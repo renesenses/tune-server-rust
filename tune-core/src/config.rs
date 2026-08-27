@@ -249,13 +249,17 @@ impl TuneConfig {
             "TUNE_LOCAL_EXCLUSIVE_MODE",
             &mut config.local_exclusive_mode,
         );
-        env_str("TUNE_LOCAL_AUDIO_BACKEND", &mut config.local_audio_backend);
-
-        // If ASIO backend is explicitly requested, enable exclusive mode
-        // automatically (ASIO is inherently exclusive).
-        if config.local_audio_backend.to_lowercase() == "asio" && !config.local_exclusive_mode {
-            config.local_exclusive_mode = true;
+        // Le nom canonique et son ancien nom mènent au même réglage. Jusqu'ici
+        // seul `tune-server` connaissait l'alias : un `.env` écrit avec
+        // l'ancien nom était honoré au démarrage du serveur et ignoré par tout
+        // autre chemin passant par ce `from_env` (#2265).
+        if let Some(backend) = local_audio_backend_from_env() {
+            config.local_audio_backend = backend;
         }
+        asio_implies_exclusive(
+            &config.local_audio_backend,
+            &mut config.local_exclusive_mode,
+        );
         env_bool("TUNE_METADATA_READONLY", &mut config.metadata_readonly);
         env_str("TUNE_DISCOGS_TOKEN", &mut config.discogs_token);
         env_str("TUNE_LASTFM_API_KEY", &mut config.lastfm_api_key);
@@ -338,6 +342,63 @@ fn parse_music_dirs(raw: &str) -> Vec<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backend audio local — un seul réglage, deux noms
+// ---------------------------------------------------------------------------
+
+/// Nom **canonique** du réglage de backend audio local (`auto`, `wasapi`, `asio`).
+///
+/// C'est ce nom-là qu'il faut écrire dans un `.env` et citer dans la
+/// documentation ou les messages destinés aux utilisateurs.
+pub const LOCAL_AUDIO_BACKEND_ENV: &str = "TUNE_LOCAL_AUDIO_BACKEND";
+
+/// Ancien nom du **même** réglage, conservé pour compatibilité ascendante.
+///
+/// Il a été ajouté le 20/06 (commit `eb8ebdf0`) parce qu'un testeur l'avait
+/// employé de bonne foi. Les `.env` déjà écrits avec ce nom doivent continuer
+/// de fonctionner : on ne le supprime pas, on cesse simplement de le
+/// recommander. Le nom canonique l'emporte quand les deux sont présents.
+pub const LOCAL_AUDIO_BACKEND_ENV_LEGACY: &str = "TUNE_AUDIO_BACKEND";
+
+/// Résout le backend audio local depuis une source de variables quelconque.
+///
+/// `lookup` rend la valeur d'une variable, ou `None` si elle n'est pas définie.
+/// Le paramètre existe pour que la règle soit vérifiable sans toucher à
+/// l'environnement du processus, qui est global et partagé entre les tests.
+///
+/// Règles, dans l'ordre :
+/// 1. le nom canonique gagne s'il est **défini**, même à vide ;
+/// 2. sinon l'ancien nom est consulté ;
+/// 3. une valeur vide n'écrase rien et laisse la valeur par défaut en place.
+///
+/// Le point 1 est délibéré : définir le nom canonique à vide neutralise
+/// l'ancien nom, ce qui est la seule façon de le désactiver sans l'effacer de
+/// son `.env`. C'est déjà le comportement de `tune-server`, reproduit ici tel
+/// quel pour que les deux chemins de configuration répondent la même chose.
+pub fn resolve_local_audio_backend<F>(lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(LOCAL_AUDIO_BACKEND_ENV)
+        .or_else(|| lookup(LOCAL_AUDIO_BACKEND_ENV_LEGACY))
+        .filter(|v| !v.is_empty())
+}
+
+/// Même résolution, lue dans l'environnement du processus.
+pub fn local_audio_backend_from_env() -> Option<String> {
+    resolve_local_audio_backend(|key| std::env::var(key).ok())
+}
+
+/// ASIO est exclusif par nature : le demander implique le mode exclusif.
+///
+/// Partagé par les deux chemins de configuration (`tune-core` et
+/// `tune-server`) pour qu'ils ne puissent pas diverger.
+pub fn asio_implies_exclusive(backend: &str, exclusive_mode: &mut bool) {
+    if backend.eq_ignore_ascii_case("asio") && !*exclusive_mode {
+        *exclusive_mode = true;
+    }
+}
+
 fn env_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
         *target = val;
@@ -396,6 +457,97 @@ mod tests {
         assert!(cfg.scan_on_startup);
         assert!(cfg.metadata_readonly);
         assert!(!cfg.crossfade_enabled);
+    }
+
+    /// Fabrique un `lookup` à partir d'une liste de paires, pour éprouver la
+    /// résolution sans toucher à l'environnement du processus.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// Le test qui gouverne #2265 : un `.env` de testeur déjà écrit avec
+    /// l'ancien nom doit continuer d'être lu. C'était vrai côté `tune-server`
+    /// et faux côté `tune-core`, où seul le nom canonique était consulté.
+    #[test]
+    fn ancien_nom_du_backend_toujours_lu() {
+        let resolved =
+            resolve_local_audio_backend(env_of(&[(LOCAL_AUDIO_BACKEND_ENV_LEGACY, "asio")]));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("asio"),
+            "un .env écrit avec {} doit rester lu",
+            LOCAL_AUDIO_BACKEND_ENV_LEGACY
+        );
+    }
+
+    /// La conséquence concrète pour l'utilisateur : demander ASIO sous
+    /// l'ancien nom doit aussi basculer en mode exclusif, comme sous le nom
+    /// canonique. Sinon le repli est lu mais reste sans effet audible.
+    #[test]
+    fn ancien_nom_asio_bascule_le_mode_exclusif() {
+        let backend =
+            resolve_local_audio_backend(env_of(&[(LOCAL_AUDIO_BACKEND_ENV_LEGACY, "asio")]))
+                .expect("l'ancien nom doit être résolu");
+        let mut exclusive = false;
+        asio_implies_exclusive(&backend, &mut exclusive);
+        assert!(
+            exclusive,
+            "ASIO demandé sous l'ancien nom doit impliquer le mode exclusif"
+        );
+    }
+
+    #[test]
+    fn nom_canonique_prime_sur_l_ancien() {
+        let resolved = resolve_local_audio_backend(env_of(&[
+            (LOCAL_AUDIO_BACKEND_ENV, "wasapi"),
+            (LOCAL_AUDIO_BACKEND_ENV_LEGACY, "asio"),
+        ]));
+        assert_eq!(resolved.as_deref(), Some("wasapi"));
+    }
+
+    /// Le nom canonique défini à vide neutralise l'ancien nom au lieu de lui
+    /// laisser la main — comportement historique de `tune-server`, qu'on ne
+    /// change pas.
+    #[test]
+    fn nom_canonique_vide_neutralise_l_ancien() {
+        let resolved = resolve_local_audio_backend(env_of(&[
+            (LOCAL_AUDIO_BACKEND_ENV, ""),
+            (LOCAL_AUDIO_BACKEND_ENV_LEGACY, "asio"),
+        ]));
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn aucun_nom_defini_laisse_la_valeur_par_defaut() {
+        assert_eq!(resolve_local_audio_backend(env_of(&[])), None);
+        assert_eq!(TuneConfig::default().local_audio_backend, "auto");
+    }
+
+    #[test]
+    fn asio_implies_exclusive_est_insensible_a_la_casse_et_ne_desactive_rien() {
+        let mut exclusive = false;
+        asio_implies_exclusive("ASIO", &mut exclusive);
+        assert!(exclusive);
+
+        let mut already_on = true;
+        asio_implies_exclusive("wasapi", &mut already_on);
+        assert!(
+            already_on,
+            "un autre backend ne doit pas désactiver l'exclusif"
+        );
+
+        let mut off = false;
+        asio_implies_exclusive("wasapi", &mut off);
+        assert!(!off);
     }
 
     #[test]
