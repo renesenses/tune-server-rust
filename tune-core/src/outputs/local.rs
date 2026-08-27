@@ -116,9 +116,20 @@ impl OpenFailure {
 
 /// Select the cpal host based on the requested backend.
 ///
-/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only)
+/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only).
+///   Falls back to WASAPI, with a warning, if the host cannot be opened or
+///   exposes no output device.
 /// - `"wasapi"`: use the default host (WASAPI on Windows)
-/// - `"auto"` (default): try ASIO first if available, fall back to default
+/// - `"auto"` (default): use WASAPI directly. **`auto` never probes ASIO.**
+/// - anything else: treated like `"wasapi"`.
+///
+/// `auto` used to try ASIO first; it no longer does, since #199. Probing an
+/// ASIO driver can make it call `abort()` and take the whole process down
+/// without a trace, so the only way to reach ASIO is to ask for it by name.
+/// Getting ASIO therefore takes a deliberate setting — see
+/// [`crate::config::LOCAL_AUDIO_BACKEND_ENV`]. A machine whose ASIO drivers
+/// are detected and listed by `/audio/asio-devices` is still playing through
+/// WASAPI as long as the backend is left on `auto`: detecting is not playing.
 ///
 /// On non-Windows platforms, always returns `cpal::default_host()`.
 pub fn select_host(backend: &str) -> cpal::Host {
@@ -160,7 +171,9 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "auto" => {
                 // Auto mode uses WASAPI directly — ASIO drivers can call
                 // abort() when probed, crashing the process silently.
-                // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
+                // Users who want ASIO must set TUNE_LOCAL_AUDIO_BACKEND=asio
+                // (the canonical name; the older TUNE_AUDIO_BACKEND is still
+                // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
                 note_observed_backend("WASAPI");
                 return cpal::default_host();
