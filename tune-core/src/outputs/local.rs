@@ -2760,28 +2760,6 @@ pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut
     count * bytes_per_sample
 }
 
-/// Copy left-aligned 16-bit source words into an ASIO I16 callback without
-/// scaling or rounding. Callers only use this for a 16-bit source contract.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) fn native_i32_to_asio_i16(samples: &[i32], out: &mut [i16]) -> usize {
-    let count = samples.len().min(out.len());
-    for (target, sample) in out[..count].iter_mut().zip(&samples[..count]) {
-        *target = (*sample >> 16) as i16;
-    }
-    count
-}
-
-/// Copy left-aligned source words into an ASIO I24 callback. A 16-bit source
-/// remains left-aligned inside the 24-bit word; a 24-bit source is unchanged.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) fn native_i32_to_asio_i24(samples: &[i32], out: &mut [cpal::I24]) -> usize {
-    let count = samples.len().min(out.len());
-    for (target, sample) in out[..count].iter_mut().zip(&samples[..count]) {
-        *target = cpal::I24::new(*sample >> 8).expect("un mot natif décalé tient sur 24 bits");
-    }
-    count
-}
-
 #[cfg(any(target_os = "windows", test))]
 fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
     let (scale, max, shift) = match bit_depth {
