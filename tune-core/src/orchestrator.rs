@@ -7019,18 +7019,27 @@ impl PlaybackOrchestrator {
     /// l'annuler. L'interface continue donc d'annoncer « prendra effet à la
     /// piste suivante », ce qui est vrai jusqu'à ce que le redémarrage advienne
     /// — mieux vaut cela qu'une promesse que l'anti-rebond peut retirer.
+    ///
+    /// Toute mutation annonce ensuite `zone.updated`. Le contrat de cet
+    /// événement est volontairement minimal : les clients rechargent la zone
+    /// et reconstruisent ainsi `signal_path` depuis le profil EQ qui vient
+    /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
     pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
-        if self.refresh_zone_eq(zone_id).await {
-            return true;
+        let applique_a_chaud = self.refresh_zone_eq(zone_id).await;
+        if !applique_a_chaud {
+            // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
+            // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
+            // seule, et redémarrer un flux inexistant n'a aucun sens.
+            let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
+            if joue {
+                self.schedule_eq_replay(zone_id);
+            }
         }
-        // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
-        // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
-        // seule, et redémarrer un flux inexistant n'a aucun sens.
-        let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
-        if joue {
-            self.schedule_eq_replay(zone_id);
+
+        if let Some(ref bus) = self.event_bus {
+            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
         }
-        false
+        applique_a_chaud
     }
 
     /// Délai d'anti-rebond avant de redémarrer un flux sur changement d'EQ.
@@ -10666,6 +10675,32 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend
+    /// `applied_live=false`, mais ce n'est pas une raison pour laisser le
+    /// client afficher l'ancien chemin du signal. `zone.updated` lui ordonne
+    /// de relire la zone, donc de reconstruire `signal_path` avec le profil qui
+    /// vient d'être écrit.
+    #[tokio::test]
+    async fn eq_change_announces_a_fresh_signal_path_without_live_output() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        let mut orch = test_orchestrator();
+        orch.event_bus = Some(bus);
+        let orch = Arc::new(orch);
+
+        assert!(
+            !orch.apply_eq_change(1_985).await,
+            "sans sortie locale vivante, le réglage ne peut pas être appliqué à chaud"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("le client ne doit pas conserver un signal_path périmé")
+            .expect("le bus doit rester ouvert");
+        assert_eq!(event.event_type, "zone.updated");
+        assert_eq!(event.data, serde_json::json!({ "zone_id": 1_985 }));
     }
 
     /// Zone locale gréée pour les tests de bascule PURE : une `LocalOutput`
