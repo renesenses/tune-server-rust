@@ -5440,10 +5440,25 @@ dependencies = [
  "tune-dj",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
+ "tune-stream-http",
  "unicode-normalization",
  "urlencoding",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "tune-stream-http"
+version = "0.9.113"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "tune-core",
 ]
 
 [[package]]

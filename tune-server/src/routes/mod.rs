@@ -72,7 +72,10 @@ pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
-pub mod stream_handler;
+// Le transport HTTP des flux ne depend d'aucun etat propre au serveur. Il vit
+// dans une branche soeur du graphe de compilation, tout en gardant le chemin
+// historique `routes::stream_handler` pour les appelants internes et externes.
+pub use tune_stream_http as stream_handler;
 pub mod streaming;
 pub mod support;
 pub mod system;
