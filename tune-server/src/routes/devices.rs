@@ -95,6 +95,9 @@ fn build_device_list(
         .map(|d| {
             seen_ids.insert(d.id.clone());
             let mut registered = registered_ids.contains(&d.id);
+            let mut output_info = all_output_info
+                .iter()
+                .find(|info| info.get("device_id").and_then(Value::as_str) == Some(d.id.as_str()));
             // Les identités secondaires comptent comme « vues » : la boucle de
             // rattrapage ci-dessous ne doit pas les réintroduire. Et si l'une
             // d'elles est enregistrée comme sortie, l'appareil l'est.
@@ -106,6 +109,11 @@ fn build_device_list(
                 for alt_id in alts.iter().filter_map(|a| a.get("id")?.as_str()) {
                     seen_ids.insert(alt_id.to_string());
                     registered = registered || registered_ids.contains(alt_id);
+                    if output_info.is_none() {
+                        output_info = all_output_info.iter().find(|info| {
+                            info.get("device_id").and_then(Value::as_str) == Some(alt_id)
+                        });
+                    }
                 }
             }
             let mut v = serde_json::to_value(d).unwrap_or_default();
@@ -113,6 +121,12 @@ fn build_device_list(
                 obj.insert("available".into(), json!(true));
                 obj.insert("registered".into(), json!(registered));
                 obj.insert("type".into(), json!(d.device_type.to_string()));
+                if let Some(capabilities) = output_info
+                    .and_then(|info| info.get("output_capabilities"))
+                    .cloned()
+                {
+                    obj.insert("output_capabilities".into(), capabilities);
+                }
             }
             v
         })
@@ -147,6 +161,7 @@ fn build_device_list(
                 "port": 0,
                 "available": true,
                 "registered": true,
+                "output_capabilities": output_info.get("output_capabilities").cloned().unwrap_or(Value::Null),
             }));
         }
     }

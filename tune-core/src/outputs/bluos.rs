@@ -1,7 +1,7 @@
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 pub struct BluosOutput {
     name: String,
@@ -126,6 +126,10 @@ impl OutputTarget for BluosOutput {
 
     fn output_type(&self) -> &str {
         "bluos"
+    }
+
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, true)
     }
 
     fn host(&self) -> Option<&str> {

@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const FRAMES_PER_PACKET: usize = 352;
 const SAMPLE_RATE: u32 = 44100;
@@ -25,6 +25,8 @@ pub struct AirplayOutput {
     paused: Arc<AtomicBool>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
+    volume: Arc<Mutex<f64>>,
+    muted: Arc<AtomicBool>,
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
     current_uri: Arc<Mutex<Option<String>>>,
@@ -51,6 +53,8 @@ impl AirplayOutput {
             paused: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(Mutex::new(1.0)),
+            muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
             current_uri: Arc::new(Mutex::new(None)),
@@ -244,7 +248,7 @@ impl RtspSession {
             .await?;
 
         if code != 200 {
-            debug!(code, "airplay_set_volume_response");
+            return Err(format!("AirPlay SET_PARAMETER volume failed: {code}"));
         }
         Ok(())
     }
@@ -382,6 +386,10 @@ impl OutputTarget for AirplayOutput {
         "airplay"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, false, true, true, false)
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host)
     }
@@ -475,18 +483,34 @@ impl OutputTarget for AirplayOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        let volume = volume.clamp(0.0, 1.0);
         let db = linear_to_airplay_db(volume);
-        if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            session.set_volume_rtsp(db).await?;
-        }
+        let mut session = self.rtsp_session.lock().await;
+        session
+            .as_mut()
+            .ok_or("AirPlay volume requires an active RTSP session")?
+            .set_volume_rtsp(db)
+            .await?;
+        drop(session);
+        *self.volume.lock().await = volume;
+        self.muted.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let db = if muted { -144.0 } else { 0.0 };
-        if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            session.set_volume_rtsp(db).await?;
-        }
+        let volume = *self.volume.lock().await;
+        let db = if muted {
+            -144.0
+        } else {
+            linear_to_airplay_db(volume)
+        };
+        let mut session = self.rtsp_session.lock().await;
+        session
+            .as_mut()
+            .ok_or("AirPlay mute requires an active RTSP session")?
+            .set_volume_rtsp(db)
+            .await?;
+        self.muted.store(muted, Ordering::SeqCst);
         Ok(())
     }
 
@@ -505,8 +529,8 @@ impl OutputTarget for AirplayOutput {
             state,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
-            volume: 1.0,
-            muted: false,
+            volume: *self.volume.lock().await,
+            muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().await.clone(),
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
