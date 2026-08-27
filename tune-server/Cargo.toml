@@ -14,11 +14,11 @@ postgres = ["tune-core/postgres"]
 # Acoustic Smart Radio: CLAP audio embeddings (onnxruntime). Opt-in build — NOT
 # in default, so the standard matrix never links ort.
 audio-embedding = ["tune-core/audio-embedding"]
-# P2 of the plugin ABI: wire the embedded wasmtime runtime (tune-core's
-# `plugins-wasm`) into the real server — AppState-backed HostContext, a
+# P2 of the plugin ABI: wire the isolated Wasmtime runtime into the real
+# server — AppState-backed HostContext, a
 # registry of loaded wasm plugins, and the `/api/v1/plugins/{id}/…` route
 # mount. NOT in default: the stock server build must not pull in wasmtime.
-plugins-wasm = ["tune-core/plugins-wasm"]
+plugins-wasm = ["dep:tune-plugin-runtime-wasm"]
 # P5 of the plugin ABI (#917): DJ mode extracted from the always-on core into a
 # native in-tree plugin. NOT in default: the stock server no longer serves /dj;
 # build `--features dj` to mount the plugin's routes at /api/v1/ext/dj.
@@ -45,6 +45,7 @@ bandcamp = ["dep:tune-bandcamp"]
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }

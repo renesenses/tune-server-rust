@@ -3,7 +3,7 @@
 //! [`AppState`], plus the registry of loaded wasm plugins the route mount
 //! ([`crate::routes::plugins`]) dispatches into.
 //!
-//! P0/P1 (in `tune-core::plugins_runtime`) left the host side abstract behind
+//! P0/P1 (in `tune-plugin-runtime-wasm`) left the host side abstract behind
 //! [`HostContext`] so it was unit-testable with a mock. This module provides
 //! the concrete implementation: [`AppStateHost`] forwards each capability to
 //! the same repos/orchestrator/event-bus the REST routes use, so a plugin's
@@ -36,7 +36,7 @@ use tune_core::event_bus::EventBus;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
 use tune_core::playback::PlaybackManager;
 use tune_core::plugins::{PluginManager, PluginManifest};
-use tune_core::plugins_runtime::{HostContext, Limits, WasmPlugin};
+use tune_plugin_runtime_wasm::{HostContext, Limits, WasmPlugin};
 
 use crate::state::AppState;
 
