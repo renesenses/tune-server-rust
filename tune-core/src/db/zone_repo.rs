@@ -1,10 +1,57 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
+
+/// Nombre d'écritures de réglages de zone que le schéma courant n'a pas pu
+/// conserver. Ce compteur de processus est volontairement monotone : un
+/// rapport de bogue doit dire qu'un mensonge a eu lieu même si l'utilisateur a
+/// depuis refermé l'écran concerné (#2154).
+static ZONE_SETTINGS_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+/// Instantané exposé par les diagnostics du serveur.
+pub fn zone_settings_ignored() -> u64 {
+    ZONE_SETTINGS_IGNORED.load(Ordering::Relaxed)
+}
+
+fn missing_column(error: &str) -> bool {
+    error.contains("no such column") || error.contains("does not exist")
+}
+
+/// Rend visible une écriture que l'ancien code transformait en faux succès.
+///
+/// La base reste utilisable et le serveur continue de tourner, mais l'appelant
+/// reçoit une erreur : une route HTTP ne peut donc plus répondre « enregistré »
+/// quand la valeur n'a jamais atteint le disque. Les écritures internes
+/// best-effort (identité réseau) utilisent aussi cette fonction pour le journal
+/// et le compteur, puis choisissent explicitement de poursuivre.
+fn setting_not_persisted(id: i64, setting: &'static str, error: &str) -> String {
+    let count = ZONE_SETTINGS_IGNORED.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        zone_id = id,
+        setting,
+        error = %error,
+        zone_settings_ignored = count,
+        "zone_setting_not_persisted"
+    );
+    format!("réglage de zone « {setting} » non enregistré : colonne absente du schéma ({error})")
+}
+
+fn visible_setting_write(
+    id: i64,
+    setting: &'static str,
+    result: Result<usize, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if missing_column(&error) => Err(setting_not_persisted(id, setting, &error)),
+        Err(error) => Err(error),
+    }
+}
 
 /// Engine-agnostic SQL builders for zone_repo.
 pub mod sql {
@@ -874,17 +921,7 @@ impl ZoneRepo {
         let val: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("autoplay_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
-        // Column may not exist on pre-v36 databases (Windows migration
-        // failure).  Swallow the error — the feature degrades gracefully
-        // to always-enabled.
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "autoplay_enabled_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "autoplay_enabled", self.db.execute(&sql, &params))
     }
 
     pub fn is_device_hidden(&self, device_id: &str) -> bool {
@@ -998,14 +1035,7 @@ impl ZoneRepo {
         let sql = self.update_field_sql("autoplay_enabled");
         let val = mode.as_stocke().to_string();
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "autoplay_mode_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "autoplay_mode", self.db.execute(&sql, &params))
     }
 
     /// Safely read autoplay_enabled for a zone.  Returns false (the default)
@@ -1038,14 +1068,7 @@ impl ZoneRepo {
     pub fn update_dsd_mode(&self, id: i64, mode: &str) -> Result<(), String> {
         let sql = self.update_field_sql("dsd_mode");
         let params: [&dyn ToSqlValue; 2] = [&mode.to_string(), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dsd_mode_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dsd_mode", self.db.execute(&sql, &params))
     }
 
     /// Whether this zone forces native FLAC to a DLNA renderer even when the
@@ -1070,14 +1093,7 @@ impl ZoneRepo {
     pub fn update_dlna_native_flac(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_native_flac");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_native_flac_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_native_flac", self.db.execute(&sql, &params))
     }
 
     /// Whether this zone serves ALAC straight to the renderer (bit-perfect, no
@@ -1102,14 +1118,7 @@ impl ZoneRepo {
     pub fn update_alac_passthrough(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("alac_passthrough");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "alac_passthrough_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "alac_passthrough", self.db.execute(&sql, &params))
     }
 
     /// Servir l'AAC tel quel au renderer, au lieu de le transcoder (#1424).
@@ -1134,14 +1143,7 @@ impl ZoneRepo {
     pub fn update_aac_passthrough(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("aac_passthrough");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "aac_passthrough_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "aac_passthrough", self.db.execute(&sql, &params))
     }
 
     /// Whether to transcode lossless to WAV/LPCM (not FLAC) for this DLNA zone.
@@ -1164,14 +1166,7 @@ impl ZoneRepo {
     pub fn update_dlna_lpcm(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_lpcm");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_lpcm_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_lpcm", self.db.execute(&sql, &params))
     }
 
     /// Whether to cap this DLNA zone's output to 16-bit. For renderers that
@@ -1209,14 +1204,7 @@ impl ZoneRepo {
     pub fn update_lyrics_offset_ms(&self, id: i64, offset_ms: i32) -> Result<(), String> {
         let sql = self.update_field_sql("lyrics_offset_ms");
         let params: [&dyn ToSqlValue; 2] = [&(offset_ms as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "lyrics_offset_ms_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "lyrics_offset_ms", self.db.execute(&sql, &params))
     }
 
     pub fn get_dlna_cap_16bit(&self, id: i64) -> bool {
@@ -1238,14 +1226,7 @@ impl ZoneRepo {
     pub fn update_dlna_cap_16bit(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_cap_16bit");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_cap_16bit_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_cap_16bit", self.db.execute(&sql, &params))
     }
 
     /// Whether to serve genuine 24-bit WAV to this DLNA zone. Opt-in, only
@@ -1270,14 +1251,7 @@ impl ZoneRepo {
     pub fn update_dlna_wav24(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_wav24");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_wav24_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_wav24", self.db.execute(&sql, &params))
     }
 
     /// Per-zone SetAVTransportURI→Play delay in ms (0 = use the config default).
@@ -1301,25 +1275,19 @@ impl ZoneRepo {
     pub fn update_dlna_play_delay_ms(&self, id: i64, delay_ms: u64) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_play_delay_ms");
         let params: [&dyn ToSqlValue; 2] = [&(delay_ms as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_play_delay_ms_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_play_delay_ms", self.db.execute(&sql, &params))
     }
 
     /// Persist the renderer's host (IP) on the zone, for host-based dedup.
-    /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
+    /// Best-effort on a pre-migration DB, but never silent: the omission is
+    /// journalised and counted for the diagnostic report (#2154).
     pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {
         let sql = self.update_field_sql("host");
         let params: [&dyn ToSqlValue; 2] = [&host, &id];
         match self.db.execute(&sql, &params) {
             Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "zone_host_column_missing_ignoring_update");
+            Err(e) if missing_column(&e) => {
+                let _ = setting_not_persisted(id, "host", &e);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1338,8 +1306,8 @@ impl ZoneRepo {
             let params: [&dyn ToSqlValue; 2] = [&mac, &id];
             match self.db.execute(&sql, &params) {
                 Ok(_) => {}
-                Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                    tracing::debug!(id, error = %e, "zone_mac_column_missing_ignoring_update");
+                Err(e) if missing_column(&e) => {
+                    let _ = setting_not_persisted(id, "mac", &e);
                 }
                 Err(e) => return Err(e),
             }
@@ -2704,5 +2672,100 @@ mod autoplay_mode_tests {
 
         assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
         assert!(repo.get_autoplay_enabled(id));
+    }
+}
+
+/// #2154 — une écriture impossible ne doit jamais devenir un faux succès.
+#[cfg(test)]
+mod ignored_zone_settings_tests {
+    use super::*;
+
+    /// Schéma volontairement antérieur aux colonnes de réglage. Il représente
+    /// exactement une migration absente, sans dépendre du numéro courant des
+    /// migrations SQLite.
+    fn pre_migration_repo() -> (ZoneRepo, i64) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                output_type TEXT,
+                output_device_id TEXT
+            );",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+        let id = repo
+            .create("Ancienne base", Some("dlna"), Some("uuid:ancienne"))
+            .unwrap();
+        (repo, id)
+    }
+
+    #[test]
+    fn les_reglages_utilisateur_refusent_le_faux_succes() {
+        let (repo, id) = pre_migration_repo();
+        let avant = zone_settings_ignored();
+        let resultats = [
+            ("autoplay_enabled", repo.update_autoplay_enabled(id, true)),
+            (
+                "autoplay_mode",
+                repo.update_autoplay_mode(id, AutoplayMode::Similar),
+            ),
+            ("dsd_mode", repo.update_dsd_mode(id, "dop")),
+            ("dlna_native_flac", repo.update_dlna_native_flac(id, true)),
+            ("alac_passthrough", repo.update_alac_passthrough(id, true)),
+            ("aac_passthrough", repo.update_aac_passthrough(id, true)),
+            ("dlna_lpcm", repo.update_dlna_lpcm(id, true)),
+            ("lyrics_offset_ms", repo.update_lyrics_offset_ms(id, 250)),
+            ("dlna_cap_16bit", repo.update_dlna_cap_16bit(id, true)),
+            ("dlna_wav24", repo.update_dlna_wav24(id, true)),
+            (
+                "dlna_play_delay_ms",
+                repo.update_dlna_play_delay_ms(id, 800),
+            ),
+        ];
+
+        for (reglage, resultat) in &resultats {
+            let erreur = resultat
+                .as_ref()
+                .expect_err("une colonne absente ne peut pas répondre succès");
+            assert!(erreur.contains(reglage), "{reglage}: {erreur}");
+            assert!(erreur.contains("non enregistré"), "{reglage}: {erreur}");
+        }
+        assert!(
+            zone_settings_ignored() >= avant + resultats.len() as u64,
+            "chaque omission doit apparaître dans le compteur de diagnostic"
+        );
+    }
+
+    #[test]
+    fn les_deux_messages_de_moteur_sont_reconnus() {
+        assert!(missing_column("execute: no such column: zones.dlna_wav24"));
+        assert!(missing_column(
+            "db error: column \"dlna_wav24\" does not exist"
+        ));
+        assert!(!missing_column("database is locked"));
+
+        let erreur = visible_setting_write(
+            7,
+            "dlna_wav24",
+            Err("db error: column \"dlna_wav24\" does not exist".into()),
+        )
+        .expect_err("PostgreSQL ne doit pas transformer l'absence en succès");
+        assert!(erreur.contains("dlna_wav24"), "{erreur}");
+    }
+
+    #[test]
+    fn l_identite_interne_reste_best_effort_mais_devient_visible() {
+        let (repo, id) = pre_migration_repo();
+        let avant = zone_settings_ignored();
+
+        repo.set_identity(id, "192.0.2.10", Some("00:11:22:33:44:55"))
+            .expect("une ancienne base ne doit pas casser la découverte");
+
+        assert!(
+            zone_settings_ignored() >= avant + 2,
+            "host et mac absents doivent être comptés"
+        );
     }
 }
