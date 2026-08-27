@@ -1172,6 +1172,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_network_mounts_identite
     },
     Migration {
         version: 84,
+        name: "listen_history_contexte_de_lecture",
+        // Rendre a chaque ecoute la trace de CE QUE l'auditeur a demande.
+        //
+        // `listen_history` ne conservait rien de l'intention : une piste jouee
+        // seule, la meme depuis une playlist et la meme dans un album complet
+        // produisaient trois lignes rigoureusement identiques. Toute rubrique
+        // voulant « refleter la realite de ce qu'a voulu faire l'auditeur »
+        // (FabienM, fil forum 1557) devait donc repartir de la table `albums`
+        // — ce que fait `fetch_continue_listening`, d'ou « Continuer l'ecoute »
+        // qui ne peut structurellement montrer qu'un album (#2441).
+        //
+        // `context_type` : `track`, `album`, `playlist`, `artist`, `label`.
+        // `context_id` : l'identifiant de cet objet, en TEXT — une playlist
+        // locale a un id numerique, un album Qobuz une chaine.
+        //
+        // Colonnes posees par add_column_if_missing dans le bloc de version,
+        // PAS par un ALTER TABLE ici : c'est la meme regle qu'a la migration
+        // 79, et l'ALTER planterait tout le runner en « duplicate column
+        // name » sur une base qui les a deja.
+        up: "",
+    },
+    Migration {
+        version: 85,
         name: "favorite_facets",
         // Mettre un LABEL en favori — et, demain, un genre, un format, une
         // annee (#2442, FabienM fil 1557).
@@ -2290,6 +2313,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
     add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
+    // Ce que l'auditeur a demande au moment du clic sur « Lire » (migration
+    // 84, #2441). TEXT pour les deux : l'identifiant peut etre un entier
+    // local ou une chaine de service de streaming.
+    add_column_if_missing(db, "listen_history", "context_type", "TEXT");
+    add_column_if_missing(db, "listen_history", "context_id", "TEXT");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -2637,13 +2665,32 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "network_mounts_unicite",
         include_str!("../../migrations/postgres/035_network_mounts_unicite.sql"),
     ),
-    // Favori d'une VALEUR de facette — le label d'abord (#2442). Table
-    // separee : `favorites.item_id` est un entier, un label n'a pas
-    // d'identite. Pendant de la migration SQLite 84.
+    // #2468 : 005 cree cette colonne en INTEGER sur une base neuve et 013 ne
+    // convertit que TEXT/VARCHAR. Une migration nouvelle est indispensable :
+    // les installations ayant deja enregistre la version 13 ne la rejouent pas.
     (
         36,
+        "bookmarks_position_bigint",
+        include_str!("../../migrations/postgres/036_bookmarks_position_bigint.sql"),
+    ),
+    // Jumelle de la migration SQLite 84. `listen_history` n'a jamais su d'ou
+    // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
+    // depuis une playlist ou dans un album donnent trois lignes identiques,
+    // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
+    (
+        37,
+        "listen_history_contexte_de_lecture",
+        include_str!("../../migrations/postgres/037_listen_history_contexte_de_lecture.sql"),
+    ),
+    // Favori d'une VALEUR de facette — le label d'abord (#2442). Table
+    // separee : `favorites.item_id` est un entier, un label n'a pas
+    // d'identite. Pendant de la migration SQLite 85.
+    // Numerotee 38 : 36 et 37 sont parties dans les lots fusionnes entre-temps,
+    // et la contiguite interdit de reserver un numero d'avance.
+    (
+        38,
         "favorite_facets",
-        include_str!("../../migrations/postgres/036_favorite_facets.sql"),
+        include_str!("../../migrations/postgres/038_favorite_facets.sql"),
     ),
 ];
 
@@ -3517,7 +3564,7 @@ mod tests {
 
     // The PG numeric-type heal chain (#1220): the migration list must stay
     // contiguous and 1-based so run_pg_migrations applies every step, and the
-    // numeric-column-type heal migrations (010/011/013) must all be present — a
+    // numeric-column-type heal migrations (010/011/013/036) must all be present — a
     // gap or a missing heal would leave a data-migrated DB with TEXT numeric
     // columns and re-break force-scan album resolution (`operator does not
     // exist: text = bigint`). (012 heals integer id columns, a sibling fix.)
@@ -3537,13 +3584,19 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 36, "latest PG migration must be 36");
-        for wanted in [10, 11, 13] {
+        assert_eq!(pg_latest_version(), 38, "latest PG migration must be 38");
+        for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
                 "numeric-type heal migration {wanted} must be registered"
             );
         }
+        assert!(
+            PG_MIGRATIONS
+                .iter()
+                .any(|&(v, name, _)| v == 36 && name == "bookmarks_position_bigint"),
+            "#2468 repair must stay registered as migration 036"
+        );
     }
 
     /// #1440 — cas RÉEL : l'anthologie « OUF », douze lignes issues de douze

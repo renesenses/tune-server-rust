@@ -148,6 +148,13 @@ pub struct ZoneState {
     /// Additif, comme `resolving` : ne modifie aucune décision de lecture.
     #[serde(default)]
     pub dop_active: bool,
+    /// Verdict réellement observé à la frontière du backend de sortie.
+    ///
+    /// Interne au serveur : les routes le fondent dans `signal_path`, contrat
+    /// public déjà consommé par les clients. `None` conserve le calcul
+    /// historique pour les sorties qui ne publient pas encore cette sonde.
+    #[serde(skip)]
+    pub output_signal_path: Option<crate::outputs::traits::OutputSignalPathStatus>,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -196,6 +203,23 @@ pub struct ZoneState {
     /// (server-initiated, no owner) rather than misattributed to a person.
     #[serde(default)]
     pub session_profile_id: Option<i64>,
+    /// Ce que l'auditeur a demande en lancant cette session : le TYPE de
+    /// l'objet sur lequel il a clique « Lire » (`track`, `album`, `playlist`,
+    /// `artist`, `label`) et son identifiant. Pose par le gestionnaire de
+    /// `POST /zones/:id/play` a partir du corps de la requete ; relu par
+    /// l'orchestrateur au moment d'ecrire `listen_history`.
+    ///
+    /// Meme mecanique que `session_profile_id`, et pour la meme raison : les
+    /// avances automatiques (autoplay, gapless, file d'attente) reutilisent la
+    /// zone sans y toucher, donc elles heritent du contexte — la deuxieme
+    /// piste d'une playlist reste une ecoute « playlist ».
+    ///
+    /// `None` = l'appelant n'a pas dit d'ou venait le geste. On ecrit NULL
+    /// plutot que de deviner : une intention inventee est pire qu'une absence.
+    #[serde(default)]
+    pub session_context_type: Option<String>,
+    #[serde(default)]
+    pub session_context_id: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -258,6 +282,7 @@ impl Default for ZoneState {
             now_playing: None,
             resolving: false,
             dop_active: false,
+            output_signal_path: None,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -275,6 +300,8 @@ impl Default for ZoneState {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
         }
     }
@@ -465,6 +492,23 @@ impl PlaybackManager {
             .dop_active = value;
     }
 
+    /// Reporte le contrat réellement constaté par le backend dans l'état de
+    /// lecture dont les routes construisent le chemin du signal.
+    pub async fn set_output_signal_path(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::OutputSignalPathStatus>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .output_signal_path = value;
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -491,6 +535,11 @@ impl PlaybackManager {
         // annoncée « recherche en cours » pendant toute la lecture.
         state.resolving = false;
         state.state = PlayState::Playing;
+        // Le verdict appartient au flux qui l'a produit. Tant que le backend
+        // n'a pas observé le premier buffer du nouveau flux, mieux vaut
+        // annoncer « non observé » que réutiliser la promesse de la piste
+        // précédente.
+        state.output_signal_path = None;
         state.paused_at = None;
         if !is_recent_seek {
             state.position_ms = 0;
@@ -553,6 +602,7 @@ impl PlaybackManager {
             // annoncée « recherche en cours » alors qu'elle est à l'arrêt.
             state.resolving = false;
             state.state = PlayState::Stopped;
+            state.output_signal_path = None;
             state.paused_at = None;
             state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
@@ -704,6 +754,34 @@ impl PlaybackManager {
             .session_profile_id = profile_id;
     }
 
+    /// Enregistrer ce que l'auditeur a demande en lancant cette session.
+    ///
+    /// Meme `entry` que `set_session_profile`, et pour la meme raison : le
+    /// gestionnaire pose le contexte AVANT que le premier `play()` ne cree la
+    /// zone, sinon la premiere piste — la seule dont l'intention soit connue —
+    /// partirait sans contexte.
+    ///
+    /// Ecrase toujours, y compris avec `None` : un nouveau geste de lecture
+    /// remplace le precedent. Sans cela, jouer une piste isolee apres une
+    /// playlist laisserait la piste marquee « playlist ».
+    ///
+    /// Aucun evenement emis — c'est de l'attribution interne, pas de l'etat
+    /// d'interface.
+    pub async fn set_session_context(
+        &self,
+        zone_id: i64,
+        context_type: Option<String>,
+        context_id: Option<String>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        z.session_context_type = context_type;
+        z.session_context_id = context_id;
+    }
+
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
@@ -828,6 +906,7 @@ mod tests {
             state: PlayState::Playing,
             resolving: false,
             dop_active: false,
+            output_signal_path: None,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),
@@ -853,6 +932,8 @@ mod tests {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
         };
         let v = now_playing_event_data(&state);

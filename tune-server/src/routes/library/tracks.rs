@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::track_repo::TrackRepo;
 
@@ -1244,5 +1245,250 @@ mod has_filters_tests {
                 "la facette « {nom} » ne compte pas comme un filtre"
             );
         }
+    }
+}
+
+// ── « Autres versions de ce titre » — #2372 ───────────────────────────────
+
+#[derive(Deserialize)]
+pub(super) struct VersionsParams {
+    /// Plafond des versions LOCALES rendues. Le streaming a son propre
+    /// budget, borne par service.
+    limit: Option<i64>,
+    /// Interroger aussi les services de streaming. Vrai par defaut : c'est le
+    /// coeur de la demande de FabienM (« pour les curieux, proposer les
+    /// versions trouvees dans les services streaming »). Le client peut le
+    /// couper pour un premier rendu immediat.
+    streaming: Option<bool>,
+}
+
+/// Rassemble les autres versions d'une piste. Rend `None` si la piste
+/// n'existe pas — le handler en fait un 404.
+///
+/// Sorti du handler pour etre testable sans monter un routeur : les tests
+/// posent une bibliotheque en memoire et appellent directement.
+pub(super) async fn rassembler_versions(
+    state: &AppState,
+    id: i64,
+    limite: i64,
+    avec_streaming: bool,
+) -> Option<Value> {
+    // Le morceau de reference : son titre, l'artiste de son album (celui que
+    // le rapprochement local compare) et l'album lui-meme. `artists` est
+    // joint deux fois : l'artiste d'album d'abord, l'artiste de piste en
+    // repli — une piste peut porter un artiste sans que l'album en ait un.
+    let e = state.backend.engine();
+    let sql = format!(
+        "SELECT t.title, COALESCE(ar.name, ar2.name, ''), COALESCE(al.title, '') \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+         WHERE t.id = {}",
+        crate::routes::versions::marqueur(e, 1)
+    );
+    let cols = state
+        .backend
+        .query_one(&sql, &[&id as &dyn ToSqlValue])
+        .ok()
+        .flatten()?;
+    let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+    let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+    let album = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+
+    let locales = crate::routes::versions::versions_locales(
+        state,
+        &titre,
+        &artiste,
+        &album,
+        Some(id),
+        limite,
+    );
+    let streaming = if avec_streaming {
+        crate::routes::versions::versions_streaming(state, &titre, &artiste, &album).await
+    } else {
+        Vec::new()
+    };
+
+    // La MEME forme qu'un groupe de `GET /home/other-versions` : l'ecran qui
+    // dessine deja la section d'accueil rend celui-ci sans une ligne de plus.
+    Some(json!({
+        "track_id": id,
+        "title": titre,
+        "artist_name": artiste,
+        "played_album": album,
+        "versions": locales,
+        "streaming": streaming,
+    }))
+}
+
+/// `GET /library/tracks/{id}/versions` — les autres versions de CE titre,
+/// bibliotheque ET services de streaming.
+///
+/// La section d'accueil `GET /home/other-versions` sait deja rapprocher les
+/// versions, mais son vivier est l'historique d'ecoute : un morceau jamais
+/// ecoute recemment n'y apparait jamais. FabienM l'a dit mot pour mot (fil
+/// 1538, 24/08) : « elles se resument aux simples dernieres ecoutes ». Cette
+/// route prend UNE piste en entree — celle designee dans le menu « … » —, et
+/// reutilise le meme rapprochement (`routes::versions`).
+///
+/// 404 quand la piste n'existe pas ; un groupe aux deux listes vides quand
+/// elle existe sans autre version : « aucune autre version connue » est une
+/// reponse, pas une erreur.
+pub(super) async fn track_versions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(p): Query<VersionsParams>,
+) -> impl IntoResponse {
+    let limite = p.limit.unwrap_or(50).clamp(1, 200);
+    let avec_streaming = p.streaming.unwrap_or(true);
+    match rassembler_versions(&state, id, limite, avec_streaming).await {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests_versions_piste {
+    use super::rassembler_versions;
+    use crate::state::AppState;
+    use tune_core::db::backend::ToSqlValue;
+
+    /// Pose « Billie Jean » sur Thriller ET sur Number Ones, plus un morceau
+    /// sans rapport. Rend l'id de la piste de Thriller.
+    fn bibliotheque_de_test(state: &AppState) -> i64 {
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Michael Jackson')", &[])
+            .unwrap();
+        let mj = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Chris Cornell')", &[])
+            .unwrap();
+        let cc = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Thriller', ?1)",
+            &[&mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let thriller = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Number Ones', ?1)",
+            &[&mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let number_ones = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Euphoria Morning', ?1)",
+            &[&cc as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let euphoria = b.last_insert_rowid();
+
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Billie Jean', ?1, ?2, 294000, '/a.flac')",
+            &[&thriller as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seed = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('billie jean', ?1, ?2, 289000, '/b.flac')",
+            &[&number_ones as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Une REPRISE : même titre, autre artiste. Le rapprochement LOCAL est
+        // volontairement strict sur l'artiste — elle ne doit pas sortir.
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Billie Jean', ?1, ?2, 301000, '/c.flac')",
+            &[&euphoria as &dyn ToSqlValue, &cc as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Un morceau sans rapport, sur le MÊME album que la graine.
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Beat It', ?1, ?2, 258000, '/d.flac')",
+            &[&thriller as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        seed
+    }
+
+    /// Le cœur de #2372 : depuis UNE piste, l'autre version portée par un
+    /// autre album ressort. Sans historique d'écoute — c'est tout l'objet :
+    /// `GET /home/other-versions` n'aurait rien rendu ici.
+    #[tokio::test]
+    async fn une_piste_donne_ses_autres_versions_sans_historique() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let seed = bibliotheque_de_test(&state);
+
+        let v = rassembler_versions(&state, seed, 50, false)
+            .await
+            .expect("la piste existe");
+
+        assert_eq!(v["title"].as_str(), Some("Billie Jean"));
+        assert_eq!(v["artist_name"].as_str(), Some("Michael Jackson"));
+        assert_eq!(v["played_album"].as_str(), Some("Thriller"));
+        let versions = v["versions"].as_array().expect("un tableau de versions");
+        assert_eq!(
+            versions.len(),
+            1,
+            "une seule autre version attendue, obtenu {versions:?}"
+        );
+        assert_eq!(versions[0]["album_title"].as_str(), Some("Number Ones"));
+        assert_eq!(versions[0]["duration_ms"].as_i64(), Some(289_000));
+    }
+
+    /// La piste de départ ne se propose pas elle-même, et son propre album
+    /// n'entre pas dans la liste.
+    #[tokio::test]
+    async fn la_piste_de_depart_et_son_album_sont_ecartes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let seed = bibliotheque_de_test(&state);
+
+        let v = rassembler_versions(&state, seed, 50, false).await.unwrap();
+        let versions = v["versions"].as_array().unwrap();
+        for ver in versions {
+            assert_ne!(
+                ver["track_id"].as_i64(),
+                Some(seed),
+                "la graine se propose elle-même"
+            );
+            assert_ne!(
+                ver["album_title"].as_str(),
+                Some("Thriller"),
+                "l'album de départ ressort : {ver:?}"
+            );
+        }
+    }
+
+    /// « Beat It » n'a aucune autre version : un groupe VIDE, pas une erreur.
+    /// Le client en tire « aucune autre version connue ».
+    #[tokio::test]
+    async fn un_morceau_sans_autre_version_rend_un_groupe_vide() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque_de_test(&state);
+        let id: i64 = state
+            .backend
+            .query_one("SELECT id FROM tracks WHERE title = 'Beat It'", &[])
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap();
+
+        let v = rassembler_versions(&state, id, 50, false).await.unwrap();
+        assert_eq!(v["versions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["streaming"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Une piste inconnue rend `None` — le handler en fait un 404, pas un
+    /// groupe vide qui ferait croire à un morceau sans version.
+    #[tokio::test]
+    async fn une_piste_inconnue_n_est_pas_un_groupe_vide() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(
+            rassembler_versions(&state, 999_999, 50, false)
+                .await
+                .is_none()
+        );
     }
 }

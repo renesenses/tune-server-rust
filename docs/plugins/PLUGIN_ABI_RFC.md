@@ -44,7 +44,8 @@ The rest of this RFC specifies **model A**.
 ## 3. WASM ABI
 
 ### 3.1 Runtime
-- Embed **`wasmtime`** in `tune-core` (behind a `plugins-wasm` feature).
+- Isolate **`wasmtime`** in `tune-plugin-runtime-wasm`, pulled only by the
+  `plugins-wasm` feature of `tune-server`.
 - One `Engine` per process; one `Store` + `Instance` per active plugin.
 - Enforce **resource limits**: max linear memory (e.g. 64 MiB), execution
   **fuel** or **epoch interruption** (kill a call that runs > N ms), no WASI
