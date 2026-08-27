@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use tune_core::audio::formats::AudioFormat;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::db::zone_repo::{Zone, ZoneRepo};
+use tune_core::db::zone_repo::{AutoplayMode, Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::http::streamer::StreamInfo;
 use tune_core::outputs::dlna::DlnaOutput;
@@ -84,7 +84,17 @@ struct PatchZone {
     #[serde(default)]
     confirm_full_volume: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
+    ///
+    /// #2271 — conserve pour les clients existants. `true` vaut
+    /// `autoplay_mode: "similar"`, `false` vaut `"off"`. Si les deux champs
+    /// arrivent ensemble, `autoplay_mode` l'emporte : il est le plus precis.
     autoplay_enabled: Option<bool>,
+    /// Ce qui s'enchaine quand la file se vide : `"off"` ou `"similar"` (#2271).
+    ///
+    /// Remplace `autoplay_enabled`, qui ne pouvait pas porter un choix de
+    /// source. Le catalogue est volontairement limite aux deux comportements
+    /// qui existent reellement aujourd'hui — voir `AutoplayMode`.
+    autoplay_mode: Option<String>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,
     /// Décalage des paroles synchronisées, en ms (positif = paroles retardées).
@@ -1587,10 +1597,15 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // correctement lu par le poller (Sandro, 0.9.70). On lit la vraie
             // valeur par l'accesseur prevu pour ca, comme les autres reglages
             // de zone ci-dessus.
+            // #2271 — les deux champs sortent ensemble et decrivent la meme
+            // colonne. `autoplay_enabled` reste emis tel quel : le client web
+            // actuel ne lit que lui, et le retirer casserait le bouton.
+            let autoplay_mode = zone_repo.get_autoplay_mode(zone_id);
             obj.insert(
                 "autoplay_enabled".into(),
-                json!(zone_repo.get_autoplay_enabled(zone_id)),
+                json!(autoplay_mode != AutoplayMode::Off),
             );
+            obj.insert("autoplay_mode".into(), json!(autoplay_mode.as_str()));
             let detected_dev = z
                 .output_device_id
                 .as_deref()
@@ -1744,10 +1759,13 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 // Meme correction que dans la liste : la valeur serialisee
                 // depuis la struct vaut toujours `false`.
+                // #2271 — meme paire que dans la liste.
+                let autoplay_mode = repo.get_autoplay_mode(id);
                 obj.insert(
                     "autoplay_enabled".into(),
-                    json!(repo.get_autoplay_enabled(id)),
+                    json!(autoplay_mode != AutoplayMode::Off),
                 );
+                obj.insert("autoplay_mode".into(), json!(autoplay_mode.as_str()));
                 let detected_dev = zone
                     .output_device_id
                     .as_deref()
@@ -1924,6 +1942,23 @@ async fn patch_zone(
             &format!("mode DSD inconnu (attendu : {})", MODES_DSD.join(", ")),
         );
     }
+    // #2271 — un mode inconnu est REFUSE, jamais range en base. Sans ce
+    // garde-fou une faute de frappe s'ecrirait telle quelle et la lecture
+    // tolerante de `get_autoplay_mode` la rattraperait en `similar` : la zone
+    // se mettrait a enchainer alors que l'auditeur croyait l'eteindre.
+    if let Some(ref mode) = body.autoplay_mode
+        && AutoplayMode::from_str_stocke(mode).is_none()
+    {
+        return refus_de_valeur(
+            id,
+            "autoplay_mode",
+            mode,
+            &format!(
+                "mode de continuation inconnu (attendu : {})",
+                AutoplayMode::NOMS.join(", ")
+            ),
+        );
+    }
     if let Some(vol) = body.volume
         && !(0..=100).contains(&vol)
     {
@@ -2039,7 +2074,18 @@ async fn patch_zone(
             state.playback.set_volume(id, 1.0).await;
         }
     }
-    if let Some(autoplay) = body.autoplay_enabled {
+    // #2271 — les deux champs visent la MEME colonne. `autoplay_mode` est le
+    // plus precis, il gagne ; `autoplay_enabled` n'est applique que seul, pour
+    // que les clients qui ne connaissent que lui continuent de fonctionner.
+    if let Some(ref mode) = body.autoplay_mode {
+        // Deja valide plus haut : le `unwrap_or` n'est pas atteignable.
+        let mode = AutoplayMode::from_str_stocke(mode).unwrap_or_default();
+        ecrire!(
+            "autoplay_mode",
+            mode.as_str(),
+            repo.update_autoplay_mode(id, mode)
+        );
+    } else if let Some(autoplay) = body.autoplay_enabled {
         ecrire!(
             "autoplay_enabled",
             autoplay,
@@ -4289,6 +4335,27 @@ mod patch_zone_deserialize_tests {
             fixed_volume,
             autoplay_enabled: false,
         }
+    }
+
+    /// #2271 — le nouveau champ de mode se deserialise, et l'ancien booleen
+    /// continue de se deserialiser seul. Les deux ensemble sont acceptes au
+    /// niveau serde ; c'est le handler qui tranche la precedence.
+    #[test]
+    fn autoplay_mode_se_deserialise() {
+        let b: PatchZone = serde_json::from_str(r#"{"autoplay_mode":"similar"}"#).unwrap();
+        assert_eq!(b.autoplay_mode.as_deref(), Some("similar"));
+        assert_eq!(b.autoplay_enabled, None, "champ absent, pas `false`");
+
+        let b: PatchZone = serde_json::from_str(r#"{"autoplay_enabled":true}"#).unwrap();
+        assert_eq!(b.autoplay_enabled, Some(true));
+        assert_eq!(
+            b.autoplay_mode, None,
+            "un client qui ne connait que le booleen n'envoie pas de mode"
+        );
+
+        let b: PatchZone = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(b.autoplay_mode, None);
+        assert_eq!(b.autoplay_enabled, None);
     }
 
     // #1320 (Cyrille) — « Aucune » ne persistait jamais : un `null` explicite
