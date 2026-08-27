@@ -14,6 +14,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 
 use tune_core::db::settings_repo::SettingsRepo;
+pub use tune_http_types::AuthUser;
 
 use crate::state::AppState;
 
@@ -30,13 +31,6 @@ pub struct JwtClaims {
     /// Expiration (unix timestamp)
     pub exp: u64,
     /// Role: "admin" or "user"
-    pub role: String,
-}
-
-/// Injected into request extensions by the auth middleware / extractor.
-#[derive(Debug, Clone)]
-pub struct AuthUser {
-    pub user_id: i64,
     pub role: String,
 }
 
