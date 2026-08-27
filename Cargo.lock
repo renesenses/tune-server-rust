@@ -5371,7 +5371,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.113"
+version = "0.9.114"
 dependencies = [
  "axum",
  "reqwest",
@@ -5463,7 +5463,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.113"
+version = "0.9.114"
 dependencies = [
  "axum",
  "serde",
