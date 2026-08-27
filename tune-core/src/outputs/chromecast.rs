@@ -716,15 +716,20 @@ mod deadline_tests {
 
         let results = futures_util::future::join_all(outputs.iter().map(|o| o.get_status())).await;
         assert!(results.iter().all(Result::is_err));
+        // Deux compteurs INDEPENDANTS, et rien n'ordonne leur retour a zero :
+        // `active` est decremente par le PAIR quand il constate la fermeture
+        // de la socket, `available_permits` par NOS taches quand elles
+        // rendent leur permis. Attendre l'un puis assertir l'autre est une
+        // course — dans un sens comme dans l'autre. On attend donc les DEUX
+        // avant d'assertir quoi que ce soit.
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) != 0 {
+            while active.load(Ordering::SeqCst) != 0 || slots.available_permits() != 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("les workers doivent rendre leur permis apres la deadline");
         assert!(maximum.load(Ordering::SeqCst) <= 2);
-        assert_eq!(slots.available_permits(), 2);
         server.abort();
     }
 
