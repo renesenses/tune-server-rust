@@ -98,7 +98,7 @@ pub type OutputCommandResult<T> = Result<T, OutputCommandError>;
 /// réussir. Les listes de formats et de dispositions sont vides quand la
 /// sortie ne sait pas encore publier cette partie du contrat ; elles ne
 /// signifient donc pas que la sortie ne sait lire aucun son.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputCapabilities {
     pub version: u16,
     pub can_pause: bool,
@@ -149,22 +149,6 @@ impl OutputCapabilities {
         self.supports(command)
             .then_some(())
             .ok_or_else(|| OutputCommandError::unsupported(command))
-    }
-}
-
-impl Default for OutputCapabilities {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            can_pause: false,
-            can_resume: false,
-            can_seek: false,
-            can_set_volume: false,
-            can_mute: false,
-            can_gapless: false,
-            formats: Vec::new(),
-            channel_layouts: Vec::new(),
-        }
     }
 }
 

@@ -1,15 +1,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::Mutex;
 
 use super::airplay::AirplayOutput;
 use super::airplay2::Airplay2Output;
+use super::bluos::BluosOutput;
+use super::bridge::BridgeOutput;
+use super::chromecast::ChromecastOutput;
+use super::dlna::DlnaOutput;
 use super::hqplayer::HqplayerOutput;
+#[cfg(feature = "local-audio")]
+use super::local::LocalOutput;
 use super::mock::MockOutput;
+use super::oaat::{OaatMultiroomOutput, OaatOutput};
 use super::openhome::OpenHomeOutput;
 use super::slimproto::SlimProtoOutput;
+use super::squeezebox::SqueezeboxOutput;
 use super::{
     OutputCapabilities, OutputCommand, OutputCommandError, OutputStatus, OutputTarget,
     TransportState,
@@ -72,6 +80,115 @@ impl OutputTarget for LegacyNoopOutput {
 
 fn unsupported(command: OutputCommand) -> OutputCommandError {
     OutputCommandError::Unsupported { command }
+}
+
+#[tokio::test]
+async fn toutes_les_sorties_integrees_declarent_le_contrat_v1() {
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(1);
+    let players = Arc::new(Mutex::new(HashMap::new()));
+    let channels = Arc::new(Mutex::new(HashMap::new()));
+    #[allow(unused_mut)] // `push(LocalOutput)` n'existe que sous local-audio.
+    let mut outputs: Vec<Box<dyn OutputTarget>> = vec![
+        Box::new(AirplayOutput::new(
+            "AirPlay".into(),
+            "airplay-1".into(),
+            "127.0.0.1".into(),
+            9,
+        )),
+        Box::new(Airplay2Output::new(
+            "AirPlay 2".into(),
+            "127.0.0.1".into(),
+            9,
+            "airplay2-1".into(),
+            "00:11:22:33:44:55".into(),
+        )),
+        Box::new(BluosOutput::new(
+            "BluOS".into(),
+            "bluos-1".into(),
+            "127.0.0.1".into(),
+            9,
+        )),
+        Box::new(BridgeOutput::new(
+            "Bridge".into(),
+            "bridge-1".into(),
+            "bridge".into(),
+            "bridge-host".into(),
+            bridge_tx,
+            Arc::new(AtomicBool::new(true)),
+        )),
+        Box::new(ChromecastOutput::new(
+            "Cast".into(),
+            "cast-1".into(),
+            "127.0.0.1".into(),
+            9,
+        )),
+        Box::new(DlnaOutput::new(
+            "DLNA".into(),
+            "dlna-1".into(),
+            "127.0.0.1".into(),
+            "http://127.0.0.1:9/transport".into(),
+            "http://127.0.0.1:9/rendering".into(),
+            None,
+        )),
+        Box::new(HqplayerOutput::new(
+            "HQPlayer".into(),
+            "hqplayer-1".into(),
+            "127.0.0.1".into(),
+            9,
+        )),
+        Box::new(MockOutput::new("mock-1", "Mock")),
+        Box::new(OaatOutput::new(
+            "OAAT".into(),
+            "127.0.0.1".into(),
+            9,
+            "oaat-1".into(),
+        )),
+        Box::new(OaatMultiroomOutput::new(
+            "OAAT group".into(),
+            "group-1".into(),
+            Vec::new(),
+        )),
+        Box::new(OpenHomeOutput::new(
+            "OpenHome".into(),
+            "openhome-1".into(),
+            "127.0.0.1".into(),
+            9,
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        )),
+        Box::new(SlimProtoOutput::new(
+            "SlimProto".into(),
+            "slimproto-1".into(),
+            "00:11:22:33:44:55".into(),
+            players,
+            channels,
+        )),
+        Box::new(SqueezeboxOutput::new(
+            "Squeezebox".into(),
+            "squeezebox-00:11:22:33:44:55".into(),
+            "127.0.0.1".into(),
+            9,
+        )),
+    ];
+    #[cfg(feature = "local-audio")]
+    outputs.push(Box::new(LocalOutput::new("Test local".into())));
+
+    for output in outputs {
+        let capabilities = output.capabilities();
+        assert_eq!(
+            capabilities.version,
+            crate::outputs::traits::OUTPUT_CAPABILITIES_VERSION,
+            "{} doit déclarer explicitement le contrat courant",
+            output.output_type()
+        );
+        assert_eq!(
+            capabilities.can_gapless,
+            output.supports_internal_gapless(),
+            "{} ne doit pas publier deux vérités gapless",
+            output.output_type()
+        );
+    }
 }
 
 #[tokio::test]

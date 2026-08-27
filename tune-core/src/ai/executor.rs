@@ -267,18 +267,26 @@ impl ToolExecutor {
 
     async fn pause(&self) -> Value {
         let device_id = self.get_zone_device_id();
-        self.orchestrator
+        match self
+            .orchestrator
             .pause(self.zone_id, device_id.as_deref())
-            .await;
-        json!({ "status": "paused" })
+            .await
+        {
+            Ok(()) => json!({ "status": "paused" }),
+            Err(error) => json!({ "error": "output_command_failed", "detail": error }),
+        }
     }
 
     async fn resume(&self) -> Value {
         let device_id = self.get_zone_device_id();
-        self.orchestrator
+        match self
+            .orchestrator
             .resume(self.zone_id, device_id.as_deref())
-            .await;
-        json!({ "status": "resumed" })
+            .await
+        {
+            Ok(()) => json!({ "status": "resumed" }),
+            Err(error) => json!({ "error": "output_command_failed", "detail": error }),
+        }
     }
 
     async fn set_volume(&self, input: Value) -> Value {
@@ -289,10 +297,14 @@ impl ToolExecutor {
             .clamp(0.0, 1.0);
 
         let device_id = self.get_zone_device_id();
-        self.orchestrator
+        match self
+            .orchestrator
             .set_volume(self.zone_id, volume, device_id.as_deref())
-            .await;
-        json!({ "status": "volume_set", "volume": volume })
+            .await
+        {
+            Ok(()) => json!({ "status": "volume_set", "volume": volume }),
+            Err(error) => json!({ "error": "output_command_failed", "detail": error }),
+        }
     }
 
     async fn next_track(&self) -> Value {

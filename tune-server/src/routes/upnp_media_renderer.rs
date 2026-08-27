@@ -324,11 +324,14 @@ async fn avtransport_control(
             }
         }
         RendererCommand::Pause => {
-            state
+            match state
                 .orchestrator
                 .pause(zone_id, device_id.as_deref())
-                .await;
-            upnp_renderer::empty_response("Pause")
+                .await
+            {
+                Ok(()) => upnp_renderer::empty_response("Pause"),
+                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            }
         }
         RendererCommand::Stop => {
             // Arrêt COMMANDÉ : la suivante en attente s'efface AVANT le stop,
@@ -342,11 +345,14 @@ async fn avtransport_control(
             upnp_renderer::empty_response("Stop")
         }
         RendererCommand::Seek(ms) => {
-            state
+            match state
                 .orchestrator
                 .seek(zone_id, ms, device_id.as_deref())
-                .await;
-            upnp_renderer::empty_response("Seek")
+                .await
+            {
+                Ok(()) => upnp_renderer::empty_response("Seek"),
+                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            }
         }
         RendererCommand::GetTransportInfo => {
             upnp_renderer::transport_info_response(&snapshot(&state, zone_id).await)
@@ -390,16 +396,25 @@ async fn renderingcontrol_control(
             upnp_renderer::volume_response(&snapshot(&state, zone_id).await)
         }
         RendererCommand::SetVolume(v) => {
-            state
+            match state
                 .orchestrator
                 .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
-                .await;
-            upnp_renderer::empty_response("SetVolume")
+                .await
+            {
+                Ok(()) => upnp_renderer::empty_response("SetVolume"),
+                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            }
         }
         RendererCommand::GetMute => upnp_renderer::mute_response(&snapshot(&state, zone_id).await),
         RendererCommand::SetMute(m) => {
-            let _ = repo.update_muted(zone_id, m);
-            upnp_renderer::empty_response("SetMute")
+            match state
+                .orchestrator
+                .set_mute(zone_id, m, device_id.as_deref())
+                .await
+            {
+                Ok(()) => upnp_renderer::empty_response("SetMute"),
+                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            }
         }
         RendererCommand::Unsupported(name) => {
             debug!(zone_id, action = %name, "upnp_renderer_unsupported_action");
