@@ -121,6 +121,18 @@ async fn continue_listening(
     Ok(Json(json!(items)))
 }
 
+// #2441 — cette requete part de `albums` et se termine par
+// `HAVING listened_tracks < a.track_count` : elle ne PEUT rien rendre d'autre
+// qu'un album de la bibliotheque locale, quelle que soit la nature de ce que
+// l'auditeur avait demande. C'est le defaut releve par FabienM (fil 1557).
+//
+// Depuis la migration 84, `listen_history` porte `context_type` /
+// `context_id` : l'intention est desormais ECRITE. Ce qu'il faut en AFFICHER
+// — mettre une playlist a cote d'un album, un artiste, un titre isole ; le
+// devenir du `HAVING` qui fait disparaitre un album fini ; les badges par
+// type — releve d'un arbitrage produit qui n'a pas ete rendu. La requete
+// n'est donc pas touchee ici : il n'y a rien de moins fiable qu'une regle
+// d'affichage inventee par celui qui pose le socle.
 fn fetch_continue_listening(
     state: &AppState,
     limit: i64,

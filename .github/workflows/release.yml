@@ -726,21 +726,82 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
-          notarize_failed() {
-            echo "::error::Notarisation REFUSÉE par Apple — le DMG ne sera pas publié. Les .tar.gz macOS, eux, restent valides et sont publiés."
+          JOURNAL_SOUMISSION="$RUNNER_TEMP/notarytool-submit.log"
+
+          # ─── Un refus d'Apple et une coupure réseau ne sont PAS la même
+          # panne, et n'appellent pas la même conclusion. ─────────────────
+          #
+          # Jusqu'à la v0.9.102 elles partageaient la même sortie :
+          # `submit --wait || notarize_failed`, qui se déclenchait sur
+          # N'IMPORTE quel code non nul, criait « REFUSÉE par Apple » et
+          # supprimait le DMG. Le 23/08 à 21:50:15, ce qui a pris cette
+          # sortie n'était pas un verdict d'Apple mais un
+          # `NSURLErrorDomain Code=-1009 / No network route` côté runner,
+          # onze secondes après une soumission qu'Apple a bel et bien
+          # ACCEPTÉE. Le DMG Intel a été détruit, la v0.9.102 publiée sans
+          # lui, et le message envoyait chercher la panne du côté des
+          # secrets ASC_API_KEY_*, qui n'y étaient pour rien.
+          #
+          # Les reprises ajoutées par #2329 entourent `stapler`, donc
+          # s'exécutent APRÈS ce bloc : un `exit 1` parti d'ici ne les
+          # atteint jamais. D'où ce correctif, en amont.
+          #
+          # La règle de sécurité, elle, ne bouge pas : un DMG non tamponné
+          # ne sort JAMAIS — Gatekeeper le refuserait chez l'utilisateur,
+          # ce qui est pire qu'un fichier absent. Toutes les sorties en
+          # échec suppriment donc le DMG. Ce qui change, c'est qu'aucune
+          # ne le fait plus sans avoir demandé son verdict à Apple, et
+          # qu'aucune ne raconte plus une cause qu'elle n'a pas constatée.
+          echec_avant_soumission() {
+            echo "::error::Notarisation impossible — « notarytool submit » a échoué (code $1) AVANT d'obtenir un identifiant de soumission : Apple n'a jamais vu ce DMG, il n'y a aucun verdict à interroger. Le DMG ne sera pas publié ; les .tar.gz macOS restent valides et sont publiés. Journal de la soumission ci-dessus."
             rm -f "$DMG_NAME"
             exit 1
+          }
+          refus_dapple() {
+            echo "::error::Notarisation REFUSÉE par Apple — verdict « $1 » relu sur la soumission $2. Le DMG ne sera pas publié ; les .tar.gz macOS restent valides et sont publiés. Détail du refus : « xcrun notarytool log $2 »."
+            rm -f "$DMG_NAME"
+            exit 1
+          }
+          verdict_inattendu() {
+            echo "::error::Notarisation interrompue et verdict inconnu de ce workflow : la soumission $2 rend l'état « $1 ». Le DMG ne sera pas publié, par précaution. Relire « xcrun notarytool info $2 » avant de conclure."
+            rm -f "$DMG_NAME"
+            exit 1
+          }
+          transport_coupe() {
+            echo "::error::Notarisation INDÉTERMINÉE — la liaison avec le service Apple a été coupée pendant l'attente du verdict. Ce n'est PAS un refus d'Apple, et ce n'est pas un problème d'identifiants : la soumission $1 est déposée, son état n'a simplement pas pu être relu après 5 tentatives. Le DMG ne sera pas publié ; les .tar.gz macOS restent valides et sont publiés. Vérifier avec « xcrun notarytool info $1 » : si l'état est « Accepted », relancer ce job sur le tag suffit, sans resoumettre."
+            rm -f "$DMG_NAME"
+            exit 1
+          }
+          # Relit l'état RÉEL d'une soumission déjà déposée. C'est la seule
+          # façon de savoir si le DMG est publiable quand `--wait` s'est
+          # fait couper : l'identifiant est toujours connu à ce moment-là,
+          # « Submission ID received » précède l'attente du verdict.
+          #
+          # Cinq essais, 10 s puis 20, 30, 40 : la panne qui amène ici est
+          # transitoire par nature, et cent secondes tiennent largement
+          # dans un job plafonné à 75 minutes.
+          verdict_de_la_soumission() {
+            local id="$1"
+            local essai statut
+            for essai in 1 2 3 4 5; do
+              statut=$(xcrun notarytool info "$id" "${AUTH[@]}" 2>/dev/null \
+                       | sed -n 's/^ *status: *//p' | head -n 1)
+              if [ -n "$statut" ] && [ "$statut" != "In Progress" ]; then
+                printf '%s' "$statut"
+                return 0
+              fi
+              if [ "$essai" -lt 5 ]; then
+                echo "État de la soumission $id non concluant (« ${statut:-injoignable} ») — nouvel essai dans ${essai}0 s ($essai/5)." >&2
+                sleep "${essai}0"
+              fi
+            done
+            return 1
           }
           # Le ticket n'existe pas à l'instant où Apple répond « Accepted » :
           # il apparaît sur son CDN quelques secondes plus tard. D'ici là
           # `stapler` rend « could not find ticket » — et comme cette étape
           # tourne sous `bash -e`, elle mourait là, en emportant un DMG
           # PARFAITEMENT notarisé.
-          #
-          # Vécu sur v0.9.102 : soumission créée à 21:50:07, acceptée par
-          # Apple, étape morte à 21:50:15. Onze secondes en tout — ni un refus
-          # (Apple a dit oui), ni le plafond de 600 s (il n'a pas eu le temps
-          # de s'écouler). Le DMG Intel a été supprimé pour rien.
           #
           # Cinq essais, 10 s puis 20, 30, 40 : cent secondes d'attente au
           # pire, dans un job plafonné à 75 minutes.
@@ -758,26 +819,48 @@ jobs:
             done
             return 1
           }
+          # Les identifiants sont rassemblés une fois : `submit` et `info`
+          # doivent parler au même compte, sans quoi le rattrapage ci-dessous
+          # interrogerait dans le vide.
           if [ -n "$ASC_API_KEY_P8" ]; then
             KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
             # printf '%s' via the env var keeps the PEM newlines intact and
             # avoids any shell interpretation of the key content.
             printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
             trap 'rm -f "$KEY_FILE"' EXIT
-            xcrun notarytool submit "$DMG_NAME" \
-              --key "$KEY_FILE" \
-              --key-id "$ASC_API_KEY_ID" \
-              --issuer "$ASC_API_ISSUER_ID" \
-              --wait --timeout 600 || notarize_failed
+            AUTH=(--key "$KEY_FILE" --key-id "$ASC_API_KEY_ID" --issuer "$ASC_API_ISSUER_ID")
           elif [ -n "$APPLE_ID" ]; then
-            xcrun notarytool submit "$DMG_NAME" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait --timeout 600 || notarize_failed
+            AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID")
           else
             echo "No notarization credentials, skipping notarization"
             exit 0
+          fi
+          # La sortie de `submit` est CONSERVÉE : elle porte l'identifiant de
+          # soumission, seule prise pour retrouver le verdict si la liaison
+          # casse en vol. `tee` la laisse visible dans le journal du job.
+          set +e
+          xcrun notarytool submit "$DMG_NAME" "${AUTH[@]}" \
+            --wait --timeout 600 2>&1 | tee "$JOURNAL_SOUMISSION"
+          CODE_SUBMIT=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE_SUBMIT" -ne 0 ]; then
+            ID_SOUMISSION=$(sed -n 's/^ *id: *//p' "$JOURNAL_SOUMISSION" | head -n 1)
+            if [ -z "$ID_SOUMISSION" ]; then
+              echec_avant_soumission "$CODE_SUBMIT"
+            fi
+            echo "::warning::« notarytool submit --wait » s'est interrompu (code $CODE_SUBMIT), mais la soumission $ID_SOUMISSION est déposée chez Apple. Son état réel est relu AVANT toute destruction du DMG."
+            STATUT=$(verdict_de_la_soumission "$ID_SOUMISSION") || transport_coupe "$ID_SOUMISSION"
+            case "$STATUT" in
+              Accepted)
+                echo "Verdict relu : Accepted. La coupure était côté transport — le DMG est notarisé et reste publiable."
+                ;;
+              Invalid|Rejected)
+                refus_dapple "$STATUT" "$ID_SOUMISSION"
+                ;;
+              *)
+                verdict_inattendu "$STATUT" "$ID_SOUMISSION"
+                ;;
+            esac
           fi
           # Un DMG non tamponné ne doit JAMAIS sortir : Gatekeeper le refuserait
           # chez l'utilisateur, ce qui est pire qu'un fichier absent. Mais on
@@ -1192,10 +1275,26 @@ jobs:
             echo "::warning::Pose du tag refusée (HTTP $STATUS) : $(cat /tmp/resp)"
           fi
 
+  # ETEINT VOLONTAIREMENT depuis le 03/06/2026 (496fc446, « manual posts have
+  # better formatting »). NE PAS rallumer sans lire #2328 : en l'etat, ce job
+  # ferait du mal.
+  #
+  #   1. Il posterait le changelog brut de git-cliff, qui emet un lien vers le
+  #      depot — PRIVE — par commit (`cliff.toml`), publiquement sur le forum.
+  #   2. Un fil cree par l'API nait `moderation_status = 'pending'` : le POST
+  #      repond 200, le job passe au vert, et PERSONNE ne voit le fil.
+  #   3. Le corps est du Markdown ; l'API attend du HTML.
+  #   4. `category: releases` n'existe pas : le champ est `type`, parmi
+  #      release|discussion|bug|feature.
+  #   5. Le jeton poste sous `user_id = 1`, affiche « Admin » — les notes sont
+  #      signees Bertrand (18).
+  #
+  # Le filet, en attendant, est `notes-de-version-watch.yml` : il ne poste rien
+  # et echoue bruyamment quand une version publiee reste sans fil de notes.
   forum:
     name: Announce on mozaiklabs forum
     needs: release
-    if: false  # Disabled — forum posts are written manually with better formatting
+    if: false  # Disabled — voir le pave ci-dessus et #2328
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Announce on forum — desactive
     steps:

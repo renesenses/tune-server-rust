@@ -104,6 +104,63 @@ fn reusable_session(
         .map(|a| (a.transport_id.clone(), a.session_id.clone()))
 }
 
+/// Le média `LOAD` tel qu'il part sur le fil, construit à partir du contrat
+/// `PlayMedia`. Fonction pure : c'est elle que les tests interrogent, faute de
+/// pouvoir brancher un vrai récepteur Cast.
+fn build_cast_media(media: &super::traits::PlayMedia<'_>) -> rust_cast::channels::media::Media {
+    use rust_cast::channels::media::{Image, Media, Metadata, MusicTrackMediaMetadata, StreamType};
+
+    // Le type de flux et la durée se décident ENSEMBLE, sinon la barre de
+    // progression ment. Une webradio est infinie : `Buffered` fait croire au
+    // récepteur qu'il tient un fichier borné, et une durée sur un flux sans fin
+    // n'existe pas. Les deux se lisent du même `live_stream`, ici et nulle part
+    // ailleurs, pour qu'on ne puisse pas corriger l'un en oubliant l'autre.
+    let (stream_type, duration) = if media.live_stream {
+        (StreamType::Live, None)
+    } else {
+        // 0 est la valeur « inconnu » de plusieurs lignes en base. Annoncer une
+        // piste de durée nulle est pire que n'annoncer aucune durée : le
+        // récepteur affiche une barre déjà terminée. Le champ Cast est en
+        // SECONDES, `PlayMedia` en millisecondes.
+        let seconds = media
+            .duration_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms as f32 / 1000.0);
+        (StreamType::Buffered, seconds)
+    };
+
+    // Même règle pour la numérotation : la ligne de bibliothèque stocke 0 pour
+    // « inconnu », et une piste 0 sur 0 est un chiffre inventé.
+    let positive = |n: Option<u32>| n.filter(|v| *v > 0);
+
+    Media {
+        content_id: media.url.to_string(),
+        content_type: media.mime_type.to_string(),
+        stream_type,
+        duration,
+        metadata: Some(Metadata::MusicTrack(MusicTrackMediaMetadata {
+            album_name: media.album.map(String::from),
+            title: media.title.map(String::from),
+            // `PlayMedia` ne porte pas d'artiste d'album ni de compositeur ni de
+            // date de sortie : les déduire de l'artiste de piste serait annoncer
+            // une valeur que Tune n'a pas mesurée.
+            album_artist: None,
+            artist: media.artist.map(String::from),
+            composer: None,
+            track_number: positive(media.track_number),
+            disc_number: positive(media.disc_number),
+            // `cover_url` est déjà résolue en URL absolue par l'orchestrateur
+            // (`resolve_cover_url`) : le Chromecast va la chercher lui-meme sur
+            // le réseau, un chemin local ne lui servirait à rien.
+            images: media
+                .cover_url
+                .map(|url| vec![Image::new(url.to_string())])
+                .unwrap_or_default(),
+            release_date: None,
+        })),
+    }
+}
+
 pub struct ChromecastOutput {
     name: String,
     device_id: String,
@@ -165,11 +222,11 @@ impl OutputTarget for ChromecastOutput {
         Some(&self.host)
     }
 
-    async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
-        self.play_url(media.url, media.mime_type, media.title, media.artist)
-            .await
-    }
-
+    /// `play_url` ne porte que quatre champs ; c'est `play_media` qui tient le
+    /// contrat complet, donc c'est ici qu'est la vraie implémentation. La
+    /// délégation va dans ce sens-là, et pas l'inverse : #2248, où le riche
+    /// `PlayMedia` était réduit à URL/MIME/titre/artiste avant même d'arriver
+    /// au constructeur du message `LOAD`.
     async fn play_url(
         &self,
         url: &str,
@@ -177,10 +234,19 @@ impl OutputTarget for ChromecastOutput {
         title: Option<&str>,
         artist: Option<&str>,
     ) -> Result<(), String> {
-        let url = url.to_string();
-        let mime = mime_type.to_string();
-        let title = title.map(String::from);
-        let artist = artist.map(String::from);
+        self.play_media(&super::traits::PlayMedia {
+            url,
+            mime_type,
+            title,
+            artist,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
+        let cast_media = build_cast_media(media);
+        let url = media.url.to_string();
         let host = self.host.clone();
         let port = self.port;
         let name = self.name.clone();
@@ -225,29 +291,7 @@ impl OutputTarget for ChromecastOutput {
 
             device
                 .media
-                .load(
-                    &transport_id,
-                    &session_id,
-                    &rust_cast::channels::media::Media {
-                        content_id: url.clone(),
-                        content_type: mime,
-                        stream_type: rust_cast::channels::media::StreamType::Buffered,
-                        duration: None,
-                        metadata: Some(rust_cast::channels::media::Metadata::MusicTrack(
-                            rust_cast::channels::media::MusicTrackMediaMetadata {
-                                album_name: None,
-                                title,
-                                album_artist: None,
-                                artist,
-                                composer: None,
-                                track_number: None,
-                                disc_number: None,
-                                images: vec![],
-                                release_date: None,
-                            },
-                        )),
-                    },
-                )
+                .load(&transport_id, &session_id, &cast_media)
                 .map_err(|e| format!("load media: {e}"))?;
 
             // `session_reused=false` sur une piste qui n'est pas la première
@@ -893,5 +937,172 @@ mod cast_tls_tests {
             UnixTime::now(),
         );
         assert!(res.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod load_message_tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------
+    // #2248 — le message LOAD doit PORTER le contrat PlayMedia.
+    //
+    // Impossible de brancher un vrai récepteur Cast ici : ce qu'on interroge
+    // est le `Media` exact remis à `device.media.load(...)`, c'est-à-dire la
+    // charge utile du message LOAD, champ par champ.
+    // ---------------------------------------------------------------------
+
+    use crate::outputs::traits::PlayMedia;
+    use rust_cast::channels::media::{Image, Metadata, MusicTrackMediaMetadata, StreamType};
+
+    fn music_metadata(
+        media: &rust_cast::channels::media::Media,
+    ) -> &rust_cast::channels::media::MusicTrackMediaMetadata {
+        match media.metadata.as_ref().expect("LOAD sans metadata") {
+            Metadata::MusicTrack(m) => m,
+            other => panic!("metadata attendue MusicTrack, obtenue {other:?}"),
+        }
+    }
+
+    /// Une piste de bibliothèque telle que l'orchestrateur la remet aujourd'hui
+    /// (`orchestrator.rs`, construction de `PlayMedia`) : tout est renseigné en
+    /// amont, rien n'est inventé ici.
+    fn piste_complete() -> PlayMedia<'static> {
+        PlayMedia {
+            url: "http://192.168.1.18:8888/stream/42",
+            mime_type: "audio/flac",
+            title: Some("Blue in Green"),
+            artist: Some("Miles Davis"),
+            album: Some("Kind of Blue"),
+            cover_url: Some("http://192.168.1.18:8888/api/v1/library/artwork/ab12cd"),
+            duration_ms: Some(337_000),
+            track_number: Some(3),
+            disc_number: Some(1),
+            live_stream: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn un_fichier_est_buffered_et_porte_sa_duree_en_secondes() {
+        let media = build_cast_media(&piste_complete());
+
+        assert_eq!(media.content_id, "http://192.168.1.18:8888/stream/42");
+        assert_eq!(media.content_type, "audio/flac");
+        assert_eq!(media.stream_type, StreamType::Buffered);
+        // 337 000 ms = 337 s, et le champ Cast est en SECONDES.
+        assert_eq!(media.duration, Some(337.0_f32));
+    }
+
+    /// Le message LOAD *exact* : une seule égalité de structure, pour que le
+    /// diff d'un échec montre TOUS les champs manquants d'un coup et non le
+    /// premier seulement.
+    #[test]
+    fn un_fichier_porte_son_album_sa_pochette_et_ses_numeros() {
+        let media = build_cast_media(&piste_complete());
+
+        assert_eq!(
+            music_metadata(&media),
+            &MusicTrackMediaMetadata {
+                title: Some("Blue in Green".to_string()),
+                artist: Some("Miles Davis".to_string()),
+                album_name: Some("Kind of Blue".to_string()),
+                track_number: Some(3),
+                disc_number: Some(1),
+                images: vec![Image::new(
+                    "http://192.168.1.18:8888/api/v1/library/artwork/ab12cd".to_string()
+                )],
+                // Tune ne connaît ni l'artiste d'album ni le compositeur ni la
+                // date à cette frontière : les inventer serait annoncer une
+                // valeur non mesurée.
+                album_artist: None,
+                composer: None,
+                release_date: None,
+            }
+        );
+    }
+
+    #[test]
+    fn une_radio_est_annoncee_live_et_sans_duree() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/radio-7",
+            mime_type: "audio/mpeg",
+            title: Some("FIP"),
+            artist: Some("Radio France"),
+            live_stream: true,
+            ..Default::default()
+        });
+
+        // Buffered sur un flux infini est sémantiquement faux : le récepteur
+        // croit tenir un fichier et affiche une barre de progression qui ment.
+        assert_eq!(media.stream_type, StreamType::Live);
+        assert_eq!(media.duration, None);
+    }
+
+    #[test]
+    fn une_duree_inconnue_ne_devient_jamais_zero() {
+        // Ne jamais annoncer une valeur qu'on n'a pas mesurée : 0.0 s ferait
+        // afficher une piste de durée nulle, pire que pas de durée du tout.
+        let inconnue = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            duration_ms: None,
+            ..Default::default()
+        });
+        assert_eq!(inconnue.duration, None);
+
+        // Certaines lignes stockent 0 pour « inconnu » : il ne doit pas
+        // franchir la frontière non plus.
+        let zero = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            duration_ms: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(zero.duration, None);
+    }
+
+    #[test]
+    fn les_numeros_a_zero_valent_inconnu_et_ne_partent_pas() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            track_number: Some(0),
+            disc_number: Some(0),
+            ..Default::default()
+        });
+        let m = music_metadata(&media);
+        assert_eq!(m.track_number, None);
+        assert_eq!(m.disc_number, None);
+    }
+
+    #[test]
+    fn sans_pochette_aucune_image_fantome_n_est_envoyee() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            cover_url: None,
+            ..Default::default()
+        });
+        assert!(music_metadata(&media).images.is_empty());
+    }
+
+    #[test]
+    fn play_url_garde_exactement_le_contrat_d_avant() {
+        // `play_url` ne connaît que quatre champs : le message LOAD qu'il
+        // produit doit rester celui d'avant #2248, à l'octet près.
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            title: Some("T"),
+            artist: Some("A"),
+            ..Default::default()
+        });
+        assert_eq!(media.stream_type, StreamType::Buffered);
+        assert_eq!(media.duration, None);
+        let m = music_metadata(&media);
+        assert_eq!(m.album_name, None);
+        assert_eq!(m.track_number, None);
+        assert!(m.images.is_empty());
     }
 }

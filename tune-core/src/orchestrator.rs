@@ -925,6 +925,31 @@ pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
     bit_depth.clamp(16, 24)
 }
 
+/// Resolution ANNONCEE d'une piste : frequence ou profondeur, telle que le
+/// client l'affiche.
+///
+/// `ligne` est la valeur de la ligne `tracks` (la source, ce que le scan a lu
+/// dans le fichier). `resolu` est celle du `ResolvedStream` — pour une piste
+/// locale c'est la resolution de SORTIE, et `resolve_local_track` la fabrique
+/// quand la ligne se tait (`unwrap_or(44100)` / `unwrap_or(16)`, puis
+/// `cap_output_bit_depth`). La substituer affiche un chiffre que personne n'a
+/// mesure.
+///
+/// Le streaming, lui, n'a pas de ligne en bibliotheque : `resolu` y EST la
+/// resolution de la source, et reste le repli legitime.
+pub(crate) fn resolution_annoncee(
+    ligne: Option<u32>,
+    resolu: Option<u32>,
+    source_locale: bool,
+) -> Option<u32> {
+    if source_locale {
+        // La ligne, ou rien. Jamais un chiffre fabrique par la sortie.
+        ligne
+    } else {
+        ligne.or(resolu)
+    }
+}
+
 /// Faut-il emballer ce DSD en DoP (trames PCM 24 bits au seizième du débit) ?
 ///
 /// - **Sortie locale** : « natif » et « dop » y mènent tous deux, une carte son
@@ -1681,16 +1706,32 @@ impl PlaybackOrchestrator {
             // the "now playing" label must show the file's real depth (16/24) —
             // matching the gapless path (advance_queue_metadata), which avoids the
             // "first tracks show 32-bit then correct to 16" glitch. Streaming has
-            // no local row (track_meta = None) so it falls back to the resolved
-            // stream format. DSD display is handled separately in zones.rs.
-            sample_rate: track_meta
-                .as_ref()
-                .and_then(|t| t.sample_rate.map(|v| v as u32))
-                .or(resolved.sample_rate),
-            bit_depth: track_meta
-                .as_ref()
-                .and_then(|t| t.bit_depth.map(|v| v as u32))
-                .or(resolved.bit_depth),
+            // no local row so it falls back to the resolved stream format. DSD
+            // display is handled separately in zones.rs.
+            //
+            // Le repli tenait sur `track_meta = None`, et c'etait trop large :
+            // une piste LOCALE dont la ligne ignore la frequence ou la
+            // profondeur y retombait aussi, et heritait alors du chiffre que
+            // `resolve_local_track` venait de fabriquer (`unwrap_or(44100)` /
+            // `unwrap_or(16)`). La meme ligne atteinte par avance gapless,
+            // elle, n'annoncait rien (`NowPlaying::from_track`). La lecture
+            // aleatoire rendait l'ecart visible : elle demarre sans cesse une
+            // PREMIERE piste tiree au hasard (#2250, fil 1036). Le predicat
+            // porte desormais sur la SOURCE, pas sur la presence d'une ligne.
+            sample_rate: resolution_annoncee(
+                track_meta
+                    .as_ref()
+                    .and_then(|t| t.sample_rate.map(|v| v as u32)),
+                resolved.sample_rate,
+                resolved.source == "local",
+            ),
+            bit_depth: resolution_annoncee(
+                track_meta
+                    .as_ref()
+                    .and_then(|t| t.bit_depth.map(|v| v as u32)),
+                resolved.bit_depth,
+                resolved.source == "local",
+            ),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
             year: track_meta.as_ref().and_then(|t| t.year),
             // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
@@ -2007,11 +2048,14 @@ impl PlaybackOrchestrator {
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
             // in async context so record_listen itself stays sync.
-            let session_profile_id = self
-                .playback
-                .get_state(req.zone_id)
-                .await
-                .session_profile_id;
+            // Meme lecture, meme raison que le profil : l'etat de zone porte
+            // aussi CE QUE l'auditeur a demande (piste, album, playlist,
+            // artiste, label), pose par le gestionnaire de `play` a partir du
+            // corps de la requete. Une avance automatique herite du contexte
+            // sans y toucher.
+            let etat = self.playback.get_state(req.zone_id).await;
+            let session_profile_id = etat.session_profile_id;
+            let context = (etat.session_context_type, etat.session_context_id);
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -2029,6 +2073,8 @@ impl PlaybackOrchestrator {
                 req.zone_id,
                 cover_path.as_deref(),
                 session_profile_id,
+                context.0.as_deref(),
+                context.1.as_deref(),
             );
         }
 
@@ -7383,6 +7429,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
+        context_type: Option<&str>,
+        context_id: Option<&str>,
     ) {
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
@@ -7404,6 +7452,13 @@ impl PlaybackOrchestrator {
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
             profile_id: session_profile_id,
+            // Ce que l'auditeur a demande. Ecrit tel qu'il l'a dit : rien
+            // n'est deduit ici de ce qui a fini par jouer. Le ticket #2441
+            // etablit que cette information n'etait ecrite NULLE PART — la
+            // section « Continuer l'ecoute » ne pouvait donc que repartir de
+            // la table `albums`.
+            context_type: context_type.map(Into::into),
+            context_id: context_id.map(Into::into),
         })
         .ok();
 
@@ -9573,6 +9628,116 @@ mod dsd_passthrough_tests {
 }
 
 #[cfg(test)]
+mod resolution_annoncee_tests {
+    use super::resolution_annoncee;
+    use crate::db::models::Track;
+    use crate::playback::NowPlaying;
+
+    /// Une piste de la bibliotheque dont la ligne ne porte NI frequence NI
+    /// profondeur ne doit rien annoncer.
+    ///
+    /// Le repli `.or(resolved)` de `play_inner` y substituait la resolution de
+    /// SORTIE — et pour une piste locale cette valeur est FABRIQUEE :
+    /// `resolve_local_track` fait `track.sample_rate.unwrap_or(44100)` et
+    /// `track.bit_depth.unwrap_or(16)` precisement quand la ligne se tait, puis
+    /// `cap_output_bit_depth` la ramene dans 16..24. Le client affichait donc
+    /// « 44,1 kHz / 16 bits » pour un fichier que personne n'a mesure.
+    ///
+    /// C'est la lecture aleatoire qui le rend visible : elle demarre sans
+    /// cesse une PREMIERE piste tiree au hasard, donc une ligne muette bien
+    /// plus souvent qu'un album qu'on a choisi (fil 1036, william — #2250).
+    #[test]
+    fn une_ligne_locale_muette_n_annonce_rien_plutot_qu_une_valeur_inventee() {
+        assert_eq!(
+            resolution_annoncee(None, Some(44100), true),
+            None,
+            "frequence : une piste locale sans frequence en base doit rester muette, \
+             pas heriter du 44100 fabrique par resolve_local_track"
+        );
+        assert_eq!(
+            resolution_annoncee(None, Some(16), true),
+            None,
+            "profondeur : une piste locale sans profondeur en base doit rester muette, \
+             pas heriter du 16 fabrique par resolve_local_track"
+        );
+    }
+
+    /// Quand la ligne SAIT, c'est elle qui parle — y compris (surtout) lorsque
+    /// la sortie transcode. C'est la regle deja en place, que ce correctif ne
+    /// doit pas defaire.
+    #[test]
+    fn une_ligne_locale_qui_sait_repond_par_sa_propre_valeur() {
+        assert_eq!(
+            resolution_annoncee(Some(96000), Some(44100), true),
+            Some(96000)
+        );
+        assert_eq!(resolution_annoncee(Some(24), Some(16), true), Some(24));
+    }
+
+    /// Le streaming n'a AUCUNE ligne en bibliotheque : la resolution resolue y
+    /// est celle de la source, pas d'une sortie. Le repli doit survivre —
+    /// sinon Qobuz et Tidal perdent leur affichage.
+    #[test]
+    fn le_streaming_garde_le_repli_sur_le_format_du_flux() {
+        assert_eq!(resolution_annoncee(None, Some(96000), false), Some(96000));
+        assert_eq!(resolution_annoncee(None, Some(24), false), Some(24));
+    }
+
+    /// La MEME ligne doit s'annoncer pareil qu'on l'atteigne en premiere piste
+    /// (`play_inner`) ou par avance gapless (`advance_queue_metadata`, qui
+    /// passe par `NowPlaying::from_track`).
+    ///
+    /// C'est l'asymetrie que decrivait william : la piste 1 d'une file
+    /// aleatoire affichait un chiffre, la piste 2 de la meme file n'affichait
+    /// rien — pour des lignes de base identiquement muettes.
+    #[test]
+    fn les_deux_surfaces_annoncent_la_meme_chose_pour_une_ligne_muette() {
+        let mut ligne = Track::new("16 bits, profondeur absente de la base".into());
+        ligne.id = Some(1);
+        ligne.sample_rate = None;
+        ligne.bit_depth = None;
+
+        let par_avance_gapless = NowPlaying::from_track(&ligne);
+
+        // Ce que `play_inner` annonce pour cette meme ligne, la sortie ayant
+        // fabrique 44100/16.
+        let par_premiere_piste_sr =
+            resolution_annoncee(ligne.sample_rate.map(|v| v as u32), Some(44100), true);
+        let par_premiere_piste_bd =
+            resolution_annoncee(ligne.bit_depth.map(|v| v as u32), Some(16), true);
+
+        assert_eq!(
+            par_premiere_piste_sr, par_avance_gapless.sample_rate,
+            "premiere piste et avance gapless doivent annoncer la MEME frequence"
+        );
+        assert_eq!(
+            par_premiere_piste_bd, par_avance_gapless.bit_depth,
+            "premiere piste et avance gapless doivent annoncer la MEME profondeur"
+        );
+    }
+
+    /// Garde-fou de site d'appel : `play_inner` doit passer par la regle, et
+    /// non refaire un `.or(resolved.…)` en direct. Sans cela, la regle
+    /// ci-dessus serait vraie en isolation et fausse en production.
+    #[test]
+    fn play_inner_passe_bien_par_la_regle() {
+        let src = include_str!("orchestrator.rs");
+        let np = src
+            .find("            sample_rate: resolution_annoncee(")
+            .zip(src.find("            bit_depth: resolution_annoncee("));
+        assert!(
+            np.is_some(),
+            "le NowPlaying de play_inner doit construire sample_rate ET bit_depth \
+             via resolution_annoncee(), sinon la regle ne protege rien"
+        );
+        assert!(
+            !src.contains(".and_then(|t| t.bit_depth.map(|v| v as u32))\n                .or(resolved.bit_depth)"),
+            "le repli direct .or(resolved.bit_depth) doit avoir disparu de play_inner"
+        );
+    }
+}
+
+#[cfg(test)]
 mod wav_override_tests {
     use super::wav_override_applies;
 
@@ -11606,6 +11771,8 @@ mod tests {
             zone_id,
             None,
             Some(7),
+            Some("playlist"),
+            Some("12"),
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -11624,6 +11791,12 @@ mod tests {
             .flatten()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
         assert_eq!(stored_profile, Some(7));
+        // #2441 — l'intention passee par l'appelant est ecrite telle quelle.
+        // Sans elle, cette ligne est indiscernable de la meme piste jouee
+        // seule, et aucune rubrique ne peut « refleter la realite de ce qu'a
+        // voulu faire l'auditeur ».
+        assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
+        assert_eq!(history[0].context_id.as_deref(), Some("12"));
         assert_eq!(history[0].source, "local");
     }
 
