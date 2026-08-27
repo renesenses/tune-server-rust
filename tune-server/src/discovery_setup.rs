@@ -36,6 +36,28 @@ fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     }
 }
 
+/// Register a discovered output and notify controllers as one operation. Zone
+/// creation is deliberately independent: hidden devices and devices for which
+/// automatic zone creation is disabled must still appear in Settings > Network.
+fn register_discovered_output(
+    registry: &mut OutputRegistry,
+    output: Box<dyn tune_core::outputs::OutputTarget>,
+    event_bus: &EventBus,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    device_type: &str,
+) {
+    registry.register(output);
+    event_bus.emit_typed(
+        EventType::DeviceDiscovered,
+        serde_json::json!({
+            "device_id": &dev.id,
+            "name": &dev.name,
+            "device_type": device_type,
+            "host": &dev.host,
+        }),
+    );
+}
+
 /// Set a zone's online state and, if it actually changed, broadcast a
 /// `zone.updated` event so controllers see availability flip in real time.
 /// (`set_online_by_device` alone is silent — clients never learned of it.)
@@ -430,7 +452,7 @@ async fn handle_ssdp_discovered(
             evt_urls,
         );
         let mut reg = outputs.lock().await;
-        reg.register(Box::new(oh));
+        register_discovered_output(&mut reg, Box::new(oh), event_bus, dev, "openhome");
         registered = true;
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
@@ -475,7 +497,7 @@ async fn handle_ssdp_discovered(
             )
             .with_play_delay(delay);
             let mut reg = outputs.lock().await;
-            reg.register(Box::new(dlna));
+            register_discovered_output(&mut reg, Box::new(dlna), event_bus, dev, "dlna");
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
@@ -965,7 +987,13 @@ pub fn spawn_mdns_handler(
 
                     if let Some(output) = output {
                         let mut reg = outputs.lock().await;
-                        reg.register(output);
+                        register_discovered_output(
+                            &mut reg,
+                            output,
+                            &event_bus,
+                            &dev,
+                            output_type_str,
+                        );
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
                         let zone_repo =
@@ -1766,10 +1794,12 @@ fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)>
 #[cfg(test)]
 mod tests {
     use super::{
-        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, resolve_control_url,
-        statut_du_fournisseur,
+        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, register_discovered_output,
+        resolve_control_url, statut_du_fournisseur,
     };
     use tune_core::db::zone_repo::Zone;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+    use tune_core::event_bus::EventBus;
 
     fn zone(name: &str, output_type: &str, device_id: &str) -> Zone {
         Zone {
@@ -1791,6 +1821,45 @@ mod tests {
             fixed_volume: false,
             autoplay_enabled: false,
         }
+    }
+
+    /// #2273: the web client reloads Settings > Network only for `device.*`.
+    /// Automatic discovery must therefore publish the same canonical contract
+    /// as manual registration, independently of any later zone decision.
+    #[tokio::test]
+    async fn automatic_discovery_emits_canonical_device_event() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let dev = DiscoveredDevice::new(
+            "cast-living-room".into(),
+            "Salon".into(),
+            OutputType::Chromecast,
+            "192.0.2.42".into(),
+            8009,
+        );
+
+        let output = tune_core::outputs::chromecast::ChromecastOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            dev.port,
+        );
+        let mut registry = tune_core::outputs::OutputRegistry::new();
+
+        register_discovered_output(&mut registry, Box::new(output), &bus, &dev, "chromecast");
+
+        let event = events.recv().await.expect("device event");
+        assert!(registry.contains("cast-living-room"));
+        assert_eq!(event.event_type, "device.discovered");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "cast-living-room",
+                "name": "Salon",
+                "device_type": "chromecast",
+                "host": "192.0.2.42",
+            })
+        );
     }
 
     /// Forum #1183: a Samsung S95BA TV is already a DLNA zone — renamed by the
