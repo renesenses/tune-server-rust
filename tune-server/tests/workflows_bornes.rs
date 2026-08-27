@@ -304,6 +304,41 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(impact.contains("python3 scripts/preflight-check.py --self-test"));
 }
 
+#[test]
+fn les_alias_linux_stables_sont_crees_avant_les_sommes() {
+    let release = workflow("release.yml");
+    let aliases = release
+        .find("bash scripts/creer-alias-actifs-release.sh artifacts")
+        .expect("release.yml ne cree plus les alias Linux stables");
+    let sommes = release
+        .find("- name: Checksums")
+        .expect("l'etape SHA256SUMS a disparu de release.yml");
+
+    assert!(
+        aliases < sommes,
+        "les alias sont crees apres SHA256SUMS et ne sont donc pas signes"
+    );
+    assert!(release.contains("artifacts/**/*.tar.gz"));
+}
+
+#[test]
+fn le_script_des_alias_release_passe_ses_contre_epreuves() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = racine.join("../scripts/creer-alias-actifs-release.sh");
+    let sortie = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("--autotest")
+        .output()
+        .expect("impossible d'executer l'autotest des alias de release");
+
+    assert!(
+        sortie.status.success(),
+        "autotest des alias en echec:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sortie.stdout),
+        String::from_utf8_lossy(&sortie.stderr)
+    );
+}
+
 /// `setup-rust-toolchain` active son propre `Swatinem/rust-cache` par defaut.
 /// En poser un second juste apres restaure deux fois `target/` ; le second peut
 /// meme remplacer un cache exact par un ancien match partiel. Le run
