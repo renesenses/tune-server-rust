@@ -117,6 +117,8 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source_url TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_license TEXT",
