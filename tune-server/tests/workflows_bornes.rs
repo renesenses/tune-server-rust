@@ -225,8 +225,9 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
 
     for nom in ["test", "clippy"] {
         assert!(
-            corps(nom).contains("-p tune-core -p tune-stream-http -p tune-server"),
-            "job {nom} : les tests du transport HTTP extrait ne sont plus executes explicitement"
+            corps(nom)
+                .contains("-p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server"),
+            "job {nom} : les crates HTTP extraites ne sont plus testees explicitement"
         );
     }
     for nom in [

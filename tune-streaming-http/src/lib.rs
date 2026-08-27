@@ -8,10 +8,42 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::event_bus::EventBus;
+use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
-use crate::state::AppState;
+pub mod deezer_proxy_handler;
+
+/// Sous-ensemble de l'état serveur nécessaire aux routes des services de
+/// streaming. Cette frontière empêche ces routes de dépendre de tout le
+/// monolithe `tune-server` et rend leur compilation indépendante.
+#[derive(Clone)]
+pub struct StreamingHttpState {
+    backend: Arc<dyn DbBackend>,
+    services: Arc<Mutex<ServiceRegistry>>,
+    event_bus: Arc<EventBus>,
+}
+
+impl StreamingHttpState {
+    pub fn new(
+        backend: Arc<dyn DbBackend>,
+        services: Arc<Mutex<ServiceRegistry>>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
+        Self {
+            backend,
+            services,
+            event_bus,
+        }
+    }
+
+    async fn save_tokens(&self) {
+        let registry = self.services.lock().await;
+        registry.save_all_tokens(&self.backend).await;
+    }
+}
 
 #[derive(Deserialize)]
 struct LimitQuery {
@@ -21,7 +53,7 @@ struct LimitQuery {
 /// Look up a service by name. Locks the registry only long enough to clone
 /// the Arc, so callers never hold the registry lock across await points.
 async fn get_svc(
-    state: &AppState,
+    state: &StreamingHttpState,
     name: &str,
 ) -> Result<Arc<RwLock<Box<dyn StreamingService>>>, (StatusCode, String)> {
     let registry = state.services.lock().await;
@@ -162,7 +194,11 @@ struct SearchQuery {
     limit: Option<usize>,
 }
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    StreamingHttpState: axum::extract::FromRef<S>,
+{
     Router::new()
         .route("/services", get(list_services))
         .route("/status", get(list_services))
@@ -263,7 +299,7 @@ pub fn router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 async fn service_search(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> Response {
@@ -271,19 +307,22 @@ async fn service_search(
     with_svc!(&state, &service, |svc| svc.search(&q.q, limit).await)
 }
 
-async fn service_albums(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_albums(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     with_svc!(&state, &service, |svc| svc.get_user_albums().await)
 }
 
 async fn service_album(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
 }
 
 async fn service_album_tracks(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
@@ -292,7 +331,7 @@ async fn service_album_tracks(
 }
 
 async fn service_artist(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
     let arc = match get_svc(&state, &service).await {
@@ -341,7 +380,7 @@ struct PageQuery {
 }
 
 async fn service_artist_albums(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
     Query(q): Query<PageQuery>,
 ) -> Response {
@@ -351,7 +390,7 @@ async fn service_artist_albums(
 }
 
 async fn service_artist_top_tracks(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
@@ -359,19 +398,22 @@ async fn service_artist_top_tracks(
         .await)
 }
 
-async fn service_playlists(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_playlists(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     with_svc!(&state, &service, |svc| svc.get_user_playlists().await)
 }
 
 async fn service_playlist(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_playlist(&playlist_id).await)
 }
 
 async fn service_playlist_tracks(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
@@ -386,7 +428,7 @@ struct CreatePlaylistBody {
 }
 
 async fn service_create_playlist(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Json(body): Json<CreatePlaylistBody>,
 ) -> Response {
@@ -402,7 +444,7 @@ struct AddTracksBody {
 }
 
 async fn service_add_tracks(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
     Json(body): Json<AddTracksBody>,
 ) -> Response {
@@ -413,7 +455,7 @@ async fn service_add_tracks(
 }
 
 async fn service_delete_playlist(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
@@ -423,7 +465,7 @@ async fn service_delete_playlist(
 }
 
 async fn service_remove_tracks(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
     Json(body): Json<AddTracksBody>,
 ) -> Response {
@@ -434,18 +476,21 @@ async fn service_remove_tracks(
 }
 
 async fn service_track(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_track(&track_id).await)
 }
 
-async fn service_featured(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_featured(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
 }
 
 async fn service_new_releases(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_new_releases().await)
@@ -457,7 +502,7 @@ struct GenreQuery {
 }
 
 async fn service_genres(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<GenreQuery>,
 ) -> Response {
@@ -466,7 +511,7 @@ async fn service_genres(
 }
 
 async fn service_genre_albums(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, genre_id)): Path<(String, String)>,
     Query(q): Query<LimitQuery>,
 ) -> Response {
@@ -477,14 +522,14 @@ async fn service_genre_albums(
 }
 
 async fn service_featured_sections(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_featured_sections().await)
 }
 
 async fn service_featured_section(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, section)): Path<(String, String)>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc
@@ -493,14 +538,14 @@ async fn service_featured_section(
 }
 
 async fn service_album_label(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_album_label(&album_id).await)
 }
 
 async fn service_playlist_tags(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_playlist_tags().await)
@@ -513,7 +558,7 @@ struct FeaturedPlaylistsQuery {
 }
 
 async fn service_featured_playlists(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<FeaturedPlaylistsQuery>,
 ) -> Response {
@@ -531,7 +576,7 @@ struct ByTagQuery {
 /// présente. Un seul appel : le client n'a pas à lire les tags puis à lancer
 /// une requête par tag.
 async fn service_featured_playlists_by_tag(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<ByTagQuery>,
 ) -> Response {
@@ -541,7 +586,7 @@ async fn service_featured_playlists_by_tag(
 }
 
 async fn service_album_context(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
@@ -555,7 +600,7 @@ async fn service_album_context(
 // ---------------------------------------------------------------------------
 
 async fn service_add_favorite(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
     with_svc_mut!(&state, &service, |svc| svc
@@ -564,7 +609,7 @@ async fn service_add_favorite(
 }
 
 async fn service_remove_favorite(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
     with_svc_mut!(&state, &service, |svc| svc
@@ -590,7 +635,7 @@ fn services_snapshot_cache() -> &'static Mutex<serde_json::Map<String, Value>> {
     CACHE.get_or_init(|| Mutex::new(serde_json::Map::new()))
 }
 
-async fn list_services(State(state): State<AppState>) -> Json<Value> {
+async fn list_services(State(state): State<StreamingHttpState>) -> Json<Value> {
     // Timeout to avoid blocking the Settings page if a streaming service auth check hangs
     let fresh = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let registry = state.services.lock().await;
@@ -625,7 +670,10 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
-async fn service_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_status(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -652,7 +700,7 @@ async fn service_status(State(state): State<AppState>, Path(service): Path<Strin
 }
 
 async fn service_auth(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     raw_body: axum::body::Bytes,
 ) -> Response {
@@ -713,7 +761,10 @@ async fn service_auth(
     }
 }
 
-async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn auth_poll_status(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -745,7 +796,10 @@ async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<Str
     }
 }
 
-async fn service_logout(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_logout(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -758,7 +812,7 @@ async fn service_logout(State(state): State<AppState>, Path(service): Path<Strin
 }
 
 async fn service_track_url(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> Response {
     let svc = match get_svc(&state, &service).await {
@@ -797,7 +851,7 @@ async fn service_track_url(
 }
 
 async fn service_favorites(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Path((service, fav_type)): Path<(String, String)>,
 ) -> Response {
     let svc = match get_svc(&state, &service).await {
@@ -878,7 +932,10 @@ async fn service_favorites(
     }
 }
 
-async fn service_enable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_enable(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.write().await;
         svc.set_enabled(true);
@@ -891,7 +948,10 @@ async fn service_enable(State(state): State<AppState>, Path(service): Path<Strin
     Json(json!({"service": service, "enabled": true})).into_response()
 }
 
-async fn service_disable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_disable(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.write().await;
         svc.set_enabled(false);
@@ -904,7 +964,10 @@ async fn service_disable(State(state): State<AppState>, Path(service): Path<Stri
     Json(json!({"service": service, "enabled": false})).into_response()
 }
 
-async fn service_auth_url(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+async fn service_auth_url(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -948,7 +1011,7 @@ struct SpotifyCallbackQuery {
 }
 
 async fn spotify_callback(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Query(q): Query<SpotifyCallbackQuery>,
 ) -> Response {
     if let Some(ref error) = q.error {
@@ -988,7 +1051,7 @@ struct TidalCallbackQuery {
 }
 
 async fn tidal_callback(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Query(q): Query<TidalCallbackQuery>,
 ) -> Response {
     if let Some(ref error) = q.error {
@@ -1074,7 +1137,7 @@ struct CompareQuery {
 }
 
 async fn compare_services(
-    State(state): State<AppState>,
+    State(state): State<StreamingHttpState>,
     Query(q): Query<CompareQuery>,
 ) -> Response {
     let service_names: Vec<&str> = q.services.split(',').map(|s| s.trim()).collect();

@@ -47,6 +47,7 @@ bandcamp = ["dep:tune-bandcamp"]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-stream-http = { path = "../tune-stream-http" }
+tune-streaming-http = { path = "../tune-streaming-http" }
 tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
