@@ -6688,6 +6688,21 @@ fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
             let r = fr + K * c + K * sr + K * br;
             out.push(l.clamp(-1.0, 1.0));
             out.push(r.clamp(-1.0, 1.0));
+        } else if to == 1 && from == 2 {
+            // Stereo vers mono : SOMMER les deux voies, pas garder la gauche.
+            //
+            // Ce bras manquait, et le repli generique plus bas ne recopiait que
+            // `frame[0]` : le canal droit etait purement jete (#2362). Pour qui
+            // ecoute sur une seule enceinte, ce « mono »-la ne change rien — il
+            // reste prive de tout ce qui est panne a droite, c'est-a-dire
+            // exactement ce qu'il voulait recuperer.
+            //
+            // 0,5 par voie et non 0,707 : sur un contenu correle — deux voies
+            // quasi identiques, le cas courant — 0,707 donnerait +3 dB et
+            // ecreterait. Meme coefficient que `build_downmix_matrix(2, 1)`,
+            // qui traite deja ce cas cote `adapt_channels_i32` : les deux
+            // chemins doivent rendre le meme signal.
+            out.push(0.5 * frame[0] + 0.5 * frame[1]);
         } else {
             for ch in 0..to {
                 out.push(frame[ch]);
@@ -8295,11 +8310,56 @@ mod tests {
         assert_eq!(stereo, [0.5, 0.5, 0.7, 0.7]);
     }
 
+    /// Stereo vers mono : les deux voies sont SOMMEES (#2362).
+    ///
+    /// Ce test affirmait exactement le defaut : il exigeait `[0.5, 0.3]`,
+    /// c'est-a-dire la voie gauche seule, la droite jetee. Un test VERT
+    /// verrouillait donc le bogue — c'est pour cela que personne ne l'a vu.
     #[test]
     fn test_adapt_channels_stereo_to_mono() {
         let stereo = [0.5f32, 0.7, 0.3, 0.9];
         let mono = adapt_channels(&stereo, 2, 1);
-        assert_eq!(mono, [0.5, 0.3]);
+        assert_eq!(mono, [0.6, 0.6]);
+    }
+
+    /// Le cas du testeur : une seule enceinte, cablee sur la voie GAUCHE.
+    ///
+    /// Ce qui n'existe QU'A DROITE doit lui parvenir. Avec l'ancien repli
+    /// cette sortie valait zero — silence complet sur un passage panne a
+    /// droite, sans aucun moyen de comprendre pourquoi.
+    #[test]
+    fn mono_ne_perd_pas_ce_qui_est_panne_a_droite() {
+        let seulement_a_droite = [0.0f32, 0.8];
+        let mono = adapt_channels(&seulement_a_droite, 2, 1);
+        assert_eq!(mono, [0.4], "la voie droite a ete jetee");
+    }
+
+    /// Deux voies identiques a pleine echelle ne doivent pas ecreter.
+    /// C'est la raison du coefficient 0,5 plutot que 0,707.
+    #[test]
+    fn mono_n_ecrete_pas_un_contenu_correle() {
+        let plein = [1.0f32, 1.0, -1.0, -1.0];
+        let mono = adapt_channels(&plein, 2, 1);
+        assert_eq!(mono, [1.0, -1.0]);
+    }
+
+    /// Les DEUX chemins mono doivent rendre le meme signal.
+    ///
+    /// `adapt_channels` (sortie locale, f32) et `build_downmix_matrix` (chemin
+    /// `adapt_channels_i32`, entier) ont ete corriges separement. Rien ne
+    /// garantissait qu'ils s'accordent — et deux chemins qui divergent d'un
+    /// facteur deux sur le niveau, personne ne le voit avant un signalement.
+    #[test]
+    fn les_deux_chemins_mono_s_accordent() {
+        let m = crate::audio::channels::build_downmix_matrix(2, 1)
+            .expect("le couple (2,1) doit avoir une matrice");
+        let stereo = [0.3f32, 0.9];
+        let par_matrice = m[0] * stereo[0] + m[1] * stereo[1];
+        let par_adapt = adapt_channels(&stereo, 2, 1)[0];
+        assert!(
+            (par_matrice - par_adapt).abs() < 1e-6,
+            "matrice={par_matrice} adapt={par_adapt}"
+        );
     }
 
     #[test]
