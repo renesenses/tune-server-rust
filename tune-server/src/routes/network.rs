@@ -175,6 +175,12 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 "host": ms.host,
                 "port": ms.port,
                 "location": ms.location,
+                // Le marquage demandé par Bertrand dans le fil forum 1425 :
+                // l'interface grise un serveur qui ne répond plus au lieu de
+                // le faire clignoter en le retirant puis le remettant. Champs
+                // AJOUTÉS — aucun client existant ne casse (#2139).
+                "reachable": ms.is_reachable(),
+                "last_seen_secs": ms.age().as_secs(),
             })
         })
         .collect();
