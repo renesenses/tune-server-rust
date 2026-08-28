@@ -381,9 +381,11 @@ async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = TelemetryReporter::is_enabled();
     let server_id = settings.get("server_id").ok().flatten();
+    let rate_limits = tune_core::cloud::rate_limit::active_all(&settings);
     Json(json!({
         "enabled": enabled,
         "server_id": server_id,
+        "rate_limits": rate_limits,
     }))
 }
 

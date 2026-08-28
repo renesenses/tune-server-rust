@@ -966,6 +966,25 @@ fn spawn_heartbeat(state: &AppState) {
                 continue;
             }
 
+            if let Some(backoff) = tune_core::cloud::rate_limit::active(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+            ) {
+                debug!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "heartbeat_deferred_rate_limit"
+                );
+                // Le heartbeat cloud est differe, pas le rafraichissement SSO :
+                // les deux routes ont des compteurs distincts.
+                if plan.refresh_account {
+                    refresh_account_premium(&backend, &license, &services).await;
+                }
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                continue;
+            }
+
             let tracks = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
                 .count()
                 .unwrap_or(0);
@@ -1267,6 +1286,13 @@ fn spawn_heartbeat(state: &AppState) {
                     }
                 }
                 Ok(resp) => {
+                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        tune_core::cloud::rate_limit::defer_from_headers(
+                            &settings,
+                            tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+                            resp.headers(),
+                        );
+                    }
                     debug!(status = %resp.status(), "heartbeat_rejected");
                 }
                 Err(e) => {

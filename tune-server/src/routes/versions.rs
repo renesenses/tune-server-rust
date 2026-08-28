@@ -22,13 +22,13 @@ use crate::state::AppState;
 
 /// Classement d'un resultat de recherche par rapport au morceau de reference.
 ///
-/// Le rapprochement reste EXACT sur le titre (insensible a la casse) — la
-/// doctrine de la section : mieux vaut rien qu'un rapprochement faux. La
-/// REPRISE est assumee : meme titre, autre artiste. Pour un titre banal
-/// (« Angel ») cela produira des homonymes — c'est le prix explicite de la
-/// demande (« des reprises de Billie Jean, il y en a plein », Bertrand,
-/// 25/08), et l'ecran les range sous un libelle « Reprises » qui assume
-/// l'incertitude.
+/// Le rapprochement reste strict sur le coeur du titre (insensible a la
+/// casse) : identite exacte, ou suffixe d'edition delimite par ` (` / ` [`.
+/// Il ne fait aucun rapprochement flou. La REPRISE est assumee : meme coeur
+/// de titre, autre artiste. Pour un titre banal (« Angel ») cela produira des
+/// homonymes — c'est le prix explicite de la demande (« des reprises de
+/// Billie Jean, il y en a plein », Bertrand, 25/08), et l'ecran les range
+/// sous un libelle « Reprises » qui assume l'incertitude.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ClasseVersion {
     /// Le meme enregistrement (meme artiste, meme album) : rien a proposer.
@@ -50,7 +50,7 @@ pub(crate) fn classer_version(
     album_trouve: &str,
 ) -> ClasseVersion {
     let meme = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
-    if !meme(titre_ecoute, titre_trouve) {
+    if !titres_equivalents(titre_ecoute, titre_trouve) {
         return ClasseVersion::SansRapport;
     }
     if meme(artiste_ecoute, artiste_trouve) {
@@ -64,21 +64,62 @@ pub(crate) fn classer_version(
     }
 }
 
+/// Deux titres designent le meme morceau quand ils sont identiques, ou quand
+/// l'un ajoute au titre nu un suffixe d'edition entre parentheses/crochets.
+///
+/// Ce n'est volontairement PAS un matcher flou : `Heroes` ne rejoint ni
+/// `Hero` ni `Heroes - Live`. La frontiere explicite evite aussi qu'un simple
+/// prefixe lexical suffise. Les variantes de FabienM, en revanche, convergent :
+/// `Running Up That Hill`, `Running Up That Hill (A Deal With God)` et
+/// `Running Up That Hill (12' Mix) [Bonus Track]`.
+pub(crate) fn titres_equivalents(a: &str, b: &str) -> bool {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    a == b || titre_est_base_de(&a, &b) || titre_est_base_de(&b, &a)
+}
+
+fn titre_est_base_de(base: &str, variante: &str) -> bool {
+    variante
+        .strip_prefix(base)
+        .is_some_and(|suffixe| suffixe.starts_with(" (") || suffixe.starts_with(" ["))
+}
+
+/// Traduction SQL portable de [`titres_equivalents`]. `SUBSTR`, `LENGTH`,
+/// `TRIM` et `LOWER` ont le meme contrat dans SQLite et PostgreSQL. Aucun
+/// `LIKE` : les `%` et `_` legitimes d'un titre ne deviennent jamais des
+/// jokers SQL.
+pub(crate) fn predicat_titres_equivalents(a: &str, b: &str) -> String {
+    let a = format!("TRIM({a})");
+    let b = format!("TRIM({b})");
+    let a_est_base = format!(
+        "(LENGTH({a}) < LENGTH({b}) \
+         AND LOWER(SUBSTR({b}, 1, LENGTH({a}))) = LOWER({a}) \
+         AND SUBSTR({b}, LENGTH({a}) + 1, 2) IN (' (', ' ['))"
+    );
+    let b_est_base = format!(
+        "(LENGTH({b}) < LENGTH({a}) \
+         AND LOWER(SUBSTR({a}, 1, LENGTH({b}))) = LOWER({b}) \
+         AND SUBSTR({a}, LENGTH({b}) + 1, 2) IN (' (', ' ['))"
+    );
+    format!("(LOWER({a}) = LOWER({b}) OR {a_est_base} OR {b_est_base})")
+}
+
 /// Le predicat SQL du rapprochement LOCAL, ecrit UNE fois.
 ///
 /// Les trois arguments sont des EXPRESSIONS SQL, pas des valeurs : la route
 /// d'accueil y passe les colonnes de sa sous-requete d'historique
 /// (`lh.title`, …), la route par piste y passe des marqueurs de parametre.
-/// Les alias `t` (tracks), `al` (albums) et `ar` (artists) sont donc imposes
-/// aux deux appelants — c'est le prix a payer pour que la regle ne soit pas
-/// recopiee.
+/// Les alias `t` (tracks), `al` (albums), `ar` (artiste d'album) et `ar2`
+/// (artiste de piste) sont donc imposes aux deux appelants — c'est le prix a
+/// payer pour que la regle ne soit pas recopiee.
 ///
 /// La regle, elle, est celle de `classer_version` traduite en SQL : meme
 /// titre, meme artiste, album DIFFERENT.
 pub(crate) fn predicat_rapprochement(titre: &str, artiste: &str, album: &str) -> String {
+    let titres = predicat_titres_equivalents("t.title", titre);
     format!(
-        "LOWER(t.title) = LOWER({titre}) \
-         AND LOWER(COALESCE(ar.name, '')) = LOWER({artiste}) \
+        "{titres} \
+         AND LOWER(COALESCE(ar2.name, ar.name, '')) = LOWER({artiste}) \
          AND LOWER(COALESCE(al.title, '')) <> LOWER(COALESCE({album}, ''))"
     )
 }
@@ -122,10 +163,21 @@ pub(crate) fn versions_locales(
          FROM tracks t \
          JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+         CROSS JOIN (SELECT CAST({} AS TEXT) AS title, \
+                            CAST({} AS TEXT) AS artist, \
+                            CAST({} AS TEXT) AS album) ref_version \
          WHERE {} AND t.id <> {} \
          ORDER BY al.title \
          LIMIT {limite}",
-        predicat_rapprochement(&marqueur(e, 1), &marqueur(e, 2), &marqueur(e, 3)),
+        marqueur(e, 1),
+        marqueur(e, 2),
+        marqueur(e, 3),
+        predicat_rapprochement(
+            "ref_version.title",
+            "ref_version.artist",
+            "ref_version.album"
+        ),
         marqueur(e, 4),
     );
     // `-1` quand il n'y a rien a exclure : aucune piste ne porte cet id, et
@@ -270,7 +322,10 @@ pub(crate) async fn versions_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClasseVersion, classer_version, predicat_rapprochement};
+    use super::{
+        ClasseVersion, classer_version, predicat_rapprochement, predicat_titres_equivalents,
+        titres_equivalents,
+    };
 
     /// « Billie Jean » par Michael Jackson sur un AUTRE album : une version.
     #[test]
@@ -320,10 +375,10 @@ mod tests {
         );
     }
 
-    /// Le titre reste EXACT : « Billie Jean (Live) » est hors sujet — la
-    /// doctrine de la section, inchangée.
+    /// Un suffixe d'edition explicite reste le meme morceau et devient donc
+    /// une autre version quand l'artiste est identique.
     #[test]
-    fn titre_different_est_sans_rapport() {
+    fn suffixe_d_edition_est_une_version() {
         assert_eq!(
             classer_version(
                 "Billie Jean",
@@ -333,7 +388,40 @@ mod tests {
                 "Michael Jackson",
                 "This Is It"
             ),
-            ClasseVersion::SansRapport
+            ClasseVersion::AutreVersion
+        );
+    }
+
+    /// Contre-epreuve exacte de #2638 : les trois titres officiels convergent,
+    /// mais une simple ressemblance sans delimiteur reste hors sujet.
+    #[test]
+    fn variantes_running_up_that_hill_partagent_le_meme_coeur() {
+        let nu = "Running Up That Hill";
+        assert!(titres_equivalents(
+            nu,
+            "Running Up That Hill (A Deal With God)"
+        ));
+        assert!(titres_equivalents(
+            nu,
+            "Running Up That Hill (12' Mix) [Bonus Track]"
+        ));
+        assert!(titres_equivalents(
+            "Running Up That Hill (A Deal With God)",
+            nu
+        ));
+        assert!(!titres_equivalents(nu, "Running Up That Mountain"));
+        assert!(!titres_equivalents("Hero", "Heroes"));
+        assert!(!titres_equivalents("Heroes", "Heroes - Live"));
+    }
+
+    #[test]
+    fn le_predicat_titre_n_utilise_aucun_joker_like() {
+        let p = predicat_titres_equivalents("t.title", "$1");
+        assert!(p.contains("SUBSTR"), "frontiere de suffixe absente : {p}");
+        assert!(p.contains("IN (' (', ' [')"), "delimiteurs absents : {p}");
+        assert!(
+            !p.contains("LIKE"),
+            "un titre ne doit pas devenir un motif : {p}"
         );
     }
 
@@ -344,11 +432,11 @@ mod tests {
     fn le_predicat_porte_les_trois_conditions() {
         let p = predicat_rapprochement("lh.title", "lh.artist_name", "lh.album_title");
         assert!(
-            p.contains("LOWER(t.title) = LOWER(lh.title)"),
+            p.contains("LOWER(TRIM(t.title)) = LOWER(TRIM(lh.title))"),
             "titre : {p}"
         );
         assert!(
-            p.contains("LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name)"),
+            p.contains("LOWER(COALESCE(ar2.name, ar.name, '')) = LOWER(lh.artist_name)"),
             "artiste : {p}"
         );
         assert!(

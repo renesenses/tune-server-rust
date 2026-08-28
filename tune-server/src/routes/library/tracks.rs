@@ -1273,13 +1273,13 @@ pub(super) async fn rassembler_versions(
     limite: i64,
     avec_streaming: bool,
 ) -> Option<Value> {
-    // Le morceau de reference : son titre, l'artiste de son album (celui que
-    // le rapprochement local compare) et l'album lui-meme. `artists` est
-    // joint deux fois : l'artiste d'album d'abord, l'artiste de piste en
-    // repli — une piste peut porter un artiste sans que l'album en ait un.
+    // Le morceau de reference : son titre, son artiste de piste (celui affiche
+    // a l'auditeur) et l'album lui-meme. L'artiste d'album n'est qu'un repli :
+    // sur une compilation « Artistes divers », le premier ferait precisement
+    // perdre les versions de l'interprete reel (#2638).
     let e = state.backend.engine();
     let sql = format!(
-        "SELECT t.title, COALESCE(ar.name, ar2.name, ''), COALESCE(al.title, '') \
+        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, '') \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1460,6 +1460,94 @@ mod tests_versions_piste {
                 "l'album de départ ressort : {ver:?}"
             );
         }
+    }
+
+    /// Contre-epreuve de #2638, avec les libelles vus chez FabienM. La graine
+    /// vit sur une compilation attribuee a « Artistes divers », mais porte
+    /// bien Kate Bush comme artiste de piste. Les suffixes d'edition ne
+    /// doivent plus vider la liste locale, et la reprise d'un autre artiste
+    /// reste exclue du rapprochement local.
+    #[tokio::test]
+    async fn running_up_that_hill_retrouve_ses_trois_versions_locales() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO artists (name) VALUES ('Thomas Mery & The desert fox')",
+            &[],
+        )
+        .unwrap();
+        let thomas = b.last_insert_rowid();
+
+        let album = |titre: &str, artiste: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id) VALUES (?1, ?2)",
+                &[&titre as &dyn ToSqlValue, &artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let hit = album("Hit Collection", divers);
+        let before = album("Before The Dawn", kate);
+        let hounds = album("Hounds Of Love", kate);
+        let reprise = album("Label Effervescence Pain Perdu", thomas);
+
+        let piste = |titre: &str, album_id: i64, artiste: i64, chemin: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+                 VALUES (?1, ?2, ?3, 296000, ?4)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &chemin as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let seed = piste("Running Up that Hill", hit, kate, "/hit.flac");
+        piste(
+            "Running Up That Hill (A Deal With God)",
+            before,
+            kate,
+            "/before.flac",
+        );
+        piste(
+            "Running Up That Hill (A Deal With God)",
+            hounds,
+            kate,
+            "/hounds.flac",
+        );
+        piste(
+            "Running Up That Hill (12' Mix) [Bonus Track]",
+            hounds,
+            kate,
+            "/mix.flac",
+        );
+        piste("Running up that hill", reprise, thomas, "/reprise.flac");
+
+        let v = rassembler_versions(&state, seed, 50, false)
+            .await
+            .expect("la piste existe");
+        assert_eq!(v["artist_name"].as_str(), Some("Kate Bush"));
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(versions.len(), 3, "versions rendues : {versions:?}");
+        assert!(versions.iter().all(|x| {
+            x["album_title"].as_str() == Some("Before The Dawn")
+                || x["album_title"].as_str() == Some("Hounds Of Love")
+        }));
+        assert!(
+            versions
+                .iter()
+                .all(|x| { x["album_title"].as_str() != Some("Label Effervescence Pain Perdu") })
+        );
     }
 
     /// « Beat It » n'a aucune autre version : un groupe VIDE, pas une erreur.
