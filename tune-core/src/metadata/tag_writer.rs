@@ -25,6 +25,50 @@ pub struct TagUpdate {
     pub lyrics: Option<String>,
 }
 
+impl TagUpdate {
+    fn sanitized(&self) -> (Self, Vec<super::TextCorrection>) {
+        fn clean(
+            field: &str,
+            value: &mut Option<String>,
+            corrections: &mut Vec<super::TextCorrection>,
+        ) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (sanitized, mut found) = super::sanitize_untrusted_single_line_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+
+        let mut update = self.clone();
+        let mut corrections = Vec::new();
+        clean("title", &mut update.title, &mut corrections);
+        clean("artist_name", &mut update.artist_name, &mut corrections);
+        clean("album_title", &mut update.album_title, &mut corrections);
+        clean("genre", &mut update.genre, &mut corrections);
+        clean("composer", &mut update.composer, &mut corrections);
+        clean("isrc", &mut update.isrc, &mut corrections);
+        clean("label", &mut update.label, &mut corrections);
+        for (field, value) in [
+            ("comment", &mut update.comment),
+            ("lyrics", &mut update.lyrics),
+        ] {
+            let Some(raw) = value.as_deref() else {
+                continue;
+            };
+            let (sanitized, mut found) = super::sanitize_untrusted_text(raw, field);
+            if !found.is_empty() {
+                *value = (!sanitized.is_empty()).then_some(sanitized);
+                corrections.append(&mut found);
+            }
+        }
+        (update, corrections)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagFormat {
     Id3,
@@ -57,7 +101,14 @@ pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResu
         return Err("file not found".into());
     }
     let path = file_path.to_string();
-    let update = update.clone();
+    let (update, corrections) = update.sanitized();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = file_path,
+            corrections = ?corrections,
+            "tag_writer_unsafe_text_sanitized"
+        );
+    }
     tokio::task::spawn_blocking(move || write_tags_lofty(&path, &update))
         .await
         .map_err(|e| format!("join: {e}"))?
@@ -402,6 +453,21 @@ mod tests {
     #[test]
     fn detect_unknown() {
         assert_eq!(detect_format("/music/song.xyz"), TagFormat::Unknown);
+    }
+
+    #[test]
+    fn tag_writer_sanitizes_every_text_field_before_the_file_boundary() {
+        let dirty = TagUpdate {
+            title: Some("A\0B".into()),
+            artist_name: Some("Lisa\u{feff}Strings".into()),
+            lyrics: Some("line one\nline two".into()),
+            ..Default::default()
+        };
+        let (clean, corrections) = dirty.sanitized();
+        assert_eq!(clean.title.as_deref(), Some("A B"));
+        assert_eq!(clean.artist_name.as_deref(), Some("Lisa Strings"));
+        assert_eq!(clean.lyrics.as_deref(), Some("line one\nline two"));
+        assert_eq!(corrections.len(), 2);
     }
 
     #[test]

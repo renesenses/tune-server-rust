@@ -2017,6 +2017,22 @@ impl PlaybackOrchestrator {
                 }
             }
 
+            // A local output opens this URL in its own reader thread just
+            // after `play_media`. If that reader never starts, the session is
+            // alive but silent and used to leave only `stale_session_removed`
+            // thirty minutes later (#2270). Arming here excludes sessions that
+            // are merely prepared in advance for gapless playback.
+            if is_local && let Some(ref sid) = resolved.stream_id {
+                let _ = arm_local_stream_consumer_watch(
+                    self.streamer.clone(),
+                    sid.clone(),
+                    req.zone_id,
+                    device_id.clone(),
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+            }
+
             let result = self
                 .send_to_output(
                     device_id,
@@ -9735,6 +9751,65 @@ fn decode_radio_stream_to_pcm(
     }
 }
 
+/// Arm a one-shot diagnostic for a stream URL handed to a local output.
+///
+/// Creating a stream session is not enough to infer a fault: gapless prepares
+/// sessions well before they are meant to be consumed. The orchestrator calls
+/// this only on the main local-play path, immediately before `play_media`.
+/// Returning the task handle keeps the behaviour directly testable without
+/// scraping logs.
+async fn arm_local_stream_consumer_watch(
+    streamer: Arc<AudioStreamer>,
+    stream_id: String,
+    zone_id: i64,
+    device_id: String,
+    grace: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<bool>> {
+    use std::sync::atomic::Ordering;
+
+    let sessions = streamer.sessions_state();
+    let session = {
+        let guard = sessions.lock().await;
+        guard.get(&stream_id).cloned()
+    }?;
+
+    if session.consumer_watch_armed.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+
+        let Some(bytes_sent) = streamer.stream_bytes_sent(&stream_id).await else {
+            // The normal failure/stop paths remove the session. They already
+            // carry their own diagnostic and must not trigger a stale alert.
+            return false;
+        };
+        if bytes_sent != 0 {
+            return false;
+        }
+
+        let file_path = session.file_path.lock().await.clone();
+        let proxy_url = session.proxy_url.lock().await.clone();
+        let active_consumers = session.active_consumers.load(Ordering::Relaxed);
+        let session_age_ms = session.created_at.elapsed().as_millis() as u64;
+        warn!(
+            zone_id,
+            device_id = %device_id,
+            stream_id = %stream_id,
+            grace_ms = grace.as_millis() as u64,
+            session_age_ms,
+            format = %session.info.format,
+            mime_type = %session.info.mime_type,
+            file_path = ?file_path,
+            proxy_url = ?proxy_url,
+            active_consumers,
+            "local_stream_never_consumed"
+        );
+        true
+    }))
+}
+
 /// On-disk path candidates for a stored (NFC-normalized) DB path, in
 /// resolution order: the stored spelling first, then its NFD (decomposed)
 /// form. The scanner stores paths NFC-normalized for consistent DB lookups,
@@ -10110,10 +10185,89 @@ mod wav_override_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{RADIO_NOT_AUDIO, emit_radio_playback_error, non_audio_content_type};
+    use super::{
+        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        non_audio_content_type,
+    };
     use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // No warning before the grace period, then one warning for a live
+        // session whose HTTP body has never emitted a byte.
+        let (unconsumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            unconsumed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("first arm creates the watchdog");
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!task.is_finished(), "the grace period must be respected");
+        assert!(task.await.expect("watchdog task"));
+        assert!(
+            arm_local_stream_consumer_watch(
+                streamer.clone(),
+                unconsumed,
+                7,
+                "local:test".to_string(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_none(),
+            "the same session must never report twice"
+        );
+
+        // A body that emitted at least one byte is consumed, even if no reader
+        // happens to be active at the exact observation instant.
+        let (consumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        {
+            let sessions = streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard[&consumed]
+                .bytes_sent
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            consumed,
+            7,
+            "local:test".to_string(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("consumed session is armed");
+        assert!(!task.await.expect("watchdog task"));
+
+        // A session removed by a normal stop/error path during the grace
+        // period does not produce this diagnostic either.
+        let (removed, _tx, _ready) = streamer.create_session(info, false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            removed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("live session is armed");
+        streamer.remove_session(&removed).await;
+        assert!(!task.await.expect("watchdog task"));
+    }
 
     /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
     /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
