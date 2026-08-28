@@ -927,7 +927,28 @@ fn build_renderer_device(
 /// renderer classification (openhome → Openhome; media renderer or bare
 /// AVTransport → Dlna; anything else → None).
 pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDevice> {
-    let desc = fetch_device_description(location).await.ok()?;
+    // Ce `None` couvrait DEUX causes que rien ne distinguait, et son seul
+    // appelant (`discovery_setup::reregister_known_renderers`) les résumait
+    // toutes deux par un unique `known_renderer_probe_failed` : « l'appareil
+    // n'a pas répondu / a répondu autre chose qu'un descriptif » et « ce n'est
+    // pas un lecteur ». Les gestes attendus sont pourtant opposés — rallumer
+    // l'appareil, ou aller voir ce que sert cette adresse (#2665).
+    //
+    // Le cas du descriptif ILLISIBLE, lui, est journalisé au niveau `warn`
+    // avec l'adresse, la nature du corps et un extrait borné par
+    // `fetch_device_description` : inutile de le redire ici.
+    let desc = match fetch_device_description(location).await {
+        Ok(desc) => desc,
+        Err(e) => {
+            debug!(
+                id = %dev_id,
+                location = %location,
+                error = %e,
+                "probe_renderer_description_failed"
+            );
+            return None;
+        }
+    };
     let host = host_from_location(location).unwrap_or_default();
     let port = port_from_location(location);
 
@@ -936,6 +957,15 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
     } else if desc.is_media_renderer() || desc.has_av_transport() {
         OutputType::Dlna
     } else {
+        // Issue distincte de la précédente : l'adresse répond, son descriptif
+        // se lit, mais il ne décrit pas un lecteur.
+        debug!(
+            id = %dev_id,
+            location = %location,
+            device_type = %desc.device_type,
+            friendly_name = %desc.friendly_name,
+            "probe_renderer_not_a_renderer"
+        );
         return None;
     };
 
