@@ -29,6 +29,8 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+#[path = "radios_validation_url.rs"]
+mod radios_validation_url;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "reidentification_album.rs"]
