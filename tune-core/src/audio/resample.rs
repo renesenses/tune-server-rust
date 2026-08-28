@@ -428,6 +428,39 @@ mod tests {
         20.0 * (measured / reference).log10()
     }
 
+    /// Fit the fundamental in quadrature and report everything left over as
+    /// distortion plus noise. This is deliberately a time-domain least-squares
+    /// measurement, independent from both the resampler and the FFT display.
+    fn thd_plus_noise_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(sin_sum, cos_sum), (frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                (
+                    sin_sum + sample as f64 * phase.sin(),
+                    cos_sum + sample as f64 * phase.cos(),
+                )
+            },
+        );
+        let sin_gain = 2.0 * sin_sum / stable.len() as f64;
+        let cos_gain = 2.0 * cos_sum / stable.len() as f64;
+        let fundamental_rms = sin_gain.hypot(cos_gain) / std::f64::consts::SQRT_2;
+        let residual_rms = (stable
+            .iter()
+            .enumerate()
+            .map(|(frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                let fitted = sin_gain * phase.sin() + cos_gain * phase.cos();
+                (sample as f64 - fitted).powi(2)
+            })
+            .sum::<f64>()
+            / stable.len() as f64)
+            .sqrt();
+        20.0 * (residual_rms / fundamental_rms).log10()
+    }
+
     fn resample_in_chunks(
         samples: &[f32],
         from_sr: u32,
@@ -580,6 +613,23 @@ mod tests {
             image_db < -80.0,
             "le sinus 1 kHz produit une image a {image_hz} Hz a {image_db:.1} dB"
         );
+    }
+
+    #[test]
+    fn resampling_keeps_sine_thd_plus_noise_below_minus_100_db() {
+        const FREQUENCY_HZ: f64 = 1_000.0;
+        const AMPLITUDE: f64 = 0.5;
+
+        for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
+            let input = sine_mono(from_sr, FREQUENCY_HZ, AMPLITUDE);
+            let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
+            let thd_n_db = thd_plus_noise_db(&output, to_sr, FREQUENCY_HZ);
+
+            assert!(
+                thd_n_db < -100.0,
+                "THD+N du SRC {from_sr} -> {to_sr} Hz mesuree a {thd_n_db:.1} dB"
+            );
+        }
     }
 
     #[test]
