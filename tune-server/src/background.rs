@@ -36,6 +36,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
+    // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
+    // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
+    // un réglage que plus personne ne relisait. Un test de câblage garde la
+    // ligne.
+    crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
@@ -112,12 +117,20 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// portant la signature de rognage, soit aucune sur une bibliothèque saine.
 ///
 /// Toute correction future du lecteur devra incrémenter ce suffixe.
+///
+/// `_v2` → `_v3` (#1865) : la passe ouvrait le chemin de la base TEL QUEL,
+/// c'est-à-dire en NFC. Sur un fichier venu de macOS ou d'un partage SMB, dont
+/// le nom est en NFD, `probe_duration_ms` rendait `None` — la piste comptait
+/// pour « illisible », puis le témoin GLOBAL était posé et la passe ne
+/// repassait jamais. Le suffixe la fait repasser une fois, avec le repli de
+/// graphie ; la requête ne rend que les pistes portant la signature de
+/// rognage, donc aucune sur une bibliothèque saine.
 fn spawn_mp3_duration_repair(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {
         let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
         if reglages
-            .get("mp3_duration_repair_done_v2")
+            .get("mp3_duration_repair_done_v3")
             .ok()
             .flatten()
             .is_some()
@@ -154,7 +167,7 @@ fn spawn_mp3_duration_repair(state: &AppState) {
 
         if candidats.is_empty() {
             info!(sans_taille, "mp3_duration_repair_rien_a_faire");
-            let _ = reglages.set("mp3_duration_repair_done_v2", "1");
+            let _ = reglages.set("mp3_duration_repair_done_v3", "1");
             return;
         }
 
@@ -164,6 +177,10 @@ fn spawn_mp3_duration_repair(state: &AppState) {
         let mut reparees = 0usize;
         let mut inchangees = 0usize;
         let mut illisibles = 0usize;
+        // Distinct d'`illisibles` : un fichier ABSENT n'est pas un fichier
+        // qu'on n'arrive pas à lire, et les confondre est ce qui a fait passer
+        // 135 pistes NFD pour de la casse (#1865).
+        let mut introuvables = 0usize;
 
         for ligne in &candidats {
             let (Some(id), Some(chemin), Some(ancienne)) = (
@@ -174,7 +191,18 @@ fn spawn_mp3_duration_repair(state: &AppState) {
                 continue;
             };
 
-            let chemin_clone = chemin.clone();
+            // Le chemin de la base est en NFC ; le fichier peut être en NFD
+            // sur le disque. On résout la graphie réelle avant d'ouvrir, et on
+            // n'écrit RIEN dans `tracks.file_path` : la base reste NFC (#1865).
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(&chemin)
+            else {
+                introuvables += 1;
+                debug!(id, chemin = %chemin, "mp3_duration_repair_chemin_introuvable");
+                continue;
+            };
+
+            let chemin_clone = sur_disque;
             let reelle = tokio::task::spawn_blocking(move || {
                 tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin_clone))
             })
@@ -209,9 +237,14 @@ fn spawn_mp3_duration_repair(state: &AppState) {
 
         info!(
             total,
-            reparees, inchangees, illisibles, sans_taille, "mp3_duration_repair_termine"
+            reparees,
+            inchangees,
+            illisibles,
+            introuvables,
+            sans_taille,
+            "mp3_duration_repair_termine"
         );
-        let _ = reglages.set("mp3_duration_repair_done_v2", "1");
+        let _ = reglages.set("mp3_duration_repair_done_v3", "1");
     });
 }
 
@@ -1093,6 +1126,29 @@ fn spawn_heartbeat(state: &AppState) {
             // with the authoritative tier / expiry.
             let ls = license.license_state().await;
 
+            // Grâce hors ligne (#1999) : tracer AVANT la coupure, pas après.
+            // La dégradation ne se signalait que par un `warn!` au quatorzième
+            // jour ; ici on écrit une ligne par heure dès que la revalidation
+            // date de plus de deux jours, avec le compte à rebours. Jamais la
+            // clé ni un identifiant d'achat — que des dates et des compteurs.
+            if let Some(g) = tune_core::license::offline_grace(&ls) {
+                match g.phase {
+                    tune_core::license::GracePhase::Grace => info!(
+                        source = ?g.source,
+                        days_since_validation = g.days_since_validation,
+                        days_remaining = g.days_remaining,
+                        total_days = g.total_days,
+                        "license_offline_grace_active (premium intact)"
+                    ),
+                    tune_core::license::GracePhase::Expired => info!(
+                        source = ?g.source,
+                        total_days = g.total_days,
+                        "license_offline_grace_lapsed (premium suspended until next successful validation)"
+                    ),
+                    tune_core::license::GracePhase::Ok => {}
+                }
+            }
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
@@ -1534,7 +1590,10 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// n'a pas pu départager :
 ///
 /// - `stream_sessions` : une session est créée par piste et n'est ramassée
-///   qu'au bout de **trente minutes** (`cleanup_stale_sessions`). Chacune tient
+///   qu'après **trente minutes SANS un octet servi** (`cleanup_stale_sessions`).
+///   Le critère était l'âge absolu depuis la création ; il est désormais
+///   l'inactivité, doublée d'un plafond absolu de vingt-quatre heures en
+///   filet (#2536). Chacune tient
 ///   un canal de 128 morceaux. Un compteur qui monte avec la lecture et
 ///   redescend au repos désigne ce cache ; un compteur plat innocente le
 ///   chemin de lecture, et c'est aussi une réponse.

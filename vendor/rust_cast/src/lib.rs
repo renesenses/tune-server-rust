@@ -37,6 +37,36 @@ mod utils;
 const DEFAULT_SENDER_ID: &str = "sender-0";
 const DEFAULT_RECEIVER_ID: &str = "receiver-0";
 
+/// Le seul texte que doive porter une commande Cast abandonnée faute de temps.
+///
+/// Il existait déjà, mais n'était produit que par la branche « échéance déjà
+/// franchie AVANT l'appel » de [`DeadlineTcpStream::remaining`]. Le cas
+/// fréquent — l'échéance tombe PENDANT le read — laissait parler la socket, et
+/// la socket dit tout autre chose (voir
+/// [`DeadlineTcpStream::as_deadline_error`]).
+pub(crate) const DEADLINE_ELAPSED: &str = "Cast command deadline elapsed";
+
+/// Un délai de socket qui expire est-il en train de dire « échéance atteinte » ?
+///
+/// `TcpStream::set_read_timeout` / `set_write_timeout` documentent leur
+/// expiration ainsi : l'erreur rendue est de type **`WouldBlock` sur Unix** et
+/// **`TimedOut` sur Windows**. Les deux valent donc « le temps imparti est
+/// écoulé », et rien d'autre — ce flux est bloquant, il n'y a pas de second
+/// producteur de `WouldBlock` ici.
+///
+/// ⚠️ Cette crate est vendorisée et n'est PAS membre du workspace
+/// (`Cargo.toml` racine, clé `members`) : des tests écrits ici ne seraient
+/// jamais joués par la CI. La règle est donc éprouvée depuis `tune-core`, de
+/// bout en bout, par `outputs::chromecast::deadline_tests` — dont
+/// `une_liaison_coupee_n_est_pas_maquillee_en_echeance`, qui vérifie
+/// précisément que le test de `kind()` ci-dessous ne se laisse pas retirer.
+pub(crate) fn is_socket_deadline_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 /// Blocking TCP stream whose every read and write is bounded by one absolute
 /// deadline. Refreshing the socket timeout before each operation prevents a
 /// sequence of individually bounded Cast requests from exceeding the command's
@@ -64,11 +94,46 @@ impl DeadlineTcpStream {
     fn remaining(&self) -> io::Result<Option<Duration>> {
         self.deadline
             .map(|deadline| {
-                deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "Cast command deadline elapsed")
-                })
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED))
             })
             .transpose()
+    }
+
+    /// Traduire l'expiration du délai de socket en échéance de commande (#2566).
+    ///
+    /// **Le défaut.** Le délai posé par [`Self::refresh_read_timeout`] expire en
+    /// rendant `WouldBlock` sur Unix. Sur macOS, `WouldBlock` est `EAGAIN`,
+    /// c'est-à-dire **`os error 35`**, dont le texte système est *« Resource
+    /// temporarily unavailable »* ; sur Linux, `os error 11` et le même texte.
+    /// Ce texte remontait tel quel jusqu'au journal :
+    ///
+    /// ```text
+    /// error=media status: Resource temporarily unavailable (os error 35)
+    /// ```
+    ///
+    /// Il envoie chercher une ressource occupée qui n'existe pas, et son
+    /// « temporarily » suggère de réessayer alors que la cause est un budget
+    /// épuisé. Chez Dimitri (0.9.115 macOS, fil 1577), cette ligne s'est répétée
+    /// **79 fois de suite** sans jamais dire ce qui se passait vraiment.
+    ///
+    /// **Pourquoi la traduction est exacte, et non une approximation.** Le délai
+    /// posé sur la socket ne vaut pas une durée arbitraire : il VAUT le temps
+    /// restant jusqu'à `deadline` ([`Self::refresh_read_timeout`] le
+    /// recalcule avant chaque opération). Son expiration est donc littéralement
+    /// l'échéance atteinte — le même événement que la branche `Err` de
+    /// [`Self::remaining`], qui porte déjà le bon message quand l'échéance est
+    /// franchie AVANT le read. Les deux chemins disent désormais la même chose.
+    ///
+    /// **Sans échéance, on ne traduit rien.** [`Self::unbounded`] ne pose aucun
+    /// délai : un `WouldBlock` y viendrait d'autre chose, et l'écraser
+    /// perdrait l'information.
+    fn as_deadline_error(&self, error: io::Error) -> io::Error {
+        if self.deadline.is_some() && is_socket_deadline_error(&error) {
+            return io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED);
+        }
+        error
     }
 
     fn refresh_read_timeout(&self) -> io::Result<()> {
@@ -89,19 +154,19 @@ impl DeadlineTcpStream {
 impl Read for DeadlineTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.refresh_read_timeout()?;
-        self.inner.read(buf)
+        self.inner.read(buf).map_err(|e| self.as_deadline_error(e))
     }
 }
 
 impl Write for DeadlineTcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.refresh_write_timeout()?;
-        self.inner.write(buf)
+        self.inner.write(buf).map_err(|e| self.as_deadline_error(e))
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.refresh_write_timeout()?;
-        self.inner.flush()
+        self.inner.flush().map_err(|e| self.as_deadline_error(e))
     }
 }
 

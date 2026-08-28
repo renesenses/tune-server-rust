@@ -1291,6 +1291,75 @@ DELETE FROM radio_stations WHERE url = 'http://stream.live.vc.bbcmedia.co.uk/bbc
 DELETE FROM radio_stations WHERE url = 'https://online.jamminvibezradio.com/listen/caribbean/live.flac';
 ",
     },
+    Migration {
+        version: 87,
+        name: "temoins_poses_sur_chemin_introuvable",
+        // Rendre leur chance aux pistes que le repli NFC/NFD va desormais
+        // retrouver (#1865).
+        //
+        // Le scanner enregistre les chemins en NFC ; macOS et les partages
+        // SMB/CIFS ecrivent les noms de fichiers en NFD. Les passes de fond
+        // ouvraient le chemin de la base TEL QUEL, recevaient ENOENT, et
+        // posaient quand meme leur temoin — « on a essaye, n'y revenons
+        // pas ». La piste sortait du balayage POUR TOUJOURS. Mesure sur .18
+        // le 28/08/2026 : 135 pistes dont le chemin stocke ne resout pas mais
+        // dont la forme NFD existe ; 114 portaient `rg_analyzed` pour ZERO
+        // `rg_track_gain`, 44 portaient `audio_embed_analyzed` pour ZERO
+        // vecteur.
+        //
+        // Le code ne posera plus ces temoins sur un fichier introuvable (il
+        // pose un report date, qui perime). Mais le code ne rattrape rien tout
+        // seul : les temoins deja en base excluent ces pistes de la requete de
+        // candidats, donc elles ne seront jamais relues. D'ou ce nettoyage.
+        //
+        // POURQUOI CE PREDICAT, ET PAS PLUS LARGE
+        //
+        // On ne retire le temoin que la ou il ne recouvre AUCUN resultat ET ou
+        // le chemin contient au moins un octet non-ASCII — seuls les chemins
+        // accentues peuvent avoir deux graphies Unicode. Sur .18 : 107 pistes
+        // pour ReplayGain (au lieu de 361 sans la clause d'accent) et 50 pour
+        // l'acoustique (au lieu de 53). Un fichier vraiment illisible dont le
+        // nom est accentue sera reessaye UNE fois, puis re-temoigne. C'est le
+        // prix, il est borne.
+        //
+        // `length(CAST(x AS BLOB))` rend des OCTETS la ou `length(x)` rend des
+        // CARACTERES : leur inegalite est le test non-ASCII portable en
+        // SQLite, sans extension regex. (La jumelle PostgreSQL 039 utilise
+        // `octet_length`, qui n'existe pas partout en SQLite ancien.)
+        //
+        // IDEMPOTENTE par construction : ce sont des DELETE. Rejouee, elle ne
+        // trouve plus rien a supprimer. `rg_skipped_oversized` est epargne :
+        // ce refus-la vient d'un calcul sur la duree et le debit, pas d'un
+        // acces disque — il reste valable.
+        //
+        // Ce qui n'est VOLONTAIREMENT pas touche : `rg_album_gain` /
+        // `rg_album_peak`. Les effacer relancerait le calcul d'album
+        // immediatement, donc AVANT que les pistes liberees aient leur gain —
+        // meme resultat, une ecriture de plus. Le gain d'album de ces albums
+        // reste donc legerement approximatif jusqu'a une reprise complete.
+        up: "
+DELETE FROM track_metadata
+WHERE key = 'rg_analyzed'
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    WHERE t.file_path IS NOT NULL
+      AND length(CAST(t.file_path AS BLOB)) <> length(t.file_path)
+      AND NOT EXISTS (SELECT 1 FROM track_metadata g
+                       WHERE g.track_id = t.id AND g.key = 'rg_track_gain')
+      AND NOT EXISTS (SELECT 1 FROM track_metadata s
+                       WHERE s.track_id = t.id AND s.key = 'rg_skipped_oversized')
+  );
+DELETE FROM track_metadata
+WHERE key = 'audio_embed_analyzed'
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    WHERE t.file_path IS NOT NULL
+      AND length(CAST(t.file_path AS BLOB)) <> length(t.file_path)
+      AND NOT EXISTS (SELECT 1 FROM track_audio_embedding e
+                       WHERE e.track_id = t.id)
+  );
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2752,6 +2821,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "favorite_facets",
         include_str!("../../migrations/postgres/038_favorite_facets.sql"),
     ),
+    // Jumelle de la migration SQLite 87 (#1865) : retirer les temoins de
+    // passe poses sur des fichiers introuvables faute de repli NFC/NFD, sans
+    // quoi le correctif ne rattrape AUCUNE des bibliotheques deja balayees.
+    // Numerotee 39 : le suivant libre a l'ouverture de la PR, pas un numero
+    // reserve d'avance — la contiguite l'interdit.
+    (
+        39,
+        "temoins_poses_sur_chemin_introuvable",
+        include_str!("../../migrations/postgres/039_temoins_poses_sur_chemin_introuvable.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3918,6 +3997,136 @@ mod tests {
         assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
     }
 
+    /// Migration 87 (#1865) — le prédicat doit viser JUSTE.
+    ///
+    /// Elle retire les témoins de passe qui ne recouvrent aucun résultat sur
+    /// les chemins non-ASCII. Trop large, elle relancerait l'analyse de toute
+    /// une bibliothèque ; trop étroite, elle ne rattraperait rien et le
+    /// correctif resterait sans effet sur les bases déjà balayées.
+    ///
+    /// Le SQL est relu depuis `MIGRATIONS` et rejoué APRÈS coup : cela vérifie
+    /// du même geste que la migration est bien **idempotente** — un DELETE
+    /// rejoué ne trouve plus rien, mais surtout il ne doit pas se mettre à
+    /// mordre sur des lignes qu'il avait épargnées.
+    #[test]
+    fn la_migration_87_ne_retire_que_les_temoins_sans_resultat_sur_chemin_accentue() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let sql = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 87)
+            .expect("migration 87 absente")
+            .up;
+
+        // id, chemin, a un gain / un vecteur ?, oversized ?
+        // Les chemins accentués sont écrits en échappements explicites : un
+        // éditeur qui recomposerait le littéral ferait passer le test sans
+        // qu'il compare quoi que ce soit.
+        let fixtures: &[(i64, &str, bool, bool)] = &[
+            // 1 — accentué, aucun gain, non oversized  → témoin RETIRÉ
+            (1, "/m/Bj\u{00f6}rk/01.flac", false, false),
+            // 2 — accentué mais un gain existe          → témoin GARDÉ
+            (2, "/m/\u{00c9}tienne/02.flac", true, false),
+            // 3 — ASCII, aucun gain                     → témoin GARDÉ
+            (3, "/m/Gramophone/03.flac", false, false),
+            // 4 — accentué, aucun gain, mais oversized  → témoin GARDÉ
+            (4, "/m/N\u{00fa}\u{00f1}ez/04.flac", false, true),
+        ];
+
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1)",
+            &[],
+        )
+        .unwrap();
+        for (id, chemin, avec_resultat, oversized) in fixtures {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path) \
+                 VALUES (?, 'T', 1, 1, ?)",
+                &[id, chemin],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_analyzed', '1')",
+                &[id],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO track_metadata (track_id, key, value) \
+                 VALUES (?, 'audio_embed_analyzed', 'clap')",
+                &[id],
+            )
+            .unwrap();
+            if *avec_resultat {
+                db.execute(
+                    "INSERT INTO track_metadata (track_id, key, value) \
+                     VALUES (?, 'rg_track_gain', '-6.00 dB')",
+                    &[id],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                     VALUES (?, 'clap', X'00', 0)",
+                    &[id],
+                )
+                .unwrap();
+            }
+            if *oversized {
+                db.execute(
+                    "INSERT INTO track_metadata (track_id, key, value) \
+                     VALUES (?, 'rg_skipped_oversized', '1')",
+                    &[id],
+                )
+                .unwrap();
+            }
+        }
+
+        let porte = |cle: &str| -> Vec<i64> {
+            let conn = db.connection().lock().unwrap();
+            let mut st = conn
+                .prepare("SELECT track_id FROM track_metadata WHERE key = ?1 ORDER BY track_id")
+                .unwrap();
+            let v: Vec<i64> = st
+                .query_map([cle], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            v
+        };
+
+        assert_eq!(porte("rg_analyzed"), vec![1, 2, 3, 4], "etat de depart");
+        assert_eq!(porte("audio_embed_analyzed"), vec![1, 2, 3, 4]);
+
+        db.execute_batch(sql).unwrap();
+
+        // Seule la piste 1 remplit les trois conditions.
+        assert_eq!(
+            porte("rg_analyzed"),
+            vec![2, 3, 4],
+            "seul le temoin accentue et sans gain doit sauter ; \
+             un gain existant (2), un chemin ASCII (3) et un refus pour \
+             taille (4) sont des decisions valables, pas des ENOENT"
+        );
+        // Cote acoustique, la 4 saute AUSSI : `rg_skipped_oversized` est un
+        // refus propre a ReplayGain (une estimation de memoire de decodage) et
+        // ne dit rien de l'empreinte, qui ne lit que dix secondes. Les deux
+        // regles ne sont donc volontairement pas les memes.
+        assert_eq!(
+            porte("audio_embed_analyzed"),
+            vec![2, 3],
+            "la 2 a un vecteur, la 3 est ASCII ; la 4 n'a pas de vecteur et son \
+             chemin est accentue — `rg_skipped_oversized` ne la protege pas ici"
+        );
+
+        // Rejeu : idempotente, et surtout elle ne mord pas plus loin.
+        db.execute_batch(sql).unwrap();
+        assert_eq!(porte("rg_analyzed"), vec![2, 3, 4], "rejeu idempotent");
+        assert_eq!(porte("audio_embed_analyzed"), vec![2, 3]);
+    }
+
     // The PG numeric-type heal chain (#1220): the migration list must stay
     // contiguous and 1-based so run_pg_migrations applies every step, and the
     // numeric-column-type heal migrations (010/011/013/036) must all be present — a
@@ -3940,7 +4149,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 38, "latest PG migration must be 38");
+        assert_eq!(pg_latest_version(), 39, "latest PG migration must be 39");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

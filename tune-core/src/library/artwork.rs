@@ -138,6 +138,69 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Extensions sous lesquelles une entrée de cache de pochette peut exister,
+/// dans l'ordre où on la cherche.
+///
+/// C'est le **contrat unique** entre celui qui écrit dans le cache
+/// ([`save_to_cache`]) et celui qui le sert
+/// (`tune-server/src/routes/library/artwork.rs::serve_artwork`). Tant que les
+/// deux listes vivaient séparément, un fichier pouvait être écrit sous un nom
+/// que la route ne regardait jamais : la base annonçait alors un condensat dont
+/// la route rendait 404, et l'écran affichait l'image de remplacement (#2567).
+///
+/// Les quatre premières sont les seules que [`save_to_cache`] produit
+/// désormais. Les suivantes sont les orthographes **héritées** : l'extension du
+/// fichier source était jusqu'ici recopiée telle quelle, et
+/// `FOLDER_COVER_NAMES` accepte `cover.jpeg`, `FOLDER.JPG`, `Front.png`… Les
+/// caches déjà constitués en sont pleins. Les garder ici les guérit **sans rien
+/// réécrire et sans changer un seul condensat** : aucune URL de pochette ne
+/// bouge, donc aucun cache de navigateur n'est invalidé.
+pub const CACHE_EXTENSIONS: &[&str] = &[
+    // Écrites aujourd'hui, dans l'ordre de fréquence.
+    "jpg", "png", "webp", "bmp", // Héritées : orthographes recopiées d'un fichier source.
+    "jpeg", "JPG", "JPEG", "PNG", "Jpg", "Jpeg", "Png",
+];
+
+/// Orthographe canonique sous laquelle une entrée de cache doit être écrite.
+///
+/// Écrire `{hash}.jpeg` ou `{hash}.JPG` revenait à annoncer un condensat que la
+/// route ne trouvait pas. On ne touche ni au condensat ni au contenu : seule
+/// l'orthographe de l'extension est ramenée à celle que la lecture cherche en
+/// premier. Une extension inconnue devient `jpg`, ce qui est déjà ce que
+/// `extract_cover_art` suppose pour un type d'image qu'il ne reconnaît pas.
+pub fn canonical_cache_ext(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "png",
+        "webp" => "webp",
+        "bmp" => "bmp",
+        _ => "jpg",
+    }
+}
+
+/// Type MIME d'une entrée de cache, d'après son extension.
+pub fn cache_mime(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+/// Retrouve le fichier de cache d'un condensat, s'il existe.
+///
+/// Rend le chemin **et** le type MIME à servir. `None` signifie que le
+/// condensat n'a aucun fichier : l'annoncer en base est alors un mensonge.
+pub fn find_cached(cache_dir: &Path, hash: &str) -> Option<(PathBuf, &'static str)> {
+    for ext in CACHE_EXTENSIONS {
+        let path = cache_dir.join(format!("{hash}.{ext}"));
+        if path.exists() {
+            return Some((path, cache_mime(ext)));
+        }
+    }
+    None
+}
+
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         warn!(
@@ -147,6 +210,11 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
         );
         return None;
     }
+    // L'extension vient souvent d'un fichier source (`cover.jpeg`,
+    // `FOLDER.JPG`) ou d'un type MIME (`image/bmp`). La ramener à l'orthographe
+    // que la lecture cherche est la seule façon de garantir que le condensat
+    // qu'on va annoncer sera servi (#2567).
+    let ext = canonical_cache_ext(ext);
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
     if let Err(e) = std::fs::write(&path, data) {
@@ -1391,9 +1459,10 @@ pub fn save_embedded_cover(
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
     // Already cached (from a previous scan or from get_or_extract): reuse it.
-    if cache_dir.join(format!("{hash}.jpg")).exists()
-        || cache_dir.join(format!("{hash}.png")).exists()
-    {
+    // La sonde interroge la MÊME liste que la route. Tant qu'elle ne regardait
+    // que `jpg`/`png`, une entrée héritée (`.jpeg`, `.JPG`, `.bmp`) passait pour
+    // absente et était réécrite à chaque passe (#2567).
+    if find_cached(cache_dir, &hash).is_some() {
         return Some(hash);
     }
 
@@ -1430,10 +1499,8 @@ pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> 
     // toutes les pistes du dossier partagent ainsi la même entrée de cache au
     // lieu d'en dupliquer une par fichier.
     let hash = artwork_hash(&folder_cover.to_string_lossy());
-    for ext in ["jpg", "png"] {
-        if cache_dir.join(format!("{hash}.{ext}")).exists() {
-            return Some(hash);
-        }
+    if find_cached(cache_dir, &hash).is_some() {
+        return Some(hash);
     }
     let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
     let ext = folder_cover
@@ -1446,13 +1513,8 @@ pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
-    // Check if already cached
-    let cached_jpg = cache_dir.join(format!("{hash}.jpg"));
-    let cached_png = cache_dir.join(format!("{hash}.png"));
-    if cached_jpg.exists() {
-        return Some(hash);
-    }
-    if cached_png.exists() {
+    // Check if already cached — même liste que la route (#2567).
+    if find_cached(cache_dir, &hash).is_some() {
         return Some(hash);
     }
 
@@ -2004,5 +2066,229 @@ mod tests {
         let h = artwork_hash("/music/artist/album/track.flac");
         assert_eq!(h.len(), 32);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ------------------------------------------------------------------
+    // #2567 — un condensat annoncé DOIT avoir un fichier que la route sait
+    // servir.
+    //
+    // La base ne stocke pas un chemin : elle stocke la CLÉ DE CACHE que le
+    // client demandera à `/api/v1/library/artwork/{clé}`. Écrire cette clé
+    // alors que le fichier porte une extension que la route ne regarde pas
+    // revient à annoncer une pochette qu'on ne sert pas — 404, image de
+    // remplacement à l'écran, et rien dans le journal.
+    //
+    // L'invariant tient en une ligne : ce que l'écriture rend, la lecture doit
+    // le retrouver. `find_cached` EST la lecture ; les tests ci-dessous ne
+    // demandent rien d'autre.
+    // ------------------------------------------------------------------
+
+    /// Un album dont la pochette de dossier s'appelle `cover.jpeg` — quatre
+    /// lettres, pas trois. `find_folder_cover` l'accepte (elle est dans
+    /// `FOLDER_COVER_NAMES`), l'écriture recopiait son extension telle quelle.
+    #[test]
+    fn pochette_de_dossier_en_jpeg_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Existence");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpeg"), b"POCHETTE").unwrap();
+        let track = music.join("01 - Pizza Boy.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let hash = get_or_extract(&track, &cache).expect("une pochette de dossier a été trouvée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route : \
+             la pochette a été écrite sous une extension que serve_artwork ne \
+             regarde pas — 404 et image de remplacement (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Même chose avec une extension en majuscules : `FOLDER.JPG` est dans la
+    /// liste des noms acceptés, et sur un système de fichiers sensible à la
+    /// casse (Linux, la plupart des NAS) `FOLDER.JPG` n'est pas `folder.jpg`.
+    #[test]
+    fn pochette_de_dossier_en_majuscules_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Album crié");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("FOLDER.JPG"), b"POCHETTE").unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let hash = get_or_extract(&track, &cache).expect("une pochette de dossier a été trouvée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Une pochette intégrée au format BMP : `extract_cover_art` rend
+    /// `image/bmp`, `save_embedded_cover` écrivait `.bmp`, la route ne
+    /// connaissait pas cette extension.
+    #[test]
+    fn pochette_integree_en_bmp_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+        let track = dir.path().join("Album/01.flac");
+        std::fs::create_dir_all(track.parent().unwrap()).unwrap();
+
+        let cover = (b"BM-POCHETTE".to_vec(), "image/bmp".to_string());
+        let hash = save_embedded_cover(&track, &cache, &cover).expect("écriture acquittée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Le même contrat, au ras de l'écriture : quelle que soit l'orthographe de
+    /// l'extension qu'on lui passe, `save_to_cache` doit produire un fichier que
+    /// la lecture retrouve.
+    #[test]
+    fn save_to_cache_ecrit_sous_une_extension_que_la_lecture_retrouve() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manquantes = Vec::new();
+        let orthographes = ["jpg", "jpeg", "JPG", "JPEG", "png", "PNG", "webp", "bmp"];
+        for (i, ext) in orthographes.iter().enumerate() {
+            let cache = dir.path().join(format!("cache{i}"));
+            let hash = format!("{i:032x}");
+            save_to_cache(b"IMAGE", &cache, &hash, ext).expect("écriture acquittée");
+            if find_cached(&cache, &hash).is_none() {
+                manquantes.push((*ext, listing(&cache)));
+            }
+        }
+        assert!(
+            manquantes.is_empty(),
+            "{} orthographe(s) sur {} écrivent un fichier que la route ne sert pas (#2567) : {:?}",
+            manquantes.len(),
+            orthographes.len(),
+            manquantes
+        );
+    }
+
+    /// L'autre moitié du contrat : l'écriture ne doit plus **produire**
+    /// d'orthographe héritée. Sans cela, la liste que la lecture doit connaître
+    /// s'allongerait à chaque source d'image nouvelle, et un cache neuf
+    /// continuerait de se remplir de noms que seule la clémence de la lecture
+    /// rattrape.
+    #[test]
+    fn l_ecriture_ne_produit_que_des_orthographes_canoniques() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let attendus = [
+            ("jpg", "jpg"),
+            ("jpeg", "jpg"),
+            ("JPG", "jpg"),
+            ("JPEG", "jpg"),
+            ("Jpeg", "jpg"),
+            ("png", "png"),
+            ("PNG", "png"),
+            ("webp", "webp"),
+            ("WEBP", "webp"),
+            ("bmp", "bmp"),
+            ("gif", "jpg"), // inconnue : jpg, comme le suppose extract_cover_art
+        ];
+        let mut ecarts = Vec::new();
+        for (i, (donnee, canonique)) in attendus.iter().enumerate() {
+            let cache = dir.path().join(format!("c{i}"));
+            let hash = format!("{i:032x}");
+            save_to_cache(b"IMAGE", &cache, &hash, donnee).expect("écriture acquittée");
+            let obtenu = listing(&cache);
+            if obtenu != vec![format!("{hash}.{canonique}")] {
+                ecarts.push((*donnee, obtenu));
+            }
+        }
+        assert!(
+            ecarts.is_empty(),
+            "{} orthographe(s) sur {} écrites hors de la forme canonique (#2567) : {:?}",
+            ecarts.len(),
+            attendus.len(),
+            ecarts
+        );
+    }
+
+    /// Garde-fou contre l'excès inverse : sans pochette nulle part, rien n'est
+    /// annoncé. Un condensat inventé vaut pire qu'une absence — il pose un
+    /// `src` qui échoue au lieu de laisser l'image de remplacement.
+    #[test]
+    fn sans_pochette_aucun_condensat_n_est_invente() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Album nu");
+        std::fs::create_dir_all(&music).unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        assert!(get_or_extract(&track, &cache).is_none());
+        assert!(listing(&cache).is_empty(), "rien ne doit être écrit");
+    }
+
+    /// Le condensat est une clé de cache : il ne bouge pas d'un appel à
+    /// l'autre. S'il bougeait, chaque client retéléchargerait la bibliothèque
+    /// entière à chaque passe.
+    #[test]
+    fn condensat_stable_entre_deux_appels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Existence");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpeg"), b"POCHETTE").unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let a = get_or_extract(&track, &cache).expect("premier appel");
+        let b = get_or_extract(&track, &cache).expect("second appel");
+        assert_eq!(a, b, "la clé de cache d'une même pochette doit être stable");
+        assert!(find_cached(&cache, &a).is_some());
+    }
+
+    /// Deux pochettes différentes ne partagent pas une entrée de cache : sinon
+    /// la seconde écraserait la première et un album porterait la jaquette
+    /// d'un autre.
+    #[test]
+    fn deux_pochettes_differentes_donnent_deux_condensats() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+        let mut hashes = Vec::new();
+        for (nom, octets) in [
+            ("Album A", &b"POCHETTE-A"[..]),
+            ("Album B", &b"POCHETTE-B"[..]),
+        ] {
+            let music = dir.path().join(nom);
+            std::fs::create_dir_all(&music).unwrap();
+            std::fs::write(music.join("cover.jpeg"), octets).unwrap();
+            let track = music.join("01.flac");
+            std::fs::write(&track, b"").unwrap();
+            hashes.push(get_or_extract(&track, &cache).expect("pochette trouvée"));
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        let (chemin, _) = find_cached(&cache, &hashes[0]).expect("A servable");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"POCHETTE-A");
+        let (chemin, _) = find_cached(&cache, &hashes[1]).expect("B servable");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"POCHETTE-B");
+    }
+
+    /// Noms de fichiers présents dans un répertoire de cache, triés. Sert à
+    /// faire dire aux échecs ce qui a réellement été écrit, plutôt que « rien
+    /// trouvé ».
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
     }
 }

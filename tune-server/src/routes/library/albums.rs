@@ -15,6 +15,7 @@ use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
+use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
 use super::Pagination;
@@ -258,7 +259,43 @@ pub(super) async fn album_tracks(
         repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
             .unwrap_or_default(),
     );
-    Json(json!(items))
+
+    // GROUPING (#2130) : lu au scan et rangé dans `track_metadata`, il n'était
+    // jusqu'ici ressorti par aucune route. Une seule requête indexée par album
+    // suffit ; le tag étant absent de l'immense majorité des bibliothèques,
+    // elle ne ramène le plus souvent aucune ligne et la clé `grouping` reste
+    // absente du JSON — ce qui laisse le contrat inchangé pour les clients qui
+    // ne la connaissent pas.
+    let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
+    let grouping = TrackMetadataRepo::with_backend(state.backend.clone())
+        .get_key_for_tracks("grouping", &track_ids)
+        .unwrap_or_default();
+
+    Json(json!(attach_grouping(items, &grouping)))
+}
+
+/// Recopie le tag GROUPING sur les pistes sérialisées d'un album.
+///
+/// La clé n'est ajoutée que pour les pistes qui en portent réellement une
+/// (`get_key_for_tracks` a déjà écarté les valeurs vides) : une piste sans
+/// GROUPING sort exactement comme avant, sans champ supplémentaire.
+fn attach_grouping(
+    items: Vec<tune_core::db::models::Track>,
+    grouping: &std::collections::HashMap<i64, String>,
+) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|t| {
+            let track_id = t.id;
+            let mut v = serde_json::to_value(&t).unwrap_or_default();
+            if let (Some(track_id), Some(obj)) = (track_id, v.as_object_mut()) {
+                if let Some(g) = grouping.get(&track_id) {
+                    obj.insert("grouping".into(), json!(g));
+                }
+            }
+            v
+        })
+        .collect()
 }
 
 pub(super) async fn quick_fav_album(
@@ -837,4 +874,55 @@ pub(super) async fn batch_update_albums(
     }
 
     Json(serde_json::json!({ "updated": updated, "total": body.album_ids.len() })).into_response()
+}
+
+#[cfg(test)]
+mod tests_grouping {
+    use super::attach_grouping;
+    use std::collections::HashMap;
+    use tune_core::db::models::Track;
+
+    fn track(id: i64, title: &str) -> Track {
+        let mut t = Track::new(title.to_string());
+        t.id = Some(id);
+        t
+    }
+
+    /// Sans GROUPING en base, la réponse d'un album est celle d'avant #2130 :
+    /// aucune clé supplémentaire. C'est le cas mesuré sur les bibliothèques
+    /// réelles, donc le cas qui doit rester gratuit.
+    #[test]
+    fn attach_grouping_leaves_tracks_untouched_when_absent() {
+        let items = vec![track(1, "I. Allegro"), track(2, "II. Adagio")];
+        let out = attach_grouping(items, &HashMap::new());
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert!(
+                v.get("grouping").is_none(),
+                "aucune clé grouping ne doit apparaître sans donnée"
+            );
+        }
+        assert_eq!(out[0]["title"], "I. Allegro");
+    }
+
+    /// Une valeur en base ressort sur la piste concernée, et sur elle seule.
+    #[test]
+    fn attach_grouping_reports_the_value_on_the_right_track() {
+        let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
+        let mut map = HashMap::new();
+        map.insert(2i64, "Titres bonus".to_string());
+        let out = attach_grouping(items, &map);
+        assert!(out[0].get("grouping").is_none());
+        assert_eq!(out[1]["grouping"], "Titres bonus");
+    }
+
+    /// Une entrée pour une piste absente de l'album ne contamine personne.
+    #[test]
+    fn attach_grouping_ignores_unknown_track_ids() {
+        let items = vec![track(1, "I. Allegro")];
+        let mut map = HashMap::new();
+        map.insert(99i64, "Autre album".to_string());
+        let out = attach_grouping(items, &map);
+        assert!(out[0].get("grouping").is_none());
+    }
 }

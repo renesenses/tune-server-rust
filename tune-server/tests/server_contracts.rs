@@ -9,6 +9,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "collections_ordre_albums.rs"]
+mod collections_ordre_albums;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "http_client_seam.rs"]
@@ -17,6 +19,8 @@ mod http_client_seam;
 mod integration;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
+#[path = "licence_grace_visible.rs"]
+mod licence_grace_visible;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]
@@ -25,10 +29,14 @@ mod output_provider_seam;
 mod paroles_source_lrclib;
 #[path = "rbac.rs"]
 mod rbac;
+#[path = "reidentification_album.rs"]
+mod reidentification_album;
 #[path = "rustsec_allowlists.rs"]
 mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "support_relais_marquer_lu.rs"]
+mod support_relais_marquer_lu;
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
 #[path = "uptime_process_scope.rs"]

@@ -836,6 +836,14 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         })
     });
 
+    // Grâce hors ligne (#1999) : décrit la fenêtre de revalidation déjà en
+    // vigueur, pour que l'utilisateur sache qu'il est couvert, depuis quand et
+    // jusqu'à quand — au lieu de découvrir la dégradation le jour où une
+    // fonction cesse de répondre. Purement descriptif : ne change ni la durée,
+    // ni l'instant d'expiration, ni ce qui est désactivé. `null` quand la
+    // question ne se pose pas (Free, ou abonnement réellement échu).
+    let offline_grace = tune_core::license::offline_grace(&ls);
+
     Json(json!({
         "tier": ls.tier,
         "license_key": ls.license_key,
@@ -845,6 +853,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
         "features": features,
         "zone_limit": zone_limit,
         "session_conflict": session_conflict,
+        "offline_grace": offline_grace,
     }))
 }
 
