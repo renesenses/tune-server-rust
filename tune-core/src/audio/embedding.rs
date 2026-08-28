@@ -753,6 +753,42 @@ fn poser_pause(raison: PauseAcoustique) {
     PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Cette pause doit-elle relâcher la session ONNX ?
+///
+/// Oui pour chacune : le modèle CLAP et la session ORT pèsent ~1,2 Go
+/// résidents (mesuré sur .18 le 28/08/2026, v0.9.117 — RSS 195 Mo au
+/// démarrage, 1388 Mo au premier lot), et une passe à l'arrêt ne s'en sert
+/// pas. Seul `Aucune` garde la session : c'est l'état où la passe travaille.
+///
+/// Le `match` est exhaustif et **sans joker**, délibérément : ajouter une
+/// cause de pause devient une erreur de compilation tant que la question
+/// n'est pas tranchée ici, au lieu d'une rétention silencieuse de 1,2 Go
+/// découverte des semaines plus tard sur la machine d'un testeur.
+fn pause_libere_session(pause: PauseAcoustique) -> bool {
+    match pause {
+        PauseAcoustique::Aucune => false,
+        PauseAcoustique::Lecture
+        | PauseAcoustique::Thermique
+        | PauseAcoustique::Memoire
+        | PauseAcoustique::NonPremium => true,
+    }
+}
+
+/// Entrer en pause : publier la raison pour l'interface **et** relâcher la
+/// session ONNX quand cette pause l'exige.
+///
+/// Les deux gestes tiennent dans une seule fonction parce que les séparer est
+/// exactement ce qui avait laissé trois `continue` garder le modèle : la pause
+/// « non premium » relâchait, les pauses lecture, thermique et budget mémoire
+/// non — alors que la pause lecture est la plus longue des quatre, puisqu'elle
+/// dure aussi longtemps que quelqu'un écoute.
+fn entrer_en_pause<T>(embedder: &mut Option<T>, pause: PauseAcoustique) {
+    poser_pause(pause);
+    if pause_libere_session(pause) {
+        *embedder = None;
+    }
+}
+
 /// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
 pub fn pause_acoustique() -> PauseAcoustique {
     match PAUSE_ACOUSTIQUE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1002,10 +1038,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         "audio_embed_requires_premium — l'analyse acoustique est réservée au premium ; le réglage reste actif et la passe reprendra dès qu'une licence sera validée"
                     );
                 }
-                poser_pause(PauseAcoustique::NonPremium);
                 // On relâche aussi la session ONNX : inutile de garder ~300 Mo
                 // résidents pour une passe qui ne tournera pas.
-                embedder = None;
+                entrer_en_pause(&mut embedder, PauseAcoustique::NonPremium);
                 tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                 continue;
             }
@@ -1088,7 +1123,21 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
                         );
                     }
-                    poser_pause(PauseAcoustique::Lecture);
+                    // On relâche la session ONNX, exactement comme la pause
+                    // « non premium » plus haut, et pour la même raison :
+                    // inutile de garder le modèle résident pour une passe qui
+                    // ne tournera pas. C'est ici que ça compte le plus, parce
+                    // que c'est la pause la plus LONGUE — elle dure tant que
+                    // quelqu'un écoute, soit des heures.
+                    //
+                    // Mesuré sur .18 le 28/08/2026 (v0.9.117) : balayage en
+                    // retrait depuis 09:15, RSS encore figé à 2345 Mo à 09:39,
+                    // dont ~1,2 Go de modèle CLAP tenus pour rien pendant que
+                    // la seule activité était la lecture d'une radio. Le
+                    // rechargement coûte quelques secondes, une seule fois,
+                    // quand la musique s'arrête — et la passe est déjà conçue
+                    // pour reconstruire sa session (`embedder.is_none()`).
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Lecture);
                     tokio::time::sleep(std::time::Duration::from_secs(
                         crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
                     ))
@@ -1104,7 +1153,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // la mémoire, une analyse facultative ne doit jamais mettre la
                 // machine en danger — et ici le danger est physique.
                 if thermal.should_hold("acoustique") {
-                    poser_pause(PauseAcoustique::Thermique);
+                    // Même règle : une machine qui a trop chaud n'a pas non
+                    // plus besoin de porter la session ONNX en attendant.
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Thermique);
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
                 }
@@ -1135,7 +1186,13 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
                         );
                     }
-                    poser_pause(PauseAcoustique::Memoire);
+                    // La plus perverse des trois : la passe s'arrête PARCE QUE
+                    // la mémoire manque, et gardait justement ce qui la
+                    // consomme. Relâcher ici rend au système le plus gros
+                    // poste du processus, ce qui est précisément la condition
+                    // pour que `MIN_AVAILABLE_MB` redevienne atteignable et
+                    // que la passe puisse reprendre.
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Memoire);
                     tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                     continue;
                 }
@@ -1268,15 +1325,80 @@ mod tests {
         assert_eq!(PauseAcoustique::default().nom(), None);
     }
 
+    /// L'état de pause est un atomique de processus : deux tests qui
+    /// l'écrivent en parallèle se voleraient mutuellement leur assertion.
+    static ETAT_PAUSE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// La raison posée est celle qu'on relit, et elle s'efface.
     #[test]
     fn la_raison_posee_est_celle_quon_relit() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
         poser_pause(PauseAcoustique::Thermique);
         assert_eq!(pause_acoustique(), PauseAcoustique::Thermique);
         poser_pause(PauseAcoustique::Lecture);
         assert_eq!(pause_acoustique().nom(), Some("playback"));
         poser_pause(PauseAcoustique::Aucune);
         assert_eq!(pause_acoustique().nom(), None);
+    }
+
+    /// **Toute** cause de pause relâche la session ONNX ; seul « la passe
+    /// travaille » la garde.
+    ///
+    /// Le défaut corrigé le 28/08/2026 : trois des quatre pauses gardaient le
+    /// modèle CLAP résident (~1,2 Go mesurés sur .18), dont la pause LECTURE,
+    /// qui dure aussi longtemps que quelqu'un écoute de la musique. Seule la
+    /// pause « non premium » relâchait.
+    #[test]
+    fn toute_pause_relache_la_session_onnx() {
+        assert!(
+            !pause_libere_session(PauseAcoustique::Aucune),
+            "au travail, la passe doit GARDER sa session : la relâcher à chaque tour rechargerait le modèle en boucle"
+        );
+        for raison in [
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+        ] {
+            assert!(
+                pause_libere_session(raison),
+                "{raison:?} : une passe à l'arrêt ne doit pas garder ~1,2 Go de modèle résident"
+            );
+        }
+    }
+
+    /// Et le geste suit la règle : `entrer_en_pause` repose bien la valeur,
+    /// tout en publiant la raison pour l'interface.
+    #[test]
+    fn entrer_en_pause_repose_la_session_et_publie_la_raison() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut session = Some(());
+        entrer_en_pause(&mut session, PauseAcoustique::Aucune);
+        assert!(
+            session.is_some(),
+            "sans pause, la session doit survivre au passage"
+        );
+
+        for raison in [
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+        ] {
+            let mut session = Some(());
+            entrer_en_pause(&mut session, raison);
+            assert!(
+                session.is_none(),
+                "{raison:?} : la session ONNX doit être relâchée en entrant en pause"
+            );
+            assert_eq!(
+                pause_acoustique(),
+                raison,
+                "{raison:?} doit rester visible dans l'interface"
+            );
+        }
+        poser_pause(PauseAcoustique::Aucune);
     }
 
     use super::*;
