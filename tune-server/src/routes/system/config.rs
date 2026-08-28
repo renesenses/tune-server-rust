@@ -101,7 +101,11 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn get_config(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
@@ -139,6 +143,14 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         // Le mode PURE impose-t-il le volume à 100 % ? Inactif par défaut :
         // cocher « Audiophile » ne doit pas changer le niveau sans prévenir.
         ("audiophile_lock_volume", json!(false)),
+        // Contribution de metadonnees enrichies (bios, images d'artistes) au
+        // cloud communautaire. Opt-in STRICT : rien ne sort tant que
+        // l'utilisateur n'a pas coche. Le libelle et la phrase qui dit ce qui
+        // part sont plus bas, dans `community_contribution`.
+        (
+            tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY,
+            json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT),
+        ),
         ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
@@ -185,6 +197,42 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
         .unwrap_or(false);
     config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
+    // Consentement de contribution. Deux valeurs, et elles ne disent pas la
+    // meme chose :
+    //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
+    //     base avec le meme lecteur que le serveur (`est_vrai`). C'est l'etat
+    //     de la bascule. Passer par la carte `config` deja re-typee ferait
+    //     diverger les deux — `"1"` y devient un nombre, qu'aucun `as_bool` ne
+    //     rattrape, et l'ecran afficherait « non » sur un reglage pose a oui.
+    //   - `effective` : ce qui va REELLEMENT se passer, `TUNE_TELEMETRY`
+    //     compris. Un exploitant qui a coupe la telemetrie a l'echelle de la
+    //     machine ferme la porte pour tout le monde ; sans cette seconde
+    //     valeur, l'ecran promettrait un envoi qui n'aura jamais lieu.
+    let contribution_enabled = settings
+        .get(tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY)
+        .ok()
+        .flatten()
+        .map(|v| tune_core::cloud::consent::est_vrai(&v))
+        .unwrap_or(tune_core::cloud::consent::CONTRIBUTION_DEFAULT);
+    let contribution_effective = tune_core::cloud::consent::contribution_autorisee(&settings);
+    config.insert(
+        tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY.to_string(),
+        json!(contribution_enabled),
+    );
+    // Le libelle et la phrase d'explication voyagent avec le reglage : le
+    // client web n'a pas a re-decrire ce qui part, et les deux ne peuvent pas
+    // diverger. Traduit dans la langue choisie dans l'app (Accept-Language).
+    config.insert(
+        "community_contribution".to_string(),
+        json!({
+            "setting_key": tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY,
+            "enabled": contribution_enabled,
+            "effective": contribution_effective,
+            "default": tune_core::cloud::consent::CONTRIBUTION_DEFAULT,
+            "label": crate::i18n::t(&lang, "settings.communityContribution.label"),
+            "description": crate::i18n::t(&lang, "settings.communityContribution.description"),
+        }),
+    );
     // Derived boolean: web client checks discogs_token_set to display badge.
     // Check both the DB setting and the env/toml fallback so that users
     // who set TUNE_DISCOGS_TOKEN in .env or tune.toml also see it as configured.
