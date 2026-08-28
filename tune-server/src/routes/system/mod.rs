@@ -62,6 +62,9 @@ pub fn router() -> Router<AppState> {
         .route("/scan/report", get(scan::scan_report))
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
+        // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit
+        // que leur present (#2080). Survit au redemarrage, borne en taille.
+        .route("/task-runs", get(diagnostics::task_runs))
         .route("/restart", post(config::restart))
         .route("/stop", post(config::stop))
         .route("/database/status", get(database::database_status))

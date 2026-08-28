@@ -1291,6 +1291,65 @@ DELETE FROM radio_stations WHERE url = 'http://stream.live.vc.bbcmedia.co.uk/bbc
 DELETE FROM radio_stations WHERE url = 'https://online.jamminvibezradio.com/listen/caribbean/live.flac';
 ",
     },
+    Migration {
+        version: 87,
+        name: "task_runs",
+        // Registre des executions automatisees (#2080).
+        //
+        // Tune lance seul une vingtaine de passes — scan de demarrage,
+        // ReplayGain, enrichissement, battement de coeur, nettoyages. Aucune ne
+        // laisse de trace INTERROGEABLE : le journal defile, et quand un
+        // utilisateur ecrit « ca n'a rien fait », on ne peut ni le confirmer ni
+        // l'infirmer. C'est cette table qui repond.
+        //
+        // Ce n'est PAS un journal de plus. Trois proprietes la separent d'une
+        // ligne `info!` :
+        //
+        //   * elle survit au redemarrage (donc on peut comparer deux boots) ;
+        //   * elle est bornee (rentention par passe + par age, cf.
+        //     `task_run_repo`) — une table d'observabilite qui grossit sans fin
+        //     finit par couter plus cher que ce qu'elle observe ;
+        //   * elle ne contient ni chemin, ni cle, ni jeton : des compteurs et
+        //     des verdicts. `detail` passe par un filtre avant l'ecriture.
+        //
+        // PAS DE COLONNE `id`. La cle naturelle (boot_id, task, seq) EST la
+        // cle primaire — meme raison que `favorite_facets` (migration 85) :
+        // toute colonne `id` impose la divergence AUTOINCREMENT / BIGSERIAL, et
+        // la bascule SQLite -> PostgreSQL l'a deja payee cher (#1706).
+        //
+        // `boot_id` est l'identite d'une INCARNATION du processus, tiree une
+        // fois au demarrage. C'est elle qui rend detectable la passe orpheline
+        // (#2002) : au demarrage, toute ligne encore `en_cours` est fermee en
+        // `interrompu`, puisque aucune passe ne survit au processus qui la
+        // portait.
+        //
+        // `started_at` / `finished_at` sont des horodatages ABSOLUS UTC
+        // ISO-8601, jamais un compteur relatif : un « il y a 3 heures » n'est
+        // pas verifiable, une date l'est (lecon de `uptime_seconds`, PR #2632).
+        //
+        // `duration_ms` est mesure sur une horloge MONOTONE cote Rust, pas par
+        // difference des deux dates : un changement d'heure systeme pendant la
+        // passe rendrait la soustraction absurde (negative, meme).
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS, sans ALTER,
+        // donc sans le piege « duplicate column name » sur une base neuve.
+        up: "
+CREATE TABLE IF NOT EXISTS task_runs (
+    boot_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms INTEGER,
+    outcome TEXT NOT NULL,
+    items INTEGER,
+    detail TEXT,
+    PRIMARY KEY (boot_id, task, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2752,6 +2811,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "favorite_facets",
         include_str!("../../migrations/postgres/038_favorite_facets.sql"),
     ),
+    // Registre des executions automatisees (#2080). Pendant de la migration
+    // SQLite 87. Sans cette entree, la route d'observabilite rendrait une
+    // erreur SQL sur tout le parc PostgreSQL — .15, .18, Docker.
+    (
+        39,
+        "task_runs",
+        include_str!("../../migrations/postgres/039_task_runs.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3940,7 +4007,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 38, "latest PG migration must be 38");
+        assert_eq!(pg_latest_version(), 39, "latest PG migration must be 39");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -4389,6 +4456,65 @@ mod tests {
                 sql.display()
             );
         }
+    }
+
+    /// Le registre des exécutions (#2080) doit exister sur les QUATRE chemins
+    /// par lesquels une base arrive à la vie. Trois suffiraient à faire croire
+    /// que c'est fait.
+    ///
+    /// Le chemin qu'on oublie est le troisième : une base créée par
+    /// l'assistant SQLite → PostgreSQL enregistre `schema_version = 99` et ne
+    /// rejoue **jamais** les scripts PG numérotés. Sur ces bases-là, la
+    /// migration 039 ne s'appliquera pas — ni maintenant, ni jamais. C'est
+    /// exactement la dérive documentée sur `lyrics_cache`.
+    ///
+    /// Ce test lit les SOURCES : il vaut donc quel que soit le jeu de features
+    /// compilé, `PG_MIGRATIONS` vivant derrière `#[cfg(feature = "postgres")]`.
+    #[test]
+    fn le_registre_des_executions_existe_sur_les_quatre_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // 1. Migration SQLite — les bases SQLite existantes ET neuves (le
+        //    runner tourne à chaque démarrage).
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == "task_runs"),
+            "la migration SQLite `task_runs` a disparu"
+        );
+
+        // 2. Migration PG numérotée — les bases PostgreSQL sur la piste
+        //    numérotée (.15, .18, Docker).
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains("039_task_runs.sql"),
+            "`task_runs` existe côté SQLite mais n'est pas enregistrée dans \
+             PG_MIGRATIONS"
+        );
+        assert!(
+            racine
+                .join("migrations/postgres/039_task_runs.sql")
+                .exists(),
+            "l'entrée PG_MIGRATIONS pointe sur un fichier absent"
+        );
+
+        // 3. `PG_FULL_SCHEMA` — une base montée d'un bloc par la bascule
+        //    SQLite → PostgreSQL, qui ne rejouera aucun script numéroté.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(
+            pg_neuf.contains("CREATE TABLE IF NOT EXISTS task_runs"),
+            "`task_runs` manque à PG_FULL_SCHEMA : une base créée par la \
+             bascule SQLite → PostgreSQL porte schema_version 99 et ne \
+             recevrait JAMAIS la migration 039"
+        );
+
+        // 4. `ENSURE_TABLES` — le rattrapage rejoué à CHAQUE démarrage, seul
+        //    filet pour une base déjà convertie AVANT cette version.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(
+            ensure.contains("CREATE TABLE IF NOT EXISTS task_runs"),
+            "`task_runs` manque à ENSURE_TABLES : les bases PostgreSQL déjà \
+             converties (schema_version 99) resteraient sans registre pour \
+             toujours"
+        );
     }
 }
 

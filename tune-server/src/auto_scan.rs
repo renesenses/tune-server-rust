@@ -228,6 +228,21 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
     let scan_done_clone = scan_done.clone();
     tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
+
+        // Registre des executions automatisees (#2080). Ouvert AVANT toute
+        // sortie anticipee : « aucun dossier configure » et « un scan tenait
+        // deja le verrou » sont deux reponses valables a « le scan n'a rien
+        // fait », et un registre qui ne les consignait pas laisserait ces deux
+        // cas indistinguables d'un scan jamais lance.
+        //
+        // Le temoin ferme la ligne sur TOUS les chemins de sortie : `terminer`
+        // en fin de scan, et son `Drop` en `interrompu` partout ailleurs — y
+        // compris le deroulement d'une panique. Il ne couvre pas l'extinction
+        // du processus ; c'est la cloture des orphelines au demarrage suivant
+        // qui s'en charge (`startup::ouvrir_le_registre_des_executions`).
+        let suivi = tune_core::db::task_run_repo::TaskRunRepo::with_backend(db.clone())
+            .ouvrir(tune_core::db::task_run_repo::TACHE_SCAN_DEMARRAGE);
+
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let raw_dirs: Vec<String> = settings
             .get("music_dirs")
@@ -244,6 +259,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            suivi.rien_a_faire(Some("aucun dossier de musique configure"));
             // Mark the scan "done" even on this early exit: the file watcher
             // waits on this flag before it starts watching.
             scan_done_clone.store(true, Ordering::Release);
@@ -256,6 +272,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // et purges concurrentes.
         let Some(scan_lease) = crate::routes::system::scan::try_begin_scan() else {
             info!("auto_scan_skipped_already_scanning");
+            suivi.rien_a_faire(Some("un autre scan tenait deja le verrou"));
             scan_done_clone.store(true, Ordering::Release);
             return;
         };
@@ -308,6 +325,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                // Le message d'erreur du moteur peut porter un chemin de base :
+                // on n'inscrit que le motif, pas `e`.
+                suivi.echec("lecture des pistes existantes impossible");
                 scan_done_clone.store(true, Ordering::Release);
                 return;
             }
@@ -838,6 +858,26 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         }
 
         event_bus.emit("library.scan.completed", report);
+
+        // Le compteur du registre est ce qui a CHANGE, pas ce qui a ete vu :
+        // un scan qui relit 40 000 fichiers inchanges n'a rien fait, et
+        // inscrire 40 000 le ferait passer pour un gros travail.
+        let modifies = inserted as i64 + updated as i64 + pistes_supprimees;
+        let verdict = if modifies == 0 {
+            tune_core::db::task_run_repo::Verdict::RienAFaire
+        } else {
+            tune_core::db::task_run_repo::Verdict::Succes
+        };
+        // Que des compteurs : ni chemin, ni nom de dossier. `missing_dirs` et
+        // `failed_paths` sont des chemins de l'utilisateur — ils restent dans
+        // le rapport de scan, jamais dans le registre.
+        let detail = format!(
+            "{total_discovered} vus, {inserted} ajoutees, {updated} mises a jour, \
+             {pistes_supprimees} retirees, {} dossiers absents",
+            missing_dirs.len()
+        );
+        suivi.terminer(verdict, Some(modifies), Some(&detail));
+
         scan_done_clone.store(true, Ordering::Release);
     });
     scan_done
@@ -924,6 +964,73 @@ fn settle_partition(
         }
     }
     (ready, pending)
+}
+
+#[cfg(test)]
+mod registre_du_scan_tests {
+    /// Le scan de demarrage inscrit son execution au registre (#2080) sur
+    /// TOUTES ses sorties. Les deux sorties anticipees comptent autant que la
+    /// normale : « aucun dossier configure » et « un scan tenait deja le
+    /// verrou » sont precisement les deux reponses a « le scan n'a rien fait »,
+    /// et sans elles ce cas se lirait comme un scan jamais lance.
+    #[test]
+    fn le_scan_de_demarrage_ferme_sa_ligne_sur_toutes_ses_sorties() {
+        let source = include_str!("auto_scan.rs");
+        let corps = source
+            .split("pub fn spawn_auto_scan")
+            .nth(1)
+            .expect("spawn_auto_scan introuvable")
+            .split("\n    scan_done\n}")
+            .next()
+            .expect("fin de spawn_auto_scan introuvable");
+
+        assert_eq!(
+            corps.matches("TACHE_SCAN_DEMARRAGE").count(),
+            1,
+            "une seule ouverture de ligne pour un scan"
+        );
+        assert_eq!(
+            corps.matches("suivi.rien_a_faire").count(),
+            2,
+            "les deux sorties anticipees (aucun dossier, verrou deja tenu) \
+             doivent chacune fermer la ligne"
+        );
+        assert_eq!(corps.matches("suivi.echec").count(), 1);
+        assert_eq!(corps.matches("suivi.terminer").count(), 1);
+    }
+
+    /// Le rapport de scan contient les chemins de l'utilisateur
+    /// (`missing_dirs`, `failed_paths`). Le registre, lui, ne doit porter que
+    /// des compteurs — il est fait pour etre colle dans un ticket.
+    #[test]
+    fn le_registre_du_scan_ne_recopie_aucun_chemin() {
+        let source = include_str!("auto_scan.rs");
+        let detail = source
+            .split("let detail = format!(")
+            .nth(1)
+            .expect("le detail du registre a change de forme")
+            .split(");")
+            .next()
+            .unwrap();
+
+        for interdit in [
+            "missing_dirs.clone",
+            "failed_paths",
+            "error_dirs",
+            "music_dirs",
+            "file_path",
+            "report_path",
+        ] {
+            assert!(
+                !detail.contains(interdit),
+                "le detail inscrit au registre ne doit pas porter `{interdit}`"
+            );
+        }
+        assert!(
+            detail.contains("missing_dirs.len()"),
+            "seul le NOMBRE de dossiers absents est inscrit, jamais leur nom"
+        );
+    }
 }
 
 #[cfg(test)]

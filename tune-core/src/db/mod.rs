@@ -29,6 +29,8 @@ pub mod source_link_repo;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
 pub mod tag_repo;
+/// Registre des executions automatisees (#2080).
+pub mod task_run_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
 pub mod tx_holder;
