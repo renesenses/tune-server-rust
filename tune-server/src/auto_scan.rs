@@ -411,13 +411,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    if db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
-                        // Se nommer : tout `write_tx` concurrent echouera tant
-                        // que ce lot tient la connexion, et sans cette
-                        // etiquette son message n'apprend rien (#1997).
-                        tune_core::db::tx_holder::declarer("scan:auto");
-                    }
+                let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
+                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                    // Se nommer : tout `write_tx` concurrent echouera tant
+                    // que ce lot tient la connexion, et sans cette
+                    // etiquette son message n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:auto");
                 }
 
                 importer.begin_batch(&batch);
@@ -528,12 +528,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     }
                 }
 
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                if is_sqlite {
                     db.execute("COMMIT", &[]).ok();
                     // Liberer meme si le COMMIT a echoue : une etiquette
                     // perimee accuserait un innocent au prochain incident.
                     tune_core::db::tx_holder::liberer();
                 }
+                drop(sqlite_write_guard);
 
                 // Emit scan progress after each batch (throttled every other
                 // batch or 2s), mirroring the manual scan's payload/phase.
