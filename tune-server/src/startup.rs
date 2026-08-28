@@ -309,8 +309,16 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
-    ["enrich_all_status", "artist_artwork_enrich_result"];
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+    "enrich_all_status",
+    "artist_artwork_enrich_result",
+    // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
+    // de passe laisserait `status: "running"` en base pour toujours et le
+    // bouton de relance grisé — exactement le défaut #2002. La constante
+    // plutôt que le littéral : renommer la clé d'un côté ne peut plus
+    // désynchroniser l'autre.
+    tune_core::library::lyrics_pass::SETTING_FILL_RESULT,
+];
 
 /// Les mêmes, dans leur forme dégradée : une chaîne nue, écrite `running` et
 /// jamais relue par personne aujourd'hui. On les neutralise quand même — un

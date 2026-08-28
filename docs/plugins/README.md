@@ -162,7 +162,38 @@ loader.start_event_dispatch(); // wires EventBus -> on_event
 | Method             | Default            | Purpose                                     |
 |--------------------|--------------------|---------------------------------------------|
 | `config_schema`    | `{}`               | JSON schema surfaced by `GET /api/v1/plugins` |
+| `default_enabled`  | `true`             | `false` = opt-in: dormant until installed    |
+| `catalogued`       | `true`             | `false` = never offered by the plugin manager |
 | `protocol_version` | the SDK's constant | ABI generation this plugin was built against |
+
+### `default_enabled` vs `catalogued`
+
+These two answer different questions, and confusing them is what produced
+[#2090](https://github.com/renesenses/tune-server-rust/issues/2090).
+
+* `default_enabled() == false` makes a plugin **opt-in**: `setup_all` leaves it
+  dormant until `plugin_{name}_installed == "true"`.  That is exactly what makes
+  it **visible** in the manager, as an "Install" button.
+* `catalogued() == false` takes it **out of the catalogue**: the manager never
+  offers it.  The plugin is still compiled, still tested, and still loads if the
+  install setting is written by hand — it simply stops promising.
+
+A plugin whose routes answer but that no client screen can reach needs the
+second, not the first.  Offering "Install" on a feature nothing exposes spends
+the user's trust and returns nothing: they install, they restart as asked, and
+nothing appears.
+
+The filter applies to the *offer* only.  A plugin that is actually **running**
+stays listed whatever `catalogued` says: hiding it would make it impossible to
+uninstall, and would misreport what the machine is doing.
+
+**Uncatalogued today** (both are compiled into every published binary — see the
+`--features` lines in `release.yml` — and both keep their tests):
+
+| Plugin    | Why it is not offered |
+|-----------|-----------------------|
+| `dj`      | **Not ready.** `HostServices` carries only the DB backend — no `PlaybackManager`, no output registry — so the plugin has no access to the audio path at all. 11 of its 13 routes change nothing: 7 echo their argument without writing anything, `/sync-tempo` answers `"tempo sync not yet implemented"`, and `/enable` `/disable` `/status` only write and re-read `dj_enabled_{zone}` — a setting those three handlers are the sole readers of. `/status` reports decks permanently `loaded: false`, contradicting `/load` one call earlier. Only `/waveform` and `/analyze` do real work. |
+| `karaoke` | **Ready, but redundant — and narrower.** All three routes work. The product already ships karaoke and it is already reachable: the lyrics panel offers a "Karaoke" toggle and highlights the current line itself, from the same core `/lyrics/{id}` data this plugin reuses. Worse, `/now/{zone_id}` gives up when the current track has no library id, while the client falls back to `/lyrics/by-meta` and so keeps karaoke working on streaming. Installing it would buy a second, smaller door — at the cost of an install and a restart. `/now/{zone_id}` keeps a use of its own for a client with no position loop; re-catalogue it when such a client exists. |
 
 `PLUGIN_PROTOCOL_VERSION` is **enforced**: `setup_all` refuses a plugin whose
 major differs, or whose minor is newer than the server's.  With plugins

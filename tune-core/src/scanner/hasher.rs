@@ -37,9 +37,8 @@ mod tests {
 
     #[test]
     fn hash_file() {
-        let dir = std::env::temp_dir().join("tune_hash_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.bin");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.bin");
         {
             let mut f = File::create(&path).unwrap();
             let data = vec![42u8; 256 * 1024]; // 256 KB
@@ -50,16 +49,11 @@ mod tests {
 
         let hash2 = compute_audio_hash(&path).unwrap();
         assert_eq!(hash, hash2);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
     fn hash_empty_file() {
-        let path = std::env::temp_dir().join("tune_hash_empty.bin");
-        File::create(&path).unwrap();
-        assert!(compute_audio_hash(&path).is_none());
-        std::fs::remove_file(&path).ok();
+        let empty = tempfile::Builder::new().suffix(".bin").tempfile().unwrap();
+        assert!(compute_audio_hash(empty.path()).is_none());
     }
 }

@@ -151,6 +151,9 @@ const MIGRATION_TABLES: &[&str] = &[
     "tags",
     "item_tags",
     "favorites",
+    // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
+    // seraient perdus à la bascule SQLite → PostgreSQL.
+    "favorite_facets",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -478,6 +481,17 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     email TEXT,
     password_hash_v2 TEXT
+);
+
+-- Favoris de VALEUR de facette (label…), #2442. Pas de colonne `id` : la clé
+-- naturelle est la clé primaire. `profile_id` en TEXT comme partout ici (la
+-- copie lie tout en texte) ; la migration 036 la ramène en BIGINT après coup.
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, facet, value)
 );
 
 CREATE TABLE IF NOT EXISTS favorites (
