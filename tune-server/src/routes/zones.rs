@@ -797,28 +797,55 @@ pub fn build_signal_path_pub(
 /// court-circuite tout traitement, donc un profil enregistré n'y change rien —
 /// puis profil activé ET gains audibles. Sans ce miroir, l'indicateur
 /// bit-perfect et le chemin audio répondraient à deux questions différentes.
+fn active_zone_eq_profile(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<tune_core::audio::eq::EqProfile> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let profile = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
+    if !profile.enabled {
+        return None;
+    }
+    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
+    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
+        .is_enabled()
+        .then_some(profile)
+}
+
 fn zone_eq_alters_signal(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
 ) -> bool {
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
-        return false;
+    active_zone_eq_profile(backend, zone_id).is_some()
+}
+
+/// Description du traitement EQ réellement configuré, y compris le headroom
+/// automatique. Le limiteur est nommé comme absent : le pré-gain réserve la
+/// marge des boosts, il ne faut plus confondre l'EQ avec une protection de crête.
+fn zone_eq_step_description(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<String> {
+    let profile = active_zone_eq_profile(backend, zone_id)?;
+    let left = profile.automatic_headroom_db(0);
+    let right = profile.automatic_headroom_db(1);
+    if (left - right).abs() < 0.01 {
+        Some(format!(
+            "EQ actif (pré-gain auto {left:.1} dB, sans limiteur)"
+        ))
+    } else {
+        Some(format!(
+            "EQ actif (pré-gain auto G {left:.1} dB / D {right:.1} dB, sans limiteur)"
+        ))
     }
-    let Some(profile) = settings
-        .get(&format!("zone_{zone_id}_eq_profile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())
-    else {
-        return false;
-    };
-    if !profile.enabled {
-        return false;
-    }
-    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
-    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2).is_enabled()
 }
 
 /// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
@@ -1048,6 +1075,7 @@ fn build_signal_path(
     let dsp_enabled = runtime_signal_path
         .map(|status| status.dsp == OutputDspState::Applied)
         .unwrap_or(configured_dsp_enabled);
+    let eq_step_description = zone_eq_step_description(&backend, zid);
 
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
@@ -1428,7 +1456,10 @@ fn build_signal_path(
     // qui avait effectivement atteint le ring Windows.
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
-            OutputDspState::Applied => Some(("DSP appliqué", false)),
+            OutputDspState::Applied => Some((
+                eq_step_description.as_deref().unwrap_or("DSP appliqué"),
+                false,
+            )),
             OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
             OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
             OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
@@ -1444,7 +1475,7 @@ fn build_signal_path(
     } else if dsp_enabled {
         steps.push(json!({
             "name": "DSP",
-            "description": "EQ/DSP active",
+            "description": eq_step_description.as_deref().unwrap_or("EQ/DSP active"),
             "bit_perfect": false,
         }));
     }
@@ -3707,6 +3738,52 @@ mod signal_path_tests {
             Some("FLAC 44kHz/16bit"),
             "aucun débit ne doit apparaître sur un flux sans perte"
         );
+    }
+
+    /// #2212 — le chemin du signal nomme le pré-gain qui prévient les overs,
+    /// et ne présente plus l'ancien saturateur implicite comme une protection.
+    #[test]
+    fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
+        let (backend, zone) = dlna_zone();
+        let zone_id = zone.id.unwrap();
+        let profile = tune_core::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![
+                tune_core::audio::eq::EqBandSpec {
+                    gain: 6.0,
+                    channel: None,
+                    ..Default::default()
+                },
+                tune_core::audio::eq::EqBandSpec {
+                    gain: 3.0,
+                    channel: Some(0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        SettingsRepo::with_backend(backend.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&profile).unwrap(),
+            )
+            .unwrap();
+
+        let sp = build_signal_path(
+            &alac_hires_playing(),
+            &zone,
+            &backend,
+            Some("Marantz"),
+            "",
+            Some(&wire("alac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "DSP").as_deref(),
+            Some("EQ actif (pré-gain auto G -9.0 dB / D -6.0 dB, sans limiteur)")
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
     }
 
     /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la
