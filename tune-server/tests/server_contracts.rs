@@ -11,6 +11,8 @@ mod auth_security;
 mod bump_natifs_android;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "favoris_facettes_routes.rs"]
+mod favoris_facettes_routes;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]
