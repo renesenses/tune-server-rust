@@ -200,6 +200,23 @@
         { "name": "WXC-50", "quirks": {} },
         { "name": "WXA-50", "quirks": {} }
       ]
+    },
+    {
+      "name": "NAD",
+      "models": [
+        { "name": "C 700", "quirks": {} },
+        { "name": "M10", "quirks": {} },
+        { "name": "M10 V2", "quirks": {} },
+        { "name": "M10 V3", "quirks": {} },
+        { "name": "M33", "quirks": {} },
+        { "name": "M66", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Samsung",
+      "models": [
+        { "name": "S95B", "quirks": {} }
+      ]
     }
   ]
 }

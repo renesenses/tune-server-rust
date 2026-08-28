@@ -205,6 +205,88 @@ mod tests {
         }
     }
 
+    /// Aucun identifiant en double, marque comme modèle.
+    ///
+    /// Ce n'est pas cosmétique : [`find_model`] résout par `find()`, donc sur
+    /// le PREMIER élément qui correspond. Un doublon masquerait silencieusement
+    /// le second — et si les deux ne portent pas les mêmes quirks, c'est le
+    /// mauvais profil qui s'appliquerait à la lecture. La comparaison est
+    /// insensible à la casse, comme la recherche.
+    #[test]
+    fn catalog_has_no_duplicate_identifiers() {
+        let cat = catalog();
+
+        let mut seen_brands: Vec<String> = Vec::new();
+        for b in &cat.brands {
+            let key = b.name.trim().to_ascii_lowercase();
+            assert!(
+                !seen_brands.contains(&key),
+                "marque en double dans le catalogue: {}",
+                b.name
+            );
+            seen_brands.push(key);
+
+            let mut seen_models: Vec<String> = Vec::new();
+            for m in &b.models {
+                let mkey = m.name.trim().to_ascii_lowercase();
+                assert!(
+                    !seen_models.contains(&mkey),
+                    "modèle en double chez {}: {}",
+                    b.name,
+                    m.name
+                );
+                seen_models.push(mkey);
+            }
+        }
+
+        // La marque libre « Autre » ne doit jamais être catalogée : elle
+        // signifie « hors catalogue, aucun quirk ».
+        assert!(
+            !seen_brands.contains(&CUSTOM_BRAND.to_ascii_lowercase()),
+            "« {CUSTOM_BRAND} » est une saisie libre, pas une marque du catalogue"
+        );
+    }
+
+    /// NAD (BluOS) et Samsung (TV DLNA) — #2136.
+    ///
+    /// Les deux marques sont ajoutées avec des modèles *sourcés* et un profil
+    /// de quirks **neutre** : aucune capacité n'a été constatée sur ce matériel
+    /// (ni plafond de fréquence, ni contrainte 16-bit). Le test verrouille cette
+    /// neutralité — poser un quirk ici exige une mesure terrain, pas une
+    /// supposition, sinon le diagnostic de tous les possesseurs est faussé.
+    #[test]
+    fn nad_and_samsung_are_catalogued_without_invented_quirks() {
+        let names: Vec<&str> = catalog().brands.iter().map(|b| b.name.as_str()).collect();
+        for expected in ["NAD", "Samsung"] {
+            assert!(
+                names.contains(&expected),
+                "marque attendue absente: {expected}"
+            );
+        }
+
+        // Modèles réellement sélectionnables (une marque nue n'offre rien).
+        assert!(find_model("NAD", "M10 V3").is_some());
+        assert!(find_model("NAD", "C 700").is_some());
+        assert!(find_model("Samsung", "S95B").is_some());
+
+        // Profil neutre : l'appareil se comporte exactement comme aujourd'hui.
+        for (brand, model) in [
+            ("NAD", "C 700"),
+            ("NAD", "M10"),
+            ("NAD", "M10 V2"),
+            ("NAD", "M10 V3"),
+            ("NAD", "M33"),
+            ("NAD", "M66"),
+            ("Samsung", "S95B"),
+        ] {
+            assert_eq!(
+                quirks_for(brand, model),
+                DeviceQuirks::default(),
+                "{brand} {model} ne doit porter aucun quirk supposé"
+            );
+        }
+    }
+
     #[test]
     fn lookup_is_case_insensitive() {
         assert!(find_model("sonos", "one").is_some());
