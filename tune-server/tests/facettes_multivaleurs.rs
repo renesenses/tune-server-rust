@@ -393,6 +393,56 @@ async fn un_filtre_qui_ne_filtre_rien_ne_rend_pas_la_bibliotheque_entiere() {
     assert_eq!(total(&vide), 15);
 }
 
+/// Défaut PRÉEXISTANT trouvé en réécrivant `list_filtered`, corrigé ici parce
+/// qu'il vit dans la fonction réécrite : la recherche libre écrivait DEUX fois
+/// le même marqueur pour UNE seule valeur liée. Légal en PostgreSQL (`$1`
+/// répété), fatal en SQLite où chaque `?` anonyme consomme un indice —
+/// `rusqlite` refusait le compte et `GET /library/tracks?q=…` rendait une liste
+/// VIDE avec un total à zéro, sur l'installation par défaut.
+#[tokio::test]
+async fn la_recherche_libre_fonctionne_sur_sqlite() {
+    let (app, state) = bibliotheque();
+    state
+        .backend
+        .execute("INSERT INTO artists (name) VALUES ('Miles Davis')", &[])
+        .expect("insertion d'artiste");
+    let artiste = state.backend.last_insert_rowid();
+    state
+        .backend
+        .execute(
+            &format!(
+                "INSERT INTO tracks (title, artist_id, file_path, duration_ms, format, genre) \
+                 VALUES ('So What', {artiste}, '/music/so_what.flac', 200000, 'flac', 'Jazz')"
+            ),
+            &[],
+        )
+        .expect("insertion");
+
+    // Par le TITRE.
+    let (st, r) = get(&app, "/api/v1/library/tracks?limit=100&q=so%20what").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(total(&r), 1, "la recherche par titre ne doit pas rendre 0");
+
+    // Par le NOM D'ARTISTE — c'est la moitié de la requête que le second
+    // marqueur portait, donc celle que le défaut faisait tomber.
+    let (_, r) = get(&app, "/api/v1/library/tracks?limit=100&q=miles").await;
+    assert_eq!(
+        total(&r),
+        1,
+        "la recherche par artiste ne doit pas rendre 0"
+    );
+
+    // Et elle se combine en ET avec une facette multivaluée.
+    let (_, r) = get(
+        &app,
+        "/api/v1/library/tracks?limit=100&q=miles&format=flac&format=aiff",
+    )
+    .await;
+    assert_eq!(total(&r), 1);
+    let (_, r) = get(&app, "/api/v1/library/tracks?limit=100&q=miles&format=wav").await;
+    assert_eq!(total(&r), 0);
+}
+
 /// La virgule dans une valeur : la raison pour laquelle le format retenu est la
 /// clé RÉPÉTÉE et non une liste séparée par des virgules. Un genre « Jazz, Blues »
 /// doit rester UNE valeur, et continuer de filtrer.

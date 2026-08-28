@@ -885,11 +885,28 @@ impl TrackRepo {
         }
 
         if let Some(query) = f.q.as_deref().filter(|s| !s.is_empty()) {
+            // ⚠️ DEUX marqueurs, DEUX valeurs liées — et non un marqueur réutilisé.
+            //
+            // Défaut PRÉEXISTANT trouvé en réécrivant cette fonction : le même
+            // `{p}` était écrit deux fois pour une seule valeur empilée. En
+            // PostgreSQL `$1` répété est légal et lie la même valeur ; en SQLite
+            // chaque `?` anonyme consomme un indice, la requête en réclamait donc
+            // deux et n'en recevait qu'un. `rusqlite` refuse le compte
+            // (`InvalidParameterCount`), la requête échouait, et
+            // `GET /library/tracks?q=…` rendait une liste VIDE avec un total à
+            // zéro — sur SQLite, c'est-à-dire l'installation par défaut.
+            //
+            // Aucun appelant du client web ne passe `q` à cette route
+            // aujourd'hui (Oxygen filtre sa fenêtre côté navigateur, la
+            // recherche passe par `/library/search`), ce qui explique que
+            // personne ne l'ait signalé.
             let like = format!("%{query}%");
+            let p = ph.take();
+            let p2 = ph.take();
             conditions.push(format!(
-                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p})))",
-                p = ph.take()
+                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
             ));
+            owned_params.push(SqlValue::Text(like.clone()));
             owned_params.push(SqlValue::Text(like));
         }
 
