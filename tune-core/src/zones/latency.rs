@@ -4,96 +4,94 @@ use tracing::{info, warn};
 
 use crate::outputs::OutputTarget;
 
-const LOCAL_LATENCY_MS: i64 = 10;
 const DEFAULT_SAMPLES: usize = 5;
 const SAMPLE_DELAY_MS: u64 = 100;
 
-pub async fn measure_output_latency(output: &dyn OutputTarget, samples: usize) -> Option<i64> {
-    let output_type = output.output_type();
-    if output_type == "local" {
-        return Some(LOCAL_LATENCY_MS);
-    }
+/// Statistiques du trajet de COMMANDE vers une sortie.
+///
+/// Elles ne décrivent pas la latence audio : aucun timestamp de présentation,
+/// tampon matériel ni délai acoustique n'entre dans cette mesure (#2215).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRttStats {
+    pub samples: usize,
+    pub min_ms: i64,
+    pub p50_ms: i64,
+    pub p95_ms: i64,
+    pub p99_ms: i64,
+    pub max_ms: i64,
+    pub uncertainty_ms: i64,
+}
 
+fn percentile(sorted: &[i64], percent: usize) -> i64 {
+    let rank = (percent * sorted.len()).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn control_rtt_stats(mut samples: Vec<i64>) -> Option<ControlRttStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let min_ms = samples[0];
+    let max_ms = samples[samples.len() - 1];
+    Some(ControlRttStats {
+        samples: samples.len(),
+        min_ms,
+        p50_ms: percentile(&samples, 50),
+        p95_ms: percentile(&samples, 95),
+        p99_ms: percentile(&samples, 99),
+        max_ms,
+        uncertainty_ms: max_ms - min_ms,
+    })
+}
+
+pub async fn measure_control_rtt(
+    output: &dyn OutputTarget,
+    samples: usize,
+) -> Option<ControlRttStats> {
     let n = if samples == 0 {
         DEFAULT_SAMPLES
     } else {
         samples
     };
-    let mut latencies = Vec::with_capacity(n);
+    let mut round_trips = Vec::with_capacity(n);
 
-    for _ in 0..n {
+    for index in 0..n {
         let start = Instant::now();
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(2), output.get_status()).await;
         match result {
             Ok(Ok(_)) => {
                 let rtt_ms = start.elapsed().as_millis() as i64;
-                latencies.push(rtt_ms / 2);
+                round_trips.push(rtt_ms);
             }
             Ok(Err(e)) => {
-                warn!(error = %e, "latency_probe_error");
+                warn!(error = %e, "control_rtt_probe_error");
             }
             Err(_) => {
-                warn!("latency_probe_timeout");
+                warn!("control_rtt_probe_timeout");
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(SAMPLE_DELAY_MS)).await;
+        if index + 1 < n {
+            tokio::time::sleep(std::time::Duration::from_millis(SAMPLE_DELAY_MS)).await;
+        }
     }
 
-    if latencies.is_empty() {
-        return None;
-    }
-
-    latencies.sort();
-    let median = latencies[latencies.len() / 2];
-    let min = *latencies.first().unwrap();
-    let max = *latencies.last().unwrap();
+    let stats = control_rtt_stats(round_trips)?;
 
     info!(
         device = output.name(),
-        median_ms = median,
-        min_ms = min,
-        max_ms = max,
-        samples = latencies.len(),
-        "latency_measured"
+        p50_ms = stats.p50_ms,
+        p95_ms = stats.p95_ms,
+        p99_ms = stats.p99_ms,
+        min_ms = stats.min_ms,
+        max_ms = stats.max_ms,
+        uncertainty_ms = stats.uncertainty_ms,
+        samples = stats.samples,
+        "control_rtt_measured"
     );
 
-    Some(median)
-}
-
-pub async fn auto_calibrate(
-    leader: &dyn OutputTarget,
-    followers: &[&dyn OutputTarget],
-) -> Vec<(String, i64)> {
-    let leader_latency = match measure_output_latency(leader, DEFAULT_SAMPLES).await {
-        Some(l) => l,
-        None => {
-            warn!(device = leader.name(), "leader_latency_failed");
-            return Vec::new();
-        }
-    };
-
-    let mut results = Vec::new();
-    for &follower in followers {
-        let follower_latency = match measure_output_latency(follower, DEFAULT_SAMPLES).await {
-            Some(l) => l,
-            None => {
-                warn!(device = follower.name(), "follower_latency_failed");
-                continue;
-            }
-        };
-        let offset = leader_latency - follower_latency;
-        info!(
-            follower = follower.name(),
-            offset_ms = offset,
-            leader_ms = leader_latency,
-            follower_ms = follower_latency,
-            "latency_calibrated"
-        );
-        results.push((follower.device_id().to_string(), offset));
-    }
-
-    results
+    Some(stats)
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +139,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_latency_constant() {
-        assert_eq!(LOCAL_LATENCY_MS, 10);
+    fn le_rtt_de_controle_n_est_jamais_divise_en_latence_audio() {
+        let stats = control_rtt_stats(vec![20, 30, 40, 50, 60]).unwrap();
+
+        assert_eq!(stats.min_ms, 20);
+        assert_eq!(stats.p50_ms, 40);
+        assert_eq!(stats.p95_ms, 60);
+        assert_eq!(stats.p99_ms, 60);
+        assert_eq!(stats.max_ms, 60);
+        assert_eq!(stats.uncertainty_ms, 40);
+    }
+
+    #[test]
+    fn aucune_reponse_ne_devient_pas_une_mesure_a_zero() {
+        assert_eq!(control_rtt_stats(Vec::new()), None);
     }
 }
