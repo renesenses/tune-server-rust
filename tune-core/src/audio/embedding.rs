@@ -139,6 +139,47 @@ impl DecodeFailure {
     }
 }
 
+/// Résultat de la lecture d'une ligne candidate.
+///
+/// La requête garantit normalement un identifiant et un chemin non vide. On
+/// garde néanmoins la distinction : avec un identifiant, une ligne
+/// inexploitable peut être marquée comme traitée ; sans identifiant, aucune
+/// sentinelle ne peut être écrite et l'invariant de base doit être signalé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmbeddingCandidate {
+    Ready { track_id: i64, path: String },
+    MissingPath { track_id: i64 },
+    MissingTrackId,
+}
+
+fn embedding_candidate(row: &[SqlValue]) -> EmbeddingCandidate {
+    let Some(track_id) = row.first().and_then(SqlValue::as_i64) else {
+        return EmbeddingCandidate::MissingTrackId;
+    };
+    match row.get(1).and_then(SqlValue::as_string) {
+        Some(path) if !path.is_empty() => EmbeddingCandidate::Ready { track_id, path },
+        _ => EmbeddingCandidate::MissingPath { track_id },
+    }
+}
+
+fn batch_without_progress(selected: usize, processed: usize, yielded_to_playback: bool) -> bool {
+    selected > 0 && processed == 0 && !yielded_to_playback
+}
+
+fn stamp_embedding_processed(repo: &TrackMetadataRepo, track_id: i64) -> bool {
+    match repo.set(track_id, SENTINEL, MODEL_ID) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                track_id,
+                %error,
+                "audio_embed_sentinel_write_failed"
+            );
+            false
+        }
+    }
+}
+
 /// Samples fed to the model: 10 s @ 48 kHz mono, matching CLAP's fixed window.
 const WINDOW_SAMPLES: usize = 480_000;
 
@@ -434,6 +475,8 @@ pub async fn analyze_embedding_batch(
         .unwrap_or(0) as i64;
 
     let mut done = 0usize;
+    let mut invalid_rows = 0usize;
+    let mut yielded_to_playback = false;
     for r in &rows {
         // Playback can start mid-batch; yield at once so neither the decode
         // nor the inference competes with the audio pipeline (#1515) — the
@@ -443,15 +486,30 @@ pub async fn analyze_embedding_batch(
                 zone = %zone,
                 "audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch"
             );
+            yielded_to_playback = true;
             break;
         }
-        let track_id = match r.first().and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => continue,
-        };
-        let path = match r.get(1).and_then(|v| v.as_string()) {
-            Some(p) if !p.is_empty() => p,
-            _ => continue,
+        let (track_id, path) = match embedding_candidate(r) {
+            EmbeddingCandidate::Ready { track_id, path } => (track_id, path),
+            EmbeddingCandidate::MissingPath { track_id } => {
+                invalid_rows += 1;
+                warn!(
+                    track_id,
+                    "audio_embed_candidate_missing_path_marked_processed"
+                );
+                if stamp_embedding_processed(&repo, track_id) {
+                    done += 1;
+                }
+                continue;
+            }
+            EmbeddingCandidate::MissingTrackId => {
+                invalid_rows += 1;
+                warn!(
+                    row = ?r,
+                    "audio_embed_candidate_missing_track_id_unmarkable"
+                );
+                continue;
+            }
         };
 
         // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
@@ -526,8 +584,9 @@ pub async fn analyze_embedding_batch(
         // Stamp the sentinel with the current MODEL_ID whether or not it
         // produced a vector, so a broken or silent file drops out of the sweep
         // (until the next model bump) instead of being retried every pass.
-        let _ = repo.set(track_id, SENTINEL, MODEL_ID);
-        done += 1;
+        if stamp_embedding_processed(&repo, track_id) {
+            done += 1;
+        }
         // Relu à chaque fichier : baisser le débit pendant que l'analyse tourne
         // doit se sentir tout de suite, pas au prochain démarrage du serveur.
         let pause = per_file_pause_ms(&crate::db::settings_repo::SettingsRepo::with_backend(
@@ -538,12 +597,21 @@ pub async fn analyze_embedding_batch(
         }
     }
 
+    if batch_without_progress(rows.len(), done, yielded_to_playback) {
+        warn!(
+            selected = rows.len(),
+            invalid_rows, "audio_embedding_batch_without_progress"
+        );
+    }
+
     // Carry the memory figures on every batch. On 2026-08-10 the sweep's cost
     // had to be reconstructed after the fact from a 5-minute process-wide RSS
     // sampler, which is what let "memory rises while the pass runs" pass for a
     // cause (#1462). Now the pass states its own cost, batch by batch.
     info!(
         embedded = done,
+        selected = rows.len(),
+        invalid_rows,
         rss_mb = process_rss_mb().unwrap_or(0),
         available_mb = available_memory_mb().unwrap_or(0),
         "audio_embedding_batch"
@@ -1212,6 +1280,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn candidate_row_preserves_the_id_when_only_the_path_is_invalid() {
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text("/music/a.flac".into())]),
+            EmbeddingCandidate::Ready {
+                track_id: 42,
+                path: "/music/a.flac".into(),
+            }
+        );
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text(String::new())]),
+            EmbeddingCandidate::MissingPath { track_id: 42 }
+        );
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Text("not-an-id".into()), SqlValue::Null]),
+            EmbeddingCandidate::MissingTrackId
+        );
+    }
+
+    #[test]
+    fn an_unusable_candidate_with_an_id_can_be_stamped_out_of_the_next_batch() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id) VALUES (42, 'Track', 1, 1)",
+            &[],
+        )
+        .unwrap();
+        let repo = TrackMetadataRepo::new(db);
+
+        assert!(stamp_embedding_processed(&repo, 42));
+        assert_eq!(
+            repo.get_all(42).unwrap().get(SENTINEL).map(String::as_str),
+            Some(MODEL_ID)
+        );
+    }
+
+    #[test]
+    fn a_selected_batch_without_progress_is_only_anomaly_without_playback_yield() {
+        assert!(batch_without_progress(3, 0, false));
+        assert!(!batch_without_progress(3, 0, true));
+        assert!(!batch_without_progress(3, 1, false));
+        assert!(!batch_without_progress(0, 0, false));
+    }
 
     #[test]
     fn clap_window_resamples_true_source_rate_to_48k() {
