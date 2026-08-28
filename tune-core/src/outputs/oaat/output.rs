@@ -329,8 +329,6 @@ async fn connect_and_setup(
     stream_info: &StreamInfo,
     refus_negociation: &Arc<std::sync::Mutex<Option<String>>>,
 ) -> Option<oaat_controller::ConnectedEndpoint> {
-    use oaat_core::ChannelLayout;
-
     let mut endpoint = match oaat_controller::ConnectedEndpoint::connect(config, endpoint_addr)
         .await
     {
@@ -357,13 +355,20 @@ async fn connect_and_setup(
     }
 
     let ch = stream_info.channels.min(8) as u8;
+    let layout = match disposition_oaat(ch) {
+        Ok(layout) => layout,
+        Err(error) => {
+            error!(device = %device_name, ch, %error, "oaat: reconnect layout rejected");
+            return None;
+        }
+    };
     if let Err(e) = endpoint
         .propose_format(
             stream_id,
             stream_info.format,
             stream_info.sample_rate,
             ch,
-            ChannelLayout::Stereo,
+            layout,
             stream_info.bits_per_sample as u8,
         )
         .await
@@ -378,7 +383,7 @@ async fn connect_and_setup(
         format: stream_info.format,
         sample_rate: stream_info.sample_rate,
         channels: ch,
-        channel_layout: ChannelLayout::Stereo,
+        channel_layout: layout,
         bits_per_sample: stream_info.bits_per_sample,
         dsd_rate: None,
     };
@@ -475,7 +480,6 @@ impl OutputTarget for OaatOutput {
     #[cfg(feature = "oaat")]
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         use oaat_controller::{ConnectedEndpoint, ControllerConfig};
-        use oaat_core::ChannelLayout;
         use oaat_core::format::AudioFormat;
         use oaat_core::wire::PacketFlags;
 
@@ -686,7 +690,13 @@ impl OutputTarget for OaatOutput {
                         let cur_format = AudioFormat::DsdU8;
                         let cur_sample_rate = dsf_info.sample_rate;
                         let ch = dsf_info.channels.min(8) as u8;
-                        let layout = ChannelLayout::Stereo;
+                        let layout = match disposition_oaat(ch) {
+                            Ok(layout) => layout,
+                            Err(error) => {
+                                warn!(device = %device_name, ch, %error, "oaat: native DSD layout rejected");
+                                break 'direct false;
+                            }
+                        };
                         let fmt_str = format_rate_display(cur_sample_rate, 1, cur_format);
 
                         info!(
@@ -3043,7 +3053,7 @@ fn construire_adaptateur_pcm(
     )
 }
 
-fn disposition_oaat(channels: u8) -> Result<oaat_core::format::ChannelLayout, String> {
+pub(super) fn disposition_oaat(channels: u8) -> Result<oaat_core::format::ChannelLayout, String> {
     use oaat_core::format::ChannelLayout;
     match channels {
         1 => Ok(ChannelLayout::Mono),
@@ -3055,6 +3065,26 @@ fn disposition_oaat(channels: u8) -> Result<oaat_core::format::ChannelLayout, St
         _ => Err(format!(
             "aucune disposition OAAT non ambiguë pour {channels} canaux"
         )),
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::disposition_oaat;
+    use oaat_core::format::ChannelLayout;
+
+    #[test]
+    fn disposition_oaat_suit_le_nombre_de_canaux_representable() {
+        assert_eq!(disposition_oaat(1).unwrap(), ChannelLayout::Mono);
+        assert_eq!(disposition_oaat(2).unwrap(), ChannelLayout::Stereo);
+        assert_eq!(disposition_oaat(6).unwrap(), ChannelLayout::FivePointOne);
+        assert_eq!(disposition_oaat(8).unwrap(), ChannelLayout::SevenPointOne);
+    }
+
+    #[test]
+    fn disposition_oaat_refuse_les_nombres_ambigus() {
+        assert!(disposition_oaat(5).is_err());
+        assert!(disposition_oaat(7).is_err());
     }
 }
 

@@ -882,6 +882,10 @@ pub struct LocalOutput {
     ///
     /// 0 = aucun flux en cours ; `current_format()` renvoie alors `None`.
     current_format: Arc<AtomicU32>,
+    /// Taps et cadence de l'IR choisie, conservés même entre deux pistes.
+    /// L'instance FFT ci-dessous n'est qu'un dérivé du format courant.
+    convolver_config:
+        Arc<std::sync::Mutex<Option<super::super::audio::convolver::ConvolverConfig>>>,
     convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
     /// PURE (audiophile) bypass for the zone currently playing on this output.
     /// When set, the playback loop skips the room-correction convolver so the
@@ -1063,6 +1067,7 @@ impl LocalOutput {
             chain_exhausted: Arc::new(AtomicBool::new(false)),
             eq: Arc::new(std::sync::Mutex::new(None)),
             current_format: Arc::new(AtomicU32::new(0)),
+            convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
@@ -1180,13 +1185,38 @@ impl LocalOutput {
     }
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
-        let conv = super::super::audio::convolver::Convolver::from_wav(path, 1024)?;
-        *self.convolver.lock().unwrap() = Some(conv);
-        tracing::info!(path, device = %self.device_name, "convolver_ir_set");
+        let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
+        *self.convolver_config.lock().unwrap() = Some(config.clone());
+        let current_format = self.current_format();
+        let active = match current_format {
+            Some((sample_rate, channels)) => {
+                match config.build_for(1024, sample_rate, channels as usize) {
+                    Ok(convolver) => Some(convolver),
+                    Err(error) => {
+                        // La configuration reste mémorisée pour une prochaine
+                        // piste compatible, mais l'ancien moteur ne doit jamais
+                        // continuer à corriger le format courant.
+                        *self.convolver.lock().unwrap() = None;
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        *self.convolver.lock().unwrap() = active;
+        tracing::info!(
+            path,
+            device = %self.device_name,
+            ir_sample_rate = config.sample_rate(),
+            ir_channels = config.source_channels(),
+            active = current_format.is_some(),
+            "convolver_ir_set"
+        );
         Ok(())
     }
 
     pub fn clear_convolver(&self) {
+        *self.convolver_config.lock().unwrap() = None;
         *self.convolver.lock().unwrap() = None;
         tracing::info!(device = %self.device_name, "convolver_cleared");
     }
@@ -1239,7 +1269,7 @@ impl LocalOutput {
     }
 
     pub fn has_convolver(&self) -> bool {
-        self.convolver.lock().unwrap().is_some()
+        self.convolver_config.lock().unwrap().is_some()
     }
 
     /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
@@ -2616,6 +2646,43 @@ fn feed_selected_windows_exclusive_tail(
         }
     }
 }
+
+/// Reconstruire l'instance FFT à partir de la configuration persistante pour
+/// le format SOURCE que le DSP va réellement recevoir.
+///
+/// En cas d'incompatibilité, l'ancienne instance est retirée : continuer avec
+/// un moteur bâti pour une autre cadence ou un autre nombre de canaux serait
+/// une correction acoustique fausse. Le flux audio, lui, peut continuer sans
+/// convolveur et le journal donne l'action à effectuer (#2210).
+fn rebuild_local_convolver(
+    config: &std::sync::Mutex<Option<crate::audio::convolver::ConvolverConfig>>,
+    active: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<bool, String> {
+    let config = config
+        .lock()
+        .map_err(|_| "verrou de configuration du convolveur empoisonné".to_string())?
+        .clone();
+    let next = match config {
+        Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
+            Ok(convolver) => Some(convolver),
+            Err(error) => {
+                if let Ok(mut current) = active.lock() {
+                    *current = None;
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    let enabled = next.is_some();
+    *active
+        .lock()
+        .map_err(|_| "verrou du convolveur actif empoisonné".to_string())? = next;
+    Ok(enabled)
+}
+
 /// Apply the local-output built-in DSP chain to an interleaved f32 buffer,
 /// in place, at the three playback-loop feed sites.
 ///
@@ -3238,6 +3305,7 @@ impl OutputTarget for LocalOutput {
         let audio_backend = self.audio_backend.clone();
         let eq = self.eq.clone();
         let current_format = self.current_format.clone();
+        let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
         let crossfeed = self.crossfeed.clone();
@@ -3520,6 +3588,21 @@ impl OutputTarget for LocalOutput {
                 // echantillons sortent d'un decodeur (FLAC, MP3, AAC) sous
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
+                current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
+                match rebuild_local_convolver(&convolver_config, &convolver, dec_sr, dec_ch) {
+                    Ok(true) => info!(
+                        sample_rate = dec_sr,
+                        channels = dec_ch,
+                        "local_convolver_built_for_stream"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => warn!(
+                        sample_rate = dec_sr,
+                        channels = dec_ch,
+                        error = %error,
+                        "local_convolver_format_rejected"
+                    ),
+                }
                 apply_local_dsp(
                     &mut samples,
                     &eq,
@@ -3536,10 +3619,6 @@ impl OutputTarget for LocalOutput {
                 // reechantillonnage que le reste (#2209).
                 let queue = flush_local_dsp(&convolver, &crossfeed, &pure_bypass, dec_ch, false);
                 samples.extend_from_slice(&queue);
-
-                // Memoriser le format pour un rebatissage d'EQ a chaud
-                // (#1725) : c'est le couple que la chaine DSP vient de voir.
-                current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
 
                 // Adapt channels and resample if needed (using rubato
                 // sinc resampler for high-quality rate conversion)
@@ -3684,6 +3763,16 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
+            match rebuild_local_convolver(&convolver_config, &convolver, sample_rate, channels) {
+                Ok(true) => info!(sample_rate, channels, "local_convolver_built_for_stream"),
+                Ok(false) => {}
+                Err(error) => warn!(
+                    sample_rate,
+                    channels,
+                    error = %error,
+                    "local_convolver_format_rejected"
+                ),
+            }
 
             // bit_depth == 0 is the sentinel for IEEE float 32-bit (4 bytes)
             let bytes_per_sample = if bit_depth == 0 {
@@ -5677,8 +5766,40 @@ impl OutputTarget for LocalOutput {
                 );
 
                 let prev_sr = sample_rate;
+                let prev_ch = channels;
                 let prev_needs_resample = needs_resample;
                 let next_needs_resample = output_sr != new_sr;
+                let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
+
+                // Un moteur FFT est lié au format source. Avant de le remplacer,
+                // rendre sa queue dans l'ANCIEN format et lui faire suivre la
+                // même adaptation/rééchantillonnage que la piste qui se termine.
+                // À format identique on ne touche à rien : son état fait partie
+                // de la continuité gapless.
+                if convolver_format_changed {
+                    let mut queue = flush_local_dsp(
+                        &convolver,
+                        &crossfeed,
+                        &pure_bypass,
+                        prev_ch,
+                        dop_active.load(Ordering::Relaxed),
+                    );
+                    if !queue.is_empty() {
+                        if needs_channel_adapt {
+                            queue = adapt_channels(&queue, prev_ch, output_ch);
+                        }
+                        if prev_needs_resample {
+                            queue = rubato_resample_chunk(
+                                &mut resampler,
+                                &queue,
+                                output_ch,
+                                false,
+                                &mut resample_leftover,
+                            );
+                        }
+                        feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
+                    }
+                }
 
                 // À cadence source identique, le resampler fait partie du flux
                 // continu : conserver son état et son leftover est nécessaire
@@ -5719,6 +5840,30 @@ impl OutputTarget for LocalOutput {
                 needs_channel_adapt = output_ch != new_ch;
                 needs_resample = next_needs_resample;
                 pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
+                current_format.store(
+                    LocalOutput::pack_format(sample_rate, channels),
+                    Ordering::Relaxed,
+                );
+                if convolver_format_changed {
+                    match rebuild_local_convolver(
+                        &convolver_config,
+                        &convolver,
+                        sample_rate,
+                        channels,
+                    ) {
+                        Ok(true) => info!(
+                            sample_rate,
+                            channels, "local_convolver_rebuilt_for_gapless_stream"
+                        ),
+                        Ok(false) => {}
+                        Err(error) => warn!(
+                            sample_rate,
+                            channels,
+                            error = %error,
+                            "local_convolver_gapless_format_rejected"
+                        ),
+                    }
+                }
 
                 // Recreate the resampler if the source sample rate changed
                 if needs_resample && new_sr != prev_sr {
@@ -6840,53 +6985,14 @@ fn find_matching_config(
     })
 }
 
-/// Adapt channel count between source and output.
-///
-/// Handles upmix (mono to stereo, etc.) and downmix.  When downmixing
-/// from 5.1 (6 ch) or 7.1 (8 ch) to stereo, applies ITU-R BS.775
-/// compliant coefficients (K = 0.707) over the standard SMPTE/ITU
-/// channel layout: FL, FR, C, LFE, SL, SR [, BL, BR].
+/// Adapt channel count between source and output through the single matrix in
+/// `audio/channels`. Invalid or partial PCM is rejected as silence instead of
+/// being partially remixed in the audio path.
 fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
-    if from_ch == to_ch {
-        return samples.to_vec();
-    }
-    let from = from_ch as usize;
-    let to = to_ch as usize;
-
-    let mut out = Vec::with_capacity(samples.len() * to / from);
-    for frame in samples.chunks_exact(from) {
-        if to > from {
-            // Upmix: copy existing channels, duplicate last for remaining
-            for &s in frame {
-                out.push(s);
-            }
-            let last = *frame.last().unwrap_or(&0.0);
-            for _ in from..to {
-                out.push(last);
-            }
-        } else if to == 2 && from >= 6 {
-            const K: f32 = 0.707;
-            let fl = frame[0];
-            let fr = frame[1];
-            let c = frame[2];
-            let sl = frame[4];
-            let sr = frame[5];
-            let (bl, br) = if from >= 8 {
-                (frame[6], frame[7])
-            } else {
-                (0.0, 0.0)
-            };
-            let l = fl + K * c + K * sl + K * bl;
-            let r = fr + K * c + K * sr + K * br;
-            out.push(l.clamp(-1.0, 1.0));
-            out.push(r.clamp(-1.0, 1.0));
-        } else {
-            for ch in 0..to {
-                out.push(frame[ch]);
-            }
-        }
-    }
-    out
+    crate::audio::channels::adapt_channels_f32(samples, from_ch, to_ch).unwrap_or_else(|error| {
+        warn!(from_ch, to_ch, error = %error, "local_channel_adaptation_rejected");
+        Vec::new()
+    })
 }
 
 /// Simple linear-interpolation resampler for rate conversion.
@@ -7136,6 +7242,38 @@ mod tests {
                 "trame {i} : {obtenu} au lieu de {attendu} — la fin de piste est perdue"
             );
         }
+    }
+
+    /// #2210 — une chaîne gapless peut changer de cadence ou de layout sans
+    /// repasser par `play_url`. Le moteur de la piste précédente doit alors
+    /// disparaître ; il ne peut redevenir actif que sur un format compatible.
+    #[test]
+    fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
+        let config = std::sync::Mutex::new(Some(
+            crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap(),
+        ));
+        let active = std::sync::Mutex::new(None);
+
+        assert!(rebuild_local_convolver(&config, &active, 48_000, 2).unwrap());
+        assert_eq!(active.lock().unwrap().as_ref().unwrap().channels(), 2);
+
+        let error = rebuild_local_convolver(&config, &active, 96_000, 2)
+            .expect_err("l'IR 48 kHz ne doit jamais corriger un flux 96 kHz");
+        assert!(
+            error.contains("48000") && error.contains("96000"),
+            "{error}"
+        );
+        assert!(
+            active.lock().unwrap().is_none(),
+            "l'ancien moteur ne doit pas survivre au changement de cadence"
+        );
+
+        assert!(rebuild_local_convolver(&config, &active, 48_000, 6).unwrap());
+        assert_eq!(
+            active.lock().unwrap().as_ref().unwrap().channels(),
+            6,
+            "le retour à la cadence de l'IR reconstruit le moteur au nouveau layout"
+        );
     }
 
     /// Et la frontière de piste : après remise à zéro, plus rien de la
@@ -8482,7 +8620,7 @@ mod tests {
     fn test_adapt_channels_stereo_to_mono() {
         let stereo = [0.5f32, 0.7, 0.3, 0.9];
         let mono = adapt_channels(&stereo, 2, 1);
-        assert_eq!(mono, [0.5, 0.3]);
+        assert_eq!(mono, [0.6, 0.6]);
     }
 
     #[test]

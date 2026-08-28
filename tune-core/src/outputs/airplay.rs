@@ -960,14 +960,14 @@ mod tests {
     /// Ici c'est `pcm_i32_to_l16_be`, la fonction réellement appelée par
     /// `stream_to_airplay`, qui est exercée.
     #[test]
-    fn la_conversion_l16_de_production_sature_un_downmix_51() {
+    fn la_conversion_l16_de_production_reserve_le_headroom_du_downmix_51() {
         let plein = i16::MAX as i32; // source 16 bits à pleine échelle
         // fl, fr, centre, LFE, sl, sr — tous à fond.
         let stereo =
             crate::audio::channels::to_stereo_i32(&[plein, plein, plein, plein, plein, plein], 6);
         assert!(
-            stereo[0] > plein,
-            "le repli doit sommer au-delà de i16 avant saturation : {}",
+            stereo[0] <= plein && stereo[0] > plein - 16,
+            "la matrice doit réserver son headroom avant la conversion L16 : {}",
             stereo[0]
         );
 
@@ -975,9 +975,8 @@ mod tests {
         assert_eq!(
             i16::from_be_bytes([l16[0], l16[1]]),
             i16::MAX,
-            "la conversion L16 doit saturer, pas reboucler : un cast nu rendait \
-             13563 là où il fallait 32767, soit une distorsion franche sur les \
-             passages forts"
+            "le downmix plein niveau doit rester plein niveau sans dépendre du \
+             saturateur de la conversion L16"
         );
         assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MAX);
     }

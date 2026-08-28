@@ -165,7 +165,7 @@ pub fn detect_max_channels_from_sink_protocols(sink_protocols: &[String]) -> u16
 }
 
 // ---------------------------------------------------------------------------
-// Downmix matrix — ITU-R BS.775 standard coefficients
+// Downmix matrix — ITU-R BS.775 coefficients with deterministic headroom
 // ---------------------------------------------------------------------------
 
 /// ITU-R BS.775 coefficient for center channel in stereo downmix.
@@ -186,8 +186,13 @@ const ITU_SURROUND_MONO_COEFF: f32 = 0.354; // -9 dB (0.5 * 0.707)
 /// `output[out_ch * source_ch + in_ch]` = coefficient to apply to input
 /// channel `in_ch` when computing output channel `out_ch`.
 ///
-/// Standard 5.1 channel order: FL, FR, FC, LFE, BL, BR
-/// Standard 7.1 channel order: FL, FR, FC, LFE, BL, BR, SL, SR
+/// Standard 5.1 channel order: FL, FR, FC, LFE, SL, SR
+/// Standard 7.1 channel order: FL, FR, FC, LFE, SL, SR, BL, BR
+///
+/// Each output row is attenuated when the sum of its absolute coefficients
+/// exceeds unity. Correlated full-scale inputs therefore remain in range
+/// without a hard clip after the sum. Relative ITU coefficients are preserved;
+/// the attenuation is the required mix headroom.
 pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> {
     if source_ch <= target_ch {
         return None;
@@ -205,70 +210,68 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
         }
 
         // 5.1 (6ch) -> stereo (2ch): ITU-R BS.775
-        // L_out = FL + 0.707*FC + 0.707*BL
-        // R_out = FR + 0.707*FC + 0.707*BR
+        // L_out = FL + 0.707*FC + 0.707*SL
+        // R_out = FR + 0.707*FC + 0.707*SR
         (6, 2) => {
-            // Row 0 (left output): FL=1.0, FC=0.707, BL=0.707
+            // Row 0 (left output): FL=1.0, FC=0.707, SL=0.707
             matrix[0] = 1.0; // FL
             matrix[2] = ITU_CENTER_COEFF; // FC
-            matrix[4] = ITU_SURROUND_COEFF; // BL
-            // Row 1 (right output): FR=1.0, FC=0.707, BR=0.707
+            matrix[4] = ITU_SURROUND_COEFF; // SL
+            // Row 1 (right output): FR=1.0, FC=0.707, SR=0.707
             matrix[src + 1] = 1.0; // FR
             matrix[src + 2] = ITU_CENTER_COEFF; // FC
-            matrix[src + 5] = ITU_SURROUND_COEFF; // BR
+            matrix[src + 5] = ITU_SURROUND_COEFF; // SR
         }
 
         // 7.1 (8ch) -> stereo (2ch): extended ITU-R BS.775
-        // L_out = FL + 0.707*FC + 0.707*BL + 0.707*SL
-        // R_out = FR + 0.707*FC + 0.707*BR + 0.707*SR
+        // L_out = FL + 0.707*FC + 0.707*SL + 0.707*BL
+        // R_out = FR + 0.707*FC + 0.707*SR + 0.707*BR
         (8, 2) => {
             matrix[0] = 1.0; // FL
             matrix[2] = ITU_CENTER_COEFF; // FC
-            matrix[4] = ITU_SURROUND_COEFF; // BL
-            matrix[6] = ITU_SURROUND_COEFF; // SL
+            matrix[4] = ITU_SURROUND_COEFF; // SL
+            matrix[6] = ITU_SURROUND_COEFF; // BL
             matrix[src + 1] = 1.0; // FR
             matrix[src + 2] = ITU_CENTER_COEFF; // FC
-            matrix[src + 5] = ITU_SURROUND_COEFF; // BR
-            matrix[src + 7] = ITU_SURROUND_COEFF; // SR
+            matrix[src + 5] = ITU_SURROUND_COEFF; // SR
+            matrix[src + 7] = ITU_SURROUND_COEFF; // BR
         }
 
-        // Any multichannel (>=6) -> mono (1ch)
-        (s, 1) if s >= 6 => {
-            // Mono = 0.5*FL + 0.5*FR + 0.707*FC + 0.354*BL + 0.354*BR
+        // 5.1 / 7.1 -> mono. Other channel counts have no unambiguous layout
+        // here and deliberately use the conservative mapping below.
+        (6 | 8, 1) => {
+            // Mono = 0.5*FL + 0.5*FR + 0.707*FC + 0.354*(surrounds)
             matrix[0] = 0.5; // FL
             matrix[1] = 0.5; // FR
             matrix[2] = ITU_CENTER_COEFF; // FC
             // LFE (index 3) intentionally excluded from mono downmix
             if src > 4 {
-                matrix[4] = ITU_SURROUND_MONO_COEFF; // BL
+                matrix[4] = ITU_SURROUND_MONO_COEFF; // SL
             }
             if src > 5 {
-                matrix[5] = ITU_SURROUND_MONO_COEFF; // BR
+                matrix[5] = ITU_SURROUND_MONO_COEFF; // SR
+            }
+            if src > 6 {
+                matrix[6] = ITU_SURROUND_MONO_COEFF; // BL
+            }
+            if src > 7 {
+                matrix[7] = ITU_SURROUND_MONO_COEFF; // BR
             }
         }
 
-        // 5.1 (6ch) -> mono (1ch)
-        (6, 1) => {
-            matrix[0] = 0.5;
-            matrix[1] = 0.5;
-            matrix[2] = ITU_CENTER_COEFF;
-            matrix[4] = ITU_SURROUND_MONO_COEFF;
-            matrix[5] = ITU_SURROUND_MONO_COEFF;
-        }
-
-        // 7.1 (8ch) -> 5.1 (6ch): fold side channels into rears
+        // 7.1 (8ch) -> 5.1 (6ch): fold back channels into surrounds
         (8, 6) => {
-            // Pass through FL, FR, FC, LFE, fold SL+BL -> BL, SR+BR -> BR
+            // Pass through FL, FR, FC, LFE, fold SL+BL -> SL, SR+BR -> SR
             for i in 0..6 {
                 matrix[i * src + i] = 1.0; // identity for first 6
             }
-            // Add side left to back left
-            matrix[4 * src + 6] = ITU_SURROUND_COEFF; // SL -> BL
-            // Add side right to back right
-            matrix[5 * src + 7] = ITU_SURROUND_COEFF; // SR -> BR
+            matrix[4 * src + 6] = ITU_SURROUND_COEFF; // BL -> SL
+            matrix[5 * src + 7] = ITU_SURROUND_COEFF; // BR -> SR
         }
 
-        // Generic fallback: pass through first `target_ch` channels
+        // Conservative fallback for an unknown layout: preserve only channels
+        // which have a destination at the same index. Never fold an unknown
+        // channel into another one (notably LFE/surround into a front channel).
         _ => {
             for i in 0..tgt.min(src) {
                 matrix[i * src + i] = 1.0;
@@ -276,30 +279,33 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
         }
     }
 
+    // Worst-case headroom: every contributing input may be correlated and at
+    // full scale. Keeping each absolute row sum <= 1 makes clipping impossible
+    // for normalized PCM without changing the relative mix coefficients.
+    for row in matrix.chunks_exact_mut(src) {
+        let peak_gain: f32 = row.iter().map(|coefficient| coefficient.abs()).sum();
+        if peak_gain > 1.0 {
+            for coefficient in row {
+                *coefficient /= peak_gain;
+            }
+        }
+    }
+
     Some(matrix)
 }
 
-/// Adapt interleaved, right-justified integer PCM to an exact channel count.
+/// Adapt interleaved floating-point PCM to an exact channel count.
 ///
-/// Downmixes use [`build_downmix_matrix`]. Upmixes preserve every source
-/// channel and duplicate the last one into the additional outputs, matching
-/// the local-output pipeline's established behaviour. The output always
-/// contains the same number of frames as the input.
-pub fn adapt_channels_i32(
-    samples: &[i32],
+/// Mono to stereo is the only implicit duplication. Wider upmixes retain the
+/// front channels and fill every absent destination with silence, so stereo
+/// content is never invented in C, LFE or surrounds. Downmixes all use the
+/// single matrix above.
+pub fn adapt_channels_f32(
+    samples: &[f32],
     source_ch: u16,
     target_ch: u16,
-    bit_depth: u16,
-) -> Result<Vec<i32>, String> {
-    if source_ch == 0 || target_ch == 0 {
-        return Err("channel count must be greater than zero".into());
-    }
-    if samples.len() % source_ch as usize != 0 {
-        return Err(format!(
-            "PCM sample count {} is not aligned to {source_ch} source channels",
-            samples.len()
-        ));
-    }
+) -> Result<Vec<f32>, String> {
+    validate_channel_adaptation(samples.len(), source_ch, target_ch)?;
     if source_ch == target_ch || samples.is_empty() {
         return Ok(samples.to_vec());
     }
@@ -311,9 +317,82 @@ pub fn adapt_channels_i32(
 
     if source_ch < target_ch {
         for frame in samples.chunks_exact(src) {
-            output.extend_from_slice(frame);
-            let last = *frame.last().unwrap_or(&0);
-            output.extend(std::iter::repeat_n(last, tgt - src));
+            if source_ch == 1 && target_ch >= 2 {
+                output.push(frame[0]);
+                output.push(frame[0]);
+                output.extend(std::iter::repeat_n(0.0, tgt - 2));
+            } else {
+                output.extend_from_slice(frame);
+                output.extend(std::iter::repeat_n(0.0, tgt - src));
+            }
+        }
+        return Ok(output);
+    }
+
+    let matrix = build_downmix_matrix(source_ch, target_ch)
+        .ok_or_else(|| format!("no downmix matrix for {source_ch} -> {target_ch} channels"))?;
+    for frame in samples.chunks_exact(src) {
+        for row in matrix.chunks_exact(src) {
+            output.push(
+                frame
+                    .iter()
+                    .zip(row)
+                    .map(|(&sample, &coefficient)| sample * coefficient)
+                    .sum(),
+            );
+        }
+    }
+    Ok(output)
+}
+
+fn validate_channel_adaptation(
+    sample_count: usize,
+    source_ch: u16,
+    target_ch: u16,
+) -> Result<(), String> {
+    if source_ch == 0 || target_ch == 0 {
+        return Err("channel count must be greater than zero".into());
+    }
+    if sample_count % source_ch as usize != 0 {
+        return Err(format!(
+            "PCM sample count {sample_count} is not aligned to {source_ch} source channels"
+        ));
+    }
+    Ok(())
+}
+
+/// Adapt interleaved, right-justified integer PCM to an exact channel count.
+///
+/// Downmixes use [`build_downmix_matrix`]. Upmixes follow the same safe policy
+/// as [`adapt_channels_f32`]: mono is duplicated to the front pair, while all
+/// other absent outputs are silent. The output always contains the same number
+/// of frames as the input.
+pub fn adapt_channels_i32(
+    samples: &[i32],
+    source_ch: u16,
+    target_ch: u16,
+    bit_depth: u16,
+) -> Result<Vec<i32>, String> {
+    validate_channel_adaptation(samples.len(), source_ch, target_ch)?;
+    if source_ch == target_ch || samples.is_empty() {
+        return Ok(samples.to_vec());
+    }
+
+    let src = source_ch as usize;
+    let tgt = target_ch as usize;
+    let frames = samples.len() / src;
+    let mut output = Vec::with_capacity(frames.saturating_mul(tgt));
+
+    if source_ch < target_ch {
+        for frame in samples.chunks_exact(src) {
+            if source_ch == 1 && target_ch >= 2 {
+                output.push(frame[0]);
+                output.push(frame[0]);
+                output.extend(std::iter::repeat_n(0, tgt - 2));
+            } else {
+                output.extend_from_slice(frame);
+                output.extend(std::iter::repeat_n(0, tgt - src));
+            }
         }
         return Ok(output);
     }
@@ -435,25 +514,27 @@ mod tests {
     fn downmix_51_to_stereo() {
         let matrix = build_downmix_matrix(6, 2).unwrap();
         assert_eq!(matrix.len(), 12); // 2 * 6
-        // Left channel: FL=1.0, FC=0.707, BL=0.707
-        assert!((matrix[0] - 1.0).abs() < 0.001);
-        assert!((matrix[2] - 0.707).abs() < 0.001);
-        assert!((matrix[4] - 0.707).abs() < 0.001);
-        // Right channel: FR=1.0, FC=0.707, BR=0.707
-        assert!((matrix[7] - 1.0).abs() < 0.001);
-        assert!((matrix[8] - 0.707).abs() < 0.001);
-        assert!((matrix[11] - 0.707).abs() < 0.001);
+        let headroom = 1.0 / (1.0 + 2.0 * 0.707);
+        assert!((matrix[0] - headroom).abs() < 0.001);
+        assert!((matrix[2] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[4] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[7] - headroom).abs() < 0.001);
+        assert!((matrix[8] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[11] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[..6].iter().sum::<f32>() - 1.0).abs() < 0.001);
+        assert!((matrix[6..].iter().sum::<f32>() - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn downmix_71_to_stereo() {
         let matrix = build_downmix_matrix(8, 2).unwrap();
         assert_eq!(matrix.len(), 16); // 2 * 8
-        // Left: FL=1.0, FC=0.707, BL=0.707, SL=0.707
-        assert!((matrix[0] - 1.0).abs() < 0.001);
-        assert!((matrix[2] - 0.707).abs() < 0.001);
-        assert!((matrix[4] - 0.707).abs() < 0.001);
-        assert!((matrix[6] - 0.707).abs() < 0.001);
+        let headroom = 1.0 / (1.0 + 3.0 * 0.707);
+        assert!((matrix[0] - headroom).abs() < 0.001);
+        assert!((matrix[2] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[4] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[6] - 0.707 * headroom).abs() < 0.001);
+        assert!((matrix[..8].iter().sum::<f32>() - 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -465,21 +546,23 @@ mod tests {
         assert!((matrix[8 + 1] - 1.0).abs() < 0.001); // FR->FR
         assert!((matrix[16 + 2] - 1.0).abs() < 0.001); // FC->FC
         assert!((matrix[24 + 3] - 1.0).abs() < 0.001); // LFE->LFE
-        // BL output: BL=1.0 + SL*0.707
-        assert!((matrix[32 + 4] - 1.0).abs() < 0.001); // BL->BL
-        assert!((matrix[32 + 6] - 0.707).abs() < 0.001); // SL->BL
+        // BL output: BL=1.0 + SL*0.707, with worst-case headroom.
+        let headroom = 1.0 / 1.707;
+        assert!((matrix[32 + 4] - headroom).abs() < 0.001); // BL->BL
+        assert!((matrix[32 + 6] - 0.707 * headroom).abs() < 0.001); // SL->BL
     }
 
     #[test]
     fn downmix_51_to_mono() {
         let matrix = build_downmix_matrix(6, 1).unwrap();
         assert_eq!(matrix.len(), 6); // 1 * 6
-        assert!((matrix[0] - 0.5).abs() < 0.001); // FL
-        assert!((matrix[1] - 0.5).abs() < 0.001); // FR
-        assert!((matrix[2] - 0.707).abs() < 0.001); // FC
+        let headroom = 1.0 / (0.5 + 0.5 + 0.707 + 0.354 + 0.354);
+        assert!((matrix[0] - 0.5 * headroom).abs() < 0.001); // FL
+        assert!((matrix[1] - 0.5 * headroom).abs() < 0.001); // FR
+        assert!((matrix[2] - 0.707 * headroom).abs() < 0.001); // FC
         assert!((matrix[3]).abs() < 0.001); // LFE excluded
-        assert!((matrix[4] - 0.354).abs() < 0.001); // BL
-        assert!((matrix[5] - 0.354).abs() < 0.001); // BR
+        assert!((matrix[4] - 0.354 * headroom).abs() < 0.001); // BL
+        assert!((matrix[5] - 0.354 * headroom).abs() < 0.001); // BR
     }
 
     #[test]
@@ -499,6 +582,40 @@ mod tests {
         assert!((matrix[0] - 1.0).abs() < 0.001); // ch0 -> out0
         assert!((matrix[11] - 1.0).abs() < 0.001); // ch1 -> out1
     }
+
+    #[test]
+    fn stereo_upmix_ne_cree_ni_centre_ni_lfe_ni_surrounds() {
+        let frame = adapt_channels_f32(&[0.25, -0.5], 2, 8).unwrap();
+        assert_eq!(frame, vec![0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn mono_upmix_ne_remplit_que_la_paire_frontale() {
+        let frame = adapt_channels_f32(&[0.25], 1, 6).unwrap();
+        assert_eq!(frame, vec![0.25, 0.25, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn downmix_pleine_echelle_reste_dans_la_plage_sans_ecretage() {
+        for channels in [6, 8] {
+            let input = vec![1.0; channels];
+            let output = adapt_channels_f32(&input, channels as u16, 2).unwrap();
+            assert_eq!(output.len(), 2);
+            assert!(
+                output
+                    .iter()
+                    .all(|sample| *sample <= 1.0 && *sample > 0.999)
+            );
+        }
+    }
+
+    #[test]
+    fn impulsions_51_restent_dans_leur_cote() {
+        let left = adapt_channels_f32(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 6, 2).unwrap();
+        let right = adapt_channels_f32(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0], 6, 2).unwrap();
+        assert!(left[0] > 0.0 && left[1] == 0.0);
+        assert!(right[1] > 0.0 && right[0] == 0.0);
+    }
 }
 
 /// Ramener un flux entrelacé à la stéréo, en entiers.
@@ -507,48 +624,14 @@ mod tests {
 /// 44,1 kHz, 16 bits, stéréo. Il reste une garde spécialisée en plus du contrat
 /// commun de `decode_to_pcm` (#2230, #2237).
 ///
-/// Le repli 5.1/7.1 reprend les coefficients de `adapt_channels`
-/// (`outputs/local.rs`), son jumeau en f32. Deux implémentations du même mixage
-/// est précisément le genre de doublon que l'epic #2219 vise à supprimer ; en
-/// attendant, elles portent les mêmes constantes et ce commentaire les relie.
+/// Toutes les conversions passent par [`adapt_channels_i32`] : AirPlay, le
+/// décodeur et la sortie locale partagent donc réellement la même matrice et la
+/// même réserve de headroom.
 pub fn to_stereo_i32(samples: &[i32], from_ch: u16) -> Vec<i32> {
     if from_ch == 2 || from_ch == 0 || samples.is_empty() {
         return samples.to_vec();
     }
-    let from = from_ch as usize;
-    if from == 1 {
-        // Mono : le même échantillon dans les deux oreilles.
-        return samples.iter().flat_map(|&s| [s, s]).collect();
-    }
-    let mut out = Vec::with_capacity(samples.len() / from * 2);
-    for frame in samples.chunks_exact(from) {
-        if from >= 6 {
-            // Repli ITU : centre et surrounds à -3 dB. En i64 pour que la somme
-            // de quatre canaux à pleine échelle ne déborde pas avant le clamp.
-            const K: f64 = 0.707;
-            let fl = frame[0] as f64;
-            let fr = frame[1] as f64;
-            let c = frame[2] as f64;
-            let sl = frame[4] as f64;
-            let sr = frame[5] as f64;
-            let (bl, br) = if from >= 8 {
-                (frame[6] as f64, frame[7] as f64)
-            } else {
-                (0.0, 0.0)
-            };
-            let l = fl + K * c + K * sl + K * bl;
-            let r = fr + K * c + K * sr + K * br;
-            let borne = |v: f64| v.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-            out.push(borne(l));
-            out.push(borne(r));
-        } else {
-            // 3, 4 ou 5 canaux : garder la paire avant. Inventer un mixage sans
-            // connaître la disposition ferait pire que mieux.
-            out.push(frame[0]);
-            out.push(frame[1]);
-        }
-    }
-    out
+    adapt_channels_i32(samples, from_ch, 2, 32).unwrap_or_else(|_| samples.to_vec())
 }
 
 #[cfg(test)]
@@ -574,19 +657,22 @@ mod stereo_i32_tests {
 
     #[test]
     fn le_51_est_replie_et_ne_deborde_pas() {
-        // Une trame 5.1 à pleine échelle : la somme dépasse i32 avant le clamp.
+        // Une trame 5.1 à pleine échelle tient par la réserve de la matrice,
+        // pas par un écrêtage après la somme.
         let plein = i32::MAX;
         let trame = [plein, plein, plein, 0, plein, plein];
         let out = to_stereo_i32(&trame, 6);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0], i32::MAX, "le repli doit borner, pas boucler");
-        assert_eq!(out[1], i32::MAX);
+        assert!(out[0] > i32::MAX - 4096);
+        assert!(out[1] > i32::MAX - 4096);
     }
 
     #[test]
     fn un_51_modere_garde_les_proportions() {
         let trame = [1000, 2000, 0, 0, 0, 0];
-        assert_eq!(to_stereo_i32(&trame, 6), vec![1000, 2000]);
+        let out = to_stereo_i32(&trame, 6);
+        assert!(out[0] > 0);
+        assert!((out[1] - 2 * out[0]).abs() <= 1);
     }
 
     #[test]
@@ -605,7 +691,7 @@ mod stereo_i32_tests {
     #[test]
     fn mono_vers_multicanal_conserve_le_nombre_de_trames() {
         let out = adapt_channels_i32(&[1, 2], 1, 4, 16).unwrap();
-        assert_eq!(out, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(out, vec![1, 1, 0, 0, 2, 2, 0, 0]);
         assert_eq!(out.len() / 4, 2);
     }
 
