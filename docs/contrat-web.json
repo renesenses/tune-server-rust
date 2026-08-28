@@ -530,6 +530,35 @@
       ]
     },
     {
+      "route": "/library/albums/{}/reidentify",
+      "methode": "POST",
+      "type": "ReidentifyResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "verdict",
+        "tracks_total"
+      ],
+      "champs_optionnels": [
+        "tracks_matched",
+        "tracks_unmatched",
+        "was_identified_before",
+        "previous_release_id",
+        "release_id",
+        "release_group_id",
+        "release_title",
+        "release_artist",
+        "release_date",
+        "release_country",
+        "release_disambiguation",
+        "match_score",
+        "fields_left_as_is",
+        "previous_identification_restored",
+        "searched_title",
+        "searched_artist"
+      ]
+    },
+    {
       "route": "/library/albums/{}/similar",
       "methode": "GET",
       "type": "Album",
@@ -989,10 +1018,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1013,10 +1040,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1048,10 +1073,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1072,10 +1095,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1819,7 +1840,8 @@
         "title",
         "artist",
         "album",
-        "cover_url"
+        "cover_url",
+        "created_at"
       ]
     },
     {
@@ -3442,22 +3464,28 @@
     {
       "route": "/zones/{}/audiophile",
       "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "enabled"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/zones/{}/audiophile",
-      "methode": "POST",
-      "type": "(en ligne)",
+      "type": "AudiophileModeState",
       "liste": false,
       "champs_obligatoires": [
         "enabled"
       ],
       "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
+        "applied_live"
+      ]
+    },
+    {
+      "route": "/zones/{}/audiophile",
+      "methode": "POST",
+      "type": "AudiophileModeState",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled"
+      ],
+      "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
         "applied_live"
       ]
     },
@@ -4406,7 +4434,7 @@
     },
     {
       "route": "/profiles/{}/favorites{}",
-      "type": "Array<{ item_type: string; item_id: number }>",
+      "type": "Array<{ item_type: string; item_id: number; created_at?: string | null }>",
       "raison": "type non structurel"
     },
     {
@@ -4751,7 +4779,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 232,
+    "routes_cartographiees": 233,
     "appels_non_resolus": 141
   }
 }

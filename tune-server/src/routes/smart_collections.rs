@@ -206,19 +206,21 @@ async fn create_collection(
         )
         .map_err(AppError::internal)?;
 
-    let created = json!({
-        "id": id,
-        "name": body.name,
-        "rules": body.rules,
-        "match_mode": match_mode,
-        "sort_by": sort_by,
-        "sort_order": sort_order,
-        "max_limit": body.max_limit,
-        "description": body.description,
-        "icon": body.icon,
-        "color": body.color,
-    });
-    Ok((StatusCode::CREATED, Json(created)).into_response())
+    // Relire l'objet persisté au lieu de fabriquer une réponse partielle :
+    // le client réutilise immédiatement ce contrat et `created_at` fait partie
+    // des champs annoncés par SmartCollection (#2732).
+    let row = state
+        .backend
+        .query_one(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+         description, icon, color, created_at \
+         FROM smart_collections WHERE id = $1",
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::internal("collection créée mais introuvable"))?;
+
+    Ok((StatusCode::CREATED, Json(decode_collection_row(&row))).into_response())
 }
 
 async fn get_collection(

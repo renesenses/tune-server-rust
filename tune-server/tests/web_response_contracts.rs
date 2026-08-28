@@ -441,6 +441,86 @@ async fn objets_persistes_respectent_leurs_contrats_web() {
     }
 }
 
+#[tokio::test]
+async fn smart_collections_conservent_la_limite_du_contrat_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+
+    let collection = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/library/smart-collections",
+        serde_json::json!({
+            "name": "Contrat borne",
+            "description": "Collection témoin",
+            "icon": "folder",
+            "color": "#123456",
+            "rules": [],
+            "match_mode": "all",
+            "sort_by": "title",
+            "sort_order": "asc",
+            "max_limit": 7
+        }),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la smart collection temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/library/smart-collections", &collection)
+        .unwrap_or_else(|erreur| panic!("POST smart collection: {erreur}; payload={collection}"));
+    assert_eq!(collection["max_limit"], 7);
+    assert!(collection["created_at"].is_string());
+    let id = collection["id"].as_i64().expect("id de smart collection");
+
+    let collection = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/library/smart-collections/{id}"),
+        serde_json::json!({"name": "Contrat borne relu", "max_limit": 3}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la smart collection temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/library/smart-collections/{}", &collection)
+        .unwrap_or_else(|erreur| panic!("PUT smart collection: {erreur}; payload={collection}"));
+    assert_eq!(collection["max_limit"], 3);
+
+    for (route_contrat, chemin_reel) in [
+        (
+            "/library/smart-collections",
+            "/api/v1/library/smart-collections".to_string(),
+        ),
+        (
+            "/library/smart-collections/{}",
+            format!("/api/v1/library/smart-collections/{id}"),
+        ),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let preview = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/library/smart-collections/preview",
+        serde_json::json!({"rules": [], "max_limit": 1}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("preview de la smart collection temoin");
+    respecte_tous_les_contrats(
+        &carte,
+        "POST",
+        "/library/smart-collections/preview",
+        &preview,
+    )
+    .unwrap_or_else(|erreur| panic!("POST preview smart collection: {erreur}; payload={preview}"));
+}
+
 #[test]
 fn la_contre_epreuve_refuse_un_champ_obligatoire_absent() {
     let contrat = ContratRoute {
