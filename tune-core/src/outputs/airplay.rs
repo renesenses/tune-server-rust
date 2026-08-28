@@ -306,7 +306,7 @@ impl RtspSession {
             .await?;
 
         if code != 200 {
-            return Err(format!("SETUP failed: {code}"));
+            return Err(setup_failure_message(code));
         }
 
         for (k, v) in &headers {
@@ -368,9 +368,13 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let _ = self
+        let (code, _, _) = self
             .send_request("TEARDOWN", "rtsp://127.0.0.1/1", &headers, None)
-            .await;
+            .await
+            .map_err(|error| format!("AirPlay TEARDOWN request failed: {error}"))?;
+        if !(200..300).contains(&code) {
+            return Err(format!("AirPlay TEARDOWN refused by device: {code}"));
+        }
         Ok(())
     }
 
@@ -393,6 +397,16 @@ impl RtspSession {
 
 fn entete_rtp_info(sequence: u16, timestamp: u32) -> String {
     format!("seq={sequence};rtptime={timestamp}")
+}
+
+fn setup_failure_message(code: u32) -> String {
+    if code == 403 {
+        return "AirPlay connection refused by the device (403): it may still be in use by \
+                another sender or require pairing; stop other playback, verify AirPlay \
+                access, then retry"
+            .to_string();
+    }
+    format!("AirPlay SETUP failed: {code}")
 }
 
 fn linear_to_airplay_db(volume: f64) -> f64 {
@@ -601,10 +615,19 @@ impl OutputTarget for AirplayOutput {
         if let Some(tx) = self.stop_tx.lock().await.take() {
             let _ = tx.send(());
         }
-        if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            session.teardown().await.ok();
+        let teardown_error = {
+            let mut session_slot = self.rtsp_session.lock().await;
+            let error = if let Some(session) = session_slot.as_mut() {
+                session.teardown().await.err()
+            } else {
+                None
+            };
+            *session_slot = None;
+            error
+        };
+        if let Some(error) = teardown_error {
+            warn!(device = %self.name, error = %error, "airplay_teardown_failed");
         }
-        *self.rtsp_session.lock().await = None;
         self.playing.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
         info!(device = %self.name, "airplay_stop");
@@ -912,6 +935,57 @@ fn rand_random() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn setup_403_explains_busy_device_and_pairing() {
+        let message = setup_failure_message(403);
+        assert!(message.contains("another sender"));
+        assert!(message.contains("pairing"));
+        assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn setup_other_status_keeps_the_rtsp_code() {
+        assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
+    }
+
+    #[tokio::test]
+    async fn teardown_refusal_is_returned_instead_of_discarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"RTSP/1.0 403 Forbidden\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let mut session = RtspSession::connect("127.0.0.1", address.port())
+            .await
+            .unwrap();
+        session.session_id = Some("stale-session".into());
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), session.teardown())
+            .await
+            .expect("TEARDOWN response must not hang")
+            .unwrap_err();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("fake RTSP server must finish")
+            .unwrap();
+
+        assert!(error.contains("TEARDOWN refused by device: 403"));
+        assert!(request.starts_with("TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0"));
+        assert!(request.contains("Session: stale-session\r\n"));
+    }
 
     #[test]
     fn volume_conversion() {
