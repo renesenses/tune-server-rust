@@ -18,6 +18,9 @@ use tracing::{info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::track_metadata_repo::TrackMetadataRepo;
+use crate::library::local_path::{
+    LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
+};
 
 /// Tracks embedded per batch before yielding, mirroring the ReplayGain sweep.
 const TRACK_BATCH: usize = 32;
@@ -108,6 +111,16 @@ fn per_file_pause_ms(settings: &crate::db::settings_repo::SettingsRepo) -> u64 {
 /// *value* is the `MODEL_ID` it was analysed under, so a model bump invalidates
 /// it and the track is re-swept (see the candidate query below).
 const SENTINEL: &str = "audio_embed_analyzed";
+
+/// Témoin de REPORT — le pendant de `rg_path_unresolved` pour cette passe.
+///
+/// [`SENTINEL`] veut dire « analysée sous ce modèle ». Il était posé même quand
+/// le fichier n'avait jamais pu être ouvert : sur .18, 44 pistes le portaient
+/// pour **zéro** vecteur en base. Cette clé-ci dit « aucune graphie ne
+/// répondait à telle date », écarte la piste du balayage pour qu'il avance, et
+/// périme au bout de [`crate::library::local_path::PATH_RETRY_AFTER_SECS`]
+/// (#1865).
+const PATH_UNRESOLVED_KEY: &str = "audio_embed_path_unresolved";
 
 /// Pourquoi le décodage n'a pas rendu d'échantillons.
 ///
@@ -444,6 +457,17 @@ pub async fn analyze_embedding_batch(
     // holds the MODEL_ID it was stamped under, so a model bump (e.g.
     // clap-audio-2023 → clap-music-2023) makes every track a candidate again and
     // the sweep re-embeds the whole library into the new space, exactly once.
+    //
+    // Le dernier NOT EXISTS écarte les pistes REPORTÉES trop récemment
+    // (#1865) : comparaison en TEXTE sur une estampille rembourrée de zéros,
+    // pas de `CAST(... AS INTEGER)` qui ferait tomber la requête sur
+    // PostgreSQL (`track_metadata.value` est partagée par toutes les clés).
+    let seuil_report = deferral_threshold(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64,
+    );
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
@@ -452,9 +476,13 @@ pub async fn analyze_embedding_batch(
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
                    AND m.value = ?) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
+                   AND m.value > ?) \
          LIMIT ?",
         &[
             &MODEL_ID as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
             &(TRACK_BATCH as i64) as &dyn ToSqlValue,
         ],
     ) {
@@ -476,6 +504,7 @@ pub async fn analyze_embedding_batch(
 
     let mut done = 0usize;
     let mut invalid_rows = 0usize;
+    let mut deferred = 0usize;
     let mut yielded_to_playback = false;
     for r in &rows {
         // Playback can start mid-batch; yield at once so neither the decode
@@ -512,13 +541,39 @@ pub async fn analyze_embedding_batch(
             }
         };
 
+        // Le chemin de la base est NFC ; le fichier peut être en NFD sur le
+        // disque (macOS, SMB/CIFS). Résolution AVANT toute décision, et
+        // surtout avant tout témoin (#1865).
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                // Introuvable n'est pas indécodable : aucun [`SENTINEL`] ici.
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "audio_embed_path_unresolved — aucune graphie (stockee, NFD, NFC) \
+                     ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(track_id, PATH_UNRESOLVED_KEY, &deferral_stamp(now));
+                // Compté comme progrès : la ligne sort de la prochaine requête.
+                // Sans cela, plus de `TRACK_BATCH` pistes introuvables
+                // bloqueraient la passe entière sur les mêmes lignes.
+                done += 1;
+                continue;
+            }
+        };
+        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
+
         // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
         // runtime; the returned samples carry the source bit depth for scaling.
         // A hard timeout guards against a decoder that spins on a pathological
         // file: on elapse we abandon the await (the blocking thread cannot be
         // cancelled, but one leaked thread is survivable) and move on, stamping
         // the sentinel below so the file is not retried.
-        let p = path.clone();
+        //
+        // `sur_disque` et pas `path` : la graphie que le système a reconnue.
+        let p = sur_disque.clone();
         let decoded = tokio::time::timeout(
             std::time::Duration::from_secs(DECODE_TIMEOUT_SECS),
             tokio::task::spawn_blocking(move || {
@@ -543,6 +598,20 @@ pub async fn analyze_embedding_batch(
         };
         let decoded = match decoded {
             Ok(d) => Some(d),
+            // Le fichier a disparu ENTRE la résolution et le décodage — un
+            // partage qui tombe en cours de passe. Ce n'est pas un fichier
+            // illisible : on reporte au lieu de le figer (#1865).
+            Err(_) if resolve_local_path(&path).is_missing() => {
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "audio_embed_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(track_id, PATH_UNRESOLVED_KEY, &deferral_stamp(now));
+                done += 1;
+                continue;
+            }
             Err(échec) => {
                 warn!(
                     track_id,
@@ -609,7 +678,8 @@ pub async fn analyze_embedding_batch(
     // sampler, which is what let "memory rises while the pass runs" pass for a
     // cause (#1462). Now the pass states its own cost, batch by batch.
     info!(
-        embedded = done,
+        embedded = done - deferred,
+        deferred,
         selected = rows.len(),
         invalid_rows,
         rss_mb = process_rss_mb().unwrap_or(0),
