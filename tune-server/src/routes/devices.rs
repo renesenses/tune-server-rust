@@ -66,11 +66,44 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     let all_output_info = outputs.info_all().await;
     drop(outputs);
 
-    Json(json!(build_device_list(
-        discovered,
-        &registered_ids,
-        &all_output_info
-    )))
+    let mut items = build_device_list(discovered, &registered_ids, &all_output_info);
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    mark_hidden_zones(&mut items, &zone_repo);
+
+    Json(json!(items))
+}
+
+/// Rend visible l'état que la découverte connaissait seulement dans ses logs.
+///
+/// Un appareil dédoublonné peut porter plusieurs identités. On conserve donc
+/// l'identité exacte de la zone masquée : le client doit la transmettre à la
+/// route de création pour que celle-ci démasque la bonne ligne et récupère ses
+/// réglages, au lieu de créer une nouvelle zone sur l'identité primaire.
+fn mark_hidden_zones(items: &mut [Value], zone_repo: &ZoneRepo) {
+    for item in items {
+        let hidden_device_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| zone_repo.is_device_hidden(id))
+            .map(str::to_owned)
+            .or_else(|| {
+                item.get("capabilities")
+                    .and_then(|c| c.get("alternatives"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|alternative| alternative.get("id").and_then(Value::as_str))
+                    .find(|id| zone_repo.is_device_hidden(id))
+                    .map(str::to_owned)
+            });
+
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("zone_hidden".into(), json!(hidden_device_id.is_some()));
+            if let Some(device_id) = hidden_device_id {
+                obj.insert("hidden_zone_device_id".into(), json!(device_id));
+            }
+        }
+    }
 }
 
 /// Construit la liste renvoyée par `GET /devices` (et `/devices/list`).
@@ -1520,7 +1553,14 @@ mod dlna_reprobe_tests {
 #[cfg(test)]
 mod list_devices_dedup_tests {
     use super::*;
+    use tune_core::db::sqlite::SqliteDb;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn zone_repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        ZoneRepo::new(db)
+    }
 
     fn marantz_deux_identites() -> Vec<DiscoveredDevice> {
         // Cas documenté dans #1880 : le même appareil s'annonce en mDNS
@@ -1649,5 +1689,51 @@ mod list_devices_dedup_tests {
             items[0].get("registered").and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn appareil_decouvert_signale_la_zone_masquee_et_son_identite_exacte() {
+        let repo = zone_repo();
+        let hidden_id = "airplay-00:06:78:7C:2E:26";
+        let zone_id = repo
+            .create("Marantz ND8006", Some("airplay"), Some(hidden_id))
+            .unwrap();
+        repo.delete(zone_id).unwrap();
+
+        let mut items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        mark_hidden_zones(&mut items, &repo);
+
+        assert_eq!(
+            items[0].get("zone_hidden").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            items[0]
+                .get("hidden_zone_device_id")
+                .and_then(Value::as_str),
+            Some(hidden_id),
+            "la restauration doit viser l'identité masquée, même secondaire"
+        );
+    }
+
+    #[test]
+    fn appareil_sans_zone_masquee_ne_propose_pas_de_restauration() {
+        let repo = zone_repo();
+        let mut items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        mark_hidden_zones(&mut items, &repo);
+
+        assert_eq!(
+            items[0].get("zone_hidden").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(items[0].get("hidden_zone_device_id").is_none());
     }
 }
