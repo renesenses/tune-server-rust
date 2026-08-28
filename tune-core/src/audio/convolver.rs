@@ -953,10 +953,10 @@ mod tests {
         let riff_size = (wav.len() - 8) as u32;
         wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        let path = std::env::temp_dir().join("tune_ir_extrachunks_test.wav");
+        let ir_file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = ir_file.path().to_path_buf();
         std::fs::write(&path, &wav).unwrap();
         let mut conv = Convolver::from_wav(path.to_str().unwrap(), 4).unwrap();
-        std::fs::remove_file(&path).ok();
 
         let latence = conv.latency_frames();
         let attendu = [1.0f32, 0.5, 0.25, 0.125];

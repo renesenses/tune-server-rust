@@ -232,12 +232,10 @@ mod tests {
 
     #[test]
     fn sidecar_uppercase_extension() {
-        let dir = std::env::temp_dir().join("tune_lrc_test_upper");
-        std::fs::create_dir_all(&dir).unwrap();
-        let audio = dir.join("Song.flac");
-        std::fs::write(dir.join("Song.LRC"), "[00:01.00] up").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = dir.path().join("Song.flac");
+        std::fs::write(dir.path().join("Song.LRC"), "[00:01.00] up").unwrap();
         let content = find_sidecar_lrc(audio.to_str().unwrap());
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(content.as_deref(), Some("[00:01.00] up"));
     }
 }

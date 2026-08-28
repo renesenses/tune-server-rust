@@ -630,10 +630,10 @@ mod tests {
         original.extend_from_slice(&mdat);
         original.extend_from_slice(&moov);
 
-        let path = std::env::temp_dir().join("tune-faststart-cover-strip-test.m4a");
+        let m4a = tempfile::Builder::new().suffix(".m4a").tempfile().unwrap();
+        let path = m4a.path().to_path_buf();
         std::fs::write(&path, &original).unwrap();
         let map = prepare_faststart(&path).expect("prepare");
-        std::fs::remove_file(&path).ok();
 
         // Total served = disk size minus the removed cover.
         assert_eq!(map.total, original.len() as u64 - covr_total as u64);
@@ -674,14 +674,14 @@ mod tests {
         original.extend_from_slice(&moov);
         original.extend_from_slice(&mdat);
 
-        let path = std::env::temp_dir().join("tune-faststart-cover-inplace-test.m4a");
+        let m4a = tempfile::Builder::new().suffix(".m4a").tempfile().unwrap();
+        let path = m4a.path().to_path_buf();
         std::fs::write(&path, &original).unwrap();
         assert!(
             prepare_faststart(&path).is_none(),
             "already faststart → declined"
         );
         let map = prepare_cover_strip_faststart(&path).expect("cover strip in place");
-        std::fs::remove_file(&path).ok();
 
         // Served size = disk minus the removed cover.
         assert_eq!(map.total, original.len() as u64 - covr_total as u64);
@@ -711,10 +711,10 @@ mod tests {
         let mut original = ftyp;
         original.extend_from_slice(&moov);
         original.extend_from_slice(&mdat);
-        let path = std::env::temp_dir().join("tune-faststart-nocover-inplace-test.m4a");
+        let m4a = tempfile::Builder::new().suffix(".m4a").tempfile().unwrap();
+        let path = m4a.path().to_path_buf();
         std::fs::write(&path, &original).unwrap();
         let r = prepare_cover_strip_faststart(&path);
-        std::fs::remove_file(&path).ok();
         assert!(r.is_none(), "no cover → serve raw");
     }
 
@@ -811,11 +811,12 @@ mod tests {
         original.extend_from_slice(&mdat);
         original.extend_from_slice(&moov);
 
-        // Write to a temp file (unique name; no Date/rand needed).
-        let path = std::env::temp_dir().join("tune-faststart-unit-test-fixture.m4a");
+        // Fichier temporaire porte par un handle : nom unique, nettoyage
+        // automatique, aucun chemin fixe partage entre utilisateurs.
+        let m4a = tempfile::Builder::new().suffix(".m4a").tempfile().unwrap();
+        let path = m4a.path().to_path_buf();
         std::fs::write(&path, &original).unwrap();
         let map = prepare_faststart(&path).expect("prepare");
-        std::fs::remove_file(&path).ok();
 
         // header = ftyp + patched moov; body = the mdat region of the original.
         assert_eq!(map.header.len(), ftyp.len() + moov.len());

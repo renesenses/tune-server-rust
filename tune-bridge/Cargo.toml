@@ -25,3 +25,6 @@ bytes = { workspace = true }
 dashmap = "6"
 reqwest = { workspace = true }
 dotenvy = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
