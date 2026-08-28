@@ -21,6 +21,8 @@ mod output_provider_seam;
 mod rbac;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "uptime_process_scope.rs"]
+mod uptime_process_scope;
 #[path = "workflows_bornes.rs"]
 mod workflows_bornes;
 #[path = "ws_auth.rs"]
