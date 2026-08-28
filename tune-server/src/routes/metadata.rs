@@ -310,11 +310,18 @@ async fn diagnose_mp3(State(state): State<AppState>) -> impl IntoResponse {
         let total = pistes.len();
 
         for (id, chemin, duree, taille) in pistes {
-            if !std::path::Path::new(&chemin).exists() {
+            // Le diagnostic accusait de `missing_file` des fichiers bien
+            // presents dont le nom est en NFD sur le disque alors que la base
+            // le tient en NFC (#1865). On resout la graphie reelle, et c'est
+            // ELLE qu'on sonde ensuite — jamais une chaine normalisee par nos
+            // soins.
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(&chemin)
+            else {
                 manquants += 1;
                 anomalies.push(anomalie(id, &chemin, vec!["missing_file"]));
                 continue;
-            }
+            };
 
             let suspecte = matches!(
                 (duree, taille),
@@ -325,7 +332,7 @@ async fn diagnose_mp3(State(state): State<AppState>) -> impl IntoResponse {
                 continue;
             }
 
-            match tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin)) {
+            match tune_core::metadata::probe_duration_ms(std::path::Path::new(&sur_disque)) {
                 None => anomalies.push(anomalie(id, &chemin, vec!["unreadable"])),
                 Some(reelle) => {
                     let ecart = (reelle as i64 - duree.unwrap_or(0)).abs();

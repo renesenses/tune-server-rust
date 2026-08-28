@@ -4,6 +4,9 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+// Repli NFC/NFD partagé (#1865) — voir `crate::library::local_path`.
+use crate::library::local_path::resolve_existing_local_path;
+
 /// Error marker returned by `resolve_local_track` when a play was superseded by
 /// a newer tap before its transcode started; `play_inner` maps it to a quiet
 /// no-op result instead of a user-facing error.
@@ -10082,28 +10085,11 @@ async fn arm_local_stream_consumer_watch(
     }))
 }
 
-/// On-disk path candidates for a stored (NFC-normalized) DB path, in
-/// resolution order: the stored spelling first, then its NFD (decomposed)
-/// form. The scanner stores paths NFC-normalized for consistent DB lookups,
-/// but Samba/CIFS and macOS-origin shares hold filenames in NFD, so the stored
-/// spelling can miss the real file when handed to the OS to open.
-fn local_path_candidates(stored: &str) -> Vec<String> {
-    use unicode_normalization::UnicodeNormalization as _;
-    let mut candidates = vec![stored.to_string()];
-    let nfd: String = stored.nfd().collect();
-    if nfd != stored {
-        candidates.push(nfd);
-    }
-    candidates
-}
-
-/// First path spelling that actually exists on disk (see
-/// [`local_path_candidates`]), or `None` when the file is genuinely gone.
-fn resolve_existing_local_path(stored: &str) -> Option<String> {
-    local_path_candidates(stored)
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-}
+// Le repli NFC/NFD qui vivait ici en `fn` privée est parti dans
+// `crate::library::local_path` (#1865) : il était connu, documenté et
+// correct, mais enfermé — la lecture en profitait, aucune passe de fond ne
+// pouvait s'en servir. Il est importé en haut de fichier, pas réécrit : une
+// seconde normalisation, forcément divergente, serait pire que l'absence.
 
 #[cfg(test)]
 mod transcode_budget_tests {
@@ -10949,24 +10935,27 @@ mod tests {
         );
     }
 
+    /// Le repli NFC/NFD lui-même est éprouvé dans
+    /// `crate::library::local_path` (#1865). Ce qui se teste ICI, c'est que la
+    /// lecture continue de PASSER PAR LUI : la sortir du module l'a rendue
+    /// partageable, elle ne doit pas s'en trouver débranchée.
     #[test]
-    fn local_path_candidates_offers_nfd_for_accented_paths() {
-        // Pure ASCII path: only the stored spelling, no redundant candidate.
-        assert_eq!(
-            super::local_path_candidates("/music/Gramophone/01.flac"),
-            vec!["/music/Gramophone/01.flac".to_string()]
-        );
-        // NFC path with a composed "é" (U+00E9): a second, NFD candidate
-        // ("e" + combining acute U+0301) is offered so an NFD Samba/CIFS or
-        // macOS-origin share still resolves to the real file (Dominique Comet).
-        let nfc = "/music/Caf\u{00e9}/track.flac";
-        let cands = super::local_path_candidates(nfc);
-        assert_eq!(cands.len(), 2, "accented path must offer stored + NFD");
-        assert_eq!(cands[0], nfc);
-        assert_ne!(cands[1], nfc);
+    fn la_lecture_locale_passe_par_le_repli_partage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Sur le disque en NFD (graphie d'un partage SMB / d'un Mac)…
+        let nfd = tmp.path().join("Bjo\u{0308}rk - Jo\u{0301}ga.flac");
+        std::fs::write(&nfd, b"x").unwrap();
+        // …et en base en NFC, comme le scanner l'enregistre.
+        let nfc = tmp
+            .path()
+            .join("Bj\u{00f6}rk - J\u{00f3}ga.flac")
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(nfc, nfd.to_string_lossy(), "les deux graphies different");
         assert!(
-            cands[1].contains('\u{0301}'),
-            "second candidate must be NFD (combining acute accent)"
+            super::resolve_existing_local_path(&nfc).is_some(),
+            "resolve_existing_local_path doit venir de library::local_path et \
+             retrouver le fichier NFD depuis le chemin NFC de la base"
         );
     }
 

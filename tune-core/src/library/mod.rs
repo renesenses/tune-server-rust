@@ -9,6 +9,7 @@ pub mod full_text_search;
 pub mod genre_tree;
 pub mod importer;
 pub mod ingest;
+pub mod local_path;
 pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod playlist_scan;
