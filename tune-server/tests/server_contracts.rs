@@ -25,6 +25,8 @@ mod output_provider_seam;
 mod paroles_source_lrclib;
 #[path = "rbac.rs"]
 mod rbac;
+#[path = "reidentification_album.rs"]
+mod reidentification_album;
 #[path = "rustsec_allowlists.rs"]
 mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]

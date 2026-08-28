@@ -16,6 +16,7 @@ mod ingest;
 mod lyrics_pass;
 mod proposals;
 mod ratings;
+mod reidentify;
 mod reports;
 mod search;
 mod stats;
@@ -338,6 +339,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}/artwork/rescan",
             post(artwork::rescan_album_artwork),
+        )
+        // Refaire l'identification d'UN album (#2128). Bornée à cet album :
+        // ni scan, ni passe de fond — voir l'en-tête de `reidentify.rs`.
+        .route(
+            "/albums/{id}/reidentify",
+            post(reidentify::reidentify_album),
         )
         .route(
             "/albums/merge-duplicates",
