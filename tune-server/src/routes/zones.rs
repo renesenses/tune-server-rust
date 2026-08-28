@@ -1262,6 +1262,26 @@ fn build_signal_path(
         && !resampling_active
         && replaygain_step.is_none();
 
+    // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
+    //
+    // C'est le message que voit l'utilisateur pour le mp3-128 de Bandcamp
+    // (#2074). La règle écrite dans le plugin — « un flux à 128 kbit/s doit
+    // être annoncé comme tel PARTOUT où il apparaît »
+    // (`plugins/tune-bandcamp/src/lib.rs`) — n'était tenue que sur l'écran
+    // Bandcamp. Passée en zone, la même piste s'affichait « MP3 44kHz/16bit »,
+    // exactement comme un 320 : le seul public de ce logiciel est celui qui
+    // règle sa chaîne au bit près, et c'est précisément à lui que la
+    // différence était cachée.
+    //
+    // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
+    // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
+    // hériter du chiffre de l'extrait.
+    let bitrate_label = np
+        .bitrate_kbps
+        .filter(|kbps| *kbps > 0 && !is_lossless)
+        .map(|kbps| format!(" {kbps} kbit/s"))
+        .unwrap_or_default();
+
     // Build steps
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
@@ -1269,11 +1289,11 @@ fn build_signal_path(
         format!("{format_name} {mhz:.1} MHz")
     } else if sample_rate >= 1000 {
         format!(
-            "{format_name} {sr}kHz/{bit_depth}bit",
+            "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
             sr = sample_rate / 1000
         )
     } else {
-        format!("{format_name} {sample_rate}Hz/{bit_depth}bit")
+        format!("{format_name}{bitrate_label} {sample_rate}Hz/{bit_depth}bit")
     };
 
     let mut steps = vec![json!({
@@ -3614,6 +3634,75 @@ mod signal_path_tests {
             .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
             .and_then(|s| s.get("detail").and_then(|d| d.as_str()))
             .map(String::from)
+    }
+
+    /// #2074 — le message que voit l'utilisateur.
+    ///
+    /// Bandcamp ne sert que du `mp3-128` en écoute libre, et la règle écrite
+    /// dans `plugins/tune-bandcamp/src/lib.rs` veut que ce débit soit
+    /// « annoncé comme tel PARTOUT où il apparaît ». Il l'était sur l'écran
+    /// Bandcamp et NULLE PART ailleurs : arrivée dans une zone, la piste
+    /// s'affichait « MP3 44kHz/16bit », indiscernable d'un 320 devant un DAC
+    /// de salon.
+    #[test]
+    fn a_lossy_source_announces_its_bitrate_in_the_signal_path() {
+        let (backend, zone) = dlna_zone();
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Un extrait".into(),
+                source: "bandcamp".into(),
+                format: Some("mp3".into()),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                bitrate_kbps: Some(128),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Marantz"), "", None).unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("MP3 128 kbit/s 44kHz/16bit"),
+            "le débit doit être lisible AVANT que le son n'atteigne le DAC"
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    }
+
+    /// #2074, cas de l'ACHAT — le pendant du test précédent.
+    ///
+    /// La règle porte sur la qualité réelle du flux, jamais sur la source
+    /// « Bandcamp » en bloc : un album acheté descend en FLAC par la même
+    /// porte, et lui coller « 128 kbit/s » serait le même mensonge dans
+    /// l'autre sens.
+    #[test]
+    fn a_lossless_source_announces_no_bitrate() {
+        let (backend, zone) = dlna_zone();
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Un album acheté".into(),
+                source: "bandcamp".into(),
+                format: Some("flac".into()),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                bitrate_kbps: None,
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Marantz"), "", None).unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 44kHz/16bit"),
+            "aucun débit ne doit apparaître sur un flux sans perte"
+        );
     }
 
     /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la

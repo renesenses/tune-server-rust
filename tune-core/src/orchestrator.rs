@@ -700,6 +700,17 @@ pub struct ResolvedStream {
     /// endpoints. Carried through to `PlayMedia::origin_url` so an output can
     /// reach the source as it was published; see that field for the rationale.
     pub origin_url: Option<String>,
+    /// Débit CONSTANT du flux SOURCE, en kbit/s, quand la source le nomme
+    /// elle-même. Jamais déduit, jamais estimé : `None` dit « on ne sait pas »
+    /// et rien ne sera affiché.
+    ///
+    /// Sa raison d'être est le 128 kbit/s de Bandcamp (#2074). La qualité
+    /// était annoncée sur l'écran Bandcamp et se perdait au passage en zone :
+    /// le chemin du signal n'affichait plus que « MP3 », indiscernable d'un
+    /// 320. Or Tune s'adresse à des gens qui règlent leur chaîne au bit près,
+    /// et la règle écrite dans `tune-bandcamp` veut que ce débit soit
+    /// « annoncé comme tel partout où il apparaît ».
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
@@ -1676,14 +1687,26 @@ impl PlaybackOrchestrator {
                 // (Progman/Cyrille: Qobuz shown compressed / wrong format).
                 .or_else(|| match resolved.source.as_str() {
                     "qobuz" => Some("flac".to_string()),
-                    // Bandcamp ne diffuse QUE du mp3-128 sans achat. Le dire
-                    // ici — et non depuis le client — pour deux raisons : le
-                    // repli sur le type MIME afficherait « MPEG » au lieu de
-                    // « MP3 », et surtout l'avance de file re-résout la piste
-                    // SANS qu'aucun client repasse un format. Sans cette
-                    // ligne, la piste 1 s'affichait autrement que la piste 2
-                    // du même album.
-                    "bandcamp" => Some("mp3".to_string()),
+                    // Bandcamp : le dire ici — et non depuis le client — pour
+                    // deux raisons : le repli sur le type MIME afficherait
+                    // « MPEG » au lieu de « MP3 », et surtout l'avance de file
+                    // re-résout la piste SANS qu'aucun client repasse un
+                    // format. Sans cette ligne, la piste 1 s'affichait
+                    // autrement que la piste 2 du même album.
+                    //
+                    // Le codec vient de l'URL, pas du nom du service : sans
+                    // achat Bandcamp ne sert que du `mp3-128`, mais un fichier
+                    // acheté descend en `flac`/`alac` par la même porte, et
+                    // l'annoncer « MP3 » serait faux (#2074). Repli sur `mp3`
+                    // quand l'URL ne nomme rien : c'est l'écoute libre.
+                    "bandcamp" => Some(
+                        req.source_id
+                            .as_deref()
+                            .and_then(bandcamp_encoding)
+                            .and_then(|enc| bandcamp_quality(&enc))
+                            .map(|q| q.codec.to_string())
+                            .unwrap_or_else(|| "mp3".to_string()),
+                    ),
                     _ => None,
                 })
                 // A media-server (UPnP/NAS) item has no local track row, so the
@@ -1744,6 +1767,13 @@ impl PlaybackOrchestrator {
             // donner aucun.
             album_id: track_meta.as_ref().and_then(|t| t.album_id),
             artist_id: track_meta.as_ref().and_then(|t| t.artist_id),
+            // Le débit annoncé par la SOURCE, quand elle le nomme. C'est ce
+            // qui manquait au 128 kbit/s de Bandcamp : annoncé sur l'écran de
+            // découverte, il disparaissait dès que la piste partait en zone —
+            // le chemin du signal ne montrait plus qu'un « MP3 » qu'aucun
+            // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
+            // n'en porte pas : sa résolution réelle est lue au scan.
+            bitrate_kbps: resolved.bitrate_kbps,
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -2503,6 +2533,7 @@ impl PlaybackOrchestrator {
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
             origin_url: None,
+            bitrate_kbps: None,
             cover_url: None,
             file_size,
         })
@@ -2625,13 +2656,26 @@ impl PlaybackOrchestrator {
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
         let source = req.source.clone().unwrap_or_else(|| "podcast".into());
-        // Bandcamp ne sert QUE du `mp3-128`, et ses URL de flux
-        // (`t4.bcbits.com/stream/<hash>/mp3-128/<id>?…`) n'ont pas
-        // d'extension : `guess_mime_from_url` retombe sur son défaut, qui se
-        // trouve être le bon. On l'affirme ici plutôt que de dépendre d'un
-        // défaut — si ce défaut changeait, la zone recevrait un MIME faux.
+        // La qualité Bandcamp est LUE DANS L'URL, jamais déduite du nom du
+        // service. L'écoute libre est du `mp3-128` ; un fichier ACHETÉ entre
+        // par la même porte en `flac`, `alac` ou `mp3-320`, et l'étiqueter
+        // « MP3 128 » serait un mensonge dans le sens le plus coûteux pour ce
+        // logiciel (#2074). `None` quand l'URL ne nomme rien : on retombe
+        // alors sur ce que Bandcamp sert sans session, sans rien affirmer de
+        // plus.
+        let bc_quality = (source == "bandcamp")
+            .then(|| bandcamp_encoding(audio_url))
+            .flatten()
+            .and_then(|enc| bandcamp_quality(&enc));
+        // Les URL de flux Bandcamp (`t4.bcbits.com/stream/<hash>/mp3-128/<id>`)
+        // n'ont pas d'extension : `guess_mime_from_url` retomberait sur son
+        // défaut, qui se trouve être le bon. On l'affirme plutôt que d'en
+        // dépendre — si ce défaut changeait, la zone recevrait un MIME faux.
         let mime_type = if source == "bandcamp" {
-            "audio/mpeg"
+            bc_quality
+                .as_ref()
+                .map(|q| q.mime_type)
+                .unwrap_or("audio/mpeg")
         } else {
             guess_mime_from_url(audio_url)
         };
@@ -2861,9 +2905,15 @@ impl PlaybackOrchestrator {
             // les pistes Tidal/Qobuz (`create_proxy_session`). Les octets
             // passent verbatim : c'est du MP3 que tout renderer sait lire, il
             // n'y a rien à transcoder.
+            //
+            // Conteneur et MIME suivent l'encodage LU DANS L'URL, avec repli
+            // sur le `mp3` de l'écoute libre : le proxy passe les octets tels
+            // quels, donc annoncer `audio/mpeg` sur un FLAC acheté ferait
+            // exactement le mislabel dont ce chemin se protège (#2074).
+            let bc_codec = bc_quality.as_ref().map(|q| q.codec).unwrap_or("mp3");
             let info = StreamInfo {
-                format: "mp3".into(),
-                mime_type: "audio/mpeg".into(),
+                format: bc_codec.into(),
+                mime_type: mime_type.to_string(),
                 sample_rate: 44100,
                 bit_depth: 16,
                 channels: 2,
@@ -2876,16 +2926,19 @@ impl PlaybackOrchestrator {
                 .create_proxy_session(info, audio_url.to_string(), false)
                 .await;
             let server_ip = self.server_ip();
-            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "mp3");
+            let stream_url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, bc_codec);
             info!(
                 url = %audio_url,
                 browser = is_browser_output,
+                codec = bc_codec,
                 "bandcamp_proxy_for_network_or_browser_output"
             );
             (
                 stream_url,
                 Some(session_id),
-                "audio/mpeg".to_string(),
+                mime_type.to_string(),
                 Some(44100u32),
                 Some(16u32),
                 Some(2u32),
@@ -3070,6 +3123,11 @@ impl PlaybackOrchestrator {
             bit_depth: out_bd,
             channels: out_ch,
             origin_url,
+            // Le débit voyage jusqu'à la zone quelle que soit la sortie prise
+            // ci-dessus — locale, WAV décodé pour OAAT, ou proxy MP3 pour un
+            // renderer réseau : les trois portent le MÊME flux source, et
+            // c'est LUI que le chemin du signal doit annoncer (#2074).
+            bitrate_kbps: bc_quality.as_ref().and_then(|q| q.bitrate_kbps),
         })
     }
 
@@ -3392,6 +3450,7 @@ impl PlaybackOrchestrator {
                         bit_depth: Some(24),
                         channels: Some(dop_channels as u32),
                         origin_url: None,
+                        bitrate_kbps: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
                     });
@@ -4568,6 +4627,7 @@ impl PlaybackOrchestrator {
             bit_depth: resolved_bd,
             channels: resolved_ch,
             origin_url: None,
+            bitrate_kbps: None,
         })
     }
 
@@ -5144,6 +5204,7 @@ impl PlaybackOrchestrator {
                             bit_depth: Some(stream_data.quality.bit_depth as u32),
                             channels: Some(2),
                             origin_url: None,
+                            bitrate_kbps: None,
                         });
                     }
                 }
@@ -5313,6 +5374,7 @@ impl PlaybackOrchestrator {
                     bit_depth: Some(bd as u32),
                     channels: Some(2),
                     origin_url: None,
+                    bitrate_kbps: None,
                 });
             }
 
@@ -6002,6 +6064,7 @@ impl PlaybackOrchestrator {
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
             origin_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -6240,6 +6303,7 @@ impl PlaybackOrchestrator {
                 // from this path, so without it short tracks were the only ones
                 // captured through the proxy — and filed under `Stream/`.
                 origin_url: prefetched.upstream_url,
+                bitrate_kbps: None,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -6336,6 +6400,7 @@ impl PlaybackOrchestrator {
             // the decoded buffer, so an output that wants the source container
             // needs the service's own URL, not ours.
             origin_url: prefetched.upstream_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -8963,6 +9028,96 @@ impl PlaybackOrchestrator {
                 )
                 .ok();
         }
+    }
+}
+
+/// Les encodages que Bandcamp nomme dans le CHEMIN d'une URL de flux.
+///
+/// Liste fermée et non heuristique : un segment de chemin Bandcamp est le plus
+/// souvent un hachage hexadécimal, et prendre n'importe quel segment pour un
+/// encodage inventerait une qualité.
+const BC_KNOWN_ENCODINGS: &[&str] = &[
+    "mp3-128",
+    "mp3-320",
+    "mp3-v0",
+    "flac",
+    "alac",
+    "aac-hi",
+    "aiff-lossless",
+    "vorbis",
+    "wav",
+];
+
+/// L'encodage nommé par une URL Bandcamp, en minuscules.
+///
+/// Bandcamp écrit le nom de l'encodage dans l'URL elle-même, sous deux formes :
+///
+/// * segment de chemin — `https://t4.bcbits.com/stream/<hash>/mp3-128/<id>?…` ;
+/// * paramètre de requête — `https://bandcamp.com/stream_redirect?enc=mp3-128&…`.
+///
+/// Un fichier d'album **acheté** emprunte la seconde forme avec une autre
+/// valeur (`enc=flac`, `enc=mp3-320`, `enc=alac`…). C'est toute la raison
+/// d'être de cette fonction : la règle écrite dans le plugin — « un flux à
+/// 128 kbit/s doit être annoncé comme tel partout où il apparaît »,
+/// `plugins/tune-bandcamp/src/lib.rs` — porte sur la QUALITÉ du flux, jamais
+/// sur le nom du service. Décider depuis `source == "bandcamp"` collerait
+/// « 128 kbit/s » sur un FLAC acheté (#2074).
+///
+/// Rend `None` quand l'URL ne nomme aucun encodage connu : on n'annonce alors
+/// rien plutôt que de deviner un chiffre.
+pub fn bandcamp_encoding(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let (path, query) = lower.split_once('?').unwrap_or((lower.as_str(), ""));
+    if let Some(enc) = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("enc="))
+        .filter(|v| !v.is_empty())
+    {
+        return Some(enc.to_string());
+    }
+    path.split('/')
+        .find(|seg| BC_KNOWN_ENCODINGS.contains(seg))
+        .map(|seg| seg.to_string())
+}
+
+/// Ce qu'un encodage Bandcamp vaut réellement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandcampQuality {
+    /// Codec, sous la forme d'extension que lit le chemin du signal.
+    pub codec: &'static str,
+    /// Type MIME à annoncer à la zone.
+    pub mime_type: &'static str,
+    /// Débit CONSTANT en kbit/s. `None` pour un débit variable ou un encodage
+    /// sans perte : un débit inventé serait pire que pas de débit du tout.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Traduire un encodage Bandcamp en codec, MIME et débit annonçables.
+pub fn bandcamp_quality(enc: &str) -> Option<BandcampQuality> {
+    let q = |codec, mime_type, bitrate_kbps| {
+        Some(BandcampQuality {
+            codec,
+            mime_type,
+            bitrate_kbps,
+        })
+    };
+    match enc {
+        "flac" => q("flac", "audio/flac", None),
+        "alac" => q("alac", "audio/mp4", None),
+        "aiff-lossless" => q("aiff", "audio/aiff", None),
+        "wav" => q("wav", "audio/wav", None),
+        "vorbis" => q("ogg", "audio/ogg", None),
+        "aac-hi" => q("aac", "audio/mp4", None),
+        // Débit variable : le nom ne porte aucun chiffre, et en inventer un
+        // serait exactement le mensonge que ce correctif supprime.
+        "mp3-v0" => q("mp3", "audio/mpeg", None),
+        // `mp3-128` (écoute libre) et `mp3-320` (achat) partagent la même
+        // forme : on lit le nombre plutôt que d'énumérer, sinon un futur
+        // `mp3-256` retomberait silencieusement sans débit.
+        other => other
+            .strip_prefix("mp3-")
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|kbps| q("mp3", "audio/mpeg", Some(kbps))),
     }
 }
 
@@ -12439,6 +12594,149 @@ mod tests {
         // annoncer « MP3 — Avec perte » de sa propre autorité.
         assert_eq!(resolved.sample_rate, Some(44100));
         assert_eq!(resolved.bit_depth, Some(16));
+    }
+
+    /// #2074 — l'URL est la seule autorité sur la qualité.
+    ///
+    /// Bandcamp nomme l'encodage dans l'URL, sous deux formes. Un fichier
+    /// ACHETÉ emprunte la même porte avec une autre valeur : la règle doit
+    /// donc porter sur le flux, jamais sur le nom du service.
+    #[test]
+    fn bandcamp_quality_is_read_from_the_url_never_from_the_source_name() {
+        use super::{bandcamp_encoding, bandcamp_quality};
+
+        // Forme « segment de chemin » — l'écoute libre publiée par Bandcamp.
+        assert_eq!(bandcamp_encoding(BC_STREAM).as_deref(), Some("mp3-128"));
+        let libre = bandcamp_quality("mp3-128").expect("mp3-128 est connu");
+        assert_eq!(libre.codec, "mp3");
+        assert_eq!(libre.mime_type, "audio/mpeg");
+        assert_eq!(libre.bitrate_kbps, Some(128));
+
+        // Forme « paramètre de requête » — la redirection de flux.
+        assert_eq!(
+            bandcamp_encoding("https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=1")
+                .as_deref(),
+            Some("mp3-128")
+        );
+
+        // ACHAT en lossless : ni MP3, ni débit. C'est le cœur de la règle.
+        let achete = bandcamp_quality(
+            &bandcamp_encoding("https://popplers5.bandcamp.com/download/track?enc=flac&id=42")
+                .expect("enc=flac doit être lu"),
+        )
+        .expect("flac est connu");
+        assert_eq!(achete.codec, "flac");
+        assert_eq!(achete.mime_type, "audio/flac");
+        assert_eq!(
+            achete.bitrate_kbps, None,
+            "un flux sans perte n'a aucun débit à annoncer"
+        );
+
+        // ACHAT en MP3 320 : même codec que l'extrait, débit différent.
+        assert_eq!(
+            bandcamp_quality("mp3-320").map(|q| q.bitrate_kbps),
+            Some(Some(320))
+        );
+        // Débit VARIABLE : on n'invente pas de chiffre.
+        assert_eq!(
+            bandcamp_quality("mp3-v0").map(|q| q.bitrate_kbps),
+            Some(None)
+        );
+
+        // Un hachage de chemin ne doit jamais passer pour un encodage.
+        assert_eq!(
+            bandcamp_encoding("https://t4.bcbits.com/stream/0123456789abcdef/7654321?p=0"),
+            None
+        );
+        assert_eq!(bandcamp_quality("chose-inconnue"), None);
+    }
+
+    #[tokio::test]
+    async fn bandcamp_carries_its_128_kbps_all_the_way_to_the_zone() {
+        // Le défaut de #2074 : la qualité était annoncée sur l'écran Bandcamp
+        // et se perdait au passage en zone. Les TROIS sorties câblées en
+        // 0.9.89 portent le même flux source — locale, WAV décodé pour OAAT,
+        // proxy MP3 pour un renderer réseau — donc les trois doivent porter
+        // le même débit jusqu'au chemin du signal.
+        let orch = test_orchestrator();
+        let sorties = [
+            None,
+            Some("local:default".to_string()),
+            Some("oaat:endpoint-1".to_string()),
+            Some("dlna:uuid-1234".to_string()),
+        ];
+        assert_eq!(sorties.len(), 4, "quatre sorties examinées");
+        for sortie in sorties {
+            let req = super::PlayRequest {
+                zone_id: 1,
+                output_device_id: sortie.clone(),
+                track_id: None,
+                source: Some("bandcamp".into()),
+                source_id: Some(BC_STREAM.into()),
+                title: Some("A Track".into()),
+                artist_name: None,
+                album_title: None,
+                cover_url: None,
+                duration_ms: Some(212_000),
+                seek_ms: None,
+                temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
+                track_number: None,
+                disc_number: None,
+            };
+            let resolved = orch.resolve_direct_url(&req).await.unwrap();
+            assert_eq!(
+                resolved.bitrate_kbps,
+                Some(128),
+                "sortie {sortie:?} : le 128 kbit/s doit atteindre la zone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purchased_bandcamp_file_is_never_labelled_mp3_128() {
+        // Cas de l'ACHAT : la même porte, un autre encodage. Coller
+        // « MP3 128 kbit/s » sur un FLAC serait le mensonge inverse.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("dlna:uuid-1234".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some("https://popplers5.bandcamp.com/download/track?enc=flac&id=42".into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert_eq!(
+            resolved.bitrate_kbps, None,
+            "aucun débit ne doit être annoncé sur un achat lossless"
+        );
+        assert_eq!(
+            resolved.mime_type, "audio/flac",
+            "le renderer doit recevoir le vrai type, pas audio/mpeg"
+        );
+        let stream_id = resolved
+            .stream_id
+            .as_deref()
+            .expect("une sortie réseau passe toujours par le proxy en clair");
+        assert!(
+            resolved.url.ends_with(&format!("/stream/{stream_id}.flac")),
+            "le conteneur servi doit suivre l'encodage réel : {}",
+            resolved.url
+        );
     }
 
     /// An output that rejects `play_media` — mirrors an AirPlay renderer whose
