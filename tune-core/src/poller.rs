@@ -2688,6 +2688,15 @@ impl PositionPoller {
                 }),
             );
         }
+        // Horodater le constat AVANT l'arrêt : c'est l'arrêt lui-même qui
+        // faisait retomber `output_reach` à `"ok"` et effaçait le bandeau
+        // « aucun onglet ne reçoit le son » à l'instant où il devenait vrai
+        // (#2588). La marque survit à l'arrêt ; la lecture suivante l'efface.
+        if navigateur {
+            self.orchestrator
+                .note_browser_unattended(zone_id, true)
+                .await;
+        }
         // Sans identifiant d'appareil, `stop` prend son repli — celui que
         // #2658 vient de borner au périmètre de la zone. Avant elle, arrêter
         // une zone navigateur coupait la musique de TOUTES les autres.
@@ -8313,6 +8322,43 @@ mod lecture_sans_destination_tests {
         assert!(fatal, "rien ne se rétablira tout seul");
     }
 
+    /// #2588 — l'abandon ne doit pas emporter l'explication du silence.
+    ///
+    /// L'arrêt fait retomber `output_reach` à `"ok"`, et le bandeau « aucun
+    /// onglet ne reçoit le son » disparaissait donc à l'instant même où le
+    /// poller le rendait vrai. Sans marque laissée derrière, l'utilisateur
+    /// voit la lecture cesser et n'apprend jamais pourquoi.
+    #[tokio::test]
+    async fn labandon_laisse_derriere_lui_de_quoi_expliquer_le_silence() {
+        let banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        let etat = banc.playback.get_state(zone_id).await;
+        assert_eq!(etat.state, PlayState::Stopped);
+        assert!(
+            etat.browser_unattended_at.is_some(),
+            "la raison du silence doit survivre à l'arrêt qui la produit"
+        );
+    }
+    /// Le constat est celui d'un ONGLET absent : une zone DLNA sans
+    /// périphérique produit le même silence pour une autre raison, et ne doit
+    /// pas hériter d'un message qui parle d'onglets (#2588).
+    #[tokio::test]
+    async fn labandon_dune_zone_sans_peripherique_naccuse_aucun_onglet() {
+        let banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Salon", "dlna", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        assert!(
+            banc.playback
+                .get_state(zone_id)
+                .await
+                .browser_unattended_at
+                .is_none(),
+            "aucun onglet n'est en cause ici"
+        );
+    }
     /// La scène du ticket : zone 987, aucun périphérique, aucun onglet. Le
     /// message reprend la sentinelle que le client sait déjà traduire.
     #[tokio::test]
