@@ -2389,7 +2389,7 @@ mod year_path_tests {
 
 #[derive(Deserialize, Default)]
 struct AutoFixBody {
-    /// Au-delà de ce degré de confiance, une suggestion est appliquée sans
+    /// À partir de ce degré de confiance, une suggestion est appliquée sans
     /// demander. En deçà, elle est proposée. Même valeur par défaut que
     /// `/suggestions/auto-apply`, pour que les deux chemins se comportent pareil.
     threshold: Option<f64>,
@@ -2445,10 +2445,9 @@ async fn auto_fix_status(State(state): State<AppState>) -> impl IntoResponse {
         // heures et conclut que « ça ne marche pas ». C'est exactement le
         // silence qui a produit #1372, #1555 et #1688 sur l'égaliseur.
         "eta_seconds": restantes * SECONDES_PAR_PISTE,
-        // `scan_loop` reçoit un `auto_apply_threshold` et l'IGNORE
-        // (`_auto_apply_threshold`) : auto-fix SUGGÈRE, il ne corrige pas. Le
-        // nom promet autre chose ; la réponse rétablit la vérité (#1993).
-        "applies_changes": false,
+        // Le seuil transmis au moteur decide maintenant entre application et
+        // suggestion. Le client peut donc annoncer le comportement reel.
+        "applies_changes": true,
     }))
     .into_response()
 }
