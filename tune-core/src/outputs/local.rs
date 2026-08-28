@@ -6840,53 +6840,14 @@ fn find_matching_config(
     })
 }
 
-/// Adapt channel count between source and output.
-///
-/// Handles upmix (mono to stereo, etc.) and downmix.  When downmixing
-/// from 5.1 (6 ch) or 7.1 (8 ch) to stereo, applies ITU-R BS.775
-/// compliant coefficients (K = 0.707) over the standard SMPTE/ITU
-/// channel layout: FL, FR, C, LFE, SL, SR [, BL, BR].
+/// Adapt channel count between source and output through the single matrix in
+/// `audio/channels`. Invalid or partial PCM is rejected as silence instead of
+/// being partially remixed in the audio path.
 fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
-    if from_ch == to_ch {
-        return samples.to_vec();
-    }
-    let from = from_ch as usize;
-    let to = to_ch as usize;
-
-    let mut out = Vec::with_capacity(samples.len() * to / from);
-    for frame in samples.chunks_exact(from) {
-        if to > from {
-            // Upmix: copy existing channels, duplicate last for remaining
-            for &s in frame {
-                out.push(s);
-            }
-            let last = *frame.last().unwrap_or(&0.0);
-            for _ in from..to {
-                out.push(last);
-            }
-        } else if to == 2 && from >= 6 {
-            const K: f32 = 0.707;
-            let fl = frame[0];
-            let fr = frame[1];
-            let c = frame[2];
-            let sl = frame[4];
-            let sr = frame[5];
-            let (bl, br) = if from >= 8 {
-                (frame[6], frame[7])
-            } else {
-                (0.0, 0.0)
-            };
-            let l = fl + K * c + K * sl + K * bl;
-            let r = fr + K * c + K * sr + K * br;
-            out.push(l.clamp(-1.0, 1.0));
-            out.push(r.clamp(-1.0, 1.0));
-        } else {
-            for ch in 0..to {
-                out.push(frame[ch]);
-            }
-        }
-    }
-    out
+    crate::audio::channels::adapt_channels_f32(samples, from_ch, to_ch).unwrap_or_else(|error| {
+        warn!(from_ch, to_ch, error = %error, "local_channel_adaptation_rejected");
+        Vec::new()
+    })
 }
 
 /// Simple linear-interpolation resampler for rate conversion.
@@ -8482,7 +8443,7 @@ mod tests {
     fn test_adapt_channels_stereo_to_mono() {
         let stereo = [0.5f32, 0.7, 0.3, 0.9];
         let mono = adapt_channels(&stereo, 2, 1);
-        assert_eq!(mono, [0.5, 0.3]);
+        assert_eq!(mono, [0.6, 0.6]);
     }
 
     #[test]
