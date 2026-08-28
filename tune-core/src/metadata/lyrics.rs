@@ -84,13 +84,24 @@ pub fn has_lrc_timestamps(content: &str) -> bool {
 /// lowercase `.lrc` extension first, then uppercase `.LRC`. Read-only:
 /// never writes anything into the user's music folders.
 pub fn find_sidecar_lrc(audio_path: &str) -> Option<String> {
+    let candidate = sidecar_lrc_path(audio_path)?;
+    std::fs::read_to_string(&candidate).ok()
+}
+
+/// Chemin du `.lrc` voisin s'il existe (même souche, `.lrc` puis `.LRC`) —
+/// sans en lire le contenu.
+///
+/// Séparé de [`find_sidecar_lrc`] pour que la passe de fond « paroles » puisse
+/// **enregistrer le chemin trouvé** dans `track_metadata` : l'indicateur de
+/// couverture doit pouvoir dire « cette piste a des paroles, et les voici »,
+/// pas seulement « oui ». Lecture seule : n'écrit jamais dans les dossiers de
+/// musique de l'utilisateur.
+pub fn sidecar_lrc_path(audio_path: &str) -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(audio_path);
     for ext in ["lrc", "LRC"] {
         let candidate = path.with_extension(ext);
         if candidate.exists() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                return Some(content);
-            }
+            return Some(candidate);
         }
     }
     None
