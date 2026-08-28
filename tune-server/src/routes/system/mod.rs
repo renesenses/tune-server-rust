@@ -19,6 +19,12 @@ mod tags;
 pub(crate) mod update;
 mod youtube;
 
+/// Nom convivial de cette machine (#2110). Réexporté ici parce que trois
+/// endroits doivent répondre la même chose à « quel serveur est-ce ? » :
+/// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
+/// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
+pub(crate) use config::resolve_server_name;
+
 use axum::Router;
 use axum::routing::{get, post};
 
