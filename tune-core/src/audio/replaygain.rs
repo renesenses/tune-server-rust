@@ -111,9 +111,9 @@ fn estimated_analysis_bytes(
         .saturating_mul(12)
 }
 
-/// Setting gate. Absent/"true" ⇒ on (Bertrand wants calculated tags filled
-/// automatically); set to "false" to disable the whole pass.
-const ENABLED_KEY: &str = "replaygain_analysis_enabled";
+/// Réglage propre à la PASSE D'ANALYSE : absent/"true" ⇒ autorisée,
+/// "false" ⇒ coupée. Il ne décide pas seul — voir [`analysis_enabled`].
+pub const ANALYSIS_ENABLED_KEY: &str = "replaygain_analysis_enabled";
 
 /// Format a gain the way ReplayGain tags do, e.g. `-6.50 dB`.
 pub fn format_gain(db: f64) -> String {
@@ -130,13 +130,51 @@ pub fn track_gain_db(lufs: f64) -> f64 {
     REFERENCE_LUFS - lufs
 }
 
-fn enabled(settings: &SettingsRepo) -> bool {
-    settings
-        .get(ENABLED_KEY)
+/// La passe d'analyse a-t-elle le droit de décoder ?
+///
+/// DEUX réglages la commandent, et les confondre est tout le défaut #2496 :
+///
+/// * [`MODE_KEY`] (`replaygain_mode`) — le sélecteur dont la première valeur
+///   s'affiche « Désactivé (niveau source) ». La boucle ne l'a JAMAIS lu : qui
+///   choisissait « Désactivé » n'arrêtait que l'APPLICATION du gain à la
+///   lecture, pendant que le balayage continuait de décoder la bibliothèque
+///   entière — CPU, disque, et sur un partage réseau chargé des démarrages de
+///   lecture à 6,8 s là où un flux distant partait en 0,15 s (#2495).
+/// * [`ANALYSIS_ENABLED_KEY`] (`replaygain_analysis_enabled`) — la coche
+///   « Analyse ReplayGain », qui coupe la passe même quand un mode est armé.
+///
+/// Règle : la passe tourne quand un mode est demandé ET que la coche n'a pas
+/// été décochée. « Désactivé » arrête donc bien le balayage. C'est la voie A
+/// de #2496 : on renonce au pré-remplissage silencieux — armer ReplayGain plus
+/// tard redevient long — pour qu'un réglage nommé « Désactivé » désactive.
+/// Un réglage sans effet est pire qu'un réglage absent : l'utilisateur croit
+/// avoir agi.
+///
+/// Un mode illisible ou absent vaut `Off`, exactement comme dans
+/// [`ReplayGainSettings::load`] : dans le doute on travaille MOINS, jamais plus.
+///
+/// Ce que cette fonction ne fait PAS, et ne doit jamais faire : effacer. Les
+/// `rg_track_gain` / `rg_album_gain` déjà mesurés restent en base et resservent
+/// tels quels dès qu'un mode est réarmé — les recalculer coûte des heures de
+/// décodage. Couper l'analyse suspend le travail, elle ne le jette pas.
+pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let opted_out = settings
+        .get(ANALYSIS_ENABLED_KEY)
         .ok()
         .flatten()
-        .map(|v| v != "false")
-        .unwrap_or(true)
+        .map(|v| v == "false")
+        .unwrap_or(false);
+    if opted_out {
+        return false;
+    }
+    let mode = settings
+        .get(MODE_KEY)
+        .ok()
+        .flatten()
+        .map(|v| ReplayGainMode::from_setting(&v))
+        .unwrap_or(ReplayGainMode::Off);
+    mode != ReplayGainMode::Off
 }
 
 /// Verrou GLOBAL des analyses lourdes : UNE seule passe décode à la fois.
@@ -200,8 +238,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // fichiers entiers, c'est l'autre moitié de la charge qui a éteint .18.
         let mut thermal = crate::audio::thermal::ThermalGate::new();
         loop {
-            let settings = SettingsRepo::with_backend(backend.clone());
-            if enabled(&settings) {
+            if analysis_enabled(&backend) {
                 if thermal.should_hold("replaygain") {
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
@@ -267,6 +304,17 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     for r in &rows {
+        // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à 180 s
+        // chacun, c'est plus d'une heure de décodage après un « Désactivé » si
+        // on ne regarde qu'entre deux lots : un réglage qui n'agit qu'au
+        // prochain démarrage n'est pas un réglage (#2496). On relit donc avant
+        // CHAQUE fichier. Le décodage déjà lancé n'est pas annulable — même
+        // contrat que le garde-fou lecture ci-dessous : on s'arrête au fichier
+        // suivant, pas au milieu d'un decode.
+        if !analysis_enabled(backend) {
+            info!("replaygain_analysis_disabled_mid_batch — réglage coupé, arrêt du balayage");
+            break;
+        }
         // Playback can start mid-batch; yield at once so a decode never
         // competes with the audio pipeline (#1310).
         if any_zone_playing(backend) {
@@ -915,5 +963,188 @@ mod tests {
         let e = (10f64.powf(-12.0 / 10.0) + 10f64.powf(-18.0 / 10.0)) / 2.0;
         let album_lufs = 10.0 * e.log10();
         assert!(album_lufs < -12.0 && album_lufs > -18.0);
+    }
+    // -----------------------------------------------------------------------
+    // #2496 — « Désactivé » doit désactiver
+    // -----------------------------------------------------------------------
+
+    /// Les tables que la passe touche, plus `n` pistes locales candidates.
+    ///
+    /// Les chemins n'existent pas : `measure_loudness_and_peak` rend `None`
+    /// aussitôt, mais la passe estampille quand même `rg_analyzed` et compte le
+    /// fichier — c'est ce compteur qui dit combien de fichiers ont VRAIMENT été
+    /// pris en charge, sans avoir à embarquer de l'audio dans le dépôt.
+    fn sweep_db(n: i64) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                                    updated_at TEXT NOT NULL DEFAULT '');
+             CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id INTEGER, file_path TEXT,
+                                  duration_ms INTEGER, sample_rate INTEGER, channels INTEGER);
+             CREATE TABLE track_metadata (track_id INTEGER NOT NULL, key TEXT NOT NULL,
+                                          value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        for i in 1..=n {
+            db.execute_batch(&format!(
+                "INSERT INTO tracks (id, album_id, file_path, duration_ms, sample_rate, channels) \
+                 VALUES ({i}, NULL, '/i2496-inexistant/{i}.flac', 300000, 44100, 2);"
+            ))
+            .unwrap();
+        }
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        (db, backend)
+    }
+
+    /// #2496 : la boucle ne lisait QUE `replaygain_analysis_enabled`, jamais
+    /// `replaygain_mode`. L'utilisateur qui choisissait « Désactivé (niveau
+    /// source) » n'arrêtait que l'application du gain à la lecture ; le
+    /// balayage continuait de décoder sa bibliothèque entière.
+    #[test]
+    fn the_off_mode_gates_the_analysis_sweep() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+
+        // Installation neuve : aucun mode écrit ⇒ Off ⇒ rien à balayer.
+        assert!(
+            !analysis_enabled(&backend),
+            "un mode absent vaut Désactivé : la passe ne doit pas démarrer"
+        );
+        settings.set(MODE_KEY, "off").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "« Désactivé » doit arrêter le balayage d'analyse (#2496)"
+        );
+
+        // Un mode réellement demandé la relance.
+        settings.set(MODE_KEY, "track").unwrap();
+        assert!(analysis_enabled(&backend), "mode piste ⇒ balayage autorisé");
+        settings.set(MODE_KEY, "album").unwrap();
+        assert!(analysis_enabled(&backend), "mode album ⇒ balayage autorisé");
+
+        // La coche « Analyse ReplayGain » reste un veto indépendant.
+        settings.set(ANALYSIS_ENABLED_KEY, "false").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "la coche décochée coupe la passe même avec un mode armé"
+        );
+        settings.set(ANALYSIS_ENABLED_KEY, "true").unwrap();
+        assert!(analysis_enabled(&backend));
+        settings.set(MODE_KEY, "off").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "la coche seule ne ressuscite pas la passe quand le mode est Désactivé"
+        );
+    }
+
+    /// Les trois comportements que #2496 demande de distinguer, sur une même
+    /// base : le balayage s'arrête, le gain DÉJÀ mesuré est conservé, et
+    /// l'application à la lecture relève d'un autre réglage.
+    #[tokio::test]
+    async fn disabling_stops_the_pass_without_losing_a_single_measured_gain() {
+        let (_db, backend) = sweep_db(2);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Piste 1 : déjà mesurée. Des heures de décodage derrière cette valeur.
+        meta.set(1, "rg_track_gain", "-6.50 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.988553").unwrap();
+        meta.set(1, "rg_analyzed", "1700000000").unwrap();
+
+        // Contre-épreuve intégrée : mode armé, la passe travaille pour de bon.
+        settings.set(MODE_KEY, "track").unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "mode armé : la piste 2 devait être prise en charge"
+        );
+
+        // Même lot rejoué, réglage sur « Désactivé ».
+        meta.delete(2, "rg_analyzed").unwrap();
+        settings.set(MODE_KEY, "off").unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "« Désactivé » : la passe ne doit décoder aucun fichier"
+        );
+        assert!(
+            !meta.get_all(2).unwrap().contains_key("rg_analyzed"),
+            "aucune piste ne doit avoir été touchée pendant que le réglage est coupé"
+        );
+
+        // AUCUNE donnée perdue : couper l'analyse suspend, n'efface pas.
+        let kept = meta.get_all(1).unwrap();
+        assert_eq!(
+            kept.get("rg_track_gain").map(String::as_str),
+            Some("-6.50 dB")
+        );
+        assert_eq!(
+            kept.get("rg_track_peak").map(String::as_str),
+            Some("0.988553")
+        );
+
+        // L'application à la lecture est un AUTRE réglage, une AUTRE décision :
+        // `Off` n'applique rien, et réarmer un mode retrouve le gain intact.
+        assert!(stored_gain_for(&backend, 1, ReplayGainMode::Off).is_none());
+        let back = stored_gain_for(&backend, 1, ReplayGainMode::Track)
+            .expect("le gain mesuré doit resservir tel quel une fois le mode réarmé");
+        assert!((back.gain_db - (-6.5)).abs() < 1e-9, "{back:?}");
+    }
+
+    /// #2496, point 4 : un réglage qui n'agit qu'au prochain démarrage n'est pas
+    /// un réglage. Un lot vaut 25 fichiers à jusqu'à 180 s chacun — sans
+    /// relecture par fichier, « Désactivé » laissait tourner plus d'une heure de
+    /// décodage.
+    #[tokio::test]
+    async fn switching_off_mid_batch_interrupts_the_running_sweep() {
+        let (_db, backend) = sweep_db(4);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+
+        // On bascule dès que la PREMIÈRE piste est estampillée. La passe dort
+        // alors PER_FILE_PAUSE_MS (400 ms) avant de relire le réglage : marge
+        // sans commune mesure avec les microsecondes que prend l'écriture.
+        let flipper = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let meta = TrackMetadataRepo::with_backend(backend.clone());
+                for _ in 0..2_000 {
+                    let stamped = meta
+                        .get_all(1)
+                        .map(|m| m.contains_key("rg_analyzed"))
+                        .unwrap_or(false);
+                    if stamped {
+                        SettingsRepo::with_backend(backend.clone())
+                            .set(MODE_KEY, "off")
+                            .unwrap();
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                false
+            })
+        };
+
+        let done = analyze_track_batch(&backend).await;
+        assert!(
+            flipper.await.unwrap(),
+            "le test n'a jamais réussi à couper le réglage — il ne prouve rien"
+        );
+        assert!(
+            done >= 1,
+            "la première piste devait être traitée, done={done}"
+        );
+        assert!(
+            done < 4,
+            "le balayage a traité les {done} pistes du lot malgré la coupure"
+        );
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        assert!(
+            !meta.get_all(4).unwrap().contains_key("rg_analyzed"),
+            "la dernière piste du lot ne devait jamais être décodée après la coupure"
+        );
     }
 }
