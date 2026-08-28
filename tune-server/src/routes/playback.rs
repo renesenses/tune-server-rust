@@ -2488,13 +2488,11 @@ struct CrossfadeSettings {
 
 /// Read the persisted crossfade settings for a zone.
 ///
-/// NOTE: crossfade is not yet applied by the playback engine (the
-/// `CrossfadeHandler` in tune-core is not wired into the transition path).
-/// This endpoint only persists/returns the user's preference so the UI can
-/// round-trip it without a 405 — actually applying the fade is a follow-up.
+/// Crossfade is not applied by the playback engine: report the capability as
+/// unavailable and never echo a stale persisted preference as if it were live.
 async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings
+    let requested_enabled = settings
         .get(&format!("crossfade_enabled:{zone_id}"))
         .ok()
         .flatten()
@@ -2507,31 +2505,66 @@ async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) 
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(3.0);
     Json(json!({
-        "enabled": enabled,
+        "available": false,
+        "enabled": false,
+        "requested_enabled": requested_enabled,
         "duration": duration,
     }))
+}
+
+fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
+    if body.enabled {
+        return Err("crossfade_unavailable");
+    }
+    Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
 }
 
 async fn set_crossfade(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    let duration = match validate_crossfade_update(&body) {
+        Ok(duration) => duration,
+        Err(code) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": code,
+                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let duration = body.duration.unwrap_or(3.0);
-    let _ = settings.set(
-        &format!("crossfade_enabled:{zone_id}"),
-        &body.enabled.to_string(),
-    );
-    let _ = settings.set(
+    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
+        error!(zone_id, %error, "crossfade_disable_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = settings.set(
         &format!("crossfade_duration:{zone_id}"),
         &duration.to_string(),
-    );
+    ) {
+        error!(zone_id, %error, "crossfade_duration_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
     Json(json!({
         "zone_id": zone_id,
-        "crossfade_enabled": body.enabled,
+        "available": false,
+        "crossfade_enabled": false,
         "crossfade_duration": duration,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -3994,5 +4027,41 @@ mod tests_contexte_de_lecture {
             contexte_de_lecture(&body),
             (Some("album".into()), Some("7".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_crossfade_indisponible {
+    use super::{CrossfadeSettings, validate_crossfade_update};
+
+    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
+    /// n'en tient compte est un faux succès. L'activation doit échouer avant
+    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    #[test]
+    fn activer_le_faux_crossfade_est_refuse() {
+        let body = CrossfadeSettings {
+            enabled: true,
+            duration: Some(5.0),
+        };
+
+        assert_eq!(
+            validate_crossfade_update(&body),
+            Err("crossfade_unavailable")
+        );
+    }
+
+    #[test]
+    fn desactiver_reste_possible_et_borne_la_preference_de_duree() {
+        let too_long = CrossfadeSettings {
+            enabled: false,
+            duration: Some(99.0),
+        };
+        let default = CrossfadeSettings {
+            enabled: false,
+            duration: None,
+        };
+
+        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
+        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
     }
 }
