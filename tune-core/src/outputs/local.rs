@@ -7067,7 +7067,7 @@ mod tests {
             "au repos, le chemin partagé annonce l'enchaînement interne"
         );
         assert!(
-            decisions::position_reset_fires(chute, sortie.supports_internal_gapless()),
+            decisions::position_reset_fires(chute, sortie.supports_internal_gapless(), false),
             "tant que la boucle vit, la chute est bien une transition interne"
         );
 
@@ -7081,7 +7081,7 @@ mod tests {
             "une boucle terminée ne peut plus rien enchaîner, quoi qu'elle ait su faire avant"
         );
         assert!(
-            !decisions::position_reset_fires(chute, sortie.supports_internal_gapless()),
+            !decisions::position_reset_fires(chute, sortie.supports_internal_gapless(), false),
             "l'avance métadonnées seule n'envoie AUCUN play : sur une chaîne morte \
              elle vole l'événement au chemin de fin naturelle et produit la boucle \
              de quelques secondes signalée par Alain (#1919)"
