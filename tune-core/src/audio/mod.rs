@@ -22,6 +22,7 @@ pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
 pub mod formats;
+pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
