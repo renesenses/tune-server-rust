@@ -96,6 +96,187 @@ pub struct TrackMetadata {
     pub comment: Option<String>,
 }
 
+/// One unsafe character removed from untrusted metadata.
+///
+/// `byte_offset` deliberately uses the UTF-8 byte position: it is the offset
+/// that a tag parser, JSON payload or C boundary can reproduce exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextCorrection {
+    pub field: String,
+    pub kind: &'static str,
+    pub codepoint: u32,
+    pub byte_offset: usize,
+}
+
+/// Replace unsafe metadata characters with one visible separator while
+/// preserving the layout characters allowed in textual tags.
+///
+/// NUL is unsafe at every C ABI boundary. U+FEFF is a BOM only at the start of
+/// a text stream and is invisible corruption inside a tag or path component.
+/// Other control characters are equally unsuitable for DB grouping and FTS,
+/// except tab, LF and CR: those three are valid in comments and lyrics. A whole
+/// consecutive run becomes one space so
+/// `"Lisa\0\u{feff}The String Soloists"` does not silently collapse to
+/// `"LisaThe String Soloists"`.
+pub fn sanitize_untrusted_text(raw: &str, field: &str) -> (String, Vec<TextCorrection>) {
+    sanitize_untrusted_text_with_layout(raw, field, true)
+}
+
+/// Single-line variant for titles, identifiers and filesystem components.
+pub fn sanitize_untrusted_single_line_text(
+    raw: &str,
+    field: &str,
+) -> (String, Vec<TextCorrection>) {
+    sanitize_untrusted_text_with_layout(raw, field, false)
+}
+
+fn sanitize_untrusted_text_with_layout(
+    raw: &str,
+    field: &str,
+    preserve_layout: bool,
+) -> (String, Vec<TextCorrection>) {
+    let mut out = String::with_capacity(raw.len());
+    let mut corrections = Vec::new();
+    let mut separator_pending = false;
+
+    for (byte_offset, c) in raw.char_indices() {
+        let kind = if c == '\0' {
+            Some("NUL")
+        } else if c == '\u{feff}' {
+            Some("BOM")
+        } else if c.is_control() && !(preserve_layout && matches!(c, '\t' | '\n' | '\r')) {
+            Some("CONTROL")
+        } else {
+            None
+        };
+
+        if let Some(kind) = kind {
+            corrections.push(TextCorrection {
+                field: field.to_string(),
+                kind,
+                codepoint: c as u32,
+                byte_offset,
+            });
+            separator_pending = true;
+            continue;
+        }
+
+        if separator_pending {
+            if !out.is_empty() && !out.ends_with(char::is_whitespace) && !c.is_whitespace() {
+                out.push(' ');
+            }
+            separator_pending = false;
+        }
+        out.push(c);
+    }
+
+    (out, corrections)
+}
+
+impl TrackMetadata {
+    /// Remove unsafe text from every field that can reach the database.
+    pub fn sanitize_text_fields(&mut self) -> Vec<TextCorrection> {
+        fn sanitize_option(
+            field: &str,
+            value: &mut Option<String>,
+            corrections: &mut Vec<TextCorrection>,
+        ) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (clean, mut found) = sanitize_untrusted_single_line_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!clean.is_empty()).then_some(clean);
+            corrections.append(&mut found);
+        }
+
+        let mut corrections = Vec::new();
+        sanitize_option("title", &mut self.title, &mut corrections);
+        sanitize_option("artist", &mut self.artist, &mut corrections);
+        sanitize_option("album", &mut self.album, &mut corrections);
+        sanitize_option("album_artist", &mut self.album_artist, &mut corrections);
+        sanitize_option(
+            "album_artist_sort",
+            &mut self.album_artist_sort,
+            &mut corrections,
+        );
+        sanitize_option("disc_subtitle", &mut self.disc_subtitle, &mut corrections);
+        sanitize_option("release_date", &mut self.release_date, &mut corrections);
+        sanitize_option("original_date", &mut self.original_date, &mut corrections);
+        sanitize_option("genre", &mut self.genre, &mut corrections);
+        sanitize_option("format", &mut self.format, &mut corrections);
+        sanitize_option("label", &mut self.label, &mut corrections);
+        sanitize_option("catalog_number", &mut self.catalog_number, &mut corrections);
+        sanitize_option(
+            "musicbrainz_recording_id",
+            &mut self.musicbrainz_recording_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_release_id",
+            &mut self.musicbrainz_release_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_artist_id",
+            &mut self.musicbrainz_artist_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_album_artist_id",
+            &mut self.musicbrainz_album_artist_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_release_group_id",
+            &mut self.musicbrainz_release_group_id,
+            &mut corrections,
+        );
+        sanitize_option("isrc", &mut self.isrc, &mut corrections);
+        if let Some(raw) = self.comment.as_deref() {
+            let (clean, mut found) = sanitize_untrusted_text(raw, "comment");
+            if !found.is_empty() {
+                self.comment = (!clean.is_empty()).then_some(clean);
+                corrections.append(&mut found);
+            }
+        }
+
+        for (index, genre) in self.genres.iter_mut().enumerate() {
+            let (clean, mut found) =
+                sanitize_untrusted_single_line_text(genre, &format!("genres[{index}]"));
+            if !found.is_empty() {
+                *genre = clean;
+                corrections.append(&mut found);
+            }
+        }
+        self.genres.retain(|genre| !genre.is_empty());
+
+        for (index, credit) in self.credits.iter_mut().enumerate() {
+            for (suffix, value) in [("name", &mut credit.name), ("role", &mut credit.role)] {
+                let (clean, mut found) = sanitize_untrusted_single_line_text(
+                    value,
+                    &format!("credits[{index}].{suffix}"),
+                );
+                if !found.is_empty() {
+                    *value = clean;
+                    corrections.append(&mut found);
+                }
+            }
+            sanitize_option(
+                &format!("credits[{index}].instrument"),
+                &mut credit.instrument,
+                &mut corrections,
+            );
+        }
+        self.credits
+            .retain(|credit| !credit.name.is_empty() && !credit.role.is_empty());
+
+        corrections
+    }
+}
+
 /// Split a multi-genre tag string into individual genres.
 ///
 /// Handles common separators: `;`, `/`, `\\`, and `\0` (null byte, used by
@@ -1817,6 +1998,19 @@ pub fn probe_duration_ms(path: &Path) -> Option<u64> {
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    let mut metadata = try_read_metadata_unsanitized(path)?;
+    let corrections = metadata.sanitize_text_fields();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "metadata_unsafe_text_sanitized"
+        );
+    }
+    Ok(metadata)
+}
+
+fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
@@ -2336,9 +2530,27 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         meta.insert("mb_work_id".into(), v);
     }
 
+    let mut corrections = Vec::new();
+    for (key, value) in &mut meta {
+        let (clean, mut found) = sanitize_untrusted_text(value, key);
+        if !found.is_empty() {
+            *value = clean;
+            corrections.append(&mut found);
+        }
+    }
+    meta.retain(|_, value| !value.is_empty());
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "extended_metadata_unsafe_text_sanitized"
+        );
+    }
+
     meta
 }
 
+#[derive(Debug, Clone)]
 pub struct MetadataUpdate {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -2352,11 +2564,47 @@ pub struct MetadataUpdate {
     pub label: Option<String>,
 }
 
+impl MetadataUpdate {
+    fn sanitized(&self) -> (Self, Vec<TextCorrection>) {
+        fn clean(field: &str, value: &mut Option<String>, corrections: &mut Vec<TextCorrection>) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (sanitized, mut found) = sanitize_untrusted_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+
+        let mut update = self.clone();
+        let mut corrections = Vec::new();
+        clean("title", &mut update.title, &mut corrections);
+        clean("artist", &mut update.artist, &mut corrections);
+        clean("album", &mut update.album, &mut corrections);
+        clean("album_artist", &mut update.album_artist, &mut corrections);
+        clean("genre", &mut update.genre, &mut corrections);
+        clean("composer", &mut update.composer, &mut corrections);
+        clean("label", &mut update.label, &mut corrections);
+        (update, corrections)
+    }
+}
+
 pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::TaggedFileExt;
     use lofty::tag::items::Timestamp;
     use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
+
+    let (update, corrections) = update.sanitized();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "metadata_tag_input_sanitized"
+        );
+    }
 
     let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
     let tag = tagged.primary_tag_mut().ok_or("no primary tag")?;
@@ -2720,6 +2968,78 @@ mod tests_dossier_de_disque {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_text_preserves_a_visible_word_boundary_and_exact_offsets() {
+        let (clean, corrections) =
+            sanitize_untrusted_text("Jacobs, Lisa\0\u{feff}The\u{0001}String Soloists", "artist");
+        assert_eq!(clean, "Jacobs, Lisa The String Soloists");
+        assert_eq!(corrections.len(), 3);
+        assert_eq!(corrections[0].kind, "NUL");
+        assert_eq!(corrections[0].codepoint, 0);
+        assert_eq!(corrections[0].byte_offset, 12);
+        assert_eq!(corrections[1].kind, "BOM");
+        assert_eq!(corrections[1].codepoint, 0xfeff);
+        assert_eq!(corrections[1].byte_offset, 13);
+        assert_eq!(corrections[2].kind, "CONTROL");
+        assert_eq!(corrections[2].codepoint, 0x01);
+        assert_eq!(corrections[2].byte_offset, 19);
+        assert!(clean.chars().all(|c| c != '\0' && c != '\u{feff}'));
+
+        let clean_multiline = "  ligne 1\nligne 2\t ";
+        assert_eq!(
+            sanitize_untrusted_text(clean_multiline, "lyrics"),
+            (clean_multiline.to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn track_metadata_sanitizes_core_lists_and_nested_credits_before_db() {
+        let mut metadata = TrackMetadata {
+            title: Some("Titre\0cache".into()),
+            artist: Some("Lisa\0\u{feff}The Strings".into()),
+            genres: vec!["Jazz\u{feff}Fusion".into(), "\0".into()],
+            credits: vec![TrackCredit {
+                name: "Chef\0Orchestre".into(),
+                role: "conductor".into(),
+                instrument: Some("violin\u{feff}solo".into()),
+            }],
+            comment: Some("ligne 1\nligne 2".into()),
+            ..Default::default()
+        };
+
+        let corrections = metadata.sanitize_text_fields();
+        assert_eq!(metadata.title.as_deref(), Some("Titre cache"));
+        assert_eq!(metadata.artist.as_deref(), Some("Lisa The Strings"));
+        assert_eq!(metadata.genres, vec!["Jazz Fusion"]);
+        assert_eq!(metadata.credits[0].name, "Chef Orchestre");
+        assert_eq!(
+            metadata.credits[0].instrument.as_deref(),
+            Some("violin solo")
+        );
+        assert_eq!(metadata.comment.as_deref(), Some("ligne 1\nligne 2"));
+        assert_eq!(corrections.len(), 7);
+    }
+
+    #[test]
+    fn tag_update_ne_peut_pas_transmettre_un_nul_a_lofty() {
+        let update = MetadataUpdate {
+            title: Some("A\0B".into()),
+            artist: Some("\u{feff}Artist".into()),
+            album: Some("Album".into()),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            composer: None,
+            label: None,
+        };
+        let (clean, corrections) = update.sanitized();
+        assert_eq!(clean.title.as_deref(), Some("A B"));
+        assert_eq!(clean.artist.as_deref(), Some("Artist"));
+        assert_eq!(corrections.len(), 2);
+    }
 
     #[test]
     fn probe_m4a_props_attrape_un_panic_du_decodeur() {
