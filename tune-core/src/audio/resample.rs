@@ -29,10 +29,16 @@ pub fn new_streaming_resampler(
     }
     let ratio = to_sr as f64 / from_sr as f64;
     let inv_ratio = 1.0 / ratio;
-    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-        (32_usize, 64_usize)
+    // A fixed short kernel makes the transition band wider in output-Hz as
+    // the decimation ratio grows. At the former 32/64 taps, 48 -> 44.1 kHz
+    // was already down 10.4 dB at 18 kHz (#2711). Scale the kernel at the
+    // supported rate boundaries so every path remains within 0.1 dB there.
+    let (sinc_len, oversampling_factor) = if inv_ratio > 4.0 {
+        (512_usize, 256_usize)
+    } else if inv_ratio > 2.0 {
+        (256_usize, 256_usize)
     } else {
-        (64_usize, 128_usize)
+        (128_usize, 256_usize)
     };
     let window = WindowFunction::BlackmanHarris2;
     let params = SincInterpolationParameters {
@@ -373,6 +379,13 @@ pub fn resample_i32(
 mod tests {
     use super::*;
 
+    // Rates that Tune advertises for local PCM output on every platform.
+    // Keep this matrix aligned with `outputs/local.rs`: it is the product
+    // contract whose SRC frame counts must remain deterministic (#2218).
+    const PRODUCT_PCM_SAMPLE_RATES: [u32; 8] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+    ];
+
     /// 1 s of a 440 Hz sine, stereo interleaved, at `sr`.
     fn sine_stereo(sr: u32) -> Vec<f32> {
         let mut out = Vec::with_capacity(sr as usize * 2);
@@ -393,6 +406,72 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    fn sine_mono(sr: u32, frequency_hz: f64, amplitude: f64) -> Vec<f32> {
+        (0..sr)
+            .map(|frame| {
+                (amplitude
+                    * (2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64).sin())
+                    as f32
+            })
+            .collect()
+    }
+
+    /// Amplitude of one known sinusoid, evaluated directly rather than through
+    /// the spectrum display code. Keeping the measuring instrument independent
+    /// from the production DSP prevents both sides from sharing the same bug.
+    fn measured_tone_amplitude(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(sin_sum, cos_sum), (frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                (
+                    sin_sum + sample as f64 * phase.sin(),
+                    cos_sum + sample as f64 * phase.cos(),
+                )
+            },
+        );
+        2.0 * sin_sum.hypot(cos_sum) / stable.len() as f64
+    }
+
+    fn gain_db(measured: f64, reference: f64) -> f64 {
+        20.0 * (measured / reference).log10()
+    }
+
+    /// Fit the fundamental in quadrature and report everything left over as
+    /// distortion plus noise. This is deliberately a time-domain least-squares
+    /// measurement, independent from both the resampler and the FFT display.
+    fn thd_plus_noise_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(sin_sum, cos_sum), (frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                (
+                    sin_sum + sample as f64 * phase.sin(),
+                    cos_sum + sample as f64 * phase.cos(),
+                )
+            },
+        );
+        let sin_gain = 2.0 * sin_sum / stable.len() as f64;
+        let cos_gain = 2.0 * cos_sum / stable.len() as f64;
+        let fundamental_rms = sin_gain.hypot(cos_gain) / std::f64::consts::SQRT_2;
+        let residual_rms = (stable
+            .iter()
+            .enumerate()
+            .map(|(frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                let fitted = sin_gain * phase.sin() + cos_gain * phase.cos();
+                (sample as f64 - fitted).powi(2)
+            })
+            .sum::<f64>()
+            / stable.len() as f64)
+            .sqrt();
+        20.0 * (residual_rms / fundamental_rms).log10()
     }
 
     fn resample_in_chunks(
@@ -466,29 +545,171 @@ mod tests {
     }
 
     #[test]
-    fn streaming_flush_is_invariant_to_chunk_boundaries() {
-        for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
-            for channels in [1_u16, 2] {
-                let input = signal(5_137, usize::from(channels));
-                let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
-                let (chunked, leftover) = resample_in_chunks(
-                    &input,
-                    from_sr,
-                    to_sr,
-                    channels,
-                    &[1, 17, 1_000, 3, 2_048, 511],
-                );
+    fn exact_frame_count_covers_every_product_rate_pair() {
+        // 4_417 is deliberately neither a resampler block boundary nor a
+        // common divisor of the advertised rates. It exercises the rounding
+        // contract without allowing an integer-ratio shortcut to hide a lost
+        // or duplicated tail frame.
+        const INPUT_FRAMES: usize = 4_417;
 
-                assert!(
-                    leftover.is_empty(),
-                    "le flush laisse des échantillons en attente pour {from_sr} -> {to_sr} Hz"
+        for from_sr in PRODUCT_PCM_SAMPLE_RATES {
+            for to_sr in PRODUCT_PCM_SAMPLE_RATES {
+                for channels in [1_u16, 2] {
+                    let input = signal(INPUT_FRAMES, usize::from(channels));
+                    let output = rubato_resample_batch_exact(&input, from_sr, to_sr, channels);
+                    let expected =
+                        (INPUT_FRAMES as f64 * to_sr as f64 / from_sr as f64).round() as usize;
+
+                    assert_eq!(
+                        output.len(),
+                        expected * usize::from(channels),
+                        "{from_sr} -> {to_sr} Hz, {channels} canal(aux), {INPUT_FRAMES} trames"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_flush_is_invariant_to_chunk_boundaries() {
+        for from_sr in PRODUCT_PCM_SAMPLE_RATES {
+            for to_sr in PRODUCT_PCM_SAMPLE_RATES {
+                if from_sr == to_sr {
+                    continue;
+                }
+                for channels in [1_u16, 2] {
+                    let input = signal(5_137, usize::from(channels));
+                    let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
+                    let (chunked, leftover) = resample_in_chunks(
+                        &input,
+                        from_sr,
+                        to_sr,
+                        channels,
+                        &[1, 17, 1_000, 3, 2_048, 511],
+                    );
+
+                    assert!(
+                        leftover.is_empty(),
+                        "le flush laisse des échantillons en attente pour {from_sr} -> {to_sr} Hz"
+                    );
+                    assert_eq!(
+                        chunked, reference,
+                        "le découpage change la sortie ou son nombre de trames pour \
+                         {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_flush_covers_block_boundaries() {
+        for (from_sr, to_sr) in [(44_100, 384_000), (384_000, 44_100)] {
+            for channels in [1_u16, 2] {
+                for input_frames in [1_usize, 1_023, 1_024, 1_025, 2_047, 2_048, 2_049] {
+                    let input = signal(input_frames, usize::from(channels));
+                    let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
+                    let (chunked, leftover) =
+                        resample_in_chunks(&input, from_sr, to_sr, channels, &[1, 1_023, 2, 511]);
+
+                    assert!(
+                        leftover.is_empty(),
+                        "le flush laisse un reliquat pour {from_sr} -> {to_sr} Hz, \
+                         {channels} canal(aux), {input_frames} trames"
+                    );
+                    assert_eq!(
+                        chunked, reference,
+                        "le flush change la sortie a la frontiere de {input_frames} trames \
+                         pour {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn downsampling_stepped_sweep_preserves_passband_and_rejects_alias() {
+        const AMPLITUDE: f64 = 0.5;
+
+        for (from_sr, to_sr) in [
+            (384_000, 48_000),
+            (192_000, 48_000),
+            (96_000, 48_000),
+            (48_000, 44_100),
+        ] {
+            for frequency_hz in [
+                50.0, 100.0, 250.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 15_000.0, 18_000.0,
+            ] {
+                let input = sine_mono(from_sr, frequency_hz, AMPLITUDE);
+                let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
+                let response_db = gain_db(
+                    measured_tone_amplitude(&output, to_sr, frequency_hz),
+                    AMPLITUDE,
                 );
-                assert_eq!(
-                    chunked, reference,
-                    "le découpage change la sortie ou son nombre de trames pour \
-                     {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                assert!(
+                    response_db.abs() < 0.1,
+                    "la bande utile {from_sr} -> {to_sr} Hz derive de \
+                     {response_db:.3} dB a {frequency_hz} Hz"
                 );
             }
+        }
+
+        // 30 kHz cannot exist at 48 kHz. A converter which merely decimates
+        // would fold it to |30 - 48| = 18 kHz at essentially full amplitude.
+        for from_sr in [96_000, 192_000, 384_000] {
+            let input = sine_mono(from_sr, 30_000.0, AMPLITUDE);
+            let output = rubato_resample_batch_exact(&input, from_sr, 48_000, 1);
+            let alias_db = gain_db(
+                measured_tone_amplitude(&output, 48_000, 18_000.0),
+                AMPLITUDE,
+            );
+
+            assert!(
+                alias_db < -80.0,
+                "un sinus 30 kHz a {from_sr} Hz se replie a 18 kHz a {alias_db:.1} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn upsampling_preserves_tone_and_rejects_spectral_image() {
+        const FROM_SR: u32 = 44_100;
+        const TO_SR: u32 = 96_000;
+        const AMPLITUDE: f64 = 0.5;
+        const TONE_HZ: f64 = 1_000.0;
+
+        let input = sine_mono(FROM_SR, TONE_HZ, AMPLITUDE);
+        let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
+        let tone_db = gain_db(measured_tone_amplitude(&output, TO_SR, TONE_HZ), AMPLITUDE);
+        assert!(
+            tone_db.abs() < 0.1,
+            "le sinus utile derive de {tone_db:.3} dB pendant le suréchantillonnage"
+        );
+
+        // Repeating/interpolating samples without a proper reconstruction
+        // filter would create the first image at FROM_SR - TONE_HZ.
+        let image_hz = FROM_SR as f64 - TONE_HZ;
+        let image_db = gain_db(measured_tone_amplitude(&output, TO_SR, image_hz), AMPLITUDE);
+        assert!(
+            image_db < -80.0,
+            "le sinus 1 kHz produit une image a {image_hz} Hz a {image_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn resampling_keeps_sine_thd_plus_noise_below_minus_100_db() {
+        const FREQUENCY_HZ: f64 = 1_000.0;
+        const AMPLITUDE: f64 = 0.5;
+
+        for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
+            let input = sine_mono(from_sr, FREQUENCY_HZ, AMPLITUDE);
+            let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
+            let thd_n_db = thd_plus_noise_db(&output, to_sr, FREQUENCY_HZ);
+
+            assert!(
+                thd_n_db < -100.0,
+                "THD+N du SRC {from_sr} -> {to_sr} Hz mesuree a {thd_n_db:.1} dB"
+            );
         }
     }
 
