@@ -154,6 +154,14 @@ pub fn router() -> Router<AppState> {
         .route("/audio-check", get(diagnostics::audio_check))
         .route("/audio/asio-devices", get(diagnostics::asio_devices))
         .route(
+            "/audio/asio-warm-scan",
+            get(diagnostics::asio_warm_scan_status),
+        )
+        .route(
+            "/audio/asio-warm-scan/rearm",
+            post(diagnostics::rearm_asio_warm_scan),
+        )
+        .route(
             "/telemetry",
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),
         )

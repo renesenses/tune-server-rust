@@ -3561,6 +3561,10 @@ mod signal_path_tests {
     fn dlna_zone() -> (Arc<dyn DbBackend>, Zone) {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        // Ces contrats exercent les réglages DLNA ajoutés par migration. Sans
+        // migration, ils restaient faussement verts tant que les écritures sur
+        // une colonne absente étaient silencieusement ignorées (#2154).
+        tune_core::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();

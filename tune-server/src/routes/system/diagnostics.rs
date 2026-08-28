@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -238,11 +239,17 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // #2154 — une base incomplète ne doit plus pouvoir ignorer des
+        // réglages pendant des mois sans laisser de trace dans le rapport.
+        "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
         "discovered_devices": devices_by_type,
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
         "asio_available": asio_avail,
+        // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
+        // une ligne WARN que l'utilisateur ne verra jamais.
+        "asio_warm_scan": crate::startup::asio_warm_status(),
         // #2392 : pourquoi un fournisseur de sortie hors-arbre est inerte.
         // Absent de la liste = non compilé ; présent avec un `refusal` = droit
         // manquant, et le refus dit lequel et quoi faire ; présent sans refus
@@ -955,6 +962,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Zones
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
+    let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
+    let asio_warm_scan = crate::startup::asio_warm_status();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
@@ -1044,6 +1053,10 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
+    md.push_str(&format!(
+        "**ASIO warm scan**: {} — {}\n",
+        asio_warm_scan.state, asio_warm_scan.message
+    ));
     md.push('\n');
 
     md.push_str("## Library\n");
@@ -1061,6 +1074,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&format!(
+        "- Zone settings not persisted: {zone_settings_ignored}\n"
+    ));
     md.push('\n');
 
     md.push_str("## Streaming Services\n");
@@ -1163,6 +1179,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "count": zone_count,
             "items": zones,
         },
+        "zone_settings_ignored": zone_settings_ignored,
+        "asio_warm_scan": asio_warm_scan,
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
@@ -1337,6 +1355,68 @@ pub(super) async fn audio_check() -> Json<Value> {
     }))
 }
 
+pub(super) async fn asio_warm_scan_status() -> Json<Value> {
+    Json(json!(crate::startup::asio_warm_status()))
+}
+
+/// Retire uniquement le témoin qui interdit le prochain préchauffage.
+///
+/// La tentative attend le redémarrage : énumérer les pilotes ASIO à chaud peut
+/// faire planter le processus ou heurter une sortie qui possède déjà le DAC.
+pub(super) async fn rearm_asio_warm_scan(
+    _admin: crate::auth::RequireAdmin,
+) -> (StatusCode, Json<Value>) {
+    use crate::startup::AsioWarmRearm;
+
+    match crate::startup::rearm_asio_warm_scan() {
+        Ok(AsioWarmRearm::Rearmed) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "rearmed",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::AlreadyReady) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "already_ready",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::DisabledByEnv) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "asio_warm_scan_disabled_by_env",
+                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "asio_not_supported",
+                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "asio_warm_scan_rearm_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "asio_warm_scan_rearm_failed",
+                    "message": error,
+                    "asio_warm_scan": crate::startup::asio_warm_status(),
+                })),
+            )
+        }
+    }
+}
+
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1477,6 +1557,16 @@ pub(super) async fn api_docs() -> Json<Value> {
             "GET",
             "/system/api-docs",
             "This endpoint — API documentation",
+        ),
+        (
+            "GET",
+            "/system/audio/asio-warm-scan",
+            "ASIO startup scan fail-safe status",
+        ),
+        (
+            "POST",
+            "/system/audio/asio-warm-scan/rearm",
+            "Allow one ASIO startup scan on the next restart (admin)",
         ),
         ("GET", "/system/telemetry", "Telemetry snapshot (opt-in)"),
         ("POST", "/system/scan", "Trigger library scan"),
