@@ -2637,6 +2637,28 @@ impl PositionPoller {
                         ps.last_radio_poll = Instant::now();
                         self.refresh_radio_metadata(zone_id, zone_state).await;
                     }
+
+                    // Zone navigateur : l'annonce « en écoute » que le
+                    // démarrage a mise en attente part d'ICI, une fois
+                    // constaté que l'onglet tire réellement le flux (#1998).
+                    //
+                    // Le démarrage ne peut pas trancher : sans périphérique de
+                    // sortie, `output_sent` y vaut toujours faux, qu'on écoute
+                    // ou non. Le seul fait observable est la consommation du
+                    // flux, et elle n'apparaît qu'après coup — c'est
+                    // exactement ce qu'une boucle de scrutation est là pour
+                    // voir. L'orchestrateur ne fait rien tant qu'il n'a rien
+                    // en attente pour ce flux, donc ce tick ne coûte qu'une
+                    // comparaison sur toutes les autres zones.
+                    if let Some(stream_id) = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref())
+                    {
+                        self.orchestrator
+                            .confirmer_lecture_navigateur(zone_id, stream_id)
+                            .await;
+                    }
                     continue;
                 }
             };
@@ -7403,6 +7425,60 @@ mod repli_logo_station_tests {
         assert_eq!(
             vignette_du_pas_radio(None, Some("https://mozaiklabs.fr/storage/radios/fip.png")),
             Some("https://mozaiklabs.fr/storage/radios/fip.png".to_string())
+        );
+    }
+}
+
+/// Garde-fou #1998 : c'est le poller qui LIBÈRE l'annonce d'une zone
+/// navigateur.
+///
+/// Le démarrage ne peut pas trancher pour une telle zone : sans périphérique de
+/// sortie, `output_sent` y vaut toujours faux, qu'on écoute ou non. La preuve
+/// — l'onglet tire réellement le flux — n'apparaît qu'après coup, donc dans la
+/// boucle de scrutation. Si cet appel disparaît de la branche « zone sans
+/// périphérique », plus aucune zone navigateur ne scrobble : c'est exactement
+/// la régression pour laquelle ce ticket a été rouvert, et elle est silencieuse.
+///
+/// Relecture de source parce que la propriété tenue est un EMPLACEMENT dans une
+/// boucle de plusieurs milliers de lignes. Même procédé, même raison que
+/// `annonce_apres_sortie_guard` dans `orchestrator.rs`.
+#[cfg(test)]
+mod annonce_navigateur_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod annonce_navigateur_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #1998."
+            )
+        })
+    }
+
+    /// L'appel doit vivre DANS la branche « pas de périphérique de sortie » :
+    /// après le rafraîchissement radio qui lui est propre, et avant le code
+    /// qui ne concerne que les zones AVEC périphérique.
+    #[test]
+    fn la_zone_sans_peripherique_libere_son_annonce_en_attente() {
+        let branche_sans_peripherique = position("decisions::deviceless_radio_refresh_due(");
+        let liberation = position(".confirmer_lecture_navigateur(zone_id, stream_id)");
+        let apres_le_match = position("// Detect track change: if the generation changed");
+        assert!(
+            branche_sans_peripherique < liberation && liberation < apres_le_match,
+            "l'annonce des zones navigateur n'est plus libérée dans la branche \
+             « zone sans périphérique » : plus aucune zone navigateur ne \
+             scrobblerait, sans le moindre message (#1998)."
         );
     }
 }

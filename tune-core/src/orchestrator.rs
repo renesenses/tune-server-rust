@@ -627,6 +627,49 @@ pub struct PlaybackOrchestrator {
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
     last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
+    /// Annonces « en écoute » DIFFÉRÉES des zones navigateur (#1998).
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie : la sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. `output_sent` y vaut donc
+    /// toujours faux, et la garde posée pour le cas BluOS a du même coup
+    /// supprimé TOUT scrobble de zone navigateur, y compris quand elle joue.
+    ///
+    /// On ne renonce pas à l'annonce et on ne la rend pas non plus gratuite :
+    /// on la met en attente ici, et elle ne part qu'une fois constaté que
+    /// l'onglet tire réellement des octets du flux — la même preuve que celle
+    /// dont `output_reach` se sert déjà (`tune-server/src/routes/zones.rs`).
+    /// Une piste que personne ne tire n'est jamais annoncée : l'entrée est
+    /// simplement écrasée par la lecture suivante.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+}
+
+/// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
+/// fois la lecture prouvée (voir [`PlaybackOrchestrator::annonces_navigateur`]).
+///
+/// Tout est capturé au démarrage, y compris `record_history` : une re-création
+/// de flux pour une piste déjà en cours (recherche de position, reconnexion
+/// radio) passe par `play_without_history` et ne doit PAS ajouter une seconde
+/// ligne d'historique. Reconstruire ce drapeau depuis le poller serait le
+/// perdre — et ferait doublonner l'historique à chaque déplacement du curseur.
+#[derive(Debug, Clone)]
+struct AnnonceNavigateurDifferee {
+    /// Flux dont on attend qu'il soit tiré. Identifie la lecture : une
+    /// nouvelle lecture crée un nouveau flux, donc l'annonce en attente d'une
+    /// piste abandonnée ne peut pas partir sous l'identité de la suivante.
+    stream_id: String,
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    source: String,
+    source_id: Option<String>,
+    /// Ligne de bibliothèque, quand il y en a une : l'album n'est relu qu'au
+    /// moment d'écrire l'historique, pas à chaque démarrage.
+    track_id: Option<i64>,
+    duration_ms: i64,
+    cover_path: Option<String>,
+    record_history: bool,
 }
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
@@ -1057,6 +1100,7 @@ impl PlaybackOrchestrator {
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
+            annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1504,6 +1548,12 @@ impl PlaybackOrchestrator {
         record_history: bool,
     ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
+        // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
+        // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
+        // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
+        // (#1998). Une zone navigateur n'a JAMAIS d'`output_device_id` : si le
+        // demandeur en fournit un, ce n'en est pas une.
+        let mut zone_navigateur = false;
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
         // the zone's DB record.  This is the primary gate for send_to_output —
@@ -1544,7 +1594,8 @@ impl PlaybackOrchestrator {
                 // absent from the DB keep the old behaviour (in-memory tests /
                 // transient states).
                 if let Some(ref zone) = zone_db {
-                    if zone.output_type.as_deref() != Some("browser") {
+                    zone_navigateur = zone.output_type.as_deref() == Some("browser");
+                    if !zone_navigateur {
                         let msg = format!(
                             "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
                             zone.name
@@ -2129,12 +2180,54 @@ impl PlaybackOrchestrator {
         // Le cas « aucune sortie configurée » rend lui aussi `false` (avec
         // `no_output_device_id_skipping_send_to_output`) : ne rien annoncer y
         // est également juste — le titre n'est parti vers aucun appareil.
-        if !output_sent {
+        //
+        // SAUF la zone navigateur, dont la sortie EST l'onglet : elle n'a pas
+        // de périphérique, `output_sent` y vaut toujours faux, et une lecture
+        // peut parfaitement avoir lieu. La garde ci-dessus lui a supprimé toute
+        // annonce, y compris quand elle joue — c'est ce que ce ticket a rouvert
+        // (#1998). Elle n'est pas remise dans le cas général : son annonce est
+        // DIFFÉRÉE jusqu'à la preuve que l'onglet tire le flux.
+        if !output_sent && !zone_navigateur {
             debug!(
                 zone_id = req.zone_id,
                 title = %resolved.title,
                 "play_not_announced_output_not_sent"
             );
+        }
+
+        if !output_sent && zone_navigateur {
+            let attente = AnnonceNavigateurDifferee {
+                stream_id: resolved.stream_id.clone().unwrap_or_default(),
+                title: resolved.title.clone(),
+                artist: resolved.artist.clone(),
+                album: album.clone(),
+                source: resolved.source.clone(),
+                source_id: req.source_id.clone(),
+                track_id: req.track_id,
+                duration_ms: resolved.duration_ms.unwrap_or(0),
+                cover_path: cover_path.clone(),
+                record_history,
+            };
+            if attente.stream_id.is_empty() {
+                // Sans flux, rien à observer : on ne saurait jamais dire que
+                // l'onglet a lu. Ne rien mettre en attente vaut mieux qu'une
+                // entrée qu'aucune preuve ne pourra jamais libérer.
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    "browser_now_playing_not_deferred_no_stream"
+                );
+            } else {
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    stream_id = %attente.stream_id,
+                    "browser_now_playing_deferred_until_stream_pulled"
+                );
+                if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+                    en_attente.insert(req.zone_id, attente);
+                }
+            }
         }
 
         // Annonce « en écoute » multi-service, avec palier de licence.
@@ -7704,6 +7797,116 @@ impl PlaybackOrchestrator {
         // listened past the threshold (see `dispatch_scrobble`).
     }
 
+    /// L'onglet a-t-il commencé à tirer le flux de cette zone ? Si oui, et
+    /// seulement alors, l'annonce « en écoute » mise en attente au démarrage
+    /// part — une fois (#1998).
+    ///
+    /// Appelée à chaque tick par le poller pour une zone SANS périphérique de
+    /// sortie. C'est le poller qui a l'horloge ; la décision, elle, reste ici,
+    /// avec les données du démarrage — `record_history` en particulier, qu'un
+    /// observateur extérieur ne peut pas reconstituer.
+    ///
+    /// La preuve est celle dont `output_reach` se sert déjà pour dire
+    /// « browser_unattended » (`tune-server/src/routes/zones.rs`) : des octets
+    /// réellement partis sur la session de flux. Aucune détection nouvelle.
+    ///
+    /// Le délai vaut au plus un tick de poller (~1 s) après le premier octet
+    /// tiré : la règle de durée minimale de Last.fm porte sur le scrobble
+    /// définitif (50 % / 4 min, côté poller), pas sur « en écoute », et une
+    /// seconde ne coûte aucune écoute légitime.
+    ///
+    /// Rend `true` quand l'annonce vient de partir.
+    pub async fn confirmer_lecture_navigateur(&self, zone_id: i64, stream_id: &str) -> bool {
+        // Rien en attente pour CE flux → rien à faire, et surtout pas
+        // d'interrogation du streamer à chaque tick de chaque zone.
+        {
+            let Ok(en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            if en_attente.get(&zone_id).map(|a| a.stream_id.as_str()) != Some(stream_id) {
+                return false;
+            }
+        }
+
+        let tire = self
+            .streamer
+            .stream_bytes_sent(stream_id)
+            .await
+            .is_some_and(|n| n > 0);
+        if !tire {
+            return false;
+        }
+
+        // Retirer AVANT d'annoncer : le verrou « une seule fois » est le retrait
+        // lui-même. Re-vérifier le flux protège d'une lecture qui aurait
+        // remplacé l'entrée pendant l'attente ci-dessus.
+        let attente = {
+            let Ok(mut en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            match en_attente.get(&zone_id) {
+                Some(a) if a.stream_id == stream_id => en_attente.remove(&zone_id),
+                _ => None,
+            }
+        };
+        let Some(attente) = attente else {
+            return false;
+        };
+
+        info!(
+            zone_id,
+            title = %attente.title,
+            source = %attente.source,
+            stream_id = %stream_id,
+            "browser_playback_confirmed_announcing"
+        );
+
+        self.dispatch_now_playing(
+            &attente.title,
+            attente.artist.as_deref(),
+            attente.album.as_deref(),
+        );
+
+        // Même exclusion que le chemin nominal : la radio n'entre pas dans
+        // l'historique local (son titre au démarrage est un instantané figé),
+        // et une re-création de flux pour une piste déjà en cours
+        // (`play_without_history`) ne doit pas doublonner la ligne.
+        if attente.record_history && attente.source != "radio" {
+            let etat = self.playback.get_state(zone_id).await;
+            let album_id = attente.track_id.and_then(|tid| {
+                TrackRepo::with_backend(self.db.clone())
+                    .get(tid)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.album_id)
+            });
+            self.record_listen(
+                &attente.title,
+                attente.artist.as_deref(),
+                attente.album.as_deref(),
+                &attente.source,
+                attente.source_id.as_deref(),
+                album_id,
+                attente.duration_ms,
+                zone_id,
+                attente.cover_path.as_deref(),
+                etat.session_profile_id,
+                etat.session_context_type.as_deref(),
+                etat.session_context_id.as_deref(),
+            );
+        }
+
+        true
+    }
+
+    /// Oublie l'annonce en attente d'une zone navigateur : la lecture s'arrête
+    /// sans que l'onglet ait rien tiré, il n'y a donc rien à annoncer.
+    fn oublier_annonce_navigateur(&self, zone_id: i64) {
+        if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+            en_attente.remove(&zone_id);
+        }
+    }
+
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
     ///
@@ -8100,6 +8303,10 @@ impl PlaybackOrchestrator {
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);
+        // Une zone navigateur arrêtée avant que l'onglet ait tiré quoi que ce
+        // soit n'a rien fait entendre : son annonce en attente meurt ici
+        // (#1998).
+        self.oublier_annonce_navigateur(zone_id);
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -12422,6 +12629,256 @@ mod tests {
         assert_eq!(history[0].source, "local");
     }
 
+    // ------------------------------------------------------------------
+    // #1998 — zone navigateur : l'annonce suit la PREUVE de lecture.
+    //
+    // Aucun de ces tests ne touche le réseau : sans clé Last.fm ni jeton
+    // ListenBrainz dans la base de test, `dispatch_now_playing` sort avant le
+    // moindre appel. Ce qui est observé ici est l'effet vérifiable côté
+    // serveur — la ligne `listen_history` et le verrou « une seule fois ».
+    // ------------------------------------------------------------------
+
+    /// Une session de flux dont l'onglet a tiré `octets` octets.
+    async fn session_navigateur(
+        orch: &PlaybackOrchestrator,
+        fichier: &std::path::Path,
+        octets: u64,
+    ) -> String {
+        let sid = orch
+            .streamer
+            .create_file_session(
+                crate::http::streamer::StreamInfo {
+                    format: "flac".into(),
+                    mime_type: "audio/flac".into(),
+                    ..Default::default()
+                },
+                fichier.to_string_lossy().into_owned(),
+                false,
+            )
+            .await;
+        if octets > 0 {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .expect("la session vient d'être créée")
+                .bytes_sent
+                .store(octets, std::sync::atomic::Ordering::Relaxed);
+        }
+        sid
+    }
+
+    fn annonce_en_attente(
+        stream_id: &str,
+        record_history: bool,
+        source: &str,
+    ) -> super::AnnonceNavigateurDifferee {
+        super::AnnonceNavigateurDifferee {
+            stream_id: stream_id.to_string(),
+            title: "Come on In".into(),
+            artist: Some("Bridge City Sinners".into()),
+            album: Some("Unholy Hymns".into()),
+            source: source.into(),
+            source_id: None,
+            track_id: None,
+            duration_ms: 180_000,
+            cover_path: None,
+            record_history,
+        }
+    }
+
+    fn lignes_historique(orch: &PlaybackOrchestrator) -> usize {
+        crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+            .recent(10)
+            .unwrap()
+            .len()
+    }
+
+    /// Le cœur du ticket rouvert : tant que l'onglet n'a rien tiré, rien n'est
+    /// annoncé ; dès qu'il tire, l'annonce part — et une seule fois.
+    #[tokio::test]
+    async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+
+        // Onglet muet : la session existe, personne ne la consomme.
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "aucun octet tiré : l'annonce ne doit pas partir — c'est le défaut d'origine"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "listen_history ne doit rien porter tant que rien n'a été entendu"
+        );
+        assert!(
+            orch.annonces_navigateur
+                .lock()
+                .unwrap()
+                .contains_key(&zone_id),
+            "l'annonce reste en attente : l'onglet peut encore démarrer"
+        );
+
+        // L'onglet tire le flux : c'est la preuve.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .unwrap()
+                .bytes_sent
+                .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'onglet consomme le flux : l'annonce doit partir"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "l'historique local doit enfin porter cette écoute"
+        );
+
+        // Le tick suivant ne doit pas re-annoncer.
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "le poller repasse chaque seconde : une écoute, une annonce"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "pas de doublon au tick suivant"
+        );
+    }
+
+    /// `record_history=false` (recherche de position, reconnexion) : l'annonce
+    /// « en écoute » part, mais l'historique ne doublonne pas. Sans ce report
+    /// du drapeau, déplacer le curseur ajouterait une ligne à chaque fois.
+    #[tokio::test]
+    async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, false, "local"));
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'annonce « en écoute » part quand même : la piste est bien entendue"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "une re-création de flux pour une piste déjà en cours ne s'ajoute pas à l'historique"
+        );
+    }
+
+    /// La radio n'entre pas dans l'historique local — même exclusion que le
+    /// chemin nominal, pour la même raison (titre figé au démarrage).
+    #[tokio::test]
+    async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
+
+        assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "la radio ne s'écrit pas dans listen_history"
+        );
+    }
+
+    /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même
+    /// si un vieux flux traîne : l'attente est identifiée par SON flux.
+    #[tokio::test]
+    async fn zone_navigateur_un_autre_flux_ne_libere_pas_l_annonce() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let attendu = session_navigateur(&orch, &f, 0).await;
+        let autre = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&attendu, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &autre).await,
+            "les octets d'un AUTRE flux ne prouvent rien sur celui-ci"
+        );
+        assert_eq!(lignes_historique(&orch), 0);
+    }
+
+    /// Arrêt avant le premier octet : il n'y a rien eu à entendre, l'attente
+    /// meurt avec la lecture.
+    #[tokio::test]
+    async fn zone_navigateur_l_arret_annule_l_annonce_en_attente() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        orch.stop(zone_id, None).await;
+
+        assert!(
+            orch.annonces_navigateur.lock().unwrap().is_empty(),
+            "l'arrêt oublie l'annonce en attente"
+        );
+        // Même si l'onglet tire des octets après coup (fin de tampon), plus
+        // rien ne part : la lecture est terminée.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(s) = sessions.get(&sid) {
+                s.bytes_sent
+                    .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert!(!orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(lignes_historique(&orch), 0);
+    }
+
     #[tokio::test]
     async fn test_resolve_cover_url_passthrough() {
         let orch = test_orchestrator();
@@ -13433,6 +13890,71 @@ mod annonce_apres_sortie_guard {
             "le scrobble définitif est reparti dans le chemin de démarrage : \
              il scrobblerait un titre à la seconde où il commence, en ignorant \
              la règle des 50 % / 4 min de Last.fm (#1113)."
+        );
+    }
+
+    /// Corps d'une méthode, de sa signature jusqu'à son accolade fermante au
+    /// même niveau d'indentation. Sert à vérifier une propriété DANS une
+    /// fonction sans que le reste du fichier puisse la satisfaire à sa place.
+    fn corps_de(signature: &str) -> &'static str {
+        let debut = position(signature);
+        let apres = &code_de_production()[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        &apres[..fin]
+    }
+
+    /// La zone navigateur n'a PAS de périphérique : `output_sent` y vaut
+    /// toujours faux. La garde ci-dessus lui avait donc supprimé toute annonce,
+    /// y compris quand elle joue — c'est la régression pour laquelle #1998 a
+    /// été rouvert. Son annonce doit être DIFFÉRÉE, pas supprimée.
+    #[test]
+    fn la_zone_navigateur_ne_perd_pas_son_annonce() {
+        assert!(
+            code_de_production().contains("if !output_sent && zone_navigateur {"),
+            "le démarrage ne met plus rien en attente pour une zone navigateur : \
+             elle ne scrobblerait plus RIEN, même en jouant (#1998, réouverture \
+             du 22/08). La sortie d'une zone navigateur est l'onglet, pas un \
+             appareil."
+        );
+    }
+
+    /// Et cette annonce différée ne part que sur PREUVE : des octets réellement
+    /// tirés de la session de flux. Pas sur l'intention de jouer.
+    #[test]
+    fn l_annonce_navigateur_suit_la_preuve_de_lecture() {
+        let corps = corps_de("pub async fn confirmer_lecture_navigateur(");
+        let preuve = corps
+            .find(".stream_bytes_sent(stream_id)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "`confirmer_lecture_navigateur` n'interroge plus les octets tirés : \
+                 elle annoncerait une écoute de zone navigateur sans preuve, ce que \
+                 #1998 reproche au démarrage."
+                )
+            });
+        let annonce = corps.find("self.dispatch_now_playing(").unwrap_or_else(|| {
+            panic!("`confirmer_lecture_navigateur` n'annonce plus rien du tout (#1998)")
+        });
+        assert!(
+            preuve < annonce,
+            "l'annonce de zone navigateur part AVANT la preuve que l'onglet tire \
+             le flux : c'est très exactement le défaut d'origine, déplacé (#1998)."
+        );
+    }
+
+    /// L'historique local de zone navigateur suit la même preuve, et garde le
+    /// drapeau `record_history` du démarrage : une re-création de flux pour une
+    /// piste déjà en cours (recherche de position) ne doit pas doublonner.
+    #[test]
+    fn l_historique_navigateur_garde_record_history() {
+        assert!(
+            corps_de("pub async fn confirmer_lecture_navigateur(")
+                .contains("if attente.record_history && attente.source != \"radio\" {"),
+            "l'historique de zone navigateur ne consulte plus `record_history` : \
+             déplacer le curseur ajouterait une ligne à chaque fois (#1998)."
         );
     }
 }
