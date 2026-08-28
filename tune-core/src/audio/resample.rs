@@ -441,10 +441,16 @@ mod tests {
         20.0 * (measured / reference).log10()
     }
 
-    /// Fit the fundamental in quadrature and report everything left over as
-    /// distortion plus noise. This is deliberately a time-domain least-squares
-    /// measurement, independent from both the resampler and the FFT display.
-    fn thd_plus_noise_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+    /// Fit the fundamental in quadrature and report the unweighted, full-band
+    /// residual relative to it.
+    ///
+    /// This is deliberately a time-domain least-squares instrument, independent
+    /// from both the resampler and the FFT display. It is a useful deterministic
+    /// regression metric, but it must not be presented as an AES17 THD+N result:
+    /// it applies neither the analyzer bandwidth nor the filters prescribed by
+    /// that standard. The name records that limitation so a future standards
+    /// harness cannot silently reuse this value as a conformance measurement.
+    fn unweighted_full_band_residual_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
         let trim = (samples.len() / 10).min(4_800);
         let stable = &samples[trim..samples.len() - trim];
         let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
@@ -697,18 +703,50 @@ mod tests {
     }
 
     #[test]
-    fn resampling_keeps_sine_thd_plus_noise_below_minus_100_db() {
-        const FREQUENCY_HZ: f64 = 1_000.0;
+    fn residual_meter_recovers_a_known_injected_distortion() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const FUNDAMENTAL_HZ: f64 = 997.0;
+        const FUNDAMENTAL_AMPLITUDE: f64 = 0.5;
+        const INJECTED_RESIDUAL_DB: f64 = -60.0;
+
+        let residual_amplitude = FUNDAMENTAL_AMPLITUDE * 10.0_f64.powf(INJECTED_RESIDUAL_DB / 20.0);
+        let samples = (0..SAMPLE_RATE)
+            .map(|frame| {
+                let time = frame as f64 / SAMPLE_RATE as f64;
+                let fundamental = FUNDAMENTAL_AMPLITUDE
+                    * (2.0 * std::f64::consts::PI * FUNDAMENTAL_HZ * time).sin();
+                let second_harmonic =
+                    residual_amplitude * (4.0 * std::f64::consts::PI * FUNDAMENTAL_HZ * time).sin();
+                (fundamental + second_harmonic) as f32
+            })
+            .collect::<Vec<_>>();
+
+        let measured = unweighted_full_band_residual_db(&samples, SAMPLE_RATE, FUNDAMENTAL_HZ);
+        assert!(
+            (measured - INJECTED_RESIDUAL_DB).abs() < 0.05,
+            "le residumetre annonce {measured:.3} dB pour un defaut injecte a \
+             {INJECTED_RESIDUAL_DB:.1} dB"
+        );
+    }
+
+    #[test]
+    fn resampling_keeps_unweighted_full_band_residual_below_minus_100_db() {
+        // Published measurement contract for this regression test (#2218):
+        // 997 Hz stimulus, -6.02 dBFS peak, one second, the central 80% of the
+        // output analyzed, no weighting and the full 0..Nyquist bandwidth.
+        // This is intentionally not labelled AES17 THD+N; see the meter above.
+        const FREQUENCY_HZ: f64 = 997.0;
         const AMPLITUDE: f64 = 0.5;
 
         for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
             let input = sine_mono(from_sr, FREQUENCY_HZ, AMPLITUDE);
             let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
-            let thd_n_db = thd_plus_noise_db(&output, to_sr, FREQUENCY_HZ);
+            let residual_db = unweighted_full_band_residual_db(&output, to_sr, FREQUENCY_HZ);
 
             assert!(
-                thd_n_db < -100.0,
-                "THD+N du SRC {from_sr} -> {to_sr} Hz mesuree a {thd_n_db:.1} dB"
+                residual_db < -100.0,
+                "residu large bande non pondere du SRC {from_sr} -> {to_sr} Hz mesure a \
+                 {residual_db:.1} dB"
             );
         }
     }
