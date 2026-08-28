@@ -522,13 +522,12 @@ const ECOUTES_STREAMING: usize = 6;
 ///   cela demande les relations d'oeuvre de MusicBrainz, donc un MBID, et la
 ///   couverture MBID de la bibliotheque est encore trop faible pour que le
 ///   resultat soit autre chose qu'un hasard ;
-/// - pas de versions Qobuz : il faudrait une recherche par morceau ecoute,
-///   donc autant d'appels au service, avec le plafond de requetes que cela
-///   suppose. A brancher quand la section aura fait ses preuves en local.
+/// - les versions des services de streaming sont cherchees sur un vivier plus
+///   petit et mises en cache six heures, afin de borner les appels distants.
 ///
-/// Le rapprochement est insensible a la casse mais **exact** sur le titre. Un
-/// « (Live) » colle au titre ne sera pas rapproche : mieux vaut ne rien
-/// proposer qu'un rapprochement faux.
+/// Le rapprochement local est insensible a la casse et strict sur le coeur du
+/// titre : seul un suffixe d'edition delimite par ` (` ou ` [` est admis. Il
+/// ne s'agit pas d'une recherche floue.
 async fn other_versions(
     State(state): State<AppState>,
     Query(p): Query<HomeParams>,
@@ -560,9 +559,10 @@ async fn other_versions(
               WHERE artist_name IS NOT NULL \
               ORDER BY listened_at DESC \
               LIMIT {ECOUTES_EXAMINEES}) lh \
-        JOIN tracks t ON LOWER(t.title) = LOWER(lh.title) \
+        CROSS JOIN tracks t \
         JOIN albums al ON t.album_id = al.id \
         LEFT JOIN artists ar ON al.artist_id = ar.id \
+        LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
         WHERE {predicat} \
         ORDER BY lh.listened_at DESC \
         LIMIT {limit}"
@@ -657,6 +657,72 @@ async fn other_versions(
     }
 
     Ok(Json(json!(groupes)))
+}
+
+#[cfg(test)]
+mod tests_other_versions {
+    use super::*;
+
+    /// Le second appelant du predicat partage (#2638) doit accepter la meme
+    /// variante de titre que la route par piste, sans perdre l'artiste reel
+    /// d'une piste rangee dans une compilation « Artistes divers ».
+    #[tokio::test]
+    async fn accueil_retrouve_une_edition_suffixee_du_titre_ecoute() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Hit Collection', ?1)",
+            &[&divers as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Before The Dawn', ?1)",
+            &[&kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let before = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Running Up That Hill (A Deal With God)', ?1, ?2, 296000, '/before.flac')",
+            &[&before as &dyn ToSqlValue, &kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, listened_at) \
+             VALUES ('Running Up that Hill', 'Kate Bush', 'Hit Collection', \
+                     '2026-08-28T09:32:00Z')",
+            &[],
+        )
+        .unwrap();
+
+        let resultat = other_versions(
+            State(state),
+            Query(HomeParams {
+                limit: Some(20),
+                zone_id: None,
+            }),
+        )
+        .await;
+        let Json(groupes) = match resultat {
+            Ok(reponse) => reponse,
+            Err(_) => panic!("la route doit repondre"),
+        };
+
+        let groupes = groupes.as_array().expect("groupes de versions");
+        assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
+        assert_eq!(
+            groupes[0]["versions"][0]["album_title"].as_str(),
+            Some("Before The Dawn")
+        );
+    }
 }
 
 /// Favorite radios + recently played radios.

@@ -2762,7 +2762,6 @@ async fn renderer_capabilities(
             Json(json!({
                 "probed": false,
                 "reason": "renderer_offline",
-                "message": "The renderer is not currently online/discovered. Make sure it is powered on and on the same network, then try again.",
             })),
         )
             .into_response();

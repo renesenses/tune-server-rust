@@ -188,7 +188,7 @@ fn request_error(e: reqwest::Error) -> (u16, Value) {
 async fn parse(resp: reqwest::Response) -> SupportResult {
     let status = resp.status().as_u16();
     // Les en-têtes se lisent AVANT `resp.text()`, qui consomme la réponse.
-    let retry_after = retry_after_secs(resp.headers());
+    let retry_after = super::rate_limit::retry_after_secs(resp.headers());
     let text = resp.text().await.map_err(|e| {
         (
             502u16,
@@ -208,28 +208,6 @@ async fn parse(resp: reqwest::Response) -> SupportResult {
 ///
 /// Rend `None` si rien n'est exploitable — l'interface affiche alors un
 /// message sans délai, jamais un délai inventé (#2178).
-fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    if let Some(secs) = headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        // 0 signifie « réessaie tout de suite » : ce n'est pas un délai à
-        // afficher, et « réessaie dans 0 seconde » serait absurde.
-        return (secs > 0).then_some(secs);
-    }
-
-    let reset = headers
-        .get("x-ratelimit-reset")?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<i64>()
-        .ok()?;
-    let now = chrono::Utc::now().timestamp();
-    (reset > now).then(|| (reset - now) as u64)
-}
-
 /// Construit le `SupportResult` à partir du statut, du corps brut et du délai
 /// lu dans les en-têtes.
 ///
@@ -279,12 +257,15 @@ mod tests {
     fn retry_after_lit_les_delta_secondes() {
         let mut h = HeaderMap::new();
         h.insert("retry-after", HeaderValue::from_static("59"));
-        assert_eq!(retry_after_secs(&h), Some(59));
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), Some(59));
     }
 
     #[test]
     fn retry_after_absent_rend_none() {
-        assert_eq!(retry_after_secs(&HeaderMap::new()), None);
+        assert_eq!(
+            crate::cloud::rate_limit::retry_after_secs(&HeaderMap::new()),
+            None
+        );
     }
 
     #[test]
@@ -295,14 +276,14 @@ mod tests {
             "retry-after",
             HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
         );
-        assert_eq!(retry_after_secs(&h), None);
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
     }
 
     #[test]
     fn retry_after_zero_rend_none() {
         let mut h = HeaderMap::new();
         h.insert("retry-after", HeaderValue::from_static("0"));
-        assert_eq!(retry_after_secs(&h), None);
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
     }
 
     #[test]
@@ -313,7 +294,8 @@ mod tests {
             "x-ratelimit-reset",
             HeaderValue::from_str(&futur.to_string()).unwrap(),
         );
-        let secs = retry_after_secs(&h).expect("un reset dans le futur donne un délai");
+        let secs = crate::cloud::rate_limit::retry_after_secs(&h)
+            .expect("un reset dans le futur donne un délai");
         // Bornes larges : la seconde peut tourner entre les deux appels.
         assert!((115..=120).contains(&secs), "délai inattendu : {secs}");
     }
@@ -326,7 +308,7 @@ mod tests {
             "x-ratelimit-reset",
             HeaderValue::from_str(&passe.to_string()).unwrap(),
         );
-        assert_eq!(retry_after_secs(&h), None);
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
     }
 
     #[test]
