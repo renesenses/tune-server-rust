@@ -912,20 +912,25 @@ impl QobuzService {
     }
 
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
-        // Qobuz returns subgenresCount (integer) rather than a subgenres array
-        // at the /genre/list level. Fall back to checking the subgenres array
-        // (returned by /genre/get) or slug depth as a heuristic.
+        // `has_children` n'existe PAS chez Qobuz : c'est NOUS qui le
+        // fabriquons. Deux champs de la réponse peuvent l'ÉNONCER —
+        // `subgenresCount` (rendu par `/genre/list`) et `subgenres` (rendu par
+        // `/genre/get`). En l'absence des deux, Qobuz ne dit rien, et la seule
+        // réponse honnête est « non ».
+        //
+        // Il y avait ici une troisième source : la forme du `slug`. Un slug
+        // sans « / » était réputé désigner un genre racine, donc pourvu
+        // d'enfants — le commentaire d'origine disait lui-même « typically ».
+        // C'est une invention : aucun champ de la réponse ne l'affirme. Elle
+        // produisait le défaut #2115 — « Be Bop » annonçant un sous-menu qui
+        // rend `[]`, et l'utilisateur devant un écran vide. Un chevron absent
+        // se rattrape d'un clic ; un chevron menteur fait douter de tout
+        // l'écran. On n'annonce plus que ce qui est ÉNONCÉ.
         let has_children = item["subgenresCount"]
             .as_u64()
             .map(|n| n > 0)
             .or_else(|| item["subgenres"].as_array().map(|a| !a.is_empty()))
-            .unwrap_or_else(|| {
-                // Top-level genres (slug without '/') typically have children
-                item["slug"]
-                    .as_str()
-                    .map(|s| !s.contains('/'))
-                    .unwrap_or(false)
-            });
+            .unwrap_or(false);
 
         // Qobuz image can be a string or an object {"large": "...", "small": "..."}
         let image_url = item["image"]
@@ -938,6 +943,71 @@ impl QobuzService {
             name: item["name"].as_str().unwrap_or("").into(),
             has_children,
             image_url,
+        }
+    }
+
+    /// Les paramètres de `/genre/list`, construits en UN SEUL endroit.
+    ///
+    /// La clé du cache éditorial est calculée sur ces paramètres exacts. Si la
+    /// liste divergeait entre l'appel qui écrit le cache et la relecture faite
+    /// par `retirer_les_chevrons_dementis`, cette dernière chercherait une clé
+    /// qui n'existe pas : le garde-fou ne se déclencherait JAMAIS, et en
+    /// silence. Une seule source pour les deux.
+    fn params_genres(parent_id: Option<&str>) -> Vec<(&str, &str)> {
+        let mut params: Vec<(&str, &str)> = vec![("offset", "0"), ("limit", "500")];
+        if let Some(pid) = parent_id {
+            params.push(("parent_id", pid));
+        }
+        params
+    }
+
+    /// Les genres d'une réponse `/genre/list`, quelle que soit sa forme.
+    fn extraire_genres(data: &serde_json::Value) -> Vec<StreamGenre> {
+        data["genres"]["items"]
+            .as_array()
+            .or_else(|| data["genres"].as_array())
+            .or_else(|| data.as_array())
+            .map(|items| items.iter().map(Self::map_genre).collect())
+            .unwrap_or_default()
+    }
+
+    /// Retire le chevron des nœuds dont on a DÉJÀ constaté qu'ils ne rendent
+    /// rien.
+    ///
+    /// Qobuz peut annoncer `subgenresCount > 0` sur un sous-genre dont
+    /// `/genre/list?parent_id=<lui>` rend `[]`. Ce mensonge-là, nous ne pouvons
+    /// pas le corriger à la source. Mais dès qu'il a été constaté une fois, la
+    /// réponse vide est dans le cache éditorial : on la relit et on retire
+    /// l'affordance, au lieu de la laisser mentir une seconde fois.
+    ///
+    /// **Coût réseau : zéro.** Aucune requête n'est déclenchée — on ne relit
+    /// que ce que la navigation de l'utilisateur a déjà rapporté. Le verrou est
+    /// pris une seule fois pour toute la liste, et la donnée n'est pas clonée :
+    /// une liste de genres peut compter jusqu'à 500 entrées (`limit`).
+    ///
+    /// **Durée de vie du démenti : celle du cache éditorial**, `TTL_EDITORIAL`
+    /// (30 min). Pas de nouvel état, pas de nouvelle purge à écrire — et si
+    /// Qobuz finit par peupler ce sous-genre, le chevron revient au plus tard
+    /// une demi-heure plus tard.
+    fn retirer_les_chevrons_dementis(&self, genres: &mut [StreamGenre]) {
+        if !genres.iter().any(|g| g.has_children) {
+            return;
+        }
+        let Ok(cache) = self.cache_editorial.lock() else {
+            return;
+        };
+        for genre in genres.iter_mut().filter(|g| g.has_children) {
+            let cle = Self::cle_cache("/genre/list", &Self::params_genres(Some(&genre.id)));
+            let Some(entree) = cache.get(&cle) else {
+                continue;
+            };
+            if entree.cree.elapsed() >= TTL_EDITORIAL {
+                continue;
+            }
+            if Self::extraire_genres(&entree.donnees).is_empty() {
+                info!(genre_id = %genre.id, genre_name = %genre.name, "qobuz_chevron_dementi");
+                genre.has_children = false;
+            }
         }
     }
 
@@ -1185,10 +1255,7 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_genres(&self, parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
-        let mut params: Vec<(&str, &str)> = vec![("offset", "0"), ("limit", "500")];
-        if let Some(pid) = parent_id {
-            params.push(("parent_id", pid));
-        }
+        let params = Self::params_genres(parent_id);
         let data = self
             .api_get_editorial("/genre/list", &params)
             .await
@@ -1196,15 +1263,11 @@ impl StreamingService for QobuzService {
                 info!(error = %e, "qobuz_genres_failed");
                 e
             })?;
-        let genres: Vec<StreamGenre> = data["genres"]["items"]
-            .as_array()
-            .or_else(|| data["genres"].as_array())
-            .or_else(|| data.as_array())
-            .map(|items| items.iter().map(Self::map_genre).collect())
-            .unwrap_or_default();
+        let mut genres: Vec<StreamGenre> = Self::extraire_genres(&data);
         if genres.is_empty() {
             info!(raw = %data, "qobuz_genres_empty_response");
         }
+        self.retirer_les_chevrons_dementis(&mut genres);
         Ok(genres)
     }
 
@@ -2328,25 +2391,151 @@ mod tests {
         assert!(!genre.has_children);
     }
 
+    /// #2115 — la forme du `slug` ne promet plus rien.
+    ///
+    /// C'est le test de non-régression du défaut signalé par Cyrille Moutia
+    /// (fil 1490) : « Be Bop » portait un chevron, et le déplier rendait `[]`.
+    /// Aucun champ de la réponse Qobuz n'énonçait de descendance — seule la
+    /// forme du slug la laissait supposer. Un slug n'est pas une preuve.
     #[test]
-    fn map_genre_slug_heuristic() {
-        // Top-level slug (no '/') implies children
-        let json = json!({
-            "id": 40,
-            "name": "Rock",
-            "slug": "rock",
-        });
-        let genre = QobuzService::map_genre(&json);
-        assert!(genre.has_children);
+    fn un_slug_ne_promet_aucun_sous_menu() {
+        // Slug racine, sans « / » : c'était le cas qui rendait `true`.
+        let racine = json!({"id": 40, "name": "Rock", "slug": "rock"});
+        assert!(
+            !QobuzService::map_genre(&racine).has_children,
+            "un slug sans « / » ne dit RIEN de la descendance"
+        );
 
-        // Sub-genre slug with '/' implies no children
-        let json2 = json!({
-            "id": 41,
-            "name": "Hard Rock",
-            "slug": "rock/hard-rock",
-        });
-        let genre2 = QobuzService::map_genre(&json2);
-        assert!(!genre2.has_children);
+        // Le cas exact du ticket : un sous-genre de niveau 2, sans
+        // `subgenresCount` ni `subgenres`, dont le slug ne porte pas de « / ».
+        let be_bop = json!({"id": 81, "name": "Be Bop", "slug": "be-bop"});
+        assert!(
+            !QobuzService::map_genre(&be_bop).has_children,
+            "#2115 : « Be Bop » ne doit plus annoncer un sous-menu vide"
+        );
+
+        // Slug hiérarchique : inchangé, mais pour la même raison désormais.
+        let hard_rock = json!({"id": 41, "name": "Hard Rock", "slug": "rock/hard-rock"});
+        assert!(!QobuzService::map_genre(&hard_rock).has_children);
+
+        // Et sans le moindre champ, le silence de Qobuz reste un « non ».
+        let muet = json!({"id": 42, "name": "Muet"});
+        assert!(!QobuzService::map_genre(&muet).has_children);
+    }
+
+    /// L'inverse du précédent : quand Qobuz ÉNONCE une descendance, on la
+    /// relaie. Sans ce test, `has_children = false` en dur passerait le
+    /// test ci-dessus et supprimerait tout l'arbre.
+    #[test]
+    fn un_compte_annonce_par_qobuz_est_relaye() {
+        let dit_par_le_compte = json!({"id": 80, "name": "Jazz", "subgenresCount": 15});
+        assert!(QobuzService::map_genre(&dit_par_le_compte).has_children);
+
+        let dit_par_le_tableau = json!({"id": 80, "name": "Jazz", "subgenres": [{"id": 81}]});
+        assert!(QobuzService::map_genre(&dit_par_le_tableau).has_children);
+    }
+
+    /// Le cache éditorial, prérempli à la main : AUCUN appel réseau.
+    ///
+    /// `api_get_editorial` sert le cache avant de toucher au réseau, donc un
+    /// `get_genres` dont la clé est en cache n'ouvre pas de socket. Ce test
+    /// tomberait en erreur de connexion s'il en ouvrait une.
+    fn service_avec_genres_en_cache(entrees: &[(Option<&str>, serde_json::Value)]) -> QobuzService {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        for (parent, donnees) in entrees {
+            let cle = QobuzService::cle_cache("/genre/list", &QobuzService::params_genres(*parent));
+            svc.cache_set(cle, donnees.clone());
+        }
+        svc
+    }
+
+    /// #2115, deuxième garde-fou — si Qobuz ment MALGRÉ un `subgenresCount`,
+    /// le vide déjà constaté retire le chevron. Zéro requête supplémentaire.
+    #[tokio::test]
+    async fn un_enfant_deja_constate_vide_perd_son_chevron() {
+        let svc = service_avec_genres_en_cache(&[
+            (
+                Some("80"),
+                json!({"genres": {"items": [
+                    {"id": 81, "name": "Be Bop", "subgenresCount": 3},
+                    {"id": 82, "name": "Cool jazz", "subgenresCount": 7},
+                ]}}),
+            ),
+            // « Be Bop » a été déplié une fois : Qobuz a rendu une liste vide.
+            (Some("81"), json!({"genres": {"items": []}})),
+        ]);
+
+        let genres = svc.get_genres(Some("80")).await.expect("cache servi");
+        assert_eq!(genres.len(), 2);
+        assert!(
+            !genres[0].has_children,
+            "« Be Bop » a été constaté vide : plus de chevron"
+        );
+        assert!(
+            genres[1].has_children,
+            "« Cool jazz » n'a jamais été déplié : on ne retire rien sans preuve"
+        );
+    }
+
+    /// Le pendant du précédent : un enfant constaté PEUPLÉ garde son chevron.
+    /// Sans lui, un `has_children = false` inconditionnel passerait.
+    #[tokio::test]
+    async fn un_enfant_constate_peuple_garde_son_chevron() {
+        let svc = service_avec_genres_en_cache(&[
+            (
+                Some("80"),
+                json!({"genres": {"items": [{"id": 81, "name": "Be Bop", "subgenresCount": 3}]}}),
+            ),
+            (
+                Some("81"),
+                json!({"genres": {"items": [{"id": 999, "name": "Hard bop"}]}}),
+            ),
+        ]);
+
+        let genres = svc.get_genres(Some("80")).await.expect("cache servi");
+        assert!(genres[0].has_children);
+    }
+
+    /// Un démenti périmé ne compte plus : la durée de vie du retrait est
+    /// celle du cache éditorial, et pas davantage.
+    #[tokio::test]
+    async fn un_dementi_perime_ne_retire_plus_le_chevron() {
+        let svc = service_avec_genres_en_cache(&[(
+            Some("80"),
+            json!({"genres": {"items": [{"id": 81, "name": "Be Bop", "subgenresCount": 3}]}}),
+        )]);
+        // Le vide constaté il y a plus de TTL_EDITORIAL.
+        let cle = QobuzService::cle_cache("/genre/list", &QobuzService::params_genres(Some("81")));
+        svc.cache_editorial.lock().unwrap().insert(
+            cle,
+            EntreeCache {
+                donnees: json!({"genres": {"items": []}}),
+                cree: Instant::now() - TTL_EDITORIAL - Duration::from_secs(1),
+            },
+        );
+
+        let genres = svc.get_genres(Some("80")).await.expect("cache servi");
+        assert!(
+            genres[0].has_children,
+            "un constat périmé n'autorise plus à retirer l'affordance"
+        );
+    }
+
+    /// La clé lue par le garde-fou DOIT être celle écrite par l'appel. Si les
+    /// deux divergent, le retrait ne se déclenche jamais — en silence.
+    #[test]
+    fn la_cle_du_dementi_est_celle_de_l_appel() {
+        assert_eq!(
+            QobuzService::cle_cache("/genre/list", &QobuzService::params_genres(Some("81"))),
+            QobuzService::cle_cache(
+                "/genre/list",
+                &[("offset", "0"), ("limit", "500"), ("parent_id", "81")]
+            )
+        );
+        assert_eq!(
+            QobuzService::cle_cache("/genre/list", &QobuzService::params_genres(None)),
+            QobuzService::cle_cache("/genre/list", &[("offset", "0"), ("limit", "500")])
+        );
     }
 
     /// Une entrée fraîche est servie, et c'est tout l'intérêt.
