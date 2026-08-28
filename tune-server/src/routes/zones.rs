@@ -1454,6 +1454,12 @@ fn build_signal_path(
     // L'état d'exécution distingue traitement et contournement. C'est le
     // reliquat commun de #2205/#2233 : un réglage enregistré ne disait pas ce
     // qui avait effectivement atteint le ring Windows.
+    let dsp_metrics = ps.output_dsp_metrics.map(|metrics| {
+        json!({
+            "eq_overs": metrics.eq_overs,
+            "eq_non_finite_samples": metrics.eq_non_finite_samples,
+        })
+    });
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
             OutputDspState::Applied => Some((
@@ -1470,6 +1476,7 @@ fn build_signal_path(
                 "name": "DSP",
                 "description": description,
                 "bit_perfect": intact,
+                "metrics": dsp_metrics.clone(),
             }));
         }
     } else if dsp_enabled {
@@ -1518,6 +1525,7 @@ fn build_signal_path(
         "steps": steps,
         "runtime_observed": runtime_signal_path.is_some(),
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
+        "dsp_metrics": dsp_metrics,
     }))
 }
 
@@ -3791,8 +3799,8 @@ mod signal_path_tests {
     #[test]
     fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
         use tune_core::outputs::traits::{
-            OutputDspState, OutputSampleTransport, OutputSignalPathStatus, OutputSignalReason,
-            OutputVolumeState,
+            OutputDspMetrics, OutputDspState, OutputSampleTransport, OutputSignalPathStatus,
+            OutputSignalReason, OutputVolumeState,
         };
 
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3814,6 +3822,10 @@ mod signal_path_tests {
                 OutputSignalReason::DspApplied,
             ],
         });
+        ps.output_dsp_metrics = Some(OutputDspMetrics {
+            eq_overs: 17,
+            eq_non_finite_samples: 2,
+        });
 
         let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "ASIO", None).unwrap();
 
@@ -3831,6 +3843,17 @@ mod signal_path_tests {
             Some("Transport flottant imposé par le callback ; DSP appliqué")
         );
         assert_eq!(step_desc(&sp, "DSP").as_deref(), Some("DSP appliqué"));
+        assert_eq!(sp["dsp_metrics"]["eq_overs"], 17);
+        assert_eq!(sp["dsp_metrics"]["eq_non_finite_samples"], 2);
+        assert_eq!(
+            sp["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["name"] == "DSP")
+                .unwrap()["metrics"]["eq_overs"],
+            17
+        );
     }
 
     // ------------------------------------------------------------------

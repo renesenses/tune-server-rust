@@ -397,6 +397,9 @@ pub struct EqProcessor {
     preamp_db: Vec<f64>,
     /// Independent deterministic PRNG state per channel for TPDF dithering.
     dither_states: Vec<u64>,
+    /// Cumulative runtime diagnostics since this processor was built for the
+    /// current stream. Read by the output telemetry path (#2212).
+    process_stats: EqProcessStats,
     channels: u16,
     enabled: bool,
 }
@@ -473,6 +476,7 @@ impl EqProcessor {
             dither_states: (0..channels.max(1))
                 .map(|channel| 0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1))
                 .collect(),
+            process_stats: EqProcessStats::default(),
             channels,
             enabled,
         }
@@ -514,6 +518,11 @@ impl EqProcessor {
             }
         }
 
+        self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
+        self.process_stats.non_finite_samples = self
+            .process_stats
+            .non_finite_samples
+            .saturating_add(stats.non_finite_samples);
         stats
     }
 
@@ -563,11 +572,21 @@ impl EqProcessor {
             }
         }
 
+        self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
+        self.process_stats.non_finite_samples = self
+            .process_stats
+            .non_finite_samples
+            .saturating_add(stats.non_finite_samples);
         stats
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Diagnostics cumulés depuis la construction du processeur pour la piste.
+    pub fn process_stats(&self) -> EqProcessStats {
+        self.process_stats
     }
 
     /// Automatic pre-gain for a channel, in dB.
@@ -938,6 +957,14 @@ mod tests {
 
         assert!(stats.overs > 0);
         assert!(samples.iter().any(|sample| sample.abs() > 1.0));
+        assert_eq!(eq.process_stats(), stats);
+
+        let mut second = vec![0.9_f32; 128];
+        let second_stats = eq.process_interleaved(&mut second);
+        assert_eq!(
+            eq.process_stats().overs,
+            stats.overs.saturating_add(second_stats.overs)
+        );
     }
 
     #[test]
