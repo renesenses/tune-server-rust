@@ -384,6 +384,114 @@ mod tests {
         out
     }
 
+    fn signal(frames: usize, channels: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|frame| {
+                (0..channels).map(move |channel| {
+                    let phase = frame as f32 * 0.037 + channel as f32 * 0.19;
+                    phase.sin() * 0.5
+                })
+            })
+            .collect()
+    }
+
+    fn resample_in_chunks(
+        samples: &[f32],
+        from_sr: u32,
+        to_sr: u32,
+        channels: u16,
+        chunk_frames: &[usize],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ch = usize::from(channels);
+        let mut resampler = Some(
+            new_streaming_resampler(from_sr, to_sr, channels)
+                .expect("la matrice emploie uniquement des formats valides"),
+        );
+        let mut leftover = Vec::new();
+        let mut output = Vec::new();
+        let mut frame = 0;
+        let total_frames = samples.len() / ch;
+        let mut chunk = 0;
+
+        while frame < total_frames {
+            let frames = chunk_frames[chunk % chunk_frames.len()].min(total_frames - frame);
+            chunk += 1;
+            let start = frame * ch;
+            let end = (frame + frames) * ch;
+            output.extend(rubato_resample_chunk(
+                &mut resampler,
+                &samples[start..end],
+                channels,
+                false,
+                &mut leftover,
+            ));
+            frame += frames;
+        }
+        output.extend(rubato_resample_chunk(
+            &mut resampler,
+            &[],
+            channels,
+            true,
+            &mut leftover,
+        ));
+        (output, leftover)
+    }
+
+    #[test]
+    fn exact_frame_count_covers_common_ratios_channels_and_boundaries() {
+        let ratios = [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (48_000, 96_000),
+            (96_000, 44_100),
+            (192_000, 48_000),
+        ];
+
+        for (from_sr, to_sr) in ratios {
+            for channels in [1_u16, 2] {
+                for input_frames in [1_usize, 37, 1_023, 1_024, 1_025, 4_417] {
+                    let input = signal(input_frames, usize::from(channels));
+                    let output = rubato_resample_batch_exact(&input, from_sr, to_sr, channels);
+                    let expected =
+                        (input_frames as f64 * to_sr as f64 / from_sr as f64).round() as usize;
+
+                    assert_eq!(
+                        output.len(),
+                        expected * usize::from(channels),
+                        "{from_sr} -> {to_sr} Hz, {channels} canal(aux), {input_frames} trames"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_flush_is_invariant_to_chunk_boundaries() {
+        for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
+            for channels in [1_u16, 2] {
+                let input = signal(5_137, usize::from(channels));
+                let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
+                let (chunked, leftover) = resample_in_chunks(
+                    &input,
+                    from_sr,
+                    to_sr,
+                    channels,
+                    &[1, 17, 1_000, 3, 2_048, 511],
+                );
+
+                assert!(
+                    leftover.is_empty(),
+                    "le flush laisse des échantillons en attente pour {from_sr} -> {to_sr} Hz"
+                );
+                assert_eq!(
+                    chunked, reference,
+                    "le découpage change la sortie ou son nombre de trames pour \
+                     {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                );
+            }
+        }
+    }
+
     #[test]
     fn batch_exact_length_matches_ratio() {
         // 44.1 kHz → 48 kHz: one second in, EXACTLY one second out. The
