@@ -17,6 +17,8 @@ mod http_client_seam;
 mod integration;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
+#[path = "licence_grace_visible.rs"]
+mod licence_grace_visible;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]

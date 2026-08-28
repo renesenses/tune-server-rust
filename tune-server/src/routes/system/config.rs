@@ -1758,6 +1758,8 @@ pub(super) async fn get_license(State(state): State<AppState>) -> Json<Value> {
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
         "hardware_fingerprint": ls.hardware_fingerprint,
+        // Grâce hors ligne (#1999) — même objet que /cloud/license/status.
+        "offline_grace": tune_core::license::offline_grace(&ls),
     }))
 }
 
