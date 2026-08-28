@@ -528,8 +528,16 @@ pub fn apply_track_overrides(tracks: &mut [SourceTrack], overrides: &[TrackOverr
 /// would be path traversal; an empty result would collapse the hierarchy. The
 /// byte cap keeps us clear of filesystem name limits on long classical titles.
 pub fn sanitize_component(raw: &str) -> String {
+    let (safe_text, corrections) =
+        crate::metadata::sanitize_untrusted_single_line_text(raw, "path_component");
+    if !corrections.is_empty() {
+        tracing::warn!(
+            corrections = ?corrections,
+            "ingest_path_component_unsafe_text_sanitized"
+        );
+    }
     let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
+    for c in safe_text.chars() {
         match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
             c if c.is_control() => {}
@@ -1225,6 +1233,15 @@ mod tests {
         assert_eq!(sanitize_component(".."), "Unknown");
         assert_eq!(sanitize_component(""), "Unknown");
         assert_eq!(sanitize_component("a:b*c|d"), "a_b_c_d");
+        assert_eq!(
+            sanitize_component("Jacobs, Lisa\0\u{feff}The String Soloists"),
+            "Jacobs, Lisa The String Soloists"
+        );
+        assert!(
+            !sanitize_component("A\0\u{feff}B")
+                .chars()
+                .any(|c| c == '\0' || c == '\u{feff}')
+        );
     }
 
     #[test]

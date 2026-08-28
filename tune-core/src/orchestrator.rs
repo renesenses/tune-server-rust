@@ -2068,6 +2068,22 @@ impl PlaybackOrchestrator {
                 }
             }
 
+            // A local output opens this URL in its own reader thread just
+            // after `play_media`. If that reader never starts, the session is
+            // alive but silent and used to leave only `stale_session_removed`
+            // thirty minutes later (#2270). Arming here excludes sessions that
+            // are merely prepared in advance for gapless playback.
+            if is_local && let Some(ref sid) = resolved.stream_id {
+                let _ = arm_local_stream_consumer_watch(
+                    self.streamer.clone(),
+                    sid.clone(),
+                    req.zone_id,
+                    device_id.clone(),
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+            }
+
             let result = self
                 .send_to_output(
                     device_id,
@@ -8243,6 +8259,40 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Les appareils qu'une AUTRE zone que `zone_id` revendique comme sienne.
+    ///
+    /// Sert à borner le repli de `stop` : ces sorties-là ne lui appartiennent
+    /// pas, les arrêter revient à couper la musique de quelqu'un d'autre.
+    /// Prend une projection `(id de zone, appareil)` plutôt que des `Zone`
+    /// entières : la règle ne dépend que de ces deux champs, et une fonction
+    /// qui n'exige pas de construire une zone complète est une fonction qu'on
+    /// peut réellement tester.
+    fn sorties_revendiquees_par_les_autres_zones<'a>(
+        zones: impl IntoIterator<Item = (Option<i64>, Option<&'a str>)>,
+        zone_id: i64,
+    ) -> std::collections::HashSet<String> {
+        zones
+            .into_iter()
+            .filter(|(id, _)| *id != Some(zone_id))
+            .filter_map(|(_, appareil)| appareil.map(str::to_string))
+            .collect()
+    }
+
+    /// Quelles sorties le repli de `stop` a le droit de toucher.
+    ///
+    /// Tout ce qui est revendiqué par une autre zone est épargné, sans
+    /// exception : c'est l'invariant que ce repli avait perdu.
+    fn sorties_a_arreter_en_repli(
+        toutes: &[String],
+        revendiquees_ailleurs: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        toutes
+            .iter()
+            .filter(|did| !revendiquees_ailleurs.contains(did.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
@@ -8281,22 +8331,53 @@ impl PlaybackOrchestrator {
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback.
+            // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
+            // enregistrées — et c'est ainsi qu'un `next` sur une zone
+            // « navigateur » (son dans le navigateur, donc AUCUN appareil côté
+            // serveur, par construction : `reject_if_zone_has_no_output_device`
+            // laisse justement passer ce cas) coupait la musique de tout le
+            // monde.
+            //
+            // Mesuré sur .18 le 28/08/2026 : dix arrêts en une heure, cadence
+            // ~100 s, chacun envoyant `dlna_stop` à l'Eversolo qui jouait la
+            // zone 10 et aux deux Sonos. La zone 10 n'étant elle-même jamais
+            // passée en « stopped », rien ne reprenait avant que le poller ne
+            // déclenche `radio_auto_retry` — jusqu'à près de trois minutes de
+            // silence à chaque fois.
+            //
+            // Le repli garde son utilité — rattraper une sortie orpheline que
+            // CETTE zone aurait laissée ouverte — mais il ne doit jamais
+            // toucher une sortie qu'une AUTRE zone revendique. Même famille
+            // que #2571 : un ordre qui sort du périmètre de la zone active.
+            let toutes_les_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .list()
+                .unwrap_or_default();
+            let revendiquees_ailleurs = Self::sorties_revendiquees_par_les_autres_zones(
+                toutes_les_zones
+                    .iter()
+                    .map(|z| (z.id, z.output_device_id.as_deref())),
+                zone_id,
+            );
             // Snapshot the Arcs first and release the registry lock, so a slow
             // or offline renderer's stop() SOAP timeout can't hold the lock and
             // starve concurrent playback for ~100s (send_to_output_lock_contention).
             let arcs: Vec<_> = {
                 let outputs = self.outputs.lock().await;
-                outputs
-                    .list()
+                Self::sorties_a_arreter_en_repli(&outputs.list(), &revendiquees_ailleurs)
                     .iter()
                     .filter_map(|did| outputs.get(did))
                     .collect()
             };
+            let arretees = arcs.len();
             for output in arcs {
                 let _ = output.lock().await.stop().await;
             }
-            warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
+            warn!(
+                zone_id,
+                arretees,
+                epargnees = revendiquees_ailleurs.len(),
+                "stop_fallback_no_device_id — repli borné aux sorties qu'aucune autre zone ne revendique"
+            );
         }
         // Remove session AFTER the output has been stopped
         if let Some(ref sid) = old_stream_id {
@@ -9942,6 +10023,65 @@ fn decode_radio_stream_to_pcm(
     }
 }
 
+/// Arm a one-shot diagnostic for a stream URL handed to a local output.
+///
+/// Creating a stream session is not enough to infer a fault: gapless prepares
+/// sessions well before they are meant to be consumed. The orchestrator calls
+/// this only on the main local-play path, immediately before `play_media`.
+/// Returning the task handle keeps the behaviour directly testable without
+/// scraping logs.
+async fn arm_local_stream_consumer_watch(
+    streamer: Arc<AudioStreamer>,
+    stream_id: String,
+    zone_id: i64,
+    device_id: String,
+    grace: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<bool>> {
+    use std::sync::atomic::Ordering;
+
+    let sessions = streamer.sessions_state();
+    let session = {
+        let guard = sessions.lock().await;
+        guard.get(&stream_id).cloned()
+    }?;
+
+    if session.consumer_watch_armed.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+
+        let Some(bytes_sent) = streamer.stream_bytes_sent(&stream_id).await else {
+            // The normal failure/stop paths remove the session. They already
+            // carry their own diagnostic and must not trigger a stale alert.
+            return false;
+        };
+        if bytes_sent != 0 {
+            return false;
+        }
+
+        let file_path = session.file_path.lock().await.clone();
+        let proxy_url = session.proxy_url.lock().await.clone();
+        let active_consumers = session.active_consumers.load(Ordering::Relaxed);
+        let session_age_ms = session.created_at.elapsed().as_millis() as u64;
+        warn!(
+            zone_id,
+            device_id = %device_id,
+            stream_id = %stream_id,
+            grace_ms = grace.as_millis() as u64,
+            session_age_ms,
+            format = %session.info.format,
+            mime_type = %session.info.mime_type,
+            file_path = ?file_path,
+            proxy_url = ?proxy_url,
+            active_consumers,
+            "local_stream_never_consumed"
+        );
+        true
+    }))
+}
+
 /// On-disk path candidates for a stored (NFC-normalized) DB path, in
 /// resolution order: the stored spelling first, then its NFD (decomposed)
 /// form. The scanner stores paths NFC-normalized for consistent DB lookups,
@@ -10317,10 +10457,89 @@ mod wav_override_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{RADIO_NOT_AUDIO, emit_radio_playback_error, non_audio_content_type};
+    use super::{
+        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        non_audio_content_type,
+    };
     use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // No warning before the grace period, then one warning for a live
+        // session whose HTTP body has never emitted a byte.
+        let (unconsumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            unconsumed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("first arm creates the watchdog");
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!task.is_finished(), "the grace period must be respected");
+        assert!(task.await.expect("watchdog task"));
+        assert!(
+            arm_local_stream_consumer_watch(
+                streamer.clone(),
+                unconsumed,
+                7,
+                "local:test".to_string(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_none(),
+            "the same session must never report twice"
+        );
+
+        // A body that emitted at least one byte is consumed, even if no reader
+        // happens to be active at the exact observation instant.
+        let (consumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        {
+            let sessions = streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard[&consumed]
+                .bytes_sent
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            consumed,
+            7,
+            "local:test".to_string(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("consumed session is armed");
+        assert!(!task.await.expect("watchdog task"));
+
+        // A session removed by a normal stop/error path during the grace
+        // period does not produce this diagnostic either.
+        let (removed, _tx, _ready) = streamer.create_session(info, false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            removed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("live session is armed");
+        streamer.remove_session(&removed).await;
+        assert!(!task.await.expect("watchdog task"));
+    }
 
     /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
     /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
@@ -13737,5 +13956,75 @@ mod annonce_apres_sortie_guard {
             "l'historique de zone navigateur ne consulte plus `record_history` : \
              déplacer le curseur ajouterait une ligne à chaque fois (#1998)."
         );
+    }
+}
+
+#[cfg(test)]
+mod stop_scope_tests {
+    use super::PlaybackOrchestrator;
+
+    /// Le repli de `stop` ne doit JAMAIS toucher l'appareil d'une autre zone.
+    ///
+    /// Le défaut mesuré sur .18 le 28/08/2026 : la zone 15 « Cet ordinateur »
+    /// est une sortie navigateur, donc sans `output_device_id` par
+    /// construction. Chaque `next` dessus tombait dans le repli, qui arrêtait
+    /// TOUTES les sorties enregistrées — l'Eversolo de la zone 10 compris, en
+    /// pleine lecture. Même famille que #2571.
+    #[test]
+    fn le_repli_de_stop_epargne_les_sorties_des_autres_zones() {
+        // Zone 15 : navigateur, aucun appareil. Zones 10 et 8 : renderers.
+        let zones = [
+            (Some(15i64), None),
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 15);
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+            "uuid:orpheline-sans-zone".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+
+        assert!(
+            !a_arreter.contains(&"uuid:eversolo-dmp-a8".to_string()),
+            "un stop sur la zone 15 ne doit pas couper l'Eversolo, qui joue la zone 10"
+        );
+        assert!(
+            !a_arreter.contains(&"uuid:sonos-chambre".to_string()),
+            "ni le Sonos de la zone 8"
+        );
+        assert_eq!(
+            a_arreter,
+            vec!["uuid:orpheline-sans-zone".to_string()],
+            "le repli garde son seul objet légitime : une sortie qu'aucune zone ne revendique"
+        );
+    }
+
+    /// Et la zone qui demande l'arrêt ne s'épargne pas elle-même : si elle a
+    /// laissé une sortie ouverte, le repli doit encore pouvoir la fermer.
+    #[test]
+    fn le_repli_peut_toujours_fermer_la_sortie_de_la_zone_qui_arrete() {
+        let zones = [
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 10);
+        assert!(
+            !revendiquees.contains("uuid:eversolo-dmp-a8"),
+            "son propre appareil n'est pas « revendiqué ailleurs »"
+        );
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+        assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
     }
 }
