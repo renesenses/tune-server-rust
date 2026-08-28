@@ -789,6 +789,20 @@ fn entrer_en_pause<T>(embedder: &mut Option<T>, pause: PauseAcoustique) {
     }
 }
 
+/// Combien de temps dormir à la fin d'un tour de passe.
+///
+/// Une zone qui joue change tout : la passe doit reboucler VITE, non pour
+/// travailler — la garde de lecture l'en empêchera — mais pour ATTEINDRE cette
+/// garde et lui laisser relâcher la session ORT. Dormir `IDLE_SLEEP_SECS` là
+/// revient à porter le modèle un quart d'heure pour rien.
+///
+/// Le repli long garde tout son sens quand rien ne joue : c'est le cas
+/// « passe drainée », et repasser toutes les deux secondes n'y apporterait
+/// que de la charge.
+fn sieste_de_fin_de_tour(une_zone_joue: bool) -> u64 {
+    if une_zone_joue { 2 } else { IDLE_SLEEP_SECS }
+}
+
 /// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
 pub fn pause_acoustique() -> PauseAcoustique {
     match PAUSE_ACOUSTIQUE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1295,7 +1309,24 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+            // Une zone joue à la fin du tour : ne PAS s'endormir un quart
+            // d'heure en gardant la session ORT. Reboucler tout de suite, pour
+            // que la garde de lecture — en haut de cette boucle — la relâche.
+            //
+            // Sans ça, l'interruption d'un lot par la lecture coûtait
+            // IDLE_SLEEP_SECS de rétention. Mesuré sur .18 le 28/08/2026 :
+            // lecture lancée à 11:25:30, session enfin rendue à 11:40:15, soit
+            // 14 min 45 s à porter le modèle pour rien. Le lot avait pourtant
+            // rendu `embedded=0` deux secondes après le début de la lecture —
+            // le repli « rien à faire, dors longtemps » confondait « passe
+            // drainée » et « passe interrompue ».
+            //
+            // Reboucler ne fait pas tourner la boucle à vide : la garde de
+            // lecture, juste après, dort `PLAYBACK_BACKOFF_SECS`. La cadence
+            // pendant l'écoute reste donc celle déjà prévue pour ce cas.
+            let sieste =
+                sieste_de_fin_de_tour(crate::audio::replaygain::any_zone_playing(&backend));
+            tokio::time::sleep(std::time::Duration::from_secs(sieste)).await;
         }
     });
 }
@@ -1802,6 +1833,36 @@ mod tests {
     /// Aucun test fonctionnel ne peut garder ce contrat : il faudrait une zone
     /// qui joue, un réseau, et 287 Mo à télécharger en CI. On lit donc la
     /// source, sur le modèle d'`output_provider_seam.rs`.
+    /// Une zone qui joue doit écourter la sieste de fin de tour.
+    ///
+    /// Sinon l'interruption d'un lot par la lecture coûte `IDLE_SLEEP_SECS` de
+    /// rétention de la session ORT. Mesuré sur .18 le 28/08/2026 : lecture
+    /// lancée à 11:25:30, session rendue à 11:40:15 — 14 min 45 s à porter le
+    /// modèle pour rien, parce que le repli long confondait « passe drainée »
+    /// et « passe interrompue ».
+    #[test]
+    fn une_zone_qui_joue_ecourte_la_sieste_de_fin_de_tour() {
+        let en_lecture = sieste_de_fin_de_tour(true);
+        let au_repos = sieste_de_fin_de_tour(false);
+
+        assert_eq!(
+            au_repos, IDLE_SLEEP_SECS,
+            "au repos, la sieste longue garde tout son sens : repasser sans \
+             cesse sur une passe drainée n'apporterait que de la charge"
+        );
+        assert!(
+            en_lecture < au_repos,
+            "pendant la lecture, la passe doit reboucler vite pour ATTEINDRE la \
+             garde de lecture, seule habilitée à relâcher la session ORT — \
+             dormir aussi longtemps qu'au repos, c'est porter le modèle pour rien"
+        );
+        assert!(
+            en_lecture <= 5,
+            "« vite » veut dire quelques secondes : {en_lecture} s laisse encore \
+             la session sur les bras."
+        );
+    }
+
     #[test]
     fn le_telechargement_du_modele_precede_la_cession_a_la_lecture() {
         let source = include_str!("embedding.rs");
