@@ -1074,6 +1074,29 @@ fn spawn_heartbeat(state: &AppState) {
             // with the authoritative tier / expiry.
             let ls = license.license_state().await;
 
+            // Grâce hors ligne (#1999) : tracer AVANT la coupure, pas après.
+            // La dégradation ne se signalait que par un `warn!` au quatorzième
+            // jour ; ici on écrit une ligne par heure dès que la revalidation
+            // date de plus de deux jours, avec le compte à rebours. Jamais la
+            // clé ni un identifiant d'achat — que des dates et des compteurs.
+            if let Some(g) = tune_core::license::offline_grace(&ls) {
+                match g.phase {
+                    tune_core::license::GracePhase::Grace => info!(
+                        source = ?g.source,
+                        days_since_validation = g.days_since_validation,
+                        days_remaining = g.days_remaining,
+                        total_days = g.total_days,
+                        "license_offline_grace_active (premium intact)"
+                    ),
+                    tune_core::license::GracePhase::Expired => info!(
+                        source = ?g.source,
+                        total_days = g.total_days,
+                        "license_offline_grace_lapsed (premium suspended until next successful validation)"
+                    ),
+                    tune_core::license::GracePhase::Ok => {}
+                }
+            }
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
