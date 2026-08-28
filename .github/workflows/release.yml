@@ -360,18 +360,31 @@ jobs:
           # path already signed the same binary; only the tarball was left out.
           if [ "$RUNNER_OS" = "macOS" ] && [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
-            codesign --force --options runtime --timestamp \
-              --identifier fr.mozaiklabs.tune-server \
-              --sign "$IDENTITY" package/tune-server
+            # `--timestamp` joint le serveur d'horodatage d'Apple. Quand il ne
+            # repond pas, codesign rend 0 mais SANS horodatage, et le
+            # `--verify --strict` qui suit rejette la signature avec
+            # « A timestamp was expected but was not found ». C'est arrive sur
+            # la v0.9.119 (x86_64-apple-darwin) : panne d'Apple, rien de local.
+            # On reessaie donc, au lieu de perdre le train sur un aleas reseau.
+            sign_horodate() {
+              local cible="$1" identifiant="$2" i
+              for i in 1 2 3 4 5; do
+                if codesign --force --options runtime --timestamp \
+                     --identifier "$identifiant" --sign "$IDENTITY" "$cible"; then
+                  return 0
+                fi
+                echo "::warning::codesign --timestamp a echoue sur $cible (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
+                sleep $((i * 15))
+              done
+              echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
+              return 1
+            }
+            sign_horodate package/tune-server fr.mozaiklabs.tune-server
             if [ -n "$DAEMON" ]; then
-              codesign --force --options runtime --timestamp \
-                --identifier fr.mozaiklabs.airplay-daemon \
-                --sign "$IDENTITY" "package/$DAEMON"
+              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon
             fi
             if [ -f package/ffmpeg ]; then
-              codesign --force --options runtime --timestamp \
-                --identifier fr.mozaiklabs.ffmpeg \
-                --sign "$IDENTITY" package/ffmpeg
+              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg
             fi
             codesign --verify --strict --verbose=2 package/tune-server
           elif [ "$RUNNER_OS" = "macOS" ]; then
@@ -703,11 +716,36 @@ jobs:
           cp -R "$APP" "$DMG_DIR/"
           ln -s /Applications "$DMG_DIR/Applications"
           sync
+          # `hdiutil create` ecrit une image temporaire non compressee AVANT de
+          # la compresser : il lui faut plusieurs fois la taille du bundle en
+          # espace libre. Sur la v0.9.119 (aarch64-apple-darwin) les trois
+          # tentatives sont tombees sur « No space left on device » — le runner
+          # GitHub arrive deja bien rempli. On rend donc l'espace occupe par des
+          # runtimes de simulateur dont ce workflow ne se sert jamais.
+          echo "Espace disque avant liberation :"
+          df -h /
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches || true
+          sudo rm -rf ~/Library/Developer/Xcode/iOS\ DeviceSupport || true
+          echo "Espace disque apres liberation :"
+          df -h /
+          dmg_cree=""
           for i in 1 2 3; do
             sleep 10
-            hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_NAME" && break
-            echo "hdiutil attempt $i failed, retrying..."
+            if hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_NAME"; then
+              dmg_cree="oui"
+              break
+            fi
+            echo "::warning::hdiutil create a echoue (essai $i/3)"
+            df -h /
           done
+          # Sans ce garde, l'echec ne se voyait qu'une etape plus loin, sur un
+          # `codesign` portant un fichier inexistant — un message qui ne parle
+          # pas de la vraie cause.
+          if [ -z "$dmg_cree" ]; then
+            echo "::error::hdiutil create a echoue 3 fois — DMG non produit (voir l'espace disque ci-dessus)"
+            exit 1
+          fi
           if [ -n "$APPLE_TEAM_ID" ]; then
             codesign --force --sign "$IDENTITY" "$DMG_NAME"
           fi
