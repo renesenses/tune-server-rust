@@ -1423,6 +1423,50 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started
 CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
 ",
     },
+    Migration {
+        // Numéro pris sur la tête courante : 88 appartient déjà à task_runs.
+        version: 89,
+        name: "replaygain_true_peak_bs1770_5",
+        // #2713 : `rg_track_peak` calculé par Tune était un simple maximum des
+        // échantillons et était clampé à 1.0. La mesure BS.1770-5 reconstruit
+        // désormais le signal à >= 192 kHz et conserve les overs.
+        //
+        // `rg_analyzed` n'est PAS employé ici comme preuve qu'une piste a été
+        // traitée : #1865 a précisément séparé un ENOENT reporté d'un essai
+        // terminal. Il sert uniquement de provenance LEGACY, conjointement à
+        // la présence d'un résultat ReplayGain, faute de marqueur de version
+        // dans les anciennes bases. Les tags de fichier n'ont jamais reçu ce
+        // témoin et sont donc préservés.
+        //
+        // Les valeurs d'album ne sont retirées que sur les pistes calculées
+        // par Tune. Les valeurs présentes sur une piste taguée restent
+        // autoritatives. `analyze_album_batch` attend ensuite que chaque piste
+        // soit résolue et ne remplit que les champs absents : aucun album
+        // partiel, aucun écrasement de tag.
+        up: "
+CREATE TEMP TABLE IF NOT EXISTS tune_true_peak_reanalysis (
+    track_id INTEGER PRIMARY KEY
+);
+DELETE FROM tune_true_peak_reanalysis;
+INSERT OR IGNORE INTO tune_true_peak_reanalysis (track_id)
+SELECT DISTINCT a.track_id
+FROM track_metadata a
+WHERE a.key = 'rg_analyzed'
+  AND EXISTS (
+      SELECT 1 FROM track_metadata value
+      WHERE value.track_id = a.track_id
+        AND value.key IN ('rg_track_gain', 'rg_track_peak')
+  );
+
+DELETE FROM track_metadata
+WHERE track_id IN (SELECT track_id FROM tune_true_peak_reanalysis)
+  AND key IN ('rg_analyzed', 'rg_track_gain', 'rg_track_peak',
+              'rg_album_gain', 'rg_album_peak',
+              'rg_track_analysis_version', 'rg_album_analysis_version');
+
+DROP TABLE tune_true_peak_reanalysis;
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2905,6 +2949,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "task_runs",
         include_str!("../../migrations/postgres/040_task_runs.sql"),
     ),
+    // Jumelle de la migration SQLite 89. Le numéro 40 appartient déjà au
+    // registre task_runs ; 41 est donc le suivant immédiat sur cette tête.
+    (
+        41,
+        "replaygain_true_peak_bs1770_5",
+        include_str!("../../migrations/postgres/041_replaygain_true_peak_bs1770_5.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4201,6 +4252,99 @@ mod tests {
         assert_eq!(porte("audio_embed_analyzed"), vec![2, 3]);
     }
 
+    /// #2713 — invalider uniquement les valeurs calculées par Tune. Le mode
+    /// doit être explicitement armé dans la fixture (#2678), et un report
+    /// ENOENT ne doit jamais être confondu avec un résultat (#1865/#2663).
+    #[test]
+    fn la_migration_89_invalide_les_sample_peaks_tune_sans_toucher_aux_tags() {
+        use crate::db::settings_repo::SettingsRepo;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use std::sync::Arc;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let sql = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 89)
+            .expect("migration true-peak absente")
+            .up;
+
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path)
+                 VALUES (1, 'Calculee', 1, 1, '/calculee.flac'),
+                        (2, 'Taguee', 1, 1, '/taguee.flac'),
+                        (3, 'Reportee', 1, 1, '/absente.flac');",
+        )
+        .unwrap();
+        let backend: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db.clone());
+        SettingsRepo::with_backend(backend.clone())
+            .set("replaygain_mode", "album")
+            .unwrap();
+        let metadata = TrackMetadataRepo::with_backend(backend.clone());
+
+        for (key, value) in [
+            ("rg_analyzed", "1700000000"),
+            ("rg_track_gain", "-6.00 dB"),
+            ("rg_track_peak", "0.990000"),
+            ("rg_album_gain", "-5.00 dB"),
+            ("rg_album_peak", "0.995000"),
+        ] {
+            metadata.set(1, key, value).unwrap();
+        }
+        metadata
+            .set(1, "rg_path_unresolved", "00000000001700000000")
+            .unwrap();
+
+        // Valeurs venues du fichier : même noms de clés, mais aucune
+        // provenance Tune. Elles doivent survivre octet pour octet.
+        for (key, value) in [
+            ("rg_track_gain", "-4.25 dB"),
+            ("rg_track_peak", "1.012345"),
+            ("rg_album_gain", "-4.75 dB"),
+            ("rg_album_peak", "1.023456"),
+        ] {
+            metadata.set(2, key, value).unwrap();
+        }
+
+        // Fichier absent : #2663 pose un report, jamais rg_analyzed. La
+        // migration ne doit ni le déclarer traité ni effacer son report.
+        metadata
+            .set(3, "rg_path_unresolved", "00000000001700000001")
+            .unwrap();
+
+        db.execute_batch(sql).unwrap();
+
+        let computed = metadata.get_all(1).unwrap();
+        assert_eq!(computed.len(), 1, "restes inattendus : {computed:?}");
+        assert!(computed.contains_key("rg_path_unresolved"));
+
+        let tagged = metadata.get_all(2).unwrap();
+        assert_eq!(tagged["rg_track_gain"], "-4.25 dB");
+        assert_eq!(tagged["rg_track_peak"], "1.012345");
+        assert_eq!(tagged["rg_album_gain"], "-4.75 dB");
+        assert_eq!(tagged["rg_album_peak"], "1.023456");
+
+        let deferred = metadata.get_all(3).unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert!(deferred.contains_key("rg_path_unresolved"));
+        assert_eq!(
+            SettingsRepo::with_backend(backend)
+                .get("replaygain_mode")
+                .unwrap()
+                .as_deref(),
+            Some("album")
+        );
+
+        // DELETE + table temporaire vidée : un rejeu ne mord pas plus loin.
+        db.execute_batch(sql).unwrap();
+        assert_eq!(metadata.get_all(1).unwrap(), computed);
+        assert_eq!(metadata.get_all(2).unwrap(), tagged);
+        assert_eq!(metadata.get_all(3).unwrap(), deferred);
+    }
+
     // The PG numeric-type heal chain (#1220): the migration list must stay
     // contiguous and 1-based so run_pg_migrations applies every step, and the
     // numeric-column-type heal migrations (010/011/013/036) must all be present — a
@@ -4223,7 +4367,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 40, "latest PG migration must be 40");
+        assert_eq!(pg_latest_version(), 41, "latest PG migration must be 41");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
