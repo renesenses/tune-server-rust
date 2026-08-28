@@ -124,6 +124,30 @@ async fn get_json(app: &axum::Router, chemin: &str) -> Result<Value, String> {
     })
 }
 
+async fn post_json(app: &axum::Router, chemin: &str) -> Result<Value, String> {
+    let reponse = app
+        .clone()
+        .oneshot(Request::post(chemin).body(Body::empty()).unwrap())
+        .await
+        .map_err(|erreur| format!("{chemin}: routeur en echec: {erreur}"))?;
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .map_err(|erreur| format!("{chemin}: corps illisible: {erreur}"))?;
+    if statut != StatusCode::OK {
+        return Err(format!(
+            "{chemin}: statut {statut}, corps {}",
+            String::from_utf8_lossy(&octets)
+        ));
+    }
+    serde_json::from_slice(&octets).map_err(|erreur| {
+        format!(
+            "{chemin}: JSON invalide ({erreur}), corps {}",
+            String::from_utf8_lossy(&octets)
+        )
+    })
+}
+
 /// Routes sans secret, matériel ni service tiers. La vague commence par les
 /// écrans les plus centraux (accueil, bibliothèque, diagnostics et réglages).
 const VAGUE_INITIALE: &[(&str, &str)] = &[
@@ -152,15 +176,41 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
         "/library/stats/completeness",
         "/api/v1/library/stats/completeness",
     ),
+    (
+        "/library/artwork/enrich-artists/status",
+        "/api/v1/library/artwork/enrich-artists/status",
+    ),
+    (
+        "/library/enrich-all/status",
+        "/api/v1/library/enrich-all/status",
+    ),
     ("/offline/status", "/api/v1/offline/status"),
     ("/onboarding/status", "/api/v1/onboarding/status"),
+    ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
+    (
+        "/streaming/youtube/auth/status",
+        "/api/v1/streaming/youtube/auth/status",
+    ),
+    (
+        "/system/admin/connections",
+        "/api/v1/system/admin/connections",
+    ),
+    ("/system/admin/discovery", "/api/v1/system/admin/discovery"),
+    ("/system/admin/health", "/api/v1/system/admin/health"),
+    (
+        "/system/background-tasks",
+        "/api/v1/system/background-tasks",
+    ),
+    ("/system/diagnostics", "/api/v1/system/diagnostics"),
+    ("/system/health/monitor", "/api/v1/system/health/monitor"),
     ("/system/scan/schedule", "/api/v1/system/scan/schedule"),
     ("/system/scan/status", "/api/v1/system/scan/status"),
     ("/system/stats", "/api/v1/system/stats"),
+    ("/system/youtube/status", "/api/v1/system/youtube/status"),
 ];
 
 #[tokio::test]
-async fn dix_huit_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
+async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
@@ -185,6 +235,20 @@ async fn dix_huit_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn desactiver_spotify_connect_rend_le_statut_complet_annonce_au_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+    let payload = post_json(&app, "/api/v1/spotify-connect/disable")
+        .await
+        .expect("reponse disable Spotify Connect");
+
+    respecte_tous_les_contrats(&carte, "POST", "/spotify-connect/disable", &payload)
+        .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
 }
 
 #[test]

@@ -39,7 +39,13 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
     settings
         .set(
             "enrich_all_status",
-            &json!({"status": "running", "task_id": task_id, "enriched": 0}).to_string(),
+            &json!({
+                "status": "running",
+                "task_id": task_id,
+                "enriched": 0,
+                "total": 0,
+            })
+            .to_string(),
         )
         .ok();
 
@@ -370,7 +376,10 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(json!({"status": "idle"}));
+        // The web contract renders these counters in every state. Returning
+        // only `status` while idle made the typed response false and forced
+        // callers to paper over missing fields (#1897).
+        .unwrap_or(json!({"status": "idle", "enriched": 0, "total": 0}));
     Json(result)
 }
 
