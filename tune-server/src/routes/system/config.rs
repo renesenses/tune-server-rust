@@ -36,9 +36,23 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
     let tracks = tracks_result.unwrap_or(0);
     let albums = albums_result.unwrap_or(0);
 
+    // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
+    // latérale fait déjà pour afficher « v0.9.117 » : la plainte d'origine est
+    // qu'elle annonce une version sans dire de quelle machine elle parle. Les
+    // séparer imposerait un second appel — et laisserait l'étiquette absente
+    // tant qu'il n'a pas répondu.
+    let server_name = resolve_server_name(
+        SettingsRepo::with_backend(state.backend.clone())
+            .get("server_name")
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+
     Json(json!({
         "status": "ok",
         "version": tune_core::version(),
+        "server_name": server_name,
         "uptime_seconds": uptime_secs,
         "db": db_status,
         "tracks": tracks,
@@ -192,6 +206,17 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     // Adresses d'accès depuis un autre appareil (Android ne résout pas .local :
     // l'IP est la seule voie universelle — harmonique131, forum-hifi p.25).
     config.insert("server_urls".to_string(), json!(server_urls(state.port)));
+    // Nom de CETTE machine, affiché en permanence par l'interface (#2110).
+    // Deux serveurs Tune sur un même réseau donnaient deux interfaces
+    // identiques : Philippe et Alain ont conclu à une mise à jour ratée alors
+    // qu'ils regardaient deux machines. Toujours présent, jamais vide — le
+    // client peut l'afficher sans garde-fou.
+    config.insert(
+        "server_name".to_string(),
+        json!(resolve_server_name(
+            config.get("server_name").and_then(|v| v.as_str())
+        )),
+    );
     // Premium licensing info
     let license_state = state.license.license_state().await;
     let premium_tier = license_state.tier;
@@ -335,6 +360,53 @@ pub(super) async fn update_config(
         }
     }
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+#[cfg(test)]
+mod nom_du_serveur_tests {
+    use super::resolve_server_name;
+
+    /// Le réglage prime, espaces compris : c'est le nom que l'utilisateur lit.
+    #[test]
+    fn le_reglage_prime_sur_le_nom_d_hote() {
+        assert_eq!(resolve_server_name(Some("Salon")), "Salon");
+        assert_eq!(resolve_server_name(Some("  Salon  ")), "Salon");
+    }
+
+    /// Absent OU vide ⇒ nom d'hôte réel. Le cas « vide » compte : le vidage du
+    /// champ dans l'interface écrit une chaîne vide dans `settings`, il ne
+    /// supprime pas la clé. Sans ce filtre, l'étiquette s'afficherait vide.
+    #[test]
+    fn le_defaut_est_le_nom_d_hote_du_systeme() {
+        let attendu = tune_core::discovery::system_hostname();
+        assert!(
+            !attendu.is_empty(),
+            "system_hostname() ne doit jamais rendre une chaîne vide : \
+             c'est le défaut sur lequel l'étiquette s'appuie"
+        );
+        assert_eq!(resolve_server_name(None), attendu);
+        assert_eq!(resolve_server_name(Some("")), attendu);
+        assert_eq!(resolve_server_name(Some("   ")), attendu);
+    }
+
+    /// Contre-épreuve du défaut : le nom d'hôte doit distinguer deux machines,
+    /// donc ne jamais être un identifiant technique ni une constante partagée.
+    #[test]
+    fn le_defaut_n_est_ni_un_uuid_ni_une_constante_de_marque() {
+        let defaut = resolve_server_name(None);
+        assert_ne!(
+            defaut, "Tune Server",
+            "« Tune Server » est le nom UPnP, identique sur les deux machines : \
+             il ne désambiguïse rien"
+        );
+        assert_ne!(defaut, "Local", "« Local » ne nomme aucune machine");
+        let ressemble_a_un_uuid =
+            defaut.len() == 36 && defaut.chars().filter(|c| *c == '-').count() == 4;
+        assert!(
+            !ressemble_a_un_uuid,
+            "le défaut ne doit pas être un UUID : l'humain doit pouvoir le lire"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1138,6 +1210,28 @@ pub(super) async fn set_license(
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
     state.license.clear_license().await;
     Json(json!({ "status": "ok", "tier": "free" }))
+}
+
+/// Nom convivial de CETTE machine — la réponse à « à quel serveur je parle ? ».
+///
+/// Le réglage `server_name` prime ; à défaut, le nom d'hôte réel du système.
+/// On passe par `tune_core::discovery::system_hostname()`, et non par le
+/// `hostname` du sous-processus qu'utilise `server_urls` ci-dessous : ce
+/// dernier rend une chaîne vide quand le binaire manque (conteneurs minimaux),
+/// alors que `system_hostname()` interroge `gethostname(2)` et ne rend jamais
+/// vide. Le défaut doit exister partout, sinon l'étiquette disparaît là où
+/// elle sert le plus. C'est aussi la dérivation qui a réparé #1127, où la
+/// version « variables d'environnement seules » retombait sur `tune-server`
+/// sous systemd et faisait porter le même nom à tous les serveurs du réseau.
+///
+/// Jamais l'`instance_id` : c'est un UUID de 36 caractères, à usage cloud, créé
+/// dix secondes après le démarrage par la tâche de heartbeat — illisible, et
+/// absent pendant les premières secondes de vie du serveur.
+pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
+    match configured.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => name.to_string(),
+        None => tune_core::discovery::system_hostname(),
+    }
 }
 
 /// URLs d'accès au serveur depuis un autre appareil du réseau.

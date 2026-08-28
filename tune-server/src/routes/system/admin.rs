@@ -242,13 +242,6 @@ fn save_peers(state: &AppState, peers: &[PeerAddr]) {
     }
 }
 
-fn local_hostname() -> String {
-    // Real OS hostname (shared helper) — the old env-only derivation collapsed
-    // to "tune-server" under systemd, so every peer advertised the same name and
-    // the "Tune servers on the network" list looked empty/duplicated (#1127).
-    tune_core::discovery::system_hostname()
-}
-
 fn zone_count(state: &AppState) -> i64 {
     state
         .backend
@@ -265,8 +258,18 @@ pub(super) async fn peer_info(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
+    // Le nom choisi par l'utilisateur prime sur le nom d'hôte (#2110) : celui
+    // qu'il lit dans son interface est aussi celui que ses autres serveurs
+    // liront de lui.
+    let nom = crate::routes::system::resolve_server_name(
+        SettingsRepo::with_backend(state.backend.clone())
+            .get("server_name")
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
     Json(json!({
-        "name": format!("Tune ({})", local_hostname()),
+        "name": format!("Tune ({nom})"),
         "version": tune_core::version(),
         "tracks": tracks,
         "zones": zone_count(&state),

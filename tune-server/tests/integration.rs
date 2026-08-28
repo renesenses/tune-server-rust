@@ -811,6 +811,109 @@ async fn playback_manager_state_transitions() {
     assert_eq!(zs.state, tune_core::playback::PlayState::Stopped);
 }
 
+// ── Identité de la machine (#2110) ────────────────────────────────
+// Deux serveurs Tune, deux interfaces identiques : Philippe et Alain ont
+// conclu à une mise à jour ratée en regardant deux machines différentes.
+// L'interface a besoin d'un nom lisible, TOUJOURS présent dans
+// /system/config, sinon elle n'a rien à afficher.
+
+#[tokio::test]
+async fn la_configuration_nomme_toujours_la_machine() {
+    let app = make_app();
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+
+    let nom = config
+        .get("server_name")
+        .and_then(|v| v.as_str())
+        .expect("/system/config doit porter `server_name` : sans lui l'interface ne peut pas dire à quelle machine elle parle");
+
+    assert!(
+        !nom.trim().is_empty(),
+        "`server_name` vide : l'étiquette s'afficherait vide"
+    );
+    // Lisible par un humain — pas l'`instance_id`, UUID de 36 caractères.
+    let ressemble_a_un_uuid = nom.len() == 36 && nom.chars().filter(|c| *c == '-').count() == 4;
+    assert!(
+        !ressemble_a_un_uuid,
+        "`server_name` ne doit pas être un identifiant technique : {nom}"
+    );
+
+    // La barre latérale lit /system/health pour afficher la version. C'est
+    // exactement l'écran qui annonçait « v0.83 » sans dire quelle machine :
+    // le nom doit voyager dans la même réponse, sinon il manque tant qu'un
+    // second appel n'a pas répondu.
+    let (status, sante) = get(&app, "/api/v1/system/health").await;
+    assert!(status.is_success(), "statut {status}");
+    assert_eq!(
+        sante.get("server_name").and_then(|v| v.as_str()),
+        Some(nom),
+        "/system/health doit nommer la même machine que /system/config"
+    );
+}
+
+#[tokio::test]
+async fn le_nom_de_la_machine_est_reglable_et_relu() {
+    let app = make_app();
+    let (avant, _) = get(&app, "/api/v1/system/config").await;
+    assert!(avant.is_success());
+
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "server_name": "Serveur du salon" }),
+    )
+    .await;
+    assert!(status.is_success(), "écriture refusée : {status}");
+
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config.get("server_name").and_then(|v| v.as_str()),
+        Some("Serveur du salon"),
+        "le nom choisi doit primer sur le nom d'hôte"
+    );
+
+    // Vider le champ ne doit pas produire une étiquette vide : on retombe sur
+    // le nom d'hôte. C'est le geste « je me suis trompé, j'efface ».
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "server_name": "   " }),
+    )
+    .await;
+    assert!(status.is_success());
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    let repli = config
+        .get("server_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !repli.trim().is_empty(),
+        "un nom vidé doit retomber sur le nom d'hôte, pas rester vide"
+    );
+}
+
+#[tokio::test]
+async fn le_nom_annonce_aux_autres_serveurs_suit_le_nom_choisi() {
+    let app = make_app();
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "server_name": "Portable" }),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, info) = get(&app, "/api/v1/system/peer-info").await;
+    assert!(status.is_success(), "statut {status}");
+    let nom = info.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        nom.contains("Portable"),
+        "un serveur nommé « Portable » doit s'annoncer ainsi à ses pairs, \
+         pas sous son nom d'hôte : {nom}"
+    );
+}
+
 // ── API JSON response guard tests ─────────────────────────────────
 // Prevents the bug class where API routes return HTML (web client
 // fallback) instead of JSON.
