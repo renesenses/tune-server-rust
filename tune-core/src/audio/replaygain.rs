@@ -854,6 +854,24 @@ mod tests {
     }
 
     #[test]
+    fn true_peak_above_one_attenuates_even_at_zero_db_gain() {
+        let settings = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        };
+        let factor = gain_factor(
+            TrackGain {
+                gain_db: 0.0,
+                peak: Some(1.1),
+            },
+            settings,
+        );
+        assert!((factor - 1.0 / 1.1).abs() < 1e-12, "{factor}");
+        assert!(factor * 1.1 <= 1.0 + 1e-12);
+    }
+
+    #[test]
     fn apply_gain_halves_16bit_samples() {
         let mut pcm = Vec::new();
         for v in [1000i16, -1000, 32767, -32768] {
