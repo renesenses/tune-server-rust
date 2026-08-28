@@ -232,7 +232,7 @@ pub(crate) fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
 /// signalements ont buté là-dessus (#1464, #1456, #1457), la cause étant une
 /// zone restée à `playing` après un arrêt brutal. Nommer la zone rend la cause
 /// lisible dans le journal, sans lire le code.
-pub(crate) fn playing_zone_name(backend: &Arc<dyn DbBackend>) -> Option<String> {
+pub fn playing_zone_name(backend: &Arc<dyn DbBackend>) -> Option<String> {
     backend
         .query_one(
             "SELECT name FROM zones WHERE last_play_state = 'playing' LIMIT 1",
