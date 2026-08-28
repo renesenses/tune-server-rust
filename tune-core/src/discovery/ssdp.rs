@@ -898,6 +898,16 @@ fn build_renderer_device(
         Some(desc.model_name.clone())
     };
     device.location = Some(location.to_string());
+    // `id` est l'identifiant que l'APPELANT nous impose — pour un re-sondage,
+    // celui qu'il a persisté. Le descripteur, lui, vient d'annoncer le sien :
+    // sans le publier ici, `reregister_known_renderers` comparait `dev.id` à
+    // l'identifiant qu'il venait de passer en argument, une tautologie qui a
+    // rendu sa garde « UUID changed » morte depuis #1126 (#2639).
+    device.stable_id = if desc.udn.is_empty() {
+        None
+    } else {
+        Some(desc.udn.clone())
+    };
 
     device.capabilities.insert(
         "service_urls".into(),
@@ -1925,6 +1935,50 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// L'UDN annonce par le descripteur doit ressortir de `build_renderer_device`.
+    ///
+    /// `id` est l'identifiant que l'APPELANT impose ; pour un re-sondage, celui
+    /// qu'il a persiste. Sans `stable_id`, `reregister_known_renderers`
+    /// comparait `dev.id` a l'argument qu'il venait de passer — une tautologie
+    /// qui a rendu sa garde « UUID changed » morte depuis #1126, et qui
+    /// reecrivait le Marantz 20 ms apres que l'autre magasin l'avait efface
+    /// (#2639).
+    #[test]
+    fn le_descripteur_publie_l_udn_qu_il_annonce_pas_celui_qu_on_lui_impose() {
+        use super::super::xml_parser::ServiceDescription;
+        let desc = DeviceDescription {
+            device_type: "urn:schemas-denon-com:device:AiosDevice:1".to_string(),
+            friendly_name: "Marantz ND8006".to_string(),
+            manufacturer: "Marantz".to_string(),
+            model_name: "ND8006".to_string(),
+            // Ce que l'appareil rend le 28/08 …
+            udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65".to_string(),
+            services: vec![ServiceDescription {
+                service_type: "urn:schemas-upnp-org:service:AVTransport:1".to_string(),
+                control_url: "/ctrl".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // … contre ce que le magasin porte encore.
+        let persiste = "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26";
+        let dev = build_renderer_device(
+            persiste,
+            "http://192.0.2.11:60006/upnp/desc/aios_device/aios_device.xml",
+            // Adresse de documentation (RFC 5737) : jamais dans un cache ARP.
+            "192.0.2.11".to_string(),
+            60006,
+            OutputType::Dlna,
+            &desc,
+        );
+        assert_eq!(dev.id, persiste, "la cle de zone reste celle de l'appelant");
+        assert_eq!(
+            dev.stable_id.as_deref(),
+            Some("uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65"),
+            "sans l'UDN reellement annonce, aucune garde ne peut voir le desaccord"
+        );
     }
 
     #[tokio::test]
