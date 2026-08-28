@@ -260,6 +260,29 @@ pub struct ZoneState {
     /// ne doit pas faire repartir l'ancrage de zéro.
     #[serde(default)]
     pub metadata_changed_at_ms: Option<i64>,
+    /// Instant où Tune a CONSTATÉ que la lecture de cette zone navigateur
+    /// n'était reçue par aucun onglet — pas l'instant présent, celui du
+    /// constat.
+    ///
+    /// `output_reach` ne pouvait dire `browser_unattended` que d'une zone
+    /// en `Playing` : la valeur retombait à `"ok"` dès que la lecture
+    /// cessait, et le bandeau qui porte cette explication disparaissait avec
+    /// elle. Or la lecture cesse précisément à cet instant-là — soit parce
+    /// que l'utilisateur arrête une zone muette, soit parce que le poller
+    /// l'abandonne au MÊME seuil que celui qui déclenche le bandeau
+    /// (`DELAI_SILENCE_ETABLI`, #2630). Le seul message qui explique le
+    /// silence s'effaçait donc au geste qu'il était censé prévenir : Pierre M
+    /// l'a vu passer et l'a rapporté de travers, ce qui a détourné
+    /// l'instruction de #2571 pendant plusieurs échanges (#2588).
+    ///
+    /// Horodater le CONSTAT sépare la durée du défaut de la durée de son
+    /// affichage. Effacé par `play()` : une nouvelle lecture rouvre la
+    /// question, la réponse d'avant ne vaut plus.
+    ///
+    /// `#[serde(skip)]`, comme `last_play_started_at` : après une
+    /// restauration d'état on ne conclut rien.
+    #[serde(skip)]
+    pub browser_unattended_at: Option<Instant>,
 }
 
 /// Vrai quand la nouvelle métadonnée now-playing change d'identité
@@ -326,6 +349,7 @@ impl Default for ZoneState {
             session_context_type: None,
             session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         }
     }
 }
@@ -585,6 +609,10 @@ impl PlaybackManager {
         // Stamp the (re)start instant so the orchestrator can coalesce a
         // redundant controller double-dispatch of this same track (#1271).
         state.last_play_started_at = Some(Instant::now());
+        // Une nouvelle lecture rouvre la question « quelqu'un reçoit-il ce
+        // son ? » : le constat de silence précédent ne décrit plus rien
+        // (#2588).
+        state.browser_unattended_at = None;
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
@@ -685,6 +713,26 @@ impl PlaybackManager {
         if let Some(state) = zones.get_mut(&zone_id) {
             state.last_restart_at = Some(Instant::now());
         }
+    }
+    /// Consigner — ou lever — le constat « aucun onglet ne reçoit le son de
+    /// cette zone ».
+    ///
+    /// `true` horodate le constat À CET INSTANT ; tant qu'il reste vrai, la
+    /// marque est rafraîchie, si bien qu'elle date toujours du DERNIER instant
+    /// où le silence a été observé, et non du premier. `false` la lève : la
+    /// zone est de nouveau reçue, il n'y a plus rien à expliquer.
+    ///
+    /// Deux appelants, une seule chose dite : la vue des zones, qui ne peut
+    /// annoncer `browser_unattended` à un client sans que le serveur en garde
+    /// trace, et le poller, qui abandonne la lecture au même seuil et
+    /// l'arrêterait sinon sans laisser d'explication derrière lui (#2588).
+    pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.browser_unattended_at = unattended.then(Instant::now);
     }
 
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
@@ -974,6 +1022,7 @@ mod tests {
             session_context_type: None,
             session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -1050,6 +1099,36 @@ mod tests {
         assert!(data["metadata_age_ms"].as_i64().unwrap() >= 0);
     }
 
+    /// #2588 — le constat de silence tient à travers l'arrêt, et pas au-delà
+    /// de la lecture suivante.
+    #[tokio::test]
+    async fn le_constat_de_silence_survit_a_larret_et_meurt_a_la_relecture() {
+        let pm = PlaybackManager::new();
+        let np = || NowPlaying {
+            title: "Track".into(),
+            ..Default::default()
+        };
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une lecture qui démarre n'a encore rien à expliquer"
+        );
+        pm.note_browser_unattended(4, true).await;
+        pm.stop(4).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_some(),
+            "l'arrêt ne doit pas emporter l'explication du silence"
+        );
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une nouvelle lecture rouvre la question"
+        );
+        // Et la vue peut lever le constat sans attendre l'échéance.
+        pm.note_browser_unattended(4, true).await;
+        pm.note_browser_unattended(4, false).await;
+        assert!(pm.get_state(4).await.browser_unattended_at.is_none());
+    }
     #[tokio::test]
     async fn set_shuffle_emits_event() {
         let pm = PlaybackManager::new();
