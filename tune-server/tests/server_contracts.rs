@@ -9,6 +9,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "collections_ordre_albums.rs"]
+mod collections_ordre_albums;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]
