@@ -11,7 +11,10 @@ name: Preflight
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
 # - version_bump: tag > Cargo.toml workspace version
 # - no_p0_issues: no blocking P0 issue open; merged fixes awaiting release
-#   verification are reported but do not create a release/closure deadlock
+#   verification (release:verification-pending) are reported but do not create
+#   a release/closure deadlock, and P0 suspended for want of field information
+#   (bloque:terrain) are exempted — LOUDLY: each one is named, with its
+#   number, in the job summary, not only in the log
 # - no_release_todos: no TODO(release) markers in source code (excl. docs/)
 # - cahier_de_recette: a cahier-recette-v{major}.{minor}*.md file exists
 # - cargo_audit: no high-severity CVE in the dependency tree

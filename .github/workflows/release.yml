@@ -935,10 +935,34 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
+  # ─── La porte : rien ne se crée avant le préflight ET les builds ───────
+  #
+  # `needs: build` + `if: always()` faisait tourner ce job MEME quand le
+  # préflight était rouge et que toute la chaîne de construction avait été
+  # sautée : `always()` neutralise le résultat des `needs`. Le job créait
+  # alors un BROUILLON de release, avec un SHA256SUMS vide pour seul actif —
+  # le préflight bloquait la construction, mais la porte de la release restait
+  # grande ouverte derrière lui.
+  #
+  # La condition nomme donc les deux dépendances, explicitement :
+  # - `preflight` : aucune release, même en brouillon, sur un préflight rouge ;
+  # - `build`     : la matrice porte `fail-fast: false`, son résultat n'est
+  #                 `success` que si les six cibles ont abouti. Un demi-jeu
+  #                 d'artefacts ne crée plus de brouillon — `publish` exigeait
+  #                 déjà `needs.build.result == 'success'`, ce brouillon-là
+  #                 n'aurait de toute façon jamais été publié.
+  #
+  # Pas de `always()` ici, à la différence de `publish` : sans fonction d'état
+  # dans la condition, GitHub y ajoute son `success()` implicite, et un run
+  # ANNULÉ ne crée donc rien non plus. Les deux égalités suffiraient à elles
+  # seules ; elles sont écrites en clair pour que la porte se lise sans
+  # connaître cette règle.
   release:
     name: Create Release
-    needs: build
-    if: always()
+    needs: [preflight, build]
+    if: >-
+      needs.preflight.result == 'success'
+      && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
@@ -1055,9 +1079,9 @@ jobs:
 
       # `draft: true` — la release naît INVISIBLE des clients.
       #
-      # Ce job porte `if: always()`, donc il tourne aussi quand des builds ont
-      # échoué : c'est voulu (on veut les artefacts partiels et les journaux),
-      # mais jusqu'ici il publiait ce demi-résultat au monde entier. v0.9.71 :
+      # Ce job a longtemps porté `if: always()` : il tournait aussi quand des
+      # builds avaient échoué, et publiait ce demi-résultat au monde entier
+      # — il ne démarre plus du tout dans ce cas (voir la porte). v0.9.71 :
       # release visible à 19:15 avec 7 assets sur 13, run terminé en échec le
       # lendemain à 07:45 — douze heures pendant lesquelles le client de mise à
       # jour de Jean Valjean a cherché un SHA256SUMS incomplet, et pendant
