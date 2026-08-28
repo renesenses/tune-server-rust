@@ -1534,7 +1534,10 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// n'a pas pu départager :
 ///
 /// - `stream_sessions` : une session est créée par piste et n'est ramassée
-///   qu'au bout de **trente minutes** (`cleanup_stale_sessions`). Chacune tient
+///   qu'après **trente minutes SANS un octet servi** (`cleanup_stale_sessions`).
+///   Le critère était l'âge absolu depuis la création ; il est désormais
+///   l'inactivité, doublée d'un plafond absolu de vingt-quatre heures en
+///   filet (#2536). Chacune tient
 ///   un canal de 128 morceaux. Un compteur qui monte avec la lecture et
 ///   redescend au repos désigne ce cache ; un compteur plat innocente le
 ///   chemin de lecture, et c'est aussi une réponse.
