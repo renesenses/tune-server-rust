@@ -16,6 +16,7 @@ mod genres;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
+mod query_multi;
 mod ratings;
 mod reports;
 mod search;

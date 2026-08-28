@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -41,8 +41,12 @@ pub(super) struct FolderPathQuery {
 pub(super) async fn folder_facet(
     Query(filters): Query<FacetQuery>,
     Query(p): Query<FolderPathQuery>,
+    RawQuery(raw): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // Facettes multi-valeurs (#2168) : elles narrowent aussi les effectifs des
+    // dossiers enfants.
+    let filters = filters.hydrate(raw.as_deref())?;
     let engine = state.backend.engine();
     // Cumulative narrowing by the OTHER facets. exclude="folder" so the caller's
     // own folder selection isn't double-applied — this endpoint scopes by the

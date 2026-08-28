@@ -11,6 +11,8 @@ mod auth_security;
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "facettes_multivaleurs.rs"]
+mod facettes_multivaleurs;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]

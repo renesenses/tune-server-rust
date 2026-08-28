@@ -9,6 +9,10 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
+// Spotify no longer accepts the `localhost` alias. Plain HTTP is allowed only
+// for an explicit loopback IP literal; Tune's default API port is 8888.
+// Remote installations must provide their registered HTTPS URI explicitly.
+const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8888/api/v1/streaming/spotify/callback";
 const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public";
 
 pub struct SpotifyService {
@@ -30,45 +34,54 @@ impl Default for SpotifyService {
     }
 }
 
+fn resolve_redirect_uri(
+    explicit: Option<&str>,
+    tune_env: Option<String>,
+    legacy_env: Option<String>,
+) -> String {
+    explicit
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_owned)
+        .or_else(|| tune_env.filter(|uri| !uri.is_empty()))
+        .or_else(|| legacy_env.filter(|uri| !uri.is_empty()))
+        .unwrap_or_else(|| DEFAULT_REDIRECT_URI.into())
+}
+
 impl SpotifyService {
     pub fn new() -> Self {
+        Self::with_config(None, None)
+    }
+
+    /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
+    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
+        let client_id = client_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                std::env::var("TUNE_SPOTIFY_CLIENT_ID")
+                    .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
+                    .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into())
+            });
+        let redirect_uri = resolve_redirect_uri(
+            redirect_uri,
+            std::env::var("TUNE_SPOTIFY_REDIRECT_URI").ok(),
+            std::env::var("SPOTIFY_REDIRECT_URI").ok(),
+        );
         Self {
             client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            client_id: std::env::var("TUNE_SPOTIFY_CLIENT_ID")
-                .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
-                .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into()),
+            client_id,
             access_token: None,
             refresh_token: None,
             username: None,
             user_id: None,
             code_verifier: None,
-            redirect_uri: std::env::var("TUNE_SPOTIFY_REDIRECT_URI")
-                .or_else(|_| std::env::var("SPOTIFY_REDIRECT_URI"))
-                .unwrap_or_else(|_| {
-                    "http://localhost:8085/api/v1/streaming/spotify/callback".into()
-                }),
+            redirect_uri,
             token_expires: None,
             enabled_override: None,
         }
-    }
-
-    /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
-    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
-        let mut svc = Self::new();
-        if let Some(id) = client_id
-            && !id.is_empty()
-        {
-            svc.client_id = id.to_string();
-        }
-        if let Some(uri) = redirect_uri
-            && !uri.is_empty()
-        {
-            svc.redirect_uri = uri.to_string();
-        }
-        svc
     }
 
     fn generate_pkce() -> (String, String) {
@@ -759,6 +772,53 @@ fn base64url_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn spotify_default_redirect_uses_the_tune_port_and_an_explicit_loopback() {
+        assert_eq!(
+            resolve_redirect_uri(None, None, None),
+            "http://127.0.0.1:8888/api/v1/streaming/spotify/callback"
+        );
+        assert!(!DEFAULT_REDIRECT_URI.contains("localhost"));
+        assert!(!DEFAULT_REDIRECT_URI.contains(":8085/"));
+    }
+
+    #[test]
+    fn spotify_redirect_precedence_is_config_then_tune_env_then_legacy_env() {
+        let tune_env = Some("https://env-tune.example/callback".into());
+        let legacy_env = Some("https://env-legacy.example/callback".into());
+
+        assert_eq!(
+            resolve_redirect_uri(None, tune_env.clone(), legacy_env.clone()),
+            "https://env-tune.example/callback"
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, None, legacy_env.clone()),
+            "https://env-legacy.example/callback"
+        );
+        assert_eq!(
+            resolve_redirect_uri(
+                Some("https://config.example/callback"),
+                tune_env,
+                legacy_env,
+            ),
+            "https://config.example/callback"
+        );
+    }
+
+    #[test]
+    fn spotify_explicit_redirect_is_used_in_the_authorization_url() {
+        let svc = SpotifyService::with_config(
+            Some("client-test"),
+            Some("https://tune.example/api/v1/streaming/spotify/callback"),
+        );
+        let url = svc.auth_url("challenge-test");
+
+        assert!(url.contains("client_id=client-test"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Ftune.example%2Fapi%2Fv1%2Fstreaming%2Fspotify%2Fcallback"
+        ));
+    }
 
     #[test]
     fn map_track_basic() {

@@ -157,6 +157,10 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
     let services = state.services.lock().await;
     let service_count = services.list().len();
     drop(services);
+    let disk_space = tune_core::health_monitor::disk_space_gb(&state.config.db_path);
+    let (disk_free_gb, disk_total_gb) = disk_space
+        .map(|(free, total)| (Some(free), Some(total)))
+        .unwrap_or((None, None));
 
     Json(json!({
         "status": "ok",
@@ -175,6 +179,8 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
         "outputs": output_count,
         "streaming_services": service_count,
         "scan_status": scan_status,
+        "disk_free_gb": disk_free_gb,
+        "disk_total_gb": disk_total_gb,
     }))
 }
 
