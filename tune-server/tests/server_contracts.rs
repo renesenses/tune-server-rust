@@ -25,6 +25,8 @@ mod licence_grace_visible;
 mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
+#[path = "paroles_ecriture_fichiers.rs"]
+mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
 #[path = "rbac.rs"]

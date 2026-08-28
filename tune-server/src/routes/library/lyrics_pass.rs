@@ -29,6 +29,10 @@ use crate::state::AppState;
 /// Identifiant de la tâche au registre `background_tasks`.
 const TASK_ID: &str = "lyrics_fetch";
 
+/// Identifiant de la passe d'écriture. Distinct : les deux peuvent tourner,
+/// et le registre doit pouvoir les nommer séparément.
+const WRITE_TASK_ID: &str = "lyrics_write";
+
 fn coverage_json(c: &lyrics_pass::LyricsCoverage) -> Value {
     let pct = if c.total_tracks > 0 {
         (c.with_lyrics as f64 / c.total_tracks as f64 * 100.0).round()
@@ -67,10 +71,22 @@ pub(super) async fn lyrics_status(State(state): State<AppState>) -> Result<Json<
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
+    let write_result = settings
+        .get(lyrics_pass::SETTING_WRITE_RESULT)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
     Ok(Json(json!({
         "coverage": coverage_json(&coverage),
         "lrclib_enabled": lyrics_pass::lrclib_consent_given(&state.backend),
         "result": result,
+        // L'écriture dans les fichiers : son consentement, sa cible, son
+        // dernier bilan. Une interface doit pouvoir dire « désactivé » sans
+        // avoir à lancer la passe pour l'apprendre.
+        "write_enabled": lyrics_pass::write_consent_given(&state.backend),
+        "write_target": lyrics_pass::WriteTarget::from_settings(&state.backend),
+        "write_result": write_result,
     })))
 }
 
@@ -193,6 +209,96 @@ pub(super) async fn lyrics_fetch(State(state): State<AppState>) -> impl IntoResp
                 "passe de fond démarrée (fichiers .lrc seulement — \
                  lyrics_lrclib_enabled n'est pas activé)"
             },
+        })),
+    )
+}
+
+/// POST /api/v1/library/lyrics/write
+///
+/// Rend aux fichiers de l'utilisateur les paroles que Tune connaît — la
+/// seconde demande de l'issue #2172.
+///
+/// Deux verrous, dans cet ordre :
+///
+/// 1. **Le geste.** Rien ne l'appelle tout seul : ni le démarrage, ni le scan,
+///    ni la passe LRCLIB. Il faut cette requête.
+/// 2. **Le consentement.** `lyrics_write_files_enabled` doit valoir `"true"`.
+///    La garde est dans `tune-core` ([`lyrics_pass::run_write_to_files`] rend
+///    `Refused` sans ouvrir un fichier) ; la route la relit seulement pour
+///    répondre franchement au lieu d'accepter un travail qui n'aura pas lieu.
+///
+/// La cible se règle par `lyrics_write_target` : `"sidecar"` (défaut, un
+/// `.lrc` posé à côté — le fichier audio n'est jamais ouvert) ou `"tag"`
+/// (l'étiquette embarquée).
+///
+/// Réponse immédiate (202) quand le travail part ; 409 quand le consentement
+/// manque. L'avancement se lit sur `GET /library/lyrics/status`.
+pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResponse {
+    let target = lyrics_pass::WriteTarget::from_settings(&state.backend);
+
+    if !lyrics_pass::write_consent_given(&state.backend) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "refused",
+                "reason": "write_disabled",
+                "setting": lyrics_pass::SETTING_WRITE_ENABLED,
+                "message": "l'écriture dans les fichiers n'est pas autorisée \
+                            (lyrics_write_files_enabled)",
+            })),
+        );
+    }
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(
+            lyrics_pass::SETTING_WRITE_RESULT,
+            &json!({"status": "running", "target": target}).to_string(),
+        )
+        .ok();
+
+    let task_guard = state.background_tasks.begin(
+        WRITE_TASK_ID,
+        "Écriture des paroles dans les fichiers…",
+        "enrichment",
+    );
+    let backend = state.backend.clone();
+    let bg_tasks = state.background_tasks.clone();
+
+    tokio::spawn(async move {
+        let _task_guard = task_guard;
+        let db = backend.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            lyrics_pass::run_write_to_files(
+                &db,
+                lyrics_pass::ExportOptions::production(target),
+                |r| {
+                    bg_tasks.update_progress(
+                        WRITE_TASK_ID,
+                        r.written as u64,
+                        r.examined.max(1) as u64,
+                        "Fichiers",
+                    );
+                },
+            )
+        })
+        .await
+        .unwrap_or_default();
+
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+            .set(
+                lyrics_pass::SETTING_WRITE_RESULT,
+                &json!({"status": "done", "write": report}).to_string(),
+            )
+            .ok();
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "target": target,
+            "message": "écriture démarrée",
         })),
     )
 }
