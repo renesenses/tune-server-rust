@@ -787,7 +787,542 @@ pub(super) async fn remove_music_dir(
     settings
         .set("music_dirs", &serde_json::to_string(&dirs)?)
         .ok();
-    Ok(Json(json!({ "dirs": dirs })))
+
+    // Le retrait ne supprime RIEN, et c'est délibéré (voir le module
+    // `purge_hors_perimetre` plus bas). Mais il DIT ce qu'il laisse derrière
+    // lui : sans ce compte, l'écran des réglages n'a aucun moyen de proposer
+    // le nettoyage, et les pistes entrent dans l'angle mort décrit en #2149.
+    let restantes = pistes_sous(&state, &normalized).len() as i64;
+    if restantes > 0 {
+        tracing::info!(
+            dossier = %normalized,
+            pistes = restantes,
+            "music_dir_removed_tracks_left_behind — ces pistes ne sont plus sous aucune racine \
+             configurée. Le scan ne les visitera plus et ne les purgera jamais (HorsPerimetre, \
+             #1943) : seul un appel explicite à /music-dirs/purge-orphans peut les retirer."
+        );
+    }
+    Ok(Json(json!({ "dirs": dirs, "orphan_tracks": restantes })))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Purge des pistes hors périmètre — le geste explicite qui manquait (#2149)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// ## Le défaut
+//
+// `remove_music_dir` retire la racine des réglages et s'arrête là. La purge de
+// fin de scan, elle, classe toute piste qui n'est sous AUCUNE racine
+// configurée en `VerdictPurge::HorsPerimetre` et la CONSERVE — délibérément,
+// c'est le garde-fou de #1943 par lequel 21 277 pistes de Yacine étaient
+// parties. Les deux comportements sont justes ; leur composition ne l'est pas :
+// une racine retirée emmène ses pistes dans un angle mort permanent. Elles ne
+// sont plus visitées, ne peuvent plus être purgées, et restent affichées avec
+// des chemins morts (Rhorn, 0.9.75, bibliothèque migrée d'un NAS à un autre).
+//
+// ## Ce qui n'est PAS fait ici
+//
+// `verdict_purge` n'est pas touché. L'assouplir rouvrirait #1943 : une racine
+// ABSENTE au scan et une racine RETIRÉE par l'utilisateur produisent le même
+// état en base et ne veulent pas dire la même chose. Ce qui manquait n'est pas
+// une permission de plus donnée au scan, c'est un SIGNAL utilisateur.
+//
+// ## Le garde-fou, et pourquoi il est structurel
+//
+// Un dossier peut être momentanément indisponible — montage réseau décroché,
+// disque débranché. Ce cas ne doit JAMAIS coûter une piste. La protection ici
+// n'est pas une heuristique de lisibilité mais une propriété de forme :
+//
+//   **cette route refuse toute cible qui est encore dans le périmètre.**
+//
+// Une racine momentanément illisible est TOUJOURS encore dans `music_dirs` —
+// c'est ce qui la définit : personne ne l'a retirée. Ses pistes sont donc hors
+// d'atteinte de cette route, quel que soit le corps de la requête, et sans que
+// le disque soit consulté une seule fois. Le système de fichiers n'entre pas
+// dans la décision : ni son état, ni sa lisibilité ne peuvent changer ce qui
+// est supprimé. C'est le seul garde-fou qu'un montage qui décroche ne peut pas
+// contourner.
+//
+// Symétriquement, une cible AU-DESSUS d'une racine vivante est refusée :
+// purger `/mnt` alors que `/mnt/nas/Musique` est configuré emporterait des
+// pistes vivantes.
+//
+// ## Et le plafond de #1943 ?
+//
+// Il s'applique, avec confirmation CHIFFRÉE (`confirm_purge=N`), par la
+// fonction de production `purge_refusee` — la même que le scan. Une
+// suppression explicitement demandée reste une suppression irréversible.
+
+/// Pourquoi une purge explicite est refusée.
+///
+/// Chaque variante est un refus **structurel** : il se décide sur la liste des
+/// racines configurées et le chemin demandé, avant toute lecture de la base et
+/// sans jamais toucher au disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusPurge {
+    /// Chemin vide : on ne purge pas « tout ».
+    CibleVide,
+    /// La cible EST une racine configurée, ou vit SOUS une racine configurée.
+    ///
+    /// C'est le garde-fou central. Un montage tombé laisse sa racine dans
+    /// `music_dirs` : ses pistes tombent donc toujours ici, et rien ne part.
+    DansLePerimetre,
+    /// La cible est AU-DESSUS d'une racine configurée : la purger emporterait
+    /// des pistes vivantes.
+    ContientUneRacine,
+}
+
+impl RefusPurge {
+    pub(crate) fn motif(self) -> &'static str {
+        match self {
+            RefusPurge::CibleVide => "cible_vide",
+            RefusPurge::DansLePerimetre => "dans_le_perimetre",
+            RefusPurge::ContientUneRacine => "contient_une_racine",
+        }
+    }
+
+    pub(crate) fn message(self, cible: &str) -> String {
+        match self {
+            RefusPurge::CibleVide => {
+                "Aucun dossier n'a été indiqué. Cette opération retire des pistes \
+                 définitivement : elle exige un chemin précis."
+                    .to_string()
+            }
+            RefusPurge::DansLePerimetre => format!(
+                "{cible} fait encore partie des dossiers de musique. Rien n'a été retiré. \
+                 Un dossier momentanément indisponible — partage réseau décroché, disque \
+                 débranché — est exactement dans ce cas : il reste configuré, et ses pistes \
+                 sont conservées. Retirez d'abord le dossier des réglages si vous voulez \
+                 vraiment vous séparer de son contenu."
+            ),
+            RefusPurge::ContientUneRacine => format!(
+                "{cible} contient un dossier de musique encore configuré. Rien n'a été \
+                 retiré : la purge y emporterait des pistes vivantes. Visez le dossier \
+                 retiré lui-même, pas un de ses parents."
+            ),
+        }
+    }
+}
+
+/// La cible est-elle purgeable, au vu des seules racines configurées ?
+///
+/// `None` = purgeable. Aucune E/S : c'est ce qui rend la protection
+/// insensible à l'état du disque.
+pub(crate) fn refus_de_purge(cible: &str, racines: &[String]) -> Option<RefusPurge> {
+    let cible = cible.trim_end_matches(['/', '\\']);
+    if cible.is_empty() {
+        return Some(RefusPurge::CibleVide);
+    }
+    for r in racines {
+        let r = tune_core::scanner::walker::normalize_path(r);
+        let r = r.trim_end_matches(['/', '\\']);
+        if r.is_empty() {
+            continue;
+        }
+        if super::scan::sous_le_dossier(cible, r) {
+            return Some(RefusPurge::DansLePerimetre);
+        }
+        if super::scan::sous_le_dossier(r, cible) {
+            return Some(RefusPurge::ContientUneRacine);
+        }
+    }
+    None
+}
+
+/// Regrouper des pistes hors périmètre sous le dossier le plus HAUT qui ne
+/// contient QUE des pistes hors périmètre.
+///
+/// Sans ce repli, l'écran listerait un dossier par album. Avec lui, Rhorn voit
+/// « /Volumes/AncienNAS — 4 212 pistes », c'est-à-dire la chose qu'il a
+/// effectivement débranchée.
+///
+/// Le repli s'arrête net dès qu'un dossier porte encore une piste vivante :
+/// une cible remontée trop haut serait de toute façon refusée par
+/// [`refus_de_purge`], mais mieux vaut ne jamais la proposer.
+pub(crate) fn regrouper_hors_perimetre(
+    hors_perimetre: &[&str],
+    vivantes: &[&str],
+) -> Vec<(String, usize)> {
+    use std::collections::{HashMap, HashSet};
+
+    // Tout ancêtre d'une piste vivante est un dossier vivant : on ne remonte
+    // jamais au-delà.
+    let mut vivants: HashSet<&str> = HashSet::new();
+    for p in vivantes {
+        let mut cur = *p;
+        while let Some(parent) = super::scan::dossier_parent(cur) {
+            cur = parent;
+            if !vivants.insert(cur) {
+                break; // déjà marqué : ses ancêtres le sont aussi.
+            }
+        }
+    }
+
+    let mut groupes: HashMap<&str, usize> = HashMap::new();
+    for p in hors_perimetre {
+        let mut plus_haut: Option<&str> = None;
+        let mut cur = *p;
+        while let Some(parent) = super::scan::dossier_parent(cur) {
+            if vivants.contains(parent) {
+                break;
+            }
+            plus_haut = Some(parent);
+            cur = parent;
+        }
+        if let Some(d) = plus_haut {
+            *groupes.entry(d).or_insert(0) += 1;
+        }
+    }
+
+    let mut sortie: Vec<(String, usize)> = groupes
+        .into_iter()
+        .map(|(d, n)| (d.to_string(), n))
+        .collect();
+    sortie.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sortie
+}
+
+/// `(id, file_path)` de toutes les pistes LOCALES.
+fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.first()?.as_i64()?;
+            let p = r.get(1)?.as_string()?;
+            if p.is_empty() { None } else { Some((id, p)) }
+        })
+        .collect()
+}
+
+/// Pistes locales dont le chemin est sous `dossier`.
+///
+/// Le filtrage se fait en Rust, jamais en SQL : un `LIKE` sur un chemin
+/// Windows fait de l'antislash un caractère d'échappement côté PostgreSQL, et
+/// c'est déjà ce qui avait rendu des dossiers vides. `sous_le_dossier`
+/// accepte les deux séparateurs.
+fn pistes_sous(state: &AppState, dossier: &str) -> Vec<i64> {
+    let d = dossier.trim_end_matches(['/', '\\']);
+    if d.is_empty() {
+        return Vec::new();
+    }
+    pistes_locales(state)
+        .into_iter()
+        .filter(|(_, p)| super::scan::sous_le_dossier(p, d))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Compter les lignes d'une table liée qui référencent ces pistes.
+///
+/// Les ids viennent de notre propre base et sont des `i64` : les interpoler
+/// est sûr, et évite un placeholder par piste (SQLite plafonne à 999).
+fn compter_liees(state: &AppState, sql_avant_in: &str, ids: &[i64]) -> i64 {
+    let mut total = 0i64;
+    for lot in ids.chunks(500) {
+        let liste = lot
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{sql_avant_in} ({liste})");
+        if let Ok(Some(row)) = state.backend.query_one(&sql, &[]) {
+            total += row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// Ce que la purge emporterait, et ce qu'elle laisserait.
+///
+/// Rendu AVANT toute suppression, pour que l'écran puisse le montrer. Les
+/// chiffres sont ceux des tables liées telles que le schéma les traite :
+///
+/// - `playlists` : `playlist_tracks` est en `ON DELETE CASCADE` et les clés
+///   étrangères sont ACTIVES sous SQLite (`PRAGMA foreign_keys=ON`,
+///   `db/sqlite.rs`). Les entrées disparaissent des listes de lecture ; les
+///   listes elles-mêmes restent, éventuellement plus courtes. Aucune référence
+///   pendante.
+/// - `queue_items` : même cascade — les pistes quittent les files d'attente.
+/// - `listen_history` : `ON DELETE SET NULL`. **L'historique n'est pas
+///   effacé** : la ligne survit avec son titre et son artiste, et perd son
+///   `track_id`. C'est aussi le filet de secours de la réconciliation des
+///   favoris, qui y relit l'identité d'un item disparu.
+/// - `favorites` : table POLYMORPHE (`item_type`/`item_id`), donc sans clé
+///   étrangère — c'est là que naîtraient les références pendantes. On lance
+///   `FavoritesReconciler::run(false)` après la purge : chaque favori orphelin
+///   est re-rattaché par identité (chemin, puis titre+artiste) à la piste
+///   vivante correspondante — le cas exact de Rhorn, dont la bibliothèque
+///   existe toujours, sous un autre NAS. `false` = `delete_unresolved` :
+///   **aucun favori n'est jamais supprimé par cette route.**
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ImpactPurge {
+    pub tracks: i64,
+    pub playlists: i64,
+    pub playlist_entries: i64,
+    pub favorites: i64,
+    pub history_entries: i64,
+    pub queue_entries: i64,
+}
+
+fn impact(state: &AppState, ids: &[i64]) -> ImpactPurge {
+    if ids.is_empty() {
+        return ImpactPurge::default();
+    }
+    ImpactPurge {
+        tracks: ids.len() as i64,
+        playlists: compter_liees(
+            state,
+            "SELECT COUNT(DISTINCT playlist_id) FROM playlist_tracks WHERE track_id IN",
+            ids,
+        ),
+        playlist_entries: compter_liees(
+            state,
+            "SELECT COUNT(*) FROM playlist_tracks WHERE track_id IN",
+            ids,
+        ),
+        favorites: compter_liees(
+            state,
+            "SELECT COUNT(*) FROM favorites WHERE item_type = 'track' AND item_id IN",
+            ids,
+        ),
+        history_entries: compter_liees(
+            state,
+            "SELECT COUNT(*) FROM listen_history WHERE track_id IN",
+            ids,
+        ),
+        queue_entries: compter_liees(
+            state,
+            "SELECT COUNT(*) FROM queue_items WHERE track_id IN",
+            ids,
+        ),
+    }
+}
+
+fn impact_json(i: &ImpactPurge) -> Value {
+    json!({
+        "tracks": i.tracks,
+        "playlists": i.playlists,
+        "playlist_entries": i.playlist_entries,
+        "favorites": i.favorites,
+        "history_entries": i.history_entries,
+        "queue_entries": i.queue_entries,
+    })
+}
+
+/// `GET /system/music-dirs/orphans` — ce qui traîne hors du périmètre.
+///
+/// Lecture seule. C'est la moitié qui rattrape les dossiers **déjà** retirés :
+/// proposer la purge au moment du retrait ne sert à rien à qui a retiré son
+/// ancien NAS il y a trois versions.
+pub(super) async fn orphan_tracks(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let racines: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .collect();
+    let toutes = pistes_locales(&state);
+
+    // Une liste de racines VIDE ne veut pas dire « tout est orphelin » : elle
+    // veut dire qu'on ne sait rien. Même prudence que `verdict_purge`.
+    if racines.is_empty() {
+        return Json(json!({
+            "groups": [],
+            "total": 0,
+            "note": "Aucun dossier de musique n'est configuré : rien ne peut être déclaré \
+                     hors périmètre.",
+        }));
+    }
+
+    let dans_le_perimetre = |p: &str| racines.iter().any(|r| super::scan::sous_le_dossier(p, r));
+    let hors_refs: Vec<&str> = toutes
+        .iter()
+        .filter(|(_, p)| !dans_le_perimetre(p))
+        .map(|(_, p)| p.as_str())
+        .collect();
+    let vivantes_refs: Vec<&str> = toutes
+        .iter()
+        .filter(|(_, p)| dans_le_perimetre(p))
+        .map(|(_, p)| p.as_str())
+        .collect();
+
+    let groupes = regrouper_hors_perimetre(&hors_refs, &vivantes_refs);
+    let ids: Vec<i64> = toutes
+        .iter()
+        .filter(|(_, p)| !dans_le_perimetre(p))
+        .map(|(id, _)| *id)
+        .collect();
+
+    Json(json!({
+        "groups": groupes
+            .iter()
+            .map(|(d, n)| json!({ "path": d, "tracks": *n as i64 }))
+            .collect::<Vec<_>>(),
+        "total": ids.len() as i64,
+        "impact": impact_json(&impact(&state, &ids)),
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PurgeOrphans {
+    path: String,
+    /// Nombre de pistes que l'utilisateur accepte de perdre.
+    ///
+    /// Un NOMBRE, pas un booléen — même contrat que `?confirm_purge=N` sur
+    /// `/scan` (#1943) : une confirmation périmée ne peut pas autoriser une
+    /// purge plus large que celle qui a été montrée.
+    #[serde(default)]
+    confirm_purge: Option<u64>,
+}
+
+/// `POST /system/music-dirs/purge-orphans` — retirer les pistes d'un dossier
+/// qui n'est plus dans le périmètre.
+///
+/// Sans `confirm_purge`, c'est un **essai à blanc** : rien n'est supprimé, on
+/// rend le plan. C'est la forme que prend la promesse « retirer un dossier
+/// devrait proposer de retirer aussi ce qu'il contenait » : l'écran retire le
+/// dossier, appelle ceci pour obtenir les chiffres, les montre, et ne
+/// rappelle avec `confirm_purge` que si l'utilisateur dit oui.
+pub(super) async fn purge_orphan_tracks(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<PurgeOrphans>,
+) -> Result<impl IntoResponse, AppError> {
+    let cible = tune_core::scanner::walker::normalize_path(&body.path);
+    let racines = super::get_music_dirs_list(&state.backend);
+
+    if let Some(refus) = refus_de_purge(&cible, &racines) {
+        tracing::warn!(
+            cible = %cible,
+            motif = refus.motif(),
+            "purge_orphelines_refusee — aucune piste retirée."
+        );
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "purged": 0,
+                "refused": true,
+                "reason": refus.motif(),
+                "message": refus.message(&cible),
+            })),
+        )
+            .into_response());
+    }
+
+    let ids = pistes_sous(&state, &cible);
+    let plan = impact(&state, &ids);
+    let total_local = pistes_locales(&state).len();
+
+    if ids.is_empty() {
+        return Ok(Json(json!({
+            "purged": 0,
+            "refused": false,
+            "impact": impact_json(&plan),
+            "message": format!("Aucune piste n'est enregistrée sous {cible}."),
+        }))
+        .into_response());
+    }
+
+    // Essai à blanc : pas de confirmation ⇒ pas de suppression.
+    let Some(_) = body.confirm_purge else {
+        return Ok(Json(json!({
+            "purged": 0,
+            "refused": false,
+            "dry_run": true,
+            "confirm_purge_required": plan.tracks,
+            "impact": impact_json(&plan),
+            "message": format!(
+                "{} pistes seraient retirées définitivement. Rappelez cette route avec \
+                 confirm_purge={} pour confirmer.",
+                plan.tracks, plan.tracks
+            ),
+        }))
+        .into_response());
+    };
+
+    // Le plafond de #1943 s'applique à une suppression explicite aussi — par
+    // la fonction de PRODUCTION, pas par une copie.
+    if super::scan::purge_refusee(ids.len(), total_local, body.confirm_purge) {
+        tracing::error!(
+            cible = %cible,
+            candidats = ids.len(),
+            total_local,
+            confirmee = ?body.confirm_purge,
+            "purge_orphelines_refusee_trop_massive — la confirmation ne couvre pas l'ampleur \
+             constatée. Aucune piste retirée."
+        );
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "purged": 0,
+                "refused": true,
+                "reason": "confirmation_insuffisante",
+                "confirm_purge_required": plan.tracks,
+                "impact": impact_json(&plan),
+                "message": format!(
+                    "La confirmation reçue ne couvre pas les {} pistes concernées. Rien n'a \
+                     été retiré. Confirmez ce nombre exact pour poursuivre.",
+                    plan.tracks
+                ),
+            })),
+        )
+            .into_response());
+    }
+
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let mut purgees = 0i64;
+    for id in &ids {
+        if track_repo.delete(*id).is_ok() {
+            purgees += 1;
+        }
+    }
+
+    // Les albums et artistes devenus vides partent avec elles — sans quoi la
+    // bibliothèque garde des albums à zéro piste, ce que #593 avait déjà
+    // montré à l'écran.
+    let albums_orphelins = AlbumRepo::with_backend(state.backend.clone())
+        .delete_orphans()
+        .unwrap_or(0);
+    let artistes_orphelins = ArtistRepo::with_backend(state.backend.clone())
+        .cleanup_orphans()
+        .unwrap_or(0);
+
+    // `favorites` n'a pas de clé étrangère : sans cette réconciliation, les
+    // cœurs pointeraient des ids morts. `false` = ne JAMAIS supprimer un
+    // favori qu'on n'a pas su re-rattacher.
+    let favoris = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
+        state.backend.clone(),
+    )
+    .run(false)
+    .unwrap_or_default();
+
+    tracing::warn!(
+        cible = %cible,
+        purgees,
+        albums_orphelins,
+        artistes_orphelins,
+        favoris_rerattaches = favoris.relinked,
+        favoris_non_resolus = favoris.unresolved,
+        "purge_orphelines_effectuee — suppression explicitement confirmée par l'utilisateur."
+    );
+
+    Ok(Json(json!({
+        "purged": purgees,
+        "refused": false,
+        "orphan_albums_removed": albums_orphelins,
+        "orphan_artists_removed": artistes_orphelins,
+        "favorites_relinked": favoris.relinked,
+        "favorites_unresolved": favoris.unresolved,
+        "impact": impact_json(&plan),
+    }))
+    .into_response())
 }
 
 /// `POST /system/stop` — arrêter le PROCESSUS serveur, sans toucher à la
@@ -1264,4 +1799,486 @@ pub(super) fn server_urls(port: u16) -> Vec<String> {
         urls.push(format!("http://{host}.local:{port}"));
     }
     urls
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #2149 — retirer un dossier des réglages laisse ses pistes en base
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod purge_hors_perimetre_tests {
+    use super::{AddMusicDir, PurgeOrphans, RefusPurge, refus_de_purge, regrouper_hors_perimetre};
+    use crate::auth::RequireAdmin;
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::models::Track;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::track_repo::TrackRepo;
+
+    /// Les chemins de test sont écrits en `/` et passés par `normalize_path`,
+    /// qui les retourne en antislashs sous Windows. Sans quoi ces tests
+    /// seraient verts sur Mac et rouges chez Rhorn.
+    fn n(p: &str) -> String {
+        tune_core::scanner::walker::normalize_path(p)
+    }
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    fn racines(state: &AppState, dirs: &[&str]) {
+        let v: Vec<String> = dirs.iter().map(|d| n(d)).collect();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", &serde_json::to_string(&v).unwrap())
+            .unwrap();
+    }
+
+    fn piste(state: &AppState, chemin: &str) -> i64 {
+        let repo = TrackRepo::with_backend(state.backend.clone());
+        let mut t = Track::new(format!("piste {chemin}"));
+        t.file_path = Some(n(chemin));
+        repo.create(&t).unwrap()
+    }
+
+    fn compte(state: &AppState) -> i64 {
+        state
+            .backend
+            .query_one("SELECT COUNT(*) FROM tracks", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    }
+
+    fn existe(state: &AppState, id: i64) -> bool {
+        state
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM tracks WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+            > 0
+    }
+
+    async fn retirer(state: &AppState, chemin: &str) -> serde_json::Value {
+        super::remove_music_dir(
+            RequireAdmin,
+            State(state.clone()),
+            Json(AddMusicDir {
+                path: chemin.to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("remove_music_dir a échoué"))
+        .0
+    }
+
+    async fn purger(
+        state: &AppState,
+        chemin: &str,
+        confirm: Option<u64>,
+    ) -> (u16, serde_json::Value) {
+        let r = super::purge_orphan_tracks(
+            RequireAdmin,
+            State(state.clone()),
+            Json(PurgeOrphans {
+                path: chemin.to_string(),
+                confirm_purge: confirm,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("purge_orphan_tracks a échoué"))
+        .into_response();
+        let code = r.status().as_u16();
+        let corps = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (code, serde_json::from_slice(&corps).unwrap())
+    }
+
+    // ── Le défaut de Rhorn ──────────────────────────────────────────────
+
+    /// Le cœur de #2149 : un dossier retiré, ses pistes s'en vont — mais
+    /// seulement sur demande explicite et chiffrée.
+    #[tokio::test]
+    async fn un_dossier_retire_puis_purge_perd_ses_pistes() {
+        let state = etat();
+        racines(&state, &["/nas1/Musique", "/nas2/Musique"]);
+        let vieille = piste(&state, "/nas1/Musique/Bach/01.flac");
+        let neuve = piste(&state, "/nas2/Musique/Bach/01.flac");
+
+        let rep = retirer(&state, "/nas1/Musique").await;
+        assert_eq!(
+            rep["orphan_tracks"].as_i64(),
+            Some(1),
+            "le retrait doit DIRE ce qu'il laisse derrière lui : {rep}"
+        );
+        assert!(existe(&state, vieille), "le retrait seul ne supprime rien");
+
+        let (code, rep) = purger(&state, "/nas1/Musique", Some(1)).await;
+        assert_eq!(code, 200, "{rep}");
+        assert_eq!(rep["purged"].as_i64(), Some(1), "{rep}");
+        assert!(!existe(&state, vieille), "la piste du dossier retiré reste");
+        assert!(
+            existe(&state, neuve),
+            "la piste du dossier VIVANT est partie"
+        );
+    }
+
+    /// Sans confirmation, c'est un essai à blanc : les chiffres, rien d'autre.
+    /// C'est ce qui permet à l'écran de « proposer de retirer aussi ce qu'il
+    /// contenait » avant d'agir.
+    #[tokio::test]
+    async fn sans_confirmation_rien_ne_part() {
+        let state = etat();
+        racines(&state, &["/nas1/Musique"]);
+        for i in 0..3 {
+            piste(&state, &format!("/vieux_nas/Musique/{i}.flac"));
+        }
+        piste(&state, "/nas1/Musique/vivante.flac");
+
+        let (code, rep) = purger(&state, "/vieux_nas/Musique", None).await;
+        assert_eq!(code, 200, "{rep}");
+        assert_eq!(rep["dry_run"].as_bool(), Some(true), "{rep}");
+        assert_eq!(rep["purged"].as_i64(), Some(0), "{rep}");
+        assert_eq!(rep["confirm_purge_required"].as_i64(), Some(3), "{rep}");
+        assert_eq!(compte(&state), 4, "un essai à blanc a supprimé des pistes");
+    }
+
+    // ── Le danger : ne pas transformer un oubli en perte de données ─────
+
+    /// **La preuve du garde-fou.** Un dossier momentanément illisible — NAS
+    /// décroché, disque débranché — reste dans `music_dirs` : personne ne l'a
+    /// retiré. Il est donc encore dans le périmètre, et AUCUNE requête, quel
+    /// que soit son contenu, ne peut lui prendre une piste.
+    ///
+    /// Le disque n'est jamais consulté : le chemin de test n'existe même pas
+    /// sur la machine qui exécute ce test, et c'est le point — ni l'état ni la
+    /// lisibilité du support n'entrent dans la décision.
+    #[tokio::test]
+    async fn un_dossier_momentanement_illisible_ne_perd_aucune_piste() {
+        let state = etat();
+        // Le montage est tombé, mais la racine est TOUJOURS configurée.
+        racines(&state, &["/mnt/nas_decroche/Musique"]);
+        let ids: Vec<i64> = (0..5)
+            .map(|i| piste(&state, &format!("/mnt/nas_decroche/Musique/{i}.flac")))
+            .collect();
+        assert!(
+            !std::path::Path::new(&n("/mnt/nas_decroche/Musique")).exists(),
+            "le dossier de test doit être absent du disque, c'est tout l'objet"
+        );
+
+        // Même en confirmant le nombre exact, et même en visant un parent.
+        for (cible, confirm) in [
+            ("/mnt/nas_decroche/Musique", Some(5)),
+            ("/mnt/nas_decroche/Musique", Some(9999)),
+            ("/mnt/nas_decroche/Musique/Bach", Some(5)),
+            ("/mnt/nas_decroche", Some(5)),
+            ("/mnt", Some(5)),
+        ] {
+            let (code, rep) = purger(&state, cible, confirm).await;
+            assert_eq!(code, 409, "cible {cible} n'a pas été refusée : {rep}");
+            assert_eq!(rep["purged"].as_i64(), Some(0), "{rep}");
+            assert_eq!(rep["refused"].as_bool(), Some(true), "{rep}");
+        }
+        assert_eq!(compte(&state), 5, "une piste a été perdue");
+        for id in ids {
+            assert!(existe(&state, id), "la piste {id} a disparu");
+        }
+    }
+
+    /// Le refus est NOMMÉ, et la phrase dit ce qui s'est passé — un montage
+    /// tombé ne doit pas laisser l'utilisateur devant un échec muet.
+    #[test]
+    fn le_refus_est_nomme_et_dit_pourquoi() {
+        let r = refus_de_purge(&n("/mnt/nas/Musique"), &[n("/mnt/nas/Musique")]).unwrap();
+        assert_eq!(r, RefusPurge::DansLePerimetre);
+        let m = r.message(&n("/mnt/nas/Musique")).to_lowercase();
+        assert!(
+            m.contains("réglages") || m.contains("dossiers de musique"),
+            "{m}"
+        );
+        assert!(m.contains("indisponible") || m.contains("décroché"), "{m}");
+
+        assert_eq!(
+            refus_de_purge(&n("/mnt"), &[n("/mnt/nas/Musique")]),
+            Some(RefusPurge::ContientUneRacine),
+            "purger un parent d'une racine vivante doit être refusé"
+        );
+        assert_eq!(
+            refus_de_purge("", &[n("/mnt/nas")]),
+            Some(RefusPurge::CibleVide)
+        );
+        assert_eq!(
+            refus_de_purge(&n("/vieux_nas"), &[n("/mnt/nas/Musique")]),
+            None,
+            "un dossier hors périmètre doit être purgeable"
+        );
+    }
+
+    /// Un préfixe de chaîne n'est pas un dossier : `/nas/Musique2` n'est pas
+    /// sous `/nas/Musique`. Le garde-fou passerait à côté sinon.
+    #[test]
+    fn un_prefixe_de_nom_n_est_pas_un_sous_dossier() {
+        assert_eq!(
+            refus_de_purge(&n("/nas/Musique2"), &[n("/nas/Musique")]),
+            None
+        );
+        assert_eq!(
+            refus_de_purge(&n("/nas/Musique/Jazz"), &[n("/nas/Musique")]),
+            Some(RefusPurge::DansLePerimetre)
+        );
+    }
+
+    /// Le plafond de #1943 s'applique aussi à une suppression explicite : une
+    /// confirmation qui ne couvre pas l'ampleur constatée ne suffit pas.
+    #[tokio::test]
+    async fn le_plafond_1943_s_applique_a_la_suppression_explicite() {
+        let state = etat();
+        racines(&state, &["/nas1/Musique"]);
+        for i in 0..60 {
+            piste(&state, &format!("/nas1/Musique/{i}.flac"));
+        }
+        for i in 0..40 {
+            piste(&state, &format!("/vieux_nas/{i}.flac"));
+        }
+
+        // 40 sur 100 = 40 % > 20 % : confirmation trop courte ⇒ refus.
+        let (code, rep) = purger(&state, "/vieux_nas", Some(10)).await;
+        assert_eq!(code, 409, "{rep}");
+        assert_eq!(rep["reason"].as_str(), Some("confirmation_insuffisante"));
+        assert_eq!(rep["confirm_purge_required"].as_i64(), Some(40), "{rep}");
+        assert_eq!(compte(&state), 100, "des pistes sont parties sur un refus");
+
+        // Le nombre exact lève le plafond.
+        let (code, rep) = purger(&state, "/vieux_nas", Some(40)).await;
+        assert_eq!(code, 200, "{rep}");
+        assert_eq!(rep["purged"].as_i64(), Some(40), "{rep}");
+        assert_eq!(compte(&state), 60);
+    }
+
+    /// Aucune racine configurée = on ne sait rien, pas « tout est orphelin ».
+    /// Même prudence que `verdict_purge`.
+    #[tokio::test]
+    async fn sans_aucune_racine_configuree_rien_n_est_declare_orphelin() {
+        let state = etat();
+        racines(&state, &[]);
+        piste(&state, "/nas1/Musique/a.flac");
+
+        let r = super::orphan_tracks(RequireAdmin, State(state.clone()))
+            .await
+            .0;
+        assert_eq!(r["total"].as_i64(), Some(0), "{r}");
+        assert_eq!(r["groups"].as_array().map(Vec::len), Some(0), "{r}");
+    }
+
+    // ── Les objets liés ─────────────────────────────────────────────────
+
+    /// Une piste dans une liste de lecture : comportement EXPLICITE. L'entrée
+    /// quitte la liste (cascade), la liste survit, les autres entrées restent,
+    /// et l'impact est annoncé AVANT la suppression.
+    #[tokio::test]
+    async fn une_piste_en_liste_de_lecture_quitte_la_liste_sans_la_detruire() {
+        let state = etat();
+        racines(&state, &["/nas1/Musique"]);
+        let vieille = piste(&state, "/vieux_nas/Bach/01.flac");
+        let gardee = piste(&state, "/nas1/Musique/Bach/02.flac");
+        state
+            .backend
+            .execute(
+                "INSERT INTO playlists (id, name) VALUES (1, 'Ma liste')",
+                &[],
+            )
+            .unwrap();
+        for (pos, t) in [(0i64, vieille), (1, gardee)] {
+            state
+                .backend
+                .execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (1, ?, ?)",
+                    &[&t as &dyn ToSqlValue, &pos as &dyn ToSqlValue],
+                )
+                .unwrap();
+        }
+
+        // L'essai à blanc annonce l'impact avant d'agir.
+        let (_, plan) = purger(&state, "/vieux_nas", None).await;
+        assert_eq!(plan["impact"]["playlists"].as_i64(), Some(1), "{plan}");
+        assert_eq!(
+            plan["impact"]["playlist_entries"].as_i64(),
+            Some(1),
+            "{plan}"
+        );
+
+        let (code, rep) = purger(&state, "/vieux_nas", Some(1)).await;
+        assert_eq!(code, 200, "{rep}");
+
+        let restant: Vec<i64> = state
+            .backend
+            .query_many(
+                "SELECT track_id FROM playlist_tracks WHERE playlist_id = 1",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(
+            restant,
+            vec![gardee],
+            "l'entrée de la piste retirée doit partir, l'autre rester — aucune \
+             référence pendante"
+        );
+        let listes: i64 = state
+            .backend
+            .query_one("SELECT COUNT(*) FROM playlists", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap();
+        assert_eq!(listes, 1, "la liste de lecture elle-même a été détruite");
+    }
+
+    /// L'historique d'écoute SURVIT : `ON DELETE SET NULL`. Une piste retirée
+    /// ne réécrit pas le passé de l'utilisateur.
+    #[tokio::test]
+    async fn l_historique_d_ecoute_survit_a_la_purge() {
+        let state = etat();
+        racines(&state, &["/nas1/Musique"]);
+        let vieille = piste(&state, "/vieux_nas/Bach/01.flac");
+        piste(&state, "/nas1/Musique/vivante.flac");
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (track_id, title, artist_name, listened_at) \
+                 VALUES (?, 'Toccata', 'Bach', '2026-08-01T10:00:00Z')",
+                &[&vieille as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        let (code, rep) = purger(&state, "/vieux_nas", Some(1)).await;
+        assert_eq!(code, 200, "{rep}");
+
+        let rows = state
+            .backend
+            .query_many("SELECT track_id, title FROM listen_history", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "la ligne d'historique a été effacée");
+        assert!(
+            rows[0].first().and_then(|v| v.as_i64()).is_none(),
+            "track_id devait passer à NULL"
+        );
+        assert_eq!(
+            rows[0].get(1).and_then(|v| v.as_string()).as_deref(),
+            Some("Toccata"),
+            "le titre écouté doit rester lisible"
+        );
+    }
+
+    /// Un favori de piste n'est JAMAIS supprimé par cette route. Chez Rhorn,
+    /// la même musique existe sous le nouveau NAS : le favori s'y re-rattache.
+    #[tokio::test]
+    async fn un_favori_est_rerattache_jamais_supprime() {
+        let state = etat();
+        racines(&state, &["/nas2/Musique"]);
+        state
+            .backend
+            .execute("INSERT INTO artists (name) VALUES ('Bach')", &[])
+            .unwrap();
+        let bach: i64 = state
+            .backend
+            .query_one("SELECT id FROM artists WHERE name = 'Bach'", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap();
+        let repo = TrackRepo::with_backend(state.backend.clone());
+        let toccata = |chemin: &str| {
+            let mut t = Track::new("Toccata".into());
+            t.file_path = Some(n(chemin));
+            t.artist_id = Some(bach);
+            t.artist_name = Some("Bach".into());
+            repo.create(&t).unwrap()
+        };
+        // La même musique, sous l'ancien NAS et sous le nouveau — le cas exact
+        // de Rhorn, qui a migré sa bibliothèque d'un support à l'autre.
+        let ancienne = toccata("/vieux_nas/Bach/Toccata.flac");
+        let nouvelle = toccata("/nas2/Musique/Bach/Toccata.flac");
+
+        // Le favori pointe l'ANCIENNE piste, avec son instantané d'identité.
+        state
+            .backend
+            .execute(
+                "INSERT INTO favorites (profile_id, item_type, item_id, item_name, item_artist, \
+                 item_path) VALUES (1, 'track', ?, 'Toccata', 'Bach', ?)",
+                &[
+                    &ancienne as &dyn ToSqlValue,
+                    &n("/vieux_nas/Bach/Toccata.flac") as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+
+        let (code, rep) = purger(&state, "/vieux_nas", Some(1)).await;
+        assert_eq!(code, 200, "{rep}");
+
+        let favs = state
+            .backend
+            .query_many(
+                "SELECT item_id FROM favorites WHERE item_type = 'track'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(favs.len(), 1, "le favori a été SUPPRIMÉ : {rep}");
+        assert_eq!(
+            favs[0].first().and_then(|v| v.as_i64()),
+            Some(nouvelle),
+            "le favori devait être re-rattaché à la piste vivante"
+        );
+    }
+
+    // ── Le regroupement montré à l'écran ────────────────────────────────
+
+    /// Rhorn doit lire « /vieux_nas — 3 pistes », pas trois lignes d'albums.
+    /// Et le repli s'arrête sous un dossier qui porte encore du vivant.
+    #[test]
+    fn les_orphelines_sont_regroupees_sous_le_plus_haut_dossier_mort() {
+        let hors = [
+            n("/vieux_nas/Bach/01.flac"),
+            n("/vieux_nas/Bach/02.flac"),
+            n("/vieux_nas/Mozart/01.flac"),
+        ];
+        let hors_refs: Vec<&str> = hors.iter().map(|s| s.as_str()).collect();
+        let g = regrouper_hors_perimetre(&hors_refs, &[]);
+        assert_eq!(g, vec![(n("/vieux_nas"), 3)], "{g:?}");
+
+        // Une piste vivante voisine empêche de remonter jusqu'à `/data`.
+        let vivante = n("/data/actuel/a.flac");
+        let mortes = [n("/data/ancien/01.flac"), n("/data/ancien/02.flac")];
+        let mortes_refs: Vec<&str> = mortes.iter().map(|s| s.as_str()).collect();
+        let g = regrouper_hors_perimetre(&mortes_refs, &[vivante.as_str()]);
+        assert_eq!(g, vec![(n("/data/ancien"), 2)], "{g:?}");
+    }
+
+    /// La route de listage rend les groupes et l'impact — c'est ce qui permet
+    /// de rattraper un dossier retiré il y a trois versions.
+    #[tokio::test]
+    async fn la_route_de_listage_montre_les_dossiers_deja_retires() {
+        let state = etat();
+        racines(&state, &["/nas2/Musique"]);
+        piste(&state, "/nas2/Musique/vivante.flac");
+        for i in 0..4 {
+            piste(&state, &format!("/vieux_nas/Bach/{i}.flac"));
+        }
+
+        let r = super::orphan_tracks(RequireAdmin, State(state.clone()))
+            .await
+            .0;
+        assert_eq!(r["total"].as_i64(), Some(4), "{r}");
+        let g = r["groups"].as_array().unwrap();
+        assert_eq!(g.len(), 1, "{r}");
+        assert_eq!(g[0]["path"].as_str(), Some(n("/vieux_nas").as_str()), "{r}");
+        assert_eq!(g[0]["tracks"].as_i64(), Some(4), "{r}");
+    }
 }

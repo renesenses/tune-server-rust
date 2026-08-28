@@ -265,7 +265,7 @@ pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
 ///
 /// `None` en haut de l'arborescence : `/a.flac` n'a pas de parent nommé, et
 /// `G:` n'en a pas non plus.
-fn dossier_parent(chemin: &str) -> Option<&str> {
+pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
     match chemin.rfind(['/', '\\']) {
         Some(0) | None => None,
         Some(i) => Some(&chemin[..i]),
