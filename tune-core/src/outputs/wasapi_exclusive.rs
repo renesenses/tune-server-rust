@@ -9,13 +9,14 @@
 //! third-party ASIO driver.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 use super::local::{
-    NativePcmRing, WasapiEndpoint, native_i32_to_pcm_bytes, select_wasapi_endpoint,
+    NativePcmRing, WasapiEndpoint, WasapiInitDecision, select_wasapi_endpoint,
+    wasapi_aligned_duration_100ns, wasapi_init_decision,
 };
 
 #[cfg(target_os = "windows")]
@@ -65,7 +66,7 @@ mod ffi {
 
     pub const S_OK: HRESULT = 0;
     pub const S_FALSE: HRESULT = 1;
-    pub const COINIT_MULTITHREADED: u32 = 0x0;
+    pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
     pub const CLSCTX_ALL: u32 = 0x17;
     pub const STGM_READ: u32 = 0;
     pub const AUDCLNT_SHAREMODE_EXCLUSIVE: u32 = 1;
@@ -74,6 +75,7 @@ mod ffi {
     pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
     pub const INFINITE: u32 = 0xFFFFFFFF;
     pub const WAIT_OBJECT_0: u32 = 0;
+    pub const RPC_E_CHANGED_MODE: HRESULT = 0x80010106u32 as i32;
 
     // KSDATAFORMAT_SUBTYPE_PCM {00000001-0000-0010-8000-00AA00389B71}
     pub const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID {
@@ -156,6 +158,7 @@ mod ffi {
 
     unsafe extern "system" {
         pub fn CoInitializeEx(pvReserved: *const c_void, dwCoInit: u32) -> HRESULT;
+        pub fn CoUninitialize();
         pub fn CoCreateInstance(
             rclsid: *const GUID,
             pUnkOuter: LPUNKNOWN,
@@ -197,6 +200,113 @@ mod ffi {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct ComApartmentGuard;
+
+#[cfg(target_os = "windows")]
+impl ComApartmentGuard {
+    fn initialize_sta() -> Result<Self, String> {
+        let hr = unsafe { ffi::CoInitializeEx(std::ptr::null(), ffi::COINIT_APARTMENTTHREADED) };
+        if hr == ffi::S_OK || hr == ffi::S_FALSE {
+            Ok(Self)
+        } else if hr == ffi::RPC_E_CHANGED_MODE {
+            Err(
+                "WASAPI exclusif doit être créé sur un thread COM STA ; ce thread est déjà MTA"
+                    .to_string(),
+            )
+        } else {
+            Err(format!("CoInitializeEx(STA) failed: 0x{hr:08X}"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::CoUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn activate_audio_client(
+    device: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, String> {
+    use ffi::*;
+    type ActivateFn = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *const GUID,
+        u32,
+        *mut std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT;
+    let vtable = unsafe { *(device as *const *const *const std::ffi::c_void) };
+    let activate: ActivateFn = unsafe { std::mem::transmute(*vtable.add(3)) };
+    let mut audio_client = std::ptr::null_mut();
+    let hr = unsafe {
+        activate(
+            device,
+            &IID_IAUDIOCLIENT,
+            CLSCTX_ALL,
+            std::ptr::null_mut(),
+            &mut audio_client,
+        )
+    };
+    if hr == S_OK {
+        Ok(audio_client)
+    } else {
+        Err(format!(
+            "IMMDevice::Activate(IAudioClient) failed: 0x{hr:08X}"
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn initialize_audio_client(
+    audio_client: *mut std::ffi::c_void,
+    format: *const ffi::WAVEFORMATEX,
+    period: ffi::REFERENCE_TIME,
+) -> ffi::HRESULT {
+    type InitializeFn = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        u32,
+        u32,
+        ffi::REFERENCE_TIME,
+        ffi::REFERENCE_TIME,
+        *const ffi::WAVEFORMATEX,
+        *const ffi::GUID,
+    ) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const std::ffi::c_void) };
+    let initialize: InitializeFn = unsafe { std::mem::transmute(*vtable.add(3)) };
+    unsafe {
+        initialize(
+            audio_client,
+            ffi::AUDCLNT_SHAREMODE_EXCLUSIVE,
+            ffi::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            period,
+            period,
+            format,
+            std::ptr::null(),
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn audio_client_buffer_size(audio_client: *mut std::ffi::c_void) -> Result<u32, String> {
+    type GetBufferSizeFn =
+        unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const std::ffi::c_void) };
+    let get_size: GetBufferSizeFn = unsafe { std::mem::transmute(*vtable.add(4)) };
+    let mut frames = 0;
+    let hr = unsafe { get_size(audio_client, &mut frames) };
+    if hr != ffi::S_OK {
+        return Err(format!("IAudioClient::GetBufferSize failed: 0x{hr:08X}"));
+    }
+    if frames == 0 {
+        return Err("IAudioClient::GetBufferSize a renvoyé zéro frame".to_string());
+    }
+    Ok(frames)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -218,7 +328,13 @@ pub struct WasapiExclusiveOutput {
     #[cfg(target_os = "windows")]
     buffer_frame_count: u32,
     running: Arc<AtomicBool>,
+    underruns: Arc<AtomicU64>,
+    deadline_misses: Arc<AtomicU64>,
+    callback_errors: Arc<AtomicU64>,
     render_thread: Option<std::thread::JoinHandle<()>>,
+    resources_released: bool,
+    #[cfg(target_os = "windows")]
+    _com_apartment: ComApartmentGuard,
 }
 
 impl WasapiExclusiveOutput {
@@ -238,9 +354,9 @@ impl WasapiExclusiveOutput {
         use std::ffi::c_void;
         use std::ptr;
 
-        unsafe {
-            CoInitializeEx(ptr::null(), COINIT_MULTITHREADED);
+        let com_apartment = ComApartmentGuard::initialize_sta()?;
 
+        unsafe {
             let resolved = resolve_wasapi_endpoint(endpoint_id.unwrap_or(device_name))?;
 
             // 1. Create MMDeviceEnumerator
@@ -283,33 +399,18 @@ impl WasapiExclusiveOutput {
                 }
             }
 
-            // 3. Activate IAudioClient
-            let mut audio_client: *mut c_void = ptr::null_mut();
-            {
-                type ActivateFn = unsafe extern "system" fn(
-                    *mut c_void,
-                    *const GUID,
-                    u32,
-                    *mut c_void,
-                    *mut *mut c_void,
-                ) -> HRESULT;
-                let vtable = *(device as *const *const *const c_void);
-                let activate: ActivateFn = std::mem::transmute(*vtable.add(3));
-                let hr = activate(
-                    device,
-                    &IID_IAUDIOCLIENT,
-                    CLSCTX_ALL,
-                    ptr::null_mut(),
-                    &mut audio_client,
-                );
-                release(device);
-                release(enumerator);
-                if hr != S_OK {
-                    return Err(format!(
-                        "IMMDevice::Activate(IAudioClient) failed: 0x{hr:08X}"
-                    ));
+            // 3. Activate IAudioClient. Keep IMMDevice alive until Initialize
+            // has succeeded: an alignment retry must release this client and
+            // activate a fresh one on the same stable endpoint (#2208).
+            let mut audio_client = match activate_audio_client(device) {
+                Ok(client) => client,
+                Err(error) => {
+                    release(device);
+                    release(enumerator);
+                    return Err(error);
                 }
-            }
+            };
+            release(enumerator);
 
             // 4. Build WAVEFORMATEXTENSIBLE for our desired format
             let block_align = (channels as u16) * (bit_depth as u16 / 8);
@@ -358,6 +459,7 @@ impl WasapiExclusiveOutput {
                         "wasapi_exclusive_format_not_supported"
                     );
                     release(audio_client);
+                    release(device);
                     return Err(format!(
                         "WASAPI Exclusive: format {channels}ch {bit_depth}bit {sample_rate}Hz not supported (0x{hr:08X})"
                     ));
@@ -375,43 +477,91 @@ impl WasapiExclusiveOutput {
                 ) -> HRESULT;
                 let vtable = *(audio_client as *const *const *const c_void);
                 let get_period: GetPeriodFn = std::mem::transmute(*vtable.add(9));
-                get_period(audio_client, &mut default_period, &mut min_period);
+                let hr = get_period(audio_client, &mut default_period, &mut min_period);
+                if hr != S_OK {
+                    release(audio_client);
+                    release(device);
+                    return Err(format!("IAudioClient::GetDevicePeriod failed: 0x{hr:08X}"));
+                }
             }
             let period = if min_period > 0 {
                 min_period
             } else {
                 default_period
             };
+            if period <= 0 {
+                release(audio_client);
+                release(device);
+                return Err(format!(
+                    "IAudioClient::GetDevicePeriod a renvoyé une période invalide : {period}"
+                ));
+            }
 
-            // 7. Initialize in exclusive mode with event callback
-            {
-                type InitializeFn = unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    u32,
-                    REFERENCE_TIME,
-                    REFERENCE_TIME,
-                    *const WAVEFORMATEX,
-                    *const GUID,
-                ) -> HRESULT;
-                let vtable = *(audio_client as *const *const *const c_void);
-                let initialize: InitializeFn = std::mem::transmute(*vtable.add(3));
-                let hr = initialize(
-                    audio_client,
-                    AUDCLNT_SHAREMODE_EXCLUSIVE,
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    period,
-                    period,
-                    &wfx.Format as *const WAVEFORMATEX,
-                    ptr::null(),
-                );
-                if hr != S_OK {
+            // 7. Initialize in exclusive event-driven mode. Windows can reject
+            // the requested period solely because its frame count is not
+            // aligned. The documented recovery requires GetBufferSize on the
+            // rejected client, Release, a fresh Activate, then Initialize with
+            // the aligned duration — never a second Initialize on the same
+            // one-shot IAudioClient.
+            let mut selected_period = period;
+            let first_hr = initialize_audio_client(
+                audio_client,
+                &wfx.Format as *const WAVEFORMATEX,
+                selected_period,
+            );
+            match wasapi_init_decision(first_hr) {
+                WasapiInitDecision::Ready => {}
+                WasapiInitDecision::RetryWithAlignedBuffer => {
+                    let aligned_frames = match audio_client_buffer_size(audio_client) {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            release(audio_client);
+                            release(device);
+                            return Err(format!(
+                                "WASAPI n a pas fourni la taille alignée après le refus : {error}"
+                            ));
+                        }
+                    };
                     release(audio_client);
+                    selected_period =
+                        match wasapi_aligned_duration_100ns(aligned_frames, sample_rate) {
+                            Ok(duration) => duration,
+                            Err(error) => {
+                                release(device);
+                                return Err(error);
+                            }
+                        };
+                    audio_client = match activate_audio_client(device) {
+                        Ok(client) => client,
+                        Err(error) => {
+                            release(device);
+                            return Err(format!(
+                                "Réactivation IAudioClient après alignement impossible : {error}"
+                            ));
+                        }
+                    };
+                    let retry_hr = initialize_audio_client(
+                        audio_client,
+                        &wfx.Format as *const WAVEFORMATEX,
+                        selected_period,
+                    );
+                    if retry_hr != S_OK {
+                        release(audio_client);
+                        release(device);
+                        return Err(format!(
+                            "IAudioClient::Initialize(EXCLUSIVE, aligned) failed: 0x{retry_hr:08X}"
+                        ));
+                    }
+                }
+                WasapiInitDecision::Fail(hr) => {
+                    release(audio_client);
+                    release(device);
                     return Err(format!(
                         "IAudioClient::Initialize(EXCLUSIVE) failed: 0x{hr:08X}"
                     ));
                 }
             }
+            release(device);
 
             // 8. Create event and set it
             let event = CreateEventW(ptr::null(), 0, 0, ptr::null());
@@ -432,13 +582,14 @@ impl WasapiExclusiveOutput {
             }
 
             // 9. Get buffer size
-            let mut buffer_frame_count: u32 = 0;
-            {
-                type GetBufferSizeFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
-                let vtable = *(audio_client as *const *const *const c_void);
-                let get_size: GetBufferSizeFn = std::mem::transmute(*vtable.add(4));
-                get_size(audio_client, &mut buffer_frame_count);
-            }
+            let buffer_frame_count = match audio_client_buffer_size(audio_client) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    CloseHandle(event);
+                    release(audio_client);
+                    return Err(error);
+                }
+            };
 
             // 10. Get render client
             let mut render_client: *mut c_void = ptr::null_mut();
@@ -466,7 +617,7 @@ impl WasapiExclusiveOutput {
                 bit_depth,
                 channels,
                 buffer_frames = buffer_frame_count,
-                period_100ns = period,
+                period_100ns = selected_period,
                 "wasapi_exclusive_initialized"
             );
 
@@ -483,7 +634,12 @@ impl WasapiExclusiveOutput {
                 event_handle: event,
                 buffer_frame_count,
                 running: Arc::new(AtomicBool::new(false)),
+                underruns: Arc::new(AtomicU64::new(0)),
+                deadline_misses: Arc::new(AtomicU64::new(0)),
+                callback_errors: Arc::new(AtomicU64::new(0)),
                 render_thread: None,
+                resources_released: false,
+                _com_apartment: com_apartment,
             })
         }
     }
@@ -494,7 +650,42 @@ impl WasapiExclusiveOutput {
     pub fn start(&mut self) -> Result<(), String> {
         use ffi::*;
 
-        self.running.store(true, Ordering::SeqCst);
+        // Exclusive event-driven rendering uses two endpoint buffers. Prime
+        // the first one completely before Start so the driver never begins on
+        // an unowned/uninitialised buffer. The producer may not have reached
+        // the ring yet; the suffix is then deterministic digital silence.
+        unsafe {
+            let mut buf: *mut u8 = std::ptr::null_mut();
+            type GetBufferFn =
+                unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut u8) -> HRESULT;
+            type ReleaseBufferFn =
+                unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> HRESULT;
+            let vtable = *(self.render_client as *const *const *const std::ffi::c_void);
+            let get_buffer: GetBufferFn = std::mem::transmute(*vtable.add(3));
+            let hr = get_buffer(self.render_client, self.buffer_frame_count, &mut buf);
+            if hr != S_OK {
+                return Err(format!(
+                    "IAudioRenderClient::GetBuffer(initial) failed: 0x{hr:08X}"
+                ));
+            }
+            let buffer_bytes =
+                (self.buffer_frame_count * self.channels * (self.bit_depth / 8)) as usize;
+            let out = std::slice::from_raw_parts_mut(buf, buffer_bytes);
+            let written = if self.paused.load(Ordering::Relaxed) {
+                0
+            } else {
+                self.ring.pop_pcm_bytes(out, self.bit_depth as u16)
+            };
+            out[written..].fill(0);
+
+            let release_buffer: ReleaseBufferFn = std::mem::transmute(*vtable.add(4));
+            let hr = release_buffer(self.render_client, self.buffer_frame_count, 0);
+            if hr != S_OK {
+                return Err(format!(
+                    "IAudioRenderClient::ReleaseBuffer(initial) failed: 0x{hr:08X}"
+                ));
+            }
+        }
 
         // Start the audio client
         unsafe {
@@ -506,6 +697,7 @@ impl WasapiExclusiveOutput {
                 return Err(format!("IAudioClient::Start failed: 0x{hr:08X}"));
             }
         }
+        self.running.store(true, Ordering::SeqCst);
 
         let ring = self.ring.clone();
         let paused = self.paused.clone();
@@ -515,7 +707,11 @@ impl WasapiExclusiveOutput {
         let buffer_frame_count = self.buffer_frame_count;
         let channels = self.channels;
         let bytes_per_sample = self.bit_depth / 8;
+        let bit_depth = self.bit_depth as u16;
         let frame_bytes = channels * bytes_per_sample;
+        let underruns = self.underruns.clone();
+        let deadline_misses = self.deadline_misses.clone();
+        let callback_errors = self.callback_errors.clone();
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
@@ -534,7 +730,7 @@ impl WasapiExclusiveOutput {
                 let wait_result = unsafe { WaitForSingleObject(event_handle, 2000) };
                 if wait_result != WAIT_OBJECT_0_LOCAL {
                     if running.load(Ordering::SeqCst) {
-                        debug!("wasapi_exclusive_wait_timeout");
+                        deadline_misses.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -550,7 +746,8 @@ impl WasapiExclusiveOutput {
                             -> i32;
                         let vtable = *(render_client as *const *const *const std::ffi::c_void);
                         let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
-                        if get_buf(render_client, buffer_frame_count, &mut buf) == S_OK_LOCAL {
+                        let hr = get_buf(render_client, buffer_frame_count, &mut buf);
+                        if hr == S_OK_LOCAL {
                             std::ptr::write_bytes(
                                 buf,
                                 0,
@@ -559,13 +756,16 @@ impl WasapiExclusiveOutput {
                             type RelBufFn =
                                 unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
                             let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
-                            rel_buf(render_client, buffer_frame_count, 0);
+                            if rel_buf(render_client, buffer_frame_count, 0) != S_OK_LOCAL {
+                                callback_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            callback_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     continue;
                 }
 
-                let needed_samples = (buffer_frame_count * channels) as usize;
                 unsafe {
                     let mut buf: *mut u8 = std::ptr::null_mut();
                     type GetBufferFn =
@@ -574,10 +774,7 @@ impl WasapiExclusiveOutput {
                     let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
                     let hr = get_buf(render_client, buffer_frame_count, &mut buf);
                     if hr != S_OK_LOCAL {
-                        debug!(
-                            hr = format!("0x{hr:08X}"),
-                            "wasapi_exclusive_getbuffer_failed"
-                        );
+                        callback_errors.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
 
@@ -585,22 +782,22 @@ impl WasapiExclusiveOutput {
                     // have already been resolved by the producer. The
                     // callback performs serialization only: no float, scale,
                     // rounding or truncation can alter a bit-perfect word.
-                    let mut samples = vec![0i32; needed_samples];
-                    let read = ring.pop(&mut samples);
-                    samples[read..].fill(0);
-
                     let out_slice = std::slice::from_raw_parts_mut(
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written =
-                        native_i32_to_pcm_bytes(&samples, (bytes_per_sample * 8) as u16, out_slice);
+                    let written = ring.pop_pcm_bytes(out_slice, bit_depth);
+                    if written < out_slice.len() {
+                        underruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     out_slice[written..].fill(0);
 
                     type RelBufFn =
                         unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
                     let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
-                    rel_buf(render_client, buffer_frame_count, 0);
+                    if rel_buf(render_client, buffer_frame_count, 0) != S_OK_LOCAL {
+                        callback_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -620,27 +817,48 @@ impl WasapiExclusiveOutput {
     /// Stop and release all WASAPI resources.
     #[cfg(target_os = "windows")]
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        if self.resources_released {
+            return;
+        }
+        let was_running = self.running.swap(false, Ordering::SeqCst);
 
         // Stop the audio client
-        unsafe {
-            type StopFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-            let vtable = *(self.audio_client as *const *const *const std::ffi::c_void);
-            let stop: StopFn = std::mem::transmute(*vtable.add(11));
-            stop(self.audio_client);
+        if was_running {
+            let stop_hr = unsafe {
+                type StopFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+                let vtable = *(self.audio_client as *const *const *const std::ffi::c_void);
+                let stop: StopFn = std::mem::transmute(*vtable.add(11));
+                stop(self.audio_client)
+            };
+            if stop_hr != ffi::S_OK {
+                warn!(
+                    hr = format!("0x{stop_hr:08X}"),
+                    "wasapi_exclusive_stop_failed"
+                );
+            }
         }
 
         if let Some(handle) = self.render_thread.take() {
             let _ = handle.join();
         }
 
-        unsafe {
+        let close_ok = unsafe {
             ffi::release(self.render_client);
             ffi::release(self.audio_client);
-            ffi::CloseHandle(self.event_handle);
+            ffi::CloseHandle(self.event_handle)
+        };
+        if close_ok == 0 {
+            warn!("wasapi_exclusive_close_event_failed");
         }
+        self.resources_released = true;
 
-        info!(device = %self.device_name, "wasapi_exclusive_stopped");
+        info!(
+            device = %self.device_name,
+            underruns = self.underrun_count(),
+            deadline_misses = self.deadline_miss_count(),
+            callback_errors = self.callback_error_count(),
+            "wasapi_exclusive_stopped"
+        );
     }
 
     pub fn format_info(&self) -> String {
@@ -662,12 +880,24 @@ impl WasapiExclusiveOutput {
     pub fn opened_device_id(&self) -> &str {
         &self.device_id
     }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn deadline_miss_count(&self) -> u64 {
+        self.deadline_misses.load(Ordering::Relaxed)
+    }
+
+    pub fn callback_error_count(&self) -> u64 {
+        self.callback_errors.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(target_os = "windows")]
 impl Drop for WasapiExclusiveOutput {
     fn drop(&mut self) {
-        if self.running.load(Ordering::SeqCst) {
+        if !self.resources_released {
             self.stop();
         }
     }
