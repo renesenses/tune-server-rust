@@ -1078,7 +1078,7 @@ impl PlaybackOrchestrator {
         );
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None)
+                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None)
             })
             .await;
 
