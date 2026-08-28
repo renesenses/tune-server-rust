@@ -2065,15 +2065,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -2083,15 +2082,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -2101,15 +2099,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -2748,7 +2745,8 @@
       "liste": false,
       "champs_obligatoires": [
         "websocket_connections",
-        "http_streamer_sessions"
+        "active_streams",
+        "registered_outputs"
       ],
       "champs_optionnels": []
     },
@@ -2759,7 +2757,6 @@
       "liste": false,
       "champs_obligatoires": [
         "devices",
-        "protocols",
         "device_count"
       ],
       "champs_optionnels": []
@@ -2782,16 +2779,17 @@
       "type": "AdminHealth",
       "liste": false,
       "champs_obligatoires": [
-        "cpu_percent",
-        "ram_mb",
-        "ram_total_mb",
-        "disk_free_gb",
-        "disk_total_gb",
+        "status",
         "uptime_seconds",
-        "uptime_formatted",
-        "open_fds",
-        "pid",
-        "python_threads"
+        "engine",
+        "version",
+        "database",
+        "playback",
+        "outputs",
+        "streaming_services",
+        "scan_status",
+        "disk_free_gb",
+        "disk_total_gb"
       ],
       "champs_optionnels": []
     },
@@ -2812,21 +2810,6 @@
         "volume",
         "buffer",
         "group_id"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/system/audio-check",
-      "methode": "GET",
-      "type": "AudioCheckResult",
-      "liste": false,
-      "champs_obligatoires": [
-        "zones",
-        "zones_with_output",
-        "local_outputs",
-        "network_renderers",
-        "has_audio",
-        "issues"
       ],
       "champs_optionnels": []
     },
@@ -3477,17 +3460,6 @@
       "champs_optionnels": [
         "applied_live"
       ]
-    },
-    {
-      "route": "/zones/{}/crossfade",
-      "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "enabled",
-        "duration"
-      ],
-      "champs_optionnels": []
     },
     {
       "route": "/zones/{}/device-presets",
@@ -4158,11 +4130,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/zone-manager/groups/{}/calibrate",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/zone-manager/zones/{}/health",
       "type": "any",
       "raison": "type non structurel"
@@ -4573,11 +4540,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/zones/{}/crossfade",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/zones/{}/normalization",
       "type": "any",
       "raison": "type non structurel"
@@ -4789,7 +4751,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 234,
-    "appels_non_resolus": 143
+    "routes_cartographiees": 232,
+    "appels_non_resolus": 141
   }
 }
