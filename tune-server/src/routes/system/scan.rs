@@ -265,7 +265,7 @@ pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
 ///
 /// `None` en haut de l'arborescence : `/a.flac` n'a pas de parent nommé, et
 /// `G:` n'en a pas non plus.
-fn dossier_parent(chemin: &str) -> Option<&str> {
+pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
     match chemin.rfind(['/', '\\']) {
         Some(0) | None => None,
         Some(i) => Some(&chemin[..i]),
@@ -1236,6 +1236,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut sous_arbres_proteges: Vec<String> = Vec::new();
         let mut pistes_hors_perimetre = 0i64;
         let mut pistes_protegees = 0i64;
+        // Pistes réellement retirées de la base. Hissé pour la même raison que
+        // ses voisines, et pour une de plus : le compte existait déjà, mais il
+        // mourait avec le bloc `else` ci-dessous. Il ne sortait que par le
+        // journal et par un `library.scan.progress` que le client efface dès
+        // l'arrivée de `library.scan.completed` — si bien que le bandeau de fin
+        // de scan annonçait « 0 supprimés » quoi que la purge ait fait (#2146).
+        let mut pistes_supprimees = 0i64;
         // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
         // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
         let mut purge_refusee_candidats = 0i64;
@@ -1338,6 +1345,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
+            pistes_supprimees = pruned;
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,
@@ -1691,6 +1699,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     // (Ces quatre clés étaient écrites DEUX fois — deux
                     // sessions ont ajouté le même bloc ; `json!` gardait
                     // silencieusement la dernière.)
+                    // Ce que la purge a effectivement retiré. Le client lit
+                    // cette clé pour le bandeau de fin de scan (#2146).
+                    "removed": pistes_supprimees,
                     "emptied_roots": racines_videes.clone(),
                     "protected_subtrees": sous_arbres_proteges.clone(),
                     "tracks_protected": pistes_protegees,
@@ -1729,6 +1740,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 "missing_dirs": missing_dirs.clone(),
                 "missing_dir_reasons": missing_dir_reasons.clone(),
                 "error_dirs": error_dirs.clone(),
+                "removed": pistes_supprimees,
                 "emptied_roots": racines_videes.clone(),
                 "protected_subtrees": sous_arbres_proteges.clone(),
                 "tracks_protected": pistes_protegees,
@@ -1761,6 +1773,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            "removed": pistes_supprimees,
             "emptied_roots": racines_videes.clone(),
             "protected_subtrees": sous_arbres_proteges.clone(),
             "tracks_protected": pistes_protegees,
@@ -2863,5 +2876,94 @@ mod tests {
         assert_eq!(super::parse_hhmm("12:60"), None);
         assert_eq!(super::parse_hhmm("noon"), None);
         assert_eq!(super::parse_hhmm(""), None);
+    }
+}
+
+/// Garde-fou : le rapport de fin de scan est construit QUATRE fois, et les
+/// quatre doivent publier ce que la purge a retiré.
+///
+/// Le bandeau de fin de scan annonçait « 0 supprimés » quoi que la purge ait
+/// fait : le client lit `d.removed`, et aucune des constructions du rapport
+/// n'envoyait cette clé (#2146). Le compte existait pourtant — il mourait avec
+/// le bloc qui le calculait.
+///
+/// Ces constructions ne sont reliées par rien de mécanique : ce sont quatre
+/// `json!` recopiés à la main, et ils ont DÉJÀ divergé une fois
+/// (`skipped_unsupported_by_ext`, qui n'existe que dans un seul — #2012).
+/// Ajouter une clé à trois d'entre eux et pas au quatrième ne casse aucune
+/// compilation et ne fait échouer aucun test fonctionnel : le champ manque
+/// simplement chez un consommateur, en silence. D'où ce test, sur le modèle de
+/// `tests/smb_dialect_seam.rs`.
+///
+/// Le quatrième exemplaire est celui du scan AUTOMATIQUE (`auto_scan.rs`) :
+/// l'issue ne le comptait pas parmi les trois, mais il purge (`pruned`) et il
+/// émet `library.scan.completed`, donc il alimente le même bandeau.
+#[cfg(test)]
+mod rapport_de_scan_publie_la_purge {
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Une clé de rapport, sous sa forme littérale exacte. `"removed"` tout
+    /// court apparaît aussi dans les noms d'événements de journal
+    /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait passer
+    /// le test sans qu'aucune clé soit publiée.
+    const CLE_PURGE: &str = "\"removed\":";
+
+    /// Présent dans les quatre rapports, et nulle part ailleurs : sert à
+    /// reconnaître un rapport de fin de scan sans compter d'accolades.
+    const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
+
+    fn source(chemin: &str) -> String {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(chemin);
+        fs::read_to_string(&p).unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()))
+    }
+
+    /// Le corps du `json!` qui précède le marqueur, commentaires ÔTÉS.
+    ///
+    /// Les commentaires nomment le défaut corrigé — « le client lit
+    /// `d.removed` » — et raconter l'histoire ne doit pas suffire à faire
+    /// passer le test. Seul le code compte.
+    fn corps_du_rapport(texte: &str, fin: usize) -> String {
+        let debut = texte[..fin]
+            .rfind("json!(")
+            .expect("un rapport doit être construit par un json!(");
+        texte[debut..fin]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn les_quatre_constructions_du_rapport_publient_la_cle_lue_par_le_client() {
+        let fichiers = ["src/routes/system/scan.rs", "src/auto_scan.rs"];
+        let mut examines = 0usize;
+        for fichier in fichiers {
+            let texte = source(fichier);
+            let mut depuis = 0usize;
+            while let Some(rel) = texte[depuis..].find(MARQUEUR_RAPPORT) {
+                let fin = depuis + rel;
+                examines += 1;
+                let corps = corps_du_rapport(&texte, fin);
+                assert!(
+                    corps.contains(CLE_PURGE),
+                    "{fichier} : la construction de rapport n° {examines} ne publie pas \
+                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan. \
+                     Un rapport qui ne l'envoie pas fait annoncer « 0 supprimés » quoi que la \
+                     purge ait fait (#2146). Les quatre constructions doivent porter la clé \
+                     (#2012)."
+                );
+                depuis = fin + MARQUEUR_RAPPORT.len();
+            }
+        }
+        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
+        // test en n'examinant RIEN. Quatre, c'est `scan_result`,
+        // `library.scan.completed`, `/scan/report`, et le rapport du scan
+        // automatique.
+        assert_eq!(
+            examines, 4,
+            "quatre constructions de rapport attendues, {examines} trouvée(s) — le marqueur \
+             {MARQUEUR_RAPPORT} a dû être renommé, ou un exemplaire ajouté/supprimé"
+        );
     }
 }

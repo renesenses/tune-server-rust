@@ -590,9 +590,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -3525,7 +3525,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.1",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -5224,7 +5224,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-trait",
  "axum",
@@ -5237,7 +5237,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "axum",
  "bytes",
@@ -5247,6 +5247,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tower-http",
@@ -5257,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5271,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "ape-decoder",
  "argon2",
@@ -5346,7 +5347,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-trait",
  "axum",
@@ -5358,7 +5359,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "axum",
  "serde_json",
@@ -5371,7 +5372,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-trait",
  "axum",
@@ -5384,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-trait",
  "serde",
@@ -5393,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5402,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5450,7 +5451,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-stream",
  "axum",
@@ -5464,7 +5465,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.116"
+version = "0.9.117"
 dependencies = [
  "async-stream",
  "axum",

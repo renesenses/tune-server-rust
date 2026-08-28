@@ -3563,14 +3563,13 @@ mod tests {
     #[test]
     fn dsf_fallback_with_valid_header() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join("tune_test_dsf_fallback.dsf");
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
         let buf = build_dsf_bytes(None);
-        std::fs::File::create(&tmp)
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = dsf_dff_fallback(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = dsf_dff_fallback(tmp.path());
         assert!(meta.is_some());
         let meta = meta.unwrap();
         // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
@@ -3599,13 +3598,12 @@ mod tests {
             ("TPUB", "Virgin Records"),
         ]);
         let buf = build_dsf_bytes(Some(&id3_tag));
-        let tmp = std::env::temp_dir().join("tune_test_dsf_id3v2.dsf");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = dsf_dff_fallback(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = dsf_dff_fallback(tmp.path());
         assert!(
             meta.is_some(),
             "dsf_dff_fallback should return Some for DSF with ID3v2"
@@ -3632,8 +3630,9 @@ mod tests {
     #[test]
     fn dsf_fallback_id3v2_overrides_path() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("V_DSF").join("Genesis - Abacab");
-        std::fs::create_dir_all(&dir).ok();
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("V_DSF").join("Genesis - Abacab");
+        std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("07 - Man On The Corner.dsf");
         let id3_tag = build_id3v2_tag(&[
             ("TIT2", "Man On The Corner"),
@@ -3647,8 +3646,6 @@ mod tests {
             .write_all(&buf)
             .unwrap();
         let meta = dsf_dff_fallback(&file_path);
-        std::fs::remove_file(&file_path).ok();
-        std::fs::remove_dir_all(std::env::temp_dir().join("V_DSF")).ok();
         assert!(meta.is_some());
         let meta = meta.unwrap();
         assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
@@ -3701,10 +3698,8 @@ mod tests {
         wav.extend_from_slice(&data);
 
         // Directory convention: .../Artist/Album/NN - Title.wav
-        let dir = std::env::temp_dir()
-            .join("tune_test_untagged_wav")
-            .join("Jean-Luc")
-            .join("Best Of");
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("Jean-Luc").join("Best Of");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("07 - Untagged Song.wav");
         std::fs::File::create(&file)
@@ -3723,8 +3718,6 @@ mod tests {
         // Holds through both fallback paths: tagless_fallback (lofty parsed props)
         // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
         assert_eq!(meta.format.as_deref(), Some("wav"));
-
-        std::fs::remove_dir_all(std::env::temp_dir().join("tune_test_untagged_wav")).ok();
     }
 
     #[test]
@@ -3737,13 +3730,12 @@ mod tests {
         use std::io::Write;
         let id3_tag = build_id3v2_tag(&[("TIT2", "Aurora"), ("TPE1", "Yes"), ("TALB", "Fragile")]);
         let buf = build_dsf_bytes(Some(&id3_tag));
-        let tmp = std::env::temp_dir().join("tune_test_dsf_title_e2e.dsf");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = try_read_metadata(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = try_read_metadata(tmp.path());
         let meta = meta.expect("try_read_metadata should succeed for a tagged DSF");
         assert_eq!(meta.title.as_deref(), Some("Aurora"));
         assert_eq!(meta.artist.as_deref(), Some("Yes"));
@@ -3762,13 +3754,12 @@ mod tests {
         let second = build_id3v2_tag(&[("TCON", "Singer/Songwriter")]);
         let mut buf = first.clone();
         buf.extend_from_slice(&second);
-        let tmp = std::env::temp_dir().join("tune_test_dual_id3v2.mp3");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let g = mp3_first_tag_genre_if_dual(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let g = mp3_first_tag_genre_if_dual(tmp.path());
         assert_eq!(g.as_deref(), Some("Alternatif"));
     }
 
@@ -3778,13 +3769,12 @@ mod tests {
         // None), so lofty's encoding/numeric-genre-aware value is kept.
         use std::io::Write;
         let only = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Jazz")]);
-        let tmp = std::env::temp_dir().join("tune_test_single_id3v2.mp3");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&only)
             .unwrap();
-        let g = mp3_first_tag_genre_if_dual(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let g = mp3_first_tag_genre_if_dual(tmp.path());
         assert_eq!(g, None);
     }
 

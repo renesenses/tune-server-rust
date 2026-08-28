@@ -1606,5 +1606,13 @@
     "ko": "이 네트워크 공유에 연결할 수 없습니다. 서버가 켜져 있고 접근 가능한지, 저장된 자격 증명이 여전히 유효한지 확인하세요.",
     "ro": "Această partajare de rețea este inaccesibilă. Verificați dacă serverul este pornit și accesibil și dacă datele de autentificare salvate sunt încă valide.",
     "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga."
+  },
+  "settings.communityContribution.label": {
+    "fr": "Partager mes métadonnées enrichies avec la communauté",
+    "en": "Share my enriched metadata with the community"
+  },
+  "settings.communityContribution.description": {
+    "fr": "Quand ce réglage est activé, Tune envoie au cloud communautaire mozaiklabs.fr les biographies d'artistes et d'albums de votre bibliothèque (nom de l'artiste, titre de l'album, identifiant MusicBrainz, texte de la biographie, source, licence et langue) ainsi que les images d'artistes récupérées automatiquement, accompagnées d'un identifiant d'installation anonyme. Ni vos fichiers, ni vos chemins de dossiers, ni votre historique d'écoute ne sont concernés. Désactivé par défaut : tant que vous ne l'activez pas, aucune de ces données ne quitte votre machine.",
+    "en": "When this setting is on, Tune sends your library's artist and album biographies (artist name, album title, MusicBrainz ID, biography text, source, licence and language) plus the artist images it fetched automatically to the mozaiklabs.fr community cloud, together with an anonymous installation identifier. Your files, your folder paths and your listening history are not involved. Off by default: until you turn it on, none of this data leaves your machine."
   }
 }

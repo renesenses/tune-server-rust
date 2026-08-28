@@ -351,13 +351,26 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
 
 /// Traduit le `SupportResult` en réponse HTTP, en préservant le status renvoyé
 /// par mozaiklabs (401/403/422…).
+///
+/// Sur un 429, `tune_core::cloud::support` a déjà déposé `retry_after` dans le
+/// corps ; on le réémet aussi en en-tête `Retry-After`, forme standard que
+/// lisent les clients non web (#2178).
 fn finish(result: support::SupportResult) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err((status, value)) => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(value),
-        )
-            .into_response(),
+        Err((status, value)) => {
+            let retry_after = value.get("retry_after").and_then(serde_json::Value::as_u64);
+            let mut resp = (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(value),
+            )
+                .into_response();
+            if let Some(secs) = retry_after {
+                if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+            resp
+        }
     }
 }

@@ -346,10 +346,15 @@ async fn install_plugin(
     State(state): State<AppState>,
     Json(_body): Json<InstallRequest>,
 ) -> Json<Value> {
-    // No download for compiled-in plugins (DJ/Karaoke) — installing just flips
-    // the settings the startup gate reads. Wasm marketplace installs go through
-    // a separate route. `restart_required` because the gate only runs at
-    // startup, so the plugin loads on the next boot, not this request.
+    // No download for compiled-in plugins (Bandcamp today) — installing just
+    // flips the settings the startup gate reads. Wasm marketplace installs go
+    // through a separate route. `restart_required` because the gate only runs
+    // at startup, so the plugin loads on the next boot, not this request.
+    //
+    // Volontairement non filtré par `catalogued()` : un greffon hors catalogue
+    // (dj, karaoke — voir #2090) n'est plus PROPOSÉ, mais reste installable par
+    // qui le demande nommément. Le retrait du catalogue est une fin de
+    // promesse, pas une condamnation.
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();

@@ -53,7 +53,8 @@ mod tune_temp_file_tests {
 
     #[test]
     fn matches_any_file_inside_system_temp() {
-        let p = std::env::temp_dir().join("whatever.flac");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("whatever.flac");
         assert!(is_tune_temp_file(&p));
     }
 

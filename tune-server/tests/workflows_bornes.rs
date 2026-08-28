@@ -121,6 +121,7 @@ fn tout_job_de_release_a_un_plafond() {
 fn tout_job_de_ci_a_un_plafond() {
     for fichier in [
         "ci.yml",
+        "preflight.yml",
         "test-postgres.yml",
         "refs-issues.yml",
         "widget-ci.yml",
@@ -133,6 +134,39 @@ fn workflow(fichier: &str) -> String {
     let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::read_to_string(racine.join("../.github/workflows").join(fichier))
         .unwrap_or_else(|e| panic!("{fichier} illisible : {e}"))
+}
+
+#[test]
+fn la_release_attend_le_preflight_avant_de_construire() {
+    let release = workflow("release.yml");
+    let jobs = jobs(&release);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de release.yml"))
+    };
+
+    assert!(
+        corps("preflight").contains("uses: ./.github/workflows/preflight.yml"),
+        "Release ne reutilise pas le preflight : deux workflows declenches par le tag peuvent diverger"
+    );
+    assert!(
+        corps("web-client")
+            .lines()
+            .any(|ligne| { cle_de_job(ligne, "needs:") && ligne.trim() == "needs: preflight" }),
+        "le premier job de construction peut demarrer sans attendre le preflight"
+    );
+
+    let preflight = workflow("preflight.yml");
+    assert!(
+        preflight.contains("  workflow_call:"),
+        "preflight.yml ne peut pas etre appele comme dependance de Release"
+    );
+    assert!(
+        !preflight.contains("  push:\n    tags: [\"v*\"]"),
+        "le tag lance encore un second preflight independant et duplique"
+    );
 }
 
 #[test]
