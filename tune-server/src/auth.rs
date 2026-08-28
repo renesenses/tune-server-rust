@@ -1070,6 +1070,10 @@ mod tests {
         assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/api-key"));
         assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/api-key"));
         assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/me"));
+        assert!(!is_public_auth_route(
+            &Method::POST,
+            "/api/v1/system/audio/asio-warm-scan/rearm"
+        ));
     }
 
     #[test]
