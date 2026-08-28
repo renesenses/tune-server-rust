@@ -2002,6 +2002,41 @@ fn decider(
     }
 }
 
+/// L'état que la boucle traîne d'un tour à l'autre. Un seul champ — mais c'est
+/// celui dont l'oubli remettrait l'option en panne : un drapeau de démarrage
+/// jamais consommé couvrirait TOUTES les occurrences à venir, et le scan
+/// programmé redeviendrait muet sur les machines en `TUNE_AUTO_SCAN`. Il vit
+/// donc ici, hors de la boucle `tokio`, pour qu'un test puisse enchaîner deux
+/// tours et le constater.
+struct Ordonnanceur {
+    /// Vrai tant que le premier tour n'a pas eu lieu ET qu'un scan de démarrage
+    /// a été lancé par ce processus.
+    premier_tour: bool,
+}
+
+impl Ordonnanceur {
+    fn new(scan_de_demarrage: bool) -> Self {
+        Self {
+            premier_tour: scan_de_demarrage,
+        }
+    }
+
+    /// Un tour de boucle réduit à sa décision : ni horloge ambiante, ni base.
+    /// Le drapeau est consommé à CHAQUE tour, y compris ceux qui ne décident
+    /// rien — sinon il survivrait jusqu'à la première occurrence due, des
+    /// heures après que le scan de démarrage soit terminé.
+    fn tour(
+        &mut self,
+        active: bool,
+        horaire: &str,
+        now: time::OffsetDateTime,
+        dernier: Option<&str>,
+    ) -> Ordre {
+        let couvert_par_le_demarrage = std::mem::take(&mut self.premier_tour);
+        decider(active, horaire, now, dernier, couvert_par_le_demarrage)
+    }
+}
+
 fn date_iso(jour: time::Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
@@ -2047,12 +2082,9 @@ fn noter_occurrence(settings: &SettingsRepo, jour: time::Date) {
 /// processus ; il ne vaut que pour le premier tour de boucle.
 pub(crate) fn spawn_scan_scheduler(state: AppState, scan_de_demarrage: bool) {
     tokio::spawn(async move {
-        // Consommé au premier tour et à lui seul : trois jours plus tard, une
-        // occurrence due doit évidemment scanner.
-        let mut premier_tour = scan_de_demarrage;
+        let mut ordonnanceur = Ordonnanceur::new(scan_de_demarrage);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let couvert_par_le_demarrage = std::mem::take(&mut premier_tour);
             let settings = SettingsRepo::with_backend(state.backend.clone());
             let active = settings
                 .get("scan_schedule_enabled")
@@ -2071,13 +2103,7 @@ pub(crate) fn spawn_scan_scheduler(state: AppState, scan_de_demarrage: bool) {
             // indisponible (certaines configurations Linux durcies).
             let now = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-            let due = match decider(
-                active,
-                &horaire,
-                now,
-                dernier.as_deref(),
-                couvert_par_le_demarrage,
-            ) {
+            let due = match ordonnanceur.tour(active, &horaire, now, dernier.as_deref()) {
                 Ordre::Rien => continue,
                 Ordre::Noter(jour, motif) => {
                     noter_occurrence(&settings, jour);
@@ -3337,6 +3363,78 @@ mod scan_scheduler_tests {
                 SANS_SCAN_DE_DEMARRAGE
             ),
             Ordre::Scanner(date!(2026 - 08 - 31))
+        );
+    }
+
+    /// Contre-épreuve de la consommation du drapeau : `decider` seul ne peut
+    /// pas la montrer, elle vit dans `Ordonnanceur::tour`. Sans ce test, un
+    /// drapeau jamais consommé passe toutes les autres assertions — et mute
+    /// définitivement le scan programmé sur une machine en `TUNE_AUTO_SCAN`.
+    #[test]
+    fn le_drapeau_de_demarrage_ne_couvre_que_le_premier_tour() {
+        let mut ordonnanceur = super::Ordonnanceur::new(true);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_SCAN_DE_DEMARRAGE),
+            "premier tour : le scan de démarrage couvre l'occurrence manquée"
+        );
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-29 21:00 UTC),
+                Some("2026-08-27")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 29)),
+            "le lendemain, le scan de démarrage est loin derrière : l'occurrence part"
+        );
+    }
+
+    /// Et le drapeau est consommé même par un tour qui ne décide rien : sinon il
+    /// survivrait jusqu'à l'occurrence du soir, des heures après la fin du scan
+    /// de démarrage, et la mangerait.
+    #[test]
+    fn le_drapeau_est_consomme_meme_par_un_tour_sans_occurrence() {
+        let mut ordonnanceur = super::Ordonnanceur::new(true);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:00 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Rien,
+            "au démarrage du matin, rien n'est dû"
+        );
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 21:00 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27)),
+            "le soir même, l'occurrence part normalement"
+        );
+    }
+
+    /// Sans scan de démarrage — le cas par défaut — le premier tour scanne déjà.
+    #[test]
+    fn sans_scan_de_demarrage_le_premier_tour_rattrape() {
+        let mut ordonnanceur = super::Ordonnanceur::new(SANS_SCAN_DE_DEMARRAGE);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27))
         );
     }
 
