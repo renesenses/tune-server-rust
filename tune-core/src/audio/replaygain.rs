@@ -877,7 +877,12 @@ mod tests {
 
     /// Base en mémoire avec le schéma complet, une piste, et rien d'autre.
     /// `zones` existe (via les migrations) et reste vide : `any_zone_playing`
-    /// rend donc false et la passe travaille.
+    /// rend donc false.
+    ///
+    /// Le mode est armé explicitement : depuis #2496, un `replaygain_mode`
+    /// ABSENT vaut « Désactivé » et [`analyze_track_batch`] rend 0 sans rien
+    /// lire. Sans cette ligne, les tests #1865 passeraient au vert en ne
+    /// testant plus rien.
     fn base_avec_piste(chemin: &str) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
@@ -897,6 +902,9 @@ mod tests {
         )
         .unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
         (db, backend)
     }
 
@@ -1300,6 +1308,39 @@ mod tests {
     /// fichier — c'est ce compteur qui dit combien de fichiers ont VRAIMENT été
     /// pris en charge, sans avoir à embarquer de l'audio dans le dépôt.
     fn sweep_db(n: i64) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        sweep_db_avec(n, None)
+    }
+
+    /// Comme [`sweep_db`], mais les fichiers EXISTENT réellement sur le disque.
+    ///
+    /// Nécessaire depuis #1865 : un chemin introuvable quitte la boucle par
+    /// `continue` **avant** la pause de [`PER_FILE_PAUSE_MS`]. Un lot
+    /// entièrement introuvable se consomme donc en quelques microsecondes, et
+    /// aucun basculement de réglage ne peut s'y intercaler — le test ne
+    /// mesurerait plus qu'une course perdue d'avance.
+    ///
+    /// Des fichiers présents mais indécodables empruntent la voie normale :
+    /// témoin `rg_analyzed` posé, **puis** pause. C'est précisément la voie que
+    /// ce test doit pouvoir interrompre.
+    ///
+    /// Le `TempDir` est rendu à l'appelant : le lâcher effacerait les fichiers
+    /// sous les pieds de la passe.
+    fn sweep_db_fichiers_presents(
+        n: i64,
+    ) -> (
+        tempfile::TempDir,
+        crate::db::sqlite::SqliteDb,
+        Arc<dyn DbBackend>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, backend) = sweep_db_avec(n, Some(tmp.path()));
+        (tmp, db, backend)
+    }
+
+    fn sweep_db_avec(
+        n: i64,
+        dossier: Option<&std::path::Path>,
+    ) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.execute_batch(
@@ -1313,10 +1354,20 @@ mod tests {
         )
         .unwrap();
         for i in 1..=n {
-            db.execute_batch(&format!(
+            let chemin = match dossier {
+                // Un octet suffit : le fichier RÉPOND, et reste indécodable.
+                Some(d) => {
+                    let f = d.join(format!("{i}.flac"));
+                    std::fs::write(&f, b"pas du flac").unwrap();
+                    f.to_string_lossy().to_string()
+                }
+                None => format!("/i2496-inexistant/{i}.flac"),
+            };
+            db.execute(
                 "INSERT INTO tracks (id, album_id, file_path, duration_ms, sample_rate, channels) \
-                 VALUES ({i}, NULL, '/i2496-inexistant/{i}.flac', 300000, 44100, 2);"
-            ))
+                 VALUES (?, NULL, ?, 300000, 44100, 2)",
+                &[&i, &chemin],
+            )
             .unwrap();
         }
         let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
@@ -1424,7 +1475,7 @@ mod tests {
     /// décodage.
     #[tokio::test]
     async fn switching_off_mid_batch_interrupts_the_running_sweep() {
-        let (_db, backend) = sweep_db(4);
+        let (_tmp, _db, backend) = sweep_db_fichiers_presents(4);
         SettingsRepo::with_backend(backend.clone())
             .set(MODE_KEY, "track")
             .unwrap();
