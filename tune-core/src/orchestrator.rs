@@ -2040,10 +2040,17 @@ impl PlaybackOrchestrator {
             // rien : elles ne sont JAMAIS remplies. Accumuler ce retard avant
             // de lancer la lecture donne au flux la réserve qui lui manque ;
             // le coût est quelques secondes au zapping d'une station.
+            // Temps réellement passé dans cette barrière. Il était jusqu'ici
+            // noyé dans `output_ms` de `playback_timing`, ce qui rendait la
+            // ligne trompeuse sur DLNA : jusqu'à 4 s d'attente DÉLIBÉRÉE s'y
+            // lisaient comme « la sortie traîne » (#2488). Reste 0 quand la
+            // barrière ne s'applique pas.
+            let mut prebuffer_ms: u128 = 0;
             if let Some(ref sid) = resolved.stream_id {
                 let is_dlna = self.output_type_of(device_id).await.as_deref() == Some("dlna");
                 let is_radio = resolved.source == "radio";
                 if is_dlna || is_radio {
+                    let prebuffer_start = std::time::Instant::now();
                     let sr = resolved.sample_rate.unwrap_or(44100) as u64;
                     let ch = (resolved.channels.unwrap_or(2) as u64).max(1);
                     let bytes_per_sample = ((resolved.bit_depth.unwrap_or(16) as u64) / 8).max(1);
@@ -2060,12 +2067,14 @@ impl PlaybackOrchestrator {
                         .streamer
                         .wait_prefill_ready(sid, target_bytes, timeout)
                         .await;
+                    prebuffer_ms = prebuffer_start.elapsed().as_millis();
                     info!(
                         zone_id = req.zone_id,
                         stream_id = %sid,
                         target_bytes,
                         reached,
                         is_radio,
+                        prebuffer_ms,
                         "initial_prebuffer_done"
                     );
                 }
@@ -2098,10 +2107,16 @@ impl PlaybackOrchestrator {
                 )
                 .await;
             let total_ms = play_start.elapsed().as_millis();
+            // `output_ms` ne compte plus l'attente de pré-tampon : les trois
+            // termes s'additionnent maintenant pour donner `total_ms`, et un
+            // blanc s'impute à la bonne étape sans relire la source.
             info!(
                 zone_id = req.zone_id,
                 resolve_ms,
-                output_ms = total_ms.saturating_sub(resolve_ms),
+                prebuffer_ms,
+                output_ms = total_ms
+                    .saturating_sub(resolve_ms)
+                    .saturating_sub(prebuffer_ms),
                 total_ms,
                 title = %resolved.title,
                 "playback_timing"

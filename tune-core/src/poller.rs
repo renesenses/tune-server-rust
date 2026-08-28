@@ -290,15 +290,75 @@ pub(crate) mod decisions {
     }
 
     use super::{
-        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS,
-        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
-        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
+        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
+        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
+        POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD,
     };
 
     /// Margin (ms) added to the track duration before position-based
     /// end-of-track is accepted, to avoid clipping the last fraction of a
     /// second on renderers that report position slightly ahead of playback.
     pub const END_MARGIN_MS: u64 = 3000;
+
+    /// Motif — stable, journalisé — de la branche qui a conclu « la piste est
+    /// finie ». Un seul mot par branche, écrit tel quel dans `track_end_gap`.
+    ///
+    /// Ce ne sont PAS des étiquettes décoratives : chaque branche porte un
+    /// plancher de silence différent (voir [`plancher_de_detection_ms`]), et
+    /// c'est ce plancher qui décide si un blanc de 3-4 s est explicable par la
+    /// détection ou s'il vient d'ailleurs (#2488).
+    pub mod motif_fin {
+        /// La sortie locale a signalé l'EOF elle-même (`ended_naturally`).
+        pub const FIN_NATURELLE_LOCALE: &str = "local_ended_naturally";
+        /// DSD sur DLNA : le pic de position a atteint la fin (#402).
+        pub const DSD_DLNA_PIC_ATTEINT: &str = "dlna_dsd_reached_end";
+        /// Le renderer annonce `Stopped` et le compteur a atteint son seuil.
+        pub const FIN_NATURELLE_APRES_STOPPED: &str = "natural_end_after_stopped";
+        /// Le renderer avait accepté `SetNext` mais n'a jamais transitionné.
+        pub const AVANCE_GAPLESS_BLOQUEE: &str = "gapless_advance_stuck";
+        /// La position a dépassé la fin sans que le renderer s'arrête.
+        pub const POSITION_AU_DELA_DE_LA_FIN: &str = "position_past_end";
+    }
+
+    /// Plancher de silence, en millisecondes, imposé par la BRANCHE de
+    /// détection qui a conclu — avant même que la résolution de la piste
+    /// suivante ne commence.
+    ///
+    /// Pourquoi ce chiffre existe (#2488) : `playback_timing` démarre à
+    /// `play_inner`, c'est-à-dire APRÈS que le sondeur a décidé d'avancer.
+    /// Tout ce qui précède cette décision est aujourd'hui invisible dans le
+    /// journal, alors que c'est structurellement le plus gros terme du blanc
+    /// entre deux pistes. Cette fonction rend ce terme lisible sans avoir à
+    /// relire la source : elle ne dérive que des constantes du sondeur.
+    ///
+    /// C'est un PLANCHER, pas une mesure : le temps réel s'y ajoute (un tick
+    /// n'est pas aligné sur la fin du morceau, et le réseau a son mot à dire).
+    ///
+    /// Un motif inconnu rend `0` — on ne devine pas.
+    pub fn plancher_de_detection_ms(motif: &str) -> u64 {
+        let tick = POLL_INTERVAL_MS;
+        match motif {
+            // La sortie locale réveille le sondeur par `TRACK_END_NOTIFY`
+            // au lieu d'attendre le tick : aucun plancher de sondage.
+            motif_fin::FIN_NATURELLE_LOCALE => 0,
+            // Il faut UN sondage pour observer que le pic a atteint la fin.
+            motif_fin::DSD_DLNA_PIC_ATTEINT => tick,
+            // Le compteur `stopped_ticks` doit atteindre son seuil.
+            motif_fin::FIN_NATURELLE_APRES_STOPPED => STOPPED_TICKS_THRESHOLD as u64 * tick,
+            // Compté depuis la fin de la temporisation gapless, qui s'ajoute
+            // encore devant : le renderer a accepté `SetNext` puis n'a rien
+            // fait, et on attend `GAPLESS_STUCK_THRESHOLD` sondages.
+            motif_fin::AVANCE_GAPLESS_BLOQUEE => GAPLESS_STUCK_THRESHOLD as u64 * tick,
+            // La position doit d'abord dépasser la fin de `END_MARGIN_MS`
+            // — autant de silence déjà écoulé — puis tenir
+            // `POSITION_PAST_END_TICKS` sondages.
+            motif_fin::POSITION_AU_DELA_DE_LA_FIN => {
+                END_MARGIN_MS + POSITION_PAST_END_TICKS as u64 * tick
+            }
+            _ => 0,
+        }
+    }
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -3424,6 +3484,11 @@ impl PositionPoller {
             let in_gapless_guard = ps.gapless_sent_at.is_some();
 
             let mut track_ended = false;
+            // Quelle branche a conclu « la piste est finie ». Journalisé tel
+            // quel par `track_end_gap` au moment d'enchaîner (#2488) : sans
+            // lui, le journal ne dit pas laquelle des cinq portes de sortie a
+            // servi, et donc pas quel plancher de silence a été payé.
+            let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
             let mut force_stop_demarrage_mort = false;
 
@@ -3583,6 +3648,7 @@ impl PositionPoller {
                             ps.gapless_stuck_ticks = 0;
                             ps.stopped_ticks = 0;
                             track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE;
                         } else {
                             fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
@@ -3610,6 +3676,7 @@ impl PositionPoller {
                             "local_output_ended_naturally_advancing"
                         );
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::FIN_NATURELLE_LOCALE;
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
@@ -3627,6 +3694,7 @@ impl PositionPoller {
                         );
                         ps.stopped_ticks = 0;
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::DSD_DLNA_PIC_ATTEINT;
                     } else {
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
@@ -3734,6 +3802,8 @@ impl PositionPoller {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         track_ended = true;
+                                        motif_fin_de_piste =
+                                            decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
                                     } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
                                         // On laisse au renderer le temps de
                                         // reprendre : s'il repart, il repassera
@@ -4232,6 +4302,7 @@ impl PositionPoller {
                             );
                             track_ended = true;
                             fsm_pact.past_end_track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN;
                         }
                     } else {
                         ps.past_end_ticks = 0;
@@ -4373,6 +4444,33 @@ impl PositionPoller {
                         .await;
                 }
             } else if track_ended {
+                // #2488 — la moitié invisible du blanc entre deux pistes.
+                //
+                // `playback_timing` (orchestrator) démarre à `play_inner`,
+                // donc APRÈS cette décision : tout ce que le sondeur a attendu
+                // pour conclure « c'est fini » n'apparaît nulle part. Sur un
+                // renderer réseau ce terme domine — de 0 ms (la sortie locale
+                // réveille le sondeur) à plusieurs secondes selon la branche.
+                // Une seule ligne, ici, au seul entonnoir d'avance côté
+                // serveur, avec le nom de la branche et son plancher.
+                let etat = poll_states.get(&zone_id);
+                info!(
+                    zone_id,
+                    motif = motif_fin_de_piste,
+                    plancher_ms = decisions::plancher_de_detection_ms(motif_fin_de_piste),
+                    stopped_ticks = etat.map(|p| p.stopped_ticks).unwrap_or(0),
+                    past_end_ticks = etat.map(|p| p.past_end_ticks).unwrap_or(0),
+                    gapless_sent = etat.map(|p| p.gapless_sent).unwrap_or(false),
+                    peak_pos = etat.map(|p| p.peak_position_ms).unwrap_or(0),
+                    track_dur = track_duration_ms,
+                    wall_secs = wall_elapsed,
+                    output = all_zones
+                        .iter()
+                        .find(|z| z.id == Some(zone_id))
+                        .and_then(|z| z.output_type.as_deref())
+                        .unwrap_or(""),
+                    "track_end_gap"
+                );
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
@@ -5236,6 +5334,61 @@ impl PositionPoller {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2488 — le plancher de silence de chaque branche de fin de piste.
+    ///
+    /// Ces assertions ne décorent pas le code : elles VERROUILLENT le chiffre
+    /// qu'un journal de testeur permettra d'imputer. Si quelqu'un touche
+    /// `STOPPED_TICKS_THRESHOLD`, `POSITION_PAST_END_TICKS`, `END_MARGIN_MS`
+    /// ou l'intervalle de sondage, le plancher annoncé dans `track_end_gap`
+    /// change — et ces tests l'annoncent au lieu de laisser une ligne de
+    /// journal mentir en silence.
+    mod plancher_de_detection {
+        use crate::poller::decisions::{motif_fin, plancher_de_detection_ms};
+
+        /// La sortie locale réveille le sondeur par `TRACK_END_NOTIFY` au lieu
+        /// d'attendre son tick : elle ne paie AUCUN plancher de sondage. C'est
+        /// la borne basse de toute la table, et ce qui distingue le chemin
+        /// local des chemins réseau.
+        #[test]
+        fn la_fin_naturelle_locale_ne_coute_aucun_sondage() {
+            assert_eq!(plancher_de_detection_ms(motif_fin::FIN_NATURELLE_LOCALE), 0);
+        }
+
+        /// Les quatre branches réseau, du moins cher au plus cher. Le blanc
+        /// rapporté par Stéphane Villerio vaut 3 à 4 s : seule la branche DSD
+        /// sur DLNA (1 s) laisse la place aux étapes suivantes dans cette
+        /// enveloppe — les deux dernières (5 s et 6 s) la dépassent à elles
+        /// seules, donc ce n'est pas elles qu'il subit.
+        #[test]
+        fn les_branches_reseau_portent_chacune_leur_plancher() {
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::DSD_DLNA_PIC_ATTEINT),
+                1_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::AVANCE_GAPLESS_BLOQUEE),
+                2_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::FIN_NATURELLE_APRES_STOPPED),
+                5_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::POSITION_AU_DELA_DE_LA_FIN),
+                6_000
+            );
+        }
+
+        /// Un motif que la table ne connaît pas rend `0` : le journal n'annonce
+        /// jamais un chiffre inventé. C'est aussi le cas de la valeur initiale
+        /// (chaîne vide) si une future branche oubliait de se nommer.
+        #[test]
+        fn un_motif_inconnu_ne_promet_rien() {
+            assert_eq!(plancher_de_detection_ms(""), 0);
+            assert_eq!(plancher_de_detection_ms("branche_inventee"), 0);
+        }
+    }
 
     mod tenue_du_renderer {
         use crate::poller::decisions::{TenueDuRenderer, qui_tient_le_renderer};
