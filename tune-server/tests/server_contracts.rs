@@ -17,6 +17,8 @@ mod integration;
 mod karaoke_plugin;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
+#[path = "paroles_source_lrclib.rs"]
+mod paroles_source_lrclib;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "smb_dialect_seam.rs"]
