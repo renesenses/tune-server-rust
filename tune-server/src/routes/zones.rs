@@ -651,7 +651,12 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
 /// la zone ; les premiers octets partent en une seconde ou deux. Douze
 /// secondes laissent de la marge à un poste lent sans laisser l'utilisateur
 /// dans le noir.
-const BROWSER_UNATTENDED_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+///
+/// La valeur vit dans `tune-core` : le poller s'en sert pour ABANDONNER une
+/// lecture que personne ne reçoit (#2630), et cette vue pour la DIRE. Deux
+/// seuils distincts, et Tune afficherait à la fois « aucun onglet ne reçoit le
+/// son » et une lecture en cours — c'est précisément le défaut signalé.
+const BROWSER_UNATTENDED_GRACE: std::time::Duration = tune_core::poller::DELAI_SILENCE_ETABLI;
 
 /// Où va réellement le son de cette zone, dit au client.
 ///
@@ -4428,6 +4433,33 @@ mod output_reach_tests {
             output_reach_of(&zone, &ps, false),
             "browser_unattended",
             "une minute de lecture sans un octet tiré : personne n'écoute"
+        );
+    }
+
+    /// Le bandeau et l'abandon doivent basculer au MÊME instant (#2630).
+    ///
+    /// Le poller arrête désormais une lecture que personne ne tire au bout de
+    /// `tune_core::poller::DELAI_SILENCE_ETABLI`. Si cette vue concluait plus
+    /// tard, l'utilisateur verrait la lecture s'arrêter sans avoir jamais lu
+    /// pourquoi ; plus tôt, elle accuserait un onglet qui a encore le droit de
+    /// démarrer. Un seuil re-codé en dur ici les ferait diverger en silence.
+    #[test]
+    fn le_bandeau_bascule_a_linstant_ou_le_poller_renonce() {
+        let zone = zone_with(Some("browser"), None);
+        let seuil = tune_core::poller::DELAI_SILENCE_ETABLI;
+        assert_eq!(
+            output_reach_of(&zone, &browser_playing_since(seuil), false),
+            "browser_unattended",
+            "à l'échéance du poller, le client doit déjà savoir pourquoi"
+        );
+        assert_eq!(
+            output_reach_of(
+                &zone,
+                &browser_playing_since(seuil - Duration::from_secs(1)),
+                false
+            ),
+            "ok",
+            "une seconde avant, l'onglet peut encore démarrer"
         );
     }
 
