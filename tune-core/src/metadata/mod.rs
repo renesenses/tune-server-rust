@@ -10,6 +10,7 @@ pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+pub mod reidentify;
 pub mod suggestions;
 pub mod tag_writer;
 
