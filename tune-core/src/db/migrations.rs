@@ -4701,13 +4701,13 @@ mod tests {
         //    numérotée (.15, .18, Docker).
         let ce_fichier = include_str!("migrations.rs");
         assert!(
-            ce_fichier.contains("039_task_runs.sql"),
+            ce_fichier.contains("040_task_runs.sql"),
             "`task_runs` existe côté SQLite mais n'est pas enregistrée dans \
              PG_MIGRATIONS"
         );
         assert!(
             racine
-                .join("migrations/postgres/039_task_runs.sql")
+                .join("migrations/postgres/040_task_runs.sql")
                 .exists(),
             "l'entrée PG_MIGRATIONS pointe sur un fichier absent"
         );
@@ -4719,7 +4719,7 @@ mod tests {
             pg_neuf.contains("CREATE TABLE IF NOT EXISTS task_runs"),
             "`task_runs` manque à PG_FULL_SCHEMA : une base créée par la \
              bascule SQLite → PostgreSQL porte schema_version 99 et ne \
-             recevrait JAMAIS la migration 039"
+             recevrait JAMAIS la migration 040"
         );
 
         // 4. `ENSURE_TABLES` — le rattrapage rejoué à CHAQUE démarrage, seul
