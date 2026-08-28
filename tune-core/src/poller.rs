@@ -25,7 +25,9 @@ static POLLER_FSM_SHADOW: LazyLock<bool> = LazyLock::new(|| {
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
-use crate::outputs::traits::{OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState};
+use crate::outputs::traits::{
+    OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+};
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
 /// Upper bound on a single `get_status` poll (device lock + transport call).
@@ -55,11 +57,18 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 async fn get_status_with_signal_path_bounded(
     output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
     timeout: Option<Duration>,
-) -> Result<(OutputStatus, Option<OutputSignalPathStatus>), String> {
+) -> Result<
+    (
+        OutputStatus,
+        Option<OutputSignalPathStatus>,
+        Option<OutputDspMetrics>,
+    ),
+    String,
+> {
     let poll = async {
         let output = output_arc.lock().await;
         let status = output.get_status().await?;
-        Ok((status, output.signal_path_status()))
+        Ok((status, output.signal_path_status(), output.dsp_metrics()))
     };
     match timeout {
         Some(t) => tokio::time::timeout(t, poll)
@@ -2372,13 +2381,16 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path)) => {
+                    Ok((s, signal_path, dsp_metrics)) => {
                         idle_backoff.entry(zone_id).or_default().record_success();
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
                         self.playback
                             .set_output_signal_path(zone_id, signal_path)
+                            .await;
+                        self.playback
+                            .set_output_dsp_metrics(zone_id, dsp_metrics)
                             .await;
                         s
                     }
@@ -2850,7 +2862,7 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path)) => {
+                    Ok((s, signal_path, dsp_metrics)) => {
                         ps.consecutive_errors = 0;
                         let latency = poll_start.elapsed().as_millis() as u32;
                         ps.last_latency_ms = latency;
@@ -2863,6 +2875,9 @@ impl PositionPoller {
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
                         self.playback
                             .set_output_signal_path(zone_id, signal_path)
+                            .await;
+                        self.playback
+                            .set_output_dsp_metrics(zone_id, dsp_metrics)
                             .await;
                         s
                     }
@@ -6966,6 +6981,12 @@ mod status_timeout_tests {
                 reasons: Vec::new(),
             })
         }
+        fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+            Some(OutputDspMetrics {
+                eq_overs: 3,
+                eq_non_finite_samples: 1,
+            })
+        }
         async fn is_available(&self) -> bool {
             true
         }
@@ -6996,23 +7017,25 @@ mod status_timeout_tests {
     #[tokio::test]
     async fn healthy_transport_passes_through() {
         let out = arc(Box::new(FastOutput));
-        let (status, signal_path) =
+        let (status, signal_path, dsp_metrics) =
             get_status_with_signal_path_bounded(&out, Some(Duration::from_secs(5)))
                 .await
                 .unwrap();
         assert_eq!(status.state, TransportState::Playing);
         assert_eq!(signal_path.unwrap().bit_perfect, true);
+        assert_eq!(dsp_metrics.unwrap().eq_overs, 3);
     }
 
     #[tokio::test]
     async fn timeout_disabled_preserves_unbounded_behavior() {
         // TUNE_POLLER_STATUS_TIMEOUT_SECS=0 → rollback to the pre-fix path.
         let out = arc(Box::new(FastOutput));
-        let (status, signal_path) = get_status_with_signal_path_bounded(&out, None)
+        let (status, signal_path, dsp_metrics) = get_status_with_signal_path_bounded(&out, None)
             .await
             .unwrap();
         assert_eq!(status.state, TransportState::Playing);
         assert!(signal_path.is_some());
+        assert_eq!(dsp_metrics.unwrap().eq_non_finite_samples, 1);
     }
 }
 

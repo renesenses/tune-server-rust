@@ -228,6 +228,17 @@ pub struct OutputSignalPathStatus {
     pub reasons: Vec<OutputSignalReason>,
 }
 
+/// Compteurs DSP réellement observés par la sortie pendant la piste courante.
+///
+/// Séparé de [`OutputSignalPathStatus`] pour ne pas casser les plugins externes
+/// qui construisent encore cette structure par littéral. Le trait expose une
+/// méthode à défaut `None`, donc l'ajout reste compatible côté source (#2212).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDspMetrics {
+    pub eq_overs: u64,
+    pub eq_non_finite_samples: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSampleTransport {
@@ -550,6 +561,11 @@ pub trait OutputTarget: Send + Sync {
     /// `None` means that this output does not expose a runtime observation;
     /// callers may retain their existing static description in that case.
     fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+        None
+    }
+
+    /// Compteurs DSP de la piste courante, quand la sortie peut les observer.
+    fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
         None
     }
 }

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
+    TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -6512,6 +6513,18 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())
     }
 
+    fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        self.eq.lock().ok().and_then(|eq| {
+            eq.as_ref().map(|processor| {
+                let stats = processor.process_stats();
+                OutputDspMetrics {
+                    eq_overs: stats.overs,
+                    eq_non_finite_samples: stats.non_finite_samples,
+                }
+            })
+        })
+    }
+
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
         let backend = self.audio_backend.clone();
@@ -7225,6 +7238,29 @@ mod tests {
             ..Default::default()
         };
         crate::audio::eq::EqProcessor::new(&profile, 44100, 2)
+    }
+
+    #[test]
+    fn la_sortie_expose_les_compteurs_du_vrai_processeur_eq() {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_eq(Some(test_eq()));
+        let mut samples = vec![f32::NAN, 0.0];
+
+        apply_local_dsp(
+            &mut samples,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            2,
+            false,
+        );
+
+        let metrics = sortie
+            .dsp_metrics()
+            .expect("un EQ actif doit exposer ses compteurs");
+        assert_eq!(metrics.eq_non_finite_samples, 1);
+        assert_eq!(metrics.eq_overs, 0);
     }
 
     fn stereo_sine_8k(frames: usize) -> Vec<f32> {
