@@ -91,12 +91,12 @@ fn service_key(service_type: &str) -> String {
 
 pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> {
     let mut reader = Reader::from_str(xml);
-    let mut desc = DeviceDescription::default();
-    let mut current_service = ServiceDescription::default();
-    let mut in_service = false;
+    let mut device_stack: Vec<DeviceDescription> = Vec::new();
+    let mut root_device: Option<DeviceDescription> = None;
+    let mut embedded_devices: Vec<DeviceDescription> = Vec::new();
+    let mut current_service: Option<ServiceDescription> = None;
     let mut current_tag = String::new();
     let mut buf = Vec::new();
-    let mut depth_in_device = 0;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -104,10 +104,9 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
                 current_tag = tag.clone();
                 match tag.as_str() {
-                    "device" => depth_in_device += 1,
+                    "device" => device_stack.push(DeviceDescription::default()),
                     "service" => {
-                        in_service = true;
-                        current_service = ServiceDescription::default();
+                        current_service = Some(ServiceDescription::default());
                     }
                     _ => {}
                 }
@@ -115,11 +114,21 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
             Ok(Event::End(ref e)) => {
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
                 match tag.as_str() {
-                    "device" => depth_in_device -= 1,
+                    "device" => {
+                        if let Some(device) = device_stack.pop() {
+                            if device_stack.is_empty() && root_device.is_none() {
+                                root_device = Some(device);
+                            } else {
+                                embedded_devices.push(device);
+                            }
+                        }
+                    }
                     "service" => {
-                        in_service = false;
-                        if !current_service.service_type.is_empty() {
-                            desc.services.push(current_service.clone());
+                        if let (Some(service), Some(device)) =
+                            (current_service.take(), device_stack.last_mut())
+                            && !service.service_type.is_empty()
+                        {
+                            device.services.push(service);
                         }
                     }
                     _ => {}
@@ -135,23 +144,23 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
                 if text.is_empty() {
                     continue;
                 }
-                if in_service {
+                if let Some(service) = current_service.as_mut() {
                     match current_tag.as_str() {
-                        "serviceType" => current_service.service_type = text,
-                        "serviceId" => current_service.service_id = text,
-                        "controlURL" => current_service.control_url = text,
-                        "eventSubURL" => current_service.event_sub_url = text,
-                        "SCPDURL" => current_service.scpd_url = text,
+                        "serviceType" => service.service_type = text,
+                        "serviceId" => service.service_id = text,
+                        "controlURL" => service.control_url = text,
+                        "eventSubURL" => service.event_sub_url = text,
+                        "SCPDURL" => service.scpd_url = text,
                         _ => {}
                     }
-                } else if depth_in_device > 0 {
+                } else if let Some(device) = device_stack.last_mut() {
                     match current_tag.as_str() {
-                        "friendlyName" => desc.friendly_name = text,
-                        "manufacturer" => desc.manufacturer = text,
-                        "modelName" => desc.model_name = text,
-                        "modelDescription" => desc.model_description = text,
-                        "UDN" => desc.udn = text,
-                        "deviceType" => desc.device_type = text,
+                        "friendlyName" => device.friendly_name = text,
+                        "manufacturer" => device.manufacturer = text,
+                        "modelName" => device.model_name = text,
+                        "modelDescription" => device.model_description = text,
+                        "UDN" => device.udn = text,
+                        "deviceType" => device.device_type = text,
                         _ => {}
                     }
                 }
@@ -164,6 +173,46 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
             _ => {}
         }
         buf.clear();
+    }
+
+    let mut desc = root_device.unwrap_or_default();
+
+    // Composite UPnP descriptions commonly expose a MediaRenderer and a
+    // MediaServer below one root device. Flattening every service lets the
+    // server's later ConnectionManager overwrite the renderer's one, whose
+    // Sink is then legitimately empty (#2072). Keep the SSDP root identity,
+    // but attach only the service-owning renderer. Prefer the standard device
+    // type, then tolerate the same non-standard AVTransport devices accepted
+    // by discovery today.
+    if !desc.is_media_renderer() && !desc.has_av_transport() {
+        let renderer = embedded_devices
+            .iter()
+            .find(|device| device.is_media_renderer())
+            .or_else(|| {
+                embedded_devices
+                    .iter()
+                    .find(|device| device.has_av_transport())
+            })
+            .cloned();
+
+        if let Some(renderer) = renderer {
+            if desc.friendly_name.is_empty() {
+                desc.friendly_name = renderer.friendly_name.clone();
+            }
+            if desc.manufacturer.is_empty() {
+                desc.manufacturer = renderer.manufacturer.clone();
+            }
+            if desc.model_name.is_empty() {
+                desc.model_name = renderer.model_name.clone();
+            }
+            if desc.model_description.is_empty() {
+                desc.model_description = renderer.model_description.clone();
+            }
+            // Append so a renderer service wins over a same-named root service
+            // in service_urls/event_sub_urls, while retaining root-only vendor
+            // services used by some OpenHome-compatible devices.
+            desc.services.extend(renderer.services);
+        }
     }
 
     Ok(desc)
@@ -375,5 +424,81 @@ mod tests {
         assert!(!desc.is_media_renderer());
         assert!(!desc.has_av_transport());
         assert!(desc.is_media_server());
+    }
+
+    const COMPOSITE_RENDERER_AND_SERVER_XML: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-denon-com:device:AiosDevice:1</deviceType>
+    <friendlyName>Marantz ND8006</friendlyName>
+    <manufacturer>Marantz</manufacturer>
+    <modelName>ND8006</modelName>
+    <UDN>uuid:root-advertised-by-ssdp</UDN>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+        <friendlyName>Marantz ND8006 Renderer</friendlyName>
+        <UDN>uuid:embedded-renderer</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>/upnp/control/renderer_dvc/AVTransport</controlURL>
+            <eventSubURL>/upnp/event/renderer_dvc/AVTransport</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/upnp/control/renderer_dvc/ConnectionManager</controlURL>
+            <eventSubURL>/upnp/event/renderer_dvc/ConnectionManager</eventSubURL>
+          </service>
+        </serviceList>
+      </device>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+        <friendlyName>Marantz ND8006 Server</friendlyName>
+        <UDN>uuid:embedded-server</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+            <controlURL>/upnp/control/ams_dvc/ContentDirectory</controlURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/upnp/control/ams_dvc/ConnectionManager</controlURL>
+            <eventSubURL>/upnp/event/ams_dvc/ConnectionManager</eventSubURL>
+          </service>
+        </serviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#;
+
+    #[test]
+    fn composite_device_keeps_root_identity_and_renderer_services() {
+        let desc = parse_device_description(COMPOSITE_RENDERER_AND_SERVER_XML).unwrap();
+
+        assert_eq!(desc.udn, "uuid:root-advertised-by-ssdp");
+        assert_eq!(desc.friendly_name, "Marantz ND8006");
+        assert_eq!(
+            desc.device_type,
+            "urn:schemas-denon-com:device:AiosDevice:1"
+        );
+        assert!(desc.has_av_transport());
+
+        let control_urls = desc.service_urls();
+        assert_eq!(
+            control_urls.get("connectionmanager").map(String::as_str),
+            Some("/upnp/control/renderer_dvc/ConnectionManager")
+        );
+        assert_eq!(
+            control_urls.get("avtransport").map(String::as_str),
+            Some("/upnp/control/renderer_dvc/AVTransport")
+        );
+        assert!(!control_urls.contains_key("contentdirectory"));
+
+        let event_urls = desc.event_sub_urls();
+        assert_eq!(
+            event_urls.get("connectionmanager").map(String::as_str),
+            Some("/upnp/event/renderer_dvc/ConnectionManager")
+        );
     }
 }
