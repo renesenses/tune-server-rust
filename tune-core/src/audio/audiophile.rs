@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
-/// Réglage global : le mode PURE impose-t-il le volume à 100 % ?
+/// Réglage global par défaut : le mode PURE impose-t-il le volume à 100 % ?
 pub const SETTING_LOCK_VOLUME: &str = "audiophile_lock_volume";
 
 /// La zone est-elle en mode PURE (audiophile) ?
@@ -39,16 +39,37 @@ pub fn zone_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// Le verrou de volume est-il armé ? **Faux par défaut** : seule la chaîne
+/// Le verrou de volume global est-il armé ? **Faux par défaut** : seule la chaîne
 /// « true » l'active, pour qu'une clé absente ou illisible ne modifie jamais
 /// le volume de personne.
-pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>) -> bool {
+pub fn global_volume_lock_enabled(db: &Arc<dyn DbBackend>) -> bool {
     SettingsRepo::with_backend(db.clone())
         .get(SETTING_LOCK_VOLUME)
         .ok()
         .flatten()
         .as_deref()
         == Some("true")
+}
+
+/// Surcharge du verrou propre à une zone.
+///
+/// Elle vit dans le même objet que le mode PURE, sous `lock_volume`. L'absence
+/// du champ signifie « hériter du réglage global » ; une valeur illisible est
+/// traitée de la même façon pour préserver le comportement historique.
+pub fn volume_lock_override(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<bool> {
+    SettingsRepo::with_backend(db.clone())
+        .get(&format!("zone_{zone_id}_audiophile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("lock_volume").and_then(|e| e.as_bool()))
+}
+
+/// Verrou effectif pour une zone : sa surcharge explicite, ou à défaut le
+/// réglage global historique. Une installation existante sans surcharge garde
+/// donc strictement son comportement.
+pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    volume_lock_override(db, zone_id).unwrap_or_else(|| global_volume_lock_enabled(db))
 }
 
 /// Volume réellement appliqué pour cette zone.
@@ -58,7 +79,7 @@ pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>) -> bool {
 /// la route de volume s'en sert pour répondre la valeur *effective*, ce qui
 /// fait remonter le curseur de l'interface au lieu de le laisser mentir.
 pub fn effective_volume(db: &Arc<dyn DbBackend>, zone_id: i64, requested: f32) -> f32 {
-    if volume_lock_enabled(db) && zone_enabled(db, zone_id) {
+    if volume_lock_enabled(db, zone_id) && zone_enabled(db, zone_id) {
         return 1.0;
     }
     requested.clamp(0.0, 1.0)
@@ -107,17 +128,61 @@ mod tests {
     #[test]
     fn the_volume_lock_is_off_until_explicitly_armed() {
         let db = mem_db();
-        assert!(!volume_lock_enabled(&db));
+        assert!(!global_volume_lock_enabled(&db));
 
         // Rien d'autre que « true » ne l'arme : on ne coupe pas le volume de
         // quelqu'un sur une valeur douteuse.
         for value in ["", "1", "oui", "yes", "TRUE"] {
             set(&db, SETTING_LOCK_VOLUME, value);
-            assert!(!volume_lock_enabled(&db), "« {value} » ne doit pas armer");
+            assert!(
+                !global_volume_lock_enabled(&db),
+                "« {value} » ne doit pas armer"
+            );
         }
 
         set(&db, SETTING_LOCK_VOLUME, "true");
-        assert!(volume_lock_enabled(&db));
+        assert!(global_volume_lock_enabled(&db));
+    }
+
+    #[test]
+    fn a_zone_inherits_the_global_lock_until_it_has_an_override() {
+        let db = mem_db();
+        assert_eq!(volume_lock_override(&db, 7), None);
+        assert!(!volume_lock_enabled(&db, 7));
+
+        set(&db, SETTING_LOCK_VOLUME, "true");
+        assert!(volume_lock_enabled(&db, 7));
+
+        set(
+            &db,
+            "zone_7_audiophile",
+            r#"{"enabled":true,"lock_volume":false}"#,
+        );
+        assert_eq!(volume_lock_override(&db, 7), Some(false));
+        assert!(!volume_lock_enabled(&db, 7));
+
+        set(
+            &db,
+            "zone_8_audiophile",
+            r#"{"enabled":true,"lock_volume":true}"#,
+        );
+        assert_eq!(volume_lock_override(&db, 8), Some(true));
+        assert!(volume_lock_enabled(&db, 8));
+    }
+
+    #[test]
+    fn malformed_zone_override_falls_back_to_the_global_setting() {
+        let db = mem_db();
+        set(&db, SETTING_LOCK_VOLUME, "true");
+        for value in [
+            r#"{"enabled":true}"#,
+            r#"{"enabled":true,"lock_volume":"oui"}"#,
+            "pas du json",
+        ] {
+            set(&db, "zone_9_audiophile", value);
+            assert_eq!(volume_lock_override(&db, 9), None);
+            assert!(volume_lock_enabled(&db, 9));
+        }
     }
 
     #[test]
@@ -137,6 +202,23 @@ mod tests {
         assert_eq!(effective_volume(&db, 2, 0.2), 0.2);
 
         // Les deux : plein volume.
+        assert_eq!(effective_volume(&db, 1, 0.2), 1.0);
+
+        // Une exclusion explicite protège cette zone malgré le verrou global.
+        set(
+            &db,
+            "zone_1_audiophile",
+            r#"{"enabled":true,"lock_volume":false}"#,
+        );
+        assert_eq!(effective_volume(&db, 1, 0.2), 0.2);
+
+        // Et l'inverse permet de verrouiller un transport seulement.
+        set(&db, SETTING_LOCK_VOLUME, "false");
+        set(
+            &db,
+            "zone_1_audiophile",
+            r#"{"enabled":true,"lock_volume":true}"#,
+        );
         assert_eq!(effective_volume(&db, 1, 0.2), 1.0);
     }
 
