@@ -40,7 +40,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
-    crate::routes::system::scan::spawn_scan_scheduler(state.clone());
+    crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);

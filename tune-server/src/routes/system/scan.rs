@@ -1914,16 +1914,20 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
 /// durée pendant laquelle le processus a été absent.
 const CLE_DERNIERE_OCCURRENCE: &str = "scan_schedule_last_run";
 
+/// Motifs d'inscription sans scan. Ce sont les événements journalisés tels
+/// quels — un test les cite, ils ne doivent pas diverger silencieusement.
+const MOTIF_AMORCE: &str = "scheduled_scan_baseline";
+const MOTIF_SCAN_DE_DEMARRAGE: &str = "scheduled_scan_covered_by_startup_scan";
+
 /// Ce que l'ordonnanceur doit faire à ce réveil.
 #[derive(Debug, PartialEq, Eq)]
 enum Ordre {
     /// Désactivé, horaire illisible, ou occurrence déjà honorée.
     Rien,
-    /// Première observation d'un horaire actif : poser la ligne de base SANS
-    /// scanner. Activer l'option ne doit jamais déclencher un scan.
-    Amorcer(time::Date),
-    /// L'occurrence de cette date est due et n'a pas été honorée.
-    Due(time::Date),
+    /// Inscrire l'occurrence SANS scanner ; le motif part au journal.
+    Noter(time::Date, &'static str),
+    /// Inscrire l'occurrence ET lancer le scan.
+    Scanner(time::Date),
 }
 
 /// La dernière occurrence dont l'heure est passée : celle d'aujourd'hui si
@@ -1958,7 +1962,19 @@ fn occurrence_due(now: time::OffsetDateTime, sh: u8, sm: u8) -> Option<time::Dat
 /// rattrapage n'est nécessaire : rattraper une occurrence vieille d'une semaine
 /// coûte exactement le prix d'une occurrence vieille d'un jour, et c'est
 /// précisément au retour de vacances que la bibliothèque est la plus périmée.
-fn decider(active: bool, horaire: &str, now: time::OffsetDateTime, dernier: Option<&str>) -> Ordre {
+///
+/// `scan_de_demarrage` vaut vrai UNIQUEMENT au premier tour, et seulement si un
+/// scan de démarrage a été lancé (`TUNE_AUTO_SCAN`). Ce scan-là fait déjà le
+/// travail de l'occurrence : elle est donc inscrite sans en lancer un second.
+/// C'est ce qui interdit la cascade au démarrage sans dépendre d'une course —
+/// le fait est connu au boot, pas mesuré 30 secondes plus tard.
+fn decider(
+    active: bool,
+    horaire: &str,
+    now: time::OffsetDateTime,
+    dernier: Option<&str>,
+    scan_de_demarrage: bool,
+) -> Ordre {
     if !active {
         return Ordre::Rien;
     }
@@ -1974,8 +1990,14 @@ fn decider(active: bool, horaire: &str, now: time::OffsetDateTime, dernier: Opti
         // Une absence n'est pas une occurrence manquée — elle ne prouve rien.
         // On l'inscrit comme point de départ, ce qui interdit le scan-surprise
         // à la mise à jour ; l'occurrence SUIVANTE, elle, est décidable.
-        None => Ordre::Amorcer(due),
-        Some(honoree) if honoree < due => Ordre::Due(due),
+        None => Ordre::Noter(due, MOTIF_AMORCE),
+        Some(honoree) if honoree < due => {
+            if scan_de_demarrage {
+                Ordre::Noter(due, MOTIF_SCAN_DE_DEMARRAGE)
+            } else {
+                Ordre::Scanner(due)
+            }
+        }
         Some(_) => Ordre::Rien,
     }
 }
@@ -2020,10 +2042,17 @@ fn noter_occurrence(settings: &SettingsRepo, jour: time::Date) {
 /// honorée ? Sinon elle part — que le tour tombe à l'heure juste, après un
 /// démarrage tardif ou après un réveil de veille : c'est le MÊME chemin, il n'y
 /// a pas de « rattrapage » séparé à maintenir.
-pub(crate) fn spawn_scan_scheduler(state: AppState) {
+///
+/// `scan_de_demarrage` dit si un scan de démarrage a été lancé par ce
+/// processus ; il ne vaut que pour le premier tour de boucle.
+pub(crate) fn spawn_scan_scheduler(state: AppState, scan_de_demarrage: bool) {
     tokio::spawn(async move {
+        // Consommé au premier tour et à lui seul : trois jours plus tard, une
+        // occurrence due doit évidemment scanner.
+        let mut premier_tour = scan_de_demarrage;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let couvert_par_le_demarrage = std::mem::take(&mut premier_tour);
             let settings = SettingsRepo::with_backend(state.backend.clone());
             let active = settings
                 .get("scan_schedule_enabled")
@@ -2042,19 +2071,27 @@ pub(crate) fn spawn_scan_scheduler(state: AppState) {
             // indisponible (certaines configurations Linux durcies).
             let now = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-            let due = match decider(active, &horaire, now, dernier.as_deref()) {
+            let due = match decider(
+                active,
+                &horaire,
+                now,
+                dernier.as_deref(),
+                couvert_par_le_demarrage,
+            ) {
                 Ordre::Rien => continue,
-                Ordre::Amorcer(jour) => {
+                Ordre::Noter(jour, motif) => {
                     noter_occurrence(&settings, jour);
-                    tracing::info!(occurrence = %date_iso(jour), "scheduled_scan_baseline");
+                    tracing::info!(occurrence = %date_iso(jour), motif, "scheduled_scan_noted");
                     continue;
                 }
-                Ordre::Due(jour) => jour,
+                Ordre::Scanner(jour) => jour,
             };
             // Même condition que le balayage acoustique, par la MÊME fonction :
             // une passe de fond ne dispute pas le disque au lecteur (#1310,
             // #1515). Rien n'est inscrit ici — l'occurrence reste due et
-            // repassera dans 30 s, jusqu'à ce que la musique s'arrête.
+            // repassera dans 30 s, jusqu'à ce que la musique s'arrête. C'est ce
+            // que demandait Thierry : « dans les mêmes conditions que le scan
+            // CLAP ».
             if let Some(zone) = tune_core::audio::replaygain::playing_zone_name(&state.backend) {
                 tracing::info!(
                     zone = %zone,
@@ -2074,11 +2111,10 @@ pub(crate) fn spawn_scan_scheduler(state: AppState) {
                     "scheduled_scan_triggered"
                 );
             } else {
-                // La porte unique refuse : un scan tourne DÉJÀ (démarrage,
-                // manuel, ajout de dossier). Il fait le travail de l'occurrence,
-                // qui est donc honorée. C'est ce qui interdit la cascade « scan
-                // de démarrage PUIS scan programmé » sur une machine rallumée
-                // après un rendez-vous manqué — le cas exact de #2469.
+                // La porte unique refuse : un scan tourne DÉJÀ (manuel, ajout de
+                // dossier, ou scan de démarrage encore en cours). Il fait le
+                // travail de l'occurrence, qui est donc honorée — jamais un
+                // second scan, jamais une nouvelle tentative dans 30 s.
                 tracing::info!(
                     occurrence = %date_iso(due),
                     "scheduled_scan_covered_by_running_scan"
@@ -3105,10 +3141,13 @@ mod rapport_de_scan_publie_la_purge {
 /// donc « la machine était éteinte de 20 h 55 à 21 h 05 » s'écrit littéralement.
 #[cfg(test)]
 mod scan_scheduler_tests {
-    use super::{Ordre, decider};
+    use super::{MOTIF_AMORCE, MOTIF_SCAN_DE_DEMARRAGE, Ordre, decider};
     use time::macros::{date, datetime};
 
     const HORAIRE: &str = "21:00";
+    /// Aucun scan de démarrage : le cas d'un poste ordinaire, `TUNE_AUTO_SCAN`
+    /// valant `false` par défaut (`tune-server/src/config.rs`).
+    const SANS_SCAN_DE_DEMARRAGE: bool = false;
 
     /// L'occurrence tombe pendant que le serveur tourne : elle part.
     #[test]
@@ -3118,15 +3157,16 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-27 21:00 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 27))
+            Ordre::Scanner(date!(2026 - 08 - 27))
         );
     }
 
     /// Une minute avant, rien : l'occurrence de la veille est déjà honorée.
     /// C'est la contre-épreuve du test précédent — sans elle, un `decider` qui
-    /// renverrait toujours `Due` passerait pour correct.
+    /// renverrait toujours `Scanner` passerait pour correct.
     #[test]
     fn avant_l_heure_ne_declenche_rien() {
         assert_eq!(
@@ -3134,7 +3174,8 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-27 20:59 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
             Ordre::Rien
         );
@@ -3145,14 +3186,14 @@ mod scan_scheduler_tests {
     #[test]
     fn occurrence_manquee_machine_eteinte_est_rattrapee_au_demarrage() {
         // Dernier passage : la veille, à l'heure. Le serveur s'arrête à 20 h 55.
-        let avant_extinction = decider(
-            true,
-            HORAIRE,
-            datetime!(2026-08-27 20:55 UTC),
-            Some("2026-08-26"),
-        );
         assert_eq!(
-            avant_extinction,
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 20:55 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
             Ordre::Rien,
             "rien n'est dû avant l'heure : l'état persisté est bien celui de la veille"
         );
@@ -3162,9 +3203,10 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-27 21:05 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 27)),
+            Ordre::Scanner(date!(2026 - 08 - 27)),
             "l'occurrence de 21 h 00 manquée doit partir au démarrage"
         );
     }
@@ -3179,9 +3221,10 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-28 09:30 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 27))
+            Ordre::Scanner(date!(2026 - 08 - 27))
         );
     }
 
@@ -3196,9 +3239,10 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-27 23:47 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 27))
+            Ordre::Scanner(date!(2026 - 08 - 27))
         );
     }
 
@@ -3206,15 +3250,15 @@ mod scan_scheduler_tests {
     /// pas : une seule occurrence est due, la plus récente.
     #[test]
     fn six_jours_manques_ne_valent_qu_une_seule_occurrence() {
-        let ordre = decider(
-            true,
-            HORAIRE,
-            datetime!(2026-08-27 09:00 UTC),
-            Some("2026-08-20"),
-        );
         assert_eq!(
-            ordre,
-            Ordre::Due(date!(2026 - 08 - 26)),
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:00 UTC),
+                Some("2026-08-20"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 26)),
             "seule la dernière occurrence échue est due"
         );
         // Et une fois celle-là honorée, plus rien avant 21 h.
@@ -3223,7 +3267,8 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-27 09:01 UTC),
-                Some("2026-08-26")
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
             Ordre::Rien
         );
@@ -3239,21 +3284,59 @@ mod scan_scheduler_tests {
             HORAIRE,
             datetime!(2026-08-28 08:00 UTC),
             Some("2026-08-26"),
+            SANS_SCAN_DE_DEMARRAGE,
         );
-        let Ordre::Due(jour) = premier else {
+        let Ordre::Scanner(jour) = premier else {
             panic!("le premier démarrage doit rattraper, obtenu {premier:?}");
         };
-        // Ce que la boucle persiste juste avant de lancer le scan.
+        // Exactement ce que la boucle persiste juste avant de lancer le scan.
         let persiste = super::date_iso(jour);
         assert_eq!(
             decider(
                 true,
                 HORAIRE,
                 datetime!(2026-08-28 08:03 UTC),
-                Some(&persiste)
+                Some(&persiste),
+                SANS_SCAN_DE_DEMARRAGE
             ),
             Ordre::Rien,
             "le second démarrage relit la trace du premier et ne relance rien"
+        );
+    }
+
+    /// L'autre moitié du « jamais deux scans » : quand `TUNE_AUTO_SCAN` est
+    /// actif, le scan de démarrage fait déjà le travail de l'occurrence manquée.
+    /// Elle est inscrite, pas rejouée — sinon la machine rallumée après un
+    /// rendez-vous manqué scannerait DEUX fois de suite.
+    #[test]
+    fn le_scan_de_demarrage_couvre_l_occurrence_manquee() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26"),
+                true
+            ),
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_SCAN_DE_DEMARRAGE),
+            "l'occurrence est honorée par le scan de démarrage, pas rejouée"
+        );
+    }
+
+    /// Et la couverture ne vaut QUE pour le premier tour : la boucle consomme le
+    /// drapeau avec `std::mem::take`. Trois jours plus tard, une occurrence due
+    /// scanne bel et bien.
+    #[test]
+    fn la_couverture_de_demarrage_ne_vaut_pas_pour_les_jours_suivants() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-31 21:00 UTC),
+                Some("2026-08-30"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 31))
         );
     }
 
@@ -3265,7 +3348,8 @@ mod scan_scheduler_tests {
                 false,
                 HORAIRE,
                 datetime!(2026-08-28 09:30 UTC),
-                Some("2026-08-20")
+                Some("2026-08-20"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
             Ordre::Rien
         );
@@ -3278,8 +3362,14 @@ mod scan_scheduler_tests {
     #[test]
     fn premiere_observation_amorce_sans_scanner() {
         assert_eq!(
-            decider(true, HORAIRE, datetime!(2026-08-27 09:30 UTC), None),
-            Ordre::Amorcer(date!(2026 - 08 - 26))
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:30 UTC),
+                None,
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Noter(date!(2026 - 08 - 26), MOTIF_AMORCE)
         );
     }
 
@@ -3288,13 +3378,19 @@ mod scan_scheduler_tests {
     /// première seule serait satisfaite par un ordonnanceur mort.
     #[test]
     fn activer_le_soir_amorce_puis_scanne_le_lendemain() {
-        let amorce = decider(true, HORAIRE, datetime!(2026-08-27 22:10 UTC), None);
+        let amorce = decider(
+            true,
+            HORAIRE,
+            datetime!(2026-08-27 22:10 UTC),
+            None,
+            SANS_SCAN_DE_DEMARRAGE,
+        );
         assert_eq!(
             amorce,
-            Ordre::Amorcer(date!(2026 - 08 - 27)),
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_AMORCE),
             "activer à 22 h 10 pour 21 h 00 ne doit pas scanner le soir même"
         );
-        let Ordre::Amorcer(jour) = amorce else {
+        let Ordre::Noter(jour, _) = amorce else {
             unreachable!()
         };
         let persiste = super::date_iso(jour);
@@ -3303,9 +3399,10 @@ mod scan_scheduler_tests {
                 true,
                 HORAIRE,
                 datetime!(2026-08-28 21:00 UTC),
-                Some(&persiste)
+                Some(&persiste),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 28)),
+            Ordre::Scanner(date!(2026 - 08 - 28)),
             "et le lendemain à 21 h 00, il part"
         );
     }
@@ -3320,9 +3417,10 @@ mod scan_scheduler_tests {
                     true,
                     HORAIRE,
                     datetime!(2026-08-27 22:00 UTC),
-                    Some(corrompu)
+                    Some(corrompu),
+                    SANS_SCAN_DE_DEMARRAGE
                 ),
-                Ordre::Amorcer(date!(2026 - 08 - 27)),
+                Ordre::Noter(date!(2026 - 08 - 27), MOTIF_AMORCE),
                 "trace « {corrompu} »"
             );
         }
@@ -3338,7 +3436,8 @@ mod scan_scheduler_tests {
                     true,
                     mauvais,
                     datetime!(2026-08-27 22:00 UTC),
-                    Some("2026-08-20")
+                    Some("2026-08-20"),
+                    SANS_SCAN_DE_DEMARRAGE
                 ),
                 Ordre::Rien,
                 "horaire « {mauvais} »"
@@ -3356,18 +3455,20 @@ mod scan_scheduler_tests {
                 true,
                 "00:00",
                 datetime!(2026-09-01 00:00 UTC),
-                Some("2026-08-31")
+                Some("2026-08-31"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 09 - 01))
+            Ordre::Scanner(date!(2026 - 09 - 01))
         );
         assert_eq!(
             decider(
                 true,
                 "23:30",
                 datetime!(2026-09-01 00:10 UTC),
-                Some("2026-08-30")
+                Some("2026-08-30"),
+                SANS_SCAN_DE_DEMARRAGE
             ),
-            Ordre::Due(date!(2026 - 08 - 31)),
+            Ordre::Scanner(date!(2026 - 08 - 31)),
             "à 00 h 10, l'occurrence de 23 h 30 due est celle du 31 août"
         );
     }
@@ -3387,18 +3488,17 @@ mod scan_scheduler_cablage_tests {
     #[test]
     fn l_ordonnanceur_est_bien_lance_au_demarrage() {
         let background = include_str!("../../background.rs");
-        assert!(
-            background.contains("scan::spawn_scan_scheduler(state.clone())"),
-            "spawn_scan_scheduler doit être appelé depuis background.rs — \
-             sans cet appel, la bascule « scan planifié » est sans effet (#2469)"
-        );
-        // Contre-épreuve du témoin : si `include_str!` pointait sur un fichier
-        // vide ou faux, l'assertion ci-dessus échouerait, mais un `contains`
-        // trop laxiste passerait sur n'importe quoi. On vérifie donc aussi que
-        // le fichier lu est bien celui qui câble les passes de fond.
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
         assert!(
             background.contains("pub async fn spawn_background_tasks"),
             "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        assert!(
+            background.contains("scan::spawn_scan_scheduler(state.clone(), config.auto_scan)"),
+            "spawn_scan_scheduler doit être appelé depuis background.rs, en lui \
+             passant `config.auto_scan` — sans cet appel, la bascule « scan \
+             planifié » est sans effet (#2469)"
         );
     }
 }
