@@ -165,7 +165,7 @@ pub async fn reply(
     body: &str,
 ) -> SupportResult {
     let resp = auth
-        .apply(http_client.post(format!("{SUPPORT_API}/{id}/reply")))
+        .apply(http_client.post(reply_url(id)))
         .json(&json!({ "body": body }))
         .timeout(TIMEOUT)
         .send()
@@ -173,6 +173,44 @@ pub async fn reply(
         .map_err(request_error)?;
 
     parse(resp).await
+}
+
+/// Mémorise la lecture d'un fil : les réponses du SAV antérieures cessent de
+/// compter dans `unread_count`.
+///
+/// Dernier appel du support qui partait encore du NAVIGATEUR vers
+/// mozaiklabs.fr, avec la clé de licence dans le corps (#2559). Depuis une page
+/// servie par le serveur Tune — `http://192.168.1.18:8888`, `http://localhost:8888` —
+/// l'origine diffère de `https://mozaiklabs.fr` : le navigateur bloquait la
+/// requête par CORS, et `localhost` n'y échappe pas. En passant par ici, la clé
+/// ne quitte plus le serveur et l'appel est de même origine pour la page.
+pub async fn mark_read(
+    http_client: &reqwest::Client,
+    auth: &SupportAuth,
+    id: i64,
+) -> SupportResult {
+    let resp = auth
+        .apply(http_client.post(read_url(id)))
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(request_error)?;
+
+    parse(resp).await
+}
+
+/// URL de réponse à un ticket.
+///
+/// Le singulier n'est pas un détail : mozaiklabs expose `…/reply` ET son alias
+/// `…/replies`, et se tromper de forme rendrait un 404 que le relais
+/// propagerait tel quel. Isolé pour être vérifié par un test.
+fn reply_url(id: i64) -> String {
+    format!("{SUPPORT_API}/{id}/reply")
+}
+
+/// URL de marquage « lu » d'un ticket.
+fn read_url(id: i64) -> String {
+    format!("{SUPPORT_API}/{id}/read")
 }
 
 /// 502 Bad Gateway quand mozaiklabs est injoignable (réseau, timeout).
@@ -381,6 +419,23 @@ mod tests {
         assert_eq!(status, 403);
         assert!(body.get("error").is_none(), "corps modifié : {body}");
         assert!(body.get("retry_after").is_none(), "corps modifié : {body}");
+    }
+
+    /// Les chemins amont sont recopiés de `routes/api.php` de site-mozaiklabs :
+    /// `POST /v1/support/tickets/{ticket}/reply` et
+    /// `POST /v1/support/tickets/{ticket}/read`. Une faute de forme rendrait un
+    /// 404 amont, que `parse` propagerait tel quel au client — un « marquer lu »
+    /// silencieusement mort, exactement le défaut qu'on corrige.
+    #[test]
+    fn les_urls_amont_suivent_le_contrat_laravel() {
+        assert_eq!(
+            reply_url(42),
+            "https://mozaiklabs.fr/api/v1/support/tickets/42/reply"
+        );
+        assert_eq!(
+            read_url(42),
+            "https://mozaiklabs.fr/api/v1/support/tickets/42/read"
+        );
     }
 
     #[test]
