@@ -104,6 +104,44 @@ const POLL_INTERVAL_MS: u64 = 1000;
 /// deux tentatives quand l'appareil ne répond plus. Assez pour cesser de le
 /// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
 const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
+/// Cadence de sondage d'une zone **arrêtée dont le renderer répond**, en
+/// secondes d'horloge murale.
+///
+/// Une zone qui ne joue rien n'est sondée que pour une seule raison : repérer
+/// une lecture démarrée hors de Tune (façade de l'appareil, autre
+/// application). Tout ce que la branche « repos » sait faire est verrouillé
+/// derrière un transport ACTIF — l'adoption du volume réglé sur l'appareil
+/// comme la reprise d'état exigent l'une et l'autre
+/// `status.state == TransportState::Playing`. Face à un renderer qui répond
+/// `Stopped`, les trois actions SOAP d'un tick ne produisent donc rien, et
+/// elles partaient chaque seconde, indéfiniment : sur une installation qui se
+/// repose 20 h par jour pour 4 h de lecture, c'est le premier poste de
+/// dépense UPnP, loin devant la lecture elle-même (#2263).
+///
+/// Ce qui est échangé : le délai de détection d'une lecture lancée depuis la
+/// façade de l'appareil passe de 1 s à 5 s au pire. Dès que le renderer
+/// annonce autre chose que `Stopped`, la cadence repart à plein régime au
+/// tick suivant — reprise d'état, synchronisation du volume et détection de
+/// conflit gardent exactement le rythme qu'elles ont aujourd'hui.
+///
+/// Écrit en secondes, converti en ticks à la compilation. `POLL_INTERVAL_MS`
+/// est le facteur de conversion implicite entre les garde-fous du sondeur
+/// comptés en ticks et ceux comptés en horloge murale ; poser « 5 ticks » ici
+/// aurait ajouté un garde-fou de plus à la première famille, celle qui se
+/// désaccorde en silence le jour où la cadence devient réglable.
+const IDLE_REPOS_POLL_SECS: u64 = 5;
+/// [`IDLE_REPOS_POLL_SECS`] exprimé en ticks de sondeur. Jamais zéro : une
+/// cadence de repos plus courte qu'un tick vaut « à chaque tick ».
+const IDLE_REPOS_POLL_TICKS: u8 = {
+    let ticks = (IDLE_REPOS_POLL_SECS * 1000).div_ceil(POLL_INTERVAL_MS);
+    if ticks == 0 {
+        1
+    } else if ticks > u8::MAX as u64 {
+        u8::MAX
+    } else {
+        ticks as u8
+    }
+};
 const GAPLESS_WINDOW_MS: u64 = 30_000;
 
 /// Au-dela de ce delai, une piste mise en attente n'est plus fiable et doit
@@ -2149,10 +2187,21 @@ impl IdlePollBackoff {
         }
     }
 
-    /// Sondage réussi : on repart à plein rythme.
-    fn record_success(&mut self) {
+    /// Sondage réussi. La suite dépend de ce que l'appareil a répondu.
+    ///
+    /// Un transport actif — `Playing`, `Paused`, `Transitioning` — veut dire
+    /// qu'il se passe quelque chose sur l'appareil : plein rythme, comme
+    /// avant. Un transport `Stopped` ne peut rien produire de plus au tick
+    /// suivant qu'à celui-ci (toute la branche « repos » est verrouillée
+    /// derrière un transport actif) : la zone retombe à la cadence de repos
+    /// [`IDLE_REPOS_POLL_TICKS`] jusqu'à ce que l'appareil bouge (#2263).
+    fn record_success(&mut self, etat: TransportState) {
         self.consecutive_errors = 0;
-        self.remaining = 0;
+        self.remaining = if etat == TransportState::Stopped {
+            IDLE_REPOS_POLL_TICKS - 1
+        } else {
+            0
+        };
     }
 
     /// Sondage en échec : recul exponentiel, plafonné.
@@ -2750,7 +2799,10 @@ impl PositionPoller {
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok((s, signal_path, dsp_metrics)) => {
-                        idle_backoff.entry(zone_id).or_default().record_success();
+                        idle_backoff
+                            .entry(zone_id)
+                            .or_default()
+                            .record_success(s.state);
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
@@ -7286,12 +7338,112 @@ mod tests {
         b.record_failure();
         b.record_failure();
         assert!(b.remaining > 0);
-        b.record_success();
+        b.record_success(TransportState::Playing);
         assert_eq!(b.consecutive_errors, 0);
         assert!(
             !b.should_skip(),
             "un appareil qui répond doit être sondé à plein rythme"
         );
+    }
+
+    /// La cadence de repos est une DURÉE, pas un nombre de ticks : elle doit
+    /// rester la même durée si la cadence du sondeur change un jour. C'est le
+    /// désaccord silencieux décrit en #2263 (les garde-fous comptés en ticks
+    /// changent de sens quand `POLL_INTERVAL_MS` bouge, ceux comptés en
+    /// horloge murale non).
+    #[test]
+    fn la_cadence_de_repos_est_une_duree_murale() {
+        let duree_ms = super::IDLE_REPOS_POLL_TICKS as u64 * super::POLL_INTERVAL_MS;
+        assert_eq!(
+            duree_ms,
+            super::IDLE_REPOS_POLL_SECS * 1000,
+            "{} ticks de {} ms ne font pas {} s",
+            super::IDLE_REPOS_POLL_TICKS,
+            super::POLL_INTERVAL_MS,
+            super::IDLE_REPOS_POLL_SECS
+        );
+        assert!(
+            super::IDLE_REPOS_POLL_TICKS >= 1,
+            "une cadence de repos nulle sonderait en boucle"
+        );
+    }
+
+    /// Un renderer qui répond `Stopped` est sondé à la cadence de repos, pas
+    /// à chaque seconde : c'est le premier poste de dépense SOAP d'une
+    /// installation au repos (#2263).
+    #[test]
+    fn une_zone_arretee_retombe_a_la_cadence_de_repos() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_success(TransportState::Stopped);
+        for i in 1..super::IDLE_REPOS_POLL_TICKS {
+            assert!(
+                b.should_skip(),
+                "tick {i} : la zone au repos ne doit pas être re-sondée"
+            );
+        }
+        assert!(
+            !b.should_skip(),
+            "après {} ticks, il faut bien re-sonder",
+            super::IDLE_REPOS_POLL_TICKS
+        );
+    }
+
+    /// Le frein ne s'applique QU'AU repos : tout transport actif — y compris
+    /// une pause ou une transition — garde le plein rythme, sans quoi la
+    /// reprise d'état et l'adoption du volume ralentiraient elles aussi.
+    #[test]
+    fn un_transport_actif_garde_le_plein_rythme() {
+        for etat in [
+            TransportState::Playing,
+            TransportState::Paused,
+            TransportState::Transitioning,
+        ] {
+            let mut b = super::IdlePollBackoff::default();
+            b.record_success(etat);
+            assert!(
+                !b.should_skip(),
+                "{etat:?} : un appareil qui bouge doit rester sondé à chaque tick"
+            );
+        }
+    }
+
+    /// Quantifie le gain, comme le fait déjà le test de l'appareil mort : sur
+    /// une minute face à une zone arrêtée dont le renderer répond poliment,
+    /// l'ancien chemin envoyait 60 sondages — soit 180 actions SOAP pour
+    /// n'apprendre rien.
+    #[test]
+    fn une_zone_arretee_ne_coute_plus_un_sondage_par_seconde() {
+        let mut b = super::IdlePollBackoff::default();
+        let mut sondages = 0;
+        for _ in 0..60 {
+            if b.should_skip() {
+                continue;
+            }
+            sondages += 1;
+            b.record_success(TransportState::Stopped);
+        }
+        assert_eq!(
+            sondages,
+            60 / super::IDLE_REPOS_POLL_TICKS as u32,
+            "60 ticks à la cadence de repos"
+        );
+        assert!(
+            sondages <= 12,
+            "60 sondages par minute étaient le défaut corrigé, or {sondages}"
+        );
+    }
+
+    /// Une zone qui se remet à jouer depuis la façade de l'appareil doit
+    /// retrouver le plein rythme au tick suivant : le frein ne doit jamais
+    /// survivre au réveil.
+    #[test]
+    fn le_frein_de_repos_saute_des_que_l_appareil_repart() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_success(TransportState::Stopped);
+        while b.should_skip() {}
+        b.record_success(TransportState::Playing);
+        assert!(!b.should_skip());
+        assert!(!b.should_skip());
     }
 
     /// Quantifie le gain : sur une minute face à un appareil qui ne répond
@@ -7595,6 +7747,132 @@ mod status_timeout_tests {
     }
 }
 
+#[cfg(test)]
+mod cadence_de_repos_tests {
+    use super::*;
+    use crate::db::zone_repo::ZoneRepo;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Renderer poli : il répond toujours, et il répond ce qu'on lui dit de
+    /// répondre. Il compte les `get_status` reçus — c'est exactement le
+    /// trafic SOAP que #2263 mesure.
+    struct Compteur {
+        etat: TransportState,
+        appels: Arc<AtomicU32>,
+    }
+    #[async_trait::async_trait]
+    impl OutputTarget for Compteur {
+        fn name(&self) -> &str {
+            "compteur"
+        }
+        fn device_id(&self) -> &str {
+            "test:compteur"
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<OutputStatus, String> {
+            self.appels.fetch_add(1, Ordering::Relaxed);
+            Ok(OutputStatus {
+                state: self.etat,
+                ..Default::default()
+            })
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Joue `ticks` tours de la vraie boucle `tick()` sur une zone arrêtée
+    /// câblée à un renderer qui répond `etat`, et rend le nombre de sondages
+    /// qu'il a réellement subis.
+    async fn sondages_sur(etat: TransportState, ticks: u32) -> u32 {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+        let device_id = "test:compteur";
+        ZoneRepo::with_backend(db.clone())
+            .create("Salon", Some("test"), Some(device_id))
+            .unwrap();
+
+        let appels = Arc::new(AtomicU32::new(0));
+        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+        outputs.lock().await.register(Box::new(Compteur {
+            etat,
+            appels: appels.clone(),
+        }));
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        let orchestrator = Arc::new(PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(Mutex::new(crate::streaming::ServiceRegistry::new())),
+            outputs.clone(),
+            None,
+        ));
+        let poller = PositionPoller::new(
+            orchestrator,
+            playback,
+            outputs.clone(),
+            db.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
+        let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
+        let startup_at = Instant::now();
+        for _ in 0..ticks {
+            poller
+                .tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                .await;
+        }
+        appels.load(Ordering::Relaxed)
+    }
+
+    /// Le défaut de #2263, mesuré sur la vraie boucle : une zone arrêtée dont
+    /// le renderer répond poliment était sondée à CHAQUE tick, indéfiniment.
+    ///
+    /// Ce test couvre le site d'appel, pas seulement `IdlePollBackoff` :
+    /// neutraliser l'état passé à `record_success` laissait les tests
+    /// unitaires du recul entièrement verts.
+    #[tokio::test]
+    async fn une_zone_arretee_est_sondee_a_la_cadence_de_repos() {
+        let sondages = sondages_sur(TransportState::Stopped, 10).await;
+        assert_eq!(
+            sondages,
+            10u32.div_ceil(IDLE_REPOS_POLL_TICKS as u32),
+            "10 ticks sur une zone arrêtée doivent tenir en {} sondages, pas {sondages}",
+            10u32.div_ceil(IDLE_REPOS_POLL_TICKS as u32)
+        );
+    }
+
+    /// Le frein ne doit jamais toucher un appareil qui joue : la reprise
+    /// d'état après une lecture lancée depuis la façade, la synchronisation du
+    /// volume et la détection de conflit gardent leur cadence d'aujourd'hui.
+    #[tokio::test]
+    async fn un_renderer_qui_joue_reste_sonde_a_chaque_tick() {
+        assert_eq!(sondages_sur(TransportState::Playing, 10).await, 10);
+    }
+}
 #[cfg(test)]
 mod gapless_stage_expiry_tests {
     use super::decisions::gapless_stage_expired;
