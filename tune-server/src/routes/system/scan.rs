@@ -852,14 +852,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         };
 
-        // Same audio-hash dedup as the auto/startup scan: without it, the
-        // manual scan (the "Scanner" button — the path users actually hit)
-        // happily inserted the same content twice when it exists under two
-        // paths, while the auto scan deduped. (hash, album_id) pairs already
-        // in the library are skipped for NEW inserts only; updates of an
-        // existing path are never affected.
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        // `audio_hash` is a cheap candidate selector, not proof of identity.
+        // Keep the candidate paths so every decision that can hide a track is
+        // confirmed byte-for-byte (#2664).
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
@@ -934,11 +931,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut updated = 0i64;
         let mut db_insert_failed = 0i64;
         let mut db_update_failed = 0i64;
-        // `skipped` stays the aggregate the UI already shows. The manual scan
-        // never dedups by audio_hash (only the auto/watcher path does), so
-        // everything it skips is either an unchanged file or a file whose
-        // metadata could not be read — broken out below so the report says
-        // which.
+        // `skipped` stays the aggregate the UI already shows. Each cause is
+        // broken out below, including only those duplicate candidates whose
+        // complete files were confirmed byte-for-byte.
         let mut skipped = pre_skipped;
         let mut skipped_unchanged = pre_skipped;
         let mut skipped_duplicate = 0i64;
@@ -1062,23 +1057,38 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         track.id = Some(existing_id);
                         to_update.push(track);
                     } else {
-                        // Deduplicate by audio_hash + album_id (same rule as
-                        // the auto scan): identical content already present in
-                        // this album via another path is not inserted again.
+                        // The sampled hash only narrows the candidates. A track
+                        // is skipped solely when a complete byte comparison
+                        // confirms an exact copy in the same album.
                         if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                             let key = (hash.clone(), aid);
-                            if known_hashes.contains(&key) {
+                            let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                            if let Some(existing_path) =
+                                tune_core::scanner::hasher::find_byte_identical_path(
+                                    std::path::Path::new(&sf.path),
+                                    &candidates,
+                                )
+                            {
                                 tracing::debug!(
                                     audio_hash = %hash,
                                     album_id = aid,
                                     path = %sf.path,
+                                    existing_path = %existing_path,
                                     "skip_duplicate_audio_hash"
                                 );
                                 skipped += 1;
                                 skipped_duplicate += 1;
                                 continue;
                             }
-                            known_hashes.insert(key);
+                            if !candidates.is_empty() {
+                                tracing::warn!(
+                                    audio_hash = %hash,
+                                    album_id = aid,
+                                    path = %sf.path,
+                                    candidates = candidates.len(),
+                                    "audio_hash_candidate_not_byte_identical"
+                                );
+                            }
                         }
                         to_insert.push(track);
                     }
@@ -1098,6 +1108,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // Only successful whole batches enter the in-memory index. A
+                // failed insert must never cause a later file to be hidden.
+                if batch_inserted == to_insert.len() as i64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as i64 - batch_inserted;
                 db_update_failed += to_update.len() as i64 - batch_updated;
                 inserted += batch_inserted;
