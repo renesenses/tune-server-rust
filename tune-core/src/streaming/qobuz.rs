@@ -428,6 +428,38 @@ impl QobuzService {
         Ok(donnees)
     }
 
+    /// Une collection de titres rattachée à un artiste, lue sous la clé qui
+    /// porte le nom de l'`extra` demandé (#2568).
+    ///
+    /// `/artist/get` range chaque extra sous son propre nom : demander
+    /// `tracks_appears_on` et relire `tracks` ne peut rien rendre. Passer
+    /// l'`extra` en paramètre lie les deux, et le lien ne peut plus se défaire.
+    ///
+    /// `api_get_editorial` et non `api_get` : le catalogue d'un artiste ne
+    /// dépend pas de ce que l'utilisateur vient de cliquer, contrairement à ses
+    /// favoris. La radio d'autoplay redemande les mêmes artistes à chaque fin
+    /// de piste — le cache lui évite un aller-retour par titre.
+    ///
+    /// **La liste de paramètres ci-dessous est la clé de cache** : la modifier
+    /// change la clé. Les tests la reconstruisent à l'identique via
+    /// `cle_cache`, et divergeraient en silence — ils appelleraient le réseau.
+    async fn pistes_extra_artiste(
+        &self,
+        artist_id: &str,
+        extra: &str,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let data = self
+            .api_get_editorial(
+                "/artist/get",
+                &[("artist_id", artist_id), ("extra", extra), ("limit", "20")],
+            )
+            .await?;
+        Ok(data[extra]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default())
+    }
+
     async fn api_get_all_pages(
         &self,
         path: &str,
@@ -1682,23 +1714,46 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
+    /// Les meilleurs titres d'un artiste — les SIENS d'abord (#2568).
+    ///
+    /// Cette fonction ne demandait que `extra=tracks_appears_on`. Ce champ ne
+    /// nomme pas les titres de l'artiste : il nomme, mot pour mot, ceux sur
+    /// lesquels il *apparaît* — invitations, compilations, participations.
+    /// L'unique appelant, `poller.rs`, écrit pourtant en commentaire « les
+    /// titres DE l'artiste » : l'écart était dans le code, pas dans
+    /// l'intention. Les cinq autres services demandent bien le catalogue de
+    /// l'artiste (`deezer.rs` `/artist/{id}/top`, `tidal.rs`
+    /// `/artists/{id}/toptracks`, `spotify.rs` `/artists/{id}/top-tracks`) :
+    /// Qobuz était le seul à part.
+    ///
+    /// Deux extras distincts, donc, et dans cet ordre :
+    ///  1. `extra=tracks` — le catalogue de l'artiste. `artist/get` l'accepte :
+    ///     le 400 relevé sur `extra=similarArtists` énumère lui-même ses
+    ///     valeurs (« accepted values are albums, tracks, playlists, … »),
+    ///     voir `get_similar_artists` juste en dessous.
+    ///  2. `extra=tracks_appears_on` — le comportement d'avant, conservé en
+    ///     REPLI. Un artiste qui n'a rien à son nom chez Qobuz (un invité, un
+    ///     chef d'orchestre) continue de rendre quelque chose plutôt que rien.
+    ///
+    /// Chaque réponse est lue sous SA propre clé. L'ancien code lisait
+    /// `tracks_appears_on` puis se rabattait sur `tracks` **dans la même
+    /// réponse** — un repli qui ne pouvait pas se déclencher, puisqu'on
+    /// n'avait jamais demandé `tracks`, et qui laissait croire que les deux
+    /// cas étaient couverts.
+    ///
+    /// Aucun tri n'est appliqué : l'ordre est celui que Qobuz rend. Classer
+    /// nous-mêmes sur une popularité que Qobuz ne donne pas reviendrait à
+    /// fabriquer le « best of » au lieu de le relayer.
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
-            .api_get(
-                "/artist/get",
-                &[
-                    ("artist_id", artist_id),
-                    ("extra", "tracks_appears_on"),
-                    ("limit", "20"),
-                ],
-            )
-            .await?;
-        let tracks = data["tracks_appears_on"]["items"]
-            .as_array()
-            .or_else(|| data["tracks"]["items"].as_array())
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        Ok(tracks)
+        match self.pistes_extra_artiste(artist_id, "tracks").await {
+            Ok(pistes) if !pistes.is_empty() => return Ok(pistes),
+            Ok(_) => debug!(artist_id, "qobuz_artiste_sans_titres_a_lui"),
+            // Un échec sur le premier extra ne condamne pas la demande : le
+            // repli reste à tenter, et c'est lui qui décidera du 500.
+            Err(e) => warn!(artist_id, error = %e, "qobuz_artiste_extra_tracks_echec"),
+        }
+        self.pistes_extra_artiste(artist_id, "tracks_appears_on")
+            .await
     }
 
     /// `artist/getSimilarArtists` — la reponse de Qobuz a « et apres ? ».
@@ -2875,5 +2930,110 @@ mod tests {
         assert_eq!(QobuzService::pochette_playlist(&vide), None);
         let chaine_vide = serde_json::json!({ "images300": [""], "image": "" });
         assert_eq!(QobuzService::pochette_playlist(&chaine_vide), None);
+    }
+
+    // ── #2568 : « top tracks » demandait les participations ───────────────
+
+    /// Le cache éditorial prérempli pour `/artist/get`, un extra par entrée :
+    /// AUCUN appel réseau, donc aucun identifiant Qobuz en jeu.
+    ///
+    /// La liste de paramètres doit être MOT POUR MOT celle de
+    /// `pistes_extra_artiste` : la clé est calculée dessus. Si elle divergeait,
+    /// le cache manquerait et le test partirait sur le réseau — c'est le seul
+    /// symptôme, et il est bruyant (erreur de connexion, jamais un faux vert).
+    fn service_avec_extras_artiste(
+        artist_id: &str,
+        entrees: &[(&str, serde_json::Value)],
+    ) -> QobuzService {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        for (extra, donnees) in entrees {
+            let cle = QobuzService::cle_cache(
+                "/artist/get",
+                &[("artist_id", artist_id), ("extra", extra), ("limit", "20")],
+            );
+            svc.cache_set(cle, donnees.clone());
+        }
+        svc
+    }
+
+    fn piste_qobuz(id: u64, titre: &str, interprete: &str, album: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "title": titre,
+            "performer": {"name": interprete},
+            "album": {"title": album, "id": 900 + id},
+            "duration": 200,
+        })
+    }
+
+    /// Le cœur de #2568 : un « best of » sert le catalogue de l'artiste, pas
+    /// les disques où il est invité.
+    ///
+    /// Qobuz répond aux deux extras. L'ancien code ne demandait que
+    /// `tracks_appears_on` et rendait donc « Comfortably Numb (live) »,
+    /// interprété par Roger Waters, sous une étiquette « Pink Floyd ».
+    #[tokio::test]
+    async fn le_best_of_sert_les_titres_de_l_artiste_pas_ses_participations() {
+        let svc = service_avec_extras_artiste(
+            "38324",
+            &[
+                (
+                    "tracks",
+                    json!({"tracks": {"items": [
+                        piste_qobuz(1, "Money", "Pink Floyd", "The Dark Side of the Moon"),
+                    ]}}),
+                ),
+                (
+                    "tracks_appears_on",
+                    json!({"tracks_appears_on": {"items": [
+                        piste_qobuz(2, "Comfortably Numb (live)", "Roger Waters", "In the Flesh"),
+                    ]}}),
+                ),
+            ],
+        );
+
+        let pistes = svc
+            .get_artist_top_tracks("38324")
+            .await
+            .expect("cache servi");
+
+        assert_eq!(pistes.len(), 1, "1 extra examiné, 1 piste attendue");
+        assert_eq!(pistes[0].title, "Money");
+        assert_eq!(
+            pistes[0].artist, "Pink Floyd",
+            "l'interprète est relayé tel quel — jamais réécrit avec l'artiste demandé"
+        );
+        assert_eq!(
+            pistes[0].album.as_deref(),
+            Some("The Dark Side of the Moon")
+        );
+    }
+
+    /// Le pendant : sans titres à son nom, les participations restent servies.
+    /// Sans ce test, supprimer purement le repli passerait pour un correctif.
+    #[tokio::test]
+    async fn sans_titres_a_lui_les_participations_restent_servies() {
+        let svc = service_avec_extras_artiste(
+            "7777",
+            &[
+                ("tracks", json!({"tracks": {"items": []}})),
+                (
+                    "tracks_appears_on",
+                    json!({"tracks_appears_on": {"items": [
+                        piste_qobuz(3, "So What", "Miles Davis", "Kind of Blue"),
+                        piste_qobuz(4, "Blue in Green", "Miles Davis", "Kind of Blue"),
+                    ]}}),
+                ),
+            ],
+        );
+
+        let pistes = svc
+            .get_artist_top_tracks("7777")
+            .await
+            .expect("cache servi");
+
+        assert_eq!(pistes.len(), 2, "2 participations en cache, 2 servies");
+        assert_eq!(pistes[0].title, "So What");
+        assert_eq!(pistes[1].title, "Blue in Green");
     }
 }
