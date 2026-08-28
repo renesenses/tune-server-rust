@@ -797,28 +797,55 @@ pub fn build_signal_path_pub(
 /// court-circuite tout traitement, donc un profil enregistré n'y change rien —
 /// puis profil activé ET gains audibles. Sans ce miroir, l'indicateur
 /// bit-perfect et le chemin audio répondraient à deux questions différentes.
+fn active_zone_eq_profile(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<tune_core::audio::eq::EqProfile> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let profile = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
+    if !profile.enabled {
+        return None;
+    }
+    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
+    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
+        .is_enabled()
+        .then_some(profile)
+}
+
 fn zone_eq_alters_signal(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
 ) -> bool {
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
-        return false;
+    active_zone_eq_profile(backend, zone_id).is_some()
+}
+
+/// Description du traitement EQ réellement configuré, y compris le headroom
+/// automatique. Le limiteur est nommé comme absent : le pré-gain réserve la
+/// marge des boosts, il ne faut plus confondre l'EQ avec une protection de crête.
+fn zone_eq_step_description(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<String> {
+    let profile = active_zone_eq_profile(backend, zone_id)?;
+    let left = profile.automatic_headroom_db(0);
+    let right = profile.automatic_headroom_db(1);
+    if (left - right).abs() < 0.01 {
+        Some(format!(
+            "EQ actif (pré-gain auto {left:.1} dB, sans limiteur)"
+        ))
+    } else {
+        Some(format!(
+            "EQ actif (pré-gain auto G {left:.1} dB / D {right:.1} dB, sans limiteur)"
+        ))
     }
-    let Some(profile) = settings
-        .get(&format!("zone_{zone_id}_eq_profile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())
-    else {
-        return false;
-    };
-    if !profile.enabled {
-        return false;
-    }
-    // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
-    tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2).is_enabled()
 }
 
 /// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
@@ -1048,6 +1075,7 @@ fn build_signal_path(
     let dsp_enabled = runtime_signal_path
         .map(|status| status.dsp == OutputDspState::Applied)
         .unwrap_or(configured_dsp_enabled);
+    let eq_step_description = zone_eq_step_description(&backend, zid);
 
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
@@ -1262,6 +1290,26 @@ fn build_signal_path(
         && !resampling_active
         && replaygain_step.is_none();
 
+    // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
+    //
+    // C'est le message que voit l'utilisateur pour le mp3-128 de Bandcamp
+    // (#2074). La règle écrite dans le plugin — « un flux à 128 kbit/s doit
+    // être annoncé comme tel PARTOUT où il apparaît »
+    // (`plugins/tune-bandcamp/src/lib.rs`) — n'était tenue que sur l'écran
+    // Bandcamp. Passée en zone, la même piste s'affichait « MP3 44kHz/16bit »,
+    // exactement comme un 320 : le seul public de ce logiciel est celui qui
+    // règle sa chaîne au bit près, et c'est précisément à lui que la
+    // différence était cachée.
+    //
+    // Filtré sur le verdict avec perte : un débit sur un FLAC n'aurait aucun
+    // sens, et un album Bandcamp ACHETÉ en lossless ne doit surtout pas
+    // hériter du chiffre de l'extrait.
+    let bitrate_label = np
+        .bitrate_kbps
+        .filter(|kbps| *kbps > 0 && !is_lossless)
+        .map(|kbps| format!(" {kbps} kbit/s"))
+        .unwrap_or_default();
+
     // Build steps
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
@@ -1269,11 +1317,11 @@ fn build_signal_path(
         format!("{format_name} {mhz:.1} MHz")
     } else if sample_rate >= 1000 {
         format!(
-            "{format_name} {sr}kHz/{bit_depth}bit",
+            "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
             sr = sample_rate / 1000
         )
     } else {
-        format!("{format_name} {sample_rate}Hz/{bit_depth}bit")
+        format!("{format_name}{bitrate_label} {sample_rate}Hz/{bit_depth}bit")
     };
 
     let mut steps = vec![json!({
@@ -1406,9 +1454,18 @@ fn build_signal_path(
     // L'état d'exécution distingue traitement et contournement. C'est le
     // reliquat commun de #2205/#2233 : un réglage enregistré ne disait pas ce
     // qui avait effectivement atteint le ring Windows.
+    let dsp_metrics = ps.output_dsp_metrics.map(|metrics| {
+        json!({
+            "eq_overs": metrics.eq_overs,
+            "eq_non_finite_samples": metrics.eq_non_finite_samples,
+        })
+    });
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
-            OutputDspState::Applied => Some(("DSP appliqué", false)),
+            OutputDspState::Applied => Some((
+                eq_step_description.as_deref().unwrap_or("DSP appliqué"),
+                false,
+            )),
             OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
             OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
             OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
@@ -1419,12 +1476,13 @@ fn build_signal_path(
                 "name": "DSP",
                 "description": description,
                 "bit_perfect": intact,
+                "metrics": dsp_metrics.clone(),
             }));
         }
     } else if dsp_enabled {
         steps.push(json!({
             "name": "DSP",
-            "description": "EQ/DSP active",
+            "description": eq_step_description.as_deref().unwrap_or("EQ/DSP active"),
             "bit_perfect": false,
         }));
     }
@@ -1467,6 +1525,7 @@ fn build_signal_path(
         "steps": steps,
         "runtime_observed": runtime_signal_path.is_some(),
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
+        "dsp_metrics": dsp_metrics,
     }))
 }
 
@@ -2742,7 +2801,6 @@ async fn renderer_capabilities(
             Json(json!({
                 "probed": false,
                 "reason": "renderer_offline",
-                "message": "The renderer is not currently online/discovered. Make sure it is powered on and on the same network, then try again.",
             })),
         )
             .into_response();
@@ -3340,46 +3398,7 @@ async fn calibrate_group(
         .iter()
         .find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match group {
-        Some(group) => {
-            let zone_ids: Vec<i64> = group["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-
-            // For each zone, measure round-trip latency to its output device
-            let outputs = state.outputs.lock().await;
-            let mut latencies = Vec::new();
-            for zid in &zone_ids {
-                let zone = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten();
-                if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
-                    if let Some(output) = outputs.get(device_id) {
-                        let output = output.lock().await;
-                        let start = std::time::Instant::now();
-                        let _ = output.get_status().await;
-                        let rtt_ms = start.elapsed().as_millis() as i64;
-                        latencies.push((*zid, rtt_ms / 2));
-                    } else {
-                        latencies.push((*zid, 0));
-                    }
-                } else {
-                    latencies.push((*zid, 0));
-                }
-            }
-            drop(outputs);
-
-            // First zone is the leader; compute sync delays relative to it
-            let leader_latency = latencies.first().map(|(_, l)| *l).unwrap_or(0);
-            let mut calibration = serde_json::Map::new();
-            for (zid, lat) in &latencies {
-                let sync_delay = leader_latency - lat;
-                calibration.insert(zid.to_string(), json!(sync_delay));
-            }
-
-            Json(json!({"group_id": group_id, "calibration": calibration})).into_response()
-        }
+        Some(_) => crate::routes::zone_manager::audio_calibration_unavailable(group_id),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -3561,6 +3580,10 @@ mod signal_path_tests {
     fn dlna_zone() -> (Arc<dyn DbBackend>, Zone) {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        // Ces contrats exercent les réglages DLNA ajoutés par migration. Sans
+        // migration, ils restaient faussement verts tant que les écritures sur
+        // une colonne absente étaient silencieusement ignorées (#2154).
+        tune_core::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
@@ -3616,14 +3639,129 @@ mod signal_path_tests {
             .map(String::from)
     }
 
+    /// #2074 — le message que voit l'utilisateur.
+    ///
+    /// Bandcamp ne sert que du `mp3-128` en écoute libre, et la règle écrite
+    /// dans `plugins/tune-bandcamp/src/lib.rs` veut que ce débit soit
+    /// « annoncé comme tel PARTOUT où il apparaît ». Il l'était sur l'écran
+    /// Bandcamp et NULLE PART ailleurs : arrivée dans une zone, la piste
+    /// s'affichait « MP3 44kHz/16bit », indiscernable d'un 320 devant un DAC
+    /// de salon.
+    #[test]
+    fn a_lossy_source_announces_its_bitrate_in_the_signal_path() {
+        let (backend, zone) = dlna_zone();
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Un extrait".into(),
+                source: "bandcamp".into(),
+                format: Some("mp3".into()),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                bitrate_kbps: Some(128),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Marantz"), "", None).unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("MP3 128 kbit/s 44kHz/16bit"),
+            "le débit doit être lisible AVANT que le son n'atteigne le DAC"
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    }
+
+    /// #2074, cas de l'ACHAT — le pendant du test précédent.
+    ///
+    /// La règle porte sur la qualité réelle du flux, jamais sur la source
+    /// « Bandcamp » en bloc : un album acheté descend en FLAC par la même
+    /// porte, et lui coller « 128 kbit/s » serait le même mensonge dans
+    /// l'autre sens.
+    #[test]
+    fn a_lossless_source_announces_no_bitrate() {
+        let (backend, zone) = dlna_zone();
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Un album acheté".into(),
+                source: "bandcamp".into(),
+                format: Some("flac".into()),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                bitrate_kbps: None,
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("Marantz"), "", None).unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some("FLAC 44kHz/16bit"),
+            "aucun débit ne doit apparaître sur un flux sans perte"
+        );
+    }
+
+    /// #2212 — le chemin du signal nomme le pré-gain qui prévient les overs,
+    /// et ne présente plus l'ancien saturateur implicite comme une protection.
+    #[test]
+    fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
+        let (backend, zone) = dlna_zone();
+        let zone_id = zone.id.unwrap();
+        let profile = tune_core::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![
+                tune_core::audio::eq::EqBandSpec {
+                    gain: 6.0,
+                    channel: None,
+                    ..Default::default()
+                },
+                tune_core::audio::eq::EqBandSpec {
+                    gain: 3.0,
+                    channel: Some(0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        SettingsRepo::with_backend(backend.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&profile).unwrap(),
+            )
+            .unwrap();
+
+        let sp = build_signal_path(
+            &alac_hires_playing(),
+            &zone,
+            &backend,
+            Some("Marantz"),
+            "",
+            Some(&wire("alac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "DSP").as_deref(),
+            Some("EQ actif (pré-gain auto G -9.0 dB / D -6.0 dB, sans limiteur)")
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    }
+
     /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la
     /// frontière du callback. Le chemin public doit le croire plutôt que de
     /// continuer à déclarer statiquement toute sortie locale bit-perfect.
     #[test]
     fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
         use tune_core::outputs::traits::{
-            OutputDspState, OutputSampleTransport, OutputSignalPathStatus, OutputSignalReason,
-            OutputVolumeState,
+            OutputDspMetrics, OutputDspState, OutputSampleTransport, OutputSignalPathStatus,
+            OutputSignalReason, OutputVolumeState,
         };
 
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3645,6 +3783,10 @@ mod signal_path_tests {
                 OutputSignalReason::DspApplied,
             ],
         });
+        ps.output_dsp_metrics = Some(OutputDspMetrics {
+            eq_overs: 17,
+            eq_non_finite_samples: 2,
+        });
 
         let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "ASIO", None).unwrap();
 
@@ -3662,6 +3804,17 @@ mod signal_path_tests {
             Some("Transport flottant imposé par le callback ; DSP appliqué")
         );
         assert_eq!(step_desc(&sp, "DSP").as_deref(), Some("DSP appliqué"));
+        assert_eq!(sp["dsp_metrics"]["eq_overs"], 17);
+        assert_eq!(sp["dsp_metrics"]["eq_non_finite_samples"], 2);
+        assert_eq!(
+            sp["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["name"] == "DSP")
+                .unwrap()["metrics"]["eq_overs"],
+            17
+        );
     }
 
     // ------------------------------------------------------------------

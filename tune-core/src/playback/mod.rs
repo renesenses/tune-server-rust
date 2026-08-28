@@ -51,6 +51,20 @@ pub struct NowPlaying {
     pub album_id: Option<i64>,
     #[serde(default)]
     pub artist_id: Option<i64>,
+    /// Débit CONSTANT du flux source, en kbit/s, quand la source le nomme
+    /// elle-même. `None` veut dire « on ne sait pas » — et rien n'est affiché.
+    ///
+    /// Il existe pour le 128 kbit/s de Bandcamp (#2074) : la qualité était
+    /// annoncée sur l'écran Bandcamp — « un flux à 128 kbit/s doit être
+    /// annoncé comme tel partout où il apparaît »,
+    /// `plugins/tune-bandcamp/src/lib.rs` — puis se perdait au passage en
+    /// zone, où le chemin du signal n'affichait plus qu'un « MP3 »
+    /// indiscernable d'un 320. Un fichier local n'en a pas besoin : sa
+    /// résolution réelle est déjà lue au scan.
+    ///
+    /// `#[serde(default)]` : un client plus ancien ne l'envoie pas.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl NowPlaying {
@@ -87,6 +101,11 @@ impl NowPlaying {
             year: track.year,
             album_id: track.album_id,
             artist_id: track.artist_id,
+            // Une piste de la bibliothèque n'annonce pas de débit : sa
+            // résolution réelle est lue au scan et déjà portée ci-dessus. Le
+            // champ existe pour les flux distants qui, eux, nomment leur
+            // encodage (#2074).
+            bitrate_kbps: None,
         }
     }
 }
@@ -155,6 +174,9 @@ pub struct ZoneState {
     /// historique pour les sorties qui ne publient pas encore cette sonde.
     #[serde(skip)]
     pub output_signal_path: Option<crate::outputs::traits::OutputSignalPathStatus>,
+    /// Compteurs DSP observés par la sortie pendant la piste courante.
+    #[serde(skip)]
+    pub output_dsp_metrics: Option<crate::outputs::traits::OutputDspMetrics>,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -283,6 +305,7 @@ impl Default for ZoneState {
             resolving: false,
             dop_active: false,
             output_signal_path: None,
+            output_dsp_metrics: None,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -507,6 +530,21 @@ impl PlaybackManager {
                 ..Default::default()
             })
             .output_signal_path = value;
+    }
+
+    pub async fn set_output_dsp_metrics(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::OutputDspMetrics>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .output_dsp_metrics = value;
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
@@ -907,6 +945,7 @@ mod tests {
             resolving: false,
             dop_active: false,
             output_signal_path: None,
+            output_dsp_metrics: None,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),

@@ -312,8 +312,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 return;
             }
         };
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Keep only files that are new or whose mtime/size changed since the
@@ -411,13 +411,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    if db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
-                        // Se nommer : tout `write_tx` concurrent echouera tant
-                        // que ce lot tient la connexion, et sans cette
-                        // etiquette son message n'apprend rien (#1997).
-                        tune_core::db::tx_holder::declarer("scan:auto");
-                    }
+                let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
+                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                    // Se nommer : tout `write_tx` concurrent echouera tant
+                    // que ce lot tient la connexion, et sans cette
+                    // etiquette son message n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:auto");
                 }
 
                 importer.begin_batch(&batch);
@@ -471,22 +471,37 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Deduplicate by audio_hash + album_id: if the same content
-                    // already exists in this album (via a different path), skip it.
+                    // `audio_hash` only selects cheap candidates. Never hide a
+                    // track until an existing path is byte-for-byte identical.
                     if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                         let key = (hash.clone(), aid);
-                        if known_hashes.contains(&key) {
+                        let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                        if let Some(existing_path) =
+                            tune_core::scanner::hasher::find_byte_identical_path(
+                                std::path::Path::new(&sf.path),
+                                &candidates,
+                            )
+                        {
                             tracing::debug!(
                                 audio_hash = %hash,
                                 album_id = aid,
                                 path = %sf.path,
+                                existing_path = %existing_path,
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
                             skipped_duplicate += 1;
                             continue;
                         }
-                        known_hashes.insert(key);
+                        if !candidates.is_empty() {
+                            tracing::warn!(
+                                audio_hash = %hash,
+                                album_id = aid,
+                                path = %sf.path,
+                                candidates = candidates.len(),
+                                "audio_hash_candidate_not_byte_identical"
+                            );
+                        }
                     }
 
                     to_insert.push(track);
@@ -497,6 +512,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                if batch_inserted == to_insert.len() as u64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as u64 - batch_inserted;
                 db_update_failed += to_update.len() as u64 - batch_updated;
                 inserted += batch_inserted;
@@ -528,12 +555,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     }
                 }
 
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                if is_sqlite {
                     db.execute("COMMIT", &[]).ok();
                     // Liberer meme si le COMMIT a echoue : une etiquette
                     // perimee accuserait un innocent au prochain incident.
                     tune_core::db::tx_holder::liberer();
                 }
+                drop(sqlite_write_guard);
 
                 // Emit scan progress after each batch (throttled every other
                 // batch or 2s), mirroring the manual scan's payload/phase.
@@ -591,6 +619,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
+        // émet lui aussi `library.scan.completed`. Son rapport ne portait
+        // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
+        // sur ce chemin-là également. Hissé pour que le rapport puisse le
+        // publier (#2146).
+        let mut pistes_supprimees = 0i64;
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
@@ -696,6 +730,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
+            pistes_supprimees = pruned;
             if pruned > 0 {
                 info!(pruned, "auto_scan_stale_tracks_removed");
             }
@@ -802,6 +837,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            // Ce que la purge a effectivement retiré. Le client lit cette clé
+            // pour le bandeau de fin de scan (#2146).
+            "removed": pistes_supprimees,
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
@@ -1211,19 +1249,36 @@ pub fn spawn_file_watcher(
                                     continue;
                                 };
 
-                                // Skip duplicate: same audio content already in this album
+                                // The hash is only a candidate selector. The
+                                // watcher is allowed to skip solely after a
+                                // full byte-for-byte comparison.
                                 if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                    if track_repo
-                                        .exists_by_audio_hash_and_album(hash, aid)
-                                        .unwrap_or(false)
+                                    let candidates = track_repo
+                                        .paths_by_audio_hash_and_album(hash, aid)
+                                        .unwrap_or_default();
+                                    if let Some(existing_path) =
+                                        tune_core::scanner::hasher::find_byte_identical_path(
+                                            std::path::Path::new(&sf.path),
+                                            &candidates,
+                                        )
                                     {
                                         tracing::debug!(
                                             audio_hash = %hash,
                                             album_id = aid,
                                             path = %sf.path,
+                                            existing_path = %existing_path,
                                             "watcher_skip_duplicate_audio_hash"
                                         );
                                         continue;
+                                    }
+                                    if !candidates.is_empty() {
+                                        tracing::warn!(
+                                            audio_hash = %hash,
+                                            album_id = aid,
+                                            path = %sf.path,
+                                            candidates = candidates.len(),
+                                            "watcher_audio_hash_candidate_not_byte_identical"
+                                        );
                                     }
                                 }
 

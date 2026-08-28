@@ -1193,6 +1193,104 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_network_mounts_identite
         // name » sur une base qui les a deja.
         up: "",
     },
+    Migration {
+        version: 85,
+        name: "favorite_facets",
+        // Mettre un LABEL en favori — et, demain, un genre, un format, une
+        // annee (#2442, FabienM fil 1557).
+        //
+        // Pourquoi une table separee plutot qu'un quatrieme `item_type` dans
+        // `favorites` : `favorites.item_id` est un INTEGER NOT NULL, et un
+        // label N'A PAS D'IDENTITE. Il n'existe ni table `labels`, ni route
+        // bibliotheque : l'onglet Labels lit une FACETTE et selectionne par
+        // CHAINE (`getLibraryFacets(['label'])`). Le faire entrer dans
+        // `favorites` supposerait de promouvoir le label en entite —
+        // normalisation d'un champ libre et sale, identifiants, jointures —
+        // ce qui est hors gabarit ici.
+        //
+        // On stocke donc la valeur telle que la facette la selectionne
+        // aujourd'hui. La colonne `facet` rend la table reutilisable sans
+        // nouvelle migration pour genre / format / annee.
+        //
+        // Pas de colonne `id` : la cle naturelle (profil, facette, valeur) EST
+        // la cle primaire. Cela evite aussi la divergence BIGSERIAL / TEXT que
+        // la bascule SQLite -> PostgreSQL impose a toute colonne `id` (cf. la
+        // migration PG 012 et l'incident #1706).
+        //
+        // `CREATE TABLE IF NOT EXISTS` : idempotent, et sans ALTER TABLE, donc
+        // sans le piege « duplicate column name » sur une base neuve.
+        up: "
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, facet, value)
+);
+CREATE INDEX IF NOT EXISTS idx_favorite_facets_profile
+    ON favorite_facets(profile_id, facet);
+",
+    },
+    Migration {
+        version: 86,
+        name: "reparer_radios_mortes_de_l_annuaire",
+        // Les stations mortes que l'utilisateur tient de NOTRE annuaire
+        // (`https://mozaiklabs.fr/api/v1/radios`, bouton « + Ajouter a Tune »),
+        // pas du semis. Le bouton insere l'URL sans jamais la sonder
+        // (`tune-server/src/routes/radios.rs`, `add_from_web`) : une entree
+        // morte cote annuaire devient une station muette cote bibliotheque.
+        //
+        // Sondage du 2026-08-28, redirections suivies, sur les 51 entrees que
+        // l'annuaire sert ce jour-la (l'issue #1960 en decrivait 46 le 19/08) :
+        // sept ne rendent pas d'audio. Deux sont deja traitees par la
+        // migration 78 (les webradios Radio France). Restent les cinq d'ici.
+        //
+        // REMPLACEES — meme station, adresse relevee chez l'operateur :
+        //
+        //   * WBGO Jazz : `stream.wbgo.org` ne resout plus (curl 6, « Could not
+        //     resolve host »). wbgo.org publie lui-meme ses deux flux sur sa
+        //     page d'accueil et sur /listen ; le 128k MP3 rend 200 `audio/mpeg`
+        //     et debite bien (638 Ko en 8 s ~ 128 kbit/s).
+        //   * Reggae Classic Mix et Classic Oldies Mix : l'operateur a change
+        //     d'hote et retire ses points FLAC. Son API AzuraCast
+        //     (`https://online.jamminvibezradio.com/api/stations`) donne
+        //     `listen_url` sur `radio.jamminvibezonline.ca` ; les deux points
+        //     `stream.aac` rendent 200 `audio/aac`, les `live.flac` rendent 404.
+        //
+        // RETIREES — aucune adresse de remplacement verifiee :
+        //
+        //   * BBC Radio 3 : `stream.live.vc.bbcmedia.co.uk/bbc_radio_three`
+        //     redirige vers `www.bbc.co.uk` et rend **200 `text/html`**. C'est
+        //     le cas decrit par l'issue : rien n'echoue, l'auditeur n'a que du
+        //     silence. Les flux HLS de la BBC rendent 410 Gone depuis ici, et
+        //     un `.m3u8` ne serait de toute facon pas jouable : `resolve_direct_url`
+        //     ne dereference une playlist qu'en gardant ses lignes en `http`,
+        //     or une playlist HLS ne porte que des segments relatifs. Rien a
+        //     mettre a la place, donc on retire.
+        //   * Caribbean variety mix : la station a disparu de chez l'operateur
+        //     — l'API AzuraCast ne declare plus qu'une seule station publique,
+        //     et `radio.jamminvibezonline.ca/listen/caribbean/stream.aac` rend
+        //     404 comme l'ancienne adresse.
+        //
+        // Cible sur l'URL et jamais sur le nom, comme les migrations 70 et 78 :
+        // le nom est ce que l'utilisateur a pu editer, l'URL est ce qui
+        // identifie le flux mort. Une station que l'utilisateur a lui-meme
+        // repointee vers une adresse qui marche survit donc intacte.
+        // Idempotent : un second passage ne trouve plus rien a corriger.
+        //
+        // Ce que cette migration NE fait PAS : elle ne corrige pas l'annuaire.
+        // Les cinq entrees sont toujours servies par mozaiklabs.fr au moment
+        // d'ecrire ceci ; un clic sur « + Ajouter a Tune » les remet. Le retrait
+        // cote annuaire est une action de donnees sur le site, hors de ce depot
+        // (voir #1960).
+        up: "
+UPDATE radio_stations SET url = 'https://ais-sa8.cdnstream1.com/3630_128.mp3' WHERE url = 'https://stream.wbgo.org/wbgo-hd';
+UPDATE radio_stations SET url = 'https://radio.jamminvibezonline.ca/listen/reggae/stream.aac' WHERE url = 'https://online.jamminvibezradio.com/listen/reggae/live.flac';
+UPDATE radio_stations SET url = 'https://radio.jamminvibezonline.ca/listen/oldies/stream.aac' WHERE url = 'https://online.jamminvibezradio.com/listen/oldies/live.flac';
+DELETE FROM radio_stations WHERE url = 'http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three';
+DELETE FROM radio_stations WHERE url = 'https://online.jamminvibezradio.com/listen/caribbean/live.flac';
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2639,12 +2737,20 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
     // depuis une playlist ou dans un album donnent trois lignes identiques,
     // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
-    // Numerotee 37 : la 36 est revenue au lot PostgreSQL fusionne entre-temps,
-    // et la contiguite interdit de reserver un numero d'avance.
     (
         37,
         "listen_history_contexte_de_lecture",
         include_str!("../../migrations/postgres/037_listen_history_contexte_de_lecture.sql"),
+    ),
+    // Favori d'une VALEUR de facette — le label d'abord (#2442). Table
+    // separee : `favorites.item_id` est un entier, un label n'a pas
+    // d'identite. Pendant de la migration SQLite 85.
+    // Numerotee 38 : 36 et 37 sont parties dans les lots fusionnes entre-temps,
+    // et la contiguite interdit de reserver un numero d'avance.
+    (
+        38,
+        "favorite_facets",
+        include_str!("../../migrations/postgres/038_favorite_facets.sql"),
     ),
 ];
 
@@ -3430,6 +3536,302 @@ mod tests {
         );
     }
 
+    /// Le catalogue que Tune LIVRE, relu tel qu'une installation neuve le
+    /// reçoit — pas le texte du semis, la table après migrations.
+    ///
+    /// Contrôle de FORME, jamais de réseau (issue #1960). Sonder les flux
+    /// depuis la CI serait instable et bombarderait des tiers ; ce que ce test
+    /// garde, c'est ce qu'aucune sonde ne rattrape : un champ vide, un doublon,
+    /// un schéma que le lecteur ne sait pas ouvrir.
+    #[test]
+    fn le_catalogue_livre_a_une_forme_valide() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String, String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, url, genre, country FROM radio_stations ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // Plancher, pas égalité : ajouter une station vérifiée ne doit pas
+        // casser le test, la vider en douce doit le casser.
+        assert!(
+            stations.len() >= 20,
+            "le catalogue livré est tombé à {} stations",
+            stations.len()
+        );
+
+        for (name, url, genre, country) in &stations {
+            assert!(!name.trim().is_empty(), "station sans nom pour l'URL {url}");
+            assert!(!url.trim().is_empty(), "station « {name} » sans URL");
+            assert!(!genre.trim().is_empty(), "station « {name} » sans genre");
+            assert!(!country.trim().is_empty(), "station « {name} » sans pays");
+
+            // Les DEUX seuls schémas que le lecteur sait ouvrir : toute lecture
+            // de station finit sur un GET reqwest (`resolve_direct_url` puis
+            // `decode_radio_stream_to_pcm`), et reqwest ne parle que http et
+            // https. Même règle que la validation à la saisie de la PR #2635.
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "station « {name} » : schéma que le lecteur ne sait pas ouvrir — {url}"
+            );
+            assert_eq!(
+                url.trim(),
+                url,
+                "station « {name} » : URL entourée d'espaces — {url:?}"
+            );
+            assert!(
+                !url.contains(' '),
+                "station « {name} » : espace dans l'URL — {url:?}"
+            );
+        }
+
+        let urls: std::collections::HashSet<&str> =
+            stations.iter().map(|(_, u, _, _)| u.as_str()).collect();
+        assert_eq!(
+            urls.len(),
+            stations.len(),
+            "deux stations livrées partagent la même URL"
+        );
+        let names: std::collections::HashSet<&str> =
+            stations.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            stations.len(),
+            "deux stations livrées portent le même nom"
+        );
+    }
+
+    /// Le semis ne doit rien planter qu'une migration ultérieure arrache.
+    ///
+    /// C'est l'erreur que les migrations 70 et 78 ont dû réparer : le semis
+    /// posait des stations mortes, une migration les retirait derrière. Le
+    /// texte du semis et les `DELETE` doivent rester d'accord — sinon une
+    /// installation neuve reçoit une station puis la perd au premier
+    /// redémarrage (issue #1960).
+    #[test]
+    fn le_semis_ne_pose_rien_qu_une_migration_supprime() {
+        let seed = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "seed_default_radios")
+            .expect("la migration de semis des radios a disparu");
+
+        // Relever la 2e chaîne SQL de chaque INSERT, en tenant compte du
+        // quote doublé (`'Mouv'''`) : un split naïf sur `'` décale tout et
+        // rendrait des URL vides — une preuve fabriquée.
+        fn litteraux_sql(ligne: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut chars = ligne.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\'' {
+                    continue;
+                }
+                let mut buf = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\'') if chars.peek() == Some(&'\'') => {
+                            chars.next();
+                            buf.push('\'');
+                        }
+                        Some('\'') | None => break,
+                        Some(c) => buf.push(c),
+                    }
+                }
+                out.push(buf);
+            }
+            out
+        }
+
+        let semees: Vec<String> = seed
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("INSERT OR IGNORE INTO radio_stations")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().nth(1))
+            .collect();
+        assert!(
+            semees.len() >= 20,
+            "seulement {} URL relevées dans le semis — le relevé s'est cassé",
+            semees.len()
+        );
+        for url in &semees {
+            assert!(
+                url.starts_with("http"),
+                "le relevé du semis a rendu {url:?} au lieu d'une URL"
+            );
+        }
+
+        for m in MIGRATIONS.iter() {
+            for line in m.up.lines() {
+                let line = line.trim();
+                if !line.starts_with("DELETE FROM radio_stations WHERE url = ") {
+                    continue;
+                }
+                let Some(supprimee) = line.split('\'').nth(1) else {
+                    continue;
+                };
+                assert!(
+                    !semees.iter().any(|s| s == supprimee),
+                    "la migration {} ({}) supprime {supprimee}, que le semis pose encore",
+                    m.version,
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Issue #1960 : les stations mortes que l'utilisateur tient de l'annuaire
+    /// et non du semis. Celles qui ont une adresse de remplacement vérifiée
+    /// sont repointées ; les autres partent.
+    #[test]
+    fn les_radios_mortes_de_l_annuaire_sont_reparees() {
+        // (URL morte, URL vivante attendue) — sondées le 2026-08-28.
+        const REMPLACEES: [(&str, &str); 3] = [
+            (
+                "https://stream.wbgo.org/wbgo-hd",
+                "https://ais-sa8.cdnstream1.com/3630_128.mp3",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/reggae/live.flac",
+                "https://radio.jamminvibezonline.ca/listen/reggae/stream.aac",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/oldies/live.flac",
+                "https://radio.jamminvibezonline.ca/listen/oldies/stream.aac",
+            ),
+        ];
+        const RETIREES: [&str; 2] = [
+            "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three",
+            "https://online.jamminvibezradio.com/listen/caribbean/live.flac",
+        ];
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let compter = |url: &str| {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                [url],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Une bibliothèque neuve ne porte aucune de ces URL : elles viennent
+        // de l'annuaire, jamais du semis.
+        for (morte, _) in REMPLACEES {
+            assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
+        }
+        for morte in RETIREES {
+            assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
+        }
+
+        // Bibliothèque existante : l'utilisateur les a ajoutées depuis
+        // l'annuaire, avec le nom et le drapeau favori que le bouton pose.
+        {
+            let conn = db.connection().lock().unwrap();
+            for (morte, _) in REMPLACEES {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country, is_favorite) VALUES ('depuis-annuaire', ?1, 'g', 'XX', 1)",
+                    [morte],
+                )
+                .unwrap();
+            }
+            for morte in RETIREES {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country, is_favorite) VALUES ('depuis-annuaire', ?1, 'g', 'XX', 1)",
+                    [morte],
+                )
+                .unwrap();
+            }
+            // Témoin : une station que l'utilisateur a lui-même repointée. La
+            // migration cible l'URL, pas le nom : elle doit survivre.
+            conn.execute(
+                "INSERT INTO radio_stations (name, url, genre, country) VALUES ('BBC Radio 3', 'https://exemple.invalid/temoin', 'g', 'XX')",
+                [],
+            )
+            .unwrap();
+        }
+        let total_avant = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+
+        // Rejouer la migration est ce que fait la mise à jour d'une base restée
+        // sous la version 86 ; on la force ici, celle-ci étant déjà à jour.
+        {
+            let conn = db.connection().lock().unwrap();
+            let m = MIGRATIONS.iter().find(|m| m.version == 86).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            // Idempotent : un second passage est un non-événement.
+            conn.execute_batch(m.up).unwrap();
+        }
+
+        for (morte, vivante) in REMPLACEES {
+            assert_eq!(compter(morte), 0, "l'URL morte {morte} est restée");
+            assert_eq!(
+                compter(vivante),
+                1,
+                "l'URL de remplacement {vivante} n'a pas été posée"
+            );
+        }
+        for morte in RETIREES {
+            assert_eq!(compter(morte), 0, "la station morte {morte} est restée");
+        }
+
+        // Le remplacement garde la ligne — nom, genre, favori — et ne la
+        // recrée pas : seule l'adresse change.
+        {
+            let conn = db.connection().lock().unwrap();
+            let favori: i64 = conn
+                .query_row(
+                    "SELECT is_favorite FROM radio_stations WHERE url = ?1",
+                    ["https://ais-sa8.cdnstream1.com/3630_128.mp3"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(favori, 1, "le remplacement a perdu le drapeau favori");
+        }
+        assert_eq!(
+            compter("https://exemple.invalid/temoin"),
+            1,
+            "la migration 86 a frappé sur le nom au lieu de l'URL"
+        );
+        let total_apres = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            total_apres,
+            total_avant - RETIREES.len() as i64,
+            "la migration 86 a retiré autre chose que les deux stations sans remplacement"
+        );
+    }
+
     #[test]
     fn renumber_queue_positions_sql_unifies_position_space() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3538,7 +3940,7 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 37, "latest PG migration must be 37");
+        assert_eq!(pg_latest_version(), 38, "latest PG migration must be 38");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

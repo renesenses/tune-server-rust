@@ -28,8 +28,20 @@ env:
 # pas de serrer au plus juste, c'est d'empecher les six heures.
 
 jobs:
+  preflight:
+    name: Preflight
+    permissions:
+      contents: read
+      issues: read
+      checks: read
+    uses: ./.github/workflows/preflight.yml
+    with:
+      version: ${{ github.ref_name }}
+      skip_ci_check: false
+
   web-client:
     name: Build Web Client
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:

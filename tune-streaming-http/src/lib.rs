@@ -784,12 +784,17 @@ async fn auth_poll_status(
                 "service": service,
                 "authenticated": authenticated,
                 "username": username,
+                // The YouTube client names this account identifier `email`.
+                // Keep the generic `username` field and expose the explicit
+                // alias so the route fulfils both contracts (#1897).
+                "email": status.username,
             }))
             .into_response()
         }
         Err(e) => Json(json!({
             "service": service,
             "authenticated": false,
+            "email": Value::Null,
             "message": e.to_string(),
         }))
         .into_response(),

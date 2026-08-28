@@ -379,12 +379,11 @@ mod tests {
 
     #[test]
     fn watcher_lifecycle() {
-        let dir = std::env::temp_dir().join("tune_watcher_test");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
 
-        let mut watcher = FileWatcher::new(vec![dir.to_string_lossy().to_string()]).unwrap();
+        let mut watcher = FileWatcher::new(vec![dir.path().to_string_lossy().to_string()]).unwrap();
 
-        let test_file = dir.join("test.flac");
+        let test_file = dir.path().join("test.flac");
         {
             let mut f = fs::File::create(&test_file).unwrap();
             f.write_all(b"fake flac data").unwrap();
@@ -397,7 +396,5 @@ mod tests {
         }
 
         watcher.stop();
-        fs::remove_file(&test_file).ok();
-        fs::remove_dir(&dir).ok();
     }
 }

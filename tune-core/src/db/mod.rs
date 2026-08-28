@@ -4,6 +4,7 @@ pub mod artist_repo;
 pub mod backend;
 pub mod engine;
 pub mod facet_filter;
+pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
 pub mod history_repo;
 pub mod metadata_proposal_repo;

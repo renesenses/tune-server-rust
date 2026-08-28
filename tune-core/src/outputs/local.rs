@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
+    TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -437,6 +438,36 @@ pub struct AudioDevice {
     pub backend: String,
 }
 
+/// Regroupe deux variantes Linux qui représentent le même nom de périphérique.
+///
+/// PipeWire/ALSA peut exposer plusieurs entrées homonymes avec des capacités
+/// différentes. La variante retenue doit rester un tout : son identité et ses
+/// capacités ne peuvent pas provenir de deux entrées différentes.
+#[cfg(any(target_os = "linux", test))]
+fn merge_linux_duplicate_variant(
+    existing: &mut AudioDevice,
+    candidate_endpoint_id: String,
+    candidate_is_default: bool,
+    candidate_max_channels: u16,
+    candidate_sample_rates: Vec<u32>,
+) -> bool {
+    let richer = candidate_max_channels > existing.max_channels
+        || (candidate_max_channels == existing.max_channels
+            && candidate_sample_rates.len() > existing.sample_rates.len());
+    if richer {
+        // L'identité bascule avec les capacités. Conserver l'endpoint de la
+        // première variante ferait rouvrir en lecture un autre périphérique
+        // que celui dont on vient de publier les capacités.
+        existing.endpoint_id = candidate_endpoint_id;
+        existing.max_channels = candidate_max_channels;
+        existing.sample_rates = candidate_sample_rates;
+    }
+    if candidate_is_default {
+        existing.is_default = true;
+    }
+    richer
+}
+
 static SCAN_GUARD: std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>)>> =
     std::sync::Mutex::new(None);
 const SCAN_COOLDOWN_SECS: u64 = 5;
@@ -578,17 +609,19 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 #[cfg(target_os = "linux")]
                 {
                     if let Some(&idx) = linux_by_name.get(&raw_name) {
-                        let richer = max_channels > devices[idx].max_channels
-                            || (max_channels == devices[idx].max_channels
-                                && sample_rates.len() > devices[idx].sample_rates.len());
-                        if richer {
-                            devices[idx].max_channels = max_channels;
-                            devices[idx].sample_rates = sample_rates.clone();
-                        }
-                        if is_default {
-                            devices[idx].is_default = true;
-                        }
-                        debug!(device = %raw_name, "local_audio_device_collapsed_pipewire_duplicate");
+                        let richer = merge_linux_duplicate_variant(
+                            &mut devices[idx],
+                            endpoint_id,
+                            is_default,
+                            max_channels,
+                            sample_rates,
+                        );
+                        debug!(
+                            device = %raw_name,
+                            retained_endpoint_id = %devices[idx].endpoint_id,
+                            richer,
+                            "local_audio_device_collapsed_pipewire_duplicate"
+                        );
                         continue;
                     }
                 }
@@ -6480,6 +6513,18 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())
     }
 
+    fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        self.eq.lock().ok().and_then(|eq| {
+            eq.as_ref().map(|processor| {
+                let stats = processor.process_stats();
+                OutputDspMetrics {
+                    eq_overs: stats.overs,
+                    eq_non_finite_samples: stats.non_finite_samples,
+                }
+            })
+        })
+    }
+
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
         let backend = self.audio_backend.clone();
@@ -7195,6 +7240,29 @@ mod tests {
         crate::audio::eq::EqProcessor::new(&profile, 44100, 2)
     }
 
+    #[test]
+    fn la_sortie_expose_les_compteurs_du_vrai_processeur_eq() {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_eq(Some(test_eq()));
+        let mut samples = vec![f32::NAN, 0.0];
+
+        apply_local_dsp(
+            &mut samples,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            2,
+            false,
+        );
+
+        let metrics = sortie
+            .dsp_metrics()
+            .expect("un EQ actif doit exposer ses compteurs");
+        assert_eq!(metrics.eq_non_finite_samples, 1);
+        assert_eq!(metrics.eq_overs, 0);
+    }
+
     fn stereo_sine_8k(frames: usize) -> Vec<f32> {
         (0..frames)
             .flat_map(|i| {
@@ -7542,6 +7610,31 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
         }
         bytes
+    }
+
+    #[test]
+    fn linux_duplicate_keeps_the_rich_variant_identity_with_its_capabilities() {
+        let mut retained = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "alsa:first-48k".into(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: vec![44_100, 48_000],
+            backend: "ALSA".into(),
+        };
+
+        assert!(merge_linux_duplicate_variant(
+            &mut retained,
+            "alsa:rich-384k".into(),
+            true,
+            32,
+            vec![44_100, 48_000, 96_000, 192_000, 384_000],
+        ));
+
+        assert_eq!(retained.endpoint_id, "alsa:rich-384k");
+        assert_eq!(retained.max_channels, 32);
+        assert_eq!(retained.sample_rates.last(), Some(&384_000));
+        assert!(retained.is_default);
     }
 
     /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une

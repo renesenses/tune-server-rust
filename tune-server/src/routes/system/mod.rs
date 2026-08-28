@@ -19,6 +19,12 @@ mod tags;
 pub(crate) mod update;
 mod youtube;
 
+/// Nom convivial de cette machine (#2110). Réexporté ici parce que trois
+/// endroits doivent répondre la même chose à « quel serveur est-ce ? » :
+/// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
+/// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
+pub(crate) use config::resolve_server_name;
+
 use axum::Router;
 use axum::routing::{get, post};
 
@@ -67,6 +73,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
+        .route("/music-dirs/orphans", get(config::orphan_tracks))
+        .route(
+            "/music-dirs/purge-orphans",
+            post(config::purge_orphan_tracks),
+        )
         .route("/browse-dirs", get(config::browse_dirs))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
@@ -153,6 +164,14 @@ pub fn router() -> Router<AppState> {
         .route("/bug-report", get(diagnostics::generate_bug_report))
         .route("/audio-check", get(diagnostics::audio_check))
         .route("/audio/asio-devices", get(diagnostics::asio_devices))
+        .route(
+            "/audio/asio-warm-scan",
+            get(diagnostics::asio_warm_scan_status),
+        )
+        .route(
+            "/audio/asio-warm-scan/rearm",
+            post(diagnostics::rearm_asio_warm_scan),
+        )
         .route(
             "/telemetry",
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),

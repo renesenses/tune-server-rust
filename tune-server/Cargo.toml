@@ -39,8 +39,12 @@ karaoke = ["dep:tune-karaoke"]
 #
 # La feature décide si le code est COMPILÉ ; `default_enabled = false` décide
 # s'il TOURNE. Le plugin est donc présent et visible, mais dormant jusqu'à ce
-# que l'utilisateur l'installe. `dj` et `karaoke` restent dans l'angle mort —
-# à trancher séparément.
+# que l'utilisateur l'installe.
+#
+# `dj` et `karaoke` sont tranchés depuis #2090 : compilés dans tous les binaires
+# publiés (voir les lignes `--features` de release.yml) mais HORS CATALOGUE
+# (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
+# écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
 
 [dependencies]

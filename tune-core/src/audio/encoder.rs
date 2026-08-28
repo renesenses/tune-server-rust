@@ -1171,12 +1171,14 @@ mod tests {
         let flac = enc.finish_sync().expect("finish");
         assert!(flac.len() > 64, "flac output too small");
 
-        let tmp = std::env::temp_dir().join(format!("tune-flac-rt-{n}.flac"));
-        std::fs::write(&tmp, &flac).expect("write temp flac");
+        let tmp = tempfile::Builder::new()
+            .suffix(".flac")
+            .tempfile()
+            .expect("temp flac");
+        std::fs::write(tmp.path(), &flac).expect("write temp flac");
         let decoded =
-            crate::audio::decode::decode_to_pcm(tmp.to_str().unwrap(), None, None, 0.0, 0.0)
+            crate::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
                 .expect("decoding our own FLAC must succeed");
-        let _ = std::fs::remove_file(&tmp);
 
         assert_eq!(decoded.bit_depth, 24, "bit depth preserved");
         assert_eq!(decoded.sample_rate, 48000, "sample rate preserved");

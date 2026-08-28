@@ -265,7 +265,7 @@ pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
 ///
 /// `None` en haut de l'arborescence : `/a.flac` n'a pas de parent nommé, et
 /// `G:` n'en a pas non plus.
-fn dossier_parent(chemin: &str) -> Option<&str> {
+pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
     match chemin.rfind(['/', '\\']) {
         Some(0) | None => None,
         Some(i) => Some(&chemin[..i]),
@@ -852,14 +852,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         };
 
-        // Same audio-hash dedup as the auto/startup scan: without it, the
-        // manual scan (the "Scanner" button — the path users actually hit)
-        // happily inserted the same content twice when it exists under two
-        // paths, while the auto scan deduped. (hash, album_id) pairs already
-        // in the library are skipped for NEW inserts only; updates of an
-        // existing path are never affected.
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        // `audio_hash` is a cheap candidate selector, not proof of identity.
+        // Keep the candidate paths so every decision that can hide a track is
+        // confirmed byte-for-byte (#2664).
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
@@ -934,11 +931,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut updated = 0i64;
         let mut db_insert_failed = 0i64;
         let mut db_update_failed = 0i64;
-        // `skipped` stays the aggregate the UI already shows. The manual scan
-        // never dedups by audio_hash (only the auto/watcher path does), so
-        // everything it skips is either an unchanged file or a file whose
-        // metadata could not be read — broken out below so the report says
-        // which.
+        // `skipped` stays the aggregate the UI already shows. Each cause is
+        // broken out below, including only those duplicate candidates whose
+        // complete files were confirmed byte-for-byte.
         let mut skipped = pre_skipped;
         let mut skipped_unchanged = pre_skipped;
         let mut skipped_duplicate = 0i64;
@@ -982,6 +977,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+                let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
                 if !is_pg {
                     // Se nommer : tout `write_tx` concurrent echouera tant que ce
                     // lot tient la connexion, et sans cette etiquette son message
@@ -1061,23 +1057,38 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         track.id = Some(existing_id);
                         to_update.push(track);
                     } else {
-                        // Deduplicate by audio_hash + album_id (same rule as
-                        // the auto scan): identical content already present in
-                        // this album via another path is not inserted again.
+                        // The sampled hash only narrows the candidates. A track
+                        // is skipped solely when a complete byte comparison
+                        // confirms an exact copy in the same album.
                         if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                             let key = (hash.clone(), aid);
-                            if known_hashes.contains(&key) {
+                            let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                            if let Some(existing_path) =
+                                tune_core::scanner::hasher::find_byte_identical_path(
+                                    std::path::Path::new(&sf.path),
+                                    &candidates,
+                                )
+                            {
                                 tracing::debug!(
                                     audio_hash = %hash,
                                     album_id = aid,
                                     path = %sf.path,
+                                    existing_path = %existing_path,
                                     "skip_duplicate_audio_hash"
                                 );
                                 skipped += 1;
                                 skipped_duplicate += 1;
                                 continue;
                             }
-                            known_hashes.insert(key);
+                            if !candidates.is_empty() {
+                                tracing::warn!(
+                                    audio_hash = %hash,
+                                    album_id = aid,
+                                    path = %sf.path,
+                                    candidates = candidates.len(),
+                                    "audio_hash_candidate_not_byte_identical"
+                                );
+                            }
                         }
                         to_insert.push(track);
                     }
@@ -1097,6 +1108,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // Only successful whole batches enter the in-memory index. A
+                // failed insert must never cause a later file to be hidden.
+                if batch_inserted == to_insert.len() as i64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as i64 - batch_inserted;
                 db_update_failed += to_update.len() as i64 - batch_updated;
                 inserted += batch_inserted;
@@ -1169,6 +1194,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         let _ = db.execute_batch("ROLLBACK");
                     }
                 }
+                drop(sqlite_write_guard);
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;
@@ -1236,6 +1262,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut sous_arbres_proteges: Vec<String> = Vec::new();
         let mut pistes_hors_perimetre = 0i64;
         let mut pistes_protegees = 0i64;
+        // Pistes réellement retirées de la base. Hissé pour la même raison que
+        // ses voisines, et pour une de plus : le compte existait déjà, mais il
+        // mourait avec le bloc `else` ci-dessous. Il ne sortait que par le
+        // journal et par un `library.scan.progress` que le client efface dès
+        // l'arrivée de `library.scan.completed` — si bien que le bandeau de fin
+        // de scan annonçait « 0 supprimés » quoi que la purge ait fait (#2146).
+        let mut pistes_supprimees = 0i64;
         // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
         // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
         let mut purge_refusee_candidats = 0i64;
@@ -1338,6 +1371,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
+            pistes_supprimees = pruned;
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,
@@ -1367,6 +1401,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
 
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+        let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
         if !is_pg {
             tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
@@ -1524,6 +1559,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 let _ = db.execute_batch("ROLLBACK");
             }
         }
+        drop(sqlite_write_guard);
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
@@ -1691,6 +1727,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     // (Ces quatre clés étaient écrites DEUX fois — deux
                     // sessions ont ajouté le même bloc ; `json!` gardait
                     // silencieusement la dernière.)
+                    // Ce que la purge a effectivement retiré. Le client lit
+                    // cette clé pour le bandeau de fin de scan (#2146).
+                    "removed": pistes_supprimees,
                     "emptied_roots": racines_videes.clone(),
                     "protected_subtrees": sous_arbres_proteges.clone(),
                     "tracks_protected": pistes_protegees,
@@ -1729,6 +1768,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 "missing_dirs": missing_dirs.clone(),
                 "missing_dir_reasons": missing_dir_reasons.clone(),
                 "error_dirs": error_dirs.clone(),
+                "removed": pistes_supprimees,
                 "emptied_roots": racines_videes.clone(),
                 "protected_subtrees": sous_arbres_proteges.clone(),
                 "tracks_protected": pistes_protegees,
@@ -1761,6 +1801,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            "removed": pistes_supprimees,
             "emptied_roots": racines_videes.clone(),
             "protected_subtrees": sous_arbres_proteges.clone(),
             "tracks_protected": pistes_protegees,
@@ -2863,5 +2904,94 @@ mod tests {
         assert_eq!(super::parse_hhmm("12:60"), None);
         assert_eq!(super::parse_hhmm("noon"), None);
         assert_eq!(super::parse_hhmm(""), None);
+    }
+}
+
+/// Garde-fou : le rapport de fin de scan est construit QUATRE fois, et les
+/// quatre doivent publier ce que la purge a retiré.
+///
+/// Le bandeau de fin de scan annonçait « 0 supprimés » quoi que la purge ait
+/// fait : le client lit `d.removed`, et aucune des constructions du rapport
+/// n'envoyait cette clé (#2146). Le compte existait pourtant — il mourait avec
+/// le bloc qui le calculait.
+///
+/// Ces constructions ne sont reliées par rien de mécanique : ce sont quatre
+/// `json!` recopiés à la main, et ils ont DÉJÀ divergé une fois
+/// (`skipped_unsupported_by_ext`, qui n'existe que dans un seul — #2012).
+/// Ajouter une clé à trois d'entre eux et pas au quatrième ne casse aucune
+/// compilation et ne fait échouer aucun test fonctionnel : le champ manque
+/// simplement chez un consommateur, en silence. D'où ce test, sur le modèle de
+/// `tests/smb_dialect_seam.rs`.
+///
+/// Le quatrième exemplaire est celui du scan AUTOMATIQUE (`auto_scan.rs`) :
+/// l'issue ne le comptait pas parmi les trois, mais il purge (`pruned`) et il
+/// émet `library.scan.completed`, donc il alimente le même bandeau.
+#[cfg(test)]
+mod rapport_de_scan_publie_la_purge {
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Une clé de rapport, sous sa forme littérale exacte. `"removed"` tout
+    /// court apparaît aussi dans les noms d'événements de journal
+    /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait passer
+    /// le test sans qu'aucune clé soit publiée.
+    const CLE_PURGE: &str = "\"removed\":";
+
+    /// Présent dans les quatre rapports, et nulle part ailleurs : sert à
+    /// reconnaître un rapport de fin de scan sans compter d'accolades.
+    const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
+
+    fn source(chemin: &str) -> String {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(chemin);
+        fs::read_to_string(&p).unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()))
+    }
+
+    /// Le corps du `json!` qui précède le marqueur, commentaires ÔTÉS.
+    ///
+    /// Les commentaires nomment le défaut corrigé — « le client lit
+    /// `d.removed` » — et raconter l'histoire ne doit pas suffire à faire
+    /// passer le test. Seul le code compte.
+    fn corps_du_rapport(texte: &str, fin: usize) -> String {
+        let debut = texte[..fin]
+            .rfind("json!(")
+            .expect("un rapport doit être construit par un json!(");
+        texte[debut..fin]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn les_quatre_constructions_du_rapport_publient_la_cle_lue_par_le_client() {
+        let fichiers = ["src/routes/system/scan.rs", "src/auto_scan.rs"];
+        let mut examines = 0usize;
+        for fichier in fichiers {
+            let texte = source(fichier);
+            let mut depuis = 0usize;
+            while let Some(rel) = texte[depuis..].find(MARQUEUR_RAPPORT) {
+                let fin = depuis + rel;
+                examines += 1;
+                let corps = corps_du_rapport(&texte, fin);
+                assert!(
+                    corps.contains(CLE_PURGE),
+                    "{fichier} : la construction de rapport n° {examines} ne publie pas \
+                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan. \
+                     Un rapport qui ne l'envoie pas fait annoncer « 0 supprimés » quoi que la \
+                     purge ait fait (#2146). Les quatre constructions doivent porter la clé \
+                     (#2012)."
+                );
+                depuis = fin + MARQUEUR_RAPPORT.len();
+            }
+        }
+        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
+        // test en n'examinant RIEN. Quatre, c'est `scan_result`,
+        // `library.scan.completed`, `/scan/report`, et le rapport du scan
+        // automatique.
+        assert_eq!(
+            examines, 4,
+            "quatre constructions de rapport attendues, {examines} trouvée(s) — le marqueur \
+             {MARQUEUR_RAPPORT} a dû être renommé, ou un exemplaire ajouté/supprimé"
+        );
     }
 }

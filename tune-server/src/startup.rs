@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tracing::{info, warn};
 
 use tune_core::outputs::oh_events::OpenHomeEventListener;
@@ -26,6 +27,30 @@ pub(crate) enum AsioWarmDecision {
     SkippedByEnv,
     /// Un balayage précédent a emporté le processus : on ne recommence pas.
     SkippedAfterCrash,
+}
+
+/// État exposé aux diagnostics et à l'interface.
+///
+/// Le chemin reste fourni : c'est la seule pièce qui permettait jusque-là de
+/// réparer le blocage à la main, et il est utile dans un rapport de support.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AsioWarmStatus {
+    pub(crate) supported: bool,
+    pub(crate) state: &'static str,
+    pub(crate) blocked_after_crash: bool,
+    pub(crate) disabled_by_env: bool,
+    pub(crate) can_rearm: bool,
+    pub(crate) retry: &'static str,
+    pub(crate) sentinel_path: String,
+    pub(crate) message: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsioWarmRearm {
+    Rearmed,
+    AlreadyReady,
+    Unsupported,
+    DisabledByEnv,
 }
 
 /// Décide si le balayage ASIO de démarrage peut être tenté.
@@ -59,6 +84,95 @@ fn asio_warm_sentinel_path() -> PathBuf {
         .parent()
         .map(|dir| dir.join(ASIO_WARM_SENTINEL))
         .unwrap_or_else(|| PathBuf::from(ASIO_WARM_SENTINEL))
+}
+
+fn asio_warm_status_at(sentinel: &Path, disabled_by_env: bool, supported: bool) -> AsioWarmStatus {
+    let blocked_after_crash = supported && sentinel.exists();
+    let (state, can_rearm, retry, message) = if !supported {
+        (
+            "unsupported",
+            false,
+            "none",
+            "Le préchauffage ASIO ne concerne que Windows.",
+        )
+    } else if disabled_by_env {
+        (
+            "disabled_by_env",
+            false,
+            "remove_environment_override",
+            "Le balayage ASIO est désactivé par TUNE_DISABLE_ASIO_SCAN.",
+        )
+    } else if blocked_after_crash {
+        (
+            "blocked_after_crash",
+            true,
+            "rearm_then_restart",
+            "Le balayage ASIO est suspendu après un plantage. Réarmez-le puis redémarrez Tune pour tenter une nouvelle fois.",
+        )
+    } else {
+        (
+            "ready",
+            false,
+            "next_restart",
+            "Le balayage ASIO est autorisé au prochain démarrage.",
+        )
+    };
+
+    AsioWarmStatus {
+        supported,
+        state,
+        blocked_after_crash,
+        disabled_by_env,
+        can_rearm,
+        retry,
+        sentinel_path: sentinel.display().to_string(),
+        message,
+    }
+}
+
+pub(crate) fn asio_warm_status() -> AsioWarmStatus {
+    asio_warm_status_at(
+        &asio_warm_sentinel_path(),
+        asio_warm_disabled_by_env(),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn rearm_asio_warm_scan_at(
+    sentinel: &Path,
+    disabled_by_env: bool,
+    supported: bool,
+) -> Result<AsioWarmRearm, String> {
+    if !supported {
+        return Ok(AsioWarmRearm::Unsupported);
+    }
+    // Un bouton ne doit jamais contourner un coupe-circuit posé par
+    // l'exploitant. Tant que l'environnement le demande, le témoin reste là.
+    if disabled_by_env {
+        return Ok(AsioWarmRearm::DisabledByEnv);
+    }
+    match std::fs::remove_file(sentinel) {
+        Ok(()) => Ok(AsioWarmRearm::Rearmed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AsioWarmRearm::AlreadyReady)
+        }
+        Err(error) => Err(format!(
+            "impossible de retirer le témoin ASIO {} : {error}",
+            sentinel.display()
+        )),
+    }
+}
+
+/// Autorise une seule nouvelle tentative au prochain démarrage.
+///
+/// On ne relance pas l'énumération dans le processus courant : une sortie peut
+/// déjà posséder le pilote et le re-sondage à chaud est précisément dangereux.
+pub(crate) fn rearm_asio_warm_scan() -> Result<AsioWarmRearm, String> {
+    rearm_asio_warm_scan_at(
+        &asio_warm_sentinel_path(),
+        asio_warm_disabled_by_env(),
+        cfg!(target_os = "windows"),
+    )
 }
 
 fn asio_warm_disabled_by_env() -> bool {
@@ -195,8 +309,16 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
-    ["enrich_all_status", "artist_artwork_enrich_result"];
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+    "enrich_all_status",
+    "artist_artwork_enrich_result",
+    // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
+    // de passe laisserait `status: "running"` en base pour toujours et le
+    // bouton de relance grisé — exactement le défaut #2002. La constante
+    // plutôt que le littéral : renommer la clé d'un côté ne peut plus
+    // désynchroniser l'autre.
+    tune_core::library::lyrics_pass::SETTING_FILL_RESULT,
+];
 
 /// Les mêmes, dans leur forme dégradée : une chaîne nue, écrite `running` et
 /// jamais relue par personne aujourd'hui. On les neutralise quand même — un
@@ -1499,6 +1621,57 @@ mod asio_warm_scan_tests {
             path.parent(),
             crate::config::default_log_file_path().parent()
         );
+    }
+
+    /// Le blocage n'est plus une ligne perdue dans le journal : il porte un
+    /// état stable, une phrase et l'action possible pour l'interface.
+    #[test]
+    fn crashed_sentinel_is_visible_and_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        let status = asio_warm_status_at(&sentinel, false, true);
+        assert_eq!(status.state, "blocked_after_crash");
+        assert!(status.blocked_after_crash);
+        assert!(status.can_rearm);
+        assert_eq!(status.retry, "rearm_then_restart");
+        assert!(status.message.contains("Réarmez"));
+        assert_eq!(status.sentinel_path, sentinel.display().to_string());
+    }
+
+    /// Réarmer retire exactement le témoin ; le second appel est idempotent et
+    /// ne transforme pas une absence normale en erreur.
+    #[test]
+    fn explicit_rearm_allows_one_future_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, false, true).unwrap(),
+            AsioWarmRearm::Rearmed
+        );
+        assert!(!sentinel.exists());
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, false, true).unwrap(),
+            AsioWarmRearm::AlreadyReady
+        );
+    }
+
+    /// L'API d'administration n'a pas le droit de défaire le choix explicite
+    /// de l'exploitant ; le fichier reste donc intact.
+    #[test]
+    fn environment_kill_switch_cannot_be_bypassed_by_rearm() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, true, true).unwrap(),
+            AsioWarmRearm::DisabledByEnv
+        );
+        assert!(sentinel.exists());
     }
 }
 

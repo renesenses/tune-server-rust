@@ -104,6 +104,74 @@ fn reusable_session(
         .map(|a| (a.transport_id.clone(), a.session_id.clone()))
 }
 
+/// Ce qu'un arrêt de zone envoie à un récepteur Cast.
+///
+/// La décision est isolée ici parce que c'est la SEULE partie de l'arrêt
+/// vérifiable sans matériel : le reste part sur le fil.
+#[derive(Debug, PartialEq, Eq)]
+enum StopPlan {
+    /// Notre lecteur tourne : arrêter le MÉDIA sur son transport. La session
+    /// applicative reste ouverte, donc réutilisable par la lecture suivante.
+    StopMedia { transport_id: String },
+    /// Rien qui nous appartienne ne tourne : appareil au repos, ou occupé par
+    /// une AUTRE application. On n'envoie rien.
+    Leave,
+}
+
+/// Arrêter la lecture SANS quitter l'application du récepteur.
+///
+/// Deux défauts se corrigent d'un même geste ici.
+///
+/// **1. Le carillon après un arrêt (#1953, #2520).** L'ancien arrêt appelait
+/// `receiver.stop_app`, documenté dans notre propre vendor
+/// (`vendor/rust_cast/src/channels/receiver.rs`) comme *« Stops currently
+/// active app »* : il QUITTE l'application. L'appareil retombe au repos,
+/// `reusable_session` ne trouve plus rien, et la lecture suivante repart sur un
+/// `LAUNCH` complet — c'est-à-dire exactement le carillon que la PR #2048 avait
+/// supprimé du changement de piste. FabienM, fil 1482 du 26/08 : *« Dès qu'on
+/// stoppe la chanson et qu'on joue une nouvelle sur la même zone CAST, on
+/// entend le BIP. »* Le canal média expose un arrêt qui n'a pas cet effet
+/// (`vendor/rust_cast/src/channels/media.rs`, `MediaChannel::stop`) : il
+/// invalide la session MÉDIA et laisse l'application en place. C'est déjà par
+/// ce canal-là que passent `pause`, `resume` et `seek` ; l'arrêt était le seul
+/// des quatre à s'adresser au récepteur.
+///
+/// **2. Couper la musique de quelqu'un d'autre.** L'ancien arrêt prenait
+/// `applications.first()` sans regarder `app_id` : sur un appareil occupé par
+/// YouTube ou Spotify, un arrêt de zone Tune quittait LEUR application. On ne
+/// vise plus que la nôtre.
+///
+/// **Pourquoi pas une simple pause ?** Parce que l'orchestrateur détruit la
+/// session de flux juste après l'arrêt (`orchestrator.rs`, `remove_session`) :
+/// un média seulement mis en pause laisserait le récepteur accroché à une URL
+/// morte. `MediaChannel::stop` relâche le média *et* invalide son
+/// `media_session_id` — la piste suivante ne peut donc pas être « reprise »
+/// par erreur, elle passe obligatoirement par un `LOAD` neuf.
+///
+/// **Changement de format en cours de session.** Il n'oblige PAS à relancer le
+/// récepteur, et c'est vérifiable ici : le format n'est porté par aucune des
+/// deux chaînes que la session conserve (`transport_id`, `session_id`). Il est
+/// entièrement redéclaré à chaque `LOAD` par `build_cast_media` — type MIME,
+/// type de flux et durée sortent du `PlayMedia` de la piste, depuis #2248/#2562
+/// qui a justement rendu `stream_type` variable (`Live` pour une webradio,
+/// `Buffered` pour un fichier). Une session conservée d'une radio à un fichier
+/// ne transporte donc aucun format périmé. C'est ce que verrouille
+/// `une_session_conservee_reannonce_le_format_a_chaque_piste`.
+///
+/// **Et l'appareil, on le rend quand ?** Jamais par nous, volontairement : un
+/// `LAUNCH` venu d'un autre expéditeur remplace l'application en cours, donc ne
+/// pas quitter la nôtre ne verrouille personne. ⚠️ Le récepteur par défaut se
+/// met aussi au repos tout seul après une période d'inactivité — durée que je
+/// n'ai pas mesurée. Un arrêt suivi d'une reprise TRÈS tardive peut donc
+/// carillonner malgré ce correctif ; c'est une limite de l'appareil, pas de
+/// Tune.
+fn plan_stop(apps: &[rust_cast::channels::receiver::Application], app_id: &str) -> StopPlan {
+    match reusable_session(apps, app_id) {
+        Some((transport_id, _)) => StopPlan::StopMedia { transport_id },
+        None => StopPlan::Leave,
+    }
+}
+
 /// Le média `LOAD` tel qu'il part sur le fil, construit à partir du contrat
 /// `PlayMedia`. Fonction pure : c'est elle que les tests interrogent, faute de
 /// pouvoir brancher un vrai récepteur Cast.
@@ -375,9 +443,12 @@ impl OutputTarget for ChromecastOutput {
         .await
     }
 
+    /// Voir `plan_stop` : l'arrêt relâche le média, il ne quitte plus
+    /// l'application du récepteur.
     async fn stop(&self) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
+        let name = self.name.clone();
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
         run_cast_command(host, port, timeout, slots, move |device| {
@@ -389,12 +460,38 @@ impl OutputTarget for ChromecastOutput {
                 .receiver
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
-            if let Some(app) = status.applications.first() {
+
+            let app_id =
+                rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string();
+            let StopPlan::StopMedia { transport_id } = plan_stop(&status.applications, &app_id)
+            else {
+                // Un arrêt réussi n'écrivait AUCUNE ligne : le seul témoin
+                // était le `device_stop_failed` de l'appelant, en cas d'erreur
+                // seulement. Un journal ne pouvait donc pas dire si un arrêt
+                // avait eu lieu — c'est ce qui a manqué pour instruire #2520.
+                info!(device = %name, session_kept = false, "chromecast_stop");
+                return Ok(());
+            };
+
+            device
+                .connection
+                .connect(&transport_id)
+                .map_err(|e| format!("connect transport: {e}"))?;
+            let media_status = device
+                .media
+                .get_status(&transport_id, None)
+                .map_err(|e| format!("media status: {e}"))?;
+            if let Some(entry) = media_status.entries.first() {
                 device
-                    .receiver
-                    .stop_app(&app.session_id)
+                    .media
+                    .stop(&transport_id, entry.media_session_id)
                     .map_err(|e| format!("stop: {e}"))?;
             }
+
+            // `session_kept=true` sur l'arrêt et `session_reused=true` sur la
+            // lecture qui suit : les deux lignes ensemble prouvent que la
+            // session a survécu à l'arrêt, sans avoir à écouter l'enceinte.
+            info!(device = %name, session_kept = true, "chromecast_stop");
             Ok::<(), String>(())
         })
         .await
@@ -840,6 +937,137 @@ mod session_reuse_tests {
     fn le_lecteur_est_retrouve_meme_derriere_une_autre_application() {
         let apps = vec![app("233637DE"), app(DEFAULT_MEDIA_RECEIVER)];
         assert!(reusable_session(&apps, DEFAULT_MEDIA_RECEIVER).is_some());
+    }
+}
+
+/// #1953, second volet (#2520) : l'ARRÊT ne doit pas fermer la session non
+/// plus.
+///
+/// La réutilisation de session de #2048 ne couvrait que le changement de
+/// piste. FabienM, fil 1482 du 26/08 : *« Cela fonctionne lorsqu'on change de
+/// morceaux sans arrêter celle-ci ! Dès qu'on stoppe la chanson et qu'on joue
+/// une nouvelle sur la même zone CAST, on entend le BIP. »* L'arrêt quittait
+/// l'application ; la lecture suivante devait relancer le récepteur.
+///
+/// Comme pour #2048, ces tests portent sur la DÉCISION — la seule partie
+/// vérifiable sans matériel. Ils ne prouvent rien de l'audible.
+#[cfg(test)]
+mod stop_keeps_session_tests {
+    use super::*;
+    use crate::outputs::traits::PlayMedia;
+    use rust_cast::channels::media::StreamType;
+    use rust_cast::channels::receiver::Application;
+
+    const DEFAULT_MEDIA_RECEIVER: &str = "CC1AD845";
+    const YOUTUBE: &str = "233637DE";
+
+    fn app(app_id: &str) -> Application {
+        Application {
+            app_id: app_id.to_string(),
+            session_id: format!("session-{app_id}"),
+            transport_id: format!("transport-{app_id}"),
+            namespaces: vec![],
+            display_name: app_id.to_string(),
+            status_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn l_arret_vise_le_transport_de_notre_lecteur() {
+        assert_eq!(
+            plan_stop(&[app(DEFAULT_MEDIA_RECEIVER)], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::StopMedia {
+                transport_id: "transport-CC1AD845".to_string()
+            },
+            "l'arrêt doit passer par le canal média de NOTRE session"
+        );
+    }
+
+    #[test]
+    fn notre_lecteur_est_vise_meme_derriere_une_autre_application() {
+        // `applications.first()` rendait YouTube : l'arrêt d'une zone Tune
+        // quittait l'application d'un autre expéditeur.
+        assert_eq!(
+            plan_stop(
+                &[app(YOUTUBE), app(DEFAULT_MEDIA_RECEIVER)],
+                DEFAULT_MEDIA_RECEIVER
+            ),
+            StopPlan::StopMedia {
+                transport_id: "transport-CC1AD845".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn l_arret_ne_touche_pas_l_application_d_un_autre_expediteur() {
+        assert_eq!(
+            plan_stop(&[app(YOUTUBE)], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::Leave,
+            "YouTube occupe l'appareil : Tune n'a rien à y arrêter"
+        );
+    }
+
+    #[test]
+    fn l_arret_sur_un_appareil_au_repos_n_envoie_rien() {
+        assert_eq!(plan_stop(&[], DEFAULT_MEDIA_RECEIVER), StopPlan::Leave);
+    }
+
+    /// Garde-fou de CONTENU, et non de comportement : l'appel part sur le fil,
+    /// aucun test ne peut l'observer sans un vrai récepteur. Le seul témoin
+    /// rejouable est donc le source lui-même. Le marqueur est épelé en deux
+    /// morceaux pour que ce test ne se contredise pas tout seul.
+    #[test]
+    fn le_module_ne_quitte_plus_l_application_du_recepteur() {
+        let source = include_str!("chromecast.rs");
+        let marqueur = concat!("stop_", "app(");
+        assert!(
+            !source.contains(marqueur),
+            "quitter l'application fait carillonner l'enceinte à la lecture \
+             suivante (#1953, #2520) : l'arrêt passe par le canal média"
+        );
+    }
+
+    /// Le changement de format ne justifie PAS de relancer le récepteur.
+    ///
+    /// La session ne conserve que deux chaînes (`transport_id`, `session_id`).
+    /// Le format, lui, est redéclaré en entier à chaque `LOAD` — et depuis
+    /// #2248/#2562 `stream_type` et `duration` en font partie, ce qui n'était
+    /// pas le cas quand la réutilisation de session a été écrite. Une session
+    /// conservée d'une webradio à un fichier ne peut donc pas servir un format
+    /// périmé.
+    #[test]
+    fn une_session_conservee_reannonce_le_format_a_chaque_piste() {
+        let radio = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/radio-7",
+            mime_type: "audio/mpeg",
+            live_stream: true,
+            ..Default::default()
+        });
+        let fichier = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/42",
+            mime_type: "audio/flac",
+            duration_ms: Some(337_000),
+            ..Default::default()
+        });
+
+        // Les trois champs qui portent le format se lisent ensemble : un seul
+        // qui traînerait de la piste précédente ferait mentir le récepteur.
+        assert_eq!(
+            (
+                radio.content_type.as_str(),
+                radio.stream_type,
+                radio.duration
+            ),
+            ("audio/mpeg", StreamType::Live, None)
+        );
+        assert_eq!(
+            (
+                fichier.content_type.as_str(),
+                fichier.stream_type,
+                fichier.duration
+            ),
+            ("audio/flac", StreamType::Buffered, Some(337.0_f32))
+        );
     }
 }
 

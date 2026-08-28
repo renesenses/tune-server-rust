@@ -373,6 +373,12 @@ pub mod sql {
          WHERE source = 'local' AND audio_hash IS NOT NULL AND album_id IS NOT NULL"
     }
 
+    pub fn get_existing_audio_hash_album_paths() -> &'static str {
+        "SELECT audio_hash, album_id, file_path FROM tracks \
+         WHERE source = 'local' AND audio_hash IS NOT NULL \
+           AND album_id IS NOT NULL AND file_path IS NOT NULL"
+    }
+
     /// Engine-agnostic search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -397,25 +403,24 @@ pub mod sql {
 /// shared query methods (which internal callers — playlist matching, tag
 /// writing, conversion — still need to see every row).
 ///
-/// Two rows are duplicates when they share the same `album_id` AND either the
-/// same non-empty `audio_hash` (identical audio bytes), or — when no hash is
-/// available — the same disc number, track number and (case-insensitive) title.
-/// The first occurrence in the input order is kept (callers order by
-/// disc/track, so the retained row is the natural one).
+/// Display collapsing deliberately ignores `audio_hash`: a sampled candidate
+/// must not make a real track disappear from an album or artist view. The
+/// legacy presentation key remains album + disc + track + case-insensitive
+/// title. The first occurrence in input order is kept.
 pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     let mut seen: HashSet<(Option<i64>, String)> = HashSet::new();
     let mut out = Vec::with_capacity(tracks.len());
     for t in tracks {
-        let key = match t.audio_hash.as_deref().map(str::trim) {
-            Some(h) if !h.is_empty() => format!("h:{h}"),
-            _ => format!(
+        let key = (
+            t.album_id,
+            format!(
                 "m:{}/{}/{}",
                 t.disc_number,
                 t.track_number,
                 t.title.trim().to_lowercase()
             ),
-        };
-        if seen.insert((t.album_id, key)) {
+        );
+        if seen.insert(key) {
             out.push(t);
         }
     }
@@ -1503,23 +1508,107 @@ impl TrackRepo {
             .collect())
     }
 
+    pub fn get_existing_audio_hash_album_paths(
+        &self,
+    ) -> Result<HashMap<(String, i64), Vec<String>>, TuneError> {
+        let rows = self
+            .db
+            .query_many(sql::get_existing_audio_hash_album_paths(), &[])?;
+        let mut paths: HashMap<(String, i64), Vec<String>> = HashMap::new();
+        for cols in rows {
+            let Some(hash) = cols.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(album_id) = cols.get(1).and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(path) = cols.get(2).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            paths.entry((hash, album_id)).or_default().push(path);
+        }
+        Ok(paths)
+    }
+
+    pub fn paths_by_audio_hash_and_album(
+        &self,
+        audio_hash: &str,
+        album_id: i64,
+    ) -> Result<Vec<String>, TuneError> {
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "SELECT file_path FROM tracks WHERE source = 'local' \
+             AND audio_hash = {} AND album_id = {} AND file_path IS NOT NULL",
+            make_ph(1),
+            make_ph(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&audio_hash, &album_id];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+            .collect())
+    }
+
     pub fn deduplicate(&self) -> Result<i64, TuneError> {
-        let count_sql = "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)";
-        let delete_sql = "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))";
-        let mut count: i64 = 0;
-        let count_ref = &mut count;
+        let rows = self.db.query_many(
+            "SELECT id, audio_hash, file_path FROM tracks \
+             WHERE source = 'local' AND audio_hash IS NOT NULL AND file_path IS NOT NULL \
+             ORDER BY audio_hash, id",
+            &[],
+        )?;
+        let mut candidates: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for cols in rows {
+            let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(hash) = cols.get(1).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(path) = cols.get(2).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            candidates.entry(hash).or_default().push((id, path));
+        }
+
+        let mut delete_ids = Vec::new();
+        for group in candidates.into_values().filter(|group| group.len() > 1) {
+            let mut representatives: Vec<(i64, String)> = Vec::new();
+            for candidate in group {
+                let is_exact_duplicate = representatives.iter().any(|(_, representative)| {
+                    crate::scanner::hasher::files_are_byte_identical(
+                        std::path::Path::new(&candidate.1),
+                        std::path::Path::new(representative),
+                    )
+                    .unwrap_or(false)
+                });
+                if is_exact_duplicate {
+                    delete_ids.push(candidate.0);
+                } else {
+                    representatives.push(candidate);
+                }
+            }
+        }
+
+        if delete_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let delete_sql = match self.db.engine() {
+            Engine::Sqlite => "DELETE FROM tracks WHERE id = ?".to_string(),
+            Engine::Postgres => "DELETE FROM tracks WHERE id = $1".to_string(),
+        };
         self.db.write_tx(&mut |tx| {
-            *count_ref = tx
-                .query_one(count_sql, &[])?
-                .as_ref()
-                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
-                .unwrap_or(0);
-            if *count_ref > 0 {
-                tx.execute(delete_sql, &[])?;
+            for id in &delete_ids {
+                tx.execute(&delete_sql, &[id])?;
             }
             Ok(())
         })?;
-        Ok(count)
+        Ok(delete_ids.len() as i64)
     }
 }
 
@@ -1625,17 +1714,26 @@ mod tests {
 
     #[test]
     fn dedup_display_collapses_content_duplicates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original_path = dir.path().join("time.flac");
+        let copy_path = dir.path().join("time-copy.flac");
+        let copy2_path = dir.path().join("time-copy-2.flac");
+        let bytes = vec![0x44u8; 128 * 1024];
+        std::fs::write(&original_path, &bytes).unwrap();
+        std::fs::write(&copy_path, &bytes).unwrap();
+        std::fs::write(&copy2_path, &bytes).unwrap();
+
         // Same album, same hash → the copy is hidden, first kept.
         let mut a = Track::new("Time".into());
         a.album_id = Some(1);
         a.disc_number = 1;
         a.track_number = 4;
         a.audio_hash = Some("HASH_TIME".into());
-        a.file_path = Some("/nas/time.flac".into());
+        a.file_path = Some(original_path.to_string_lossy().into_owned());
         let mut a_copy = a.clone();
-        a_copy.file_path = Some("/local/time.flac".into()); // real duplicate file
+        a_copy.file_path = Some(copy_path.to_string_lossy().into_owned());
         let mut a_copy2 = a.clone();
-        a_copy2.file_path = Some("/local2/time.flac".into()); // triplicate
+        a_copy2.file_path = Some(copy2_path.to_string_lossy().into_owned());
 
         // Same album, hash-less: dedup falls back to disc/track/title.
         let mut b = Track::new("Money".into());
@@ -1677,7 +1775,38 @@ mod tests {
             ]
         );
         // The retained "Time" is the first-seen path (album 1), not a copy.
-        assert_eq!(out[0].file_path.as_deref(), Some("/nas/time.flac"));
+        assert_eq!(out[0].file_path.as_deref(), a.file_path.as_deref());
+    }
+
+    #[test]
+    fn dedup_display_garde_deux_fichiers_distincts_au_meme_hash_candidat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let sample_size = 65_536;
+        let mut left = vec![0u8; sample_size * 4];
+        let mut right = vec![0u8; sample_size * 4];
+        left[sample_size * 2..].fill(0x11);
+        right[sample_size * 2..].fill(0x22);
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+        assert_eq!(
+            Some(hash.clone()),
+            crate::scanner::hasher::compute_audio_hash(&right_path)
+        );
+
+        let mut left_track = Track::new("Left".into());
+        left_track.album_id = Some(1);
+        left_track.audio_hash = Some(hash.clone());
+        left_track.file_path = Some(left_path.to_string_lossy().into_owned());
+        let mut right_track = Track::new("Right".into());
+        right_track.album_id = Some(1);
+        right_track.audio_hash = Some(hash);
+        right_track.file_path = Some(right_path.to_string_lossy().into_owned());
+
+        let out = dedup_display_tracks(vec![left_track, right_track]);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
@@ -1885,6 +2014,60 @@ mod tests {
         let mut t = Track::new("A".into());
         t.file_path = Some("/a.flac".into());
         repo.create(&t).unwrap();
+        assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn cleanup_ne_supprime_pas_une_collision_de_hash_partiel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let sample_size = 65_536;
+        let mut left = vec![0u8; sample_size * 4];
+        let mut right = vec![0u8; sample_size * 4];
+        left[sample_size * 2..].fill(0x31);
+        right[sample_size * 2..].fill(0x42);
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+        assert_eq!(
+            Some(hash.clone()),
+            crate::scanner::hasher::compute_audio_hash(&right_path)
+        );
+
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for (title, path) in [("Left", &left_path), ("Right", &right_path)] {
+            let mut track = Track::new(title.into());
+            track.file_path = Some(path.to_string_lossy().into_owned());
+            track.audio_hash = Some(hash.clone());
+            repo.create(&track).unwrap();
+        }
+
+        assert_eq!(repo.deduplicate().unwrap(), 0);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn cleanup_supprime_uniquement_la_copie_octet_pour_octet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let bytes = vec![0x5au8; 65_536 * 3];
+        std::fs::write(&left_path, &bytes).unwrap();
+        std::fs::write(&right_path, &bytes).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for (title, path) in [("Left", &left_path), ("Right", &right_path)] {
+            let mut track = Track::new(title.into());
+            track.file_path = Some(path.to_string_lossy().into_owned());
+            track.audio_hash = Some(hash.clone());
+            repo.create(&track).unwrap();
+        }
+
+        assert_eq!(repo.deduplicate().unwrap(), 1);
         assert_eq!(repo.count().unwrap(), 1);
     }
 

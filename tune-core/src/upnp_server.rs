@@ -75,6 +75,15 @@ pub fn track_audio_url(base_url: &str, track_id: i64) -> String {
     format!("{base_url}{API_PATH}/library/tracks/{track_id}/audio")
 }
 
+/// URL stable du flux radio servi par Tune au MediaServer.
+///
+/// La station externe n'est volontairement pas publiée dans la DIDL : le
+/// renderer revient vers Tune, qui peut alors décoder le codec source en WAV,
+/// appliquer son contrat HTTP live et nettoyer la session à la déconnexion.
+pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
+    format!("{base_url}{API_PATH}/radios/{radio_id}/audio.wav")
+}
+
 #[derive(Clone)]
 pub struct UpnpState {
     pub backend: Arc<dyn DbBackend>,
@@ -372,6 +381,40 @@ pub fn parse_soap_action(soap_xml: &str) -> Option<String> {
     }
 }
 
+/// Object addressed by a ContentDirectory request, when the action carries
+/// one. Browse calls it `ObjectID`; Search and several optional actions call
+/// the same concept `ContainerID`.
+fn parse_content_directory_object_id(soap_xml: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(soap_xml);
+    reader.config_mut().trim_text(true);
+    let mut current_tag = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_tag = name.rsplit(':').next().unwrap_or(&name).to_string();
+            }
+            Ok(Event::End(_)) => current_tag.clear(),
+            Ok(Event::Text(e)) if matches!(current_tag.as_str(), "ObjectID" | "ContainerID") => {
+                let decoded = e.decode().ok()?;
+                let value = match unescape(&decoded) {
+                    Ok(unescaped) => unescaped.into_owned(),
+                    Err(_) => decoded.to_string(),
+                };
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// Enveloppe SOAP d'une réponse d'action réussie.
 fn soap_action_response(service_urn: &str, action: &str, args: &str) -> String {
     format!(
@@ -450,7 +493,12 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
             soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
         }
         Some(other) => {
-            debug!(action = other, "upnp_content_directory_unsupported_action");
+            let object_id = parse_content_directory_object_id(soap_body);
+            warn!(
+                action = other,
+                object_id = object_id.as_deref().unwrap_or("<absent>"),
+                "upnp_content_directory_unsupported_action"
+            );
             soap_fault(401, "Invalid Action")
         }
     }
@@ -1578,49 +1626,19 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
     }
 }
 
-/// Traduit le codec d'une station en type MIME utilisable dans un
-/// `protocolInfo` DIDL.
-///
-/// La colonne `codec` porte un **nom de codec**, pas un type MIME : Radio
-/// Browser renvoie « MP3 », « AAC », « AAC+ », « FLAC », « OGG », et la saisie
-/// manuelle reprend ces étiquettes. Les préfixer d'`audio/` produisait
-/// `audio/MP3` ou `audio/AAC`, qui ne sont pas des types enregistrés. Un point
-/// de contrôle strict — la télécommande d'un Marantz ND8006, par exemple —
-/// confronte le `protocolInfo` de chaque item à ses propres capacités et
-/// **écarte ce qu'il ne reconnaît pas** : le dossier Radio s'affiche vide alors
-/// que les stations sont bien renvoyées.
-fn radio_mime_type(codec: Option<&str>) -> String {
-    let brut = codec.unwrap_or("").trim();
-    // Un type MIME déjà complet est respecté tel quel (saisie manuelle).
-    if brut.contains('/') {
-        return brut.to_ascii_lowercase();
-    }
-    match brut.to_ascii_uppercase().as_str() {
-        "AAC" | "AAC+" | "AACP" | "HE-AAC" | "M4A" | "MP4" => "audio/aac",
-        "FLAC" => "audio/flac",
-        "OGG" | "VORBIS" | "OPUS" => "audio/ogg",
-        "WAV" | "WAVE" | "PCM" => "audio/wav",
-        // « MP3 », « MPEG », l'inconnu et l'absent : l'audio/mpeg est le seul
-        // format qu'aucun lecteur réseau ne refuse, et c'était déjà le repli.
-        _ => "audio/mpeg",
-    }
-    .to_string()
-}
-
 fn browse_radios(state: &UpnpState) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
-    let _base = state.base_url();
+    let base = state.base_url();
 
     let mut inner = String::new();
     for station in &stations {
         let id = format!("radio/{}", station.id.unwrap_or(0));
         let mut res = String::new();
-        let mime_full = radio_mime_type(station.codec.as_deref());
+        let url = radio_audio_url(&base, station.id.unwrap_or(0));
         res.push_str(&format!(
-            "<res protocolInfo=\"http-get:*:{mime_full}:*\">{url}</res>",
-            mime_full = quick_xml::escape::escape(&mime_full),
-            url = quick_xml::escape::escape(&station.url),
+            "<res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>",
+            url = quick_xml::escape::escape(&url),
         ));
         if let Some(ref logo) = station.logo_url {
             res.push_str(&format!(
@@ -2257,42 +2275,47 @@ mod tests {
         assert_eq!(state.base_url(), "http://10.11.12.13:8888");
     }
 
-    /// Le défaut signalé par Jean Valjean : le dossier Radio vide sur un
-    /// Marantz ND8006. Les noms de codec de Radio Browser sont en majuscules,
-    /// et `audio/MP3` n'existe pas.
     #[test]
-    fn le_codec_dune_station_devient_un_type_mime_reel() {
-        assert_eq!(radio_mime_type(Some("MP3")), "audio/mpeg");
-        assert_eq!(radio_mime_type(Some("AAC")), "audio/aac");
-        assert_eq!(radio_mime_type(Some("AAC+")), "audio/aac");
-        assert_eq!(radio_mime_type(Some("FLAC")), "audio/flac");
-        assert_eq!(radio_mime_type(Some("OGG")), "audio/ogg");
-    }
+    fn le_media_server_publie_une_url_tune_wav_sans_contacter_la_station() {
+        use crate::db::radio_repo::RadioStation;
+        use crate::db::sqlite::SqliteDb;
 
-    #[test]
-    fn aucun_type_annonce_ne_porte_le_nom_du_codec() {
-        for codec in ["MP3", "AAC", "AAC+", "FLAC", "OGG", "UNKNOWN", ""] {
-            let mime = radio_mime_type(Some(codec));
-            assert!(
-                mime.starts_with("audio/") && mime[6..].chars().all(|c| !c.is_ascii_uppercase()),
-                "« {codec} » annoncé comme « {mime} » — un type MIME ne porte pas de majuscule"
-            );
-        }
-    }
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let station_id = RadioRepo::with_backend(backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "FIP HiFi".into(),
+                url: "https://icecast.example/fip-hifi.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: Some("France".into()),
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: true,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+        let mut state = UpnpState::new(backend, 8888, None);
+        state.advertised_ip = Some("192.168.1.18".into());
 
-    #[test]
-    fn un_codec_absent_ou_inconnu_retombe_sur_mpeg() {
-        assert_eq!(radio_mime_type(None), "audio/mpeg");
-        assert_eq!(radio_mime_type(Some("UNKNOWN")), "audio/mpeg");
-        assert_eq!(radio_mime_type(Some("  ")), "audio/mpeg");
-    }
+        let didl = browse_radios(&state);
+        let url = radio_audio_url(&state.base_url(), station_id);
 
-    /// Une saisie manuelle qui donne déjà un type MIME complet est respectée —
-    /// c'est la porte de sortie pour un format que la table ci-dessus ignore.
-    #[test]
-    fn un_type_mime_deja_complet_est_conserve() {
-        assert_eq!(radio_mime_type(Some("audio/x-mpegurl")), "audio/x-mpegurl");
-        assert_eq!(radio_mime_type(Some("Audio/MPEG")), "audio/mpeg");
+        assert!(didl.total >= 1);
+        assert!(didl.xml.contains(&format!(
+            "protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>"
+        )));
+        assert!(
+            !didl.xml.contains("icecast.example"),
+            "Browse divulgue encore l URL externe et contourne Tune : {}",
+            didl.xml
+        );
     }
 
     #[test]
@@ -2402,6 +2425,79 @@ mod tests {
         // Un Browse ordinaire répond toujours en BrowseResponse.
         let browse = build_browse_response(&state, &soap_body("Browse", urn));
         assert!(browse.contains("<u:BrowseResponse"));
+    }
+
+    #[derive(Clone, Default)]
+    struct JournalCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn un_refus_content_directory_nomme_action_et_objet_sans_accuser_les_actions_valides() {
+        let state = test_state();
+        let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        let journal = JournalCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let with_object = format!(
+                r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><u:CreateObject xmlns:u="{urn}"><ObjectID>albums/42</ObjectID></u:CreateObject></s:Body>
+</s:Envelope>"#
+            );
+            assert!(is_soap_fault(&build_browse_response(&state, &with_object)));
+            assert!(is_soap_fault(&build_browse_response(
+                &state,
+                &soap_body("DestroyObject", urn)
+            )));
+            assert!(!is_soap_fault(&build_browse_response(
+                &state,
+                &soap_body("GetSystemUpdateID", urn)
+            )));
+        });
+
+        let log = journal.texte();
+        assert!(
+            log.contains("WARN"),
+            "le refus doit survivre au niveau par défaut: {log}"
+        );
+        assert!(log.contains("action=\"CreateObject\""), "{log}");
+        assert!(log.contains("object_id=\"albums/42\""), "{log}");
+        assert!(log.contains("action=\"DestroyObject\""), "{log}");
+        assert!(log.contains("object_id=\"<absent>\""), "{log}");
+        assert_eq!(
+            log.matches("upnp_content_directory_unsupported_action")
+                .count(),
+            2,
+            "une action valide ne doit produire aucun faux refus: {log}"
+        );
     }
 
     #[test]

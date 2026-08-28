@@ -176,6 +176,34 @@ impl EqProfile {
         )
     }
 
+    /// Conservative automatic headroom for one channel.
+    ///
+    /// Biquads are cascaded, so their gains multiply in the linear domain and
+    /// add in dB. Reserving the sum of every positive peak/shelf gain prevents
+    /// an EQ boost from depending on a limiter or saturator. Pass, notch and
+    /// cut-only filters need no positive-gain allowance.
+    pub fn automatic_headroom_db(&self, channel: u16) -> f64 {
+        let positive_db: f64 = if self.bands.is_empty() {
+            let (bass, mid, treble) = self.effective_gains();
+            [bass, mid, treble]
+                .into_iter()
+                .filter(|gain| gain.is_finite() && *gain > 0.0)
+                .sum()
+        } else {
+            self.bands
+                .iter()
+                .filter(|band| {
+                    band.vise_le_canal(channel)
+                        && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                        && band.gain.is_finite()
+                        && band.gain > 0.0
+                })
+                .map(|band| band.gain.clamp(0.0, 24.0))
+                .sum()
+        };
+        -positive_db
+    }
+
     /// Tone preset for the DECLARED listening environment.
     /// Returns (bass_db, mid_db, treble_db) offsets.
     ///
@@ -364,8 +392,25 @@ pub struct EqProcessor {
     filters: Vec<Vec<BiquadCoeffs>>,
     /// Per-channel state for each cascade stage: [channel][stage]
     states: Vec<Vec<BiquadState>>,
+    /// Automatic pre-gain per channel, applied before the cascade.
+    preamp_gains: Vec<f64>,
+    preamp_db: Vec<f64>,
+    /// Independent deterministic PRNG state per channel for TPDF dithering.
+    dither_states: Vec<u64>,
+    /// Cumulative runtime diagnostics since this processor was built for the
+    /// current stream. Read by the output telemetry path (#2212).
+    process_stats: EqProcessStats,
     channels: u16,
     enabled: bool,
+}
+
+/// Diagnostics for one processed audio buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EqProcessStats {
+    /// Samples outside the nominal -1..1 output range before quantization.
+    pub overs: u64,
+    /// Invalid samples replaced with silence rather than propagated.
+    pub non_finite_samples: u64,
 }
 
 impl EqProcessor {
@@ -412,6 +457,13 @@ impl EqProcessor {
             .iter()
             .map(|f| vec![BiquadState::default(); f.len()])
             .collect();
+        let preamp_db: Vec<f64> = (0..channels.max(1))
+            .map(|ch| profile.automatic_headroom_db(ch))
+            .collect();
+        let preamp_gains = preamp_db
+            .iter()
+            .map(|db| 10.0_f64.powf(db / 20.0))
+            .collect();
         // Un profil dont TOUTES les bandes sont neutres, ou qui ne vise aucun
         // canal existant, ne doit pas rester « actif » a ne rien faire.
         let enabled = profile.enabled && filters.iter().any(|f| !f.is_empty());
@@ -419,6 +471,12 @@ impl EqProcessor {
         Self {
             filters,
             states,
+            preamp_gains,
+            preamp_db,
+            dither_states: (0..channels.max(1))
+                .map(|channel| 0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1))
+                .collect(),
+            process_stats: EqProcessStats::default(),
             channels,
             enabled,
         }
@@ -426,9 +484,10 @@ impl EqProcessor {
 
     /// Process interleaved PCM bytes in-place.
     /// `bit_depth`: 16, 24, or 32.
-    pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
+    pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) -> EqProcessStats {
+        let mut stats = EqProcessStats::default();
         if !self.enabled || pcm.is_empty() || self.channels == 0 {
-            return;
+            return stats;
         }
 
         let bytes_per_sample = (bit_depth / 8) as usize;
@@ -437,7 +496,8 @@ impl EqProcessor {
         for frame in pcm.chunks_exact_mut(frame_size) {
             for ch in 0..self.channels as usize {
                 let offset = ch * bytes_per_sample;
-                let sample = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth);
+                let sample = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth)
+                    * self.preamp_gains[ch];
 
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
@@ -446,17 +506,30 @@ impl EqProcessor {
                     s = stage.process(coeffs, s);
                 }
 
-                // Soft clip to prevent digital overs
-                let out = soft_clip(s);
-                write_sample_f64(&mut frame[offset..], out, bytes_per_sample, bit_depth);
+                if !s.is_finite() {
+                    stats.non_finite_samples += 1;
+                    s = 0.0;
+                } else if !(-1.0..1.0).contains(&s) {
+                    stats.overs += 1;
+                }
+
+                let dither = tpdf_dither(&mut self.dither_states[ch]);
+                write_sample_f64(&mut frame[offset..], s, bytes_per_sample, bit_depth, dither);
             }
         }
+
+        self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
+        self.process_stats.non_finite_samples = self
+            .process_stats
+            .non_finite_samples
+            .saturating_add(stats.non_finite_samples);
+        stats
     }
 
     /// Process an **interleaved f32** buffer (`[L0, R0, L1, R1, …]`, normalised
     /// to -1..1) in place.
     ///
-    /// Same cascade, same per-channel state and same soft-clip as
+    /// Same cascade and same per-channel state as
     /// [`Self::process_pcm`] — only the sample representation differs. The
     /// local output (`outputs/local.rs`) already holds its audio as f32 for
     /// cpal and runs its convolver / crossfeed on that buffer; going through
@@ -467,30 +540,58 @@ impl EqProcessor {
     /// than processed half-way: a partial frame would advance the per-channel
     /// filter states out of step and every later chunk would be filtered with
     /// the wrong channel's history.
-    pub fn process_interleaved(&mut self, samples: &mut [f32]) {
+    pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        let mut stats = EqProcessStats::default();
         if !self.enabled || samples.is_empty() || self.channels == 0 {
-            return;
+            return stats;
         }
         let ch_count = self.channels as usize;
-        if samples.len() % ch_count != 0 {
-            return;
+        if !samples.len().is_multiple_of(ch_count) {
+            return stats;
         }
 
         for frame in samples.chunks_exact_mut(ch_count) {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
-                let mut s = *sample as f64;
+                let mut s = *sample as f64 * self.preamp_gains[ch];
+                if !s.is_finite() {
+                    stats.non_finite_samples += 1;
+                    s = 0.0;
+                }
                 for (stage, coeffs) in state.iter_mut().zip(cascade.iter()) {
                     s = stage.process(coeffs, s);
                 }
-                *sample = soft_clip(s) as f32;
+                if !s.is_finite() {
+                    stats.non_finite_samples += 1;
+                    s = 0.0;
+                } else if !(-1.0..1.0).contains(&s) {
+                    stats.overs += 1;
+                }
+                *sample = s as f32;
             }
         }
+
+        self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
+        self.process_stats.non_finite_samples = self
+            .process_stats
+            .non_finite_samples
+            .saturating_add(stats.non_finite_samples);
+        stats
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Diagnostics cumulés depuis la construction du processeur pour la piste.
+    pub fn process_stats(&self) -> EqProcessStats {
+        self.process_stats
+    }
+
+    /// Automatic pre-gain for a channel, in dB.
+    pub fn preamp_db(&self, channel: u16) -> Option<f64> {
+        self.preamp_db.get(channel as usize).copied()
     }
 
     /// Reprendre l'historique des filtres du processeur que celui-ci remplace,
@@ -536,6 +637,7 @@ impl EqProcessor {
             return;
         }
         self.states.clone_from(&previous.states);
+        self.dither_states.clone_from(&previous.dither_states);
     }
 }
 
@@ -553,10 +655,11 @@ fn read_sample_f64(buf: &[u8], bytes: usize, bit_depth: u16) -> f64 {
     raw / max_val
 }
 
-fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16) {
+fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16, dither_lsb: f64) {
     let max_val = (1i64 << (bit_depth - 1)) as f64;
-    let clamped = sample.clamp(-1.0, 1.0 - f64::EPSILON);
-    let raw = (clamped * max_val) as i64;
+    let clamped = sample.clamp(-1.0, 1.0 - 1.0 / max_val);
+    let raw = (clamped * max_val + dither_lsb).round();
+    let raw = raw.clamp(-max_val, max_val - 1.0) as i64;
     match bytes {
         2 => {
             let b = (raw as i16).to_le_bytes();
@@ -579,14 +682,18 @@ fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16) {
     }
 }
 
-/// Soft clipper to prevent digital overs from EQ boost.
-/// Uses tanh-based saturation above 0.95 for smooth limiting.
-fn soft_clip(x: f64) -> f64 {
-    if x.abs() < 0.95 {
-        x
-    } else {
-        x.signum() * (0.95 + 0.05 * ((x.abs() - 0.95) / 0.05).tanh())
+/// Triangular PDF noise in [-1, 1] LSB, obtained by subtracting two uniform
+/// variates. Xorshift64* keeps this lock-free in the audio path.
+fn tpdf_dither(state: &mut u64) -> f64 {
+    fn uniform(state: &mut u64) -> f64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        let value = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        (value >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
     }
+
+    uniform(state) - uniform(state)
 }
 
 #[cfg(test)]
@@ -720,15 +827,155 @@ mod tests {
     }
 
     #[test]
-    fn soft_clip_preserves_normal_signal() {
-        assert!((soft_clip(0.5) - 0.5).abs() < 1e-10);
-        assert!((soft_clip(-0.5) - (-0.5)).abs() < 1e-10);
+    fn automatic_headroom_sums_positive_gains_per_channel() {
+        let profile = EqProfile {
+            enabled: true,
+            bands: vec![
+                EqBandSpec {
+                    gain: 6.0,
+                    channel: None,
+                    ..Default::default()
+                },
+                EqBandSpec {
+                    gain: 3.0,
+                    channel: Some(0),
+                    ..Default::default()
+                },
+                EqBandSpec {
+                    gain: -12.0,
+                    channel: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(profile.automatic_headroom_db(0), -9.0);
+        assert_eq!(profile.automatic_headroom_db(1), -6.0);
+        let eq = EqProcessor::new(&profile, 44_100, 2);
+        assert_eq!(eq.preamp_db(0), Some(-9.0));
+        assert_eq!(eq.preamp_db(1), Some(-6.0));
     }
 
     #[test]
-    fn soft_clip_limits_overs() {
-        assert!(soft_clip(1.5) < 1.0);
-        assert!(soft_clip(-1.5) > -1.0);
+    fn processed_integer_silence_receives_zero_mean_tpdf_dither() {
+        let profile = EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 20_000.0,
+                gain: -1.0,
+                band_type: "high_shelf".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut pcm = vec![0_u8; 32_768 * 2];
+        let stats = EqProcessor::new(&profile, 44_100, 1).process_pcm(&mut pcm, 16);
+        let values: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let sum: i64 = values.iter().map(|&v| i64::from(v)).sum();
+
+        assert_eq!(stats, EqProcessStats::default());
+        assert!(values.iter().any(|&v| v == -1));
+        assert!(values.iter().any(|&v| v == 1));
+        assert!(sum.abs() < 512, "TPDF mean drifted: sum={sum}");
+    }
+
+    #[test]
+    fn boosted_full_scale_signal_needs_no_hidden_saturator() {
+        let profile = EqProfile {
+            enabled: true,
+            bass_gain_db: 12.0,
+            mid_gain_db: 12.0,
+            treble_gain_db: 12.0,
+            ..Default::default()
+        };
+        let mut pcm = Vec::with_capacity(44_100 * 4);
+        for i in 0..44_100 {
+            let value = (2.0 * PI * 997.0 * i as f64 / 44_100.0).sin() * 0.999;
+            let raw = (value * i32::MAX as f64) as i32;
+            pcm.extend_from_slice(&raw.to_le_bytes());
+        }
+
+        let mut eq = EqProcessor::new(&profile, 44_100, 1);
+        assert_eq!(eq.preamp_db(0), Some(-36.0));
+        let stats = eq.process_pcm(&mut pcm, 32);
+        assert_eq!(stats.overs, 0);
+        assert_eq!(stats.non_finite_samples, 0);
+    }
+
+    #[test]
+    fn float_path_is_linear_and_has_no_implicit_saturator() {
+        let profile = EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 1_000.0,
+                gain: 12.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let input: Vec<f32> = (0..4096)
+            .map(|i| (2.0 * PI * 1_000.0 * i as f64 / 44_100.0).sin() as f32 * 0.4)
+            .collect();
+        let mut quiet = input.clone();
+        let mut loud: Vec<f32> = input.iter().map(|sample| sample * 2.0).collect();
+
+        EqProcessor::new(&profile, 44_100, 1).process_interleaved(&mut quiet);
+        EqProcessor::new(&profile, 44_100, 1).process_interleaved(&mut loud);
+
+        for (index, (quiet, loud)) in quiet.iter().zip(&loud).enumerate() {
+            assert!(
+                (*loud - 2.0 * *quiet).abs() < 2e-6,
+                "nonlinear output at sample {index}: {quiet} -> {loud}"
+            );
+        }
+    }
+
+    #[test]
+    fn float_path_reports_overs_without_hiding_them() {
+        let profile = EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 1_000.0,
+                gain: 12.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut eq = EqProcessor::new(&profile, 44_100, 1);
+        // Disable the automatic allowance only inside this counter-test to
+        // prove that an over is reported and remains observable in float.
+        eq.preamp_gains[0] = 1.0;
+        let mut samples: Vec<f32> = (0..4096)
+            .map(|i| (2.0 * PI * 1_000.0 * i as f64 / 44_100.0).sin() as f32 * 0.8)
+            .collect();
+
+        let stats = eq.process_interleaved(&mut samples);
+
+        assert!(stats.overs > 0);
+        assert!(samples.iter().any(|sample| sample.abs() > 1.0));
+        assert_eq!(eq.process_stats(), stats);
+
+        let mut second = vec![0.9_f32; 128];
+        let second_stats = eq.process_interleaved(&mut second);
+        assert_eq!(
+            eq.process_stats().overs,
+            stats.overs.saturating_add(second_stats.overs)
+        );
+    }
+
+    #[test]
+    fn invalid_float_sample_is_counted_and_never_propagated() {
+        let profile = shelf_profile();
+        let mut samples = vec![f32::NAN, 0.0];
+        let stats = EqProcessor::new(&profile, 44_100, 1).process_interleaved(&mut samples);
+
+        assert_eq!(stats.non_finite_samples, 1);
+        assert_eq!(samples[0], 0.0);
+        assert!(samples[1].is_finite());
     }
 
     /// Profil de test : -12 dB de plateau aigu à 2 kHz, stéréo.
@@ -982,7 +1229,7 @@ mod tests {
     fn une_bande_ne_touche_que_son_canal() {
         let profil = EqProfile {
             enabled: true,
-            bands: vec![bande(1000.0, 12.0, Some(0))],
+            bands: vec![bande(1000.0, -12.0, Some(0))],
             ..Default::default()
         };
         let (mut buf, _) = stereo_sine(1000.0, 4096);
@@ -994,8 +1241,8 @@ mod tests {
         let apres_g = energie(&buf, 2, 0);
         let apres_d = energie(&buf, 2, 1);
         assert!(
-            apres_g > avant_g * 1.5,
-            "la gauche doit etre relevee : {avant_g} -> {apres_g}"
+            apres_g < avant_g * 0.2,
+            "la gauche doit etre attenuee : {avant_g} -> {apres_g}"
         );
         assert!(
             (apres_d - avant_d).abs() / avant_d < 0.01,
@@ -1009,14 +1256,16 @@ mod tests {
     fn chaque_canal_peut_avoir_sa_propre_courbe() {
         let profil = EqProfile {
             enabled: true,
-            bands: vec![bande(1000.0, 12.0, Some(0)), bande(1000.0, -12.0, Some(1))],
+            bands: vec![bande(1000.0, -6.0, Some(0)), bande(1000.0, -12.0, Some(1))],
             ..Default::default()
         };
         let (mut buf, _) = stereo_sine(1000.0, 4096);
         let avant = energie(&buf, 2, 0);
         EqProcessor::new(&profil, 44100, 2).process_interleaved(&mut buf);
-        assert!(energie(&buf, 2, 0) > avant, "gauche relevee");
-        assert!(energie(&buf, 2, 1) < avant, "droite attenuee");
+        let gauche = energie(&buf, 2, 0);
+        let droite = energie(&buf, 2, 1);
+        assert!(gauche < avant, "gauche attenuee");
+        assert!(droite < gauche, "droite davantage attenuee");
     }
 
     /// Le defaut ne change RIEN : un prereglage enregistre avant cette version
@@ -1026,7 +1275,7 @@ mod tests {
     fn une_bande_sans_canal_agit_partout_comme_avant() {
         let profil = EqProfile {
             enabled: true,
-            bands: vec![bande(1000.0, 12.0, None)],
+            bands: vec![bande(1000.0, -12.0, None)],
             ..Default::default()
         };
         let (mut buf, _) = stereo_sine(1000.0, 4096);
@@ -1035,8 +1284,8 @@ mod tests {
         let g = energie(&buf, 2, 0);
         let d = energie(&buf, 2, 1);
         assert!(
-            g > avant * 1.5 && d > avant * 1.5,
-            "les deux canaux montent"
+            g < avant * 0.2 && d < avant * 0.2,
+            "les deux canaux sont attenues"
         );
         assert!((g - d).abs() / g < 1e-6, "et de la meme facon : {g} vs {d}");
     }

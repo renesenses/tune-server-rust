@@ -116,6 +116,10 @@ pub struct StreamSession {
     /// counter surfaces that case for diagnostics (a renderer that re-requests
     /// without closing its first connection — DMP-A8 FIP silent-after-reconnect).
     pub active_consumers: std::sync::atomic::AtomicU32,
+    /// The local-output watchdog is armed at most once for this session. A
+    /// session prepared for gapless remains unarmed until its URL is actually
+    /// handed to the local output.
+    pub consumer_watch_armed: std::sync::atomic::AtomicBool,
     /// Monotonic token identifying the CURRENT owner of the single-consumer
     /// radio PCM channel. A DLNA renderer that re-requests the radio stream
     /// (buffer refill / reconnect) without closing its first connection would
@@ -218,6 +222,7 @@ impl StreamSession {
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
+            consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),

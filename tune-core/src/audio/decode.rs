@@ -9,7 +9,7 @@ use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
@@ -1299,6 +1299,7 @@ pub fn decode_to_pcm_streaming(
         None,
         None,
         0.0,
+        None,
     )
 }
 
@@ -1320,6 +1321,7 @@ pub fn decode_to_pcm_streaming_with_notify(
         Some(data_ready),
         None,
         0.0,
+        None,
     )
 }
 
@@ -1343,6 +1345,7 @@ pub fn decode_to_pcm_streaming_with_levels(
         Some(data_ready),
         Some(levels_tx),
         0.0,
+        None,
     )
 }
 
@@ -1367,6 +1370,37 @@ pub fn decode_to_pcm_streaming_seeked(
         Some(data_ready),
         Some(levels_tx),
         seek_s,
+        None,
+    )
+}
+
+/// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
+/// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
+/// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
+pub fn decode_http_range_to_pcm_streaming_seeked(
+    source: super::http_range::HttpRangeSource,
+    codec_hint: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    let source_name = format!("flux-distant.{codec_hint}");
+    decode_to_pcm_streaming_inner(
+        &source_name,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
+        Some(Box::new(source)),
     )
 }
 
@@ -1380,6 +1414,7 @@ fn decode_to_pcm_streaming_inner(
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
+    source_override: Option<Box<dyn MediaSource>>,
 ) -> Result<(u16, u32), String> {
     if target_sample_rate == Some(0) {
         return Err("stream target sample rate must be greater than zero".into());
@@ -1596,8 +1631,20 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = if let Some(source) = source_override {
+        MediaSourceStream::new(source, Default::default())
+    } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+        let source = crate::audio::staged_growth::SeekableGrowingSource::open(file_path, growth)
+            .map_err(|e| format!("open (staged growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
@@ -3135,12 +3182,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // chunk->i32 conversion and in-place trim. No real .dsf fixtures existed.
     #[test]
     fn decode_dsf_end_to_end_silence() {
-        let path = std::env::temp_dir().join("tune_test_dsf_silence.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x55 = 01010101, LSB-first -> alternating +1/-1 -> near silence.
         write_test_dsf(p, 0x55);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(out.sample_rate, 176_400);
         assert_eq!(out.bit_depth, 24);
@@ -3161,12 +3208,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_end_to_end_negative_dc() {
-        let path = std::env::temp_dir().join("tune_test_dsf_negdc.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x00 = all bits 0 -> all -1.0 -> strong negative DC.
         write_test_dsf(p, 0x00);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!out.samples_i32.is_empty());
         let mid = out.samples_i32[out.samples_i32.len() / 2];
@@ -3178,12 +3225,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_stereo_vers_mono_respecte_les_trames() {
-        let path = std::env::temp_dir().join("tune_test_dsf_mono_contract.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let stereo = decode_to_pcm(p, Some(176_400), None, 0.0, 0.0).unwrap();
         let mono = decode_to_pcm(p, Some(176_400), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(stereo.channels, 2);
         assert_eq!(mono.channels, 1);
@@ -3197,7 +3244,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_dsf_mono_entete_et_payload_sont_alignes() {
-        let path = std::env::temp_dir().join("tune_test_dsf_stream_mono.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         write_test_dsf(path.to_str().unwrap(), 0x55);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3212,6 +3260,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
@@ -3220,7 +3269,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         assert_eq!(decoder.await.unwrap().unwrap(), (24, 176_400));
-        std::fs::remove_file(path).ok();
 
         let header = chunks.first().expect("WAV header DSD->PCM");
         assert_eq!(u16::from_le_bytes([header[22], header[23]]), 1);
@@ -3247,12 +3295,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // instead of converting all of it and trimming (the DSD hang, Sandro's DSF).
     #[test]
     fn decode_dsf_bounded_stops_early() {
-        let path = std::env::temp_dir().join("tune_test_dsf_bounded.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let full = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
         let bounded = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.005).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!bounded.samples_i32.is_empty());
         assert!(
@@ -3339,13 +3387,11 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// payload doivent raconter la même chose.
     #[test]
     fn la_cible_est_un_contrat_sur_le_payload_symphonia() {
-        let dir = std::env::temp_dir().join("tune_target_decode");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("stereo_96000_24.wav");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stereo_96000_24.wav");
         ecrire_wav_96k_24_stereo(&path, 9_600);
 
         let d = decode_to_pcm(path.to_str().unwrap(), Some(44_100), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(d.sample_rate, 44_100);
         assert_eq!(d.channels, 1);
@@ -3358,7 +3404,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_wav_entete_et_payload_partagent_le_format_cible() {
-        let path = std::env::temp_dir().join("tune_stream_target_96000_24.wav");
+        let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = wav.path().to_path_buf();
         ecrire_wav_96k_24_stereo(&path, 9_600);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3373,6 +3420,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
@@ -3381,7 +3429,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         let result = decoder.await.unwrap().unwrap();
-        std::fs::remove_file(path).ok();
 
         assert_eq!(result, (16, 44_100));
         let header = chunks.first().expect("WAV header");
@@ -3561,6 +3608,96 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(
             result.samples_i32.iter().any(|s| *s != 0),
             "decoded Opus PCM must not be all silence (the pre-fix failure mode)"
+        );
+    }
+
+    /// Empreinte du signal réellement décodé par libopus (#2251).
+    ///
+    /// `decode_opus` ci-dessus contrôle le contenant : cadence, canaux, durée,
+    /// « pas tout à zéro ». Rien n'y contrôle le **contenu**. Or c'est
+    /// exactement là que se cache le risque d'`audiopus_sys` : la crate est
+    /// abandonnée (RUSTSEC-2026-0150) et devra être remplacée ; un remplaçant
+    /// qui compile et rend le bon nombre d'échantillons du mauvais son
+    /// passerait toute la suite actuelle sans un rouge.
+    ///
+    /// La fixture `test.opus` est un 440 Hz stéréo **asymétrique** : le canal
+    /// gauche est deux fois plus fort que le droit. On vérifie donc la
+    /// fréquence, le rapport gauche/droite, le niveau et le nombre de trames.
+    /// On ne fige aucun condensat : le décodage Opus n'est pas garanti
+    /// bit-à-bit d'une libopus à l'autre (RFC 8251), une empreinte spectrale
+    /// tolérante l'est.
+    ///
+    /// ⚠ La libopus réellement liée **varie selon la machine** :
+    /// `audiopus_sys` sonde `pkg-config` avant de retomber sur sa copie
+    /// embarquée (figée sur xiph `7b05f44`, mars 2021). Un Mac de
+    /// développement avec Homebrew lie la 1.6.1, un runner CI Linux la
+    /// version du système ou la copie embarquée. Les bornes absolues
+    /// ci-dessous sont donc larges (±20 %) : elles sont là pour attraper un
+    /// gain divisé ou doublé, pas pour départager deux libopus conformes. Ce
+    /// sont les grandeurs **relatives** — rapport gauche/droite, dominance
+    /// spectrale, nombre de trames — qui portent la discrimination fine.
+    ///
+    /// Valeurs observées sur `audiopus 0.3.0-rc.0` / `audiopus_sys 0.2.2`
+    /// (libopus 1.6.1 via Homebrew) : 96 960 trames, rms G = 2877,6,
+    /// rms D = 1442,1, crête = 4140, dominante 440 Hz.
+    #[test]
+    fn decode_opus_fixture_garde_le_profil_du_signal() {
+        use crate::audio::opus_ogg::{channel_f64, goertzel_power, rms};
+
+        let path = fixture_path("test.opus");
+        let d = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert_eq!(d.sample_rate, 48_000);
+        assert_eq!(d.channels, 2);
+
+        // Nombre de trames : contrat de découpage (pre-skip + granulepos).
+        // Un remplaçant qui compte autrement doit être regardé de près, pas
+        // adopté en silence.
+        assert_eq!(
+            d.samples_i32.len() / 2,
+            96_960,
+            "le nombre de trames décodées a changé — pre-skip ou fin de flux \
+             traités différemment"
+        );
+
+        let left = channel_f64(&d.samples_i32, 2, 0);
+        let right = channel_f64(&d.samples_i32, 2, 1);
+
+        // Fenêtre de 0,5 s prise après l'attaque : 24 000 échantillons =
+        // nombre entier de périodes à 440 et 880 Hz, Goertzel exact.
+        let seg =
+            |ch: &[f64]| -> Vec<f64> { ch.iter().skip(9_600).take(24_000).copied().collect() };
+        for (name, ch) in [("gauche", &left), ("droit", &right)] {
+            let s = seg(ch);
+            assert_eq!(s.len(), 24_000, "fenêtre {name} incomplète");
+            let p440 = goertzel_power(&s, 48_000.0, 440.0);
+            let p880 = goertzel_power(&s, 48_000.0, 880.0);
+            let p220 = goertzel_power(&s, 48_000.0, 220.0);
+            assert!(
+                p440 > 100.0 * p880.max(1.0) && p440 > 100.0 * p220.max(1.0),
+                "canal {name} : la fixture est un 440 Hz, on mesure \
+                 p220={p220:.1} p440={p440:.1} p880={p880:.1} — cadence fausse \
+                 ou flux brouillé ?"
+            );
+        }
+
+        // Asymétrie gauche/droite ≈ 2 : attrape l'inversion des canaux et le
+        // repli mono, qu'aucun autre test de ce fichier ne verrait.
+        let (rl, rr) = (rms(&left), rms(&right));
+        let ratio = rl / rr.max(1.0);
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "rapport gauche/droite = {ratio:.2} (attendu ≈2,0 ; rms G={rl:.0}, \
+             rms D={rr:.0}) — canaux inversés, repliés en mono, ou gain faux"
+        );
+        assert!(
+            (2_300.0..=3_460.0).contains(&rl),
+            "niveau du canal gauche dérivé : rms={rl:.0} (attendu ≈2878, ±20 %)"
+        );
+
+        let peak = d.samples_i32.iter().map(|s| s.abs()).max().unwrap_or(0);
+        assert!(
+            (3_310..=4_970).contains(&peak),
+            "crête dérivée : {peak} (attendue ≈4140, ±20 %) — gain ou profondeur faux"
         );
     }
 

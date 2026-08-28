@@ -627,6 +627,49 @@ pub struct PlaybackOrchestrator {
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
     last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
+    /// Annonces « en écoute » DIFFÉRÉES des zones navigateur (#1998).
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie : la sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. `output_sent` y vaut donc
+    /// toujours faux, et la garde posée pour le cas BluOS a du même coup
+    /// supprimé TOUT scrobble de zone navigateur, y compris quand elle joue.
+    ///
+    /// On ne renonce pas à l'annonce et on ne la rend pas non plus gratuite :
+    /// on la met en attente ici, et elle ne part qu'une fois constaté que
+    /// l'onglet tire réellement des octets du flux — la même preuve que celle
+    /// dont `output_reach` se sert déjà (`tune-server/src/routes/zones.rs`).
+    /// Une piste que personne ne tire n'est jamais annoncée : l'entrée est
+    /// simplement écrasée par la lecture suivante.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+}
+
+/// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
+/// fois la lecture prouvée (voir [`PlaybackOrchestrator::annonces_navigateur`]).
+///
+/// Tout est capturé au démarrage, y compris `record_history` : une re-création
+/// de flux pour une piste déjà en cours (recherche de position, reconnexion
+/// radio) passe par `play_without_history` et ne doit PAS ajouter une seconde
+/// ligne d'historique. Reconstruire ce drapeau depuis le poller serait le
+/// perdre — et ferait doublonner l'historique à chaque déplacement du curseur.
+#[derive(Debug, Clone)]
+struct AnnonceNavigateurDifferee {
+    /// Flux dont on attend qu'il soit tiré. Identifie la lecture : une
+    /// nouvelle lecture crée un nouveau flux, donc l'annonce en attente d'une
+    /// piste abandonnée ne peut pas partir sous l'identité de la suivante.
+    stream_id: String,
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    source: String,
+    source_id: Option<String>,
+    /// Ligne de bibliothèque, quand il y en a une : l'album n'est relu qu'au
+    /// moment d'écrire l'historique, pas à chaque démarrage.
+    track_id: Option<i64>,
+    duration_ms: i64,
+    cover_path: Option<String>,
+    record_history: bool,
 }
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
@@ -700,6 +743,17 @@ pub struct ResolvedStream {
     /// endpoints. Carried through to `PlayMedia::origin_url` so an output can
     /// reach the source as it was published; see that field for the rationale.
     pub origin_url: Option<String>,
+    /// Débit CONSTANT du flux SOURCE, en kbit/s, quand la source le nomme
+    /// elle-même. Jamais déduit, jamais estimé : `None` dit « on ne sait pas »
+    /// et rien ne sera affiché.
+    ///
+    /// Sa raison d'être est le 128 kbit/s de Bandcamp (#2074). La qualité
+    /// était annoncée sur l'écran Bandcamp et se perdait au passage en zone :
+    /// le chemin du signal n'affichait plus que « MP3 », indiscernable d'un
+    /// 320. Or Tune s'adresse à des gens qui règlent leur chaîne au bit près,
+    /// et la règle écrite dans `tune-bandcamp` veut que ce débit soit
+    /// « annoncé comme tel partout où il apparaît ».
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
@@ -1046,7 +1100,74 @@ impl PlaybackOrchestrator {
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
+            annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
+    /// radios du MediaServer.
+    ///
+    /// La connexion à la station ne commence qu'ici, au GET audio — jamais au
+    /// Browse ni au HEAD. La route HTTP possède la durée de vie de la session
+    /// et la retire lorsque son corps est terminé ou abandonné.
+    pub async fn create_media_server_radio_session(&self, radio_url: String) -> String {
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (stream_id, tx, data_ready, session) =
+            self.streamer.create_radio_session(wav_info, 256).await;
+        let stream_id_for_task = stream_id.clone();
+        let session_for_done = session.clone();
+
+        info!(
+            stream_id = %stream_id,
+            url = %radio_url,
+            "media_server_radio_decode_started"
+        );
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None)
+            })
+            .await;
+
+            session_for_done
+                .producer_done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Réveille aussi le corps qui attend encore la détection du vrai
+            // format. `notify_one` mémorise un permis si l'échec précède son
+            // premier poll, contrairement à `notify_waiters`.
+            session_for_done.data_ready.notify_one();
+            // `create_radio_session` conserve un émetteur de garde pour les
+            // flux permanents. Cette session est liée à une requête : quand le
+            // producteur finit, le corps HTTP doit recevoir EOF.
+            session_for_done.close_sender().await;
+
+            match result {
+                Ok(Ok(())) => debug!(
+                    stream_id = %stream_id_for_task,
+                    "media_server_radio_decode_ended"
+                ),
+                Ok(Err(error)) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_failed"
+                ),
+                Err(error) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_task_panicked"
+                ),
+            }
+        });
+
+        stream_id
     }
 
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
@@ -1427,6 +1548,12 @@ impl PlaybackOrchestrator {
         record_history: bool,
     ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
+        // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
+        // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
+        // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
+        // (#1998). Une zone navigateur n'a JAMAIS d'`output_device_id` : si le
+        // demandeur en fournit un, ce n'en est pas une.
+        let mut zone_navigateur = false;
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
         // the zone's DB record.  This is the primary gate for send_to_output —
@@ -1467,7 +1594,8 @@ impl PlaybackOrchestrator {
                 // absent from the DB keep the old behaviour (in-memory tests /
                 // transient states).
                 if let Some(ref zone) = zone_db {
-                    if zone.output_type.as_deref() != Some("browser") {
+                    zone_navigateur = zone.output_type.as_deref() == Some("browser");
+                    if !zone_navigateur {
                         let msg = format!(
                             "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
                             zone.name
@@ -1676,14 +1804,26 @@ impl PlaybackOrchestrator {
                 // (Progman/Cyrille: Qobuz shown compressed / wrong format).
                 .or_else(|| match resolved.source.as_str() {
                     "qobuz" => Some("flac".to_string()),
-                    // Bandcamp ne diffuse QUE du mp3-128 sans achat. Le dire
-                    // ici — et non depuis le client — pour deux raisons : le
-                    // repli sur le type MIME afficherait « MPEG » au lieu de
-                    // « MP3 », et surtout l'avance de file re-résout la piste
-                    // SANS qu'aucun client repasse un format. Sans cette
-                    // ligne, la piste 1 s'affichait autrement que la piste 2
-                    // du même album.
-                    "bandcamp" => Some("mp3".to_string()),
+                    // Bandcamp : le dire ici — et non depuis le client — pour
+                    // deux raisons : le repli sur le type MIME afficherait
+                    // « MPEG » au lieu de « MP3 », et surtout l'avance de file
+                    // re-résout la piste SANS qu'aucun client repasse un
+                    // format. Sans cette ligne, la piste 1 s'affichait
+                    // autrement que la piste 2 du même album.
+                    //
+                    // Le codec vient de l'URL, pas du nom du service : sans
+                    // achat Bandcamp ne sert que du `mp3-128`, mais un fichier
+                    // acheté descend en `flac`/`alac` par la même porte, et
+                    // l'annoncer « MP3 » serait faux (#2074). Repli sur `mp3`
+                    // quand l'URL ne nomme rien : c'est l'écoute libre.
+                    "bandcamp" => Some(
+                        req.source_id
+                            .as_deref()
+                            .and_then(bandcamp_encoding)
+                            .and_then(|enc| bandcamp_quality(&enc))
+                            .map(|q| q.codec.to_string())
+                            .unwrap_or_else(|| "mp3".to_string()),
+                    ),
                     _ => None,
                 })
                 // A media-server (UPnP/NAS) item has no local track row, so the
@@ -1744,6 +1884,13 @@ impl PlaybackOrchestrator {
             // donner aucun.
             album_id: track_meta.as_ref().and_then(|t| t.album_id),
             artist_id: track_meta.as_ref().and_then(|t| t.artist_id),
+            // Le débit annoncé par la SOURCE, quand elle le nomme. C'est ce
+            // qui manquait au 128 kbit/s de Bandcamp : annoncé sur l'écran de
+            // découverte, il disparaissait dès que la piste partait en zone —
+            // le chemin du signal ne montrait plus qu'un « MP3 » qu'aucun
+            // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
+            // n'en porte pas : sa résolution réelle est lue au scan.
+            bitrate_kbps: resolved.bitrate_kbps,
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -1921,6 +2068,22 @@ impl PlaybackOrchestrator {
                 }
             }
 
+            // A local output opens this URL in its own reader thread just
+            // after `play_media`. If that reader never starts, the session is
+            // alive but silent and used to leave only `stale_session_removed`
+            // thirty minutes later (#2270). Arming here excludes sessions that
+            // are merely prepared in advance for gapless playback.
+            if is_local && let Some(ref sid) = resolved.stream_id {
+                let _ = arm_local_stream_consumer_watch(
+                    self.streamer.clone(),
+                    sid.clone(),
+                    req.zone_id,
+                    device_id.clone(),
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+            }
+
             let result = self
                 .send_to_output(
                     device_id,
@@ -2017,12 +2180,54 @@ impl PlaybackOrchestrator {
         // Le cas « aucune sortie configurée » rend lui aussi `false` (avec
         // `no_output_device_id_skipping_send_to_output`) : ne rien annoncer y
         // est également juste — le titre n'est parti vers aucun appareil.
-        if !output_sent {
+        //
+        // SAUF la zone navigateur, dont la sortie EST l'onglet : elle n'a pas
+        // de périphérique, `output_sent` y vaut toujours faux, et une lecture
+        // peut parfaitement avoir lieu. La garde ci-dessus lui a supprimé toute
+        // annonce, y compris quand elle joue — c'est ce que ce ticket a rouvert
+        // (#1998). Elle n'est pas remise dans le cas général : son annonce est
+        // DIFFÉRÉE jusqu'à la preuve que l'onglet tire le flux.
+        if !output_sent && !zone_navigateur {
             debug!(
                 zone_id = req.zone_id,
                 title = %resolved.title,
                 "play_not_announced_output_not_sent"
             );
+        }
+
+        if !output_sent && zone_navigateur {
+            let attente = AnnonceNavigateurDifferee {
+                stream_id: resolved.stream_id.clone().unwrap_or_default(),
+                title: resolved.title.clone(),
+                artist: resolved.artist.clone(),
+                album: album.clone(),
+                source: resolved.source.clone(),
+                source_id: req.source_id.clone(),
+                track_id: req.track_id,
+                duration_ms: resolved.duration_ms.unwrap_or(0),
+                cover_path: cover_path.clone(),
+                record_history,
+            };
+            if attente.stream_id.is_empty() {
+                // Sans flux, rien à observer : on ne saurait jamais dire que
+                // l'onglet a lu. Ne rien mettre en attente vaut mieux qu'une
+                // entrée qu'aucune preuve ne pourra jamais libérer.
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    "browser_now_playing_not_deferred_no_stream"
+                );
+            } else {
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    stream_id = %attente.stream_id,
+                    "browser_now_playing_deferred_until_stream_pulled"
+                );
+                if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+                    en_attente.insert(req.zone_id, attente);
+                }
+            }
         }
 
         // Annonce « en écoute » multi-service, avec palier de licence.
@@ -2503,6 +2708,7 @@ impl PlaybackOrchestrator {
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
             origin_url: None,
+            bitrate_kbps: None,
             cover_url: None,
             file_size,
         })
@@ -2625,13 +2831,26 @@ impl PlaybackOrchestrator {
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
         let source = req.source.clone().unwrap_or_else(|| "podcast".into());
-        // Bandcamp ne sert QUE du `mp3-128`, et ses URL de flux
-        // (`t4.bcbits.com/stream/<hash>/mp3-128/<id>?…`) n'ont pas
-        // d'extension : `guess_mime_from_url` retombe sur son défaut, qui se
-        // trouve être le bon. On l'affirme ici plutôt que de dépendre d'un
-        // défaut — si ce défaut changeait, la zone recevrait un MIME faux.
+        // La qualité Bandcamp est LUE DANS L'URL, jamais déduite du nom du
+        // service. L'écoute libre est du `mp3-128` ; un fichier ACHETÉ entre
+        // par la même porte en `flac`, `alac` ou `mp3-320`, et l'étiqueter
+        // « MP3 128 » serait un mensonge dans le sens le plus coûteux pour ce
+        // logiciel (#2074). `None` quand l'URL ne nomme rien : on retombe
+        // alors sur ce que Bandcamp sert sans session, sans rien affirmer de
+        // plus.
+        let bc_quality = (source == "bandcamp")
+            .then(|| bandcamp_encoding(audio_url))
+            .flatten()
+            .and_then(|enc| bandcamp_quality(&enc));
+        // Les URL de flux Bandcamp (`t4.bcbits.com/stream/<hash>/mp3-128/<id>`)
+        // n'ont pas d'extension : `guess_mime_from_url` retomberait sur son
+        // défaut, qui se trouve être le bon. On l'affirme plutôt que d'en
+        // dépendre — si ce défaut changeait, la zone recevrait un MIME faux.
         let mime_type = if source == "bandcamp" {
-            "audio/mpeg"
+            bc_quality
+                .as_ref()
+                .map(|q| q.mime_type)
+                .unwrap_or("audio/mpeg")
         } else {
             guess_mime_from_url(audio_url)
         };
@@ -2861,9 +3080,15 @@ impl PlaybackOrchestrator {
             // les pistes Tidal/Qobuz (`create_proxy_session`). Les octets
             // passent verbatim : c'est du MP3 que tout renderer sait lire, il
             // n'y a rien à transcoder.
+            //
+            // Conteneur et MIME suivent l'encodage LU DANS L'URL, avec repli
+            // sur le `mp3` de l'écoute libre : le proxy passe les octets tels
+            // quels, donc annoncer `audio/mpeg` sur un FLAC acheté ferait
+            // exactement le mislabel dont ce chemin se protège (#2074).
+            let bc_codec = bc_quality.as_ref().map(|q| q.codec).unwrap_or("mp3");
             let info = StreamInfo {
-                format: "mp3".into(),
-                mime_type: "audio/mpeg".into(),
+                format: bc_codec.into(),
+                mime_type: mime_type.to_string(),
                 sample_rate: 44100,
                 bit_depth: 16,
                 channels: 2,
@@ -2876,16 +3101,19 @@ impl PlaybackOrchestrator {
                 .create_proxy_session(info, audio_url.to_string(), false)
                 .await;
             let server_ip = self.server_ip();
-            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "mp3");
+            let stream_url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, bc_codec);
             info!(
                 url = %audio_url,
                 browser = is_browser_output,
+                codec = bc_codec,
                 "bandcamp_proxy_for_network_or_browser_output"
             );
             (
                 stream_url,
                 Some(session_id),
-                "audio/mpeg".to_string(),
+                mime_type.to_string(),
                 Some(44100u32),
                 Some(16u32),
                 Some(2u32),
@@ -3070,6 +3298,11 @@ impl PlaybackOrchestrator {
             bit_depth: out_bd,
             channels: out_ch,
             origin_url,
+            // Le débit voyage jusqu'à la zone quelle que soit la sortie prise
+            // ci-dessus — locale, WAV décodé pour OAAT, ou proxy MP3 pour un
+            // renderer réseau : les trois portent le MÊME flux source, et
+            // c'est LUI que le chemin du signal doit annoncer (#2074).
+            bitrate_kbps: bc_quality.as_ref().and_then(|q| q.bitrate_kbps),
         })
     }
 
@@ -3392,6 +3625,7 @@ impl PlaybackOrchestrator {
                         bit_depth: Some(24),
                         channels: Some(dop_channels as u32),
                         origin_url: None,
+                        bitrate_kbps: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
                     });
@@ -4026,6 +4260,10 @@ impl PlaybackOrchestrator {
                         budget_s = transcode_budget.as_secs(),
                         "transcode_budget_selected"
                     );
+                    // Même raison que le pré-transcode DASH plus bas : la ligne
+                    // de fin doit porter sa propre durée, pour rester lisible
+                    // seule dans un export de journal tronqué par la rotation.
+                    let file_transcode_start = std::time::Instant::now();
                     let transcode_result = tokio::time::timeout(
                         transcode_budget,
                         transcode_source_to_file(
@@ -4070,6 +4308,7 @@ impl PlaybackOrchestrator {
                                 file = %file_path,
                                 tmp = %serve_path,
                                 file_size,
+                                elapsed_ms = file_transcode_start.elapsed().as_millis() as u64,
                                 "transcode_to_temp_file_complete"
                             );
 
@@ -4568,6 +4807,7 @@ impl PlaybackOrchestrator {
             bit_depth: resolved_bd,
             channels: resolved_ch,
             origin_url: None,
+            bitrate_kbps: None,
         })
     }
 
@@ -4811,6 +5051,13 @@ impl PlaybackOrchestrator {
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
             let is_dash_local = upstream_url.starts_with("file://");
+            // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
+            // atome `moov` a la fin : une source HTTP seekable permet a
+            // Symphonia de lire cet index puis de revenir aux premiers paquets,
+            // sans attendre le telechargement complet (#1885). Les autres
+            // services gardent leur chemin eprouve dans cette premiere vague.
+            let use_http_range = service_name.eq_ignore_ascii_case("youtube")
+                && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
 
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
@@ -4834,9 +5081,38 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // For DASH file:// URLs the fMP4 is already on disk — use it
-                // directly instead of downloading via HTTP.
-                let tmp_file = if is_dash_local {
+                // Sonde Range AVANT d'envoyer un en-tete WAV. Si le CDN le
+                // refuse, aucun octet n'a encore rejoint la session et le repli
+                // historique par fichier temporaire reste parfaitement propre.
+                let ranged_source = if use_http_range {
+                    let upstream = upstream_url.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::audio::http_range::HttpRangeSource::open(&upstream)
+                    })
+                    .await
+                    {
+                        Ok(Ok(source)) => {
+                            info!("streaming_http_range_decode_selected");
+                            Some(source)
+                        }
+                        Ok(Err(e)) => {
+                            info!(error = %e, "streaming_http_range_unavailable_falling_back");
+                            None
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_http_range_probe_task_failed");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Sans source Range, conserver strictement le chemin existant :
+                // fichier DASH deja local ou telechargement complet vers un temp.
+                let tmp_file = if ranged_source.is_some() {
+                    None
+                } else if is_dash_local {
                     let file_path = upstream_url
                         .strip_prefix("file://")
                         .unwrap_or(&upstream_url)
@@ -4850,9 +5126,8 @@ impl PlaybackOrchestrator {
                         file_size,
                         "streaming_dash_file_already_on_disk"
                     );
-                    file_path
+                    Some((file_path, false))
                 } else {
-                    // Download to temp file on a blocking thread
                     let tmp_path = std::env::temp_dir()
                         .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
                         .to_string_lossy()
@@ -4885,7 +5160,7 @@ impl PlaybackOrchestrator {
                     .await;
 
                     match download_result {
-                        Ok(Ok(path)) => path,
+                        Ok(Ok(path)) => Some((path, true)),
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
                             let _ = std::fs::remove_file(&tmp_path);
@@ -4899,27 +5174,42 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // Progressive decode: stream PCM chunks as they are decoded.
-                // The DLNA renderer can start fetching as soon as first chunks
-                // arrive, reducing transition latency after download completes.
-                let tmp_file_clone = tmp_file.clone();
-                let tx_clone = tx.clone();
+                let tx_for_decode = tx.clone();
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_seeked(
-                        &tmp_file_clone,
-                        Some(sr),
-                        Some(2),
-                        Some(bd),
-                        tx_clone,
-                        32768,
-                        data_ready,
-                        levels_tx,
-                        seek_s,
-                    )
-                })
-                .await;
+                let decode_result = if let Some(source) = ranged_source {
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                            source,
+                            &codec,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                } else {
+                    let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
+                            &tmp_file_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                };
 
                 // Clean up the temp file — but ONLY if WE downloaded it. For a
                 // file:// DASH source, tmp_file IS the Tidal-cache-owned
@@ -4930,7 +5220,9 @@ impl PlaybackOrchestrator {
                 // ~54MB DASH — while concurrent transcodes raced on the emptied
                 // file (file_size=0 → decode failed). That was the ASIO "repeat"
                 // runaway (also on Qobuz). Leave cache-owned files alone.
-                if !is_dash_local {
+                if let Some((tmp_file, owned)) = tmp_file
+                    && owned
+                {
                     let _ = std::fs::remove_file(&tmp_file);
                 }
 
@@ -5144,6 +5436,7 @@ impl PlaybackOrchestrator {
                             bit_depth: Some(stream_data.quality.bit_depth as u32),
                             channels: Some(2),
                             origin_url: None,
+                            bitrate_kbps: None,
                         });
                     }
                 }
@@ -5313,6 +5606,7 @@ impl PlaybackOrchestrator {
                     bit_depth: Some(bd as u32),
                     channels: Some(2),
                     origin_url: None,
+                    bitrate_kbps: None,
                 });
             }
 
@@ -5330,6 +5624,19 @@ impl PlaybackOrchestrator {
             // aiguilles figées. Le chemin remux (opt-in TUNE_DASH_REMUX) ne
             // décode rien : VU légitimement muets dans ce cas.
             let dash_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+            // Durée du pré-transcode, sur la ligne de FIN.
+            //
+            // C'est l'étape qui domine le démarrage d'une piste DASH (Tidal
+            // HI-RES) vers un renderer réseau : décodage intégral en PCM puis
+            // ré-encodage, avant que le moindre octet ne parte. Le journal
+            // disait qu'elle avait eu lieu, jamais combien elle avait coûté :
+            // il fallait soustraire deux horodatages. Or le fichier de journal
+            // est plafonné et tourne — la ligne de DÉBUT peut avoir disparu de
+            // l'export d'un testeur alors que la ligne de FIN y est encore, et
+            // la durée devenait alors impossible à établir. Même convention que
+            // `tidal_dash_multi_segment_download_complete`, qui porte déjà son
+            // `elapsed_ms` (`streaming/tidal.rs`).
+            let pre_transcode_start = std::time::Instant::now();
             let transcode_result = tokio::task::spawn_blocking(move || {
                 // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
                 // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
@@ -5410,6 +5717,7 @@ impl PlaybackOrchestrator {
                         tmp = %tmp_path,
                         file_size,
                         bit_depth = actual_bd,
+                        elapsed_ms = pre_transcode_start.elapsed().as_millis() as u64,
                         "streaming_dash_pre_transcode_complete"
                     );
 
@@ -6002,6 +6310,7 @@ impl PlaybackOrchestrator {
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
             origin_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -6240,6 +6549,7 @@ impl PlaybackOrchestrator {
                 // from this path, so without it short tracks were the only ones
                 // captured through the proxy — and filed under `Stream/`.
                 origin_url: prefetched.upstream_url,
+                bitrate_kbps: None,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -6336,6 +6646,7 @@ impl PlaybackOrchestrator {
             // the decoded buffer, so an output that wants the source container
             // needs the service's own URL, not ours.
             origin_url: prefetched.upstream_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -7538,6 +7849,116 @@ impl PlaybackOrchestrator {
         // listened past the threshold (see `dispatch_scrobble`).
     }
 
+    /// L'onglet a-t-il commencé à tirer le flux de cette zone ? Si oui, et
+    /// seulement alors, l'annonce « en écoute » mise en attente au démarrage
+    /// part — une fois (#1998).
+    ///
+    /// Appelée à chaque tick par le poller pour une zone SANS périphérique de
+    /// sortie. C'est le poller qui a l'horloge ; la décision, elle, reste ici,
+    /// avec les données du démarrage — `record_history` en particulier, qu'un
+    /// observateur extérieur ne peut pas reconstituer.
+    ///
+    /// La preuve est celle dont `output_reach` se sert déjà pour dire
+    /// « browser_unattended » (`tune-server/src/routes/zones.rs`) : des octets
+    /// réellement partis sur la session de flux. Aucune détection nouvelle.
+    ///
+    /// Le délai vaut au plus un tick de poller (~1 s) après le premier octet
+    /// tiré : la règle de durée minimale de Last.fm porte sur le scrobble
+    /// définitif (50 % / 4 min, côté poller), pas sur « en écoute », et une
+    /// seconde ne coûte aucune écoute légitime.
+    ///
+    /// Rend `true` quand l'annonce vient de partir.
+    pub async fn confirmer_lecture_navigateur(&self, zone_id: i64, stream_id: &str) -> bool {
+        // Rien en attente pour CE flux → rien à faire, et surtout pas
+        // d'interrogation du streamer à chaque tick de chaque zone.
+        {
+            let Ok(en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            if en_attente.get(&zone_id).map(|a| a.stream_id.as_str()) != Some(stream_id) {
+                return false;
+            }
+        }
+
+        let tire = self
+            .streamer
+            .stream_bytes_sent(stream_id)
+            .await
+            .is_some_and(|n| n > 0);
+        if !tire {
+            return false;
+        }
+
+        // Retirer AVANT d'annoncer : le verrou « une seule fois » est le retrait
+        // lui-même. Re-vérifier le flux protège d'une lecture qui aurait
+        // remplacé l'entrée pendant l'attente ci-dessus.
+        let attente = {
+            let Ok(mut en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            match en_attente.get(&zone_id) {
+                Some(a) if a.stream_id == stream_id => en_attente.remove(&zone_id),
+                _ => None,
+            }
+        };
+        let Some(attente) = attente else {
+            return false;
+        };
+
+        info!(
+            zone_id,
+            title = %attente.title,
+            source = %attente.source,
+            stream_id = %stream_id,
+            "browser_playback_confirmed_announcing"
+        );
+
+        self.dispatch_now_playing(
+            &attente.title,
+            attente.artist.as_deref(),
+            attente.album.as_deref(),
+        );
+
+        // Même exclusion que le chemin nominal : la radio n'entre pas dans
+        // l'historique local (son titre au démarrage est un instantané figé),
+        // et une re-création de flux pour une piste déjà en cours
+        // (`play_without_history`) ne doit pas doublonner la ligne.
+        if attente.record_history && attente.source != "radio" {
+            let etat = self.playback.get_state(zone_id).await;
+            let album_id = attente.track_id.and_then(|tid| {
+                TrackRepo::with_backend(self.db.clone())
+                    .get(tid)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.album_id)
+            });
+            self.record_listen(
+                &attente.title,
+                attente.artist.as_deref(),
+                attente.album.as_deref(),
+                &attente.source,
+                attente.source_id.as_deref(),
+                album_id,
+                attente.duration_ms,
+                zone_id,
+                attente.cover_path.as_deref(),
+                etat.session_profile_id,
+                etat.session_context_type.as_deref(),
+                etat.session_context_id.as_deref(),
+            );
+        }
+
+        true
+    }
+
+    /// Oublie l'annonce en attente d'une zone navigateur : la lecture s'arrête
+    /// sans que l'onglet ait rien tiré, il n'y a donc rien à annoncer.
+    fn oublier_annonce_navigateur(&self, zone_id: i64) {
+        if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+            en_attente.remove(&zone_id);
+        }
+    }
+
     /// Dispatch scrobbles to all configured services, respecting tier limits.
     /// Free = 1 service max, Premium = all simultaneously.
     ///
@@ -7890,6 +8311,40 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Les appareils qu'une AUTRE zone que `zone_id` revendique comme sienne.
+    ///
+    /// Sert à borner le repli de `stop` : ces sorties-là ne lui appartiennent
+    /// pas, les arrêter revient à couper la musique de quelqu'un d'autre.
+    /// Prend une projection `(id de zone, appareil)` plutôt que des `Zone`
+    /// entières : la règle ne dépend que de ces deux champs, et une fonction
+    /// qui n'exige pas de construire une zone complète est une fonction qu'on
+    /// peut réellement tester.
+    fn sorties_revendiquees_par_les_autres_zones<'a>(
+        zones: impl IntoIterator<Item = (Option<i64>, Option<&'a str>)>,
+        zone_id: i64,
+    ) -> std::collections::HashSet<String> {
+        zones
+            .into_iter()
+            .filter(|(id, _)| *id != Some(zone_id))
+            .filter_map(|(_, appareil)| appareil.map(str::to_string))
+            .collect()
+    }
+
+    /// Quelles sorties le repli de `stop` a le droit de toucher.
+    ///
+    /// Tout ce qui est revendiqué par une autre zone est épargné, sans
+    /// exception : c'est l'invariant que ce repli avait perdu.
+    fn sorties_a_arreter_en_repli(
+        toutes: &[String],
+        revendiquees_ailleurs: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        toutes
+            .iter()
+            .filter(|did| !revendiquees_ailleurs.contains(did.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
@@ -7900,6 +8355,10 @@ impl PlaybackOrchestrator {
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);
+        // Une zone navigateur arrêtée avant que l'onglet ait tiré quoi que ce
+        // soit n'a rien fait entendre : son annonce en attente meurt ici
+        // (#1998).
+        self.oublier_annonce_navigateur(zone_id);
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -7924,22 +8383,53 @@ impl PlaybackOrchestrator {
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback.
+            // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
+            // enregistrées — et c'est ainsi qu'un `next` sur une zone
+            // « navigateur » (son dans le navigateur, donc AUCUN appareil côté
+            // serveur, par construction : `reject_if_zone_has_no_output_device`
+            // laisse justement passer ce cas) coupait la musique de tout le
+            // monde.
+            //
+            // Mesuré sur .18 le 28/08/2026 : dix arrêts en une heure, cadence
+            // ~100 s, chacun envoyant `dlna_stop` à l'Eversolo qui jouait la
+            // zone 10 et aux deux Sonos. La zone 10 n'étant elle-même jamais
+            // passée en « stopped », rien ne reprenait avant que le poller ne
+            // déclenche `radio_auto_retry` — jusqu'à près de trois minutes de
+            // silence à chaque fois.
+            //
+            // Le repli garde son utilité — rattraper une sortie orpheline que
+            // CETTE zone aurait laissée ouverte — mais il ne doit jamais
+            // toucher une sortie qu'une AUTRE zone revendique. Même famille
+            // que #2571 : un ordre qui sort du périmètre de la zone active.
+            let toutes_les_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .list()
+                .unwrap_or_default();
+            let revendiquees_ailleurs = Self::sorties_revendiquees_par_les_autres_zones(
+                toutes_les_zones
+                    .iter()
+                    .map(|z| (z.id, z.output_device_id.as_deref())),
+                zone_id,
+            );
             // Snapshot the Arcs first and release the registry lock, so a slow
             // or offline renderer's stop() SOAP timeout can't hold the lock and
             // starve concurrent playback for ~100s (send_to_output_lock_contention).
             let arcs: Vec<_> = {
                 let outputs = self.outputs.lock().await;
-                outputs
-                    .list()
+                Self::sorties_a_arreter_en_repli(&outputs.list(), &revendiquees_ailleurs)
                     .iter()
                     .filter_map(|did| outputs.get(did))
                     .collect()
             };
+            let arretees = arcs.len();
             for output in arcs {
                 let _ = output.lock().await.stop().await;
             }
-            warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
+            warn!(
+                zone_id,
+                arretees,
+                epargnees = revendiquees_ailleurs.len(),
+                "stop_fallback_no_device_id — repli borné aux sorties qu'aucune autre zone ne revendique"
+            );
         }
         // Remove session AFTER the output has been stopped
         if let Some(ref sid) = old_stream_id {
@@ -8966,6 +9456,96 @@ impl PlaybackOrchestrator {
     }
 }
 
+/// Les encodages que Bandcamp nomme dans le CHEMIN d'une URL de flux.
+///
+/// Liste fermée et non heuristique : un segment de chemin Bandcamp est le plus
+/// souvent un hachage hexadécimal, et prendre n'importe quel segment pour un
+/// encodage inventerait une qualité.
+const BC_KNOWN_ENCODINGS: &[&str] = &[
+    "mp3-128",
+    "mp3-320",
+    "mp3-v0",
+    "flac",
+    "alac",
+    "aac-hi",
+    "aiff-lossless",
+    "vorbis",
+    "wav",
+];
+
+/// L'encodage nommé par une URL Bandcamp, en minuscules.
+///
+/// Bandcamp écrit le nom de l'encodage dans l'URL elle-même, sous deux formes :
+///
+/// * segment de chemin — `https://t4.bcbits.com/stream/<hash>/mp3-128/<id>?…` ;
+/// * paramètre de requête — `https://bandcamp.com/stream_redirect?enc=mp3-128&…`.
+///
+/// Un fichier d'album **acheté** emprunte la seconde forme avec une autre
+/// valeur (`enc=flac`, `enc=mp3-320`, `enc=alac`…). C'est toute la raison
+/// d'être de cette fonction : la règle écrite dans le plugin — « un flux à
+/// 128 kbit/s doit être annoncé comme tel partout où il apparaît »,
+/// `plugins/tune-bandcamp/src/lib.rs` — porte sur la QUALITÉ du flux, jamais
+/// sur le nom du service. Décider depuis `source == "bandcamp"` collerait
+/// « 128 kbit/s » sur un FLAC acheté (#2074).
+///
+/// Rend `None` quand l'URL ne nomme aucun encodage connu : on n'annonce alors
+/// rien plutôt que de deviner un chiffre.
+pub fn bandcamp_encoding(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let (path, query) = lower.split_once('?').unwrap_or((lower.as_str(), ""));
+    if let Some(enc) = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("enc="))
+        .filter(|v| !v.is_empty())
+    {
+        return Some(enc.to_string());
+    }
+    path.split('/')
+        .find(|seg| BC_KNOWN_ENCODINGS.contains(seg))
+        .map(|seg| seg.to_string())
+}
+
+/// Ce qu'un encodage Bandcamp vaut réellement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandcampQuality {
+    /// Codec, sous la forme d'extension que lit le chemin du signal.
+    pub codec: &'static str,
+    /// Type MIME à annoncer à la zone.
+    pub mime_type: &'static str,
+    /// Débit CONSTANT en kbit/s. `None` pour un débit variable ou un encodage
+    /// sans perte : un débit inventé serait pire que pas de débit du tout.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Traduire un encodage Bandcamp en codec, MIME et débit annonçables.
+pub fn bandcamp_quality(enc: &str) -> Option<BandcampQuality> {
+    let q = |codec, mime_type, bitrate_kbps| {
+        Some(BandcampQuality {
+            codec,
+            mime_type,
+            bitrate_kbps,
+        })
+    };
+    match enc {
+        "flac" => q("flac", "audio/flac", None),
+        "alac" => q("alac", "audio/mp4", None),
+        "aiff-lossless" => q("aiff", "audio/aiff", None),
+        "wav" => q("wav", "audio/wav", None),
+        "vorbis" => q("ogg", "audio/ogg", None),
+        "aac-hi" => q("aac", "audio/mp4", None),
+        // Débit variable : le nom ne porte aucun chiffre, et en inventer un
+        // serait exactement le mensonge que ce correctif supprime.
+        "mp3-v0" => q("mp3", "audio/mpeg", None),
+        // `mp3-128` (écoute libre) et `mp3-320` (achat) partagent la même
+        // forme : on lit le nombre plutôt que d'énumérer, sinon un futur
+        // `mp3-256` retomberait silencieusement sans débit.
+        other => other
+            .strip_prefix("mp3-")
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|kbps| q("mp3", "audio/mpeg", Some(kbps))),
+    }
+}
+
 fn guess_mime_from_url(url: &str) -> &'static str {
     let lower = url.to_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
@@ -9495,6 +10075,65 @@ fn decode_radio_stream_to_pcm(
     }
 }
 
+/// Arm a one-shot diagnostic for a stream URL handed to a local output.
+///
+/// Creating a stream session is not enough to infer a fault: gapless prepares
+/// sessions well before they are meant to be consumed. The orchestrator calls
+/// this only on the main local-play path, immediately before `play_media`.
+/// Returning the task handle keeps the behaviour directly testable without
+/// scraping logs.
+async fn arm_local_stream_consumer_watch(
+    streamer: Arc<AudioStreamer>,
+    stream_id: String,
+    zone_id: i64,
+    device_id: String,
+    grace: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<bool>> {
+    use std::sync::atomic::Ordering;
+
+    let sessions = streamer.sessions_state();
+    let session = {
+        let guard = sessions.lock().await;
+        guard.get(&stream_id).cloned()
+    }?;
+
+    if session.consumer_watch_armed.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+
+        let Some(bytes_sent) = streamer.stream_bytes_sent(&stream_id).await else {
+            // The normal failure/stop paths remove the session. They already
+            // carry their own diagnostic and must not trigger a stale alert.
+            return false;
+        };
+        if bytes_sent != 0 {
+            return false;
+        }
+
+        let file_path = session.file_path.lock().await.clone();
+        let proxy_url = session.proxy_url.lock().await.clone();
+        let active_consumers = session.active_consumers.load(Ordering::Relaxed);
+        let session_age_ms = session.created_at.elapsed().as_millis() as u64;
+        warn!(
+            zone_id,
+            device_id = %device_id,
+            stream_id = %stream_id,
+            grace_ms = grace.as_millis() as u64,
+            session_age_ms,
+            format = %session.info.format,
+            mime_type = %session.info.mime_type,
+            file_path = ?file_path,
+            proxy_url = ?proxy_url,
+            active_consumers,
+            "local_stream_never_consumed"
+        );
+        true
+    }))
+}
+
 /// On-disk path candidates for a stored (NFC-normalized) DB path, in
 /// resolution order: the stored spelling first, then its NFD (decomposed)
 /// form. The scanner stores paths NFC-normalized for consistent DB lookups,
@@ -9870,10 +10509,89 @@ mod wav_override_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{RADIO_NOT_AUDIO, emit_radio_playback_error, non_audio_content_type};
+    use super::{
+        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        non_audio_content_type,
+    };
     use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // No warning before the grace period, then one warning for a live
+        // session whose HTTP body has never emitted a byte.
+        let (unconsumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            unconsumed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("first arm creates the watchdog");
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!task.is_finished(), "the grace period must be respected");
+        assert!(task.await.expect("watchdog task"));
+        assert!(
+            arm_local_stream_consumer_watch(
+                streamer.clone(),
+                unconsumed,
+                7,
+                "local:test".to_string(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_none(),
+            "the same session must never report twice"
+        );
+
+        // A body that emitted at least one byte is consumed, even if no reader
+        // happens to be active at the exact observation instant.
+        let (consumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        {
+            let sessions = streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard[&consumed]
+                .bytes_sent
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            consumed,
+            7,
+            "local:test".to_string(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("consumed session is armed");
+        assert!(!task.await.expect("watchdog task"));
+
+        // A session removed by a normal stop/error path during the grace
+        // period does not produce this diagnostic either.
+        let (removed, _tx, _ready) = streamer.create_session(info, false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            removed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("live session is armed");
+        streamer.remove_session(&removed).await;
+        assert!(!task.await.expect("watchdog task"));
+    }
 
     /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
     /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
@@ -11588,7 +12306,8 @@ mod tests {
     #[tokio::test]
     async fn transport_timeout_keeps_the_stream_session_but_refusal_drops_it() {
         let orch = test_orchestrator();
-        let f = std::env::temp_dir().join("tune-timeout-session-test.flac");
+        let flac = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        let f = flac.path().to_path_buf();
         std::fs::write(&f, b"fake audio").unwrap();
 
         for (device_id, output, doit_survivre) in [
@@ -11651,7 +12370,6 @@ mod tests {
                 "{device_id} : session présente={encore_la}, attendu={doit_survivre}"
             );
         }
-        let _ = std::fs::remove_file(&f);
     }
 
     /// #1518 (Vincent) : seek d'une piste STREAMING (Qobuz/Tidal) sur sortie
@@ -11961,6 +12679,256 @@ mod tests {
         assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
         assert_eq!(history[0].context_id.as_deref(), Some("12"));
         assert_eq!(history[0].source, "local");
+    }
+
+    // ------------------------------------------------------------------
+    // #1998 — zone navigateur : l'annonce suit la PREUVE de lecture.
+    //
+    // Aucun de ces tests ne touche le réseau : sans clé Last.fm ni jeton
+    // ListenBrainz dans la base de test, `dispatch_now_playing` sort avant le
+    // moindre appel. Ce qui est observé ici est l'effet vérifiable côté
+    // serveur — la ligne `listen_history` et le verrou « une seule fois ».
+    // ------------------------------------------------------------------
+
+    /// Une session de flux dont l'onglet a tiré `octets` octets.
+    async fn session_navigateur(
+        orch: &PlaybackOrchestrator,
+        fichier: &std::path::Path,
+        octets: u64,
+    ) -> String {
+        let sid = orch
+            .streamer
+            .create_file_session(
+                crate::http::streamer::StreamInfo {
+                    format: "flac".into(),
+                    mime_type: "audio/flac".into(),
+                    ..Default::default()
+                },
+                fichier.to_string_lossy().into_owned(),
+                false,
+            )
+            .await;
+        if octets > 0 {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .expect("la session vient d'être créée")
+                .bytes_sent
+                .store(octets, std::sync::atomic::Ordering::Relaxed);
+        }
+        sid
+    }
+
+    fn annonce_en_attente(
+        stream_id: &str,
+        record_history: bool,
+        source: &str,
+    ) -> super::AnnonceNavigateurDifferee {
+        super::AnnonceNavigateurDifferee {
+            stream_id: stream_id.to_string(),
+            title: "Come on In".into(),
+            artist: Some("Bridge City Sinners".into()),
+            album: Some("Unholy Hymns".into()),
+            source: source.into(),
+            source_id: None,
+            track_id: None,
+            duration_ms: 180_000,
+            cover_path: None,
+            record_history,
+        }
+    }
+
+    fn lignes_historique(orch: &PlaybackOrchestrator) -> usize {
+        crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+            .recent(10)
+            .unwrap()
+            .len()
+    }
+
+    /// Le cœur du ticket rouvert : tant que l'onglet n'a rien tiré, rien n'est
+    /// annoncé ; dès qu'il tire, l'annonce part — et une seule fois.
+    #[tokio::test]
+    async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+
+        // Onglet muet : la session existe, personne ne la consomme.
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "aucun octet tiré : l'annonce ne doit pas partir — c'est le défaut d'origine"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "listen_history ne doit rien porter tant que rien n'a été entendu"
+        );
+        assert!(
+            orch.annonces_navigateur
+                .lock()
+                .unwrap()
+                .contains_key(&zone_id),
+            "l'annonce reste en attente : l'onglet peut encore démarrer"
+        );
+
+        // L'onglet tire le flux : c'est la preuve.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .unwrap()
+                .bytes_sent
+                .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'onglet consomme le flux : l'annonce doit partir"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "l'historique local doit enfin porter cette écoute"
+        );
+
+        // Le tick suivant ne doit pas re-annoncer.
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "le poller repasse chaque seconde : une écoute, une annonce"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "pas de doublon au tick suivant"
+        );
+    }
+
+    /// `record_history=false` (recherche de position, reconnexion) : l'annonce
+    /// « en écoute » part, mais l'historique ne doublonne pas. Sans ce report
+    /// du drapeau, déplacer le curseur ajouterait une ligne à chaque fois.
+    #[tokio::test]
+    async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, false, "local"));
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'annonce « en écoute » part quand même : la piste est bien entendue"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "une re-création de flux pour une piste déjà en cours ne s'ajoute pas à l'historique"
+        );
+    }
+
+    /// La radio n'entre pas dans l'historique local — même exclusion que le
+    /// chemin nominal, pour la même raison (titre figé au démarrage).
+    #[tokio::test]
+    async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
+
+        assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "la radio ne s'écrit pas dans listen_history"
+        );
+    }
+
+    /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même
+    /// si un vieux flux traîne : l'attente est identifiée par SON flux.
+    #[tokio::test]
+    async fn zone_navigateur_un_autre_flux_ne_libere_pas_l_annonce() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let attendu = session_navigateur(&orch, &f, 0).await;
+        let autre = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&attendu, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &autre).await,
+            "les octets d'un AUTRE flux ne prouvent rien sur celui-ci"
+        );
+        assert_eq!(lignes_historique(&orch), 0);
+    }
+
+    /// Arrêt avant le premier octet : il n'y a rien eu à entendre, l'attente
+    /// meurt avec la lecture.
+    #[tokio::test]
+    async fn zone_navigateur_l_arret_annule_l_annonce_en_attente() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        orch.stop(zone_id, None).await;
+
+        assert!(
+            orch.annonces_navigateur.lock().unwrap().is_empty(),
+            "l'arrêt oublie l'annonce en attente"
+        );
+        // Même si l'onglet tire des octets après coup (fin de tampon), plus
+        // rien ne part : la lecture est terminée.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(s) = sessions.get(&sid) {
+                s.bytes_sent
+                    .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert!(!orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(lignes_historique(&orch), 0);
     }
 
     #[tokio::test]
@@ -12441,6 +13409,149 @@ mod tests {
         assert_eq!(resolved.bit_depth, Some(16));
     }
 
+    /// #2074 — l'URL est la seule autorité sur la qualité.
+    ///
+    /// Bandcamp nomme l'encodage dans l'URL, sous deux formes. Un fichier
+    /// ACHETÉ emprunte la même porte avec une autre valeur : la règle doit
+    /// donc porter sur le flux, jamais sur le nom du service.
+    #[test]
+    fn bandcamp_quality_is_read_from_the_url_never_from_the_source_name() {
+        use super::{bandcamp_encoding, bandcamp_quality};
+
+        // Forme « segment de chemin » — l'écoute libre publiée par Bandcamp.
+        assert_eq!(bandcamp_encoding(BC_STREAM).as_deref(), Some("mp3-128"));
+        let libre = bandcamp_quality("mp3-128").expect("mp3-128 est connu");
+        assert_eq!(libre.codec, "mp3");
+        assert_eq!(libre.mime_type, "audio/mpeg");
+        assert_eq!(libre.bitrate_kbps, Some(128));
+
+        // Forme « paramètre de requête » — la redirection de flux.
+        assert_eq!(
+            bandcamp_encoding("https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=1")
+                .as_deref(),
+            Some("mp3-128")
+        );
+
+        // ACHAT en lossless : ni MP3, ni débit. C'est le cœur de la règle.
+        let achete = bandcamp_quality(
+            &bandcamp_encoding("https://popplers5.bandcamp.com/download/track?enc=flac&id=42")
+                .expect("enc=flac doit être lu"),
+        )
+        .expect("flac est connu");
+        assert_eq!(achete.codec, "flac");
+        assert_eq!(achete.mime_type, "audio/flac");
+        assert_eq!(
+            achete.bitrate_kbps, None,
+            "un flux sans perte n'a aucun débit à annoncer"
+        );
+
+        // ACHAT en MP3 320 : même codec que l'extrait, débit différent.
+        assert_eq!(
+            bandcamp_quality("mp3-320").map(|q| q.bitrate_kbps),
+            Some(Some(320))
+        );
+        // Débit VARIABLE : on n'invente pas de chiffre.
+        assert_eq!(
+            bandcamp_quality("mp3-v0").map(|q| q.bitrate_kbps),
+            Some(None)
+        );
+
+        // Un hachage de chemin ne doit jamais passer pour un encodage.
+        assert_eq!(
+            bandcamp_encoding("https://t4.bcbits.com/stream/0123456789abcdef/7654321?p=0"),
+            None
+        );
+        assert_eq!(bandcamp_quality("chose-inconnue"), None);
+    }
+
+    #[tokio::test]
+    async fn bandcamp_carries_its_128_kbps_all_the_way_to_the_zone() {
+        // Le défaut de #2074 : la qualité était annoncée sur l'écran Bandcamp
+        // et se perdait au passage en zone. Les TROIS sorties câblées en
+        // 0.9.89 portent le même flux source — locale, WAV décodé pour OAAT,
+        // proxy MP3 pour un renderer réseau — donc les trois doivent porter
+        // le même débit jusqu'au chemin du signal.
+        let orch = test_orchestrator();
+        let sorties = [
+            None,
+            Some("local:default".to_string()),
+            Some("oaat:endpoint-1".to_string()),
+            Some("dlna:uuid-1234".to_string()),
+        ];
+        assert_eq!(sorties.len(), 4, "quatre sorties examinées");
+        for sortie in sorties {
+            let req = super::PlayRequest {
+                zone_id: 1,
+                output_device_id: sortie.clone(),
+                track_id: None,
+                source: Some("bandcamp".into()),
+                source_id: Some(BC_STREAM.into()),
+                title: Some("A Track".into()),
+                artist_name: None,
+                album_title: None,
+                cover_url: None,
+                duration_ms: Some(212_000),
+                seek_ms: None,
+                temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
+                track_number: None,
+                disc_number: None,
+            };
+            let resolved = orch.resolve_direct_url(&req).await.unwrap();
+            assert_eq!(
+                resolved.bitrate_kbps,
+                Some(128),
+                "sortie {sortie:?} : le 128 kbit/s doit atteindre la zone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purchased_bandcamp_file_is_never_labelled_mp3_128() {
+        // Cas de l'ACHAT : la même porte, un autre encodage. Coller
+        // « MP3 128 kbit/s » sur un FLAC serait le mensonge inverse.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("dlna:uuid-1234".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some("https://popplers5.bandcamp.com/download/track?enc=flac&id=42".into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert_eq!(
+            resolved.bitrate_kbps, None,
+            "aucun débit ne doit être annoncé sur un achat lossless"
+        );
+        assert_eq!(
+            resolved.mime_type, "audio/flac",
+            "le renderer doit recevoir le vrai type, pas audio/mpeg"
+        );
+        let stream_id = resolved
+            .stream_id
+            .as_deref()
+            .expect("une sortie réseau passe toujours par le proxy en clair");
+        assert!(
+            resolved.url.ends_with(&format!("/stream/{stream_id}.flac")),
+            "le conteneur servi doit suivre l'encodage réel : {}",
+            resolved.url
+        );
+    }
+
     /// An output that rejects `play_media` — mirrors an AirPlay renderer whose
     /// ANNOUNCE returns 403 (Bilou, forum #1135).
     struct RejectingOutput {
@@ -12832,5 +13943,140 @@ mod annonce_apres_sortie_guard {
              il scrobblerait un titre à la seconde où il commence, en ignorant \
              la règle des 50 % / 4 min de Last.fm (#1113)."
         );
+    }
+
+    /// Corps d'une méthode, de sa signature jusqu'à son accolade fermante au
+    /// même niveau d'indentation. Sert à vérifier une propriété DANS une
+    /// fonction sans que le reste du fichier puisse la satisfaire à sa place.
+    fn corps_de(signature: &str) -> &'static str {
+        let debut = position(signature);
+        let apres = &code_de_production()[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        &apres[..fin]
+    }
+
+    /// La zone navigateur n'a PAS de périphérique : `output_sent` y vaut
+    /// toujours faux. La garde ci-dessus lui avait donc supprimé toute annonce,
+    /// y compris quand elle joue — c'est la régression pour laquelle #1998 a
+    /// été rouvert. Son annonce doit être DIFFÉRÉE, pas supprimée.
+    #[test]
+    fn la_zone_navigateur_ne_perd_pas_son_annonce() {
+        assert!(
+            code_de_production().contains("if !output_sent && zone_navigateur {"),
+            "le démarrage ne met plus rien en attente pour une zone navigateur : \
+             elle ne scrobblerait plus RIEN, même en jouant (#1998, réouverture \
+             du 22/08). La sortie d'une zone navigateur est l'onglet, pas un \
+             appareil."
+        );
+    }
+
+    /// Et cette annonce différée ne part que sur PREUVE : des octets réellement
+    /// tirés de la session de flux. Pas sur l'intention de jouer.
+    #[test]
+    fn l_annonce_navigateur_suit_la_preuve_de_lecture() {
+        let corps = corps_de("pub async fn confirmer_lecture_navigateur(");
+        let preuve = corps
+            .find(".stream_bytes_sent(stream_id)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "`confirmer_lecture_navigateur` n'interroge plus les octets tirés : \
+                 elle annoncerait une écoute de zone navigateur sans preuve, ce que \
+                 #1998 reproche au démarrage."
+                )
+            });
+        let annonce = corps.find("self.dispatch_now_playing(").unwrap_or_else(|| {
+            panic!("`confirmer_lecture_navigateur` n'annonce plus rien du tout (#1998)")
+        });
+        assert!(
+            preuve < annonce,
+            "l'annonce de zone navigateur part AVANT la preuve que l'onglet tire \
+             le flux : c'est très exactement le défaut d'origine, déplacé (#1998)."
+        );
+    }
+
+    /// L'historique local de zone navigateur suit la même preuve, et garde le
+    /// drapeau `record_history` du démarrage : une re-création de flux pour une
+    /// piste déjà en cours (recherche de position) ne doit pas doublonner.
+    #[test]
+    fn l_historique_navigateur_garde_record_history() {
+        assert!(
+            corps_de("pub async fn confirmer_lecture_navigateur(")
+                .contains("if attente.record_history && attente.source != \"radio\" {"),
+            "l'historique de zone navigateur ne consulte plus `record_history` : \
+             déplacer le curseur ajouterait une ligne à chaque fois (#1998)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_scope_tests {
+    use super::PlaybackOrchestrator;
+
+    /// Le repli de `stop` ne doit JAMAIS toucher l'appareil d'une autre zone.
+    ///
+    /// Le défaut mesuré sur .18 le 28/08/2026 : la zone 15 « Cet ordinateur »
+    /// est une sortie navigateur, donc sans `output_device_id` par
+    /// construction. Chaque `next` dessus tombait dans le repli, qui arrêtait
+    /// TOUTES les sorties enregistrées — l'Eversolo de la zone 10 compris, en
+    /// pleine lecture. Même famille que #2571.
+    #[test]
+    fn le_repli_de_stop_epargne_les_sorties_des_autres_zones() {
+        // Zone 15 : navigateur, aucun appareil. Zones 10 et 8 : renderers.
+        let zones = [
+            (Some(15i64), None),
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 15);
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+            "uuid:orpheline-sans-zone".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+
+        assert!(
+            !a_arreter.contains(&"uuid:eversolo-dmp-a8".to_string()),
+            "un stop sur la zone 15 ne doit pas couper l'Eversolo, qui joue la zone 10"
+        );
+        assert!(
+            !a_arreter.contains(&"uuid:sonos-chambre".to_string()),
+            "ni le Sonos de la zone 8"
+        );
+        assert_eq!(
+            a_arreter,
+            vec!["uuid:orpheline-sans-zone".to_string()],
+            "le repli garde son seul objet légitime : une sortie qu'aucune zone ne revendique"
+        );
+    }
+
+    /// Et la zone qui demande l'arrêt ne s'épargne pas elle-même : si elle a
+    /// laissé une sortie ouverte, le repli doit encore pouvoir la fermer.
+    #[test]
+    fn le_repli_peut_toujours_fermer_la_sortie_de_la_zone_qui_arrete() {
+        let zones = [
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 10);
+        assert!(
+            !revendiquees.contains("uuid:eversolo-dmp-a8"),
+            "son propre appareil n'est pas « revendiqué ailleurs »"
+        );
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+        assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
     }
 }
