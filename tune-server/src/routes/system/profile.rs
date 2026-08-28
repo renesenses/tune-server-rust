@@ -75,7 +75,11 @@ pub(super) async fn system_profile(State(state): State<AppState>) -> Json<Value>
         "version": tune_core::version(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // #2117 : l'ancrage absolu voyage avec le compteur relatif, sinon la
+        // charge agrégée redonne à lire la valeur ambiguë que l'agrégation
+        // était censée éviter.
         "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "process_started_at": state.process_started_at_rfc3339(),
         "database_engine": state.backend.engine().as_str(),
         "audio_backend": audio_backend,
     });

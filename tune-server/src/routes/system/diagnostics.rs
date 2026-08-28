@@ -234,7 +234,14 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "rust_version": tune_core::rustc_version(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // #2117 : `uptime_seconds` mesure BIEN ce processus — il naît d'un
+        // `Instant` posé au démarrage — mais un compteur relatif ne permet pas
+        // de VÉRIFIER que le processus interrogé est le même qu'à l'appel
+        // précédent : il faut le déduire, et la déduction a déjà fait écarter
+        // à tort l'hypothèse d'un redémarrage pendant un diagnostic. L'ancrage
+        // absolu ci-dessous répond sans déduction : il change au redémarrage.
         "uptime_seconds": uptime_secs,
+        "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
@@ -1040,6 +1047,13 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         std::env::consts::ARCH
     ));
     md.push_str(&format!("**Uptime**: {uptime_str}\n"));
+    // #2117 : un rapport de bogue est lu bien après avoir été produit, souvent
+    // à côté d'un journal horodaté. « 1h19 » ne se recoupe avec rien ; une date
+    // de démarrage se recoupe avec tout.
+    md.push_str(&format!(
+        "**Process started**: {}\n",
+        state.process_started_at_rfc3339()
+    ));
     md.push_str(&format!("**PID**: {}\n", std::process::id()));
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
@@ -1150,6 +1164,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "arch": std::env::consts::ARCH,
         "uptime_seconds": uptime_secs,
         "uptime": uptime_str,
+        "process_started_at": state.process_started_at_rfc3339(),
         "pid": std::process::id(),
         "rss_mb": rss_mb,
         "library": {
