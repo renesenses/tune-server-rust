@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use lofty::file::TaggedFileExt;
@@ -11,6 +11,9 @@ use crate::state::AppState;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::track_repo::TrackRepo;
+
+use super::query_multi::track_filter_from_raw;
+use crate::error::AppError;
 
 /// Build a JSON array string for the `genres` column from parsed metadata.
 fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
@@ -71,87 +74,38 @@ pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
 }
 
-/// Query parameters for GET /library/tracks — supports pagination + metadata filters.
-/// All filters combine with AND logic.
+/// Query parameters for GET /library/tracks.
+///
+/// ⚠️ **Les facettes ne sont PAS des champs de cette structure.** La
+/// `Deserialize` dérivée refuse une clé en double (`duplicate field`), donc
+/// `?format=aiff&format=flac` rendait 400 tant qu'un champ `format` existait
+/// ici (#2168). Elles se lisent toutes dans `query_multi::track_filter_from_raw`,
+/// à partir de la chaîne de requête BRUTE — qui reprend au passage la
+/// validation de type que `serde` assurait (`?year=abc` → 400).
+///
+/// Ne restent ici que la pagination et ce qui ne peut pas se répéter.
 #[derive(Deserialize, Default)]
 pub(super) struct TrackFilterQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    pub genre: Option<String>,
-    pub year: Option<i32>,
-    pub format: Option<String>,
-    pub sample_rate: Option<i32>,
-    pub bit_depth: Option<i32>,
-    pub source: Option<String>,
-    pub label: Option<String>,
-    pub composer: Option<String>,
-    pub q: Option<String>,
-    pub artist: Option<String>,
-    pub country: Option<String>,
-    pub mood: Option<String>,
-    pub source_media: Option<String>,
-    /// Oxygen folder facet: absolute directory prefix; matches its whole subtree.
-    pub folder: Option<String>,
-    /// Oxygen rating facet: album rating 1-5 (profile 1).
-    pub rating: Option<i32>,
-    /// Oxygen collection facet: manual collection name (resolved to album ids).
+    /// Facette Collections : nom d'une collection manuelle ou intelligente.
+    /// MONOVALUÉE — voir `TrackFilter::collection_ids`.
     pub collection: Option<String>,
-    /// Facette Favoris : `track` ou `album` (profil 1).
-    pub favorite: Option<String>,
-    /// Facette Listes de lecture : nom de la liste.
-    pub playlist: Option<String>,
-    /// Facette Sans étiquette : `genre`, `year`, `artist`, `album` ou `cover`.
-    pub untagged: Option<String>,
-    /// Facette Année d'enregistrement (`albums.original_year`).
-    pub original_year: Option<i32>,
-}
-
-impl TrackFilterQuery {
-    /// Une requête porte-t-elle au moins un filtre ?
-    ///
-    /// Extrait de `list_tracks` pour être testable : tant que l'expression
-    /// vivait en ligne, un champ pouvait en être absent sans qu'aucun test ne
-    /// puisse le dire. C'est arrivé — `original_year` avait été ajouté à la
-    /// suite d'un `;`, donc dans une fermeture `|| …` créée et jetée, et le
-    /// tri par année d'enregistrement partait sur le chemin NON filtré.
-    ///
-    /// Toute facette ajoutée à cette structure doit être ajoutée ici ET dans
-    /// `chaque_facette_compte_comme_un_filtre`.
-    fn has_filters(&self) -> bool {
-        let non_vide = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
-
-        self.genre.is_some()
-            || self.year.is_some()
-            || self.format.is_some()
-            || self.sample_rate.is_some()
-            || self.bit_depth.is_some()
-            || self.source.is_some()
-            || self.label.is_some()
-            || self.composer.is_some()
-            || self.q.is_some()
-            || self.artist.is_some()
-            || self.country.is_some()
-            || self.mood.is_some()
-            || self.source_media.is_some()
-            || self.rating.is_some()
-            || self.original_year.is_some()
-            || non_vide(&self.folder)
-            || non_vide(&self.collection)
-            || non_vide(&self.favorite)
-            || non_vide(&self.playlist)
-            || non_vide(&self.untagged)
-    }
 }
 
 pub(super) async fn list_tracks(
     State(state): State<AppState>,
     Query(p): Query<TrackFilterQuery>,
-) -> Json<Value> {
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, AppError> {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
 
-    let has_filters = p.has_filters();
+    // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
+    // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
+    // et qu'il refuse même en double.
+    let mut filter = track_filter_from_raw(raw.as_deref())?;
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
@@ -175,38 +129,24 @@ pub(super) async fn list_tracks(
             }
         };
 
-    if has_filters {
-        match repo.list_filtered(
-            p.genre.as_deref(),
-            p.year,
-            p.format.as_deref(),
-            p.sample_rate,
-            p.bit_depth,
-            p.source.as_deref(),
-            p.label.as_deref(),
-            p.composer.as_deref(),
-            p.q.as_deref(),
-            p.artist.as_deref(),
-            p.country.as_deref(),
-            p.mood.as_deref(),
-            p.source_media.as_deref(),
-            p.folder.as_deref(),
-            p.rating,
-            collection_ids.as_deref(),
-            collection_track_ids.as_deref(),
-            p.favorite.as_deref(),
-            p.playlist.as_deref(),
-            p.untagged.as_deref(),
-            p.original_year,
-            limit,
-            offset,
-        ) {
-            Ok((items, total)) => {
-                Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
-            }
+    filter.collection_ids = collection_ids;
+    filter.collection_track_ids = collection_track_ids;
+
+    // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
+    // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
+    // suive, la route emprunte le chemin filtré, n'y filtre rien, et rend la
+    // bibliothèque ENTIÈRE en annonçant un filtre actif — c'est exactement ce
+    // que faisait `?favorite=1` avant #2168.
+    if filter.is_active() {
+        match repo.list_filtered(&filter, limit, offset) {
+            Ok((items, total)) => Ok(Json(
+                json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+            )),
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
-                Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+                Ok(Json(
+                    json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
+                ))
             }
         }
     } else {
@@ -224,7 +164,9 @@ pub(super) async fn list_tracks(
                 Vec::new()
             }
         };
-        Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+        Ok(Json(
+            json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+        ))
     }
 }
 
@@ -1128,8 +1070,17 @@ mod identification_acoustique_tests {
 }
 
 #[cfg(test)]
-mod has_filters_tests {
-    use super::TrackFilterQuery;
+mod filtre_actif_tests {
+    use super::super::query_multi::track_filter_from_raw;
+    use tune_core::db::facet_filter::TrackFilter;
+
+    /// La requête telle qu'elle arrive sur le fil — le chemin de `list_tracks`.
+    fn depuis(raw: &str) -> TrackFilter {
+        match track_filter_from_raw(Some(raw)) {
+            Ok(f) => f,
+            Err(_) => panic!("requête acceptable : {raw}"),
+        }
+    }
 
     /// Le garde-fou de la régression : `original_year` seul DOIT compter comme
     /// un filtre. Il ne comptait pas — il avait atterri après un `;`, dans une
@@ -1137,12 +1088,8 @@ mod has_filters_tests {
     /// faire échouer la compilation. Neuf checks de CI verts ne l'ont pas vu.
     #[test]
     fn annee_denregistrement_seule_est_un_filtre() {
-        let q = TrackFilterQuery {
-            original_year: Some(1969),
-            ..Default::default()
-        };
         assert!(
-            q.has_filters(),
+            depuis("original_year=1969").is_active(),
             "filtrer sur l'année d'enregistrement partait sur le chemin NON filtré"
         );
     }
@@ -1151,100 +1098,90 @@ mod has_filters_tests {
     /// paginée) ne serait jamais emprunté.
     #[test]
     fn une_requete_nue_ne_filtre_rien() {
-        assert!(!TrackFilterQuery::default().has_filters());
+        assert!(!depuis("limit=50&offset=0").is_active());
+        assert!(!TrackFilter::default().is_active());
     }
 
     /// Une chaîne vide n'est pas un filtre : `?favorite=` arrive ainsi depuis
     /// le client quand la facette est désélectionnée.
     #[test]
     fn une_chaine_vide_nest_pas_un_filtre() {
-        let q = TrackFilterQuery {
-            favorite: Some(String::new()),
-            playlist: Some(String::new()),
-            untagged: Some(String::new()),
-            collection: Some(String::new()),
-            folder: Some(String::new()),
-            ..Default::default()
-        };
-        assert!(!q.has_filters(), "une facette vide ne doit pas filtrer");
+        let q = depuis("favorite=&playlist=&untagged=&collection=&folder=&format=&genre=");
+        assert!(!q.is_active(), "une facette vide ne doit pas filtrer");
+    }
+
+    /// ⚠️ Défaut RÉEL corrigé au passage. Avant #2168, une valeur hors du
+    /// vocabulaire fermé comptait comme un filtre (`Option::is_some`) mais ne
+    /// produisait AUCUNE condition SQL (`_ => {}`) : la route empruntait le
+    /// chemin filtré, n'y filtrait rien, et rendait la bibliothèque ENTIÈRE
+    /// avec un total qui la confirmait. `is_active` teste désormais le
+    /// vocabulaire, pas la présence.
+    #[test]
+    fn une_valeur_hors_vocabulaire_ne_rend_plus_toute_la_bibliotheque() {
+        assert!(!depuis("favorite=1").is_active());
+        assert!(!depuis("untagged=mbid").is_active());
+        assert!(depuis("favorite=album").is_active());
+        assert!(depuis("untagged=cover").is_active());
     }
 
     /// Chaque facette, prise SEULE, doit compter. Ce test est la raison d'être
-    /// de l'extraction : il échouera si une facette est ajoutée à la structure
-    /// et oubliée dans `has_filters` — exactement le défaut corrigé ici.
+    /// de l'extraction : il échouera si une facette est ajoutée et oubliée dans
+    /// `TrackFilter::is_active` — exactement le défaut corrigé ici.
     #[test]
     fn chaque_facette_compte_comme_un_filtre() {
-        let cas: Vec<(&str, TrackFilterQuery)> = vec![
-            (
-                "genre",
-                TrackFilterQuery {
-                    genre: Some("Rock".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "year",
-                TrackFilterQuery {
-                    year: Some(1994),
-                    ..Default::default()
-                },
-            ),
-            (
-                "original_year",
-                TrackFilterQuery {
-                    original_year: Some(1969),
-                    ..Default::default()
-                },
-            ),
-            (
-                "rating",
-                TrackFilterQuery {
-                    rating: Some(4),
-                    ..Default::default()
-                },
-            ),
-            (
-                "favorite",
-                TrackFilterQuery {
-                    favorite: Some("1".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "playlist",
-                TrackFilterQuery {
-                    playlist: Some("Ma liste".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "untagged",
-                TrackFilterQuery {
-                    untagged: Some("genre".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "collection",
-                TrackFilterQuery {
-                    collection: Some("Jazz".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "folder",
-                TrackFilterQuery {
-                    folder: Some("/mnt/music".into()),
-                    ..Default::default()
-                },
-            ),
+        let cas = [
+            ("genre", "genre=Rock"),
+            ("year", "year=1994"),
+            ("format", "format=flac"),
+            ("sample_rate", "sample_rate=96000"),
+            ("bit_depth", "bit_depth=24"),
+            ("source", "source=local"),
+            ("label", "label=ECM"),
+            ("composer", "composer=Bach"),
+            ("artist", "artist=Miles+Davis"),
+            ("country", "country=FR"),
+            ("mood", "mood=calme"),
+            ("source_media", "source_media=CD"),
+            ("original_year", "original_year=1969"),
+            ("rating", "rating=4"),
+            ("favorite", "favorite=track"),
+            ("playlist", "playlist=Ma+liste"),
+            ("untagged", "untagged=genre"),
+            ("folder", "folder=%2Fmnt%2Fmusic"),
+            ("q", "q=so+what"),
         ];
-        for (nom, q) in cas {
+        for (nom, raw) in cas {
             assert!(
-                q.has_filters(),
+                depuis(raw).is_active(),
                 "la facette « {nom} » ne compte pas comme un filtre"
             );
         }
+        // `collection` ne passe pas par la chaîne brute : la route la résout en
+        // identifiants avant d'appeler `list_filtered`.
+        let sel = TrackFilter {
+            collection_ids: Some(vec![12]),
+            ..Default::default()
+        };
+        assert!(sel.is_active(), "la facette « collection » ne compte pas");
+    }
+
+    /// Le cas de Cyrille (fil 1513) : deux formats et deux fréquences cochés.
+    #[test]
+    fn plusieurs_valeurs_dans_une_meme_facette() {
+        let q = depuis("format=aiff&format=flac&sample_rate=44100&sample_rate=352800");
+        assert_eq!(q.formats, vec!["aiff".to_string(), "flac".to_string()]);
+        assert_eq!(q.sample_rates, vec![44100, 352800]);
+        assert!(q.is_active());
+    }
+
+    /// Rétrocompatibilité : une URL enregistrée avant #2168 (une valeur par
+    /// facette) donne exactement le même filtre.
+    #[test]
+    fn une_url_ancienne_reste_lue_a_lidentique() {
+        let q = depuis("genre=Jazz&format=flac&year=1971&limit=3000");
+        assert_eq!(q.genres, vec!["Jazz".to_string()]);
+        assert_eq!(q.formats, vec!["flac".to_string()]);
+        assert_eq!(q.years, vec![1971]);
     }
 }
 

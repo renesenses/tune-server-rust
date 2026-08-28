@@ -380,7 +380,8 @@ pub(super) async fn update_config(
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
-    let volume_lock_was_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
+    let volume_lock_was_enabled =
+        tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
     if volume_lock_confirmation_required(&values, volume_lock_was_enabled, full_volume_confirmed) {
         tracing::warn!("audiophile_volume_lock_confirmation_required");
         return Ok((

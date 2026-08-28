@@ -2576,13 +2576,11 @@ struct CrossfadeSettings {
 
 /// Read the persisted crossfade settings for a zone.
 ///
-/// NOTE: crossfade is not yet applied by the playback engine (the
-/// `CrossfadeHandler` in tune-core is not wired into the transition path).
-/// This endpoint only persists/returns the user's preference so the UI can
-/// round-trip it without a 405 — actually applying the fade is a follow-up.
+/// Crossfade is not applied by the playback engine: report the capability as
+/// unavailable and never echo a stale persisted preference as if it were live.
 async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings
+    let requested_enabled = settings
         .get(&format!("crossfade_enabled:{zone_id}"))
         .ok()
         .flatten()
@@ -2595,31 +2593,66 @@ async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) 
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(3.0);
     Json(json!({
-        "enabled": enabled,
+        "available": false,
+        "enabled": false,
+        "requested_enabled": requested_enabled,
         "duration": duration,
     }))
+}
+
+fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
+    if body.enabled {
+        return Err("crossfade_unavailable");
+    }
+    Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
 }
 
 async fn set_crossfade(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    let duration = match validate_crossfade_update(&body) {
+        Ok(duration) => duration,
+        Err(code) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": code,
+                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let duration = body.duration.unwrap_or(3.0);
-    let _ = settings.set(
-        &format!("crossfade_enabled:{zone_id}"),
-        &body.enabled.to_string(),
-    );
-    let _ = settings.set(
+    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
+        error!(zone_id, %error, "crossfade_disable_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = settings.set(
         &format!("crossfade_duration:{zone_id}"),
         &duration.to_string(),
-    );
+    ) {
+        error!(zone_id, %error, "crossfade_duration_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
     Json(json!({
         "zone_id": zone_id,
-        "crossfade_enabled": body.enabled,
+        "available": false,
+        "crossfade_enabled": false,
         "crossfade_duration": duration,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -3056,30 +3089,50 @@ async fn save_queue_as_pin(
 // ---------------------------------------------------------------------------
 
 async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("zone_{zone_id}_audiophile");
-    let val = settings
-        .get(&key)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(json!({ "enabled": false }));
-    Json(val)
+    Json(json!({
+        "enabled": tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id),
+        "lock_volume": tune_core::audio::audiophile::volume_lock_override(
+            &state.backend,
+            zone_id,
+        ),
+        "effective_lock_volume": tune_core::audio::audiophile::volume_lock_enabled(
+            &state.backend,
+            zone_id,
+        ),
+    }))
+}
+
+/// Trois états JSON pour une surcharge : champ absent, `null` (hériter), ou
+/// booléen explicite. `Option<Option<bool>>` sans désérialiseur confondrait les
+/// deux premiers et empêcherait de revenir au réglage global.
+fn nested_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 struct AudiophileChange {
-    enabled: bool,
+    /// Absent quand la requête ne change que la portée du verrou.
+    enabled: Option<bool>,
+    /// `null` = hériter du réglage global, booléen = surcharge de cette zone.
+    #[serde(default, deserialize_with = "nested_option")]
+    lock_volume: Option<Option<bool>>,
     #[serde(default)]
     confirm_full_volume: bool,
 }
 
-/// L'activation de PURE avec le verrou armé est une commande de volume à
-/// 100 %, pas un simple changement d'affichage. Le serveur impose donc la
-/// confirmation à tous les clients, y compris une télécommande ou un appel
-/// direct qui contournerait le client web (#2445).
-fn full_volume_confirmation_required(lock_enabled: bool, body: &AudiophileChange) -> bool {
-    lock_enabled && body.enabled && !body.confirm_full_volume
+/// Toute transition vers « PURE + verrou effectif » est une commande à 100 %,
+/// qu'elle vienne de l'activation de PURE ou de la surcharge par zone. Une
+/// requête qui ne change rien ne redemande pas une confirmation (#2526).
+fn full_volume_confirmation_required(
+    was_full_volume: bool,
+    will_be_full_volume: bool,
+    confirmed: bool,
+) -> bool {
+    !was_full_volume && will_be_full_volume && !confirmed
 }
 
 async fn set_audiophile(
@@ -3087,8 +3140,23 @@ async fn set_audiophile(
     Path(zone_id): Path<i64>,
     Json(body): Json<AudiophileChange>,
 ) -> axum::response::Response {
-    let lock_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
-    if full_volume_confirmation_required(lock_enabled, &body) {
+    let current_enabled = tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
+    let current_lock = tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id);
+    let current_override =
+        tune_core::audio::audiophile::volume_lock_override(&state.backend, zone_id);
+    let target_enabled = body.enabled.unwrap_or(current_enabled);
+    let target_override = body.lock_volume.unwrap_or(current_override);
+    let target_lock = target_override.unwrap_or_else(|| {
+        tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
+    });
+    let was_full_volume = current_enabled && current_lock;
+    let will_be_full_volume = target_enabled && target_lock;
+
+    if full_volume_confirmation_required(
+        was_full_volume,
+        will_be_full_volume,
+        body.confirm_full_volume,
+    ) {
         warn!(zone_id, "audiophile_full_volume_confirmation_required");
         return (
             StatusCode::CONFLICT,
@@ -3103,7 +3171,7 @@ async fn set_audiophile(
     // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
     // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
     // deux mondes, ni bit-perfect ni réglable.
-    if lock_enabled && body.enabled {
+    if !was_full_volume && will_be_full_volume {
         let device_id = get_zone_device_id(&state, zone_id);
         if let Err(error) = state
             .orchestrator
@@ -3116,11 +3184,24 @@ async fn set_audiophile(
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
+    let mut stored = serde_json::Map::new();
+    stored.insert("enabled".into(), json!(target_enabled));
+    if let Some(lock_volume) = target_override {
+        stored.insert("lock_volume".into(), json!(lock_volume));
+    }
     // Le témoin de confirmation autorise cette seule requête : il ne devient
     // jamais un réglage persistant qui pourrait autoriser un saut ultérieur.
-    settings
-        .set(&key, &json!({ "enabled": body.enabled }).to_string())
-        .ok();
+    if let Err(error) = settings.set(&key, &Value::Object(stored).to_string()) {
+        error!(zone_id, %error, "audiophile_setting_write_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "audiophile_setting_write_failed",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
 
     // Repousser l'état vers la sortie qui joue. Sans cet appel, la clé était
     // écrite, la route répondait un succès, et la bascule n'atteignait le son
@@ -3128,10 +3209,16 @@ async fn set_audiophile(
     // ReplayGain continuaient de travailler pendant que le badge PURE
     // s'allumait (#1986). Même famille que #1725 (EQ) et #1786 (crossfeed) —
     // et le garde-fou de `routes/mod.rs` couvre désormais cette clé aussi.
-    let applique_a_chaud = state.orchestrator.apply_audiophile_change(zone_id).await;
+    let applique_a_chaud = if body.enabled.is_some() {
+        state.orchestrator.apply_audiophile_change(zone_id).await
+    } else {
+        false
+    };
     info!(
         zone_id,
-        enabled = body.enabled,
+        enabled = target_enabled,
+        lock_volume = ?target_override,
+        effective_lock_volume = target_lock,
         applique_a_chaud,
         "audiophile_mode_set"
     );
@@ -3140,7 +3227,9 @@ async fn set_audiophile(
     // audible MAINTENANT, ou seulement au prochain flux ? Le témoin de
     // confirmation n'est volontairement jamais renvoyé ni persisté.
     Json(json!({
-        "enabled": body.enabled,
+        "enabled": target_enabled,
+        "lock_volume": target_override,
+        "effective_lock_volume": target_lock,
         "applied_live": applique_a_chaud,
     }))
     .into_response()
@@ -3642,35 +3731,28 @@ mod tests {
 
     #[test]
     fn pure_avec_verrou_refuse_toute_activation_non_confirmee() {
-        let activation = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: false,
-        };
-        assert!(full_volume_confirmation_required(true, &activation));
-
-        let confirmation = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: true,
-        };
-        assert!(!full_volume_confirmation_required(true, &confirmation));
+        assert!(full_volume_confirmation_required(false, true, false));
+        assert!(!full_volume_confirmation_required(false, true, true));
     }
 
     #[test]
     fn aucune_confirmation_n_est_demandee_sans_montee_de_volume() {
-        let activation_sans_verrou = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: false,
-        };
-        assert!(!full_volume_confirmation_required(
-            false,
-            &activation_sans_verrou
-        ));
+        assert!(!full_volume_confirmation_required(false, false, false));
+        assert!(!full_volume_confirmation_required(true, true, false));
+        assert!(!full_volume_confirmation_required(true, false, false));
+    }
 
-        let desactivation = AudiophileChange {
-            enabled: false,
-            confirm_full_volume: false,
-        };
-        assert!(!full_volume_confirmation_required(true, &desactivation));
+    #[test]
+    fn surcharge_de_verrou_distingue_absent_heritage_et_booleen() {
+        let absent: AudiophileChange = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(absent.enabled, None);
+        assert_eq!(absent.lock_volume, None);
+
+        let heritage: AudiophileChange = serde_json::from_str(r#"{"lock_volume":null}"#).unwrap();
+        assert_eq!(heritage.lock_volume, Some(None));
+
+        let force: AudiophileChange = serde_json::from_str(r#"{"lock_volume":true}"#).unwrap();
+        assert_eq!(force.lock_volume, Some(Some(true)));
     }
 
     #[test]
@@ -4089,5 +4171,41 @@ mod tests_contexte_de_lecture {
             contexte_de_lecture(&body),
             (Some("album".into()), Some("7".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_crossfade_indisponible {
+    use super::{CrossfadeSettings, validate_crossfade_update};
+
+    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
+    /// n'en tient compte est un faux succès. L'activation doit échouer avant
+    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    #[test]
+    fn activer_le_faux_crossfade_est_refuse() {
+        let body = CrossfadeSettings {
+            enabled: true,
+            duration: Some(5.0),
+        };
+
+        assert_eq!(
+            validate_crossfade_update(&body),
+            Err("crossfade_unavailable")
+        );
+    }
+
+    #[test]
+    fn desactiver_reste_possible_et_borne_la_preference_de_duree() {
+        let too_long = CrossfadeSettings {
+            enabled: false,
+            duration: Some(99.0),
+        };
+        let default = CrossfadeSettings {
+            enabled: false,
+            duration: None,
+        };
+
+        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
+        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
     }
 }

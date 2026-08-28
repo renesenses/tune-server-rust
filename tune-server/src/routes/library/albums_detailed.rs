@@ -12,7 +12,7 @@
 //! donc exactement ce que le rail annonce.
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use serde_json::{Value, json};
 
 use crate::error::AppError;
@@ -27,8 +27,12 @@ const ONLY_REAL_ALBUMS: &str = "t.album_id IS NOT NULL";
 
 pub(super) async fn albums_detailed(
     Query(q): Query<FacetQuery>,
+    RawQuery(raw): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // Même lecture des facettes multi-valeurs que le rail (#2168) : les cartes
+    // doivent compter exactement ce que le rail annonce.
+    let q = q.hydrate(raw.as_deref())?;
     let engine = state.backend.engine();
     // Même résolution que le rail : le nom d'une collection manuelle vit dans
     // un JSON de réglages, pas dans une table joignable.

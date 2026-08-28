@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::state::AppState;
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::track_repo::TrackRepo;
 
 use super::Pagination;
 
@@ -107,6 +108,12 @@ pub(super) async fn completeness_stats(
     let albums_without_artist = get(10);
     let total_artists = get(11);
     let artists_without_image = get(12);
+    // Le client affiche ce nombre dans la pastille « Métadonnées douteuses ».
+    // Réutiliser le compteur de la route `/metadata/doubtful` garantit que la
+    // pastille et la liste comptent exactement la même population (#1897).
+    let doubtful_count = TrackRepo::with_backend(state.backend.clone())
+        .count_doubtful()
+        .map_err(|erreur| AppError::internal(erreur.to_string()))?;
 
     let genre_pct = if total_tracks > 0 {
         with_genre as f64 / total_tracks as f64 * 100.0
@@ -166,6 +173,7 @@ pub(super) async fn completeness_stats(
         "tracks_without_artist": total_tracks - with_artist,
         "albums_without_artist": albums_without_artist,
         "artists_without_image": artists_without_image,
+        "doubtful_count": doubtful_count,
         "genre_pct": genre_pct.round(),
         "year_pct": year_pct.round(),
         "artist_pct": artist_pct.round(),

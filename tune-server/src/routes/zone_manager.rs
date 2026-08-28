@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::zones::latency::measure_control_rtt;
 
 use crate::state::AppState;
 
@@ -443,6 +444,22 @@ async fn group_volume(
 // Calibrate
 // ---------------------------------------------------------------------------
 
+fn audio_calibration_unavailable_payload(group_id: i64) -> Value {
+    json!({
+        "error": "audio_calibration_unavailable",
+        "group_id": group_id,
+        "message": "Le RTT de commande ne mesure pas la latence de restitution audio. Utilisez les corrections manuelles jusqu'à la disponibilité de timestamps de présentation ou d'une mesure acoustique.",
+    })
+}
+
+pub(crate) fn audio_calibration_unavailable(group_id: i64) -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(audio_calibration_unavailable_payload(group_id)),
+    )
+        .into_response()
+}
+
 async fn calibrate_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
@@ -454,48 +471,7 @@ async fn calibrate_group(
         .iter()
         .find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match group {
-        Some(group) => {
-            let zone_ids: Vec<i64> = group["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-
-            let outputs = state.outputs.lock().await;
-            let mut latencies = Vec::new();
-            for zid in &zone_ids {
-                let zone = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten();
-                if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
-                    if let Some(output) = outputs.get(device_id) {
-                        let output = output.lock().await;
-                        let start = std::time::Instant::now();
-                        let _ = output.get_status().await;
-                        let rtt_ms = start.elapsed().as_millis() as i64;
-                        latencies.push((*zid, rtt_ms / 2));
-                    } else {
-                        latencies.push((*zid, 0));
-                    }
-                } else {
-                    latencies.push((*zid, 0));
-                }
-            }
-            drop(outputs);
-
-            let leader_latency = latencies.first().map(|(_, l)| *l).unwrap_or(0);
-            let mut calibration = serde_json::Map::new();
-            for (zid, lat) in &latencies {
-                let sync_delay = leader_latency - lat;
-                calibration.insert(zid.to_string(), json!(sync_delay));
-            }
-
-            Json(json!({
-                "group_id": group_id,
-                "calibration": calibration,
-            }))
-            .into_response()
-        }
+        Some(_) => audio_calibration_unavailable(group_id),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -855,10 +831,13 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Measure Latency
+// Measure control RTT
 // ---------------------------------------------------------------------------
 
-/// Measure round-trip time to all zone output devices.
+/// Mesure le trajet aller-retour d'une COMMANDE vers chaque sortie.
+///
+/// Ce diagnostic ne prétend pas connaître la latence audio. En particulier,
+/// aucun demi-RTT n'est publié comme estimation de restitution (#2215).
 async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
@@ -870,24 +849,42 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         if let Some(ref device_id) = z.output_device_id {
             if let Some(output) = outputs.get(device_id) {
                 let output = output.lock().await;
-                let start = std::time::Instant::now();
-                let _ = output.get_status().await;
-                let rtt_ms = start.elapsed().as_millis() as u64;
-                results.push(json!({
-                    "zone_id": zone_id,
-                    "zone_name": z.name,
-                    "device_id": device_id,
-                    "rtt_ms": rtt_ms,
-                    "estimated_latency_ms": rtt_ms / 2,
-                    "status": "reachable",
-                }));
+                match measure_control_rtt(&**output, 5).await {
+                    Some(stats) => results.push(json!({
+                        "zone_id": zone_id,
+                        "zone_name": z.name,
+                        "device_id": device_id,
+                        "measurement": "control_rtt",
+                        "control_rtt": {
+                            "samples": stats.samples,
+                            "min_ms": stats.min_ms,
+                            "p50_ms": stats.p50_ms,
+                            "p95_ms": stats.p95_ms,
+                            "p99_ms": stats.p99_ms,
+                            "max_ms": stats.max_ms,
+                            "uncertainty_ms": stats.uncertainty_ms,
+                        },
+                        "audio_latency_ms": null,
+                        "status": "reachable",
+                    })),
+                    None => results.push(json!({
+                        "zone_id": zone_id,
+                        "zone_name": z.name,
+                        "device_id": device_id,
+                        "measurement": "control_rtt",
+                        "control_rtt": null,
+                        "audio_latency_ms": null,
+                        "status": "probe_failed",
+                    })),
+                }
             } else {
                 results.push(json!({
                     "zone_id": zone_id,
                     "zone_name": z.name,
                     "device_id": device_id,
-                    "rtt_ms": null,
-                    "estimated_latency_ms": null,
+                    "measurement": "control_rtt",
+                    "control_rtt": null,
+                    "audio_latency_ms": null,
                     "status": "output_not_registered",
                 }));
             }
@@ -896,8 +893,9 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
                 "zone_id": zone_id,
                 "zone_name": z.name,
                 "device_id": null,
-                "rtt_ms": null,
-                "estimated_latency_ms": null,
+                "measurement": "control_rtt",
+                "control_rtt": null,
+                "audio_latency_ms": null,
                 "status": "no_output_assigned",
             }));
         }
@@ -905,6 +903,9 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(json!({
         "latencies": results,
+        "measurement": "control_rtt",
+        "audio_latency_available": false,
+        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio.",
         "measured_at": now_iso(),
     }))
 }
@@ -1304,5 +1305,27 @@ mod tests {
         ])
         .await;
         assert_eq!(refuses, vec![format!("127.0.0.1:{port_mauvais}")]);
+    }
+
+    #[test]
+    fn le_refus_de_calibrage_explique_la_mesure_manquante() {
+        let payload = audio_calibration_unavailable_payload(42);
+
+        assert_eq!(payload["error"], "audio_calibration_unavailable");
+        assert_eq!(payload["group_id"], 42);
+        assert!(payload["message"].as_str().unwrap().contains("RTT"));
+        assert!(payload["message"].as_str().unwrap().contains("audio"));
+    }
+
+    #[test]
+    fn aucune_route_ne_rebaptise_un_demi_rtt_en_latence_audio() {
+        let manager = include_str!("zone_manager.rs");
+        let zones = include_str!("zones.rs");
+
+        let demi_rtt = concat!("rtt_ms", " / 2");
+        let fausse_estimation = concat!("estimated_", "latency_ms");
+        assert!(!manager.contains(demi_rtt));
+        assert!(!zones.contains(demi_rtt));
+        assert!(!manager.contains(fausse_estimation));
     }
 }

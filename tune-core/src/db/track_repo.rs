@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+pub use super::facet_filter::TrackFilter;
+use super::facet_filter::{Placeholders, any_of, favorite_condition, untagged_condition};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -371,6 +373,12 @@ pub mod sql {
          WHERE source = 'local' AND audio_hash IS NOT NULL AND album_id IS NOT NULL"
     }
 
+    pub fn get_existing_audio_hash_album_paths() -> &'static str {
+        "SELECT audio_hash, album_id, file_path FROM tracks \
+         WHERE source = 'local' AND audio_hash IS NOT NULL \
+           AND album_id IS NOT NULL AND file_path IS NOT NULL"
+    }
+
     /// Engine-agnostic search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -395,25 +403,24 @@ pub mod sql {
 /// shared query methods (which internal callers — playlist matching, tag
 /// writing, conversion — still need to see every row).
 ///
-/// Two rows are duplicates when they share the same `album_id` AND either the
-/// same non-empty `audio_hash` (identical audio bytes), or — when no hash is
-/// available — the same disc number, track number and (case-insensitive) title.
-/// The first occurrence in the input order is kept (callers order by
-/// disc/track, so the retained row is the natural one).
+/// Display collapsing deliberately ignores `audio_hash`: a sampled candidate
+/// must not make a real track disappear from an album or artist view. The
+/// legacy presentation key remains album + disc + track + case-insensitive
+/// title. The first occurrence in input order is kept.
 pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     let mut seen: HashSet<(Option<i64>, String)> = HashSet::new();
     let mut out = Vec::with_capacity(tracks.len());
     for t in tracks {
-        let key = match t.audio_hash.as_deref().map(str::trim) {
-            Some(h) if !h.is_empty() => format!("h:{h}"),
-            _ => format!(
+        let key = (
+            t.album_id,
+            format!(
                 "m:{}/{}/{}",
                 t.disc_number,
                 t.track_number,
                 t.title.trim().to_lowercase()
             ),
-        };
-        if seen.insert((t.album_id, key)) {
+        );
+        if seen.insert(key) {
             out.push(t);
         }
     }
@@ -654,161 +661,161 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    /// Filtered track listing with optional WHERE clauses (AND logic).
+    /// Filtered track listing with optional WHERE clauses.
+    ///
+    /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
+    /// se combinent en **OU** (`format = aiff OU flac`) ; deux facettes
+    /// différentes se combinent en **ET** (`format = flac ET genre = jazz`).
+    /// Une facette dont la liste est vide ne produit AUCUN prédicat — ni
+    /// `IN ()`, ni un `1 = 1` qui rendrait la bibliothèque entière.
+    ///
     /// Returns (items, total_matching_count).
     pub fn list_filtered(
         &self,
-        genre: Option<&str>,
-        year: Option<i32>,
-        format: Option<&str>,
-        sample_rate: Option<i32>,
-        bit_depth: Option<i32>,
-        source: Option<&str>,
-        label: Option<&str>,
-        composer: Option<&str>,
-        q: Option<&str>,
-        artist: Option<&str>,
-        country: Option<&str>,
-        mood: Option<&str>,
-        source_media: Option<&str>,
-        folder: Option<&str>,
-        rating: Option<i32>,
-        collection_ids: Option<&[i64]>,
-        collection_track_ids: Option<&[i64]>,
-        // Facettes Oxygen « lot 1 ». Les prédicats SQL ci-dessous sont les
-        // JUMEAUX de ceux de `routes::library::facets::build_conditions` (autre
-        // crate) : une facette qui compterait autrement que la liste qu'elle
-        // filtre serait pire qu'une facette absente.
-        favorite: Option<&str>,
-        playlist: Option<&str>,
-        untagged: Option<&str>,
-        // Année d'ENREGISTREMENT (`albums.original_year`) — distincte de
-        // `year`, qui est celle de l'édition.
-        original_year: Option<i32>,
+        f: &TrackFilter,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Track>, i64), TuneError> {
-        let make_ph = |i: usize| match self.db.engine() {
-            Engine::Sqlite => SqliteDialect.placeholder(i),
-            Engine::Postgres => PostgresDialect.placeholder(i),
-        };
+        let engine = self.db.engine();
+        // Un SEUL compteur de marqueurs pour tout le WHERE : en SQLite ils
+        // s'écrivent tous `?` et seul l'ORDRE de liaison compte, donc chaque
+        // valeur doit être empilée exactement quand son marqueur est demandé.
+        let mut ph = Placeholders::new(engine);
 
         let mut conditions: Vec<String> = Vec::new();
         let mut owned_params: Vec<SqlValue> = Vec::new();
-        let mut idx = 1usize;
 
-        if let Some(g) = genre {
-            // Match genre column or JSON genres array containing the value
-            conditions.push(format!(
-                "(LOWER(t.genre) = LOWER({p}) OR t.genres LIKE {p2})",
-                p = make_ph(idx),
-                p2 = make_ph(idx + 1)
-            ));
-            owned_params.push(SqlValue::Text(g.to_string()));
-            owned_params.push(SqlValue::Text(format!("%\"{}\"%", g)));
-            idx += 2;
+        // Genre : la colonne `t.genre` OU le tableau JSON `t.genres`. Avec
+        // plusieurs genres sélectionnés, les deux tests s'étendent ensemble —
+        // et les valeurs sont empilées dans l'ordre où les marqueurs sortent :
+        // d'abord les N du `IN`, puis les N motifs `LIKE`.
+        if !f.genres.is_empty() {
+            let n = f.genres.len();
+            let in_part = ph
+                .in_list_ci("t.genre", n)
+                .expect("liste non vide déjà vérifiée");
+            let like_part = (0..n)
+                .map(|_| format!("t.genres LIKE {}", ph.take()))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            conditions.push(format!("({in_part} OR {like_part})"));
+            for g in &f.genres {
+                owned_params.push(SqlValue::Text(g.clone()));
+            }
+            for g in &f.genres {
+                owned_params.push(SqlValue::Text(format!("%\"{g}\"%")));
+            }
         }
 
-        if let Some(y) = year {
-            conditions.push(format!("t.year = {}", make_ph(idx)));
-            owned_params.push(SqlValue::Int(y as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.year", f.years.len()) {
+            conditions.push(c);
+            for y in &f.years {
+                owned_params.push(SqlValue::Int(*y));
+            }
         }
 
-        if let Some(f) = format {
-            conditions.push(format!("LOWER(t.format) = LOWER({})", make_ph(idx)));
-            owned_params.push(SqlValue::Text(f.to_string()));
-            idx += 1;
+        if let Some(c) = ph.in_list_ci("t.format", f.formats.len()) {
+            conditions.push(c);
+            for v in &f.formats {
+                owned_params.push(SqlValue::Text(v.clone()));
+            }
         }
 
-        if let Some(sr) = sample_rate {
-            conditions.push(format!("t.sample_rate = {}", make_ph(idx)));
-            owned_params.push(SqlValue::Int(sr as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.sample_rate", f.sample_rates.len()) {
+            conditions.push(c);
+            for v in &f.sample_rates {
+                owned_params.push(SqlValue::Int(*v));
+            }
         }
 
-        if let Some(bd) = bit_depth {
-            conditions.push(format!("t.bit_depth = {}", make_ph(idx)));
-            owned_params.push(SqlValue::Int(bd as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.bit_depth", f.bit_depths.len()) {
+            conditions.push(c);
+            for v in &f.bit_depths {
+                owned_params.push(SqlValue::Int(*v));
+            }
         }
 
-        if let Some(src) = source {
-            conditions.push(format!("t.source = {}", make_ph(idx)));
-            owned_params.push(SqlValue::Text(src.to_string()));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.source", f.sources.len()) {
+            conditions.push(c);
+            for v in &f.sources {
+                owned_params.push(SqlValue::Text(v.clone()));
+            }
         }
 
-        if let Some(lbl) = label {
-            conditions.push(format!("LOWER(t.label) LIKE LOWER({})", make_ph(idx)));
-            owned_params.push(SqlValue::Text(format!("%{}%", lbl)));
-            idx += 1;
+        if let Some(c) = ph.or_like_ci("t.label", f.labels.len()) {
+            conditions.push(c);
+            for v in &f.labels {
+                owned_params.push(SqlValue::Text(format!("%{v}%")));
+            }
         }
 
-        if let Some(cmp) = composer {
-            conditions.push(format!("LOWER(t.composer) LIKE LOWER({})", make_ph(idx)));
-            owned_params.push(SqlValue::Text(format!("%{}%", cmp)));
-            idx += 1;
+        if let Some(c) = ph.or_like_ci("t.composer", f.composers.len()) {
+            conditions.push(c);
+            for v in &f.composers {
+                owned_params.push(SqlValue::Text(format!("%{v}%")));
+            }
         }
 
-        if let Some(a) = artist {
-            // The artist name lives on the joined `artists` table (tracks stores
-            // only artist_id) — `tracks` has no artist_name column, so the old
-            // `t.artist_name` predicate raised a SQL error that list_tracks
-            // swallowed into an empty result: clicking an Oxygen "Artistes" facet
-            // returned zero tracks (forum #1189). The base query + count both
-            // LEFT JOIN artists ar, so filter on ar.name.
-            conditions.push(format!("ar.name = {}", make_ph(idx)));
-            owned_params.push(SqlValue::Text(a.to_string()));
-            idx += 1;
+        // The artist name lives on the joined `artists` table (tracks stores
+        // only artist_id) — `tracks` has no artist_name column, so the old
+        // `t.artist_name` predicate raised a SQL error that list_tracks
+        // swallowed into an empty result: clicking an Oxygen "Artistes" facet
+        // returned zero tracks (forum #1189). The base query + count both
+        // LEFT JOIN artists ar, so filter on ar.name.
+        if let Some(c) = ph.in_list("ar.name", f.artists.len()) {
+            conditions.push(c);
+            for v in &f.artists {
+                owned_params.push(SqlValue::Text(v.clone()));
+            }
         }
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
-        // is a fixed literal; only the value is a bound parameter.
-        for (opt, key) in [
-            (country, "release_country"),
-            (mood, "mood"),
-            (source_media, "source_media"),
+        // is a fixed literal; only the values are bound parameters.
+        for (values, key) in [
+            (&f.countries, "release_country"),
+            (&f.moods, "mood"),
+            (&f.source_medias, "source_media"),
         ] {
-            if let Some(v) = opt {
+            if let Some(c) = ph.in_list("tm.value", values.len()) {
                 conditions.push(format!(
                     "EXISTS (SELECT 1 FROM track_metadata tm \
-                     WHERE tm.track_id = t.id AND tm.key = '{key}' AND tm.value = {})",
-                    make_ph(idx)
+                     WHERE tm.track_id = t.id AND tm.key = '{key}' AND {c})"
                 ));
-                owned_params.push(SqlValue::Text(v.to_string()));
-                idx += 1;
+                for v in values {
+                    owned_params.push(SqlValue::Text(v.clone()));
+                }
             }
         }
 
         // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
         // under the selected directory subtree. The current breadcrumb path IS
         // the filter — recursive so a parent folder includes its sub-folders.
-        if let Some(fld) = folder.filter(|s| !s.is_empty()) {
+        // Reste MONOVALUÉ : un chemin est une position dans un arbre, pas une
+        // valeur parmi d'autres (l'interface n'offre qu'un fil d'Ariane).
+        if let Some(fld) = f.folder.as_deref().filter(|s| !s.is_empty()) {
             conditions.push(format!(
                 "t.file_path LIKE {}{}",
-                make_ph(idx),
-                like_escape_clause(self.db.engine())
+                ph.take(),
+                like_escape_clause(engine)
             ));
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
-            idx += 1;
         }
 
         // Album rating (profile 1): tracks inherit their album's rating.
-        if let Some(r) = rating {
+        if let Some(c) = ph.in_list("arr.rating", f.ratings.len()) {
             conditions.push(format!(
                 "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND arr.rating = {})",
-                make_ph(idx)
+                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
             ));
-            owned_params.push(SqlValue::Int(r as i64));
-            idx += 1;
+            for v in &f.ratings {
+                owned_params.push(SqlValue::Int(*v));
+            }
         }
 
         // Manual collection: album ids are our own i64s (parsed from the
         // collections setting JSON by the caller), so inlining the IN list is
         // injection-safe. An empty set matches nothing.
-        if let Some(ids) = collection_ids {
+        if let Some(ids) = f.collection_ids.as_deref() {
             if ids.is_empty() {
                 conditions.push("1 = 0".to_string());
             } else {
@@ -824,7 +831,7 @@ impl TrackRepo {
         // Smart collection: the caller resolved its rules to concrete track ids
         // (our own i64s), inlined the same injection-safe way as album ids above.
         // An empty set matches nothing.
-        if let Some(ids) = collection_track_ids {
+        if let Some(ids) = f.collection_track_ids.as_deref() {
             if ids.is_empty() {
                 conditions.push("1 = 0".to_string());
             } else {
@@ -838,72 +845,74 @@ impl TrackRepo {
         }
 
         // L'année d'enregistrement vit sur l'ALBUM : jointure par EXISTS.
-        if let Some(y) = original_year {
+        if let Some(c) = ph.in_list("alo.original_year", f.original_years.len()) {
             conditions.push(format!(
-                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
-                make_ph(idx)
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
             ));
-            owned_params.push(SqlValue::Int(y as i64));
-            idx += 1;
-        }
-
-        // Favoris du profil 1 : la piste elle-même, ou son album.
-        if let Some(kind) = favorite.filter(|s| !s.is_empty()) {
-            match kind {
-                "album" => conditions.push(
-                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                     AND f.item_type = 'album' AND f.item_id = t.album_id)"
-                        .to_string(),
-                ),
-                "track" => conditions.push(
-                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                     AND f.item_type = 'track' AND f.item_id = t.id)"
-                        .to_string(),
-                ),
-                // Valeur inconnue : ne rien filtrer plutôt que tout exclure.
-                _ => {}
+            for v in &f.original_years {
+                owned_params.push(SqlValue::Int(*v));
             }
         }
 
-        if let Some(name) = playlist.filter(|s| !s.is_empty()) {
+        // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
+        // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
+        if let Some(c) = any_of(
+            f.favorites
+                .iter()
+                .filter_map(|k| favorite_condition(k))
+                .map(str::to_string)
+                .collect(),
+        ) {
+            conditions.push(c);
+        }
+
+        if let Some(c) = ph.in_list_ci("pl.name", f.playlists.len()) {
             conditions.push(format!(
                 "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
-                 WHERE pt.track_id = t.id AND LOWER(pl.name) = LOWER({}))",
-                make_ph(idx)
+                 WHERE pt.track_id = t.id AND {c})"
             ));
-            owned_params.push(SqlValue::Text(name.to_string()));
-            idx += 1;
+            for v in &f.playlists {
+                owned_params.push(SqlValue::Text(v.clone()));
+            }
         }
 
         // Étiquette manquante : liste FERMÉE, le SQL ne dépend jamais de
         // l'entrée brute. « Manquant » = NULL ou chaîne vide (un tag effacé
         // laisse souvent une chaîne vide, et l'utilisateur ne fait pas la
         // différence).
-        if let Some(field) = untagged.filter(|s| !s.is_empty()) {
-            let missing = match field {
-                "genre" => Some("(t.genre IS NULL OR t.genre = '')"),
-                "year" => Some("(t.year IS NULL OR t.year = 0)"),
-                "artist" => Some("t.artist_id IS NULL"),
-                "album" => Some("t.album_id IS NULL"),
-                "cover" => Some(
-                    "(t.album_id IS NULL OR EXISTS (SELECT 1 FROM albums al \
-                      WHERE al.id = t.album_id AND (al.cover_path IS NULL OR al.cover_path = '')))",
-                ),
-                _ => None,
-            };
-            if let Some(cond) = missing {
-                conditions.push(cond.to_string());
-            }
+        if let Some(c) = any_of(
+            f.untagged
+                .iter()
+                .filter_map(|k| untagged_condition(k).map(str::to_string))
+                .collect(),
+        ) {
+            conditions.push(c);
         }
 
-        if let Some(query) = q {
-            let like = format!("%{}%", query);
+        if let Some(query) = f.q.as_deref().filter(|s| !s.is_empty()) {
+            // ⚠️ DEUX marqueurs, DEUX valeurs liées — et non un marqueur réutilisé.
+            //
+            // Défaut PRÉEXISTANT trouvé en réécrivant cette fonction : le même
+            // `{p}` était écrit deux fois pour une seule valeur empilée. En
+            // PostgreSQL `$1` répété est légal et lie la même valeur ; en SQLite
+            // chaque `?` anonyme consomme un indice, la requête en réclamait donc
+            // deux et n'en recevait qu'un. `rusqlite` refuse le compte
+            // (`InvalidParameterCount`), la requête échouait, et
+            // `GET /library/tracks?q=…` rendait une liste VIDE avec un total à
+            // zéro — sur SQLite, c'est-à-dire l'installation par défaut.
+            //
+            // Aucun appelant du client web ne passe `q` à cette route
+            // aujourd'hui (Oxygen filtre sa fenêtre côté navigateur, la
+            // recherche passe par `/library/search`), ce qui explique que
+            // personne ne l'ait signalé.
+            let like = format!("%{query}%");
+            let p = ph.take();
+            let p2 = ph.take();
             conditions.push(format!(
-                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p})))",
-                p = make_ph(idx)
+                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
             ));
+            owned_params.push(SqlValue::Text(like.clone()));
             owned_params.push(SqlValue::Text(like));
-            idx += 1;
         }
 
         let where_clause = if conditions.is_empty() {
@@ -929,8 +938,8 @@ impl TrackRepo {
             .unwrap_or(0);
 
         // Fetch paginated results
-        let limit_ph = make_ph(idx);
-        let offset_ph = make_ph(idx + 1);
+        let limit_ph = ph.take();
+        let offset_ph = ph.take();
         let data_sql = format!(
             "{}{} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
@@ -1499,23 +1508,107 @@ impl TrackRepo {
             .collect())
     }
 
+    pub fn get_existing_audio_hash_album_paths(
+        &self,
+    ) -> Result<HashMap<(String, i64), Vec<String>>, TuneError> {
+        let rows = self
+            .db
+            .query_many(sql::get_existing_audio_hash_album_paths(), &[])?;
+        let mut paths: HashMap<(String, i64), Vec<String>> = HashMap::new();
+        for cols in rows {
+            let Some(hash) = cols.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(album_id) = cols.get(1).and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(path) = cols.get(2).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            paths.entry((hash, album_id)).or_default().push(path);
+        }
+        Ok(paths)
+    }
+
+    pub fn paths_by_audio_hash_and_album(
+        &self,
+        audio_hash: &str,
+        album_id: i64,
+    ) -> Result<Vec<String>, TuneError> {
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "SELECT file_path FROM tracks WHERE source = 'local' \
+             AND audio_hash = {} AND album_id = {} AND file_path IS NOT NULL",
+            make_ph(1),
+            make_ph(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&audio_hash, &album_id];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+            .collect())
+    }
+
     pub fn deduplicate(&self) -> Result<i64, TuneError> {
-        let count_sql = "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)";
-        let delete_sql = "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))";
-        let mut count: i64 = 0;
-        let count_ref = &mut count;
+        let rows = self.db.query_many(
+            "SELECT id, audio_hash, file_path FROM tracks \
+             WHERE source = 'local' AND audio_hash IS NOT NULL AND file_path IS NOT NULL \
+             ORDER BY audio_hash, id",
+            &[],
+        )?;
+        let mut candidates: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        for cols in rows {
+            let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(hash) = cols.get(1).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let Some(path) = cols.get(2).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            candidates.entry(hash).or_default().push((id, path));
+        }
+
+        let mut delete_ids = Vec::new();
+        for group in candidates.into_values().filter(|group| group.len() > 1) {
+            let mut representatives: Vec<(i64, String)> = Vec::new();
+            for candidate in group {
+                let is_exact_duplicate = representatives.iter().any(|(_, representative)| {
+                    crate::scanner::hasher::files_are_byte_identical(
+                        std::path::Path::new(&candidate.1),
+                        std::path::Path::new(representative),
+                    )
+                    .unwrap_or(false)
+                });
+                if is_exact_duplicate {
+                    delete_ids.push(candidate.0);
+                } else {
+                    representatives.push(candidate);
+                }
+            }
+        }
+
+        if delete_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let delete_sql = match self.db.engine() {
+            Engine::Sqlite => "DELETE FROM tracks WHERE id = ?".to_string(),
+            Engine::Postgres => "DELETE FROM tracks WHERE id = $1".to_string(),
+        };
         self.db.write_tx(&mut |tx| {
-            *count_ref = tx
-                .query_one(count_sql, &[])?
-                .as_ref()
-                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
-                .unwrap_or(0);
-            if *count_ref > 0 {
-                tx.execute(delete_sql, &[])?;
+            for id in &delete_ids {
+                tx.execute(&delete_sql, &[id])?;
             }
             Ok(())
         })?;
-        Ok(count)
+        Ok(delete_ids.len() as i64)
     }
 }
 
@@ -1621,17 +1714,26 @@ mod tests {
 
     #[test]
     fn dedup_display_collapses_content_duplicates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original_path = dir.path().join("time.flac");
+        let copy_path = dir.path().join("time-copy.flac");
+        let copy2_path = dir.path().join("time-copy-2.flac");
+        let bytes = vec![0x44u8; 128 * 1024];
+        std::fs::write(&original_path, &bytes).unwrap();
+        std::fs::write(&copy_path, &bytes).unwrap();
+        std::fs::write(&copy2_path, &bytes).unwrap();
+
         // Same album, same hash → the copy is hidden, first kept.
         let mut a = Track::new("Time".into());
         a.album_id = Some(1);
         a.disc_number = 1;
         a.track_number = 4;
         a.audio_hash = Some("HASH_TIME".into());
-        a.file_path = Some("/nas/time.flac".into());
+        a.file_path = Some(original_path.to_string_lossy().into_owned());
         let mut a_copy = a.clone();
-        a_copy.file_path = Some("/local/time.flac".into()); // real duplicate file
+        a_copy.file_path = Some(copy_path.to_string_lossy().into_owned());
         let mut a_copy2 = a.clone();
-        a_copy2.file_path = Some("/local2/time.flac".into()); // triplicate
+        a_copy2.file_path = Some(copy2_path.to_string_lossy().into_owned());
 
         // Same album, hash-less: dedup falls back to disc/track/title.
         let mut b = Track::new("Money".into());
@@ -1673,7 +1775,38 @@ mod tests {
             ]
         );
         // The retained "Time" is the first-seen path (album 1), not a copy.
-        assert_eq!(out[0].file_path.as_deref(), Some("/nas/time.flac"));
+        assert_eq!(out[0].file_path.as_deref(), a.file_path.as_deref());
+    }
+
+    #[test]
+    fn dedup_display_garde_deux_fichiers_distincts_au_meme_hash_candidat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let sample_size = 65_536;
+        let mut left = vec![0u8; sample_size * 4];
+        let mut right = vec![0u8; sample_size * 4];
+        left[sample_size * 2..].fill(0x11);
+        right[sample_size * 2..].fill(0x22);
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+        assert_eq!(
+            Some(hash.clone()),
+            crate::scanner::hasher::compute_audio_hash(&right_path)
+        );
+
+        let mut left_track = Track::new("Left".into());
+        left_track.album_id = Some(1);
+        left_track.audio_hash = Some(hash.clone());
+        left_track.file_path = Some(left_path.to_string_lossy().into_owned());
+        let mut right_track = Track::new("Right".into());
+        right_track.album_id = Some(1);
+        right_track.audio_hash = Some(hash);
+        right_track.file_path = Some(right_path.to_string_lossy().into_owned());
+
+        let out = dedup_display_tracks(vec![left_track, right_track]);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
@@ -1881,6 +2014,60 @@ mod tests {
         let mut t = Track::new("A".into());
         t.file_path = Some("/a.flac".into());
         repo.create(&t).unwrap();
+        assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn cleanup_ne_supprime_pas_une_collision_de_hash_partiel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let sample_size = 65_536;
+        let mut left = vec![0u8; sample_size * 4];
+        let mut right = vec![0u8; sample_size * 4];
+        left[sample_size * 2..].fill(0x31);
+        right[sample_size * 2..].fill(0x42);
+        std::fs::write(&left_path, left).unwrap();
+        std::fs::write(&right_path, right).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+        assert_eq!(
+            Some(hash.clone()),
+            crate::scanner::hasher::compute_audio_hash(&right_path)
+        );
+
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for (title, path) in [("Left", &left_path), ("Right", &right_path)] {
+            let mut track = Track::new(title.into());
+            track.file_path = Some(path.to_string_lossy().into_owned());
+            track.audio_hash = Some(hash.clone());
+            repo.create(&track).unwrap();
+        }
+
+        assert_eq!(repo.deduplicate().unwrap(), 0);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn cleanup_supprime_uniquement_la_copie_octet_pour_octet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left_path = dir.path().join("left.flac");
+        let right_path = dir.path().join("right.flac");
+        let bytes = vec![0x5au8; 65_536 * 3];
+        std::fs::write(&left_path, &bytes).unwrap();
+        std::fs::write(&right_path, &bytes).unwrap();
+        let hash = crate::scanner::hasher::compute_audio_hash(&left_path).unwrap();
+
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        for (title, path) in [("Left", &left_path), ("Right", &right_path)] {
+            let mut track = Track::new(title.into());
+            track.file_path = Some(path.to_string_lossy().into_owned());
+            track.audio_hash = Some(hash.clone());
+            repo.create(&track).unwrap();
+        }
+
+        assert_eq!(repo.deduplicate().unwrap(), 1);
         assert_eq!(repo.count().unwrap(), 1);
     }
 

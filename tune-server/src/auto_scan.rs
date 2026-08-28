@@ -312,8 +312,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 return;
             }
         };
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Keep only files that are new or whose mtime/size changed since the
@@ -471,22 +471,37 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Deduplicate by audio_hash + album_id: if the same content
-                    // already exists in this album (via a different path), skip it.
+                    // `audio_hash` only selects cheap candidates. Never hide a
+                    // track until an existing path is byte-for-byte identical.
                     if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                         let key = (hash.clone(), aid);
-                        if known_hashes.contains(&key) {
+                        let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                        if let Some(existing_path) =
+                            tune_core::scanner::hasher::find_byte_identical_path(
+                                std::path::Path::new(&sf.path),
+                                &candidates,
+                            )
+                        {
                             tracing::debug!(
                                 audio_hash = %hash,
                                 album_id = aid,
                                 path = %sf.path,
+                                existing_path = %existing_path,
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
                             skipped_duplicate += 1;
                             continue;
                         }
-                        known_hashes.insert(key);
+                        if !candidates.is_empty() {
+                            tracing::warn!(
+                                audio_hash = %hash,
+                                album_id = aid,
+                                path = %sf.path,
+                                candidates = candidates.len(),
+                                "audio_hash_candidate_not_byte_identical"
+                            );
+                        }
                     }
 
                     to_insert.push(track);
@@ -497,6 +512,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                if batch_inserted == to_insert.len() as u64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as u64 - batch_inserted;
                 db_update_failed += to_update.len() as u64 - batch_updated;
                 inserted += batch_inserted;
@@ -1222,19 +1249,36 @@ pub fn spawn_file_watcher(
                                     continue;
                                 };
 
-                                // Skip duplicate: same audio content already in this album
+                                // The hash is only a candidate selector. The
+                                // watcher is allowed to skip solely after a
+                                // full byte-for-byte comparison.
                                 if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                    if track_repo
-                                        .exists_by_audio_hash_and_album(hash, aid)
-                                        .unwrap_or(false)
+                                    let candidates = track_repo
+                                        .paths_by_audio_hash_and_album(hash, aid)
+                                        .unwrap_or_default();
+                                    if let Some(existing_path) =
+                                        tune_core::scanner::hasher::find_byte_identical_path(
+                                            std::path::Path::new(&sf.path),
+                                            &candidates,
+                                        )
                                     {
                                         tracing::debug!(
                                             audio_hash = %hash,
                                             album_id = aid,
                                             path = %sf.path,
+                                            existing_path = %existing_path,
                                             "watcher_skip_duplicate_audio_hash"
                                         );
                                         continue;
+                                    }
+                                    if !candidates.is_empty() {
+                                        tracing::warn!(
+                                            audio_hash = %hash,
+                                            album_id = aid,
+                                            path = %sf.path,
+                                            candidates = candidates.len(),
+                                            "watcher_audio_hash_candidate_not_byte_identical"
+                                        );
                                     }
                                 }
 

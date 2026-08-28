@@ -9,6 +9,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "facettes_multivaleurs.rs"]
+mod facettes_multivaleurs;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]
@@ -31,6 +33,8 @@ mod smb_dialect_seam;
 mod tests_orphelins;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
+#[path = "web_response_contracts.rs"]
+mod web_response_contracts;
 #[path = "workflows_bornes.rs"]
 mod workflows_bornes;
 #[path = "ws_auth.rs"]
