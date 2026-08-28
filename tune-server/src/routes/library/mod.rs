@@ -1,3 +1,4 @@
+mod album_order;
 mod albums;
 mod albums_detailed;
 mod ambiances;
