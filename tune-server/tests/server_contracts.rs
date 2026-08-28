@@ -13,6 +13,8 @@ mod bump_natifs_android;
 mod collections_ordre_albums;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "favoris_facettes_routes.rs"]
+mod favoris_facettes_routes;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]
