@@ -629,6 +629,18 @@ const THERMAL_RETRY_SECS: u64 = 120;
 /// enough not to spin, short enough that the sweep resumes on its own once
 /// whatever was using the memory (a scan, a transcode) has finished.
 const LOW_MEMORY_RETRY_SECS: u64 = 300;
+/// Délai au-delà duquel la construction de la session ORT est considérée
+/// perdue. Généreux à dessein : bâtir une session depuis un modèle de 287 Mo
+/// prend des secondes, pas des minutes, même sur une machine modeste. Ce
+/// n'est pas un budget de performance, c'est un garde-fou contre un appel qui
+/// ne revient JAMAIS.
+///
+/// Yves Corbat, MacBook Pro M1, nuit du 27 au 28/08/2026 : `audio_runtime_loaded`
+/// à 20:49:12, puis plus une seule ligne acoustique pendant 10 h 30, alors que
+/// le reste du serveur journalisait normalement. Or les quatre issues de ce
+/// bloc journalisent toutes — la passe était donc figée DANS `AudioEmbedder::load`.
+/// L'interface affichait « Analyse en cours 0 % », indéfiniment.
+const MODEL_LOAD_TIMEOUT_SECS: u64 = 300;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
@@ -1018,6 +1030,14 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Le nombre de fils avec lequel la session courante a été bâtie, pour
         // détecter un changement de réglage.
         let mut loaded_threads = 0usize;
+        // Loquet « le chargement du modèle n'est jamais revenu ». Une tâche
+        // bloquante ne s'annule pas : après un dépassement de délai, le fil
+        // reste pris quelque part dans ORT. Réessayer tous les quarts d'heure
+        // empilerait un fil bloqué de plus à chaque tour, jusqu'à épuiser le
+        // vivier de tâches bloquantes du runtime — et là ce n'est plus
+        // l'analyse acoustique qui tombe, c'est tout ce qui lit un fichier.
+        // On signale une fois, et on s'arrête là jusqu'au redémarrage.
+        let mut load_abandonne = false;
         // Garde thermique de CETTE passe : il porte sa propre hystérésis et
         // journalise ses propres transitions (#1576).
         let mut thermal = crate::audio::thermal::ThermalGate::new();
@@ -1262,9 +1282,31 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         warn!(error = %e, path = %p.display(), "audio_model_unavailable");
                     } else if let Err(e) = ensure_runtime_loaded(&p).await {
                         warn!(error = %e, "audio_runtime_unavailable");
+                    } else if load_abandonne {
+                        // Déjà signalé : on ne réessaie pas, sous peine
+                        // d'empiler les fils bloqués. Voir `load_abandonne`.
                     } else {
-                        match AudioEmbedder::load(&p, threads) {
-                            Ok(e) => {
+                        // Une trace AVANT la tentative. Sans elle, un appel
+                        // qui ne revient pas est indiscernable d'une passe qui
+                        // ne s'est jamais planifiée : le journal s'arrête, un
+                        // point c'est tout, et rien ne dit où. C'est ce qui a
+                        // rendu le cas d'Yves si long à établir.
+                        info!(
+                            model = %p.display(),
+                            intra_threads = threads,
+                            "audio_embedder_loading"
+                        );
+                        // `AudioEmbedder::load` construit une session ORT :
+                        // c'est du travail bloquant, lancé jusqu'ici À MÊME la
+                        // tâche async. Un blocage y figeait donc aussi un fil
+                        // du runtime tokio, au détriment de tout le serveur.
+                        let chemin = p.clone();
+                        let charge = tokio::task::spawn_blocking(move || {
+                            AudioEmbedder::load(&chemin, threads)
+                        });
+                        let delai = std::time::Duration::from_secs(MODEL_LOAD_TIMEOUT_SECS);
+                        match tokio::time::timeout(delai, charge).await {
+                            Ok(Ok(Ok(e))) => {
                                 info!(
                                     model = %p.display(),
                                     intra_threads = threads,
@@ -1273,7 +1315,22 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                                 embedder = Some(e);
                                 loaded_threads = threads;
                             }
-                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
+                            Ok(Ok(Err(e))) => warn!(error = %e, "audio_embedder_load_failed"),
+                            // La tâche bloquante a paniqué : sans ce bras, la
+                            // panique restait dans le `JoinError` et personne
+                            // ne l'apprenait.
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "audio_embedder_load_panicked")
+                            }
+                            Err(_) => {
+                                load_abandonne = true;
+                                warn!(
+                                    timeout_s = MODEL_LOAD_TIMEOUT_SECS,
+                                    model = %p.display(),
+                                    intra_threads = threads,
+                                    "audio_embedder_load_timed_out — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; le fil de chargement ne peut pas être repris"
+                                );
+                            }
                         }
                     }
                 }
@@ -1833,6 +1890,70 @@ mod tests {
     /// Aucun test fonctionnel ne peut garder ce contrat : il faudrait une zone
     /// qui joue, un réseau, et 287 Mo à télécharger en CI. On lit donc la
     /// source, sur le modèle d'`output_provider_seam.rs`.
+    /// Le chargement du modèle doit rester **annoncé, sorti du runtime async
+    /// et borné**. Les trois vont ensemble : c'est leur absence conjointe qui a
+    /// rendu la panne d'Yves Corbat (MacBook Pro M1, 27-28/08/2026) à la fois
+    /// silencieuse et interminable — `audio_runtime_loaded` puis plus une seule
+    /// ligne acoustique pendant 10 h 30, jauge figée à 0 %, et un fil du
+    /// runtime tokio immobilisé au passage.
+    ///
+    /// Garde STRUCTUREL, pas une preuve de comportement : il verrouille la
+    /// forme du bloc, pas ce qu'ORT en fait. Il est donc sensible aux
+    /// renommages — c'est le prix d'un test qui lit son propre source, et
+    /// l'échec dit alors quoi corriger.
+    #[test]
+    fn le_chargement_du_modele_est_annonce_hors_runtime_et_borne() {
+        let source = include_str!("embedding.rs");
+        // ⚠️ Ne chercher QUE dans le code de production. Une première version
+        // de ce test balayait le fichier entier : après un `cargo fmt`, le
+        // motif recherché n'existait plus dans le code, `find` tombait sur la
+        // chaîne littérale DE CE TEST — située plus bas — et l'ordre attendu
+        // était satisfait par construction. Le garde-fou passait au vert sur
+        // un code qui avait perdu la propriété qu'il prétendait verrouiller.
+        let fin_prod = source
+            .find("mod tests {")
+            .expect("le module de test a disparu ou a été renommé");
+        let prod = &source[..fin_prod];
+
+        let annonce = prod
+            .find("\"audio_embedder_loading\"")
+            .expect("la trace AVANT la tentative a disparu : un chargement qui ne revient pas redevient indiscernable d'une passe jamais planifiée");
+        // Tout ce qui doit suivre l'annonce, et rien qui la précède.
+        let apres = &prod[annonce..];
+
+        let pos_appel = apres
+            .find("AudioEmbedder::load(&chemin, threads)")
+            .expect("l'appel de chargement ne suit plus son annonce — soit la trace est passée derrière et ne prévient plus de rien, soit l'appel n'est plus celui qu'on croit");
+        // Le `spawn_blocking` doit envelopper CET appel-ci. Chercher le mot
+        // n'importe où après l'annonce ne suffit pas : la passe en contient un
+        // autre plus bas (l'héritage des jumelles), qui satisfaisait le test
+        // alors même que le chargement était redevenu direct. Vérifié par
+        // contre-épreuve — c'est ce trou qui a laissé passer la variante B.
+        let pos_spawn = apres[..pos_appel]
+            .rfind("spawn_blocking")
+            .expect("le chargement est repassé À MÊME la tâche async : un blocage y fige aussi un fil du runtime tokio, et ce n'est plus seulement l'analyse acoustique qui tombe");
+        assert!(
+            pos_appel - pos_spawn < 120,
+            "le `spawn_blocking` le plus proche est à {} caractères de l'appel : \
+             il en enveloppe probablement un autre, pas celui-ci.",
+            pos_appel - pos_spawn
+        );
+        assert!(
+            apres.contains("tokio::time::timeout(delai, charge)"),
+            "le délai maximal a disparu : un chargement bloqué redevient éternel."
+        );
+        assert!(
+            prod.contains("audio_embedder_load_timed_out"),
+            "un dépassement de délai doit se dire dans le journal, sinon il \
+             remplace un silence par un autre."
+        );
+        assert!(
+            prod.contains("audio_embedder_load_panicked"),
+            "une panique de la tâche bloquante reste sinon enfermée dans le \
+             JoinError, et personne ne l'apprend."
+        );
+    }
+
     /// Une zone qui joue doit écourter la sieste de fin de tour.
     ///
     /// Sinon l'interruption d'un lot par la lecture coûte `IDLE_SLEEP_SECS` de
