@@ -36,6 +36,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
+    // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
+    // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
+    // un réglage que plus personne ne relisait. Un test de câblage garde la
+    // ligne.
+    crate::routes::system::scan::spawn_scan_scheduler(state.clone());
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
