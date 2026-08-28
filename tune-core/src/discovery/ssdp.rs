@@ -436,8 +436,17 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                                 &usn,
                                 &advert.location,
                             );
+                            // `to` et `st` : sans eux la trace dit qu'une
+                            // réponse n'est pas partie, sans dire à qui ni pour
+                            // quelle identité — donc sans permettre d'agir
+                            // (#2417, même défaut).
                             if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(error = %e, "ssdp_msearch_reply_failed");
+                                debug!(
+                                    to = %addr,
+                                    st = %st_reply,
+                                    error = %e,
+                                    "ssdp_msearch_reply_failed"
+                                );
                             }
                         }
                     }
@@ -454,7 +463,12 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                                 &adv.location,
                             );
                             if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(error = %e, "ssdp_renderer_msearch_reply_failed");
+                                debug!(
+                                    to = %addr,
+                                    st = %st_reply,
+                                    error = %e,
+                                    "ssdp_renderer_msearch_reply_failed"
+                                );
                             }
                         }
                     }
@@ -1214,8 +1228,17 @@ async fn process_responses(
             if let Some(mut device) = st.devices.remove(&dev_id) {
                 device.available = false;
                 st.miss_count.remove(&dev_id);
-                st.known_locations.remove(&dev_id);
-                info!(id = %dev_id, name = %device.name, "ssdp_device_lost");
+                // L'adresse est retirée ici : la lire AVANT, pour pouvoir la
+                // journaliser. C'est elle que la sonde unicast vient
+                // d'interroger sans réponse (#2417) — sans elle, la trace dit
+                // qu'un lecteur a disparu et laisse chercher lequel.
+                let location = st.known_locations.remove(&dev_id);
+                info!(
+                    id = %dev_id,
+                    name = %device.name,
+                    location = %location.as_deref().unwrap_or("inconnue"),
+                    "ssdp_device_lost"
+                );
                 drop(st);
                 let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
             }
@@ -1957,6 +1980,91 @@ mod tests {
             ligne.contains(&location),
             "la trace d'échec ne nomme pas la LOCATION fautive ; \
              sans elle on ne peut pas savoir quelle adresse rend du HTML.\n\
+             attendu quelque part dans la ligne : {location}\n\
+             ligne obtenue : {ligne}"
+        );
+    }
+
+    // ── Le même angle mort, sur l'autre bout du cycle de vie (#2417) ──────
+    //
+    // `ssdp_device_create_failed` n'était pas le seul échec muet du module :
+    // `ssdp_device_lost` déclare un appareil disparu et ne nomme que son UUID
+    // et son nom d'usage. Or c'est une sonde unicast sur une URL précise qui
+    // vient d'échouer — `unicast_probe` lit `known_locations[dev_id]`, s'y
+    // connecte, et jette l'erreur ET l'adresse (`Err(_) => false`). Le journal
+    // dit donc qu'un lecteur a disparu, sans dire quelle adresse a cessé de
+    // répondre : impossible de la curler, de vérifier si l'appareil a changé
+    // d'IP, ou de distinguer une panne réseau d'un renderer éteint. Même
+    // défaut, même correction : l'URL est sous la main, elle doit sortir.
+    #[tokio::test]
+    async fn la_perte_d_un_appareil_nomme_la_location_devenue_muette() {
+        use tracing::instrument::WithSubscriber;
+
+        // Un port qu'on ouvre puis qu'on referme : l'adresse est plausible et
+        // la sonde unicast de dernière chance échouera à coup sûr, vite.
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ecoute.local_addr().unwrap();
+        drop(ecoute);
+        let location = format!("http://{addr}/upnp/description.xml");
+
+        const DEV_ID: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+        {
+            let mut st = state.lock().await;
+            st.devices.insert(
+                DEV_ID.to_string(),
+                DiscoveredDevice::new(
+                    DEV_ID.to_string(),
+                    "Ampli du salon".to_string(),
+                    OutputType::Dlna,
+                    "127.0.0.1".to_string(),
+                    addr.port(),
+                ),
+            );
+            st.known_locations
+                .insert(DEV_ID.to_string(), location.clone());
+        }
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        // Aucune annonce pendant tout le délai de grâce : l'appareil est
+        // déclaré perdu au dernier cycle, après l'échec de la sonde unicast.
+        async {
+            for _ in 0..MISS_GRACE_CYCLES {
+                process_responses(&state, &tx, Vec::new()).await;
+            }
+        }
+        .with_subscriber(abonne)
+        .await;
+
+        assert!(
+            state.lock().await.devices.is_empty(),
+            "l'appareil aurait dû être déclaré perdu au bout de \
+             {MISS_GRACE_CYCLES} cycles sans annonce ; le test ne passerait \
+             pas par ssdp_device_lost"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SsdpEvent::DeviceLost(_))),
+            "l'événement DeviceLost aurait dû être émis"
+        );
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_lost"))
+            .unwrap_or_else(|| panic!("aucune trace ssdp_device_lost dans le journal :\n{texte}"));
+
+        assert!(
+            ligne.contains(&location),
+            "la trace de perte ne nomme pas la LOCATION devenue muette ; \
+             sans elle on ne sait pas quelle adresse a cessé de répondre.\n\
              attendu quelque part dans la ligne : {location}\n\
              ligne obtenue : {ligne}"
         );
