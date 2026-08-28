@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::backend::DbBackend;
@@ -194,6 +195,15 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
 /// controle `cloud::consent::contribution_autorisee` lui-meme.
 async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosWrite) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
 
     let artist_repo = ArtistRepo::with_backend(db.clone());
@@ -302,6 +312,20 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
             Ok(resp) => {
                 let status = resp.status();
                 warn!(batch = i, status = %status, "bio_sync_upload_rejected");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if let Some(backoff) = rate_limit::defer_from_headers(
+                        &settings,
+                        CloudScope::BiosWrite,
+                        resp.headers(),
+                    ) {
+                        warn!(
+                            scope = backoff.scope,
+                            until_epoch = backoff.until_epoch,
+                            retry_after_seconds = backoff.retry_after_seconds,
+                            "bio_sync_rate_limit_persisted"
+                        );
+                    }
+                }
                 // `POST /community/bios` est plafonne a 5 requetes par heure
                 // (routes/api.php:705, `throttle:5,60`). Sans ce garde-fou, le
                 // lot 0 refuse en 429 etait suivi de tous les autres, refuses
@@ -343,6 +367,16 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
 }
 
 async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, artist_url: &str) {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosArtistsRead) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let artist_repo = ArtistRepo::with_backend(db.clone());
 
     let candidates = match artist_repo.artists_without_bio_with_mbid() {
@@ -380,6 +414,13 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_artists_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosArtistsRead,
+                    resp.headers(),
+                );
+            }
             // Le marqueur reste inexplique de #2258 (`status=500`). La cause
             // est cote cloud ; ce qui est corrige ici est la REACTION du
             // client, qui reemettait le lot suivant sans pause ni limite.
@@ -429,6 +470,16 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
 }
 
 async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosAlbumsRead) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let album_repo = AlbumRepo::with_backend(db.clone());
 
     // Phase 1: download by MBID (existing path, for albums that have one)
@@ -462,13 +513,20 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosAlbumsRead,
+                    resp.headers(),
+                );
+            }
             // Stop hammering the cloud when it rate-limits (429) or errors (5xx):
             // the old `continue` fired every batch back-to-back with no delay,
             // producing dozens of rejected requests/sec (Fabien). Retry happens
             // on the next scan-completed event / daily cycle.
             if apres_refus(status) == ApresRefus::ArreterLeCycle {
                 warn!("bio_download_backoff — cloud rate-limited, stopping run");
-                break;
+                return;
             }
             continue;
         }
@@ -553,6 +611,13 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_by_title_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosAlbumsRead,
+                    resp.headers(),
+                );
+            }
             // Stop hammering the cloud on 429 / 5xx instead of firing the next
             // batch immediately (Fabien: dozens of by-title 429s per second).
             if apres_refus(status) == ApresRefus::ArreterLeCycle {
@@ -849,7 +914,10 @@ mod tests {
                 get(
                     move |axum::extract::State(h): axum::extract::State<Arc<AtomicUsize>>| async move {
                         h.fetch_add(1, Ordering::SeqCst);
-                        axum::http::StatusCode::from_u16(status).unwrap()
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("Retry-After", "3600")],
+                        )
                     },
                 ),
             )
@@ -859,7 +927,10 @@ mod tests {
                     move |axum::extract::State(h): axum::extract::State<Arc<AtomicUsize>>,
                           _corps: String| async move {
                         h.fetch_add(1, Ordering::SeqCst);
-                        axum::http::StatusCode::from_u16(status).unwrap()
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("Retry-After", "3600")],
+                        )
                     },
                 ),
             )
@@ -961,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn televersement_un_429_arrete_le_cycle() {
+    async fn televersement_un_429_persiste_le_delai_et_survit_au_redemarrage() {
         use crate::db::models::Artist;
 
         let db = fresh_db();
@@ -976,10 +1047,16 @@ mod tests {
 
         upload_bios_to(&db, &format!("{base}/upload")).await;
 
+        // Un nouvel appel reconstruit son `SettingsRepo`, comme apres un
+        // redemarrage. Il doit relire l'echeance avant toute requete.
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
-            "un 429 doit arreter le televersement apres le premier lot"
+            "un 429 doit arreter le cycle et le suivant avant toute requete"
         );
+        let settings = SettingsRepo::with_backend(db);
+        assert!(rate_limit::active(&settings, CloudScope::BiosWrite).is_some());
     }
 }

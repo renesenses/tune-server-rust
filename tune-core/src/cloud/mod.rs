@@ -8,6 +8,7 @@ pub mod library_sync;
 pub mod metadata_proposals;
 pub mod playlist_hub;
 pub mod plugins;
+pub mod rate_limit;
 pub mod recommendations;
 #[cfg(feature = "cloud-relay")]
 pub mod relay;
