@@ -395,6 +395,39 @@ mod tests {
             .collect()
     }
 
+    fn sine_mono(sr: u32, frequency_hz: f64, amplitude: f64) -> Vec<f32> {
+        (0..sr)
+            .map(|frame| {
+                (amplitude
+                    * (2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64).sin())
+                    as f32
+            })
+            .collect()
+    }
+
+    /// Amplitude of one known sinusoid, evaluated directly rather than through
+    /// the spectrum display code. Keeping the measuring instrument independent
+    /// from the production DSP prevents both sides from sharing the same bug.
+    fn measured_tone_amplitude(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(sin_sum, cos_sum), (frame, &sample)| {
+                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                (
+                    sin_sum + sample as f64 * phase.sin(),
+                    cos_sum + sample as f64 * phase.cos(),
+                )
+            },
+        );
+        2.0 * sin_sum.hypot(cos_sum) / stable.len() as f64
+    }
+
+    fn gain_db(measured: f64, reference: f64) -> f64 {
+        20.0 * (measured / reference).log10()
+    }
+
     fn resample_in_chunks(
         samples: &[f32],
         from_sr: u32,
@@ -490,6 +523,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn downsampling_preserves_passband_and_rejects_out_of_band_alias() {
+        const FROM_SR: u32 = 96_000;
+        const TO_SR: u32 = 48_000;
+        const AMPLITUDE: f64 = 0.5;
+
+        for frequency_hz in [100.0, 1_000.0, 10_000.0] {
+            let input = sine_mono(FROM_SR, frequency_hz, AMPLITUDE);
+            let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
+            let response_db = gain_db(
+                measured_tone_amplitude(&output, TO_SR, frequency_hz),
+                AMPLITUDE,
+            );
+
+            assert!(
+                response_db.abs() < 0.1,
+                "la bande utile derive de {response_db:.3} dB a {frequency_hz} Hz"
+            );
+        }
+
+        // 30 kHz cannot exist at 48 kHz. A converter which merely decimates
+        // would fold it to |30 - 48| = 18 kHz at essentially full amplitude.
+        let input = sine_mono(FROM_SR, 30_000.0, AMPLITUDE);
+        let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
+        let alias_db = gain_db(measured_tone_amplitude(&output, TO_SR, 18_000.0), AMPLITUDE);
+
+        assert!(
+            alias_db < -80.0,
+            "un sinus 30 kHz se replie a 18 kHz a {alias_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn upsampling_preserves_tone_and_rejects_spectral_image() {
+        const FROM_SR: u32 = 44_100;
+        const TO_SR: u32 = 96_000;
+        const AMPLITUDE: f64 = 0.5;
+        const TONE_HZ: f64 = 1_000.0;
+
+        let input = sine_mono(FROM_SR, TONE_HZ, AMPLITUDE);
+        let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
+        let tone_db = gain_db(measured_tone_amplitude(&output, TO_SR, TONE_HZ), AMPLITUDE);
+        assert!(
+            tone_db.abs() < 0.1,
+            "le sinus utile derive de {tone_db:.3} dB pendant le suréchantillonnage"
+        );
+
+        // Repeating/interpolating samples without a proper reconstruction
+        // filter would create the first image at FROM_SR - TONE_HZ.
+        let image_hz = FROM_SR as f64 - TONE_HZ;
+        let image_db = gain_db(measured_tone_amplitude(&output, TO_SR, image_hz), AMPLITUDE);
+        assert!(
+            image_db < -80.0,
+            "le sinus 1 kHz produit une image a {image_hz} Hz a {image_db:.1} dB"
+        );
     }
 
     #[test]
