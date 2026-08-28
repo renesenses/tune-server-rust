@@ -87,6 +87,16 @@ pub struct ZonePollerMetrics {
     pub consecutive_errors: u8,
     pub last_latency_ms: u32,
     pub max_latency_ms: u32,
+    /// L'appareil annonce toujours jouer alors que la position est arrivee a la
+    /// fin de la piste — ou l'a depassee — depuis [`DEPASSEMENT_DUREE_TICKS`]
+    /// ticks consecutifs (#2493).
+    ///
+    /// Champ de CONSTAT, jamais de commande : rien dans le sondeur ne s'appuie
+    /// dessus pour avancer ou arreter une piste. Il existe pour qu'un
+    /// diagnostic de zone cesse d'affirmer une lecture normale quand Tune sait
+    /// deja qu'elle ne l'est pas — soit la lecture est bloquee, soit la duree
+    /// connue est fausse, et le sondeur ne peut pas trancher entre les deux.
+    pub lecture_au_dela_de_la_duree: bool,
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
@@ -207,6 +217,17 @@ const POSITION_PAST_END_TICKS: u8 = 3;
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
 const POLL_FAIL_END_MIN_ERRORS: u8 = 2;
+/// Ticks de scrutation (~1 s) pendant lesquels la position doit rester collee a
+/// la fin — ou au-dela — avant que Tune ose DIRE que l'etat annonce ne veut plus
+/// rien dire (#2493).
+///
+/// Vingt fois [`POSITION_PAST_END_TICKS`] : tous les detecteurs de fin de piste
+/// agissent en trois ticks. Ce compteur ne commence donc a compter que la ou ils
+/// ont TOUS deja renonce, et n'atteint son seuil qu'une minute plus tard. Une
+/// transition sans blanc, une reprise apres pause, une fin de piste normale sont
+/// toutes reglees bien avant — le compteur repart de zero a chaque changement de
+/// piste et des que la position quitte la zone de fin.
+const DEPASSEMENT_DUREE_TICKS: u8 = 60;
 /// After a gapless metadata advance (the poller called advance_queue_metadata
 /// expecting the renderer to auto-transition), if the renderer stays Stopped
 /// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
@@ -751,6 +772,45 @@ pub(crate) mod decisions {
             && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// UN tick ou l'etat annonce se contredit lui-meme : la piste a une duree
+    /// connue, et la position rapportee est arrivee a la fin — ou l'a depassee —
+    /// alors que l'appareil dit toujours jouer (#2493, Tades : 1'46 « en
+    /// lecture » depuis dix minutes sur une Serenade/upmpdcli).
+    ///
+    /// Ce predicat ne DECIDE rien : l'appelant s'en sert uniquement pour
+    /// compter, puis pour le DIRE. Aucune piste n'est avancee ni arretee par ce
+    /// chemin, et c'est delibere — la meme forme est produite par deux causes
+    /// qu'aucune horloge ne sait distinguer :
+    ///
+    /// - la lecture est reellement bloquee (le renderer ment sur son etat) ;
+    /// - la duree que Tune connait est FAUSSE (etiquette erronee, piste plus
+    ///   longue que ce que le scan a mesure) et la lecture est parfaitement
+    ///   valide.
+    ///
+    /// Couper dans le second cas amputerait une ecoute legitime. On se contente
+    /// donc de cesser d'affirmer ce qu'on ne sait pas.
+    ///
+    /// Ce que le predicat refuse de qualifier :
+    /// - `source_radio` : un flux de radio n'a pas de fin, sa position n'a rien
+    ///   a depasser ;
+    /// - `duree_connue_ms` nulle ou derisoire : sans duree il n'y a pas de
+    ///   depassement possible — le seuil reprend celui de [`past_end_reached`]
+    ///   ([`END_MARGIN_MS`]) pour que les deux parlent de la meme « fin ».
+    ///
+    /// La duree passee par l'appelant est la duree EFFECTIVE
+    /// (`max(file d'attente, sane_current_duration)`) : une duree de base trop
+    /// courte face a un renderer credible est deja elargie la, donc le cas « le
+    /// scan a sous-estime la piste » ne remonte meme pas jusqu'ici.
+    pub fn position_au_dela_de_la_duree(
+        source_radio: bool,
+        duree_connue_ms: u64,
+        position_ms: u64,
+    ) -> bool {
+        !source_radio
+            && duree_connue_ms > END_MARGIN_MS
+            && position_ms.saturating_add(END_MARGIN_MS) >= duree_connue_ms
+    }
+
     /// Position to persist for auto-resume. A position within `END_MARGIN_MS`
     /// of the track end means the track is effectively complete; persist 0 so a
     /// later auto-resume plays it from the start instead of seeking into the
@@ -1011,6 +1071,103 @@ pub(crate) mod decisions {
             && queue_duration_ms > END_MARGIN_MS
             && wall_elapsed_secs.saturating_mul(1000)
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+}
+
+/// #2493 — Tades : « un morceau de Turapin (1'46) tourne depuis 10 minutes »
+/// (HIFIMAN Serenade, pile UPnP `upmpdcli`, 26/08).
+///
+/// Ce que ces tests tiennent, et ce qu'ils refusent de tenir.
+#[cfg(test)]
+mod depassement_duree_tests {
+    use super::decisions::{END_MARGIN_MS, position_au_dela_de_la_duree};
+
+    /// Duree reelle du morceau du signalement : 1 min 46 s.
+    const TURAPIN_MS: u64 = 106_000;
+    /// Dix minutes : ce que le testeur a vu defiler.
+    const DIX_MINUTES_MS: u64 = 600_000;
+
+    /// La forme du signalement : duree connue, position tres au-dela.
+    #[test]
+    fn position_tres_au_dela_de_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "une position de dix minutes sur une piste de 1'46 doit etre constatee"
+        );
+    }
+
+    /// La forme que l'ecran MONTRE reellement : la position rendue au client est
+    /// plafonnee a la duree (voir le `min(dur)` du sondeur), donc le testeur lit
+    /// « 1:46 / 1:46, en lecture » indefiniment. Le constat doit tenir sur cette
+    /// forme-la aussi, sinon il ne couvre pas le cas observe.
+    #[test]
+    fn position_collee_a_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS),
+            "position figee EXACTEMENT a la duree : c'est ce que le testeur voit"
+        );
+    }
+
+    /// Une radio n'a pas de fin : sa position ne depasse rien, quelle qu'elle
+    /// soit et quelle que soit la duree que quelqu'un aurait cru y lire.
+    #[test]
+    fn une_radio_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(true, 0, DIX_MINUTES_MS),
+            "radio sans duree : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(true, TURAPIN_MS, DIX_MINUTES_MS),
+            "meme si une duree traine dans les metadonnees, une radio reste hors sujet"
+        );
+        // Contre-epreuve de la garde `source_radio` : memes chiffres, source
+        // ordinaire — la, et la seulement, le constat tombe.
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "la garde ne doit tenir QUE sur la radio, sinon elle ne prouve rien"
+        );
+    }
+
+    /// Duree nulle ou derisoire : il n'y a rien a depasser. Le seuil est le meme
+    /// que celui de `past_end_reached` — les deux doivent parler de la meme
+    /// « fin », sans quoi Tune constaterait un depassement la ou son propre
+    /// detecteur de fin de piste ne voit meme pas de piste.
+    #[test]
+    fn une_duree_nulle_ou_absente_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, 0, DIX_MINUTES_MS),
+            "duree inconnue (0) : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(false, END_MARGIN_MS, DIX_MINUTES_MS),
+            "duree egale a la marge de fin : sous le seuil de `past_end_reached`"
+        );
+        // Contre-epreuve : une milliseconde de plus que la marge, et la duree
+        // devient exploitable.
+        assert!(
+            position_au_dela_de_la_duree(false, END_MARGIN_MS + 1, DIX_MINUTES_MS),
+            "juste au-dessus de la marge, la duree redevient une duree"
+        );
+    }
+
+    /// Une lecture ordinaire en plein milieu de piste n'est jamais constatee —
+    /// c'est la garde qui empeche ce chemin de parler a tort une fois par
+    /// seconde sur toutes les zones du parc.
+    #[test]
+    fn une_lecture_en_cours_de_piste_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS / 2),
+            "a mi-piste, rien a signaler"
+        );
+        // Bord exact : la zone de fin commence a duree - END_MARGIN_MS.
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS - 1),
+            "une milliseconde AVANT la zone de fin : encore une lecture ordinaire"
+        );
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS),
+            "au bord exact de la zone de fin, le constat est possible"
+        );
     }
 }
 
@@ -2040,6 +2197,20 @@ struct ZonePollState {
     /// Consecutive `Playing` polls with neither renderer position nor served
     /// bytes progressing. See `decisions::dlna_playing_stall_eligible`.
     playing_stall_ticks: u8,
+    /// Ticks CONSECUTIFS ou la position rapportee est a la fin de la piste — ou
+    /// au-dela — alors que l'appareil annonce toujours jouer. Voir
+    /// [`decisions::position_au_dela_de_la_duree`] et [`DEPASSEMENT_DUREE_TICKS`].
+    ///
+    /// Compte dans le bras `Playing` uniquement : une zone en pause n'y passe
+    /// pas, donc une pause de vingt minutes ne gonfle pas ce compteur — c'est
+    /// precisement ce que l'horloge murale (`track_started_at`, jamais repliee
+    /// a la reprise) ne sait pas faire. Remis a zero des que la position quitte
+    /// la zone de fin, et a chaque changement de piste.
+    depassement_duree_ticks: u8,
+    /// Latch par piste : l'incoherence a deja ete DITE une fois (journal +
+    /// metrique de zone). Sans lui la boucle ecrirait la meme ligne chaque
+    /// seconde pendant tout le temps que dure le blocage.
+    depassement_duree_signale: bool,
     /// Ticks pendant lesquels on a refusé de conclure à une fin naturelle parce
     /// que le flux servi était manifestement incomplet (voir
     /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
@@ -2114,6 +2285,8 @@ impl ZonePollState {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -2792,6 +2965,9 @@ impl PositionPoller {
                 ps.gapless_stuck_ticks = 0;
                 // Re-arm the DLNA poll-fail wall-clock fallback for the new track.
                 ps.wall_clock_end_fired = false;
+                // Le constat de depassement vaut pour UNE piste (#2493).
+                ps.depassement_duree_ticks = 0;
+                ps.depassement_duree_signale = false;
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
@@ -3089,6 +3265,10 @@ impl PositionPoller {
                         consecutive_errors: ps.consecutive_errors,
                         last_latency_ms: ps.last_latency_ms,
                         max_latency_ms: ps.max_latency_ms,
+                        // Chemin RADIO : un flux sans fin ne depasse aucune
+                        // duree, et ce bras n'evalue meme pas le predicat
+                        // (#2493). Constat toujours faux, par construction.
+                        lecture_au_dela_de_la_duree: false,
                     },
                 );
 
@@ -3939,6 +4119,12 @@ impl PositionPoller {
                         .and_then(|z| z.output_type.as_deref())
                         .unwrap_or("");
                     let is_dlna = output_type_str == "dlna";
+                    // Un flux de radio n'a pas de fin : sa position ne peut rien
+                    // depasser (#2493).
+                    let source_est_radio = zone_state
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.source == "radio");
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -4308,6 +4494,65 @@ impl PositionPoller {
                         ps.past_end_ticks = 0;
                     }
 
+                    // #2493 — Tades : « un morceau de 1'46 tourne depuis dix
+                    // minutes » (Serenade/upmpdcli). Aucun des cinq detecteurs
+                    // ci-dessus n'a agi, et la position montree a l'ecran est
+                    // plafonnee a la duree : le testeur voit « 1:46 / 1:46, en
+                    // lecture » indefiniment. Tune n'a alors plus le droit de
+                    // presenter cet etat comme une lecture ordinaire.
+                    //
+                    // Ce bloc ne touche NI `track_ended` NI `force_stop`. La
+                    // meme forme est produite par une lecture bloquee et par une
+                    // duree fausse (etiquette erronee, piste reellement plus
+                    // longue) : couper reviendrait a amputer une ecoute valide
+                    // une fois sur deux. On DIT, on n'agit pas — voir
+                    // `decisions::position_au_dela_de_la_duree`.
+                    //
+                    // Complementaire de #2116 juste en dessous, qui exclut
+                    // explicitement la zone de fin (`near_known_end`) : celui-la
+                    // couvre la position gelee AVANT la fin, celui-ci la
+                    // position collee A la fin.
+                    if decisions::position_au_dela_de_la_duree(
+                        source_est_radio,
+                        effective_end_duration_ms,
+                        status.position_ms,
+                    ) {
+                        ps.depassement_duree_ticks = ps.depassement_duree_ticks.saturating_add(1);
+                    } else {
+                        ps.depassement_duree_ticks = 0;
+                        ps.depassement_duree_signale = false;
+                    }
+                    if !track_ended
+                        && ps.depassement_duree_ticks >= DEPASSEMENT_DUREE_TICKS
+                        && !ps.depassement_duree_signale
+                    {
+                        ps.depassement_duree_signale = true;
+                        // Les trois inconnues que le ticket reclamait faute de
+                        // journal : la position est-elle figee, reboucle-t-elle,
+                        // et des octets sont-ils encore servis ?
+                        let octets_servis = match zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.stream_id.as_deref())
+                        {
+                            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                            None => None,
+                        };
+                        warn!(
+                            zone_id,
+                            output_type = output_type_str,
+                            position_ms = status.position_ms,
+                            peak_position_ms = ps.peak_position_ms,
+                            duree_file_ms = track_duration_ms,
+                            duree_rapportee_ms = status.duration_ms,
+                            duree_effective_ms = effective_end_duration_ms,
+                            wall_secs = wall_elapsed,
+                            ticks = ps.depassement_duree_ticks,
+                            ?octets_servis,
+                            "lecture_annoncee_au_dela_de_la_duree"
+                        );
+                    }
+
                     // #2116: a renderer can acknowledge Play forever while
                     // producing no more sound. Only stop after two independent
                     // progress signals (renderer position and bytes served by
@@ -4395,6 +4640,7 @@ impl PositionPoller {
                     consecutive_errors: ps.consecutive_errors,
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
+                    lecture_au_dela_de_la_duree: ps.depassement_duree_signale,
                 },
             );
 
@@ -5660,6 +5906,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -5717,6 +5965,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -6019,6 +6269,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -6816,6 +7068,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -7022,6 +7276,8 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -7655,6 +7911,95 @@ mod annonce_navigateur_guard {
             "l'annonce des zones navigateur n'est plus libérée dans la branche \
              « zone sans périphérique » : plus aucune zone navigateur ne \
              scrobblerait, sans le moindre message (#1998)."
+        );
+    }
+}
+
+/// #2493 — garde-fou d'EMPLACEMENT : le constat de depassement DIT, il n'agit
+/// pas.
+///
+/// La propriete tenue n'est pas une valeur, c'est une absence dans un bloc
+/// precis d'une boucle de plusieurs milliers de lignes : entre l'appel a
+/// `position_au_dela_de_la_duree` et la ligne de journal qu'il declenche, il ne
+/// doit y avoir NI `track_ended = true` NI `force_stop = true`.
+///
+/// C'est tout l'arbitrage du ticket. La meme forme — position a la fin,
+/// appareil qui dit jouer — est produite par une lecture bloquee ET par une
+/// duree fausse (etiquette erronee, piste reellement plus longue). Aucune
+/// horloge ne sait les distinguer, donc agir couperait une ecoute legitime une
+/// fois sur deux. Le jour ou quelqu'un « complete » ce bloc par un saut de
+/// piste, ce test doit l'arreter.
+///
+/// Meme procede, meme raison que `annonce_navigateur_guard` : relecture de
+/// source parce que la propriete est un emplacement.
+#[cfg(test)]
+mod depassement_duree_nagit_pas_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe a ce module pour que
+    /// les motifs cherches ne puissent pas se trouver eux-memes dans les
+    /// assertions ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod depassement_duree_nagit_pas_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a ete renomme : la decoupe ne protege plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a ete remanie ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #2493."
+            )
+        })
+    }
+
+    #[test]
+    fn le_bloc_de_constat_ne_touche_ni_la_piste_ni_la_zone() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        assert!(
+            debut < fin,
+            "le journal du constat doit suivre l'appel au predicat"
+        );
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            !bloc.contains("track_ended = true"),
+            "le constat de depassement avance maintenant la piste. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+        assert!(
+            !bloc.contains("force_stop = true"),
+            "le constat de depassement arrete maintenant la zone. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+    }
+
+    /// Le constat n'a le droit de parler qu'APRES que tous les detecteurs de
+    /// fin de piste ont renonce : il compte jusqu'a `DEPASSEMENT_DUREE_TICKS`,
+    /// pas jusqu'a `POSITION_PAST_END_TICKS`. Confondre les deux seuils ferait
+    /// crier le journal a chaque fin de piste normale.
+    #[test]
+    fn le_constat_attend_son_propre_seuil() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            bloc.contains("DEPASSEMENT_DUREE_TICKS"),
+            "le constat ne s'appuie plus sur son propre seuil : il parlerait \
+             avant que les detecteurs de fin de piste aient eu leur chance."
+        );
+        assert!(
+            super::DEPASSEMENT_DUREE_TICKS > super::POSITION_PAST_END_TICKS,
+            "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
+             detecteurs de fin de piste, sinon il double-signale une fin de \
+             piste parfaitement normale."
         );
     }
 }
