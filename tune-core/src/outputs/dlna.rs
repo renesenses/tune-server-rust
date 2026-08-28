@@ -1146,11 +1146,11 @@ impl DlnaOutput {
             // et distingue « injoignable » de « joignable mais muet ».
             Ok(_) => {
                 warn!(device = %self.name, "renderer_caps_probe_empty_sink");
-                RendererCapabilities::default()
+                RendererCapabilities::inconclusive("empty_sink")
             }
             Err(e) => {
                 warn!(device = %self.name, error = %e, "renderer_caps_probe_failed");
-                RendererCapabilities::default()
+                RendererCapabilities::inconclusive("soap_failed")
             }
         }
     }
@@ -1162,6 +1162,10 @@ impl DlnaOutput {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RendererCapabilities {
     pub probed: bool,
+    /// Stable machine-readable cause when `probed` is false. The API, not the
+    /// translated UI, knows whether SOAP failed or returned an empty Sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
     pub flac: bool,
     /// Plain `audio/wav` / `audio/x-wav`.
     pub wav: bool,
@@ -1175,6 +1179,15 @@ pub struct RendererCapabilities {
     pub dsd: bool,
     /// Raw Sink entries, for an advanced/debug view.
     pub sink: Vec<String>,
+}
+
+impl RendererCapabilities {
+    fn inconclusive(reason: &'static str) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
@@ -1211,6 +1224,7 @@ fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
     });
     RendererCapabilities {
         probed: true,
+        reason: None,
         flac: has("audio/flac"),
         wav: has("audio/wav"),
         lpcm16: has("audio/l16"),
@@ -1396,6 +1410,16 @@ mod tests {
         assert!(c.lpcm16, "audio/L16 present");
         assert!(!c.lpcm24, "no audio/L24 advertised");
         assert!(c.mp3 && c.aac && c.dsd);
+        assert_eq!(c.reason, None, "une sonde concluante ne porte aucun refus");
+    }
+
+    #[test]
+    fn une_sonde_inconclusive_expose_une_raison_stable() {
+        let c = RendererCapabilities::inconclusive("empty_sink");
+        let json = serde_json::to_value(c).unwrap();
+
+        assert_eq!(json["probed"], false);
+        assert_eq!(json["reason"], "empty_sink");
     }
 
     #[test]
