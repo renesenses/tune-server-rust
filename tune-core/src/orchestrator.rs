@@ -1049,6 +1049,72 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
+    /// radios du MediaServer.
+    ///
+    /// La connexion à la station ne commence qu'ici, au GET audio — jamais au
+    /// Browse ni au HEAD. La route HTTP possède la durée de vie de la session
+    /// et la retire lorsque son corps est terminé ou abandonné.
+    pub async fn create_media_server_radio_session(&self, radio_url: String) -> String {
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (stream_id, tx, data_ready, session) =
+            self.streamer.create_radio_session(wav_info, 256).await;
+        let stream_id_for_task = stream_id.clone();
+        let session_for_done = session.clone();
+
+        info!(
+            stream_id = %stream_id,
+            url = %radio_url,
+            "media_server_radio_decode_started"
+        );
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None)
+            })
+            .await;
+
+            session_for_done
+                .producer_done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Réveille aussi le corps qui attend encore la détection du vrai
+            // format. `notify_one` mémorise un permis si l'échec précède son
+            // premier poll, contrairement à `notify_waiters`.
+            session_for_done.data_ready.notify_one();
+            // `create_radio_session` conserve un émetteur de garde pour les
+            // flux permanents. Cette session est liée à une requête : quand le
+            // producteur finit, le corps HTTP doit recevoir EOF.
+            session_for_done.close_sender().await;
+
+            match result {
+                Ok(Ok(())) => debug!(
+                    stream_id = %stream_id_for_task,
+                    "media_server_radio_decode_ended"
+                ),
+                Ok(Err(error)) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_failed"
+                ),
+                Err(error) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_task_panicked"
+                ),
+            }
+        });
+
+        stream_id
+    }
+
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
         self.levels_prewarm
