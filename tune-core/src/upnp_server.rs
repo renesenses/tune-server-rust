@@ -381,6 +381,40 @@ pub fn parse_soap_action(soap_xml: &str) -> Option<String> {
     }
 }
 
+/// Object addressed by a ContentDirectory request, when the action carries
+/// one. Browse calls it `ObjectID`; Search and several optional actions call
+/// the same concept `ContainerID`.
+fn parse_content_directory_object_id(soap_xml: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(soap_xml);
+    reader.config_mut().trim_text(true);
+    let mut current_tag = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                current_tag = name.rsplit(':').next().unwrap_or(&name).to_string();
+            }
+            Ok(Event::End(_)) => current_tag.clear(),
+            Ok(Event::Text(e)) if matches!(current_tag.as_str(), "ObjectID" | "ContainerID") => {
+                let decoded = e.decode().ok()?;
+                let value = match unescape(&decoded) {
+                    Ok(unescaped) => unescaped.into_owned(),
+                    Err(_) => decoded.to_string(),
+                };
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// Enveloppe SOAP d'une réponse d'action réussie.
 fn soap_action_response(service_urn: &str, action: &str, args: &str) -> String {
     format!(
@@ -459,7 +493,12 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
             soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
         }
         Some(other) => {
-            debug!(action = other, "upnp_content_directory_unsupported_action");
+            let object_id = parse_content_directory_object_id(soap_body);
+            warn!(
+                action = other,
+                object_id = object_id.as_deref().unwrap_or("<absent>"),
+                "upnp_content_directory_unsupported_action"
+            );
             soap_fault(401, "Invalid Action")
         }
     }
@@ -2386,6 +2425,79 @@ mod tests {
         // Un Browse ordinaire répond toujours en BrowseResponse.
         let browse = build_browse_response(&state, &soap_body("Browse", urn));
         assert!(browse.contains("<u:BrowseResponse"));
+    }
+
+    #[derive(Clone, Default)]
+    struct JournalCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn un_refus_content_directory_nomme_action_et_objet_sans_accuser_les_actions_valides() {
+        let state = test_state();
+        let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        let journal = JournalCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let with_object = format!(
+                r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body><u:CreateObject xmlns:u="{urn}"><ObjectID>albums/42</ObjectID></u:CreateObject></s:Body>
+</s:Envelope>"#
+            );
+            assert!(is_soap_fault(&build_browse_response(&state, &with_object)));
+            assert!(is_soap_fault(&build_browse_response(
+                &state,
+                &soap_body("DestroyObject", urn)
+            )));
+            assert!(!is_soap_fault(&build_browse_response(
+                &state,
+                &soap_body("GetSystemUpdateID", urn)
+            )));
+        });
+
+        let log = journal.texte();
+        assert!(
+            log.contains("WARN"),
+            "le refus doit survivre au niveau par défaut: {log}"
+        );
+        assert!(log.contains("action=\"CreateObject\""), "{log}");
+        assert!(log.contains("object_id=\"albums/42\""), "{log}");
+        assert!(log.contains("action=\"DestroyObject\""), "{log}");
+        assert!(log.contains("object_id=\"<absent>\""), "{log}");
+        assert_eq!(
+            log.matches("upnp_content_directory_unsupported_action")
+                .count(),
+            2,
+            "une action valide ne doit produire aucun faux refus: {log}"
+        );
     }
 
     #[test]
