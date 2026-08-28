@@ -1361,8 +1361,7 @@ WHERE key = 'audio_embed_analyzed'
 ",
     },
     Migration {
-        // Numéro PROVISOIRE sur la tête gelée de #2716. Il sera remplacé par
-        // le suivant immédiat au moment où Bertrand ouvrira notre couloir.
+        // Numéro suivant immédiat après la migration 87 livrée par #2716.
         version: 88,
         name: "replaygain_true_peak_bs1770_5",
         // #2713 : `rg_track_peak` calculé par Tune était un simple maximum des
@@ -2876,8 +2875,7 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "temoins_poses_sur_chemin_introuvable",
         include_str!("../../migrations/postgres/039_temoins_poses_sur_chemin_introuvable.sql"),
     ),
-    // Numéro provisoire sur #2716 gelée ; à renuméroter au prochain immédiat
-    // lors de l'ouverture du couloir d'intégration de #2713.
+    // Numéro suivant immédiat après la migration PostgreSQL 039 livrée par #2716.
     (
         40,
         "replaygain_true_peak_bs1770_5",
