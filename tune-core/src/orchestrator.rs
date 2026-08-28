@@ -3169,8 +3169,29 @@ impl PlaybackOrchestrator {
             // les octets compressés contourneraient entièrement le DSP. C'est
             // notamment le cas d'une zone navigateur, qui n'a aucun device_id
             // mais doit recevoir le WAV déjà égalisé par Tune (#2063).
-            let needs_proxy =
-                req.output_device_id.is_some() || !reliable_ext || radio_eq_profile.is_some();
+            //
+            // Une zone NAVIGATEUR n'a jamais droit au passthrough, EQ ou pas
+            // (#2670). Le client web reecrit toute URL absolue en chemin
+            // relatif — `browserPlay`, `u.pathname + u.search`, pour joindre
+            // l'hote Tune plutot que l'IP annoncee par le serveur. Lui rendre
+            // l'URL de la station fait donc demander `/tsfjazz-high.mp3` a
+            // Tune, qui repond par son repli SPA : 200 `text/html`, sa propre
+            // page. L'auditeur recoit une page web a la place du flux, et Tune
+            // n'a rien a en dire puisqu'il n'a jamais ouvert le flux lui-meme :
+            // le controle `non_audio_content_type` vit dans
+            // `decode_radio_stream_to_pcm`, que ce chemin court-circuite.
+            // C'est la MEME cause que #2076 / #2158, deja corrigee pour
+            // Bandcamp quelques branches plus haut par un proxy local.
+            //
+            // La bascule ne coute rien de nouveau : une zone navigateur recoit
+            // deja du WAV pour toute station au codec ambigu (.aac, .ogg, sans
+            // extension), soit 44 des 51 entrees de l'annuaire au 28/08/2026.
+            // Seules les rares URL en .mp3/.flac/.wav prenaient ce raccourci —
+            // TSF Jazz en fait partie, et c'est la station signalee.
+            let needs_proxy = req.output_device_id.is_some()
+                || is_browser_output
+                || !reliable_ext
+                || radio_eq_profile.is_some();
 
             if needs_proxy {
                 let wav_info = StreamInfo {
@@ -13085,6 +13106,66 @@ mod tests {
             "l'EQ actif doit interdire le passthrough MP3"
         );
         assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.origin_url.as_deref(), Some(source));
+    }
+
+    /// #2670 — une zone NAVIGATEUR ne doit jamais recevoir l'URL de la station.
+    ///
+    /// Le client web reecrit toute URL absolue en chemin relatif
+    /// (`browserPlay` : `u.pathname + u.search`), pour joindre l'hote Tune
+    /// plutot que l'IP que le serveur annonce. L'URL d'une station en `.mp3`
+    /// devient donc une requete `/station.mp3` adressee a Tune, a laquelle le
+    /// repli SPA (`routes/mod.rs`, `ServeDir::fallback(ServeFile(index.html))`)
+    /// repond 200 `text/html` : une page web au lieu du flux.
+    ///
+    /// Et Tune ne peut rien en dire : sans session locale il n'ouvre jamais le
+    /// flux, donc ni `non_audio_content_type` ni `RADIO_NOT_AUDIO` — qui vivent
+    /// dans `decode_radio_stream_to_pcm` — ne peuvent se declencher. C'etait le
+    /// seul chemin radio ou une station morte restait muette ET silencieuse.
+    #[tokio::test]
+    async fn browser_radio_mp3_is_never_handed_the_station_url() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        // Aucun profil EQ n'est ecrit : c'est precisement le cas que le
+        // passthrough laissait passer (#2063 ne couvrait que l'EQ actif).
+        // Port 9 (discard) : la tache de decodage echoue en local, aucun appel
+        // reseau reel ne sort de ce test.
+        let source = "http://127.0.0.1:9/tsfjazz-high.mp3";
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some(source.into()),
+            title: Some("TSF Jazz".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "une zone navigateur doit recevoir une session Tune, pas l'URL de la station"
+        );
+        assert_ne!(
+            resolved.url, source,
+            "l'URL de la station renvoyee telle quelle est reecrite en chemin local par le client, \
+             qui recoit alors la page HTML de Tune"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+        // L'amont voyage quand meme : un enregistreur ou les titres ICY n'ont
+        // pas d'autre chemin de retour vers la source.
         assert_eq!(resolved.origin_url.as_deref(), Some(source));
     }
 
