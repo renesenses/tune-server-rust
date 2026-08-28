@@ -8056,6 +8056,40 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Les appareils qu'une AUTRE zone que `zone_id` revendique comme sienne.
+    ///
+    /// Sert à borner le repli de `stop` : ces sorties-là ne lui appartiennent
+    /// pas, les arrêter revient à couper la musique de quelqu'un d'autre.
+    /// Prend une projection `(id de zone, appareil)` plutôt que des `Zone`
+    /// entières : la règle ne dépend que de ces deux champs, et une fonction
+    /// qui n'exige pas de construire une zone complète est une fonction qu'on
+    /// peut réellement tester.
+    fn sorties_revendiquees_par_les_autres_zones<'a>(
+        zones: impl IntoIterator<Item = (Option<i64>, Option<&'a str>)>,
+        zone_id: i64,
+    ) -> std::collections::HashSet<String> {
+        zones
+            .into_iter()
+            .filter(|(id, _)| *id != Some(zone_id))
+            .filter_map(|(_, appareil)| appareil.map(str::to_string))
+            .collect()
+    }
+
+    /// Quelles sorties le repli de `stop` a le droit de toucher.
+    ///
+    /// Tout ce qui est revendiqué par une autre zone est épargné, sans
+    /// exception : c'est l'invariant que ce repli avait perdu.
+    fn sorties_a_arreter_en_repli(
+        toutes: &[String],
+        revendiquees_ailleurs: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        toutes
+            .iter()
+            .filter(|did| !revendiquees_ailleurs.contains(did.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
@@ -8090,22 +8124,53 @@ impl PlaybackOrchestrator {
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback.
+            // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
+            // enregistrées — et c'est ainsi qu'un `next` sur une zone
+            // « navigateur » (son dans le navigateur, donc AUCUN appareil côté
+            // serveur, par construction : `reject_if_zone_has_no_output_device`
+            // laisse justement passer ce cas) coupait la musique de tout le
+            // monde.
+            //
+            // Mesuré sur .18 le 28/08/2026 : dix arrêts en une heure, cadence
+            // ~100 s, chacun envoyant `dlna_stop` à l'Eversolo qui jouait la
+            // zone 10 et aux deux Sonos. La zone 10 n'étant elle-même jamais
+            // passée en « stopped », rien ne reprenait avant que le poller ne
+            // déclenche `radio_auto_retry` — jusqu'à près de trois minutes de
+            // silence à chaque fois.
+            //
+            // Le repli garde son utilité — rattraper une sortie orpheline que
+            // CETTE zone aurait laissée ouverte — mais il ne doit jamais
+            // toucher une sortie qu'une AUTRE zone revendique. Même famille
+            // que #2571 : un ordre qui sort du périmètre de la zone active.
+            let toutes_les_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .list()
+                .unwrap_or_default();
+            let revendiquees_ailleurs = Self::sorties_revendiquees_par_les_autres_zones(
+                toutes_les_zones
+                    .iter()
+                    .map(|z| (z.id, z.output_device_id.as_deref())),
+                zone_id,
+            );
             // Snapshot the Arcs first and release the registry lock, so a slow
             // or offline renderer's stop() SOAP timeout can't hold the lock and
             // starve concurrent playback for ~100s (send_to_output_lock_contention).
             let arcs: Vec<_> = {
                 let outputs = self.outputs.lock().await;
-                outputs
-                    .list()
+                Self::sorties_a_arreter_en_repli(&outputs.list(), &revendiquees_ailleurs)
                     .iter()
                     .filter_map(|did| outputs.get(did))
                     .collect()
             };
+            let arretees = arcs.len();
             for output in arcs {
                 let _ = output.lock().await.stop().await;
             }
-            warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
+            warn!(
+                zone_id,
+                arretees,
+                epargnees = revendiquees_ailleurs.len(),
+                "stop_fallback_no_device_id — repli borné aux sorties qu'aucune autre zone ne revendique"
+            );
         }
         // Remove session AFTER the output has been stopped
         if let Some(ref sid) = old_stream_id {
@@ -13369,5 +13434,75 @@ mod annonce_apres_sortie_guard {
              il scrobblerait un titre à la seconde où il commence, en ignorant \
              la règle des 50 % / 4 min de Last.fm (#1113)."
         );
+    }
+}
+
+#[cfg(test)]
+mod stop_scope_tests {
+    use super::PlaybackOrchestrator;
+
+    /// Le repli de `stop` ne doit JAMAIS toucher l'appareil d'une autre zone.
+    ///
+    /// Le défaut mesuré sur .18 le 28/08/2026 : la zone 15 « Cet ordinateur »
+    /// est une sortie navigateur, donc sans `output_device_id` par
+    /// construction. Chaque `next` dessus tombait dans le repli, qui arrêtait
+    /// TOUTES les sorties enregistrées — l'Eversolo de la zone 10 compris, en
+    /// pleine lecture. Même famille que #2571.
+    #[test]
+    fn le_repli_de_stop_epargne_les_sorties_des_autres_zones() {
+        // Zone 15 : navigateur, aucun appareil. Zones 10 et 8 : renderers.
+        let zones = [
+            (Some(15i64), None),
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 15);
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+            "uuid:orpheline-sans-zone".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+
+        assert!(
+            !a_arreter.contains(&"uuid:eversolo-dmp-a8".to_string()),
+            "un stop sur la zone 15 ne doit pas couper l'Eversolo, qui joue la zone 10"
+        );
+        assert!(
+            !a_arreter.contains(&"uuid:sonos-chambre".to_string()),
+            "ni le Sonos de la zone 8"
+        );
+        assert_eq!(
+            a_arreter,
+            vec!["uuid:orpheline-sans-zone".to_string()],
+            "le repli garde son seul objet légitime : une sortie qu'aucune zone ne revendique"
+        );
+    }
+
+    /// Et la zone qui demande l'arrêt ne s'épargne pas elle-même : si elle a
+    /// laissé une sortie ouverte, le repli doit encore pouvoir la fermer.
+    #[test]
+    fn le_repli_peut_toujours_fermer_la_sortie_de_la_zone_qui_arrete() {
+        let zones = [
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 10);
+        assert!(
+            !revendiquees.contains("uuid:eversolo-dmp-a8"),
+            "son propre appareil n'est pas « revendiqué ailleurs »"
+        );
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+        assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
     }
 }
