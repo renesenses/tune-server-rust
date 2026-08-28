@@ -4151,6 +4151,10 @@ impl PlaybackOrchestrator {
                         budget_s = transcode_budget.as_secs(),
                         "transcode_budget_selected"
                     );
+                    // Même raison que le pré-transcode DASH plus bas : la ligne
+                    // de fin doit porter sa propre durée, pour rester lisible
+                    // seule dans un export de journal tronqué par la rotation.
+                    let file_transcode_start = std::time::Instant::now();
                     let transcode_result = tokio::time::timeout(
                         transcode_budget,
                         transcode_source_to_file(
@@ -4195,6 +4199,7 @@ impl PlaybackOrchestrator {
                                 file = %file_path,
                                 tmp = %serve_path,
                                 file_size,
+                                elapsed_ms = file_transcode_start.elapsed().as_millis() as u64,
                                 "transcode_to_temp_file_complete"
                             );
 
@@ -5458,6 +5463,19 @@ impl PlaybackOrchestrator {
             // aiguilles figées. Le chemin remux (opt-in TUNE_DASH_REMUX) ne
             // décode rien : VU légitimement muets dans ce cas.
             let dash_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+            // Durée du pré-transcode, sur la ligne de FIN.
+            //
+            // C'est l'étape qui domine le démarrage d'une piste DASH (Tidal
+            // HI-RES) vers un renderer réseau : décodage intégral en PCM puis
+            // ré-encodage, avant que le moindre octet ne parte. Le journal
+            // disait qu'elle avait eu lieu, jamais combien elle avait coûté :
+            // il fallait soustraire deux horodatages. Or le fichier de journal
+            // est plafonné et tourne — la ligne de DÉBUT peut avoir disparu de
+            // l'export d'un testeur alors que la ligne de FIN y est encore, et
+            // la durée devenait alors impossible à établir. Même convention que
+            // `tidal_dash_multi_segment_download_complete`, qui porte déjà son
+            // `elapsed_ms` (`streaming/tidal.rs`).
+            let pre_transcode_start = std::time::Instant::now();
             let transcode_result = tokio::task::spawn_blocking(move || {
                 // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
                 // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
@@ -5538,6 +5556,7 @@ impl PlaybackOrchestrator {
                         tmp = %tmp_path,
                         file_size,
                         bit_depth = actual_bd,
+                        elapsed_ms = pre_transcode_start.elapsed().as_millis() as u64,
                         "streaming_dash_pre_transcode_complete"
                     );
 
