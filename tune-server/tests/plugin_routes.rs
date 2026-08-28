@@ -497,3 +497,83 @@ async fn opt_in_plugin_loads_after_install() {
     assert_eq!(entry["installed"], true);
     assert_eq!(entry["enabled"], true);
 }
+
+/// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
+/// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
+/// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client
+/// ne sait les atteindre, et proposer « Installer » sur une fonction que rien
+/// n'expose ne rend rien à l'utilisateur (#2090).
+///
+/// Le test s'exécute sous le jeu de fonctionnalités livré. Sans `--features
+/// dj,karaoke` les deux greffons ne sont pas enregistrés du tout, et le test
+/// passerait sans rien prouver : on l'annonce dans le message d'échec plutôt
+/// que de laisser croire à une preuve.
+#[tokio::test]
+async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+
+    for hidden in ["dj", "karaoke"] {
+        assert!(
+            !names.contains(&hidden),
+            "« {hidden} » ne doit plus être proposé par le gestionnaire (listés : {names:?})"
+        );
+    }
+
+    // Contre-épreuve dans le même souffle : le filtre retire les greffons hors
+    // catalogue, pas les greffons dormants en général. Un opt-in ordinaire,
+    // dormant pour exactement la même raison, reste proposé.
+    assert!(
+        names.contains(&"optin"),
+        "un opt-in catalogué doit rester proposé (listés : {names:?})"
+    );
+}
+
+/// Retiré du catalogue n'est pas retiré du binaire : DJ se charge encore si on
+/// pose son réglage d'installation à la main, et son routeur est monté comme
+/// avant. C'est la différence entre cesser de promettre et supprimer.
+///
+/// Et ce qui TOURNE reste listé. Le filtre ne porte que sur le catalogue —
+/// l'offre faite à qui n'a rien installé. Masquer un greffon déjà installé le
+/// rendrait indésinstallable, et mentirait sur l'état de la machine.
+#[cfg(feature = "dj")]
+#[tokio::test]
+async fn uncatalogued_dj_still_loads_when_installed_by_hand() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_dj_installed", "true")
+        .expect("marquer DJ installé");
+
+    let routers = tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+    assert!(
+        routers.iter().any(|(name, _)| name == "dj"),
+        "DJ doit encore contribuer son routeur (montés : {:?})",
+        routers.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+
+    let app = tune_server::routes::router(state.clone());
+    let (_status, body) = body_of(&app, "/api/v1/plugins").await;
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "dj")
+        .expect("un greffon qui tourne reste listé, hors catalogue ou non");
+    assert_eq!(entry["enabled"], true);
+}
