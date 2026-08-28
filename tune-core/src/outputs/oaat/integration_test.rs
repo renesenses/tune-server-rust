@@ -427,9 +427,18 @@ mod tests {
             payload.iter().all(|byte| *byte == 0),
             "L=-R doit donner un downmix mono nul byte-for-byte"
         );
-        let last = &packets.last().unwrap().0;
+        let (last, last_payload) = packets.last().unwrap();
         assert!(last.flags.contains(PacketFlags::LAST_PACKET));
-        assert_eq!(last.sample_offset, 2_400);
+        assert!(
+            !last_payload.is_empty(),
+            "LAST doit etre porte par le dernier payload audio reel"
+        );
+        assert_eq!(last_payload.len() % 2, 0);
+        assert_eq!(
+            last.sample_offset + (last_payload.len() / 2) as u64,
+            2_400,
+            "l offset de debut et le dernier payload doivent couvrir exactement 50 ms"
+        );
         output.stop().await.ok();
     }
 
@@ -915,8 +924,22 @@ mod tests {
                 .all(|(_, payload)| payload.iter().all(|byte| *byte == 0)),
             "le témoin silencieux doit rester nul byte-for-byte après conversion"
         );
-        let second_last = &second_packets.last().expect("LAST piste 2").0;
-        assert_eq!(second_last.sample_offset, 22_050);
+        let (second_last, second_last_payload) = second_packets.last().expect("LAST piste 2");
+        assert!(
+            second_last
+                .flags
+                .contains(oaat_core::wire::PacketFlags::LAST_PACKET)
+        );
+        assert!(
+            !second_last_payload.is_empty(),
+            "LAST piste 2 doit etre porte par le dernier payload audio reel"
+        );
+        assert_eq!(second_last_payload.len() % 4, 0);
+        assert_eq!(
+            second_last.sample_offset + (second_last_payload.len() / 4) as u64,
+            22_050,
+            "l offset de debut et le dernier payload doivent couvrir exactement 500 ms"
+        );
 
         output.stop().await.ok();
         http_handle.abort();
