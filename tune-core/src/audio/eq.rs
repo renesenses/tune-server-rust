@@ -700,6 +700,59 @@ fn tpdf_dither(state: &mut u64) -> f64 {
 mod tests {
     use super::*;
 
+    fn response_db(coeffs: BiquadCoeffs, freq: f64, sample_rate: f64) -> f64 {
+        let omega = 2.0 * PI * freq / sample_rate;
+        let (sin_1, cos_1) = omega.sin_cos();
+        let (sin_2, cos_2) = (2.0 * omega).sin_cos();
+        let numerator_re = coeffs.b0 + coeffs.b1 * cos_1 + coeffs.b2 * cos_2;
+        let numerator_im = -coeffs.b1 * sin_1 - coeffs.b2 * sin_2;
+        let denominator_re = 1.0 + coeffs.a1 * cos_1 + coeffs.a2 * cos_2;
+        let denominator_im = -coeffs.a1 * sin_1 - coeffs.a2 * sin_2;
+        let numerator_power = numerator_re * numerator_re + numerator_im * numerator_im;
+        let denominator_power = denominator_re * denominator_re + denominator_im * denominator_im;
+        10.0 * (numerator_power / denominator_power).log10()
+    }
+
+    #[test]
+    fn biquads_match_rbj_reference_points() {
+        const SAMPLE_RATE: f64 = 48_000.0;
+        const CENTER: f64 = 2_000.0;
+        const GAIN_DB: f64 = 9.0;
+        const BUTTERWORTH_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+        let peak = response_db(
+            peaking_eq(CENTER, GAIN_DB, 1.3, SAMPLE_RATE),
+            CENTER,
+            SAMPLE_RATE,
+        );
+        assert!((peak - GAIN_DB).abs() < 1e-9, "pic central : {peak} dB");
+
+        for (name, coeffs) in [
+            ("passe-bas", low_pass(CENTER, BUTTERWORTH_Q, SAMPLE_RATE)),
+            ("passe-haut", high_pass(CENTER, BUTTERWORTH_Q, SAMPLE_RATE)),
+        ] {
+            let cutoff = response_db(coeffs, CENTER, SAMPLE_RATE);
+            assert!(
+                (cutoff + 3.010_299_956_64).abs() < 1e-9,
+                "{name} à la coupure : {cutoff} dB"
+            );
+        }
+
+        let low = low_shelf(CENTER, GAIN_DB, SAMPLE_RATE);
+        assert!((response_db(low, 1.0, SAMPLE_RATE) - GAIN_DB).abs() < 0.001);
+        assert!(response_db(low, 23_000.0, SAMPLE_RATE).abs() < 0.001);
+
+        let high = high_shelf(CENTER, GAIN_DB, SAMPLE_RATE);
+        assert!(response_db(high, 1.0, SAMPLE_RATE).abs() < 0.001);
+        assert!((response_db(high, 23_000.0, SAMPLE_RATE) - GAIN_DB).abs() < 0.001);
+
+        let notch_at_center = response_db(notch(CENTER, 1.0, SAMPLE_RATE), CENTER, SAMPLE_RATE);
+        assert!(
+            notch_at_center < -250.0,
+            "le zéro du notch ne tombe pas au centre : {notch_at_center} dB"
+        );
+    }
+
     #[test]
     fn flat_eq_is_transparent() {
         let profile = EqProfile::default();
