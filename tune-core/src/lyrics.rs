@@ -7,6 +7,7 @@
 //!   including negative results which are retried after 14 days.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,18 @@ use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 /// Negative cache entries (no lyrics found) are retried after this delay.
-const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
+pub const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
+
+/// Process-wide count of LRCLIB replies that told us to slow down (HTTP 429
+/// « Too Many Requests » or 503). Incremented by [`fetch_lrclib_raw`], never
+/// reset — a caller snapshots it before a run and compares afterwards.
+///
+/// LRCLIB is a free community service with no API key: a batch pass that kept
+/// hammering it after a 429 would get the whole instance banned, and that would
+/// also kill the on-demand lookup done while listening. The background pass
+/// (`crate::library::lyrics_pass`) watches this counter and stops on the first
+/// hit. Same idiom as `ARTWORK_RATE_LIMIT_HITS` in `library::artwork`.
+pub static LRCLIB_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -137,6 +149,15 @@ pub async fn fetch_lrclib_raw(
     }
 
     if !resp.status().is_success() {
+        // 429/503 = « ralentis ». On le compte pour que la passe de fond
+        // s'arrête au premier signal au lieu de continuer à cogner.
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            LRCLIB_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+            warn!(status = %resp.status(), "lrclib_rate_limited");
+        }
         return Err(format!("lrclib returned {}", resp.status()));
     }
 
@@ -247,11 +268,31 @@ impl LyricsCacheEntry {
         let Some(ref fetched) = self.fetched_at else {
             return false;
         };
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(NEGATIVE_CACHE_TTL_DAYS);
         // Both engines store `YYYY-MM-DDTHH:MM:SSZ`: lexicographic order is
         // chronological order for this fixed-width format.
-        fetched.as_str() >= cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string().as_str()
+        fetched.as_str() >= negative_retry_cutoff().as_str()
     }
+
+    /// Vrai quand cette entrée **dispense d'interroger LRCLIB** : soit elle
+    /// porte des paroles (les positifs n'expirent pas), soit c'est un échec
+    /// encore frais.
+    ///
+    /// Règle unique partagée par la récupération à la demande
+    /// ([`get_lyrics`]) et par la passe de fond
+    /// (`crate::library::lyrics_pass`) : une recherche déjà payée — y compris
+    /// une recherche **infructueuse** — ne doit jamais être repayée.
+    pub fn spares_a_fetch(&self) -> bool {
+        !self.is_negative() || self.negative_still_fresh()
+    }
+}
+
+/// Horodatage ISO-8601 UTC en deçà duquel un échec en cache est périmé et
+/// mérite une nouvelle tentative. Format à largeur fixe : la comparaison
+/// lexicographique vaut comparaison chronologique, sur les deux moteurs.
+pub fn negative_retry_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(NEGATIVE_CACHE_TTL_DAYS))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 fn dialect_sql(db: &Arc<dyn DbBackend>, f: impl Fn(&dyn SqlDialect) -> String) -> String {
@@ -349,7 +390,7 @@ pub async fn get_lyrics(
 ) -> Result<Lyrics, String> {
     // 1. Try cache.
     if let Some(cached) = load_cache_entry(db, track_id) {
-        if !cached.is_negative() || cached.negative_still_fresh() {
+        if cached.spares_a_fetch() {
             debug!(track_id, "lyrics_cache_hit");
             let lines = cached
                 .synced_lyrics
