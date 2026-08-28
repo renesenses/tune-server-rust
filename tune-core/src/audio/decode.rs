@@ -3135,12 +3135,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // chunk->i32 conversion and in-place trim. No real .dsf fixtures existed.
     #[test]
     fn decode_dsf_end_to_end_silence() {
-        let path = std::env::temp_dir().join("tune_test_dsf_silence.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x55 = 01010101, LSB-first -> alternating +1/-1 -> near silence.
         write_test_dsf(p, 0x55);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(out.sample_rate, 176_400);
         assert_eq!(out.bit_depth, 24);
@@ -3161,12 +3161,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_end_to_end_negative_dc() {
-        let path = std::env::temp_dir().join("tune_test_dsf_negdc.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x00 = all bits 0 -> all -1.0 -> strong negative DC.
         write_test_dsf(p, 0x00);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!out.samples_i32.is_empty());
         let mid = out.samples_i32[out.samples_i32.len() / 2];
@@ -3178,12 +3178,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_stereo_vers_mono_respecte_les_trames() {
-        let path = std::env::temp_dir().join("tune_test_dsf_mono_contract.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let stereo = decode_to_pcm(p, Some(176_400), None, 0.0, 0.0).unwrap();
         let mono = decode_to_pcm(p, Some(176_400), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(stereo.channels, 2);
         assert_eq!(mono.channels, 1);
@@ -3197,7 +3197,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_dsf_mono_entete_et_payload_sont_alignes() {
-        let path = std::env::temp_dir().join("tune_test_dsf_stream_mono.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         write_test_dsf(path.to_str().unwrap(), 0x55);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3220,7 +3221,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         assert_eq!(decoder.await.unwrap().unwrap(), (24, 176_400));
-        std::fs::remove_file(path).ok();
 
         let header = chunks.first().expect("WAV header DSD->PCM");
         assert_eq!(u16::from_le_bytes([header[22], header[23]]), 1);
@@ -3247,12 +3247,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // instead of converting all of it and trimming (the DSD hang, Sandro's DSF).
     #[test]
     fn decode_dsf_bounded_stops_early() {
-        let path = std::env::temp_dir().join("tune_test_dsf_bounded.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let full = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
         let bounded = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.005).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!bounded.samples_i32.is_empty());
         assert!(
@@ -3339,13 +3339,11 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// payload doivent raconter la même chose.
     #[test]
     fn la_cible_est_un_contrat_sur_le_payload_symphonia() {
-        let dir = std::env::temp_dir().join("tune_target_decode");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("stereo_96000_24.wav");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stereo_96000_24.wav");
         ecrire_wav_96k_24_stereo(&path, 9_600);
 
         let d = decode_to_pcm(path.to_str().unwrap(), Some(44_100), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(d.sample_rate, 44_100);
         assert_eq!(d.channels, 1);
@@ -3358,7 +3356,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_wav_entete_et_payload_partagent_le_format_cible() {
-        let path = std::env::temp_dir().join("tune_stream_target_96000_24.wav");
+        let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = wav.path().to_path_buf();
         ecrire_wav_96k_24_stereo(&path, 9_600);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3381,7 +3380,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         let result = decoder.await.unwrap().unwrap();
-        std::fs::remove_file(path).ok();
 
         assert_eq!(result, (16, 44_100));
         let header = chunks.first().expect("WAV header");

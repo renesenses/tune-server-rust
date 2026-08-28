@@ -1611,10 +1611,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn provision_and_embed() {
-        let dir = std::env::temp_dir().join("tune-audio-embed-e2e");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("clap-audio-music-2023.onnx");
+        let dir = tempfile::TempDir::new().unwrap();
+        let model = dir.path().join("clap-audio-music-2023.onnx");
 
         ensure_model(&model).await.expect("download model");
         ensure_runtime_loaded(&model)

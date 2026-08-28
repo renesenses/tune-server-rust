@@ -1951,8 +1951,8 @@ mod tests {
 
     #[test]
     fn save_to_cache_and_read() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_cache");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("cache");
 
         let data = b"fake image data";
         let result = save_to_cache(data, &dir, "test_hash_123", "jpg");
@@ -1961,25 +1961,22 @@ mod tests {
         let path = result.unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), data);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_to_cache_creates_dir() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_new_dir");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("nouveau");
         assert!(!dir.exists());
 
         save_to_cache(b"test", &dir, "hash", "png");
         assert!(dir.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_or_extract_nonexistent() {
-        let cache_dir = std::env::temp_dir().join("tune_test_extract_ne");
+        let base = tempfile::TempDir::new().unwrap();
+        let cache_dir = base.path().join("cache");
         let result = get_or_extract(Path::new("/tmp/nonexistent_audio_file.flac"), &cache_dir);
         assert!(result.is_none());
     }

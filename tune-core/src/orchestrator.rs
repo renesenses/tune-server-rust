@@ -11588,7 +11588,8 @@ mod tests {
     #[tokio::test]
     async fn transport_timeout_keeps_the_stream_session_but_refusal_drops_it() {
         let orch = test_orchestrator();
-        let f = std::env::temp_dir().join("tune-timeout-session-test.flac");
+        let flac = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        let f = flac.path().to_path_buf();
         std::fs::write(&f, b"fake audio").unwrap();
 
         for (device_id, output, doit_survivre) in [
@@ -11651,7 +11652,6 @@ mod tests {
                 "{device_id} : session présente={encore_la}, attendu={doit_survivre}"
             );
         }
-        let _ = std::fs::remove_file(&f);
     }
 
     /// #1518 (Vincent) : seek d'une piste STREAMING (Qobuz/Tidal) sur sortie

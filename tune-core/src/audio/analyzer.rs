@@ -989,7 +989,8 @@ mod tests {
 
     #[tokio::test]
     async fn decode_pcm_rend_toujours_des_trames_i16() {
-        let path = std::env::temp_dir().join("tune_analyzer_24bit_contract.wav");
+        let wav_file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = wav_file.path().to_path_buf();
         let source = [0x7f_ffffi32, -0x80_0000i32, 0x12_3456i32, -0x12_3456i32];
         let mut data = Vec::new();
         for sample in source {
@@ -1014,7 +1015,6 @@ mod tests {
         let pcm = decode_pcm(path.to_str().unwrap(), 22_050, 1, 0.0, 0.0)
             .await
             .unwrap();
-        std::fs::remove_file(path).ok();
         let samples: Vec<i16> = pcm
             .chunks_exact(2)
             .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
