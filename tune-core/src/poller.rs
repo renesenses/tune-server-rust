@@ -402,8 +402,15 @@ pub(crate) mod decisions {
     /// and steals the event from the natural-end path (Stopped branch →
     /// play_from_queue = real load), causing the endless 1-2s-then-zero loop
     /// (Rhorn, #1072). So the fallback only fires for internal-gapless outputs.
-    pub fn position_reset_fires(raw_position_reset: bool, can_internal_gapless: bool) -> bool {
-        raw_position_reset && can_internal_gapless
+    /// It is also forbidden during the seek grace period: recreating the current
+    /// stream can produce the same position-drop shape, but it never means the
+    /// renderer moved to the next queue item (#2170).
+    pub fn position_reset_fires(
+        raw_position_reset: bool,
+        can_internal_gapless: bool,
+        in_seek_grace: bool,
+    ) -> bool {
+        raw_position_reset && can_internal_gapless && !in_seek_grace
     }
 
     /// A renderer can report the PREVIOUS session's position for the first
@@ -3222,10 +3229,17 @@ impl PositionPoller {
                         None => false,
                     }
                 };
-                position_reset =
-                    decisions::position_reset_fires(position_reset, can_internal_gapless);
+                position_reset = decisions::position_reset_fires(
+                    position_reset,
+                    can_internal_gapless,
+                    in_seek_grace,
+                );
                 if !position_reset {
-                    info!(zone_id, "position_reset_deferred_to_natural_end");
+                    if in_seek_grace {
+                        info!(zone_id, "gapless_advance_suppressed_after_seek");
+                    } else {
+                        info!(zone_id, "position_reset_deferred_to_natural_end");
+                    }
                 }
             }
             ps.last_position_ms = status.position_ms;
@@ -5888,12 +5902,28 @@ mod tests {
         assert!(raw, "the drop shape matches on both output kinds");
 
         // Chromecast (can_internal_gapless == false) → suppressed.
-        assert!(!decisions::position_reset_fires(raw, false));
+        assert!(!decisions::position_reset_fires(raw, false, false));
         // DLNA (can_internal_gapless == true) → fires as before.
-        assert!(decisions::position_reset_fires(raw, true));
+        assert!(decisions::position_reset_fires(raw, true, false));
         // No raw reset → never, regardless of output kind.
-        assert!(!decisions::position_reset_fires(false, true));
-        assert!(!decisions::position_reset_fires(false, false));
+        assert!(!decisions::position_reset_fires(false, true, false));
+        assert!(!decisions::position_reset_fires(false, false, false));
+    }
+
+    #[test]
+    fn position_reset_during_seek_never_advances_gapless_metadata() {
+        // #2170: a seek near the arming window recreates the OAAT stream. The
+        // old direct-file path restarted at zero, so the drop shape looked
+        // exactly like a real internal transition. A current-track seek must
+        // never advance queue metadata, even when gapless is armed and the
+        // output otherwise supports internal chaining.
+        let raw = decisions::position_reset(258_760, 174, true);
+        assert!(raw);
+        assert!(!decisions::position_reset_fires(raw, true, true));
+
+        // Once the seek grace is over, an honest internal transition keeps the
+        // existing behavior.
+        assert!(decisions::position_reset_fires(raw, true, false));
     }
 
     #[test]
