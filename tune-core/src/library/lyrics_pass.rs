@@ -501,12 +501,17 @@ impl FillOptions<'static> {
 /// Le consentement, lu là où il est stocké. Rendu public pour que la route
 /// puisse répondre « refusé » sans dupliquer la règle.
 pub fn lrclib_consent_given(db: &Arc<dyn DbBackend>) -> bool {
+    setting(db, SETTING_LRCLIB_ENABLED).as_deref() == Some("true")
+}
+
+/// Un réglage, lu là où il vit. Un seul lecteur pour les deux consentements —
+/// celui de LRCLIB et celui de l'écriture — pour qu'ils ne puissent pas
+/// diverger sur la façon d'interpréter une clé absente.
+fn setting(db: &Arc<dyn DbBackend>, key: &str) -> Option<String> {
     crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
-        .get(SETTING_LRCLIB_ENABLED)
+        .get(key)
         .ok()
         .flatten()
-        .as_deref()
-        == Some("true")
 }
 
 /// Remplit les paroles manquantes de la bibliothèque depuis LRCLIB.
@@ -639,6 +644,375 @@ where
     );
     progress(&report);
     report
+}
+
+// ---------------------------------------------------------------------------
+// Passe 3 — écriture dans les fichiers. Disque, donc consentement séparé.
+// ---------------------------------------------------------------------------
+//
+// Les deux passes précédentes ne font qu'apprendre : elles remplissent la base
+// de Tune. Celle-ci **rend** ce qui a été appris aux fichiers de
+// l'utilisateur, pour que ses paroles survivent à Tune — c'est la seconde
+// demande de l'issue #2172, et la réserve n° 2 du fil forum en fixe le cadre :
+// « l'écriture dans les fichiers de l'utilisateur doit rester explicite et
+// optionnelle, jamais automatique ».
+//
+// Ce que ça veut dire, concrètement, et vérifié par les tests plus bas :
+//
+// - **Un consentement à elle.** [`SETTING_WRITE_ENABLED`] est une clé
+//   *distincte* de [`SETTING_LRCLIB_ENABLED`] : accepter d'interroger un
+//   service tiers n'est pas accepter qu'on modifie ses fichiers. Sans elle,
+//   [`run_write_to_files`] rend [`WriteStatus::Refused`] **sans ouvrir un seul
+//   fichier**. La garde est ici, dans le cœur, pas seulement dans la route.
+// - **Jamais automatique.** Aucun appel au démarrage ni après un scan ; seule
+//   la route `POST /library/lyrics/write` la déclenche.
+// - **Additif, jamais destructeur.** Le mode par défaut
+//   ([`WriteTarget::Sidecar`]) n'ouvre même pas le fichier audio, et refuse
+//   d'écraser un `.lrc` déjà posé. Le mode [`WriteTarget::Tag`] n'écrit que
+//   dans une étiquette vide de paroles.
+// - **Reprenable et borné.** Le succès est enregistré dans `track_metadata`,
+//   ce qui sort la piste des candidates du run suivant ; un run est plafonné
+//   par [`ExportOptions::max_files`].
+
+/// Réglage de consentement pour l'écriture dans les fichiers de l'utilisateur.
+pub const SETTING_WRITE_ENABLED: &str = "lyrics_write_files_enabled";
+
+/// Réglage : où écrire. `"sidecar"` (défaut) ou `"tag"`.
+pub const SETTING_WRITE_TARGET: &str = "lyrics_write_target";
+
+/// Réglage où la passe d'écriture publie son avancement puis son bilan (JSON).
+pub const SETTING_WRITE_RESULT: &str = "lyrics_write_result";
+
+/// Où écrire les paroles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteTarget {
+    /// Un `.lrc` posé à côté de la piste. Défaut : n'ouvre jamais le fichier
+    /// audio, donc ne peut pas l'abîmer. Réservé aux paroles **synchronisées**
+    /// — un `.lrc` sans horodatage ne s'afficherait nulle part.
+    Sidecar,
+    /// L'étiquette embarquée (USLT en ID3, LYRICS en Vorbis…). Réécrit le
+    /// fichier audio, donc n'y touche que s'il n'a pas déjà des paroles.
+    Tag,
+}
+
+impl WriteTarget {
+    /// Lit la cible dans les réglages. Toute valeur inconnue retombe sur
+    /// [`WriteTarget::Sidecar`] : devant un réglage qu'on ne comprend pas, on
+    /// choisit celui qui ne touche pas au fichier audio.
+    pub fn from_settings(db: &Arc<dyn DbBackend>) -> Self {
+        match setting(db, SETTING_WRITE_TARGET).as_deref() {
+            Some("tag") => Self::Tag,
+            _ => Self::Sidecar,
+        }
+    }
+}
+
+/// Comment un run d'écriture s'est terminé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteStatus {
+    /// Plus aucune candidate.
+    Done,
+    /// [`SETTING_WRITE_ENABLED`] ne vaut pas `"true"`. **Aucun octet écrit.**
+    Refused,
+    /// Plafond [`ExportOptions::max_files`] atteint : relancer reprendra.
+    Capped,
+}
+
+/// Bilan d'un run d'écriture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WriteReport {
+    pub status: WriteStatus,
+    pub target: WriteTarget,
+    /// Candidates parcourues.
+    pub examined: usize,
+    /// Fichiers réellement écrits.
+    pub written: usize,
+    /// Rien d'écrivable pour cette cible — typiquement des paroles non
+    /// synchronisées alors qu'on écrit des `.lrc`, ou un format sans
+    /// étiquettes.
+    pub skipped_no_body: usize,
+    /// Le fichier portait déjà des paroles : on n'écrase pas. Le passage
+    /// l'inscrit quand même dans `track_metadata`, pour que l'indicateur
+    /// cesse de sous-compter.
+    pub skipped_present: usize,
+    /// Échecs d'écriture (droits, disque plein, étiquette illisible…).
+    pub failed: usize,
+}
+
+impl Default for WriteReport {
+    fn default() -> Self {
+        Self {
+            status: WriteStatus::Done,
+            target: WriteTarget::Sidecar,
+            examined: 0,
+            written: 0,
+            skipped_no_body: 0,
+            skipped_present: 0,
+            failed: 0,
+        }
+    }
+}
+
+/// Garde-fous du run d'écriture.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportOptions {
+    pub target: WriteTarget,
+    /// Plafond de fichiers écrits pour **ce** run.
+    pub max_files: usize,
+}
+
+impl ExportOptions {
+    /// Les garde-fous de production : 2 000 fichiers par run. La passe étant
+    /// reprenable, plusieurs runs valent un run illimité — et une erreur de
+    /// réglage ne se propage pas à 50 000 fichiers d'un coup.
+    pub fn production(target: WriteTarget) -> Self {
+        Self {
+            target,
+            max_files: 2_000,
+        }
+    }
+}
+
+/// Le consentement à l'écriture, lu là où il est stocké.
+///
+/// **Distinct** de [`lrclib_consent_given`], et volontairement : les deux
+/// autorisations ne portent pas sur la même chose.
+pub fn write_consent_given(db: &Arc<dyn DbBackend>) -> bool {
+    setting(db, SETTING_WRITE_ENABLED).as_deref() == Some("true")
+}
+
+/// Une piste dont Tune connaît les paroles mais dont le fichier les ignore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportCandidate {
+    pub track_id: i64,
+    pub file_path: String,
+    pub synced: Option<String>,
+    pub plain: Option<String>,
+}
+
+/// Pistes à écrire pour cette cible : un fichier, des paroles connues en
+/// cache, et **pas encore** de paroles là où on s'apprête à écrire.
+///
+/// Le prédicat d'exclusion suit la cible, et c'est ce qui rend la passe
+/// reprenable : en `.lrc` on écarte celles qui ont déjà un `.lrc`
+/// ([`HAS_LRC`]), en étiquette celles qui ont déjà une étiquette
+/// ([`HAS_TAG`]). Écrire l'un n'empêche donc jamais d'écrire l'autre plus
+/// tard.
+pub fn export_candidates(
+    db: &Arc<dyn DbBackend>,
+    target: WriteTarget,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<ExportCandidate>, String> {
+    let already = match target {
+        WriteTarget::Sidecar => HAS_LRC,
+        WriteTarget::Tag => HAS_TAG,
+    };
+    let sql = dialect_sql(db, |d| {
+        format!(
+            "SELECT t.id, t.file_path, c.synced_lyrics, c.plain_lyrics \
+             FROM tracks t \
+             JOIN lyrics_cache c ON c.track_id = t.id \
+             WHERE t.id > {p1} AND t.file_path IS NOT NULL AND t.file_path <> '' \
+               AND ((c.synced_lyrics IS NOT NULL AND c.synced_lyrics <> '') \
+                 OR (c.plain_lyrics IS NOT NULL AND c.plain_lyrics <> '')) \
+               AND NOT {already} \
+             ORDER BY t.id LIMIT {p2}",
+            p1 = d.placeholder(1),
+            p2 = d.placeholder(2),
+        )
+    });
+    let params: [&dyn ToSqlValue; 2] = [&after_id, &limit];
+    Ok(db
+        .query_many(&sql, &params)?
+        .into_iter()
+        .filter_map(|r| {
+            let non_vide = |i: usize| {
+                r.get(i)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+            };
+            Some(ExportCandidate {
+                track_id: r.first()?.as_i64()?,
+                file_path: r.get(1)?.as_string()?,
+                synced: non_vide(2),
+                plain: non_vide(3),
+            })
+        })
+        .collect())
+}
+
+/// Nettoie un corps de paroles venu d'un tiers avant qu'il ne franchisse la
+/// frontière du fichier — même règle que l'éditeur d'étiquettes
+/// (`metadata::tag_writer`). Rend `None` s'il ne reste rien.
+fn corps_assaini(raw: &str) -> Option<String> {
+    let (propre, corrections) = crate::metadata::sanitize_untrusted_text(raw, "lyrics");
+    if !corrections.is_empty() {
+        debug!(?corrections, "lyrics_write_text_sanitized");
+    }
+    (!propre.trim().is_empty()).then_some(propre)
+}
+
+/// Écrit dans les fichiers de l'utilisateur les paroles que Tune connaît.
+///
+/// Bloquant (disque) : à appeler sous `spawn_blocking`. Aucun réseau — tout
+/// vient de `lyrics_cache`, déjà payé.
+///
+/// `progress(bilan)` est appelé au fil de l'eau.
+pub fn run_write_to_files(
+    db: &Arc<dyn DbBackend>,
+    opts: ExportOptions,
+    mut progress: impl FnMut(&WriteReport),
+) -> WriteReport {
+    const BATCH: i64 = 200;
+    let mut report = WriteReport {
+        target: opts.target,
+        ..Default::default()
+    };
+
+    // Consentement — avant tout, et avant le moindre octet.
+    if !write_consent_given(db) {
+        info!("lyrics_write_refused_no_consent");
+        report.status = WriteStatus::Refused;
+        return report;
+    }
+
+    let meta = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
+    let mut after_id = 0i64;
+
+    'outer: loop {
+        let batch = match export_candidates(db, opts.target, after_id, BATCH) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "lyrics_write_candidates_failed");
+                break;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+
+        for cand in batch {
+            after_id = cand.track_id;
+            report.examined += 1;
+
+            if report.written >= opts.max_files {
+                report.status = WriteStatus::Capped;
+                break 'outer;
+            }
+
+            let outcome = match opts.target {
+                WriteTarget::Sidecar => write_one_sidecar(&cand),
+                WriteTarget::Tag => write_one_tag(&cand),
+            };
+
+            match outcome {
+                WriteOutcome::Written(key, value) => {
+                    if let Err(e) = meta.set(cand.track_id, key, &value) {
+                        // Le fichier est écrit ; seule la note en base a
+                        // manqué. Ne pas compter un succès qui ne serait pas
+                        // repris au run suivant serait mentir dans l'autre
+                        // sens — on le dit dans le journal et on compte
+                        // l'écriture, qui a bien eu lieu.
+                        warn!(track_id = cand.track_id, error = %e, "lyrics_write_note_failed");
+                    }
+                    report.written += 1;
+                }
+                WriteOutcome::AlreadyThere(key, value) => {
+                    if let Err(e) = meta.set(cand.track_id, key, &value) {
+                        warn!(track_id = cand.track_id, error = %e, "lyrics_write_note_failed");
+                    }
+                    report.skipped_present += 1;
+                }
+                WriteOutcome::Nothing => report.skipped_no_body += 1,
+                WriteOutcome::Failed(e) => {
+                    warn!(track_id = cand.track_id, error = %e, "lyrics_write_failed");
+                    report.failed += 1;
+                }
+            }
+        }
+        progress(&report);
+    }
+
+    info!(
+        status = ?report.status,
+        target = ?report.target,
+        examined = report.examined,
+        written = report.written,
+        skipped_no_body = report.skipped_no_body,
+        skipped_present = report.skipped_present,
+        failed = report.failed,
+        "lyrics_write_done"
+    );
+    progress(&report);
+    report
+}
+
+/// Ce qu'une piste a donné. La clé et la valeur rendues sont celles à noter
+/// dans `track_metadata`, pour que l'indicateur et le run suivant soient
+/// d'accord avec le disque.
+enum WriteOutcome {
+    Written(&'static str, String),
+    AlreadyThere(&'static str, String),
+    Nothing,
+    Failed(String),
+}
+
+/// Un `.lrc` voisin. Paroles synchronisées seulement.
+fn write_one_sidecar(cand: &ExportCandidate) -> WriteOutcome {
+    let Some(lrc) = cand.synced.as_deref().and_then(corps_assaini) else {
+        return WriteOutcome::Nothing;
+    };
+    match crate::metadata::lyrics::write_sidecar_lrc(&cand.file_path, &lrc) {
+        Ok(path) => WriteOutcome::Written(META_KEY_SIDECAR, path.to_string_lossy().to_string()),
+        Err(crate::metadata::lyrics::SidecarWriteError::AlreadyExists(path)) => {
+            WriteOutcome::AlreadyThere(META_KEY_SIDECAR, path.to_string_lossy().to_string())
+        }
+        // Paroles sans horodatage, ou fichier audio disparu : rien à écrire,
+        // et rien d'anormal non plus.
+        Err(
+            e @ (crate::metadata::lyrics::SidecarWriteError::NotLrc
+            | crate::metadata::lyrics::SidecarWriteError::MissingAudioFile
+            | crate::metadata::lyrics::SidecarWriteError::BadPath),
+        ) => {
+            debug!(track_id = cand.track_id, reason = %e, "lyrics_write_sidecar_skipped");
+            WriteOutcome::Nothing
+        }
+        Err(e) => WriteOutcome::Failed(e.to_string()),
+    }
+}
+
+/// L'étiquette embarquée. Paroles plates de préférence — un USLT est fait pour
+/// du texte ; à défaut, le corps synchronisé, que la cascade d'affichage sait
+/// reconnaître comme du LRC (`has_lrc_timestamps`).
+fn write_one_tag(cand: &ExportCandidate) -> WriteOutcome {
+    let Some(body) = cand
+        .plain
+        .as_deref()
+        .or(cand.synced.as_deref())
+        .and_then(corps_assaini)
+    else {
+        return WriteOutcome::Nothing;
+    };
+    if crate::metadata::tag_writer::is_unsupported_format(&cand.file_path) {
+        return WriteOutcome::Nothing;
+    }
+    if !std::path::Path::new(&cand.file_path).is_file() {
+        return WriteOutcome::Nothing;
+    }
+    // Dernière vérification avant d'ouvrir : la base peut ignorer une
+    // étiquette posée hors de Tune. On ne l'écrase pas.
+    if let Some(existing) = crate::metadata::lyrics::read_embedded_lyrics(&cand.file_path) {
+        return WriteOutcome::AlreadyThere(META_KEY_TAG, existing);
+    }
+
+    let fields = std::collections::HashMap::from([("lyrics".to_string(), body.clone())]);
+    match crate::metadata::tag_writer::write_metadata_to_file_sync(&cand.file_path, &fields) {
+        Ok(_) => WriteOutcome::Written(META_KEY_TAG, body),
+        Err(e) => WriteOutcome::Failed(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,5 +1649,346 @@ mod tests {
             again.examined, 0,
             "une piste dont le .lrc est déjà inscrit n'est pas ré-examinée"
         );
+    }
+
+    // -- Passe 3 : écriture dans les fichiers (#2172) -----------------------
+
+    fn write_consent(db: &Arc<dyn DbBackend>, on: bool) {
+        SettingsRepo::with_backend(db.clone())
+            .set(SETTING_WRITE_ENABLED, if on { "true" } else { "false" })
+            .unwrap();
+    }
+
+    /// Une piste avec un vrai fichier sur le disque et des paroles en cache —
+    /// l'état exact que la passe d'écriture doit savoir rendre au fichier.
+    fn piste_avec_fichier(
+        db: &Arc<dyn DbBackend>,
+        dir: &tempfile::TempDir,
+        nom: &str,
+        synced: Option<&str>,
+        plain: Option<&str>,
+    ) -> (i64, String) {
+        let artist_id = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new(format!("Artiste de {nom}")))
+            .unwrap();
+        let chemin = dir.path().join(nom);
+        std::fs::write(&chemin, b"pas vraiment du son").unwrap();
+        let chemin = chemin.to_str().unwrap().to_string();
+
+        let mut t = Track::new(nom.into());
+        t.artist_id = Some(artist_id);
+        t.duration_ms = 210_000;
+        t.file_path = Some(chemin.clone());
+        let id = TrackRepo::with_backend(db.clone()).create(&t).unwrap();
+        crate::lyrics::store_cache_entry(db, id, nom, "Artiste", synced, plain);
+        (id, chemin)
+    }
+
+    #[test]
+    fn sans_consentement_la_passe_n_ecrit_pas_un_octet() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_id, chemin) =
+            piste_avec_fichier(&db, &dir, "Muette.flac", Some("[00:01.00] une ligne"), None);
+        write_consent(&db, false);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+
+        assert_eq!(r.status, WriteStatus::Refused);
+        assert_eq!(r.written, 0);
+        assert_eq!(
+            r.examined, 0,
+            "le refus tombe AVANT la selection : aucune piste n'est meme regardee"
+        );
+        assert!(
+            crate::metadata::lyrics::find_sidecar_lrc(&chemin).is_none(),
+            "aucun `.lrc` ne doit exister apres un refus"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "le dossier de musique ne contient toujours que le fichier audio"
+        );
+    }
+
+    #[test]
+    fn avec_consentement_le_lrc_est_ecrit_et_l_indicateur_le_voit() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (id, chemin) = piste_avec_fichier(
+            &db,
+            &dir,
+            "Chantee.flac",
+            Some("[00:01.00] une ligne"),
+            Some("une ligne"),
+        );
+        write_consent(&db, true);
+
+        // Avant : la couverture compte cette piste comme « lrclib », pas
+        // comme « lrc » — les paroles ne sont que chez nous.
+        assert_eq!(coverage(&db).unwrap().from_lrc, 0);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+
+        assert_eq!(r.status, WriteStatus::Done);
+        assert_eq!((r.written, r.failed, r.skipped_present), (1, 0, 0));
+        assert_eq!(
+            crate::metadata::lyrics::find_sidecar_lrc(&chemin).as_deref(),
+            Some("[00:01.00] une ligne\n"),
+            "le fichier voisin porte bien les paroles"
+        );
+        assert_eq!(
+            TrackMetadataRepo::with_backend(db.clone())
+                .get_all(id)
+                .unwrap()
+                .get(META_KEY_SIDECAR)
+                .map(String::as_str),
+            Some(dir.path().join("Chantee.lrc").to_str().unwrap()),
+            "le chemin ecrit est note en base"
+        );
+        assert_eq!(
+            coverage(&db).unwrap().from_lrc,
+            1,
+            "l'indicateur suit le disque"
+        );
+    }
+
+    #[test]
+    fn un_lrc_deja_pose_par_l_utilisateur_n_est_jamais_ecrase() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        piste_avec_fichier(
+            &db,
+            &dir,
+            "Occupee.flac",
+            Some("[00:01.00] les notres"),
+            None,
+        );
+        // Posé à la main : la base ne le connaît pas encore, donc la piste
+        // est candidate — c'est bien l'écriture qui doit refuser, pas le SQL.
+        let sien = dir.path().join("Occupee.lrc");
+        std::fs::write(&sien, "[00:09.00] les siennes").unwrap();
+        write_consent(&db, true);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+
+        assert_eq!((r.written, r.skipped_present, r.failed), (0, 1, 0));
+        assert_eq!(
+            std::fs::read_to_string(&sien).unwrap(),
+            "[00:09.00] les siennes",
+            "le fichier de l'utilisateur est intact"
+        );
+    }
+
+    #[test]
+    fn des_paroles_plates_ne_produisent_pas_de_lrc() {
+        // Un `.lrc` sans horodatage serait lu comme synchronisé et
+        // n'afficherait rien : mieux vaut ne pas l'écrire.
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_id, chemin) =
+            piste_avec_fichier(&db, &dir, "Plate.flac", None, Some("des paroles plates"));
+        write_consent(&db, true);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+
+        assert_eq!((r.examined, r.written, r.skipped_no_body), (1, 0, 1));
+        assert!(crate::metadata::lyrics::find_sidecar_lrc(&chemin).is_none());
+    }
+
+    #[test]
+    fn la_passe_est_reprenable_le_second_run_n_a_plus_rien_a_faire() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        piste_avec_fichier(&db, &dir, "Une.flac", Some("[00:01.00] a"), None);
+        piste_avec_fichier(&db, &dir, "Deux.flac", Some("[00:02.00] b"), None);
+        write_consent(&db, true);
+
+        let un = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+        assert_eq!(un.written, 2);
+
+        let deux = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+        assert_eq!(
+            (deux.examined, deux.written),
+            (0, 0),
+            "ce qui est ecrit sort des candidates : un second run ne repasse pas dessus"
+        );
+    }
+
+    #[test]
+    fn le_plafond_arrete_le_run_et_le_dit() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        piste_avec_fichier(&db, &dir, "Une.flac", Some("[00:01.00] a"), None);
+        piste_avec_fichier(&db, &dir, "Deux.flac", Some("[00:02.00] b"), None);
+        write_consent(&db, true);
+
+        let r = run_write_to_files(
+            &db,
+            ExportOptions {
+                target: WriteTarget::Sidecar,
+                max_files: 1,
+            },
+            |_| {},
+        );
+        assert_eq!(r.status, WriteStatus::Capped);
+        assert_eq!(r.written, 1, "le plafond compte les fichiers ecrits");
+    }
+
+    #[test]
+    fn la_cible_choisit_le_predicat_d_exclusion() {
+        // Une piste qui a déjà un `.lrc` en base reste candidate pour
+        // l'étiquette, et l'inverse. Sans ce distinguo, écrire l'un
+        // interdirait l'autre à jamais.
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let meta = TrackMetadataRepo::with_backend(db.clone());
+        let (avec_lrc, _) =
+            piste_avec_fichier(&db, &dir, "AvecLrc.flac", Some("[00:01.00] a"), None);
+        meta.set(avec_lrc, META_KEY_SIDECAR, "/musique/a.lrc")
+            .unwrap();
+        let (avec_tag, _) =
+            piste_avec_fichier(&db, &dir, "AvecTag.flac", Some("[00:02.00] b"), None);
+        meta.set(avec_tag, META_KEY_TAG, "des paroles").unwrap();
+
+        let pour_lrc: Vec<i64> = export_candidates(&db, WriteTarget::Sidecar, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.track_id)
+            .collect();
+        let pour_tag: Vec<i64> = export_candidates(&db, WriteTarget::Tag, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.track_id)
+            .collect();
+
+        assert_eq!(pour_lrc, vec![avec_tag]);
+        assert_eq!(pour_tag, vec![avec_lrc]);
+    }
+
+    #[test]
+    fn sans_paroles_en_cache_rien_n_est_candidat() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        // Cache négatif : LRCLIB a cherché, n'a rien trouvé. Il n'y a rien à
+        // écrire, et surtout pas un fichier vide.
+        piste_avec_fichier(&db, &dir, "Vide.flac", None, None);
+        assert!(
+            export_candidates(&db, WriteTarget::Sidecar, 0, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn en_etiquette_les_paroles_font_l_aller_retour_dans_un_vrai_fichier() {
+        // Le seul test qui ouvre un vrai conteneur audio : sans lui, rien ne
+        // prouve que lofty écrit bien un USLT que la lecture retrouve.
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let cible = dir.path().join("Reelle.flac");
+        std::fs::copy(&source, &cible).unwrap();
+        assert!(
+            crate::metadata::lyrics::read_embedded_lyrics(cible.to_str().unwrap()).is_none(),
+            "temoin : la fixture n'a pas de paroles au depart"
+        );
+
+        let artist_id = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste".into()))
+            .unwrap();
+        let mut t = Track::new("Reelle".into());
+        t.artist_id = Some(artist_id);
+        t.file_path = Some(cible.to_str().unwrap().to_string());
+        let id = TrackRepo::with_backend(db.clone()).create(&t).unwrap();
+        crate::lyrics::store_cache_entry(&db, id, "Reelle", "Artiste", None, Some("une ligne"));
+        write_consent(&db, true);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
+
+        assert_eq!((r.written, r.failed), (1, 0), "bilan : {r:?}");
+        assert_eq!(
+            crate::metadata::lyrics::read_embedded_lyrics(cible.to_str().unwrap()).as_deref(),
+            Some("une ligne"),
+            "l'etiquette relue rend ce qui a ete ecrit"
+        );
+        assert_eq!(
+            coverage(&db).unwrap().from_tag,
+            1,
+            "l'indicateur compte desormais une etiquette"
+        );
+    }
+
+    #[test]
+    fn en_etiquette_une_piste_deja_etiquetee_hors_de_tune_n_est_pas_reecrite() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let cible = dir.path().join("Deja.flac");
+        std::fs::copy(&source, &cible).unwrap();
+        let chemin = cible.to_str().unwrap().to_string();
+        // Des paroles posées dans le fichier, mais inconnues de la base :
+        // seule la relecture juste avant l'écriture peut les voir.
+        crate::metadata::tag_writer::write_metadata_to_file_sync(
+            &chemin,
+            &std::collections::HashMap::from([("lyrics".to_string(), "les siennes".to_string())]),
+        )
+        .unwrap();
+
+        let artist_id = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste".into()))
+            .unwrap();
+        let mut t = Track::new("Deja".into());
+        t.artist_id = Some(artist_id);
+        t.file_path = Some(chemin.clone());
+        let id = TrackRepo::with_backend(db.clone()).create(&t).unwrap();
+        crate::lyrics::store_cache_entry(&db, id, "Deja", "Artiste", None, Some("les notres"));
+        write_consent(&db, true);
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
+
+        assert_eq!((r.written, r.skipped_present), (0, 1), "bilan : {r:?}");
+        assert_eq!(
+            crate::metadata::lyrics::read_embedded_lyrics(&chemin).as_deref(),
+            Some("les siennes"),
+            "l'etiquette de l'utilisateur est intacte"
+        );
+    }
+
+    #[test]
+    fn la_cible_par_defaut_est_celle_qui_ne_touche_pas_au_fichier_audio() {
+        let db = test_db();
+        assert_eq!(WriteTarget::from_settings(&db), WriteTarget::Sidecar);
+        SettingsRepo::with_backend(db.clone())
+            .set(SETTING_WRITE_TARGET, "tag")
+            .unwrap();
+        assert_eq!(WriteTarget::from_settings(&db), WriteTarget::Tag);
+        SettingsRepo::with_backend(db.clone())
+            .set(SETTING_WRITE_TARGET, "n_importe_quoi")
+            .unwrap();
+        assert_eq!(
+            WriteTarget::from_settings(&db),
+            WriteTarget::Sidecar,
+            "un reglage incomprehensible retombe sur le mode le moins invasif"
+        );
+    }
+
+    #[test]
+    fn les_deux_consentements_sont_independants() {
+        // Autoriser LRCLIB n'autorise pas à toucher aux fichiers, et
+        // réciproquement. Une seule clé pour les deux serait un piège.
+        let db = test_db();
+        consent(&db, true);
+        assert!(lrclib_consent_given(&db));
+        assert!(
+            !write_consent_given(&db),
+            "le consentement LRCLIB n'ouvre pas l'ecriture"
+        );
+        write_consent(&db, true);
+        consent(&db, false);
+        assert!(write_consent_given(&db));
+        assert!(!lrclib_consent_given(&db));
     }
 }
