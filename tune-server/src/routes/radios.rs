@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,6 +11,224 @@ use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use crate::error::AppError;
 use crate::routes::active_profile::DEFAULT_PROFILE_ID;
 use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Validation de l'adresse d'un flux, À LA SAISIE
+// ---------------------------------------------------------------------------
+
+/// Les seuls schémas que le lecteur de radios sait réellement ouvrir.
+///
+/// Ce n'est pas une préférence, c'est un relevé. Toute lecture de station part
+/// de `play_radio` (plus bas), qui passe l'adresse à l'orchestrateur en
+/// `source = "radio"` ; celui-ci la route vers `resolve_direct_url`
+/// (`tune-core/src/orchestrator.rs`), et de là il n'existe que deux issues :
+///
+/// * `decode_radio_stream_to_pcm` — sorties locale, OAAT et DLNA proxifiée —
+///   ouvre le flux par un GET reqwest ;
+/// * le passthrough DLNA envoie l'adresse telle quelle au renderer, en
+///   rétrogradant `https` en `http` parce que les renderers ne font pas de TLS.
+///
+/// La déréférence `.m3u`/`.pls` en amont (`resolve_playlist_url`) ne retient
+/// d'ailleurs que les entrées commençant par `http://` ou `https://`.
+///
+/// `rtsp://`, `mms://` et `rtmp://` existent bien dans ce dépôt, mais nulle
+/// part sur ce chemin : uniquement dans le classeur d'entrées de playlist
+/// (`tune-core/src/library/m3u_parser.rs`) et dans le protocole de contrôle
+/// AirPlay (`tune-core/src/outputs/airplay.rs`). Les accepter ici échangerait
+/// un silence contre un autre.
+const SCHEMAS_LISIBLES: [&str; 2] = ["http", "https"];
+
+/// Ce qui cloche dans une adresse de flux — assez précisément pour être
+/// réparable sans relire l'adresse caractère par caractère.
+///
+/// Tades a cherché deux jours pourquoi sa station restait muette avant de
+/// découvrir lui-même que son adresse commençait par `http;//` et non
+/// `http://` (fil 1484, issue #2097). Tune l'avait acceptée, stockée, puis
+/// proposée à la lecture sans un mot. Un « URL invalide » ne lui aurait pas
+/// fait gagner une minute : c'est le caractère fautif qu'il faut nommer, et
+/// c'est la raison d'être de chacune de ces variantes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProblemeUrlFlux {
+    /// Vide, ou seulement des blancs.
+    Vide,
+    /// Le schéma est là, le séparateur est faux : `http;//`, `http.//`,
+    /// `https,//`… C'est exactement le cas du ticket.
+    SeparateurFaux { debut: String, schema: String },
+    /// Aucun schéma reconnaissable : `exemple.net/flux`, `://x`, `1.2.3.4`…
+    SansSchema { debut: String },
+    /// Schéma bien formé, mais que le lecteur ne sait pas ouvrir.
+    SchemaNonLisible { schema: String },
+    /// `http://` et rien derrière, ou `http:///flux`.
+    SansHote { schema: String },
+    /// Un blanc au milieu — collage coupé.
+    Espace,
+}
+
+impl ProblemeUrlFlux {
+    /// Code stable, pour l'appelant qui programme contre l'API plutôt que de
+    /// lire la prose.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Vide => "radio_url_vide",
+            Self::SeparateurFaux { .. } => "radio_url_separateur_faux",
+            Self::SansSchema { .. } => "radio_url_sans_schema",
+            Self::SchemaNonLisible { .. } => "radio_url_schema_non_lisible",
+            Self::SansHote { .. } => "radio_url_sans_hote",
+            Self::Espace => "radio_url_espace",
+        }
+    }
+
+    /// Le message montré à l'utilisateur, dans la langue de son interface.
+    pub(crate) fn message(&self, lang: &str) -> String {
+        match self {
+            Self::Vide => crate::i18n::t(lang, "radio.url.vide"),
+            Self::Espace => crate::i18n::t(lang, "radio.url.espace"),
+            Self::SeparateurFaux { debut, schema } => {
+                crate::i18n::t(lang, "radio.url.separateurFaux")
+                    .replace("{debut}", debut)
+                    .replace("{schema}", schema)
+            }
+            Self::SansSchema { debut } => {
+                crate::i18n::t(lang, "radio.url.sansSchema").replace("{debut}", debut)
+            }
+            Self::SchemaNonLisible { schema } => {
+                crate::i18n::t(lang, "radio.url.schemaNonLisible").replace("{schema}", schema)
+            }
+            Self::SansHote { schema } => {
+                crate::i18n::t(lang, "radio.url.sansHote").replace("{schema}", schema)
+            }
+        }
+    }
+}
+
+/// Un schéma d'URI : une lettre, puis lettres, chiffres, `+`, `-`, `.`
+/// (RFC 3986 §3.1). Sans ce garde-fou, `//serveur://flux` ferait croire à un
+/// schéma nommé `//serveur` et produirait un message absurde.
+fn est_un_jeton_de_schema(s: &str) -> bool {
+    s.chars().next().is_some_and(|p| p.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// L'hôte d'une autorité, ou `""` s'il n'y en a pas.
+///
+/// Délibérément permissif : on ne veut savoir qu'une chose, s'il y a un
+/// serveur à joindre. Un port explicite, un `utilisateur:motdepasse@`, une
+/// IPv4 nue, un `localhost` sans point, une IPv6 entre crochets sont tous des
+/// hôtes valides que des testeurs utilisent réellement (Icecast sur le réseau
+/// local, notamment) — les refuser serait pire que le défaut corrigé ici.
+fn hote_de(apres_schema: &str) -> &str {
+    let autorite = apres_schema
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(apres_schema);
+    // Le dernier `@` sépare l'identifiant de l'hôte ; un mot de passe peut
+    // lui-même contenir un `@`, d'où `rsplit`.
+    let hote_port = autorite.rsplit('@').next().unwrap_or(autorite);
+    // Une IPv6 littérale est entre crochets et ses deux-points font partie de
+    // l'adresse : on ne coupe pas dedans.
+    if let Some(sans_crochet) = hote_port.strip_prefix('[') {
+        return match sans_crochet.find(']') {
+            Some(fin) => &sans_crochet[..fin],
+            None => "",
+        };
+    }
+    hote_port.split(':').next().unwrap_or(hote_port)
+}
+
+/// Les `n` premiers caractères, suivis d'une ellipse si l'adresse continue.
+/// On découpe par CARACTÈRES et non par octets : une adresse peut porter de
+/// l'UTF-8 et un `&str[..n]` paniquerait au milieu d'un point de code.
+fn extrait(url: &str, n: usize) -> String {
+    let court: String = url.chars().take(n).collect();
+    if url.chars().count() > n {
+        format!("{court}…")
+    } else {
+        court
+    }
+}
+
+/// Distingue « il manque tout le schéma » de « le schéma y est, mais le
+/// séparateur est faux ». C'est cette seconde forme qui a coûté deux jours à
+/// Tades ; la nommer permet de désigner le caractère fautif au lieu de
+/// renvoyer l'utilisateur à sa relecture.
+fn probleme_de_schema_absent(url: &str) -> ProblemeUrlFlux {
+    let bas = url.to_ascii_lowercase();
+    for schema in SCHEMAS_LISIBLES {
+        let Some(reste) = bas.strip_prefix(schema) else {
+            continue;
+        };
+        let mut caracteres = reste.chars();
+        let Some(faux) = caracteres.next() else {
+            continue;
+        };
+        // Le caractère fautif doit être une PONCTUATION : `httpx//…` n'est pas
+        // un `http` mal séparé, et le présenter comme tel enverrait
+        // l'utilisateur corriger le mauvais caractère.
+        if !faux.is_ascii_alphanumeric() && faux != ':' && caracteres.as_str().starts_with("//") {
+            return ProblemeUrlFlux::SeparateurFaux {
+                debut: extrait(url, schema.len() + 3),
+                schema: schema.to_string(),
+            };
+        }
+    }
+    ProblemeUrlFlux::SansSchema {
+        debut: extrait(url, 16),
+    }
+}
+
+/// Valide une adresse de flux SAISIE et rend sa forme nettoyée (espaces de
+/// bord retirés).
+///
+/// Volontairement permissive au-delà du schéma : port explicite, chemin vide,
+/// IP nue, sous-domaines à rallonge, paramètres de requête, identifiants —
+/// tout cela passe, parce que tout cela se lit. Le seul refus porte sur ce qui
+/// ne peut pas fonctionner.
+///
+/// N'est appelée que sur les chemins de **saisie** (création, modification,
+/// ajout depuis le web). Les entrées déjà en base ne repassent jamais par ici :
+/// une station enregistrée avant ce correctif reste lisible, exportable et
+/// modifiable, y compris si son adresse serait refusée aujourd'hui.
+pub(crate) fn valider_url_flux(saisie: &str) -> Result<String, ProblemeUrlFlux> {
+    let url = saisie.trim();
+    if url.is_empty() {
+        return Err(ProblemeUrlFlux::Vide);
+    }
+    if url.chars().any(char::is_whitespace) {
+        return Err(ProblemeUrlFlux::Espace);
+    }
+    let Some(coupe) = url.find("://") else {
+        return Err(probleme_de_schema_absent(url));
+    };
+    let schema = &url[..coupe];
+    if !est_un_jeton_de_schema(schema) {
+        return Err(probleme_de_schema_absent(url));
+    }
+    let schema = schema.to_ascii_lowercase();
+    if !SCHEMAS_LISIBLES.contains(&schema.as_str()) {
+        return Err(ProblemeUrlFlux::SchemaNonLisible { schema });
+    }
+    if hote_de(&url[coupe + 3..]).is_empty() {
+        return Err(ProblemeUrlFlux::SansHote { schema });
+    }
+    Ok(url.to_string())
+}
+
+/// Le refus, mis en forme pour le client web.
+///
+/// La forme du corps n'est pas libre : `api.ts` lit le TEXTE dans `message`
+/// (`detail`, à défaut `message`) et le CODE dans `error`. `AppError` met au
+/// contraire le texte dans `error` — l'utiliser ici afficherait « 400 Bad
+/// Request » à l'écran et le beau message dans un champ que personne ne lit.
+fn refus_url(probleme: &ProblemeUrlFlux, lang: &str) -> axum::response::Response {
+    let message = probleme.message(lang);
+    tracing::warn!(code = probleme.code(), %message, "radio_url_refusee");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": probleme.code(), "message": message })),
+    )
+        .into_response()
+}
 
 fn favicon_from_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
@@ -235,19 +453,27 @@ async fn get_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl I
 }
 
 async fn create_radio(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<CreateRadio>,
 ) -> impl IntoResponse {
+    // Refusé AVANT toute écriture : une adresse qu'aucun chemin de lecture ne
+    // peut ouvrir n'a rien à faire en base, et le dire maintenant coûte à
+    // l'utilisateur une correction au lieu d'une station muette (#2097).
+    let url = match valider_url_flux(&body.url) {
+        Ok(url) => url,
+        Err(probleme) => return refus_url(&probleme, &crate::i18n::lang_from_header(&headers)),
+    };
     let repo = RadioRepo::with_backend(state.backend.clone());
     let auto_logo = if body.logo_url.is_none() {
-        favicon_from_url(body.homepage.as_deref().unwrap_or(&body.url))
+        favicon_from_url(body.homepage.as_deref().unwrap_or(&url))
     } else {
         None
     };
     let station = RadioStation {
         id: None,
         name: body.name,
-        url: body.url,
+        url,
         homepage: body.homepage,
         logo_url: body.logo_url.or(auto_logo),
         country: body.country,
@@ -293,10 +519,24 @@ struct UpdateRadioBody {
 }
 
 async fn update_radio(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateRadioBody>,
 ) -> impl IntoResponse {
+    // La validation porte sur ce qui est SAISI, jamais sur ce qui est déjà
+    // enregistré : on ne relit `station.url` que si la requête ne propose pas
+    // de nouvelle adresse. Une station créée avant ce correctif, avec une
+    // adresse que la règle refuserait aujourd'hui, reste donc modifiable —
+    // on peut renommer, reclasser ou dé-favoriser sans être obligé de
+    // réparer son adresse d'abord.
+    let url_saisie = match body.url.as_deref().map(valider_url_flux) {
+        Some(Err(probleme)) => {
+            return refus_url(&probleme, &crate::i18n::lang_from_header(&headers));
+        }
+        Some(Ok(url)) => Some(url),
+        None => None,
+    };
     let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -304,7 +544,7 @@ async fn update_radio(
     if let Some(name) = body.name {
         station.name = name;
     }
-    if let Some(url) = body.url {
+    if let Some(url) = url_saisie {
         station.url = url;
     }
     if let Some(homepage) = body.homepage {
@@ -432,14 +672,27 @@ async fn add_from_web(
     Query(q): Query<AddFromWebQuery>,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
+    // Troisième porte d'entrée, même serrure : une adresse impossible arrivée
+    // par un lien « ajouter à Tune » produirait la même station muette qu'une
+    // adresse tapée à la main (#2097).
+    let url = match valider_url_flux(&q.url) {
+        Ok(url) => url,
+        Err(probleme) => {
+            let message = probleme.message(&lang);
+            tracing::warn!(code = probleme.code(), %message, "radio_url_refusee_add_from_web");
+            // Le message CITE l'adresse reçue : il doit être échappé avant
+            // d'entrer dans la page, sinon `?url=<script>…` s'y exécuterait.
+            return axum::response::Html(page_erreur_ajout(&lang, &echapper_html(&message)));
+        }
+    };
     let repo = RadioRepo::with_backend(state.backend.clone());
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
-        url: q.url.clone(),
+        url: url.clone(),
         homepage: None,
         // Fall back to the stream host favicon so a web-added radio shows art.
-        logo_url: q.logo_url.clone().or_else(|| favicon_from_url(&q.url)),
+        logo_url: q.logo_url.clone().or_else(|| favicon_from_url(&url)),
         country: q.country,
         language: None,
         genre: q.genre,
@@ -457,7 +710,8 @@ async fn add_from_web(
                 json!({"action": "created", "id": id}),
             );
             let title = crate::i18n::t(&lang, "radio.addedTitle");
-            let body_txt = crate::i18n::t(&lang, "radio.addedBody").replace("{name}", &q.name);
+            let body_txt =
+                crate::i18n::t(&lang, "radio.addedBody").replace("{name}", &echapper_html(&q.name));
             let close = crate::i18n::t(&lang, "radio.canCloseTab");
             format!(
                 r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
@@ -466,15 +720,38 @@ async fn add_from_web(
 </body></html>"#
             )
         }
-        Err(e) => format!(
-            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
-<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#f87171">{err_title}</h1><p>{e}</p></div>
-</body></html>"#,
-            err_title = crate::i18n::t(&lang, "radio.errorTitle")
-        ),
+        Err(e) => page_erreur_ajout(&lang, &echapper_html(&e)),
     };
     axum::response::Html(html)
+}
+
+/// La page « ça n'a pas marché » rendue par `add_from_web`.
+///
+/// Elle était écrite en clair dans la seule branche `Err` du `create`. Le
+/// refus d'une adresse impossible doit produire exactement la même page —
+/// d'où l'extraction, pour qu'il n'y en ait qu'une à faire évoluer.
+fn page_erreur_ajout(lang: &str, message_echappe: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
+<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center"><h1 style="color:#f87171">{err_title}</h1><p>{message_echappe}</p></div>
+</body></html>"#,
+        err_title = crate::i18n::t(lang, "radio.errorTitle")
+    )
+}
+
+/// Neutralise le balisage avant interpolation dans la page ci-dessus.
+///
+/// Le message de refus CITE l'adresse saisie (`« {debut} »`) : sans cet
+/// échappement, un `?url=<script>…` transformerait la page d'erreur en vecteur
+/// d'injection. Le nom de la station, déjà interpolé avant ce correctif, passe
+/// désormais par le même filtre.
+fn echapper_html(brut: &str) -> String {
+    brut.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn toggle_favorite(
@@ -1629,5 +1906,208 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests_validation_url_flux {
+    use super::{ProblemeUrlFlux, valider_url_flux};
+
+    /// Le cas du ticket : un point-virgule à la place des deux-points.
+    ///
+    /// Tune a accepté cette adresse, l'a stockée, l'a proposée à la lecture, et
+    /// n'a produit que du silence ; c'est Tades qui a fini par relire l'adresse
+    /// caractère par caractère (fil 1484, #2097). Elle doit désormais être
+    /// refusée à la saisie, et le refus doit NOMMER le schéma attendu.
+    #[test]
+    fn le_point_virgule_du_ticket_est_refuse() {
+        let probleme = valider_url_flux("http;//classic-hd.example.net/stream").unwrap_err();
+        assert_eq!(
+            probleme,
+            ProblemeUrlFlux::SeparateurFaux {
+                debut: "http;//…".into(),
+                schema: "http".into(),
+            }
+        );
+        // Le message doit dire quoi corriger, pas « URL invalide ».
+        let message = probleme.message("fr");
+        assert!(message.contains("http://"), "message = {message}");
+        assert!(message.contains("deux-points"), "message = {message}");
+    }
+
+    /// La même faute sur `https`, et sur d'autres caractères que le
+    /// point-virgule : c'est la classe entière de fautes de frappe qui doit
+    /// être reconnue, pas la seule occurrence signalée.
+    #[test]
+    fn les_autres_separateurs_fautifs_sont_reconnus() {
+        for saisie in [
+            "https;//example.net/flux",
+            "http.//example.net/flux",
+            "http,//example.net/flux",
+            "HTTP;//EXAMPLE.NET/flux",
+        ] {
+            let probleme = valider_url_flux(saisie).unwrap_err();
+            assert!(
+                matches!(probleme, ProblemeUrlFlux::SeparateurFaux { .. }),
+                "{saisie} attendu SeparateurFaux, obtenu {probleme:?}"
+            );
+        }
+    }
+
+    /// Le vrai risque de ce chantier n'est pas de laisser passer une adresse
+    /// impossible : c'est de refuser une adresse qui marchait. Une station
+    /// enregistrée hier et qui jouait doit rester enregistrable aujourd'hui.
+    ///
+    /// Chacune de ces formes est légitime et lisible par
+    /// `decode_radio_stream_to_pcm` (un simple GET) : port explicite, chemin
+    /// vide, IPv4 nue, IPv6 littérale, hôte sans point sur le réseau local,
+    /// paramètres de requête, identifiants, majuscules dans le schéma,
+    /// sous-domaines à rallonge, playlist `.m3u`/`.pls` déréférencée en amont.
+    #[test]
+    fn les_adresses_exotiques_mais_legitimes_passent() {
+        let legitimes = [
+            "http://example.net",
+            "https://example.net",
+            "http://example.net/",
+            "http://icecast.example.net:8000/stream.mp3",
+            "https://example.net:443/hls/master.m3u8",
+            "http://192.168.1.42:8000/",
+            "http://[2001:db8::1]:8000/stream",
+            "http://localhost:8000/stream",
+            "http://nas/flux",
+            "https://stream.relay.eu-west.cdn.radio.example.net/live/aac?bitrate=320&session=abc",
+            "http://user:motdepasse@example.net:8000/stream",
+            "HTTP://EXAMPLE.NET/Stream.MP3",
+            "HtTpS://example.net/stream",
+            "http://example.net/live.m3u",
+            "http://example.net/live.pls",
+            "http://example.net/stream#anchor",
+            "http://exemple-très-long.example.net/flux",
+        ];
+        assert_eq!(legitimes.len(), 17, "le lot témoin a changé de taille");
+        for saisie in legitimes {
+            assert!(
+                valider_url_flux(saisie).is_ok(),
+                "{saisie} aurait dû être acceptée : {:?}",
+                valider_url_flux(saisie)
+            );
+        }
+    }
+
+    /// Les espaces de bord d'un copier-coller ne sont pas une faute : on les
+    /// retire, on ne refuse pas.
+    #[test]
+    fn les_blancs_de_bord_sont_rognes_pas_refuses() {
+        assert_eq!(
+            valider_url_flux("  http://example.net/stream \n").unwrap(),
+            "http://example.net/stream"
+        );
+    }
+
+    #[test]
+    fn le_vide_et_les_blancs_seuls_sont_refuses() {
+        assert_eq!(valider_url_flux("").unwrap_err(), ProblemeUrlFlux::Vide);
+        assert_eq!(
+            valider_url_flux("   \t ").unwrap_err(),
+            ProblemeUrlFlux::Vide
+        );
+    }
+
+    #[test]
+    fn un_blanc_au_milieu_est_refuse() {
+        assert_eq!(
+            valider_url_flux("http://example.net/mon flux.mp3").unwrap_err(),
+            ProblemeUrlFlux::Espace
+        );
+    }
+
+    /// Sans schéma du tout — le cas « j'ai collé le nom du site ».
+    #[test]
+    fn une_adresse_sans_schema_est_refusee() {
+        assert_eq!(
+            valider_url_flux("example.net/stream.mp3").unwrap_err(),
+            ProblemeUrlFlux::SansSchema {
+                debut: "example.net/stre…".into()
+            }
+        );
+        // Un jeton de schéma illégal ne doit pas être présenté comme un schéma.
+        assert!(matches!(
+            valider_url_flux("//serveur://flux").unwrap_err(),
+            ProblemeUrlFlux::SansSchema { .. }
+        ));
+    }
+
+    /// Un schéma bien formé mais qu'aucun chemin de lecture n'ouvre. Le lot
+    /// inclut `rtsp`/`mms`/`rtmp` : ils existent dans le classeur d'entrées
+    /// M3U, jamais dans la lecture d'une radio.
+    #[test]
+    fn un_schema_que_le_lecteur_nouvre_pas_est_refuse() {
+        for (saisie, attendu) in [
+            ("ftp://example.net/stream", "ftp"),
+            ("mms://example.net/stream", "mms"),
+            ("rtsp://example.net/stream", "rtsp"),
+            ("rtmp://example.net/stream", "rtmp"),
+            ("file:///home/bertrand/flux.mp3", "file"),
+            ("HTTPX://example.net/stream", "httpx"),
+        ] {
+            assert_eq!(
+                valider_url_flux(saisie).unwrap_err(),
+                ProblemeUrlFlux::SchemaNonLisible {
+                    schema: attendu.into()
+                },
+                "pour {saisie}"
+            );
+        }
+    }
+
+    #[test]
+    fn une_adresse_sans_hote_est_refusee() {
+        for saisie in [
+            "http://",
+            "https://",
+            "http:///flux.mp3",
+            "http://:8000/stream",
+            "http://utilisateur@/stream",
+            "http://[2001:db8::1/stream",
+        ] {
+            assert!(
+                matches!(
+                    valider_url_flux(saisie).unwrap_err(),
+                    ProblemeUrlFlux::SansHote { .. }
+                ),
+                "{saisie} aurait dû être refusée faute d'hôte : {:?}",
+                valider_url_flux(saisie)
+            );
+        }
+    }
+
+    /// Chaque refus porte un code stable ET un message traduit en français
+    /// comme en anglais. Un message qui retomberait sur la clé (`radio.url.…`)
+    /// serait un message inutile affiché tel quel à l'écran.
+    #[test]
+    fn chaque_refus_a_un_code_et_un_message_dans_les_deux_langues() {
+        let refus = [
+            valider_url_flux("").unwrap_err(),
+            valider_url_flux("http;//example.net").unwrap_err(),
+            valider_url_flux("example.net").unwrap_err(),
+            valider_url_flux("mms://example.net").unwrap_err(),
+            valider_url_flux("http://").unwrap_err(),
+            valider_url_flux("http://exa mple.net").unwrap_err(),
+        ];
+        assert_eq!(refus.len(), 6, "un problème n'est pas couvert");
+        for probleme in &refus {
+            assert!(probleme.code().starts_with("radio_url_"));
+            for lang in ["fr", "en"] {
+                let message = probleme.message(lang);
+                assert!(
+                    !message.starts_with("radio.url."),
+                    "{lang}: traduction manquante pour {probleme:?}"
+                );
+                assert!(
+                    !message.contains("{debut}") && !message.contains("{schema}"),
+                    "{lang}: substitution non faite dans « {message} »"
+                );
+            }
+        }
     }
 }

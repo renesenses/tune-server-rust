@@ -17,6 +17,8 @@ mod integration;
 mod karaoke_plugin;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
+#[path = "radios_validation_url.rs"]
+mod radios_validation_url;
 #[path = "rbac.rs"]
 mod rbac;
 #[path = "smb_dialect_seam.rs"]
