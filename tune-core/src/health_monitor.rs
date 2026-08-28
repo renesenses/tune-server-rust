@@ -164,7 +164,7 @@ impl AdvancedHealthMonitor {
     }
 
     pub fn check_disk(&self) -> CheckResult {
-        let free_gb = disk_free_gb(&self.config.db_path);
+        let free_gb = disk_space_gb(&self.config.db_path).map(|(free, _total)| free);
         let status = match free_gb {
             Some(gb) if gb < self.config.disk_critical_gb as f64 => AlertLevel::Critical,
             Some(gb) if gb < self.config.disk_warning_gb as f64 => AlertLevel::Warning,
@@ -332,7 +332,11 @@ fn get_rss_mb() -> Option<f64> {
     }
 }
 
-fn disk_free_gb(path: &str) -> Option<f64> {
+/// Free and total space, in GiB, on the volume that contains `path`.
+///
+/// The health endpoint and the support diagnostics must measure the same
+/// volume as the database, rather than the process working directory.
+pub fn disk_space_gb(path: &str) -> Option<(f64, f64)> {
     let parent = std::path::Path::new(path)
         .parent()
         .unwrap_or(std::path::Path::new("."));
@@ -343,13 +347,25 @@ fn disk_free_gb(path: &str) -> Option<f64> {
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.lines().nth(1)?;
-    let avail_kb: f64 = line.split_whitespace().nth(3)?.parse().ok()?;
-    Some(avail_kb / (1024.0 * 1024.0))
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let total_kb: f64 = fields.get(1)?.parse().ok()?;
+    let avail_kb: f64 = fields.get(3)?.parse().ok()?;
+    let kb_per_gib = 1024.0 * 1024.0;
+    Some((avail_kb / kb_per_gib, total_kb / kb_per_gib))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn disk_space_reports_the_volume_containing_the_database() {
+        let (free, total) = disk_space_gb("./tune-test.db").expect("df on database volume");
+        assert!(free >= 0.0);
+        assert!(total > 0.0);
+        assert!(free <= total);
+    }
 
     #[test]
     fn worst_status() {
