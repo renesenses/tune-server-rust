@@ -239,6 +239,20 @@ const GAPLESS_STUCK_THRESHOLD: u8 = 2;
 /// the slider from bouncing back on DLNA renderers with latent GetVolume.
 const VOLUME_GRACE_SECS: u64 = 5;
 
+/// Délai au-delà duquel une lecture dont pas un octet n'a été tiré n'est plus
+/// un démarrage lent mais un silence établi.
+///
+/// C'est le seuil que `output_reach` utilisait déjà pour dire
+/// `browser_unattended` au client (`tune-server/src/routes/zones.rs`) : le
+/// client web branche son `<audio>` sur `stream_url` dès qu'il a l'état de la
+/// zone, et les premiers octets partent en une seconde ou deux. Douze secondes
+/// laissent de la marge à un poste lent sans laisser l'utilisateur dans le noir.
+///
+/// Il vit ici, dans `tune-core`, parce que le poller et la vue des zones
+/// doivent trancher au MÊME instant : deux seuils, et le serveur dirait à la
+/// fois « personne ne reçoit ce son » et « en lecture ».
+pub const DELAI_SILENCE_ETABLI: Duration = Duration::from_secs(12);
+
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
 /// against the *real* code path.
@@ -891,6 +905,42 @@ pub(crate) mod decisions {
         interval_secs: u64,
     ) -> bool {
         is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
+    }
+
+    /// Une lecture sans destination doit-elle cesser d'être annoncée ?
+    ///
+    /// Une zone sans périphérique de sortie prépare son flux, renonce à
+    /// l'envoyer (`no_output_device_id_skipping_send_to_output`) et passe
+    /// quand même en lecture : `orchestrator_play … output_sent=false`. Rien
+    /// ne revenait ensuite sur cet état — la branche « pas de périphérique »
+    /// du poller se termine par un `continue` — et la zone restait annoncée
+    /// « en cours » indéfiniment, barre de progression comprise (#2630,
+    /// journal de Pierre M).
+    ///
+    /// **Ce que ce prédicat ne regarde surtout pas : la présence d'un
+    /// périphérique.** Une zone navigateur n'en a JAMAIS — sa sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. Une garde « pas de
+    /// périphérique ⇒ pas de lecture » les rendrait toutes muettes ; c'est la
+    /// régression exacte de `70401f2d`, réparée par #2657. Le seul fait
+    /// observable est la CONSOMMATION du flux, et c'est la même preuve que
+    /// `output_reach` utilise déjà pour dire `browser_unattended`.
+    ///
+    /// On n'abandonne donc que sur des faits POSITIFS :
+    /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
+    ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
+    ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
+    /// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+    ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
+    ///   de silence : on laisse la lecture tranquille.
+    ///
+    /// Le sens du doute est celui de #2657 : on préfère taire un silence réel
+    /// que d'en inventer un.
+    pub fn lecture_sans_destination_abandonnee(
+        depuis_le_demarrage: Option<std::time::Duration>,
+        octets_servis: Option<u64>,
+    ) -> bool {
+        depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
+            && octets_servis == Some(0)
     }
 
     /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
@@ -2560,6 +2610,91 @@ impl PositionPoller {
         }
     }
 
+    /// Une lecture que personne ne reçoit cesse d'être annoncée « en cours ».
+    ///
+    /// Rend `true` si la zone a été arrêtée. Appelée par le tick UNIQUEMENT
+    /// dans la branche « zone sans périphérique de sortie » : c'est là, et
+    /// seulement là, que l'état « en lecture » ne repose sur rien. Une zone
+    /// avec périphérique a déjà ses propres chiens de garde
+    /// (`output_reported_failure_stopping_zone`,
+    /// `dlna_playing_without_progress_stopping_zone`, `demarrage_mort`).
+    ///
+    /// Le verdict lui-même est dans
+    /// [`decisions::lecture_sans_destination_abandonnee`] — et il ne regarde
+    /// PAS la présence d'un périphérique, seulement la consommation du flux.
+    /// Une zone navigateur dont l'onglet joue sert des octets et n'est jamais
+    /// touchée ici.
+    async fn abandonner_lecture_sans_destination(
+        &self,
+        zone_state: &crate::playback::ZoneState,
+    ) -> bool {
+        let zone_id = zone_state.zone_id;
+        let octets_servis = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        if !decisions::lecture_sans_destination_abandonnee(
+            zone_state.last_play_started_at.map(|t| t.elapsed()),
+            octets_servis,
+        ) {
+            return false;
+        }
+
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten();
+        let navigateur = zone.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+        // La zone navigateur et la zone orpheline produisent le même silence,
+        // mais pas le même geste : ouvrir un onglet, ou attribuer une sortie.
+        // Le message dit lequel. Le second reprend mot pour mot la sentinelle
+        // que le client sait déjà traduire (`zone_no_output_device`).
+        let message = if navigateur {
+            "zone_browser_unattended:No browser tab is playing this zone — open Tune in a browser \
+             on the computer that should play, or give this zone an output device."
+                .to_string()
+        } else {
+            format!(
+                "zone_no_output_device:Zone '{}' has no output device assigned — assign an output \
+                 device to this zone or delete it and re-create it from a device.",
+                zone.as_ref().map(|z| z.name.as_str()).unwrap_or("?")
+            )
+        };
+        warn!(
+            zone_id,
+            navigateur,
+            title = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.title.as_str())
+                .unwrap_or(""),
+            "lecture_sans_destination_abandonnee"
+        );
+        if let Some(ref bus) = self.event_bus {
+            // `fatal` : rien ne se rétablira tout seul, et la zone s'arrête
+            // juste après — sans ce drapeau la fenêtre de grâce d'après-lecture
+            // du client avalerait le message, et l'utilisateur n'aurait, une
+            // fois de plus, que le silence.
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": true,
+                }),
+            );
+        }
+        // Sans identifiant d'appareil, `stop` prend son repli — celui que
+        // #2658 vient de borner au périmètre de la zone. Avant elle, arrêter
+        // une zone navigateur coupait la musique de TOUTES les autres.
+        self.orchestrator.stop(zone_id, None).await;
+        true
+    }
+
     async fn tick(
         &self,
         poll_states: &mut HashMap<i64, ZonePollState>,
@@ -2903,6 +3038,18 @@ impl PositionPoller {
                         self.orchestrator
                             .confirmer_lecture_navigateur(zone_id, stream_id)
                             .await;
+                    }
+
+                    // … et le versant symétrique : l'ABSENCE de preuve.
+                    //
+                    // #2657 a appris à cette branche à LIBÉRER l'annonce quand
+                    // l'onglet tire le flux. Rien ne lui apprenait à RENONCER
+                    // quand personne ne le tire : la zone restait « en
+                    // lecture » pour toujours, barre de progression comprise,
+                    // alors que le démarrage avait déjà renoncé à envoyer quoi
+                    // que ce soit (`output_sent=false`, #2630).
+                    if self.abandonner_lecture_sans_destination(zone_state).await {
+                        poll_states.remove(&zone_id);
                     }
                     continue;
                 }
@@ -7911,6 +8058,319 @@ mod annonce_navigateur_guard {
             "l'annonce des zones navigateur n'est plus libérée dans la branche \
              « zone sans périphérique » : plus aucune zone navigateur ne \
              scrobblerait, sans le moindre message (#1998)."
+        );
+    }
+
+    /// Garde-fou #2630, versant symétrique du précédent.
+    ///
+    /// L'abandon d'une lecture que personne ne reçoit doit vivre dans la MÊME
+    /// branche : c'est la seule où l'état « en lecture » ne repose sur rien.
+    /// Retiré de la boucle, la méthode reste compilée, testée et verte — et
+    /// plus personne ne l'appelle. La zone 987 se remettrait à jouer dans le
+    /// vide, sans le moindre message.
+    #[test]
+    fn la_zone_sans_peripherique_renonce_a_ce_quelle_nenvoie_pas() {
+        let branche_sans_peripherique = position("decisions::deviceless_radio_refresh_due(");
+        let abandon = position(".abandonner_lecture_sans_destination(zone_state)");
+        let apres_le_match = position("// Detect track change: if the generation changed");
+        assert!(
+            branche_sans_peripherique < abandon && abandon < apres_le_match,
+            "l'abandon d'une lecture sans destination n'est plus appelé dans la \
+             branche « zone sans périphérique » : une zone qui n'envoie rien \
+             resterait annoncée « en lecture » indéfiniment (#2630)."
+        );
+    }
+}
+
+/// #2630 — une lecture que personne ne reçoit cesse d'être annoncée.
+///
+/// Le journal de Pierre M, zone 987 : `no_output_device_id_skipping_send_to_output`
+/// puis `orchestrator_play … output_sent=false`. Le serveur constate qu'il n'a
+/// envoyé le titre nulle part, et l'annonce quand même. Rien ne revenait
+/// ensuite sur cet état : la branche « pas de périphérique » du poller se
+/// terminait par un `continue`.
+///
+/// La ligne de crête est ici : une zone navigateur n'a JAMAIS de périphérique
+/// et joue pourtant pour de vrai. Le verdict ne porte donc pas sur l'appareil
+/// mais sur la CONSOMMATION du flux — la preuve que #2657 a déjà introduite.
+#[cfg(test)]
+mod lecture_sans_destination_tests {
+    use super::{DELAI_SILENCE_ETABLI, PositionPoller, decisions};
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::{NowPlaying, PlayState, PlaybackManager, ZoneState};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        orchestrator: Arc<PlaybackOrchestrator>,
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        tmp: tempfile::TempDir,
+    }
+
+    impl Banc {
+        async fn monter() -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let playback = Arc::new(PlaybackManager::new());
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            let poller = PositionPoller::new(
+                orchestrator.clone(),
+                playback.clone(),
+                outputs,
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(bus);
+            Self {
+                poller,
+                playback,
+                orchestrator,
+                db,
+                recu,
+                tmp: tempfile::TempDir::new().unwrap(),
+            }
+        }
+
+        /// Une zone en lecture, sans AUCUN périphérique de sortie, dont le flux
+        /// a servi `octets`. C'est la scène du ticket.
+        async fn zone_en_lecture(&self, nom: &str, output_type: &str, octets: u64) -> i64 {
+            let zone_id = ZoneRepo::with_backend(self.db.clone())
+                .create(nom, Some(output_type), None)
+                .unwrap();
+            let fichier = self.tmp.path().join(format!("{zone_id}.flac"));
+            std::fs::write(&fichier, b"fake audio").unwrap();
+            let sid = self
+                .orchestrator
+                .streamer
+                .create_file_session(
+                    crate::http::streamer::StreamInfo {
+                        format: "flac".into(),
+                        mime_type: "audio/flac".into(),
+                        ..Default::default()
+                    },
+                    fichier.to_string_lossy().into_owned(),
+                    false,
+                )
+                .await;
+            if octets > 0 {
+                let sessions = self.orchestrator.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                sessions
+                    .get(&sid)
+                    .expect("la session vient d'être créée")
+                    .bytes_sent
+                    .store(octets, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        title: "Never Make It on Time".into(),
+                        stream_id: Some(sid),
+                        source: "local".into(),
+                        duration_ms: 240_000,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            zone_id
+        }
+
+        /// L'instantané que le poller reçoit, vieilli de `age`. Vieillir l'état
+        /// plutôt que dormir : le seuil est de douze secondes.
+        async fn instantane(&self, zone_id: i64, age: Duration) -> ZoneState {
+            let mut zs = self.playback.get_state(zone_id).await;
+            zs.last_play_started_at = Some(
+                Instant::now()
+                    .checked_sub(age)
+                    .expect("machine démarrée depuis moins que l'âge simulé"),
+            );
+            zs
+        }
+
+        /// L'erreur remontée au client pour cette zone, s'il y en a une.
+        fn erreur(&mut self, zone_id: i64) -> Option<(String, bool)> {
+            let mut trouvee = None;
+            while let Ok(ev) = self.recu.try_recv() {
+                if ev.event_type == "zone.playback_error"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id)
+                {
+                    trouvee = Some((
+                        ev.data
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        ev.data.get("fatal").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
+            }
+            trouvee
+        }
+    }
+
+    /// ⛔ LA RÉGRESSION À NE PAS COMMETTRE.
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie et joue pourtant
+    /// vraiment : son onglet tire le flux. Une garde « pas de périphérique donc
+    /// pas de lecture » la couperait — c'est exactement ce que `70401f2d` a
+    /// fait à l'annonce Last.fm, et qu'il a fallu réparer par #2657. Ici la
+    /// zone joue depuis cinq minutes : rien ne doit lui arriver.
+    #[tokio::test]
+    async fn la_zone_navigateur_qui_joue_vraiment_nest_jamais_touchee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc
+            .zone_en_lecture("Cet ordinateur", "browser", 64 * 1024)
+            .await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(300)).await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "l'onglet tire le flux : cette zone JOUE, on n'y touche pas"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "la zone navigateur doit rester en lecture"
+        );
+        assert_eq!(
+            banc.erreur(zone_id),
+            None,
+            "aucune erreur ne doit être montrée à qui écoute réellement"
+        );
+    }
+
+    /// Le démarrage d'une zone navigateur n'est pas un silence : l'onglet met
+    /// une seconde ou deux à tirer ses premiers octets. Pendant la grâce, on ne
+    /// conclut rien.
+    #[tokio::test]
+    async fn le_demarrage_dun_onglet_lent_est_laisse_tranquille() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc
+            .instantane(zone_id, DELAI_SILENCE_ETABLI - Duration::from_secs(1))
+            .await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "avant l'échéance, un onglet peut encore démarrer"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing
+        );
+        assert_eq!(banc.erreur(zone_id), None);
+    }
+
+    /// Zone navigateur, personne au bout du fil, l'échéance est passée : Tune
+    /// arrête de prétendre. Le message dit le geste utile — ouvrir un onglet.
+    #[tokio::test]
+    async fn la_zone_navigateur_sans_onglet_cesse_detre_annoncee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(
+            banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "douze secondes sans un octet : ce n'est plus un démarrage"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "la zone ne doit plus être annoncée « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_browser_unattended:"),
+            "le message doit désigner l'onglet manquant, pas un périphérique : {message}"
+        );
+        assert!(fatal, "rien ne se rétablira tout seul");
+    }
+
+    /// La scène du ticket : zone 987, aucun périphérique, aucun onglet. Le
+    /// message reprend la sentinelle que le client sait déjà traduire.
+    #[tokio::test]
+    async fn la_zone_sans_peripherique_ni_onglet_ne_ment_plus() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Salon", "dlna", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "`output_sent=false` ne doit plus produire un état « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_no_output_device:") && message.contains("Salon"),
+            "le message doit nommer la zone et le geste : {message}"
+        );
+        assert!(fatal);
+    }
+
+    /// Le verdict, sans I/O. `None` n'est jamais une preuve : ni une date de
+    /// démarrage absente (`last_play_started_at` est `#[serde(skip)]`, il vaut
+    /// `None` après une restauration d'état), ni un flux inconnu du streamer.
+    #[test]
+    fn le_doute_profite_toujours_a_la_lecture() {
+        use decisions::lecture_sans_destination_abandonnee as abandon;
+        let vieux = DELAI_SILENCE_ETABLI + Duration::from_secs(1);
+
+        assert!(
+            abandon(Some(vieux), Some(0)),
+            "vieux et muet : on abandonne"
+        );
+        assert!(
+            abandon(Some(DELAI_SILENCE_ETABLI), Some(0)),
+            "pile à l'échéance : on abandonne"
+        );
+        assert!(
+            !abandon(
+                Some(DELAI_SILENCE_ETABLI - Duration::from_millis(1)),
+                Some(0)
+            ),
+            "une milliseconde avant l'échéance : on attend"
+        );
+        assert!(
+            !abandon(None, Some(0)),
+            "démarrage non daté : on ne conclut rien"
+        );
+        assert!(
+            !abandon(Some(vieux), None),
+            "flux inconnu du streamer : ce n'est pas une preuve de silence"
+        );
+        assert!(
+            !abandon(Some(vieux), Some(1)),
+            "un seul octet servi suffit à prouver que quelqu'un écoute"
         );
     }
 }
