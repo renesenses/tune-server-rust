@@ -643,21 +643,25 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
     Json(v)
 }
 
-/// Replace a zone's queue, retrying briefly on the transient
-/// "cannot start a transaction within a transaction" error.
+/// Replace a zone's queue after taking the SQLite user-write lane.
 ///
 /// A library scan holds a per-batch write transaction on the shared SQLite
 /// connection (BEGIN IMMEDIATE … COMMIT) while releasing the connection mutex
-/// between statements, so a concurrent `set_queue` sees an open transaction and
-/// fails. Each scan batch commits within ~1–2 s, so a few short async waits let
-/// playback replace the queue instead of failing silently and leaving the user
-/// stuck on the current track (Yves: impossible de quitter le dernier MP3
-/// pendant qu'un scan tourne). Non-transient errors return immediately.
+/// between statements. The process-wide lane makes a concurrent `set_queue`
+/// wait for that logical transaction instead of entering it and failing. The
+/// retries remain as a defensive fallback for an unregistered transaction;
+/// non-transient errors still return immediately.
 async fn set_queue_retrying(
     queue_repo: &PlayQueueRepo,
+    sqlite: bool,
     zone_id: i64,
     track_ids: &[i64],
 ) -> Result<(), String> {
+    let _write_guard = if sqlite {
+        Some(crate::sqlite_write_gate::user_queue().await)
+    } else {
+        None
+    };
     const MAX_ATTEMPTS: usize = 12;
     let mut last_err = String::new();
     for attempt in 0..MAX_ATTEMPTS {
@@ -673,6 +677,83 @@ async fn set_queue_retrying(
         }
     }
     Err(last_err)
+}
+
+#[cfg(test)]
+mod sqlite_scan_queue_arbitration_tests {
+    use super::set_queue_retrying;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::models::Track;
+    use tune_core::db::play_queue_repo::PlayQueueRepo;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::track_repo::TrackRepo;
+
+    /// Yves (#1997): while a scan owned the shared SQLite transaction, Play
+    /// exhausted its retries and cleared the requested queue. The user write
+    /// must now wait for the scan batch, then replace the queue byte-for-byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lecture_attend_le_lot_de_scan_puis_conserve_toute_la_file() {
+        let db = SqliteDb::open_in_memory().expect("SQLite in-memory");
+        db.init_schema().expect("schema");
+        db.execute(
+            "INSERT INTO zones (name, output_type) VALUES ('Main', 'local')",
+            &[],
+        )
+        .expect("zone");
+
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        let tracks = TrackRepo::with_backend(backend.clone());
+        let mut first = Track::new("Premier".into());
+        first.file_path = Some("/music/first.flac".into());
+        let mut second = Track::new("Second".into());
+        second.file_path = Some("/music/second.flac".into());
+        let first_id = tracks.create(&first).expect("first track");
+        let second_id = tracks.create(&second).expect("second track");
+
+        // Simulate the logical scan guard plus its manual transaction. Using
+        // the async acquisition here avoids blocking a Tokio worker in a test;
+        // production scan batches acquire the same gate from spawn_blocking.
+        let scan_guard = crate::sqlite_write_gate::user_queue().await;
+        backend
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("scan begin");
+
+        let queue_backend = backend.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut writer = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let queue = PlayQueueRepo::with_backend(queue_backend);
+            set_queue_retrying(&queue, true, 1, &[first_id, second_id]).await
+        });
+        started_rx.await.expect("queue task started");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut writer)
+                .await
+                .is_err(),
+            "the queue write must wait while the scan transaction is open"
+        );
+
+        backend.execute_batch("COMMIT").expect("scan commit");
+        drop(scan_guard);
+        writer
+            .await
+            .expect("queue task")
+            .expect("queue write after scan");
+
+        let queue = PlayQueueRepo::with_backend(backend);
+        let entries = queue.get_queue(1).expect("persisted queue");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.track_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id],
+            "the requested queue must survive the scan arbitration intact"
+        );
+    }
 }
 
 async fn play(
@@ -1222,7 +1303,14 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    match set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
+    match set_queue_retrying(
+        &queue_repo,
+        state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
+        zone_id,
+        &track_ids,
+    )
+    .await
+    {
         Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
         Err(e) => {
             // Never proceed on the STALE queue: track 1 would play now and the
@@ -3304,7 +3392,14 @@ pub async fn shuffle_all(
     // immediatement ici, alors que le chemin « Lire » s'accordait 2,4 s
     // (#1997). Une lecture aleatoire lancee pendant un scan vidait donc la
     // file sans meme attendre.
-    match set_queue_retrying(&queue_repo, zone_id, &all_ids).await {
+    match set_queue_retrying(
+        &queue_repo,
+        state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
+        zone_id,
+        &all_ids,
+    )
+    .await
+    {
         Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
         Err(e) => {
             warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");

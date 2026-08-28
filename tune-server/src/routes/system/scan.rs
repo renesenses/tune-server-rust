@@ -982,6 +982,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+                let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
                 if !is_pg {
                     // Se nommer : tout `write_tx` concurrent echouera tant que ce
                     // lot tient la connexion, et sans cette etiquette son message
@@ -1169,6 +1170,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         let _ = db.execute_batch("ROLLBACK");
                     }
                 }
+                drop(sqlite_write_guard);
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;
@@ -1375,6 +1377,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
 
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+        let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
         if !is_pg {
             tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
@@ -1532,6 +1535,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 let _ = db.execute_batch("ROLLBACK");
             }
         }
+        drop(sqlite_write_guard);
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
