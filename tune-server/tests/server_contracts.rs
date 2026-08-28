@@ -15,6 +15,8 @@ mod http_client_seam;
 mod integration;
 #[path = "karaoke_plugin.rs"]
 mod karaoke_plugin;
+#[path = "notarisation_bornes.rs"]
+mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_source_lrclib.rs"]
@@ -25,6 +27,8 @@ mod rbac;
 mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "tests_orphelins.rs"]
+mod tests_orphelins;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "workflows_bornes.rs"]
