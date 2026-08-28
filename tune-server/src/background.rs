@@ -941,8 +941,23 @@ fn spawn_heartbeat(state: &AppState) {
             }
         };
 
+        let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
+
         loop {
             let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+
+            // Registre des executions automatisees (#2080) : un cycle = une
+            // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
+            // — rien ne change cote utilisateur quand mozaiklabs.fr ne repond
+            // plus, et le `debug!` qui le signale n'est meme pas actif par
+            // defaut. Un serveur premium dont la licence cesse d'etre validee
+            // se decouvre aujourd'hui trente jours plus tard, a l'expiration de
+            // la grace hors-ligne. Ici, ca se lit.
+            //
+            // Cadence horaire et retention a 50 : le registre garde environ
+            // deux jours de battements. C'est le bon ordre de grandeur pour
+            // « depuis quand ca ne passe plus », pas pour un historique long.
+            let suivi = registre.ouvrir(tune_core::db::task_run_repo::TACHE_BATTEMENT_COEUR);
 
             // Marqueur de vivacite LOCAL, utilise pour la detection de crash au
             // demarrage suivant. Il ne quitte jamais la machine : il reste donc
@@ -967,6 +982,9 @@ fn spawn_heartbeat(state: &AppState) {
                 if plan.refresh_account {
                     refresh_account_premium(&backend, &license, &services).await;
                 }
+                suivi.rien_a_faire(Some(
+                    "telemetrie desactivee — marqueur local seulement, rien n'est parti",
+                ));
                 tokio::time::sleep(HEARTBEAT_INTERVAL).await;
                 continue;
             }
@@ -1165,6 +1183,13 @@ fn spawn_heartbeat(state: &AppState) {
                 "server_id": server_id,
             });
 
+            // Verdict du cycle pour le registre. Le motif ne porte QUE le code
+            // HTTP ou un mot : ni URL, ni cle de licence, ni empreinte
+            // materielle — la charge utile en contient trois, le registre
+            // aucune.
+            let mut verdict = tune_core::db::task_run_repo::Verdict::Echec;
+            let mut motif = String::from("hote injoignable");
+
             match client
                 .post("https://mozaiklabs.fr/api/v1/heartbeat")
                 .header("Accept", "application/json")
@@ -1173,6 +1198,8 @@ fn spawn_heartbeat(state: &AppState) {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
+                    verdict = tune_core::db::task_run_repo::Verdict::Succes;
+                    motif = format!("accepte ({})", resp.status().as_u16());
                     debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
 
                     // Parse license validation data from the response body.
@@ -1299,11 +1326,14 @@ fn spawn_heartbeat(state: &AppState) {
                         );
                     }
                     debug!(status = %resp.status(), "heartbeat_rejected");
+                    motif = format!("refuse ({})", resp.status().as_u16());
                 }
                 Err(e) => {
                     debug!(error = %e, "heartbeat_failed");
                 }
             }
+
+            suivi.terminer(verdict, None, Some(&motif));
 
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
             // subscription is picked up without waiting for the offline grace or
@@ -2237,5 +2267,68 @@ mod heartbeat_server_id_tests {
             "le server_id du heartbeat doit venir du meme accesseur que la \
              telemetrie et que le pont"
         );
+    }
+
+    /// Le battement inscrit son cycle au registre des executions (#2080), et
+    /// sur les DEUX sorties : l'envoi reel, et l'opt-out ou rien ne part.
+    ///
+    /// Sans la seconde, un serveur telemetrie eteinte n'aurait aucune ligne, et
+    /// « le battement ne tourne plus » serait indistinguable de « le battement
+    /// tourne mais n'envoie rien, comme demande ».
+    #[test]
+    fn le_battement_inscrit_chaque_cycle_au_registre() {
+        let source = include_str!("background.rs");
+        let corps = source
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de spawn_heartbeat introuvable");
+
+        assert_eq!(
+            corps.matches("TACHE_BATTEMENT_COEUR").count(),
+            1,
+            "un cycle = une ligne : le registre doit etre ouvert une fois par \
+             tour de boucle, pas plusieurs"
+        );
+        assert!(
+            corps.contains("suivi.rien_a_faire"),
+            "l'opt-out telemetrie doit fermer sa ligne en `rien a faire`, pas \
+             la laisser ouverte jusqu'au prochain redemarrage"
+        );
+        assert!(
+            corps.contains("suivi.terminer(verdict"),
+            "le cycle qui a envoye doit fermer sa ligne avec son verdict"
+        );
+    }
+
+    /// La charge utile du battement porte la cle de licence et l'empreinte
+    /// materielle. Le registre, lui, ne doit porter qu'un code HTTP.
+    #[test]
+    fn le_registre_du_battement_ne_recopie_ni_cle_ni_empreinte() {
+        let source = include_str!("background.rs");
+        let corps = source
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de spawn_heartbeat introuvable");
+
+        for ligne in corps.lines().filter(|l| l.contains("motif =")) {
+            for interdit in [
+                "license_key",
+                "hardware_fingerprint",
+                "instance_id",
+                "server_id",
+                "hostname",
+            ] {
+                assert!(
+                    !ligne.contains(interdit),
+                    "le motif inscrit au registre ne doit pas porter `{interdit}` : {ligne}"
+                );
+            }
+        }
     }
 }
