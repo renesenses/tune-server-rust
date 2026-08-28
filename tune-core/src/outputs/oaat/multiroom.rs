@@ -223,7 +223,6 @@ impl OutputTarget for OaatMultiroomOutput {
 
     #[cfg(feature = "oaat")]
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        use oaat_core::ChannelLayout;
         use oaat_core::format::AudioFormat;
         use oaat_core::wire::PacketFlags;
 
@@ -354,7 +353,14 @@ impl OutputTarget for OaatMultiroomOutput {
             let cur_sample_rate = si.sample_rate;
             let cur_bits = si.bits_per_sample;
             let ch = si.channels.min(8) as u8;
-            let layout = ChannelLayout::Stereo;
+            let layout = match super::output::disposition_oaat(ch) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    error!(device = %device_name, ch, %error, "oaat-multiroom: layout rejected");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
             let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
             let packet_size = if is_flac {
                 FLAC_CHUNK_SIZE

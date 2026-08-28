@@ -30,8 +30,9 @@ pub fn downmix(samples: &[f32], source_channels: u16, target_channels: u16) -> V
             for in_ch in 0..src {
                 sum += samples[in_offset + in_ch] * matrix[row_offset + in_ch];
             }
-            // Soft clip to [-1.0, 1.0] to prevent overflow
-            output.push(sum.clamp(-1.0, 1.0));
+            // The shared matrix already reserves worst-case headroom. Keep an
+            // out-of-range source visible instead of hiding it behind a clip.
+            output.push(sum);
         }
     }
 
@@ -306,10 +307,9 @@ mod tests {
         let samples = vec![0.5, -0.5, 0.3, 0.0, 0.1, -0.1];
         let result = downmix(&samples, 6, 2);
         assert_eq!(result.len(), 2);
-        // L = FL + 0.707*FC + 0.707*BL = 0.5 + 0.2121 + 0.0707 = 0.7828
-        assert!((result[0] - 0.7828).abs() < 0.01);
-        // R = FR + 0.707*FC + 0.707*BR = -0.5 + 0.2121 + -0.0707 = -0.3586
-        assert!((result[1] - (-0.3586)).abs() < 0.01);
+        let headroom = 1.0 / (1.0 + 2.0 * 0.707);
+        assert!((result[0] - 0.7828 * headroom).abs() < 0.01);
+        assert!((result[1] - (-0.3586) * headroom).abs() < 0.01);
     }
 
     #[test]
@@ -336,9 +336,8 @@ mod tests {
         assert_eq!(result.len(), 4); // 2 channels * 2 bytes
         let left = i16::from_le_bytes([result[0], result[1]]);
         let right = i16::from_le_bytes([result[2], result[3]]);
-        // L = 10000 + 0.707*5000 + 0.707*2000 = 10000 + 3535 + 1414 = 14949
-        assert!((left as f64 - 14949.0).abs() < 10.0);
-        // R = -10000 + 0.707*5000 + 0.707*(-2000) = -10000 + 3535 - 1414 = -7879
-        assert!((right as f64 - (-7879.0)).abs() < 10.0);
+        let headroom = 1.0 / (1.0 + 2.0 * 0.707);
+        assert!((left as f64 - 14949.0 * headroom).abs() < 10.0);
+        assert!((right as f64 - (-7879.0) * headroom).abs() < 10.0);
     }
 }
