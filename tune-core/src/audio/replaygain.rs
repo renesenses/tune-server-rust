@@ -17,6 +17,9 @@
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
+use crate::library::local_path::{
+    LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
+};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -34,6 +37,22 @@ const PER_FILE_PAUSE_MS: u64 = 400;
 
 /// How long the loop sleeps once there is nothing left to analyse.
 const IDLE_SLEEP_SECS: u64 = 900;
+
+/// Témoin de REPORT — à ne pas confondre avec `rg_analyzed`.
+///
+/// `rg_analyzed` veut dire « on a essayé, n'y revenons pas ». Il était posé
+/// même quand le fichier était introuvable, ce qui gelait définitivement des
+/// pistes parfaitement saines : chemin stocké en NFC, fichier sur le disque en
+/// NFD (#1865), ou simplement partage démonté au mauvais moment. Sur .18,
+/// 114 pistes portaient `rg_analyzed` pour **zéro** `rg_track_gain` calculé.
+///
+/// Cette clé-ci dit autre chose : « aucune graphie ne répondait à telle date ».
+/// Elle écarte la piste du balayage — sans quoi les 135 pistes concernées, plus
+/// nombreuses que `TRACK_BATCH`, bloqueraient la passe entière sur les mêmes
+/// lignes — mais elle **périme** au bout de
+/// [`crate::library::local_path::PATH_RETRY_AFTER_SECS`]. Un disque rebranché
+/// est repris tout seul.
+const PATH_UNRESOLVED_KEY: &str = "rg_path_unresolved";
 
 /// Ceiling on the ESTIMATED decoded footprint of one track before analysis.
 ///
@@ -111,9 +130,9 @@ fn estimated_analysis_bytes(
         .saturating_mul(12)
 }
 
-/// Setting gate. Absent/"true" ⇒ on (Bertrand wants calculated tags filled
-/// automatically); set to "false" to disable the whole pass.
-const ENABLED_KEY: &str = "replaygain_analysis_enabled";
+/// Réglage propre à la PASSE D'ANALYSE : absent/"true" ⇒ autorisée,
+/// "false" ⇒ coupée. Il ne décide pas seul — voir [`analysis_enabled`].
+pub const ANALYSIS_ENABLED_KEY: &str = "replaygain_analysis_enabled";
 
 /// Format a gain the way ReplayGain tags do, e.g. `-6.50 dB`.
 pub fn format_gain(db: f64) -> String {
@@ -130,13 +149,51 @@ pub fn track_gain_db(lufs: f64) -> f64 {
     REFERENCE_LUFS - lufs
 }
 
-fn enabled(settings: &SettingsRepo) -> bool {
-    settings
-        .get(ENABLED_KEY)
+/// La passe d'analyse a-t-elle le droit de décoder ?
+///
+/// DEUX réglages la commandent, et les confondre est tout le défaut #2496 :
+///
+/// * [`MODE_KEY`] (`replaygain_mode`) — le sélecteur dont la première valeur
+///   s'affiche « Désactivé (niveau source) ». La boucle ne l'a JAMAIS lu : qui
+///   choisissait « Désactivé » n'arrêtait que l'APPLICATION du gain à la
+///   lecture, pendant que le balayage continuait de décoder la bibliothèque
+///   entière — CPU, disque, et sur un partage réseau chargé des démarrages de
+///   lecture à 6,8 s là où un flux distant partait en 0,15 s (#2495).
+/// * [`ANALYSIS_ENABLED_KEY`] (`replaygain_analysis_enabled`) — la coche
+///   « Analyse ReplayGain », qui coupe la passe même quand un mode est armé.
+///
+/// Règle : la passe tourne quand un mode est demandé ET que la coche n'a pas
+/// été décochée. « Désactivé » arrête donc bien le balayage. C'est la voie A
+/// de #2496 : on renonce au pré-remplissage silencieux — armer ReplayGain plus
+/// tard redevient long — pour qu'un réglage nommé « Désactivé » désactive.
+/// Un réglage sans effet est pire qu'un réglage absent : l'utilisateur croit
+/// avoir agi.
+///
+/// Un mode illisible ou absent vaut `Off`, exactement comme dans
+/// [`ReplayGainSettings::load`] : dans le doute on travaille MOINS, jamais plus.
+///
+/// Ce que cette fonction ne fait PAS, et ne doit jamais faire : effacer. Les
+/// `rg_track_gain` / `rg_album_gain` déjà mesurés restent en base et resservent
+/// tels quels dès qu'un mode est réarmé — les recalculer coûte des heures de
+/// décodage. Couper l'analyse suspend le travail, elle ne le jette pas.
+pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let opted_out = settings
+        .get(ANALYSIS_ENABLED_KEY)
         .ok()
         .flatten()
-        .map(|v| v != "false")
-        .unwrap_or(true)
+        .map(|v| v == "false")
+        .unwrap_or(false);
+    if opted_out {
+        return false;
+    }
+    let mode = settings
+        .get(MODE_KEY)
+        .ok()
+        .flatten()
+        .map(|v| ReplayGainMode::from_setting(&v))
+        .unwrap_or(ReplayGainMode::Off);
+    mode != ReplayGainMode::Off
 }
 
 /// Verrou GLOBAL des analyses lourdes : UNE seule passe décode à la fois.
@@ -175,7 +232,7 @@ pub(crate) fn any_zone_playing(backend: &Arc<dyn DbBackend>) -> bool {
 /// signalements ont buté là-dessus (#1464, #1456, #1457), la cause étant une
 /// zone restée à `playing` après un arrêt brutal. Nommer la zone rend la cause
 /// lisible dans le journal, sans lire le code.
-pub(crate) fn playing_zone_name(backend: &Arc<dyn DbBackend>) -> Option<String> {
+pub fn playing_zone_name(backend: &Arc<dyn DbBackend>) -> Option<String> {
     backend
         .query_one(
             "SELECT name FROM zones WHERE last_play_state = 'playing' LIMIT 1",
@@ -200,8 +257,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // fichiers entiers, c'est l'autre moitié de la charge qui a éteint .18.
         let mut thermal = crate::audio::thermal::ThermalGate::new();
         loop {
-            let settings = SettingsRepo::with_backend(backend.clone());
-            if enabled(&settings) {
+            if analysis_enabled(&backend) {
                 if thermal.should_hold("replaygain") {
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
@@ -243,6 +299,13 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // Local tracks with a file on disk, not yet analysed (no `rg_analyzed`
     // sentinel) and without file-tag ReplayGain (`rg_track_gain`). The two
     // NOT EXISTS keep the sweep advancing and honour the file's own tags.
+    //
+    // Le troisième écarte les pistes REPORTÉES trop récemment (#1865). La
+    // comparaison se fait en TEXTE sur une estampille rembourrée de zéros,
+    // pas via un `CAST(... AS INTEGER)` : `track_metadata.value` est partagée
+    // par toutes les clés, et un CAST y ferait tomber la requête entière sur
+    // PostgreSQL dès qu'une valeur non numérique existe ailleurs dans la table.
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
@@ -250,8 +313,14 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                  WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_track_gain') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
+                   AND m.value > ?) \
          LIMIT ?",
-        &[&(TRACK_BATCH as i64) as &dyn ToSqlValue],
+        &[
+            &seuil_report as &dyn ToSqlValue,
+            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+        ],
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -266,7 +335,19 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
 
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
+    let mut deferred = 0usize;
     for r in &rows {
+        // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à 180 s
+        // chacun, c'est plus d'une heure de décodage après un « Désactivé » si
+        // on ne regarde qu'entre deux lots : un réglage qui n'agit qu'au
+        // prochain démarrage n'est pas un réglage (#2496). On relit donc avant
+        // CHAQUE fichier. Le décodage déjà lancé n'est pas annulable — même
+        // contrat que le garde-fou lecture ci-dessous : on s'arrête au fichier
+        // suivant, pas au milieu d'un decode.
+        if !analysis_enabled(backend) {
+            info!("replaygain_analysis_disabled_mid_batch — réglage coupé, arrêt du balayage");
+            break;
+        }
         // Playback can start mid-batch; yield at once so a decode never
         // competes with the audio pipeline (#1310).
         if any_zone_playing(backend) {
@@ -281,6 +362,39 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             Some(p) if !p.is_empty() => p,
             _ => continue,
         };
+
+        // Le chemin de la base est en NFC ; le fichier, lui, peut être écrit
+        // en NFD sur le disque (macOS, SMB/CIFS). On résout AVANT de décider
+        // quoi que ce soit — et surtout avant de poser le moindre témoin
+        // (#1865).
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                // Introuvable N'EST PAS indécodable. Aucun `rg_analyzed` ici :
+                // on ne fige pas une piste que le prochain montage rendra. On
+                // pose seulement un report daté, qui périme tout seul.
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "replaygain_path_unresolved — aucune graphie (stockee, NFD, NFC) \
+                     ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                // Compté dans `done` : le balayage a bel et bien AVANCÉ (la
+                // ligne ne ressortira pas de la prochaine requête). Sans cela,
+                // un lot entièrement introuvable rendrait 0 et endormirait la
+                // passe 15 minutes à chaque paquet de 25 lignes.
+                done += 1;
+                continue;
+            }
+        };
+        // Un report qui traînait n'a plus lieu d'être : le fichier répond.
+        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
 
         let est = estimated_analysis_bytes(
             r.get(2).and_then(|v| v.as_i64()),
@@ -300,9 +414,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             continue;
         }
 
+        // `sur_disque`, PAS `path` : c'est la graphie que le système a
+        // reconnue. Le chemin de la base reste ce qu'il est — on ne le
+        // réécrit pas, on ne le normalise pas non plus (#1865).
         let measured = tokio::time::timeout(
             std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
-            crate::audio::analyzer::measure_loudness_and_peak(&path),
+            crate::audio::analyzer::measure_loudness_and_peak(&sur_disque),
         )
         .await;
         match measured {
@@ -311,8 +428,28 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
             }
+            // Le fichier a disparu ENTRE la résolution et le décodage — un
+            // partage qui tombe pendant la passe, exactement le scénario qui a
+            // déjà coûté des pistes. On ne le déclare pas indécodable : on le
+            // reporte, comme un absent de la première heure.
+            Ok(None) if resolve_local_path(&path).is_missing() => {
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "replaygain_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(
+                    track_id,
+                    PATH_UNRESOLVED_KEY,
+                    &deferral_stamp(now_epoch_secs() as i64),
+                );
+                done += 1;
+                continue;
+            }
             Ok(None) => {
-                // Undecodable / silent — still stamp so we don't retry forever.
+                // Le fichier est bien là et reste illisible ou silencieux :
+                // là, le témoin est légitime.
                 debug!(track_id, path = %path, "replaygain_measure_none");
             }
             Err(_elapsed) => {
@@ -337,7 +474,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
     }
 
-    info!(analyzed = done, "replaygain_track_batch");
+    // `deferred` est porté par la ligne de journal : sans lui, un lot où tout
+    // est introuvable ressemblerait à un lot analysé (#1865).
+    info!(
+        analyzed = done - deferred,
+        deferred, "replaygain_track_batch"
+    );
     done
 }
 
@@ -690,6 +832,188 @@ mod tests {
         assert_eq!(playing_zone_name(&backend), None);
     }
 
+    // ---------------------------------------------------------------------
+    // #1865 — chemin stocké en NFC, fichier en NFD sur le disque.
+    // ---------------------------------------------------------------------
+
+    /// Base en mémoire avec le schéma complet, une piste, et rien d'autre.
+    /// `zones` existe (via les migrations) et reste vide : `any_zone_playing`
+    /// rend donc false.
+    ///
+    /// Le mode est armé explicitement : depuis #2496, un `replaygain_mode`
+    /// ABSENT vaut « Désactivé » et [`analyze_track_batch`] rend 0 sans rien
+    /// lire. Sans cette ligne, les tests #1865 passeraient au vert en ne
+    /// testant plus rien.
+    fn base_avec_piste(chemin: &str) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Bjork')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Homogenic', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+             sample_rate, channels) VALUES (42, 'Joga', 1, 1, ?, 300000, 44100, 2)",
+            &[&chemin],
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        (db, backend)
+    }
+
+    fn temoins(db: &crate::db::sqlite::SqliteDb) -> std::collections::HashMap<String, String> {
+        TrackMetadataRepo::new(db.clone()).get_all(42).unwrap()
+    }
+
+    /// LE défaut. Un fichier introuvable N'EST PAS un fichier indécodable :
+    /// aucun `rg_analyzed` ne doit être posé, sans quoi la piste sort du
+    /// balayage POUR TOUJOURS — c'est ce qui a figé 114 pistes sur .18 pour
+    /// zéro gain calculé.
+    #[tokio::test]
+    async fn un_fichier_introuvable_est_reporte_jamais_marque_analyse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp
+            .path()
+            .join("Bj\u{00f6}rk - J\u{00f3}ga.flac")
+            .to_string_lossy()
+            .to_string();
+        let (db, backend) = base_avec_piste(&absent);
+
+        let traites = analyze_track_batch(&backend).await;
+
+        let m = temoins(&db);
+        assert!(
+            !m.contains_key("rg_analyzed"),
+            "un ENOENT ne doit PAS poser le temoin d'analyse ; temoins = {m:?}"
+        );
+        assert!(
+            m.contains_key(PATH_UNRESOLVED_KEY),
+            "un report date doit etre pose ; temoins = {m:?}"
+        );
+        // Le report compte comme progrès : sinon 135 pistes introuvables — plus
+        // que TRACK_BATCH — bloqueraient la passe sur les mêmes lignes.
+        assert_eq!(traites, 1, "le balayage doit avoir AVANCE");
+    }
+
+    /// Un report frais écarte la piste du lot suivant ; passé la fenêtre, elle
+    /// redevient candidate. C'est ce qui empêche le report d'être, à son tour,
+    /// un état définitif — un disque rebranché est repris tout seul.
+    #[tokio::test]
+    async fn le_report_ecarte_puis_perime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp
+            .path()
+            .join("N\u{00fa}\u{00f1}ez.flac")
+            .to_string_lossy()
+            .to_string();
+        let (db, backend) = base_avec_piste(&absent);
+        let repo = TrackMetadataRepo::new(db.clone());
+        let maintenant = now_epoch_secs() as i64;
+
+        // Report tout frais → la piste n'est même pas sélectionnée.
+        repo.set(42, PATH_UNRESOLVED_KEY, &deferral_stamp(maintenant))
+            .unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "une piste reportee a l'instant ne doit pas ressortir"
+        );
+
+        // Report périmé → elle repasse candidate, et se fait re-reporter avec
+        // une estampille fraîche.
+        repo.set(
+            42,
+            PATH_UNRESOLVED_KEY,
+            &deferral_stamp(maintenant - crate::library::local_path::PATH_RETRY_AFTER_SECS - 60),
+        )
+        .unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "passe la fenetre, la piste doit etre reessayee"
+        );
+        let m = temoins(&db);
+        assert!(!m.contains_key("rg_analyzed"));
+        assert!(m[PATH_UNRESOLVED_KEY] >= deferral_stamp(maintenant));
+    }
+
+    /// La base tient le chemin en NFC, le disque le porte en NFD : la passe
+    /// doit TROUVER le fichier. Il est ici volontairement illisible (des
+    /// octets quelconques), donc `rg_analyzed` est légitime — mais AUCUN
+    /// report ne doit être posé, ce qui prouve que la résolution a abouti.
+    ///
+    /// Sans le repli NFC→NFD, cette piste serait reportée : c'est la mutation
+    /// qui met ce test au rouge.
+    #[tokio::test]
+    async fn le_disque_en_nfd_est_retrouve_depuis_le_chemin_nfc_de_la_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Sur le disque : NFD (graphie d'un Mac ou d'un partage SMB).
+        let nfd = tmp.path().join("Bjo\u{0308}rk - Jo\u{0301}ga.flac");
+        std::fs::write(&nfd, b"pas du flac, mais bien present").unwrap();
+        // En base : NFC, comme le scanner l'enregistre.
+        let nfc = tmp
+            .path()
+            .join("Bj\u{00f6}rk - J\u{00f3}ga.flac")
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(
+            nfc,
+            nfd.to_string_lossy(),
+            "les deux graphies doivent differer octet a octet"
+        );
+
+        let (db, backend) = base_avec_piste(&nfc);
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+
+        let m = temoins(&db);
+        assert!(
+            !m.contains_key(PATH_UNRESOLVED_KEY),
+            "le fichier a ete TROUVE : aucun report ne doit etre pose ; temoins = {m:?}"
+        );
+        assert!(
+            m.contains_key("rg_analyzed"),
+            "fichier present mais indecodable : le temoin d'analyse est legitime"
+        );
+    }
+
+    /// La contrepartie du correctif : la base n'est JAMAIS réécrite. Le repli
+    /// sert à ouvrir, pas à stocker — un chemin normalisé par nos soins peut
+    /// être introuvable sur un montage sensible à la forme.
+    #[tokio::test]
+    async fn la_passe_ne_reecrit_jamais_le_chemin_stocke() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nfd = tmp.path().join("E\u{0301}tienne.flac");
+        std::fs::write(&nfd, b"x").unwrap();
+        let nfc = tmp
+            .path()
+            .join("\u{00c9}tienne.flac")
+            .to_string_lossy()
+            .to_string();
+
+        let (db, backend) = base_avec_piste(&nfc);
+        analyze_track_batch(&backend).await;
+
+        let apres = db
+            .query_one("SELECT file_path FROM tracks WHERE id = 42", &[])
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_string())
+            .unwrap();
+        assert_eq!(
+            apres, nfc,
+            "le chemin en base doit rester EXACTEMENT celui du scanner (NFC)"
+        );
+    }
+
     /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui
     /// gonflait l'estimation d'un facteur 16 a 32 et ecartait TOUT fichier DSD
     /// de l'analyse.
@@ -915,5 +1239,231 @@ mod tests {
         let e = (10f64.powf(-12.0 / 10.0) + 10f64.powf(-18.0 / 10.0)) / 2.0;
         let album_lufs = 10.0 * e.log10();
         assert!(album_lufs < -12.0 && album_lufs > -18.0);
+    }
+    // -----------------------------------------------------------------------
+    // #2496 — « Désactivé » doit désactiver
+    // -----------------------------------------------------------------------
+
+    /// Les tables que la passe touche, plus `n` pistes locales candidates.
+    ///
+    /// Les chemins n'existent pas : `measure_loudness_and_peak` rend `None`
+    /// aussitôt, mais la passe estampille quand même `rg_analyzed` et compte le
+    /// fichier — c'est ce compteur qui dit combien de fichiers ont VRAIMENT été
+    /// pris en charge, sans avoir à embarquer de l'audio dans le dépôt.
+    fn sweep_db(n: i64) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        sweep_db_avec(n, None)
+    }
+
+    /// Comme [`sweep_db`], mais les fichiers EXISTENT réellement sur le disque.
+    ///
+    /// Nécessaire depuis #1865 : un chemin introuvable quitte la boucle par
+    /// `continue` **avant** la pause de [`PER_FILE_PAUSE_MS`]. Un lot
+    /// entièrement introuvable se consomme donc en quelques microsecondes, et
+    /// aucun basculement de réglage ne peut s'y intercaler — le test ne
+    /// mesurerait plus qu'une course perdue d'avance.
+    ///
+    /// Des fichiers présents mais indécodables empruntent la voie normale :
+    /// témoin `rg_analyzed` posé, **puis** pause. C'est précisément la voie que
+    /// ce test doit pouvoir interrompre.
+    ///
+    /// Le `TempDir` est rendu à l'appelant : le lâcher effacerait les fichiers
+    /// sous les pieds de la passe.
+    fn sweep_db_fichiers_presents(
+        n: i64,
+    ) -> (
+        tempfile::TempDir,
+        crate::db::sqlite::SqliteDb,
+        Arc<dyn DbBackend>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, backend) = sweep_db_avec(n, Some(tmp.path()));
+        (tmp, db, backend)
+    }
+
+    fn sweep_db_avec(
+        n: i64,
+        dossier: Option<&std::path::Path>,
+    ) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                                    updated_at TEXT NOT NULL DEFAULT '');
+             CREATE TABLE tracks (id INTEGER PRIMARY KEY, album_id INTEGER, file_path TEXT,
+                                  duration_ms INTEGER, sample_rate INTEGER, channels INTEGER);
+             CREATE TABLE track_metadata (track_id INTEGER NOT NULL, key TEXT NOT NULL,
+                                          value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        for i in 1..=n {
+            let chemin = match dossier {
+                // Un octet suffit : le fichier RÉPOND, et reste indécodable.
+                Some(d) => {
+                    let f = d.join(format!("{i}.flac"));
+                    std::fs::write(&f, b"pas du flac").unwrap();
+                    f.to_string_lossy().to_string()
+                }
+                None => format!("/i2496-inexistant/{i}.flac"),
+            };
+            db.execute(
+                "INSERT INTO tracks (id, album_id, file_path, duration_ms, sample_rate, channels) \
+                 VALUES (?, NULL, ?, 300000, 44100, 2)",
+                &[&i, &chemin],
+            )
+            .unwrap();
+        }
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        (db, backend)
+    }
+
+    /// #2496 : la boucle ne lisait QUE `replaygain_analysis_enabled`, jamais
+    /// `replaygain_mode`. L'utilisateur qui choisissait « Désactivé (niveau
+    /// source) » n'arrêtait que l'application du gain à la lecture ; le
+    /// balayage continuait de décoder sa bibliothèque entière.
+    #[test]
+    fn the_off_mode_gates_the_analysis_sweep() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+
+        // Installation neuve : aucun mode écrit ⇒ Off ⇒ rien à balayer.
+        assert!(
+            !analysis_enabled(&backend),
+            "un mode absent vaut Désactivé : la passe ne doit pas démarrer"
+        );
+        settings.set(MODE_KEY, "off").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "« Désactivé » doit arrêter le balayage d'analyse (#2496)"
+        );
+
+        // Un mode réellement demandé la relance.
+        settings.set(MODE_KEY, "track").unwrap();
+        assert!(analysis_enabled(&backend), "mode piste ⇒ balayage autorisé");
+        settings.set(MODE_KEY, "album").unwrap();
+        assert!(analysis_enabled(&backend), "mode album ⇒ balayage autorisé");
+
+        // La coche « Analyse ReplayGain » reste un veto indépendant.
+        settings.set(ANALYSIS_ENABLED_KEY, "false").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "la coche décochée coupe la passe même avec un mode armé"
+        );
+        settings.set(ANALYSIS_ENABLED_KEY, "true").unwrap();
+        assert!(analysis_enabled(&backend));
+        settings.set(MODE_KEY, "off").unwrap();
+        assert!(
+            !analysis_enabled(&backend),
+            "la coche seule ne ressuscite pas la passe quand le mode est Désactivé"
+        );
+    }
+
+    /// Les trois comportements que #2496 demande de distinguer, sur une même
+    /// base : le balayage s'arrête, le gain DÉJÀ mesuré est conservé, et
+    /// l'application à la lecture relève d'un autre réglage.
+    #[tokio::test]
+    async fn disabling_stops_the_pass_without_losing_a_single_measured_gain() {
+        let (_db, backend) = sweep_db(2);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Piste 1 : déjà mesurée. Des heures de décodage derrière cette valeur.
+        meta.set(1, "rg_track_gain", "-6.50 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.988553").unwrap();
+        meta.set(1, "rg_analyzed", "1700000000").unwrap();
+
+        // Contre-épreuve intégrée : mode armé, la passe travaille pour de bon.
+        settings.set(MODE_KEY, "track").unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "mode armé : la piste 2 devait être prise en charge"
+        );
+
+        // Même lot rejoué, réglage sur « Désactivé ».
+        meta.delete(2, "rg_analyzed").unwrap();
+        settings.set(MODE_KEY, "off").unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "« Désactivé » : la passe ne doit décoder aucun fichier"
+        );
+        assert!(
+            !meta.get_all(2).unwrap().contains_key("rg_analyzed"),
+            "aucune piste ne doit avoir été touchée pendant que le réglage est coupé"
+        );
+
+        // AUCUNE donnée perdue : couper l'analyse suspend, n'efface pas.
+        let kept = meta.get_all(1).unwrap();
+        assert_eq!(
+            kept.get("rg_track_gain").map(String::as_str),
+            Some("-6.50 dB")
+        );
+        assert_eq!(
+            kept.get("rg_track_peak").map(String::as_str),
+            Some("0.988553")
+        );
+
+        // L'application à la lecture est un AUTRE réglage, une AUTRE décision :
+        // `Off` n'applique rien, et réarmer un mode retrouve le gain intact.
+        assert!(stored_gain_for(&backend, 1, ReplayGainMode::Off).is_none());
+        let back = stored_gain_for(&backend, 1, ReplayGainMode::Track)
+            .expect("le gain mesuré doit resservir tel quel une fois le mode réarmé");
+        assert!((back.gain_db - (-6.5)).abs() < 1e-9, "{back:?}");
+    }
+
+    /// #2496, point 4 : un réglage qui n'agit qu'au prochain démarrage n'est pas
+    /// un réglage. Un lot vaut 25 fichiers à jusqu'à 180 s chacun — sans
+    /// relecture par fichier, « Désactivé » laissait tourner plus d'une heure de
+    /// décodage.
+    #[tokio::test]
+    async fn switching_off_mid_batch_interrupts_the_running_sweep() {
+        let (_tmp, _db, backend) = sweep_db_fichiers_presents(4);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+
+        // On bascule dès que la PREMIÈRE piste est estampillée. La passe dort
+        // alors PER_FILE_PAUSE_MS (400 ms) avant de relire le réglage : marge
+        // sans commune mesure avec les microsecondes que prend l'écriture.
+        let flipper = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let meta = TrackMetadataRepo::with_backend(backend.clone());
+                for _ in 0..2_000 {
+                    let stamped = meta
+                        .get_all(1)
+                        .map(|m| m.contains_key("rg_analyzed"))
+                        .unwrap_or(false);
+                    if stamped {
+                        SettingsRepo::with_backend(backend.clone())
+                            .set(MODE_KEY, "off")
+                            .unwrap();
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                false
+            })
+        };
+
+        let done = analyze_track_batch(&backend).await;
+        assert!(
+            flipper.await.unwrap(),
+            "le test n'a jamais réussi à couper le réglage — il ne prouve rien"
+        );
+        assert!(
+            done >= 1,
+            "la première piste devait être traitée, done={done}"
+        );
+        assert!(
+            done < 4,
+            "le balayage a traité les {done} pistes du lot malgré la coupure"
+        );
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        assert!(
+            !meta.get_all(4).unwrap().contains_key("rg_analyzed"),
+            "la dernière piste du lot ne devait jamais être décodée après la coupure"
+        );
     }
 }

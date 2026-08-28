@@ -243,6 +243,54 @@ pousser** : un merge sans conflit peut casser la compilation.
 
 ---
 
+## 6 bis. Une release publiée se solde — clôture et réponse aux testeurs
+
+**Le stock d'issues doit refléter l'état du code.** Il ne le fait pas tout
+seul : `Closes` ne ferme rien ici (voir ci-dessus), et un correctif fusionné
+n'est pas un correctif livré. Sans cette étape, on accumule des issues
+ouvertes dont le défaut n'existe plus — mesuré le 28/08/2026 : **23 issues P2
+traitées dans la journée, 0 fermée, 373 issues ouvertes**. Le compteur ne
+mesurait plus le travail, il mesurait l'oubli.
+
+**Pendant le cycle de développement**, on ne touche pas au suivi : ni triage,
+ni fermeture, ni commentaire spontané. **Dès qu'une release est PUBLIÉE**, on
+solde ce qu'elle livre.
+
+### Ce qu'il faut faire, dans cet ordre
+
+1. **Établir ce que la release livre réellement**, issue par issue.
+2. **Fermer à la main** — `gh issue close`, puis `gh issue view <n> --json state`
+   pour vérifier au lieu de supposer.
+3. **Commenter** en disant **à partir de quelle version** c'est corrigé. Un
+   testeur en version antérieure verra encore le défaut : sans le numéro de
+   version, la réponse est inutilisable.
+
+### La preuve exigée avant de fermer
+
+**Le contenu de l'artefact publié**, jamais autre chose. Ni « PR mergée », ni
+`git tag --contains`, ni `--is-ancestor` — une fusion peut écraser du contenu,
+et un correctif peut manquer son tag de quelques minutes. C'est arrivé **trois
+fois en août** : #2317 raté de 17 min, #2404 de 30 min, le kiosque d'un jour.
+
+Un `grep` dans le binaire ou dans le `web/` du tarball, **avec un cas témoin
+sur une version antérieure où le marqueur doit être ABSENT** (`rc=1`). Sans
+témoin, une absence de résultat ne prouve rien : elle peut venir d'un marqueur
+mal choisi. Choisir un littéral qui survit à la compilation — message de
+journal, code d'erreur, champ sérialisé — **jamais un nom de fonction**, que
+la minification et le linker effacent.
+
+### Ce qu'on ne ferme pas
+
+- les issues portant **`keep-open`** ;
+- celles dont le correctif est fusionné mais **absent de l'artefact publié** —
+  elles attendent la release suivante ;
+- **jamais de fermeture en masse au jugé.** Une issue fermée à tort ne se
+  rouvre pratiquement jamais, et le testeur qui l'avait ouverte le vit comme
+  un abandon.
+
+
+---
+
 ## 7. Plusieurs agents travaillent ce dépôt — le verrou est obligatoire
 
 Vous n'êtes pas seul. Le 2026-08-20, **quatre PR ont touché `verdict_purge`

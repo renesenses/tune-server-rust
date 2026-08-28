@@ -21,34 +21,45 @@ pub(super) struct ProxyQuery {
 }
 
 pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
-    let cache_dir = artwork_cache_dir();
-    for ext in &["jpg", "png", "webp"] {
-        let path = cache_dir.join(format!("{hash}.{ext}"));
-        if path.exists()
-            && let Ok(data) = tokio::fs::read(&path).await
-        {
-            // webp is common for radio station logos and custom radio uploads
-            // (set_radio_artwork accepts it) but serve_artwork never served it →
-            // 404 → blank cover (Bilou).
-            let mime = match *ext {
-                "png" => "image/png",
-                "webp" => "image/webp",
-                _ => "image/jpeg",
-            };
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
-            headers.insert(
-                "Cache-Control",
-                axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-            headers.insert(
-                "ETag",
-                axum::http::HeaderValue::from_str(&format!("\"{hash}\""))
-                    .unwrap_or(axum::http::HeaderValue::from_static("\"artwork\"")),
-            );
-            return (StatusCode::OK, headers, data).into_response();
-        }
+    serve_artwork_from(&artwork_cache_dir(), &hash).await
+}
+
+/// Sert une entrée du cache de pochettes, répertoire donné.
+///
+/// Séparée de [`serve_artwork`] pour être éprouvée sans variable
+/// d'environnement : `artwork_cache_dir()` lit `TUNE_ARTWORK_DIR`, qui est
+/// commun à tout le processus et donc inutilisable depuis des tests parallèles.
+///
+/// La liste des extensions cherchées n'est plus écrite ici : c'est
+/// [`tune_core::library::artwork::CACHE_EXTENSIONS`], la même que celle sous
+/// laquelle l'écriture dépose ses fichiers. Deux listes séparées, c'était la
+/// porte ouverte à un condensat annoncé en base et introuvable ici (#2567).
+async fn serve_artwork_from(cache_dir: &std::path::Path, hash: &str) -> axum::response::Response {
+    if let Some((path, mime)) = tune_core::library::artwork::find_cached(cache_dir, hash)
+        && let Ok(data) = tokio::fs::read(&path).await
+    {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static(mime));
+        headers.insert(
+            "Cache-Control",
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        headers.insert(
+            "ETag",
+            HeaderValue::from_str(&format!("\"{hash}\""))
+                .unwrap_or(HeaderValue::from_static("\"artwork\"")),
+        );
+        return (StatusCode::OK, headers, data).into_response();
     }
+    // Une pochette absente n'existait jusqu'ici que dans la console du testeur :
+    // la route ne journalisait ni succès ni échec, et un 404 de pochette était
+    // invisible côté serveur (#2567). Le condensat suffit à retrouver l'album
+    // (`SELECT id FROM albums WHERE cover_path = …`).
+    tracing::warn!(
+        hash = %hash,
+        cache_dir = %cache_dir.display(),
+        "artwork_cache_miss — condensat annoncé sans fichier servable"
+    );
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -808,5 +819,99 @@ mod tests_decompte_artistes {
         assert_eq!(compte.cache_perdu_sans_mbid, 1);
         assert_eq!(compte.total(), 4, "quatre artistes sans photo visible");
         assert_eq!(compte.cache_perdu(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2567 — ce que la base annonce, la route doit le servir.
+//
+// Le client web ne fabrique pas l'identifiant qu'il demande : il recopie
+// `cover_path` tel que le serveur le lui a rendu, et le pose derrière
+// `/api/v1/library/artwork/`. Un condensat annoncé que cette route ne trouve
+// pas, c'est l'image de remplacement à l'écran — et, jusqu'ici, rien du tout
+// dans le journal du serveur.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests_service_pochette {
+    use super::*;
+
+    fn ecrire(dir: &std::path::Path, nom: &str, octets: &[u8]) {
+        std::fs::write(dir.join(nom), octets).unwrap();
+    }
+
+    /// Les orthographes que l'écriture a réellement produites sur le terrain :
+    /// l'extension d'une `cover.jpeg` ou d'une `FOLDER.JPG` était recopiée
+    /// telle quelle, et une pochette intégrée BMP était écrite `.bmp`.
+    #[tokio::test]
+    async fn toute_entree_de_cache_ecrite_est_servie() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cas: &[(&str, &str, &str)] = &[
+            ("0000000000000000000000000000000a", "jpg", "image/jpeg"),
+            ("0000000000000000000000000000000b", "jpeg", "image/jpeg"),
+            ("0000000000000000000000000000000c", "JPG", "image/jpeg"),
+            ("0000000000000000000000000000000d", "JPEG", "image/jpeg"),
+            ("0000000000000000000000000000000e", "png", "image/png"),
+            ("0000000000000000000000000000000f", "PNG", "image/png"),
+            ("00000000000000000000000000000010", "webp", "image/webp"),
+            ("00000000000000000000000000000011", "bmp", "image/bmp"),
+        ];
+        let mut echecs = Vec::new();
+        for (hash, ext, mime) in cas {
+            ecrire(cache.path(), &format!("{hash}.{ext}"), b"IMAGE");
+            let reponse = serve_artwork_from(cache.path(), hash).await;
+            let statut = reponse.status();
+            let recu = reponse
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            if statut != StatusCode::OK || recu != *mime {
+                echecs.push(format!(
+                    "{ext} → {statut} / {recu:?} (attendu 200 OK / {mime})"
+                ));
+            }
+        }
+        assert!(
+            echecs.is_empty(),
+            "{} orthographe(s) sur {} écrites dans le cache mais non servies (#2567) : {:?}",
+            echecs.len(),
+            cas.len(),
+            echecs
+        );
+    }
+
+    /// Garde-fou : un condensat sans fichier reste un 404. Servir un octet de
+    /// remplacement à sa place ferait croire à une pochette et empêcherait de
+    /// jamais la reconstruire.
+    #[tokio::test]
+    async fn un_condensat_sans_fichier_reste_un_404() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let reponse = serve_artwork_from(cache.path(), "8865c2f2e1a6f89c34ab584ec5b8e158").await;
+        assert_eq!(reponse.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Garde-fou : l'ETag reste le condensat lui-même. Le changer invaliderait
+    /// d'un coup la pochette déjà en cache dans chaque navigateur.
+    #[tokio::test]
+    async fn l_etag_reste_le_condensat() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "8865c2f2e1a6f89c34ab584ec5b8e158";
+        ecrire(cache.path(), &format!("{hash}.jpg"), b"IMAGE");
+        let reponse = serve_artwork_from(cache.path(), hash).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        assert_eq!(
+            reponse.headers().get("ETag").unwrap().to_str().unwrap(),
+            format!("\"{hash}\"")
+        );
+        assert_eq!(
+            reponse
+                .headers()
+                .get("Cache-Control")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "public, max-age=31536000, immutable"
+        );
     }
 }

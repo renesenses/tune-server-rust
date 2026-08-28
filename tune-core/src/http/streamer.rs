@@ -14,6 +14,30 @@ pub use crate::audio::wav::{LIVE_BOUNDED_DATA_SIZE, LIVE_BOUNDED_TOTAL_LEN};
 
 pub const ICY_METAINT: usize = 16384;
 
+/// Silence sur le fil au bout duquel une session est déclarée morte.
+///
+/// Trente minutes : c'est le seuil qui existait déjà, mais compté sur
+/// l'INACTIVITÉ et non sur l'âge (#2536). Le garder à l'identique a deux
+/// vertus. Une session orpheline — préparation gapless abandonnée, lecture
+/// interrompue, renderer qui n'a jamais tiré un octet — n'a par construction
+/// jamais d'activité : son inactivité se confond avec son âge et elle part à
+/// la même minute qu'avant. Et le raccourcir serait une régression : une
+/// lecture EN PAUSE ne tire plus rien du serveur, une borne courte la
+/// ramasserait alors qu'elle survit une demi-heure aujourd'hui.
+pub const SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Filet : durée de vie maximale d'une session, activité ou pas.
+///
+/// Sans lui, passer à l'inactivité ouvrirait une fuite : un consommateur qui
+/// suinte quelques octets de temps en temps, ou un renderer qui garde sa
+/// connexion ouverte sans jamais finir, épinglerait indéfiniment la session,
+/// son fichier de pré-transcodage et sa connexion amont. Vingt-quatre heures
+/// est hors d'atteinte de toute piste réelle — la plus longue ici est une
+/// image de CD d'un seul tenant, ~80 min, et un acte d'opéra ou un set
+/// enregistré restent loin sous la journée — donc ce plafond ne peut pas
+/// couper une écoute, tout en garantissant que rien ne traîne plus d'un jour.
+pub const SESSION_ABSOLUTE_CAP: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// A boxed, cloneable async closure that re-resolves a fresh signed CDN URL
 /// for the track backing a proxy session.
 ///
@@ -110,6 +134,23 @@ pub struct StreamSession {
     pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
+    ///
+    /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
+    /// (fichier, radio, mandataire) dans `corps_compte` / `build_file_body` :
+    /// c'est déjà la mesure d'activité du serveur, celle dont le poller et le
+    /// chien de garde de sortie locale déduisent « personne n'écoute ». Le GC
+    /// la relit à chaque balayage plutôt que d'ajouter un second compteur.
+    /// `gc_seen_bytes` retient la valeur du balayage précédent ; dès qu'elle
+    /// bouge, `gc_active_at_ms` est réarmé sur l'âge courant. L'inactivité
+    /// vaut donc `created_at.elapsed() - gc_active_at_ms`. Deux entiers
+    /// atomiques, parce que le verdict se rend dans un `retain` synchrone où
+    /// l'on ne peut ni `await` ni prendre un `Mutex` tokio.
+    pub gc_seen_bytes: std::sync::atomic::AtomicU64,
+    /// Âge (ms depuis `created_at`) auquel le GC a vu `bytes_sent` bouger pour
+    /// la dernière fois. `0` = jamais : l'inactivité se confond alors avec
+    /// l'âge, et une session orpheline est reprise exactement comme avant.
+    pub gc_active_at_ms: std::sync::atomic::AtomicU64,
     /// Number of HTTP requests currently streaming this session. The radio→WAV
     /// channel is single-consumer (`rx` behind a Mutex): a second concurrent
     /// reader would race the first for each PCM chunk and split the stream. This
@@ -221,6 +262,8 @@ impl StreamSession {
             wav_header_stash: std::sync::OnceLock::new(),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
+            gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -709,35 +752,75 @@ impl AudioStreamer {
             .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Reprendre les sessions mortes — sur leur SILENCE, pas sur leur âge.
+    ///
+    /// Une session qui débite des octets est vivante quel que soit son âge.
+    /// Le critère précédent était l'âge absolu depuis `created_at`, jamais
+    /// rafraîchi : une piste de plus de trente minutes — une image de CD d'un
+    /// seul tenant, un acte d'opéra, un set — voyait sa session retirée de la
+    /// table et son fichier de pré-transcodage effacé du disque en pleine
+    /// lecture (#2536). Deux bornes désormais : [`SESSION_IDLE_TIMEOUT`] sur
+    /// l'inactivité pour libérer, [`SESSION_ABSOLUTE_CAP`] en filet pour
+    /// qu'aucune session ne devienne éternelle.
+    ///
+    /// La radio reste exemptée des deux, comme avant : elle est infinie par
+    /// nature et son flux ne se rejoue pas.
     pub async fn cleanup_stale_sessions(&self) -> usize {
+        self.cleanup_stale_sessions_with(SESSION_IDLE_TIMEOUT, SESSION_ABSOLUTE_CAP)
+            .await
+    }
+
+    /// Same sweep with injectable bounds, so the two clocks can be exercised
+    /// in milliseconds instead of half an hour.
+    pub async fn cleanup_stale_sessions_with(
+        &self,
+        idle_timeout: std::time::Duration,
+        absolute_cap: std::time::Duration,
+    ) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut sessions = self.sessions.lock().await;
         let before = sessions.len();
         // Collect temp files to clean up from stale sessions
         let mut temp_files_to_remove: Vec<String> = Vec::new();
-        // 30 minutes for streaming sessions — Hi-Res tracks can be large
-        // and DLNA renderers may buffer slowly.  Orphaned sessions from
-        // gapless prep or interrupted playback are cleaned up sooner by
-        // the orchestrator; this GC is the safety net.
         sessions.retain(|id, s| {
             if s.is_radio {
                 return true;
             }
             let age = s.created_at.elapsed();
-            if age > std::time::Duration::from_secs(1800) {
-                // Check for temp transcode file to clean up.
-                // We can't .await inside retain, so use try_lock.
-                if let Ok(fp) = s.file_path.try_lock() {
-                    if let Some(ref path) = *fp {
-                        if is_temp_transcode_file(path) {
-                            temp_files_to_remove.push(path.clone());
-                        }
+            // Relire l'activité : `bytes_sent` est monotone, donc « la valeur
+            // a bougé depuis le balayage précédent » suffit à dater la
+            // dernière fois que des octets sont partis.
+            let sent = s.bytes_sent.load(Relaxed);
+            if sent != s.gc_seen_bytes.swap(sent, Relaxed) {
+                s.gc_active_at_ms.store(age.as_millis() as u64, Relaxed);
+            }
+            let idle = age.saturating_sub(std::time::Duration::from_millis(
+                s.gc_active_at_ms.load(Relaxed),
+            ));
+            let reason = if idle > idle_timeout {
+                "idle"
+            } else if age > absolute_cap {
+                "absolute_cap"
+            } else {
+                return true;
+            };
+            // Check for temp transcode file to clean up.
+            // We can't .await inside retain, so use try_lock.
+            if let Ok(fp) = s.file_path.try_lock() {
+                if let Some(ref path) = *fp {
+                    if is_temp_transcode_file(path) {
+                        temp_files_to_remove.push(path.clone());
                     }
                 }
-                info!(stream_id = %id, age_secs = age.as_secs(), "stale_session_removed");
-                false
-            } else {
-                true
             }
+            info!(
+                stream_id = %id,
+                age_secs = age.as_secs(),
+                idle_secs = idle.as_secs(),
+                reason,
+                "stale_session_removed"
+            );
+            false
         });
         let after = sessions.len();
         drop(sessions);
@@ -1326,5 +1409,174 @@ mod tests {
         };
         let expected = 256_487u64 * 96000 * 2 * 3 / 1000 + 44;
         assert_eq!(info.wav_content_length(), Some(expected));
+    }
+
+    // ─── Péremption des sessions : activité, pas âge (#2536) ────────
+    //
+    // Les bornes réelles se comptent en dizaines de minutes ; les tests
+    // injectent les leurs (`cleanup_stale_sessions_with`) et jouent sur des
+    // centaines de millisecondes. Aucune horloge n'est simulée : `created_at`
+    // est un `std::time::Instant`, que `tokio::time::pause()` n'atteint pas.
+    // Les marges sont donc prises larges (au moins 3×) pour qu'une machine
+    // chargée ne fasse pas basculer un verdict.
+
+    fn info_de_test() -> StreamInfo {
+        StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            ..Default::default()
+        }
+    }
+
+    /// Simuler ce que fait le corps HTTP : servir des octets.
+    async fn servir_des_octets(streamer: &AudioStreamer, id: &str) {
+        let sessions = streamer.sessions_state();
+        let guard = sessions.lock().await;
+        if let Some(s) = guard.get(id) {
+            s.bytes_sent
+                .fetch_add(65_536, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    async fn session_presente(streamer: &AudioStreamer, id: &str) -> bool {
+        streamer.sessions_state().lock().await.contains_key(id)
+    }
+
+    async fn patienter(ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
+    /// Une image de CD d'une heure débite pendant des heures : son âge n'a
+    /// jamais rien dit de son état. Tant que des octets partent, elle vit.
+    #[tokio::test]
+    async fn une_session_qui_debite_survit_a_son_age() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+
+        let inactivite = std::time::Duration::from_millis(1_500);
+        let plafond = std::time::Duration::from_secs(3_600);
+
+        // 2 s de lecture continue, soit bien au-delà de la borne d'inactivité.
+        for _ in 0..8 {
+            servir_des_octets(&streamer, &id).await;
+            patienter(250).await;
+            streamer
+                .cleanup_stale_sessions_with(inactivite, plafond)
+                .await;
+        }
+
+        assert!(
+            session_presente(&streamer, &id).await,
+            "une session dont les octets partent encore ne doit jamais être ramassée"
+        );
+    }
+
+    /// Le piège symétrique : une session abandonnée doit toujours partir.
+    #[tokio::test]
+    async fn une_session_muette_est_ramassee() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+
+        patienter(900).await;
+        let retires = streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+
+        assert_eq!(retires, 1, "une session qui n'a jamais servi un octet fuit");
+        assert!(!session_presente(&streamer, &id).await);
+    }
+
+    /// Reprise après une pause : le compteur d'inactivité repart de zéro.
+    #[tokio::test]
+    async fn la_reprise_d_activite_relance_le_compteur() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+
+        let inactivite = std::time::Duration::from_millis(1_000);
+        let plafond = std::time::Duration::from_secs(3_600);
+
+        // Silence court : sous la borne, la session reste.
+        patienter(400).await;
+        streamer
+            .cleanup_stale_sessions_with(inactivite, plafond)
+            .await;
+        assert!(session_presente(&streamer, &id).await);
+
+        // La lecture reprend.
+        servir_des_octets(&streamer, &id).await;
+        patienter(400).await;
+        streamer
+            .cleanup_stale_sessions_with(inactivite, plafond)
+            .await;
+        assert!(session_presente(&streamer, &id).await);
+
+        // Nouveau silence, court lui aussi : l'âge dépasse la borne, pas
+        // l'inactivité. C'est ici que l'ancien critère la ramassait.
+        patienter(400).await;
+        streamer
+            .cleanup_stale_sessions_with(inactivite, plafond)
+            .await;
+        assert!(
+            session_presente(&streamer, &id).await,
+            "l'activité intermédiaire doit avoir remis le compteur à zéro"
+        );
+
+        // Silence long : cette fois elle part.
+        patienter(1_400).await;
+        let retires = streamer
+            .cleanup_stale_sessions_with(inactivite, plafond)
+            .await;
+        assert_eq!(retires, 1);
+        assert!(!session_presente(&streamer, &id).await);
+    }
+
+    /// Le filet : une session qui débite sans fin ne vit pas pour autant
+    /// éternellement — mémoire, fichier temporaire et socket amont se libèrent.
+    #[tokio::test]
+    async fn le_plafond_absolu_ramasse_une_session_eternellement_active() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+
+        let inactivite = std::time::Duration::from_secs(3_600);
+        let plafond = std::time::Duration::from_millis(600);
+
+        let mut retires = 0;
+        for _ in 0..5 {
+            servir_des_octets(&streamer, &id).await;
+            patienter(200).await;
+            retires += streamer
+                .cleanup_stale_sessions_with(inactivite, plafond)
+                .await;
+        }
+
+        assert_eq!(
+            retires, 1,
+            "le plafond absolu doit finir par reprendre une session sans fin"
+        );
+        assert!(!session_presente(&streamer, &id).await);
+    }
+
+    /// La radio reste hors du ramasse-miettes, comme avant.
+    #[tokio::test]
+    async fn la_radio_reste_exemptee_des_deux_bornes() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
+
+        patienter(300).await;
+        let retires = streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+        assert_eq!(retires, 0);
+        assert!(session_presente(&streamer, &id).await);
     }
 }

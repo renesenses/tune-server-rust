@@ -1532,6 +1532,24 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "message": format!("Zone {} max latency {}ms", zone_id, m.max_latency_ms),
             }));
         }
+        // #2493 : l'appareil annonce toujours jouer alors que la position a
+        // atteint — ou depasse — la duree de la piste depuis une minute. Le
+        // sondeur ne coupe rien (une duree fausse produit la meme forme qu'une
+        // lecture bloquee), mais il refuse de laisser le diagnostic annoncer
+        // une lecture saine.
+        if m.lecture_au_dela_de_la_duree {
+            issues.push(json!({
+                "severity": "warning",
+                "type": "zone_playback_beyond_duration",
+                "zone_id": zone_id,
+                "message": format!(
+                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
+                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
+                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
+                     dans le journal."
+                ),
+            }));
+        }
     }
     drop(metrics);
 

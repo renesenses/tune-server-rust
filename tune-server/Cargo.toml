@@ -92,6 +92,9 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only : fabriquer des horodatages passés pour rejouer une machine restée
+# hors ligne (tests/licence_grace_visible.rs, #1999).
+chrono = { workspace = true }
 # Test-only: implementing `TunePlugin` and giving it a scratch data dir in
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }

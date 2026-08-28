@@ -87,6 +87,16 @@ pub struct ZonePollerMetrics {
     pub consecutive_errors: u8,
     pub last_latency_ms: u32,
     pub max_latency_ms: u32,
+    /// L'appareil annonce toujours jouer alors que la position est arrivee a la
+    /// fin de la piste — ou l'a depassee — depuis [`DEPASSEMENT_DUREE_TICKS`]
+    /// ticks consecutifs (#2493).
+    ///
+    /// Champ de CONSTAT, jamais de commande : rien dans le sondeur ne s'appuie
+    /// dessus pour avancer ou arreter une piste. Il existe pour qu'un
+    /// diagnostic de zone cesse d'affirmer une lecture normale quand Tune sait
+    /// deja qu'elle ne l'est pas — soit la lecture est bloquee, soit la duree
+    /// connue est fausse, et le sondeur ne peut pas trancher entre les deux.
+    pub lecture_au_dela_de_la_duree: bool,
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
@@ -207,6 +217,17 @@ const POSITION_PAST_END_TICKS: u8 = 3;
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
 const POLL_FAIL_END_MIN_ERRORS: u8 = 2;
+/// Ticks de scrutation (~1 s) pendant lesquels la position doit rester collee a
+/// la fin — ou au-dela — avant que Tune ose DIRE que l'etat annonce ne veut plus
+/// rien dire (#2493).
+///
+/// Vingt fois [`POSITION_PAST_END_TICKS`] : tous les detecteurs de fin de piste
+/// agissent en trois ticks. Ce compteur ne commence donc a compter que la ou ils
+/// ont TOUS deja renonce, et n'atteint son seuil qu'une minute plus tard. Une
+/// transition sans blanc, une reprise apres pause, une fin de piste normale sont
+/// toutes reglees bien avant — le compteur repart de zero a chaque changement de
+/// piste et des que la position quitte la zone de fin.
+const DEPASSEMENT_DUREE_TICKS: u8 = 60;
 /// After a gapless metadata advance (the poller called advance_queue_metadata
 /// expecting the renderer to auto-transition), if the renderer stays Stopped
 /// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
@@ -217,6 +238,20 @@ const GAPLESS_STUCK_THRESHOLD: u8 = 2;
 /// does not overwrite the volume with the renderer-reported value. Prevents
 /// the slider from bouncing back on DLNA renderers with latent GetVolume.
 const VOLUME_GRACE_SECS: u64 = 5;
+
+/// Délai au-delà duquel une lecture dont pas un octet n'a été tiré n'est plus
+/// un démarrage lent mais un silence établi.
+///
+/// C'est le seuil que `output_reach` utilisait déjà pour dire
+/// `browser_unattended` au client (`tune-server/src/routes/zones.rs`) : le
+/// client web branche son `<audio>` sur `stream_url` dès qu'il a l'état de la
+/// zone, et les premiers octets partent en une seconde ou deux. Douze secondes
+/// laissent de la marge à un poste lent sans laisser l'utilisateur dans le noir.
+///
+/// Il vit ici, dans `tune-core`, parce que le poller et la vue des zones
+/// doivent trancher au MÊME instant : deux seuils, et le serveur dirait à la
+/// fois « personne ne reçoit ce son » et « en lecture ».
+pub const DELAI_SILENCE_ETABLI: Duration = Duration::from_secs(12);
 
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
@@ -290,15 +325,75 @@ pub(crate) mod decisions {
     }
 
     use super::{
-        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS,
-        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
-        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS,
+        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
+        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
+        POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD,
     };
 
     /// Margin (ms) added to the track duration before position-based
     /// end-of-track is accepted, to avoid clipping the last fraction of a
     /// second on renderers that report position slightly ahead of playback.
     pub const END_MARGIN_MS: u64 = 3000;
+
+    /// Motif — stable, journalisé — de la branche qui a conclu « la piste est
+    /// finie ». Un seul mot par branche, écrit tel quel dans `track_end_gap`.
+    ///
+    /// Ce ne sont PAS des étiquettes décoratives : chaque branche porte un
+    /// plancher de silence différent (voir [`plancher_de_detection_ms`]), et
+    /// c'est ce plancher qui décide si un blanc de 3-4 s est explicable par la
+    /// détection ou s'il vient d'ailleurs (#2488).
+    pub mod motif_fin {
+        /// La sortie locale a signalé l'EOF elle-même (`ended_naturally`).
+        pub const FIN_NATURELLE_LOCALE: &str = "local_ended_naturally";
+        /// DSD sur DLNA : le pic de position a atteint la fin (#402).
+        pub const DSD_DLNA_PIC_ATTEINT: &str = "dlna_dsd_reached_end";
+        /// Le renderer annonce `Stopped` et le compteur a atteint son seuil.
+        pub const FIN_NATURELLE_APRES_STOPPED: &str = "natural_end_after_stopped";
+        /// Le renderer avait accepté `SetNext` mais n'a jamais transitionné.
+        pub const AVANCE_GAPLESS_BLOQUEE: &str = "gapless_advance_stuck";
+        /// La position a dépassé la fin sans que le renderer s'arrête.
+        pub const POSITION_AU_DELA_DE_LA_FIN: &str = "position_past_end";
+    }
+
+    /// Plancher de silence, en millisecondes, imposé par la BRANCHE de
+    /// détection qui a conclu — avant même que la résolution de la piste
+    /// suivante ne commence.
+    ///
+    /// Pourquoi ce chiffre existe (#2488) : `playback_timing` démarre à
+    /// `play_inner`, c'est-à-dire APRÈS que le sondeur a décidé d'avancer.
+    /// Tout ce qui précède cette décision est aujourd'hui invisible dans le
+    /// journal, alors que c'est structurellement le plus gros terme du blanc
+    /// entre deux pistes. Cette fonction rend ce terme lisible sans avoir à
+    /// relire la source : elle ne dérive que des constantes du sondeur.
+    ///
+    /// C'est un PLANCHER, pas une mesure : le temps réel s'y ajoute (un tick
+    /// n'est pas aligné sur la fin du morceau, et le réseau a son mot à dire).
+    ///
+    /// Un motif inconnu rend `0` — on ne devine pas.
+    pub fn plancher_de_detection_ms(motif: &str) -> u64 {
+        let tick = POLL_INTERVAL_MS;
+        match motif {
+            // La sortie locale réveille le sondeur par `TRACK_END_NOTIFY`
+            // au lieu d'attendre le tick : aucun plancher de sondage.
+            motif_fin::FIN_NATURELLE_LOCALE => 0,
+            // Il faut UN sondage pour observer que le pic a atteint la fin.
+            motif_fin::DSD_DLNA_PIC_ATTEINT => tick,
+            // Le compteur `stopped_ticks` doit atteindre son seuil.
+            motif_fin::FIN_NATURELLE_APRES_STOPPED => STOPPED_TICKS_THRESHOLD as u64 * tick,
+            // Compté depuis la fin de la temporisation gapless, qui s'ajoute
+            // encore devant : le renderer a accepté `SetNext` puis n'a rien
+            // fait, et on attend `GAPLESS_STUCK_THRESHOLD` sondages.
+            motif_fin::AVANCE_GAPLESS_BLOQUEE => GAPLESS_STUCK_THRESHOLD as u64 * tick,
+            // La position doit d'abord dépasser la fin de `END_MARGIN_MS`
+            // — autant de silence déjà écoulé — puis tenir
+            // `POSITION_PAST_END_TICKS` sondages.
+            motif_fin::POSITION_AU_DELA_DE_LA_FIN => {
+                END_MARGIN_MS + POSITION_PAST_END_TICKS as u64 * tick
+            }
+            _ => 0,
+        }
+    }
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -691,6 +786,45 @@ pub(crate) mod decisions {
             && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// UN tick ou l'etat annonce se contredit lui-meme : la piste a une duree
+    /// connue, et la position rapportee est arrivee a la fin — ou l'a depassee —
+    /// alors que l'appareil dit toujours jouer (#2493, Tades : 1'46 « en
+    /// lecture » depuis dix minutes sur une Serenade/upmpdcli).
+    ///
+    /// Ce predicat ne DECIDE rien : l'appelant s'en sert uniquement pour
+    /// compter, puis pour le DIRE. Aucune piste n'est avancee ni arretee par ce
+    /// chemin, et c'est delibere — la meme forme est produite par deux causes
+    /// qu'aucune horloge ne sait distinguer :
+    ///
+    /// - la lecture est reellement bloquee (le renderer ment sur son etat) ;
+    /// - la duree que Tune connait est FAUSSE (etiquette erronee, piste plus
+    ///   longue que ce que le scan a mesure) et la lecture est parfaitement
+    ///   valide.
+    ///
+    /// Couper dans le second cas amputerait une ecoute legitime. On se contente
+    /// donc de cesser d'affirmer ce qu'on ne sait pas.
+    ///
+    /// Ce que le predicat refuse de qualifier :
+    /// - `source_radio` : un flux de radio n'a pas de fin, sa position n'a rien
+    ///   a depasser ;
+    /// - `duree_connue_ms` nulle ou derisoire : sans duree il n'y a pas de
+    ///   depassement possible — le seuil reprend celui de [`past_end_reached`]
+    ///   ([`END_MARGIN_MS`]) pour que les deux parlent de la meme « fin ».
+    ///
+    /// La duree passee par l'appelant est la duree EFFECTIVE
+    /// (`max(file d'attente, sane_current_duration)`) : une duree de base trop
+    /// courte face a un renderer credible est deja elargie la, donc le cas « le
+    /// scan a sous-estime la piste » ne remonte meme pas jusqu'ici.
+    pub fn position_au_dela_de_la_duree(
+        source_radio: bool,
+        duree_connue_ms: u64,
+        position_ms: u64,
+    ) -> bool {
+        !source_radio
+            && duree_connue_ms > END_MARGIN_MS
+            && position_ms.saturating_add(END_MARGIN_MS) >= duree_connue_ms
+    }
+
     /// Position to persist for auto-resume. A position within `END_MARGIN_MS`
     /// of the track end means the track is effectively complete; persist 0 so a
     /// later auto-resume plays it from the start instead of seeking into the
@@ -771,6 +905,42 @@ pub(crate) mod decisions {
         interval_secs: u64,
     ) -> bool {
         is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
+    }
+
+    /// Une lecture sans destination doit-elle cesser d'être annoncée ?
+    ///
+    /// Une zone sans périphérique de sortie prépare son flux, renonce à
+    /// l'envoyer (`no_output_device_id_skipping_send_to_output`) et passe
+    /// quand même en lecture : `orchestrator_play … output_sent=false`. Rien
+    /// ne revenait ensuite sur cet état — la branche « pas de périphérique »
+    /// du poller se termine par un `continue` — et la zone restait annoncée
+    /// « en cours » indéfiniment, barre de progression comprise (#2630,
+    /// journal de Pierre M).
+    ///
+    /// **Ce que ce prédicat ne regarde surtout pas : la présence d'un
+    /// périphérique.** Une zone navigateur n'en a JAMAIS — sa sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. Une garde « pas de
+    /// périphérique ⇒ pas de lecture » les rendrait toutes muettes ; c'est la
+    /// régression exacte de `70401f2d`, réparée par #2657. Le seul fait
+    /// observable est la CONSOMMATION du flux, et c'est la même preuve que
+    /// `output_reach` utilise déjà pour dire `browser_unattended`.
+    ///
+    /// On n'abandonne donc que sur des faits POSITIFS :
+    /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
+    ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
+    ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
+    /// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+    ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
+    ///   de silence : on laisse la lecture tranquille.
+    ///
+    /// Le sens du doute est celui de #2657 : on préfère taire un silence réel
+    /// que d'en inventer un.
+    pub fn lecture_sans_destination_abandonnee(
+        depuis_le_demarrage: Option<std::time::Duration>,
+        octets_servis: Option<u64>,
+    ) -> bool {
+        depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
+            && octets_servis == Some(0)
     }
 
     /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
@@ -951,6 +1121,103 @@ pub(crate) mod decisions {
             && queue_duration_ms > END_MARGIN_MS
             && wall_elapsed_secs.saturating_mul(1000)
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+}
+
+/// #2493 — Tades : « un morceau de Turapin (1'46) tourne depuis 10 minutes »
+/// (HIFIMAN Serenade, pile UPnP `upmpdcli`, 26/08).
+///
+/// Ce que ces tests tiennent, et ce qu'ils refusent de tenir.
+#[cfg(test)]
+mod depassement_duree_tests {
+    use super::decisions::{END_MARGIN_MS, position_au_dela_de_la_duree};
+
+    /// Duree reelle du morceau du signalement : 1 min 46 s.
+    const TURAPIN_MS: u64 = 106_000;
+    /// Dix minutes : ce que le testeur a vu defiler.
+    const DIX_MINUTES_MS: u64 = 600_000;
+
+    /// La forme du signalement : duree connue, position tres au-dela.
+    #[test]
+    fn position_tres_au_dela_de_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "une position de dix minutes sur une piste de 1'46 doit etre constatee"
+        );
+    }
+
+    /// La forme que l'ecran MONTRE reellement : la position rendue au client est
+    /// plafonnee a la duree (voir le `min(dur)` du sondeur), donc le testeur lit
+    /// « 1:46 / 1:46, en lecture » indefiniment. Le constat doit tenir sur cette
+    /// forme-la aussi, sinon il ne couvre pas le cas observe.
+    #[test]
+    fn position_collee_a_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS),
+            "position figee EXACTEMENT a la duree : c'est ce que le testeur voit"
+        );
+    }
+
+    /// Une radio n'a pas de fin : sa position ne depasse rien, quelle qu'elle
+    /// soit et quelle que soit la duree que quelqu'un aurait cru y lire.
+    #[test]
+    fn une_radio_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(true, 0, DIX_MINUTES_MS),
+            "radio sans duree : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(true, TURAPIN_MS, DIX_MINUTES_MS),
+            "meme si une duree traine dans les metadonnees, une radio reste hors sujet"
+        );
+        // Contre-epreuve de la garde `source_radio` : memes chiffres, source
+        // ordinaire — la, et la seulement, le constat tombe.
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "la garde ne doit tenir QUE sur la radio, sinon elle ne prouve rien"
+        );
+    }
+
+    /// Duree nulle ou derisoire : il n'y a rien a depasser. Le seuil est le meme
+    /// que celui de `past_end_reached` — les deux doivent parler de la meme
+    /// « fin », sans quoi Tune constaterait un depassement la ou son propre
+    /// detecteur de fin de piste ne voit meme pas de piste.
+    #[test]
+    fn une_duree_nulle_ou_absente_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, 0, DIX_MINUTES_MS),
+            "duree inconnue (0) : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(false, END_MARGIN_MS, DIX_MINUTES_MS),
+            "duree egale a la marge de fin : sous le seuil de `past_end_reached`"
+        );
+        // Contre-epreuve : une milliseconde de plus que la marge, et la duree
+        // devient exploitable.
+        assert!(
+            position_au_dela_de_la_duree(false, END_MARGIN_MS + 1, DIX_MINUTES_MS),
+            "juste au-dessus de la marge, la duree redevient une duree"
+        );
+    }
+
+    /// Une lecture ordinaire en plein milieu de piste n'est jamais constatee —
+    /// c'est la garde qui empeche ce chemin de parler a tort une fois par
+    /// seconde sur toutes les zones du parc.
+    #[test]
+    fn une_lecture_en_cours_de_piste_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS / 2),
+            "a mi-piste, rien a signaler"
+        );
+        // Bord exact : la zone de fin commence a duree - END_MARGIN_MS.
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS - 1),
+            "une milliseconde AVANT la zone de fin : encore une lecture ordinaire"
+        );
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS),
+            "au bord exact de la zone de fin, le constat est possible"
+        );
     }
 }
 
@@ -1980,6 +2247,20 @@ struct ZonePollState {
     /// Consecutive `Playing` polls with neither renderer position nor served
     /// bytes progressing. See `decisions::dlna_playing_stall_eligible`.
     playing_stall_ticks: u8,
+    /// Ticks CONSECUTIFS ou la position rapportee est a la fin de la piste — ou
+    /// au-dela — alors que l'appareil annonce toujours jouer. Voir
+    /// [`decisions::position_au_dela_de_la_duree`] et [`DEPASSEMENT_DUREE_TICKS`].
+    ///
+    /// Compte dans le bras `Playing` uniquement : une zone en pause n'y passe
+    /// pas, donc une pause de vingt minutes ne gonfle pas ce compteur — c'est
+    /// precisement ce que l'horloge murale (`track_started_at`, jamais repliee
+    /// a la reprise) ne sait pas faire. Remis a zero des que la position quitte
+    /// la zone de fin, et a chaque changement de piste.
+    depassement_duree_ticks: u8,
+    /// Latch par piste : l'incoherence a deja ete DITE une fois (journal +
+    /// metrique de zone). Sans lui la boucle ecrirait la meme ligne chaque
+    /// seconde pendant tout le temps que dure le blocage.
+    depassement_duree_signale: bool,
     /// Ticks pendant lesquels on a refusé de conclure à une fin naturelle parce
     /// que le flux servi était manifestement incomplet (voir
     /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
@@ -2054,6 +2335,8 @@ impl ZonePollState {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -2325,6 +2608,91 @@ impl PositionPoller {
                 }
             }
         }
+    }
+
+    /// Une lecture que personne ne reçoit cesse d'être annoncée « en cours ».
+    ///
+    /// Rend `true` si la zone a été arrêtée. Appelée par le tick UNIQUEMENT
+    /// dans la branche « zone sans périphérique de sortie » : c'est là, et
+    /// seulement là, que l'état « en lecture » ne repose sur rien. Une zone
+    /// avec périphérique a déjà ses propres chiens de garde
+    /// (`output_reported_failure_stopping_zone`,
+    /// `dlna_playing_without_progress_stopping_zone`, `demarrage_mort`).
+    ///
+    /// Le verdict lui-même est dans
+    /// [`decisions::lecture_sans_destination_abandonnee`] — et il ne regarde
+    /// PAS la présence d'un périphérique, seulement la consommation du flux.
+    /// Une zone navigateur dont l'onglet joue sert des octets et n'est jamais
+    /// touchée ici.
+    async fn abandonner_lecture_sans_destination(
+        &self,
+        zone_state: &crate::playback::ZoneState,
+    ) -> bool {
+        let zone_id = zone_state.zone_id;
+        let octets_servis = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        if !decisions::lecture_sans_destination_abandonnee(
+            zone_state.last_play_started_at.map(|t| t.elapsed()),
+            octets_servis,
+        ) {
+            return false;
+        }
+
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten();
+        let navigateur = zone.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+        // La zone navigateur et la zone orpheline produisent le même silence,
+        // mais pas le même geste : ouvrir un onglet, ou attribuer une sortie.
+        // Le message dit lequel. Le second reprend mot pour mot la sentinelle
+        // que le client sait déjà traduire (`zone_no_output_device`).
+        let message = if navigateur {
+            "zone_browser_unattended:No browser tab is playing this zone — open Tune in a browser \
+             on the computer that should play, or give this zone an output device."
+                .to_string()
+        } else {
+            format!(
+                "zone_no_output_device:Zone '{}' has no output device assigned — assign an output \
+                 device to this zone or delete it and re-create it from a device.",
+                zone.as_ref().map(|z| z.name.as_str()).unwrap_or("?")
+            )
+        };
+        warn!(
+            zone_id,
+            navigateur,
+            title = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.title.as_str())
+                .unwrap_or(""),
+            "lecture_sans_destination_abandonnee"
+        );
+        if let Some(ref bus) = self.event_bus {
+            // `fatal` : rien ne se rétablira tout seul, et la zone s'arrête
+            // juste après — sans ce drapeau la fenêtre de grâce d'après-lecture
+            // du client avalerait le message, et l'utilisateur n'aurait, une
+            // fois de plus, que le silence.
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": true,
+                }),
+            );
+        }
+        // Sans identifiant d'appareil, `stop` prend son repli — celui que
+        // #2658 vient de borner au périmètre de la zone. Avant elle, arrêter
+        // une zone navigateur coupait la musique de TOUTES les autres.
+        self.orchestrator.stop(zone_id, None).await;
+        true
     }
 
     async fn tick(
@@ -2671,6 +3039,18 @@ impl PositionPoller {
                             .confirmer_lecture_navigateur(zone_id, stream_id)
                             .await;
                     }
+
+                    // … et le versant symétrique : l'ABSENCE de preuve.
+                    //
+                    // #2657 a appris à cette branche à LIBÉRER l'annonce quand
+                    // l'onglet tire le flux. Rien ne lui apprenait à RENONCER
+                    // quand personne ne le tire : la zone restait « en
+                    // lecture » pour toujours, barre de progression comprise,
+                    // alors que le démarrage avait déjà renoncé à envoyer quoi
+                    // que ce soit (`output_sent=false`, #2630).
+                    if self.abandonner_lecture_sans_destination(zone_state).await {
+                        poll_states.remove(&zone_id);
+                    }
                     continue;
                 }
             };
@@ -2732,6 +3112,9 @@ impl PositionPoller {
                 ps.gapless_stuck_ticks = 0;
                 // Re-arm the DLNA poll-fail wall-clock fallback for the new track.
                 ps.wall_clock_end_fired = false;
+                // Le constat de depassement vaut pour UNE piste (#2493).
+                ps.depassement_duree_ticks = 0;
+                ps.depassement_duree_signale = false;
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
@@ -3029,6 +3412,10 @@ impl PositionPoller {
                         consecutive_errors: ps.consecutive_errors,
                         last_latency_ms: ps.last_latency_ms,
                         max_latency_ms: ps.max_latency_ms,
+                        // Chemin RADIO : un flux sans fin ne depasse aucune
+                        // duree, et ce bras n'evalue meme pas le predicat
+                        // (#2493). Constat toujours faux, par construction.
+                        lecture_au_dela_de_la_duree: false,
                     },
                 );
 
@@ -3424,6 +3811,11 @@ impl PositionPoller {
             let in_gapless_guard = ps.gapless_sent_at.is_some();
 
             let mut track_ended = false;
+            // Quelle branche a conclu « la piste est finie ». Journalisé tel
+            // quel par `track_end_gap` au moment d'enchaîner (#2488) : sans
+            // lui, le journal ne dit pas laquelle des cinq portes de sortie a
+            // servi, et donc pas quel plancher de silence a été payé.
+            let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
             let mut force_stop_demarrage_mort = false;
 
@@ -3583,6 +3975,7 @@ impl PositionPoller {
                             ps.gapless_stuck_ticks = 0;
                             ps.stopped_ticks = 0;
                             track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE;
                         } else {
                             fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
@@ -3610,6 +4003,7 @@ impl PositionPoller {
                             "local_output_ended_naturally_advancing"
                         );
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::FIN_NATURELLE_LOCALE;
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
@@ -3627,6 +4021,7 @@ impl PositionPoller {
                         );
                         ps.stopped_ticks = 0;
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::DSD_DLNA_PIC_ATTEINT;
                     } else {
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
@@ -3734,6 +4129,8 @@ impl PositionPoller {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         track_ended = true;
+                                        motif_fin_de_piste =
+                                            decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
                                     } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
                                         // On laisse au renderer le temps de
                                         // reprendre : s'il repart, il repassera
@@ -3869,6 +4266,12 @@ impl PositionPoller {
                         .and_then(|z| z.output_type.as_deref())
                         .unwrap_or("");
                     let is_dlna = output_type_str == "dlna";
+                    // Un flux de radio n'a pas de fin : sa position ne peut rien
+                    // depasser (#2493).
+                    let source_est_radio = zone_state
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.source == "radio");
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -4232,9 +4635,69 @@ impl PositionPoller {
                             );
                             track_ended = true;
                             fsm_pact.past_end_track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN;
                         }
                     } else {
                         ps.past_end_ticks = 0;
+                    }
+
+                    // #2493 — Tades : « un morceau de 1'46 tourne depuis dix
+                    // minutes » (Serenade/upmpdcli). Aucun des cinq detecteurs
+                    // ci-dessus n'a agi, et la position montree a l'ecran est
+                    // plafonnee a la duree : le testeur voit « 1:46 / 1:46, en
+                    // lecture » indefiniment. Tune n'a alors plus le droit de
+                    // presenter cet etat comme une lecture ordinaire.
+                    //
+                    // Ce bloc ne touche NI `track_ended` NI `force_stop`. La
+                    // meme forme est produite par une lecture bloquee et par une
+                    // duree fausse (etiquette erronee, piste reellement plus
+                    // longue) : couper reviendrait a amputer une ecoute valide
+                    // une fois sur deux. On DIT, on n'agit pas — voir
+                    // `decisions::position_au_dela_de_la_duree`.
+                    //
+                    // Complementaire de #2116 juste en dessous, qui exclut
+                    // explicitement la zone de fin (`near_known_end`) : celui-la
+                    // couvre la position gelee AVANT la fin, celui-ci la
+                    // position collee A la fin.
+                    if decisions::position_au_dela_de_la_duree(
+                        source_est_radio,
+                        effective_end_duration_ms,
+                        status.position_ms,
+                    ) {
+                        ps.depassement_duree_ticks = ps.depassement_duree_ticks.saturating_add(1);
+                    } else {
+                        ps.depassement_duree_ticks = 0;
+                        ps.depassement_duree_signale = false;
+                    }
+                    if !track_ended
+                        && ps.depassement_duree_ticks >= DEPASSEMENT_DUREE_TICKS
+                        && !ps.depassement_duree_signale
+                    {
+                        ps.depassement_duree_signale = true;
+                        // Les trois inconnues que le ticket reclamait faute de
+                        // journal : la position est-elle figee, reboucle-t-elle,
+                        // et des octets sont-ils encore servis ?
+                        let octets_servis = match zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.stream_id.as_deref())
+                        {
+                            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                            None => None,
+                        };
+                        warn!(
+                            zone_id,
+                            output_type = output_type_str,
+                            position_ms = status.position_ms,
+                            peak_position_ms = ps.peak_position_ms,
+                            duree_file_ms = track_duration_ms,
+                            duree_rapportee_ms = status.duration_ms,
+                            duree_effective_ms = effective_end_duration_ms,
+                            wall_secs = wall_elapsed,
+                            ticks = ps.depassement_duree_ticks,
+                            ?octets_servis,
+                            "lecture_annoncee_au_dela_de_la_duree"
+                        );
                     }
 
                     // #2116: a renderer can acknowledge Play forever while
@@ -4324,6 +4787,7 @@ impl PositionPoller {
                     consecutive_errors: ps.consecutive_errors,
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
+                    lecture_au_dela_de_la_duree: ps.depassement_duree_signale,
                 },
             );
 
@@ -4373,6 +4837,33 @@ impl PositionPoller {
                         .await;
                 }
             } else if track_ended {
+                // #2488 — la moitié invisible du blanc entre deux pistes.
+                //
+                // `playback_timing` (orchestrator) démarre à `play_inner`,
+                // donc APRÈS cette décision : tout ce que le sondeur a attendu
+                // pour conclure « c'est fini » n'apparaît nulle part. Sur un
+                // renderer réseau ce terme domine — de 0 ms (la sortie locale
+                // réveille le sondeur) à plusieurs secondes selon la branche.
+                // Une seule ligne, ici, au seul entonnoir d'avance côté
+                // serveur, avec le nom de la branche et son plancher.
+                let etat = poll_states.get(&zone_id);
+                info!(
+                    zone_id,
+                    motif = motif_fin_de_piste,
+                    plancher_ms = decisions::plancher_de_detection_ms(motif_fin_de_piste),
+                    stopped_ticks = etat.map(|p| p.stopped_ticks).unwrap_or(0),
+                    past_end_ticks = etat.map(|p| p.past_end_ticks).unwrap_or(0),
+                    gapless_sent = etat.map(|p| p.gapless_sent).unwrap_or(false),
+                    peak_pos = etat.map(|p| p.peak_position_ms).unwrap_or(0),
+                    track_dur = track_duration_ms,
+                    wall_secs = wall_elapsed,
+                    output = all_zones
+                        .iter()
+                        .find(|z| z.id == Some(zone_id))
+                        .and_then(|z| z.output_type.as_deref())
+                        .unwrap_or(""),
+                    "track_end_gap"
+                );
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
@@ -5237,6 +5728,61 @@ impl PositionPoller {
 #[cfg(test)]
 mod tests {
 
+    /// #2488 — le plancher de silence de chaque branche de fin de piste.
+    ///
+    /// Ces assertions ne décorent pas le code : elles VERROUILLENT le chiffre
+    /// qu'un journal de testeur permettra d'imputer. Si quelqu'un touche
+    /// `STOPPED_TICKS_THRESHOLD`, `POSITION_PAST_END_TICKS`, `END_MARGIN_MS`
+    /// ou l'intervalle de sondage, le plancher annoncé dans `track_end_gap`
+    /// change — et ces tests l'annoncent au lieu de laisser une ligne de
+    /// journal mentir en silence.
+    mod plancher_de_detection {
+        use crate::poller::decisions::{motif_fin, plancher_de_detection_ms};
+
+        /// La sortie locale réveille le sondeur par `TRACK_END_NOTIFY` au lieu
+        /// d'attendre son tick : elle ne paie AUCUN plancher de sondage. C'est
+        /// la borne basse de toute la table, et ce qui distingue le chemin
+        /// local des chemins réseau.
+        #[test]
+        fn la_fin_naturelle_locale_ne_coute_aucun_sondage() {
+            assert_eq!(plancher_de_detection_ms(motif_fin::FIN_NATURELLE_LOCALE), 0);
+        }
+
+        /// Les quatre branches réseau, du moins cher au plus cher. Le blanc
+        /// rapporté par Stéphane Villerio vaut 3 à 4 s : seule la branche DSD
+        /// sur DLNA (1 s) laisse la place aux étapes suivantes dans cette
+        /// enveloppe — les deux dernières (5 s et 6 s) la dépassent à elles
+        /// seules, donc ce n'est pas elles qu'il subit.
+        #[test]
+        fn les_branches_reseau_portent_chacune_leur_plancher() {
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::DSD_DLNA_PIC_ATTEINT),
+                1_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::AVANCE_GAPLESS_BLOQUEE),
+                2_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::FIN_NATURELLE_APRES_STOPPED),
+                5_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::POSITION_AU_DELA_DE_LA_FIN),
+                6_000
+            );
+        }
+
+        /// Un motif que la table ne connaît pas rend `0` : le journal n'annonce
+        /// jamais un chiffre inventé. C'est aussi le cas de la valeur initiale
+        /// (chaîne vide) si une future branche oubliait de se nommer.
+        #[test]
+        fn un_motif_inconnu_ne_promet_rien() {
+            assert_eq!(plancher_de_detection_ms(""), 0);
+            assert_eq!(plancher_de_detection_ms("branche_inventee"), 0);
+        }
+    }
+
     mod tenue_du_renderer {
         use crate::poller::decisions::{TenueDuRenderer, qui_tient_le_renderer};
 
@@ -5507,6 +6053,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -5564,6 +6112,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -5866,6 +6416,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -6663,6 +7215,8 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -6869,6 +7423,8 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
@@ -7502,6 +8058,408 @@ mod annonce_navigateur_guard {
             "l'annonce des zones navigateur n'est plus libérée dans la branche \
              « zone sans périphérique » : plus aucune zone navigateur ne \
              scrobblerait, sans le moindre message (#1998)."
+        );
+    }
+
+    /// Garde-fou #2630, versant symétrique du précédent.
+    ///
+    /// L'abandon d'une lecture que personne ne reçoit doit vivre dans la MÊME
+    /// branche : c'est la seule où l'état « en lecture » ne repose sur rien.
+    /// Retiré de la boucle, la méthode reste compilée, testée et verte — et
+    /// plus personne ne l'appelle. La zone 987 se remettrait à jouer dans le
+    /// vide, sans le moindre message.
+    #[test]
+    fn la_zone_sans_peripherique_renonce_a_ce_quelle_nenvoie_pas() {
+        let branche_sans_peripherique = position("decisions::deviceless_radio_refresh_due(");
+        let abandon = position(".abandonner_lecture_sans_destination(zone_state)");
+        let apres_le_match = position("// Detect track change: if the generation changed");
+        assert!(
+            branche_sans_peripherique < abandon && abandon < apres_le_match,
+            "l'abandon d'une lecture sans destination n'est plus appelé dans la \
+             branche « zone sans périphérique » : une zone qui n'envoie rien \
+             resterait annoncée « en lecture » indéfiniment (#2630)."
+        );
+    }
+}
+
+/// #2630 — une lecture que personne ne reçoit cesse d'être annoncée.
+///
+/// Le journal de Pierre M, zone 987 : `no_output_device_id_skipping_send_to_output`
+/// puis `orchestrator_play … output_sent=false`. Le serveur constate qu'il n'a
+/// envoyé le titre nulle part, et l'annonce quand même. Rien ne revenait
+/// ensuite sur cet état : la branche « pas de périphérique » du poller se
+/// terminait par un `continue`.
+///
+/// La ligne de crête est ici : une zone navigateur n'a JAMAIS de périphérique
+/// et joue pourtant pour de vrai. Le verdict ne porte donc pas sur l'appareil
+/// mais sur la CONSOMMATION du flux — la preuve que #2657 a déjà introduite.
+#[cfg(test)]
+mod lecture_sans_destination_tests {
+    use super::{DELAI_SILENCE_ETABLI, PositionPoller, decisions};
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::{NowPlaying, PlayState, PlaybackManager, ZoneState};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        orchestrator: Arc<PlaybackOrchestrator>,
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        tmp: tempfile::TempDir,
+    }
+
+    impl Banc {
+        async fn monter() -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let playback = Arc::new(PlaybackManager::new());
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            let poller = PositionPoller::new(
+                orchestrator.clone(),
+                playback.clone(),
+                outputs,
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(bus);
+            Self {
+                poller,
+                playback,
+                orchestrator,
+                db,
+                recu,
+                tmp: tempfile::TempDir::new().unwrap(),
+            }
+        }
+
+        /// Une zone en lecture, sans AUCUN périphérique de sortie, dont le flux
+        /// a servi `octets`. C'est la scène du ticket.
+        async fn zone_en_lecture(&self, nom: &str, output_type: &str, octets: u64) -> i64 {
+            let zone_id = ZoneRepo::with_backend(self.db.clone())
+                .create(nom, Some(output_type), None)
+                .unwrap();
+            let fichier = self.tmp.path().join(format!("{zone_id}.flac"));
+            std::fs::write(&fichier, b"fake audio").unwrap();
+            let sid = self
+                .orchestrator
+                .streamer
+                .create_file_session(
+                    crate::http::streamer::StreamInfo {
+                        format: "flac".into(),
+                        mime_type: "audio/flac".into(),
+                        ..Default::default()
+                    },
+                    fichier.to_string_lossy().into_owned(),
+                    false,
+                )
+                .await;
+            if octets > 0 {
+                let sessions = self.orchestrator.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                sessions
+                    .get(&sid)
+                    .expect("la session vient d'être créée")
+                    .bytes_sent
+                    .store(octets, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        title: "Never Make It on Time".into(),
+                        stream_id: Some(sid),
+                        source: "local".into(),
+                        duration_ms: 240_000,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            zone_id
+        }
+
+        /// L'instantané que le poller reçoit, vieilli de `age`. Vieillir l'état
+        /// plutôt que dormir : le seuil est de douze secondes.
+        async fn instantane(&self, zone_id: i64, age: Duration) -> ZoneState {
+            let mut zs = self.playback.get_state(zone_id).await;
+            zs.last_play_started_at = Some(
+                Instant::now()
+                    .checked_sub(age)
+                    .expect("machine démarrée depuis moins que l'âge simulé"),
+            );
+            zs
+        }
+
+        /// L'erreur remontée au client pour cette zone, s'il y en a une.
+        fn erreur(&mut self, zone_id: i64) -> Option<(String, bool)> {
+            let mut trouvee = None;
+            while let Ok(ev) = self.recu.try_recv() {
+                if ev.event_type == "zone.playback_error"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id)
+                {
+                    trouvee = Some((
+                        ev.data
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        ev.data.get("fatal").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
+            }
+            trouvee
+        }
+    }
+
+    /// ⛔ LA RÉGRESSION À NE PAS COMMETTRE.
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie et joue pourtant
+    /// vraiment : son onglet tire le flux. Une garde « pas de périphérique donc
+    /// pas de lecture » la couperait — c'est exactement ce que `70401f2d` a
+    /// fait à l'annonce Last.fm, et qu'il a fallu réparer par #2657. Ici la
+    /// zone joue depuis cinq minutes : rien ne doit lui arriver.
+    #[tokio::test]
+    async fn la_zone_navigateur_qui_joue_vraiment_nest_jamais_touchee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc
+            .zone_en_lecture("Cet ordinateur", "browser", 64 * 1024)
+            .await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(300)).await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "l'onglet tire le flux : cette zone JOUE, on n'y touche pas"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "la zone navigateur doit rester en lecture"
+        );
+        assert_eq!(
+            banc.erreur(zone_id),
+            None,
+            "aucune erreur ne doit être montrée à qui écoute réellement"
+        );
+    }
+
+    /// Le démarrage d'une zone navigateur n'est pas un silence : l'onglet met
+    /// une seconde ou deux à tirer ses premiers octets. Pendant la grâce, on ne
+    /// conclut rien.
+    #[tokio::test]
+    async fn le_demarrage_dun_onglet_lent_est_laisse_tranquille() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc
+            .instantane(zone_id, DELAI_SILENCE_ETABLI - Duration::from_secs(1))
+            .await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "avant l'échéance, un onglet peut encore démarrer"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing
+        );
+        assert_eq!(banc.erreur(zone_id), None);
+    }
+
+    /// Zone navigateur, personne au bout du fil, l'échéance est passée : Tune
+    /// arrête de prétendre. Le message dit le geste utile — ouvrir un onglet.
+    #[tokio::test]
+    async fn la_zone_navigateur_sans_onglet_cesse_detre_annoncee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(
+            banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "douze secondes sans un octet : ce n'est plus un démarrage"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "la zone ne doit plus être annoncée « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_browser_unattended:"),
+            "le message doit désigner l'onglet manquant, pas un périphérique : {message}"
+        );
+        assert!(fatal, "rien ne se rétablira tout seul");
+    }
+
+    /// La scène du ticket : zone 987, aucun périphérique, aucun onglet. Le
+    /// message reprend la sentinelle que le client sait déjà traduire.
+    #[tokio::test]
+    async fn la_zone_sans_peripherique_ni_onglet_ne_ment_plus() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Salon", "dlna", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "`output_sent=false` ne doit plus produire un état « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_no_output_device:") && message.contains("Salon"),
+            "le message doit nommer la zone et le geste : {message}"
+        );
+        assert!(fatal);
+    }
+
+    /// Le verdict, sans I/O. `None` n'est jamais une preuve : ni une date de
+    /// démarrage absente (`last_play_started_at` est `#[serde(skip)]`, il vaut
+    /// `None` après une restauration d'état), ni un flux inconnu du streamer.
+    #[test]
+    fn le_doute_profite_toujours_a_la_lecture() {
+        use decisions::lecture_sans_destination_abandonnee as abandon;
+        let vieux = DELAI_SILENCE_ETABLI + Duration::from_secs(1);
+
+        assert!(
+            abandon(Some(vieux), Some(0)),
+            "vieux et muet : on abandonne"
+        );
+        assert!(
+            abandon(Some(DELAI_SILENCE_ETABLI), Some(0)),
+            "pile à l'échéance : on abandonne"
+        );
+        assert!(
+            !abandon(
+                Some(DELAI_SILENCE_ETABLI - Duration::from_millis(1)),
+                Some(0)
+            ),
+            "une milliseconde avant l'échéance : on attend"
+        );
+        assert!(
+            !abandon(None, Some(0)),
+            "démarrage non daté : on ne conclut rien"
+        );
+        assert!(
+            !abandon(Some(vieux), None),
+            "flux inconnu du streamer : ce n'est pas une preuve de silence"
+        );
+        assert!(
+            !abandon(Some(vieux), Some(1)),
+            "un seul octet servi suffit à prouver que quelqu'un écoute"
+        );
+    }
+}
+
+/// #2493 — garde-fou d'EMPLACEMENT : le constat de depassement DIT, il n'agit
+/// pas.
+///
+/// La propriete tenue n'est pas une valeur, c'est une absence dans un bloc
+/// precis d'une boucle de plusieurs milliers de lignes : entre l'appel a
+/// `position_au_dela_de_la_duree` et la ligne de journal qu'il declenche, il ne
+/// doit y avoir NI `track_ended = true` NI `force_stop = true`.
+///
+/// C'est tout l'arbitrage du ticket. La meme forme — position a la fin,
+/// appareil qui dit jouer — est produite par une lecture bloquee ET par une
+/// duree fausse (etiquette erronee, piste reellement plus longue). Aucune
+/// horloge ne sait les distinguer, donc agir couperait une ecoute legitime une
+/// fois sur deux. Le jour ou quelqu'un « complete » ce bloc par un saut de
+/// piste, ce test doit l'arreter.
+///
+/// Meme procede, meme raison que `annonce_navigateur_guard` : relecture de
+/// source parce que la propriete est un emplacement.
+#[cfg(test)]
+mod depassement_duree_nagit_pas_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe a ce module pour que
+    /// les motifs cherches ne puissent pas se trouver eux-memes dans les
+    /// assertions ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod depassement_duree_nagit_pas_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a ete renomme : la decoupe ne protege plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a ete remanie ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #2493."
+            )
+        })
+    }
+
+    #[test]
+    fn le_bloc_de_constat_ne_touche_ni_la_piste_ni_la_zone() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        assert!(
+            debut < fin,
+            "le journal du constat doit suivre l'appel au predicat"
+        );
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            !bloc.contains("track_ended = true"),
+            "le constat de depassement avance maintenant la piste. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+        assert!(
+            !bloc.contains("force_stop = true"),
+            "le constat de depassement arrete maintenant la zone. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+    }
+
+    /// Le constat n'a le droit de parler qu'APRES que tous les detecteurs de
+    /// fin de piste ont renonce : il compte jusqu'a `DEPASSEMENT_DUREE_TICKS`,
+    /// pas jusqu'a `POSITION_PAST_END_TICKS`. Confondre les deux seuils ferait
+    /// crier le journal a chaque fin de piste normale.
+    #[test]
+    fn le_constat_attend_son_propre_seuil() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            bloc.contains("DEPASSEMENT_DUREE_TICKS"),
+            "le constat ne s'appuie plus sur son propre seuil : il parlerait \
+             avant que les detecteurs de fin de piste aient eu leur chance."
+        );
+        assert!(
+            super::DEPASSEMENT_DUREE_TICKS > super::POSITION_PAST_END_TICKS,
+            "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
+             detecteurs de fin de piste, sinon il double-signale une fin de \
+             piste parfaitement normale."
         );
     }
 }

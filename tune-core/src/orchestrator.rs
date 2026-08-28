@@ -4,6 +4,9 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+// Repli NFC/NFD partagé (#1865) — voir `crate::library::local_path`.
+use crate::library::local_path::resolve_existing_local_path;
+
 /// Error marker returned by `resolve_local_track` when a play was superseded by
 /// a newer tap before its transcode started; `play_inner` maps it to a quiet
 /// no-op result instead of a user-facing error.
@@ -2037,10 +2040,17 @@ impl PlaybackOrchestrator {
             // rien : elles ne sont JAMAIS remplies. Accumuler ce retard avant
             // de lancer la lecture donne au flux la réserve qui lui manque ;
             // le coût est quelques secondes au zapping d'une station.
+            // Temps réellement passé dans cette barrière. Il était jusqu'ici
+            // noyé dans `output_ms` de `playback_timing`, ce qui rendait la
+            // ligne trompeuse sur DLNA : jusqu'à 4 s d'attente DÉLIBÉRÉE s'y
+            // lisaient comme « la sortie traîne » (#2488). Reste 0 quand la
+            // barrière ne s'applique pas.
+            let mut prebuffer_ms: u128 = 0;
             if let Some(ref sid) = resolved.stream_id {
                 let is_dlna = self.output_type_of(device_id).await.as_deref() == Some("dlna");
                 let is_radio = resolved.source == "radio";
                 if is_dlna || is_radio {
+                    let prebuffer_start = std::time::Instant::now();
                     let sr = resolved.sample_rate.unwrap_or(44100) as u64;
                     let ch = (resolved.channels.unwrap_or(2) as u64).max(1);
                     let bytes_per_sample = ((resolved.bit_depth.unwrap_or(16) as u64) / 8).max(1);
@@ -2057,12 +2067,14 @@ impl PlaybackOrchestrator {
                         .streamer
                         .wait_prefill_ready(sid, target_bytes, timeout)
                         .await;
+                    prebuffer_ms = prebuffer_start.elapsed().as_millis();
                     info!(
                         zone_id = req.zone_id,
                         stream_id = %sid,
                         target_bytes,
                         reached,
                         is_radio,
+                        prebuffer_ms,
                         "initial_prebuffer_done"
                     );
                 }
@@ -2095,10 +2107,16 @@ impl PlaybackOrchestrator {
                 )
                 .await;
             let total_ms = play_start.elapsed().as_millis();
+            // `output_ms` ne compte plus l'attente de pré-tampon : les trois
+            // termes s'additionnent maintenant pour donner `total_ms`, et un
+            // blanc s'impute à la bonne étape sans relire la source.
             info!(
                 zone_id = req.zone_id,
                 resolve_ms,
-                output_ms = total_ms.saturating_sub(resolve_ms),
+                prebuffer_ms,
+                output_ms = total_ms
+                    .saturating_sub(resolve_ms)
+                    .saturating_sub(prebuffer_ms),
                 total_ms,
                 title = %resolved.title,
                 "playback_timing"
@@ -3151,8 +3169,29 @@ impl PlaybackOrchestrator {
             // les octets compressés contourneraient entièrement le DSP. C'est
             // notamment le cas d'une zone navigateur, qui n'a aucun device_id
             // mais doit recevoir le WAV déjà égalisé par Tune (#2063).
-            let needs_proxy =
-                req.output_device_id.is_some() || !reliable_ext || radio_eq_profile.is_some();
+            //
+            // Une zone NAVIGATEUR n'a jamais droit au passthrough, EQ ou pas
+            // (#2670). Le client web reecrit toute URL absolue en chemin
+            // relatif — `browserPlay`, `u.pathname + u.search`, pour joindre
+            // l'hote Tune plutot que l'IP annoncee par le serveur. Lui rendre
+            // l'URL de la station fait donc demander `/tsfjazz-high.mp3` a
+            // Tune, qui repond par son repli SPA : 200 `text/html`, sa propre
+            // page. L'auditeur recoit une page web a la place du flux, et Tune
+            // n'a rien a en dire puisqu'il n'a jamais ouvert le flux lui-meme :
+            // le controle `non_audio_content_type` vit dans
+            // `decode_radio_stream_to_pcm`, que ce chemin court-circuite.
+            // C'est la MEME cause que #2076 / #2158, deja corrigee pour
+            // Bandcamp quelques branches plus haut par un proxy local.
+            //
+            // La bascule ne coute rien de nouveau : une zone navigateur recoit
+            // deja du WAV pour toute station au codec ambigu (.aac, .ogg, sans
+            // extension), soit 44 des 51 entrees de l'annuaire au 28/08/2026.
+            // Seules les rares URL en .mp3/.flac/.wav prenaient ce raccourci —
+            // TSF Jazz en fait partie, et c'est la station signalee.
+            let needs_proxy = req.output_device_id.is_some()
+                || is_browser_output
+                || !reliable_ext
+                || radio_eq_profile.is_some();
 
             if needs_proxy {
                 let wav_info = StreamInfo {
@@ -10134,28 +10173,11 @@ async fn arm_local_stream_consumer_watch(
     }))
 }
 
-/// On-disk path candidates for a stored (NFC-normalized) DB path, in
-/// resolution order: the stored spelling first, then its NFD (decomposed)
-/// form. The scanner stores paths NFC-normalized for consistent DB lookups,
-/// but Samba/CIFS and macOS-origin shares hold filenames in NFD, so the stored
-/// spelling can miss the real file when handed to the OS to open.
-fn local_path_candidates(stored: &str) -> Vec<String> {
-    use unicode_normalization::UnicodeNormalization as _;
-    let mut candidates = vec![stored.to_string()];
-    let nfd: String = stored.nfd().collect();
-    if nfd != stored {
-        candidates.push(nfd);
-    }
-    candidates
-}
-
-/// First path spelling that actually exists on disk (see
-/// [`local_path_candidates`]), or `None` when the file is genuinely gone.
-fn resolve_existing_local_path(stored: &str) -> Option<String> {
-    local_path_candidates(stored)
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-}
+// Le repli NFC/NFD qui vivait ici en `fn` privée est parti dans
+// `crate::library::local_path` (#1865) : il était connu, documenté et
+// correct, mais enfermé — la lecture en profitait, aucune passe de fond ne
+// pouvait s'en servir. Il est importé en haut de fichier, pas réécrit : une
+// seconde normalisation, forcément divergente, serait pire que l'absence.
 
 #[cfg(test)]
 mod transcode_budget_tests {
@@ -11001,24 +11023,27 @@ mod tests {
         );
     }
 
+    /// Le repli NFC/NFD lui-même est éprouvé dans
+    /// `crate::library::local_path` (#1865). Ce qui se teste ICI, c'est que la
+    /// lecture continue de PASSER PAR LUI : la sortir du module l'a rendue
+    /// partageable, elle ne doit pas s'en trouver débranchée.
     #[test]
-    fn local_path_candidates_offers_nfd_for_accented_paths() {
-        // Pure ASCII path: only the stored spelling, no redundant candidate.
-        assert_eq!(
-            super::local_path_candidates("/music/Gramophone/01.flac"),
-            vec!["/music/Gramophone/01.flac".to_string()]
-        );
-        // NFC path with a composed "é" (U+00E9): a second, NFD candidate
-        // ("e" + combining acute U+0301) is offered so an NFD Samba/CIFS or
-        // macOS-origin share still resolves to the real file (Dominique Comet).
-        let nfc = "/music/Caf\u{00e9}/track.flac";
-        let cands = super::local_path_candidates(nfc);
-        assert_eq!(cands.len(), 2, "accented path must offer stored + NFD");
-        assert_eq!(cands[0], nfc);
-        assert_ne!(cands[1], nfc);
+    fn la_lecture_locale_passe_par_le_repli_partage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Sur le disque en NFD (graphie d'un partage SMB / d'un Mac)…
+        let nfd = tmp.path().join("Bjo\u{0308}rk - Jo\u{0301}ga.flac");
+        std::fs::write(&nfd, b"x").unwrap();
+        // …et en base en NFC, comme le scanner l'enregistre.
+        let nfc = tmp
+            .path()
+            .join("Bj\u{00f6}rk - J\u{00f3}ga.flac")
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(nfc, nfd.to_string_lossy(), "les deux graphies different");
         assert!(
-            cands[1].contains('\u{0301}'),
-            "second candidate must be NFD (combining acute accent)"
+            super::resolve_existing_local_path(&nfc).is_some(),
+            "resolve_existing_local_path doit venir de library::local_path et \
+             retrouver le fichier NFD depuis le chemin NFC de la base"
         );
     }
 
@@ -13081,6 +13106,66 @@ mod tests {
             "l'EQ actif doit interdire le passthrough MP3"
         );
         assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.origin_url.as_deref(), Some(source));
+    }
+
+    /// #2670 — une zone NAVIGATEUR ne doit jamais recevoir l'URL de la station.
+    ///
+    /// Le client web reecrit toute URL absolue en chemin relatif
+    /// (`browserPlay` : `u.pathname + u.search`), pour joindre l'hote Tune
+    /// plutot que l'IP que le serveur annonce. L'URL d'une station en `.mp3`
+    /// devient donc une requete `/station.mp3` adressee a Tune, a laquelle le
+    /// repli SPA (`routes/mod.rs`, `ServeDir::fallback(ServeFile(index.html))`)
+    /// repond 200 `text/html` : une page web au lieu du flux.
+    ///
+    /// Et Tune ne peut rien en dire : sans session locale il n'ouvre jamais le
+    /// flux, donc ni `non_audio_content_type` ni `RADIO_NOT_AUDIO` — qui vivent
+    /// dans `decode_radio_stream_to_pcm` — ne peuvent se declencher. C'etait le
+    /// seul chemin radio ou une station morte restait muette ET silencieuse.
+    #[tokio::test]
+    async fn browser_radio_mp3_is_never_handed_the_station_url() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        // Aucun profil EQ n'est ecrit : c'est precisement le cas que le
+        // passthrough laissait passer (#2063 ne couvrait que l'EQ actif).
+        // Port 9 (discard) : la tache de decodage echoue en local, aucun appel
+        // reseau reel ne sort de ce test.
+        let source = "http://127.0.0.1:9/tsfjazz-high.mp3";
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some(source.into()),
+            title: Some("TSF Jazz".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "une zone navigateur doit recevoir une session Tune, pas l'URL de la station"
+        );
+        assert_ne!(
+            resolved.url, source,
+            "l'URL de la station renvoyee telle quelle est reecrite en chemin local par le client, \
+             qui recoit alors la page HTML de Tune"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+        // L'amont voyage quand meme : un enregistreur ou les titres ICY n'ont
+        // pas d'autre chemin de retour vers la source.
         assert_eq!(resolved.origin_url.as_deref(), Some(source));
     }
 

@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -9,6 +9,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 
+use super::album_order::{CollectionSort, sort_albums};
 use super::now_iso_utc;
 
 #[derive(Deserialize)]
@@ -21,6 +22,12 @@ pub(super) struct CreateCollectionBody {
 pub(super) struct CollectionAlbumPath {
     id: i64,
     album_id: i64,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct CollectionAlbumsQuery {
+    /// `artist` (défaut), `title`, `year`, ou `added` pour l'ordre d'ajout.
+    sort: Option<String>,
 }
 
 pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Value> {
@@ -110,9 +117,17 @@ pub(super) async fn delete_collection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Les albums d'un dossier.
+///
+/// L'ordre par défaut est alphabétique par artiste (puis année, puis titre),
+/// et non plus l'ordre d'ajout : personne ne pouvait remettre un dossier en
+/// ordre, faute d'endpoint de réordonnancement (Lulu/JLuc, fil 1591, #2675).
+/// `?sort=added` rend l'ordre historique, pour un dossier monté comme une
+/// séquence d'écoute. Le tri est fait en Rust — voir `album_order`.
 pub(super) async fn collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(query): Query<CollectionAlbumsQuery>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let collections: Vec<Value> = settings
@@ -133,10 +148,12 @@ pub(super) async fn collection_albums(
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default();
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
-    let albums: Vec<Value> = album_ids
+    let mut albums: Vec<tune_core::db::models::Album> = album_ids
         .iter()
-        .filter_map(|&aid| album_repo.get(aid).ok().flatten().map(|a| a.to_json()))
+        .filter_map(|&aid| album_repo.get(aid).ok().flatten())
         .collect();
+    sort_albums(&mut albums, CollectionSort::parse(query.sort.as_deref()));
+    let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     Json(json!(albums)).into_response()
 }
 

@@ -202,6 +202,15 @@ pub struct LicenseState {
     /// starts clean and the next heartbeat restores it if still in conflict.
     #[serde(default)]
     pub session_conflict: Option<SessionConflict>,
+    /// Le marqueur premium de la CLÉ tel qu'il est persisté (`license_tier`),
+    /// AVANT toute dégradation. Purement informatif (#1999) : `tier` est écrasé
+    /// deux fois — au chargement quand la grâce est écoulée, et dans
+    /// `license_state()` par le tier *effectif* — si bien qu'une fois la grâce
+    /// lapsée plus rien en mémoire ne disait qu'il y avait eu une licence. Sans
+    /// ce témoin, impossible d'expliquer à l'utilisateur POURQUOI son premium a
+    /// disparu. Ne participe à aucune décision d'autorisation.
+    #[serde(default)]
+    pub key_premium_marker: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +261,9 @@ impl LicenseManager {
             Some("premium") => Tier::Premium,
             _ => Tier::Free,
         };
+        // Le marqueur persisté, capturé AVANT la dégradation ci-dessous : c'est
+        // lui qui permettra d'expliquer une retombée en Free (#1999).
+        let key_premium_marker = tier == Tier::Premium;
 
         // Grace period check: degrade to Free if last validation is too old.
         if tier == Tier::Premium {
@@ -318,6 +330,7 @@ impl LicenseManager {
             qobuz_proxy_first,
             modules,
             session_conflict: None,
+            key_premium_marker,
         };
 
         Self {
@@ -386,6 +399,7 @@ impl LicenseManager {
         state.license_key = Some(key.to_string());
         state.tier = Tier::Free;
         state.last_validated = None;
+        state.key_premium_marker = false;
 
         info!(
             key_prefix = &key[..key.len().min(8)],
@@ -407,6 +421,7 @@ impl LicenseManager {
         state.tier = Tier::Free;
         state.expires_at = None;
         state.last_validated = None;
+        state.key_premium_marker = false;
 
         info!("license_cleared");
     }
@@ -430,6 +445,7 @@ impl LicenseManager {
         state.tier = tier;
         state.expires_at = expires_at;
         state.last_validated = Some(now.clone());
+        state.key_premium_marker = tier == Tier::Premium;
 
         info!(tier = %tier, validated = %now, "license_updated_from_server");
     }
@@ -611,6 +627,21 @@ impl LicenseManager {
         fp
     }
 
+    /// État de la grâce hors ligne, pour l'affichage (#1999).
+    ///
+    /// Purement descriptif : ne lit que l'état déjà en mémoire et ne modifie
+    /// rien. `None` quand la question ne se pose pas (aucun droit premium en
+    /// jeu, ou abonnement réellement échu).
+    pub async fn offline_grace(&self) -> Option<OfflineGrace> {
+        offline_grace(&*self.state.read().await)
+    }
+
+    /// Durée de la fenêtre de grâce hors ligne, en jours — le chiffre à écrire
+    /// dans l'interface et la documentation plutôt qu'à recopier à la main.
+    pub const fn offline_grace_days() -> i64 {
+        GRACE_PERIOD_DAYS
+    }
+
     /// Zone limit for the free tier (exposed for UI display).
     pub fn free_zone_limit(&self) -> i64 {
         self.free_max_zones
@@ -770,6 +801,174 @@ fn effective_tier(state: &LicenseState) -> Tier {
     } else {
         Tier::Free
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline grace — READ-ONLY reporting (#1999)
+// ---------------------------------------------------------------------------
+//
+// Tout ce qui suit ne fait que *décrire* la fenêtre de grâce déjà appliquée par
+// `key_premium_active` / `account_premium_active`. Aucune de ces fonctions n'est
+// appelée par `effective_tier` : la politique (durée, instant d'expiration,
+// fonctions désactivées) est rigoureusement inchangée. Le défaut de #1999 n'est
+// pas que la grâce se comporte mal — c'est qu'elle est invisible.
+
+/// À partir de quand on annonce la grâce à l'utilisateur.
+///
+/// Le battement va vers mozaiklabs.fr toutes les heures
+/// (`HEARTBEAT_INTERVAL`) : 48 tentatives ratées d'affilée ne sont plus un
+/// hoquet réseau, c'est une coupure. En deçà, se taire — un serveur qui manque
+/// deux battements est parfaitement sain et n'a rien à signaler.
+///
+/// Ce seuil ne gouverne QUE l'affichage. Il ne raccourcit ni n'allonge la
+/// grâce : à J+2 comme à J+13, le serveur est premium exactement comme avant.
+const GRACE_NOTICE_AFTER_DAYS: i64 = 2;
+
+/// Où en est la revalidation en ligne des droits premium.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GracePhase {
+    /// Confirmé en ligne récemment — rien à signaler.
+    Ok,
+    /// Pas de confirmation depuis au moins [`GRACE_NOTICE_AFTER_DAYS`] jours,
+    /// mais la fenêtre court toujours : **le premium est intact**.
+    Grace,
+    /// La fenêtre est écoulée : les droits premium sont retombés en Free en
+    /// attendant la prochaine validation réussie.
+    Expired,
+}
+
+/// Quelle source de premium porte la fenêtre décrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraceSource {
+    /// Clé de licence (`license_last_validated`).
+    Key,
+    /// Compte mozaiklabs.fr lié en SSO (`mozaik_premium_checked`).
+    Account,
+}
+
+/// État de la grâce hors ligne, tel qu'il remonte à l'interface.
+///
+/// Ne contient **aucune donnée sensible** : ni clé, ni identifiant d'achat, ni
+/// jeton — seulement des dates et un compte de jours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineGrace {
+    pub phase: GracePhase,
+    pub source: GraceSource,
+    /// Dernière confirmation en ligne réussie (ISO-8601 Zulu). `None` = jamais.
+    pub since: Option<String>,
+    /// Instant où la fenêtre se referme (`since` + [`GRACE_PERIOD_DAYS`]).
+    pub until: Option<String>,
+    /// Jours entiers restants, arrondis au supérieur ; 0 une fois écoulée.
+    pub days_remaining: i64,
+    /// Durée totale de la fenêtre, en jours — le chiffre à afficher.
+    pub total_days: i64,
+    /// Depuis combien de jours entiers la dernière confirmation date.
+    pub days_since_validation: i64,
+}
+
+/// Décrit la fenêtre de grâce qui s'applique à cet état — sans rien décider.
+///
+/// Rend `None` quand la question ne se pose pas : aucun droit premium en jeu
+/// (utilisateur Free), ou abonnement dont la date de fin est *réellement*
+/// passée — ce dernier cas n'est pas une affaire de réseau et ne doit surtout
+/// pas être présenté comme tel.
+///
+/// Quand les deux sources sont premium, on décrit celle qui tient le plus
+/// longtemps : c'est elle qui gouverne, `effective_tier` étant un OU.
+pub fn offline_grace(state: &LicenseState) -> Option<OfflineGrace> {
+    let mut candidates: Vec<(GraceSource, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+
+    // Clé : marqueur premium PERSISTÉ (pas `tier`, qui est écrasé par la
+    // dégradation au chargement et par le tier effectif dans `license_state`)
+    // et date de fin propre non dépassée.
+    if state.key_premium_marker
+        && !state
+            .expires_at
+            .as_deref()
+            .is_some_and(|e| is_expired(e, 0))
+    {
+        candidates.push((
+            GraceSource::Key,
+            state.last_validated.as_deref().and_then(parse_timestamp),
+        ));
+    }
+
+    // Compte SSO : drapeau posé et abonnement non échu.
+    if state.account_premium
+        && !state
+            .account_premium_expires
+            .as_deref()
+            .is_some_and(|e| is_expired(e, 0))
+    {
+        candidates.push((
+            GraceSource::Account,
+            state
+                .account_premium_checked
+                .as_deref()
+                .and_then(parse_timestamp),
+        ));
+    }
+
+    // `None` (jamais confirmé) trie plus bas que n'importe quel `Some` : la
+    // source la mieux revalidée gagne.
+    let (source, anchor) = candidates.into_iter().max_by_key(|(_, a)| *a)?;
+
+    let total_days = GRACE_PERIOD_DAYS;
+
+    let Some(anchor) = anchor else {
+        // Premium jamais validé en ligne : déjà en Free, et la fenêtre n'a
+        // jamais commencé à courir. Le dire, plutôt que de laisser deviner.
+        return Some(OfflineGrace {
+            phase: GracePhase::Expired,
+            source,
+            since: None,
+            until: None,
+            days_remaining: 0,
+            total_days,
+            days_since_validation: 0,
+        });
+    };
+
+    let now = chrono::Utc::now();
+    let until = anchor + chrono::Duration::days(total_days);
+    let elapsed = now - anchor;
+
+    // Aligné au millimètre sur `is_expired(anchor, GRACE_PERIOD_DAYS)`, qui
+    // compare `anchor < now - 14j`, soit `until < now`.
+    let expired = until <= now;
+    let days_remaining = if expired {
+        0
+    } else {
+        // Arrondi au supérieur : tant qu'il reste la moindre heure, on annonce
+        // « 1 jour », jamais « 0 ».
+        ((until - now).num_seconds() + 86_399).div_euclid(86_400)
+    };
+    let days_since_validation = elapsed.num_seconds().max(0).div_euclid(86_400);
+
+    let phase = if expired {
+        GracePhase::Expired
+    } else if days_since_validation >= GRACE_NOTICE_AFTER_DAYS {
+        GracePhase::Grace
+    } else {
+        GracePhase::Ok
+    };
+
+    Some(OfflineGrace {
+        phase,
+        source,
+        since: Some(format_utc(anchor)),
+        until: Some(format_utc(until)),
+        days_remaining,
+        total_days,
+        days_since_validation,
+    })
+}
+
+/// Le format Zulu que le reste du fichier persiste et relit.
+fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
@@ -947,6 +1146,7 @@ mod tests {
             qobuz_proxy_first: false,
             modules: vec![],
             session_conflict: None,
+            key_premium_marker: tier == Tier::Premium,
         }
     }
 
@@ -967,6 +1167,7 @@ mod tests {
             qobuz_proxy_first: false,
             modules: vec![],
             session_conflict: None,
+            key_premium_marker: tier == Tier::Premium,
         }
     }
 
@@ -1358,5 +1559,325 @@ mod tests {
         let state = mgr.license_state().await;
         assert_eq!(state.expires_at.as_deref(), Some("2030-12-31T00:00:00Z"));
         assert!(state.last_validated.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Grâce hors ligne : la rendre VISIBLE (#1999)
+    //
+    // Didier (fil forum 1491) ne demandait pas que la grâce change — il
+    // demandait à savoir qu'elle existe. Ces tests décrivent ce que
+    // l'utilisateur doit pouvoir lire, et surtout ils verrouillent le fait que
+    // rien de ce qui est *appliqué* n'a bougé.
+    // -----------------------------------------------------------------------
+
+    fn hours_ago_iso(hours: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(hours))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[test]
+    fn grace_fenetre_de_quatorze_jours_annoncee() {
+        // Le chiffre affiché doit venir du code, jamais d'un commentaire.
+        let g = offline_grace(&key_state(Tier::Premium, None, Some(now_iso()))).unwrap();
+        assert_eq!(g.total_days, 14, "la fenêtre annoncée est celle du code");
+        assert_eq!(LicenseManager::offline_grace_days(), 14);
+    }
+
+    #[test]
+    fn grace_silencieuse_quand_la_validation_est_fraiche() {
+        // Un serveur qui a manqué un battement ou deux n'a rien à signaler :
+        // afficher une alerte là serait du bruit, pas de l'information.
+        let g = offline_grace(&key_state(Tier::Premium, None, Some(hours_ago_iso(6)))).unwrap();
+        assert_eq!(g.phase, GracePhase::Ok);
+        assert_eq!(g.days_remaining, 14);
+        assert_eq!(g.days_since_validation, 0);
+    }
+
+    #[test]
+    fn grace_entree_apres_deux_jours_sans_revalidation() {
+        // 48 battements horaires ratés : ce n'est plus un hoquet. On le dit.
+        let g = offline_grace(&key_state(Tier::Premium, None, Some(past_iso(3)))).unwrap();
+        assert_eq!(g.phase, GracePhase::Grace, "état visible dès J+2");
+        assert_eq!(g.days_since_validation, 3);
+    }
+
+    #[test]
+    fn grace_jour_restant_correct_a_chaque_etape() {
+        // Le compte à rebours que lit l'utilisateur. Un décalage d'un jour ici
+        // et la promesse affichée est fausse.
+        for (jours_ecoules, restant) in [(0, 14), (1, 13), (7, 7), (13, 1)] {
+            let g = offline_grace(&key_state(
+                Tier::Premium,
+                None,
+                Some(past_iso(jours_ecoules)),
+            ))
+            .unwrap();
+            assert_eq!(
+                g.days_remaining, restant,
+                "à J+{jours_ecoules} il doit rester {restant} jour(s), lu {}",
+                g.days_remaining
+            );
+        }
+    }
+
+    #[test]
+    fn grace_le_terme_annonce_est_la_derniere_validation_plus_quatorze_jours() {
+        let depuis = past_iso(5);
+        let g = offline_grace(&key_state(Tier::Premium, None, Some(depuis.clone()))).unwrap();
+        assert_eq!(g.since.as_deref(), Some(depuis.as_str()));
+        let attendu = (parse_timestamp(&depuis).unwrap() + chrono::Duration::days(14))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        assert_eq!(g.until.as_deref(), Some(attendu.as_str()));
+    }
+
+    #[test]
+    fn grace_expiree_au_dela_de_quatorze_jours() {
+        let g = offline_grace(&key_state(Tier::Premium, None, Some(past_iso(20)))).unwrap();
+        assert_eq!(g.phase, GracePhase::Expired);
+        assert_eq!(g.days_remaining, 0, "jamais de compte négatif à l'écran");
+    }
+
+    #[test]
+    fn grace_expiree_quand_le_premium_na_jamais_ete_valide() {
+        // Cas « premium sans last_validated » : dégradé d'emblée. L'utilisateur
+        // doit lire pourquoi, pas deviner.
+        let g = offline_grace(&key_state(Tier::Premium, None, None)).unwrap();
+        assert_eq!(g.phase, GracePhase::Expired);
+        assert_eq!(g.since, None);
+        assert_eq!(g.until, None);
+    }
+
+    #[test]
+    fn grace_muette_pour_un_utilisateur_gratuit() {
+        // Rien à annoncer : pas de droits premium en jeu.
+        assert!(offline_grace(&state(Tier::Free, false, None, None)).is_none());
+    }
+
+    #[test]
+    fn grace_muette_quand_labonnement_est_reellement_echu() {
+        // Une date de fin dépassée n'est PAS une coupure réseau. La présenter
+        // comme une grâce ferait croire à l'utilisateur qu'il suffit de se
+        // reconnecter — ce serait un mensonge.
+        assert!(
+            offline_grace(&key_state(
+                Tier::Premium,
+                Some(past_iso(1)),
+                Some(now_iso())
+            ))
+            .is_none()
+        );
+        assert!(
+            offline_grace(&state(Tier::Free, true, Some(past_iso(1)), Some(now_iso()))).is_none()
+        );
+    }
+
+    #[test]
+    fn grace_suit_aussi_le_compte_sso() {
+        let g = offline_grace(&state(Tier::Free, true, None, Some(past_iso(4)))).unwrap();
+        assert_eq!(g.source, GraceSource::Account);
+        assert_eq!(g.phase, GracePhase::Grace);
+        assert_eq!(g.days_remaining, 10);
+    }
+
+    #[test]
+    fn grace_decrit_la_source_qui_tient_le_plus_longtemps() {
+        // `effective_tier` est un OU : c'est la source la mieux revalidée qui
+        // gouverne, donc c'est elle qu'il faut décrire. Annoncer l'autre
+        // afficherait une expiration qui n'aura pas lieu.
+        let mut s = key_state(Tier::Premium, None, Some(past_iso(10)));
+        s.account_premium = true;
+        s.account_premium_checked = Some(now_iso());
+        let g = offline_grace(&s).unwrap();
+        assert_eq!(g.source, GraceSource::Account);
+        assert_eq!(g.phase, GracePhase::Ok);
+    }
+
+    #[test]
+    fn grace_ne_change_rien_a_ce_qui_est_applique() {
+        // LE test de non-durcissement. Pour chaque état décrit, le tier
+        // effectif reste exactement celui d'avant #1999 : la visibilité n'est
+        // pas une politique.
+        let cas: Vec<(&str, LicenseState, Tier)> = vec![
+            (
+                "frais",
+                key_state(Tier::Premium, None, Some(now_iso())),
+                Tier::Premium,
+            ),
+            (
+                "J+3 (annoncé)",
+                key_state(Tier::Premium, None, Some(past_iso(3))),
+                Tier::Premium,
+            ),
+            (
+                "J+13 (dernier jour)",
+                key_state(Tier::Premium, None, Some(past_iso(13))),
+                Tier::Premium,
+            ),
+            (
+                "J+20 (écoulée)",
+                key_state(Tier::Premium, None, Some(past_iso(20))),
+                Tier::Free,
+            ),
+            (
+                "jamais validé",
+                key_state(Tier::Premium, None, None),
+                Tier::Free,
+            ),
+            (
+                "compte J+4",
+                state(Tier::Free, true, None, Some(past_iso(4))),
+                Tier::Premium,
+            ),
+        ];
+        for (nom, s, attendu) in cas {
+            assert_eq!(
+                effective_tier(&s),
+                attendu,
+                "{nom} : la grâce visible ne doit RIEN changer au tier appliqué"
+            );
+        }
+    }
+
+    #[test]
+    fn grace_annoncee_tant_que_le_premium_tient_encore() {
+        // Corollaire du précédent, dit dans l'autre sens : tant que la phase
+        // n'est pas `Expired`, le premium est intact. C'est ce qui permet
+        // d'écrire un message rassurant sans mentir.
+        for jours in [0, 1, 2, 5, 13] {
+            let s = key_state(Tier::Premium, None, Some(past_iso(jours)));
+            let g = offline_grace(&s).unwrap();
+            assert_ne!(g.phase, GracePhase::Expired, "J+{jours}");
+            assert_eq!(effective_tier(&s), Tier::Premium, "J+{jours}");
+        }
+    }
+
+    #[test]
+    fn grace_ne_laisse_fuir_aucune_donnee_sensible() {
+        // Le JSON part vers le navigateur : il ne doit porter que des dates et
+        // des compteurs, jamais la clé ni un identifiant d'achat.
+        let mut s = key_state(Tier::Premium, None, Some(past_iso(3)));
+        s.license_key = Some("TUNE-SECRET-0000-1111".into());
+        s.account_premium_expires = Some(future_iso(30));
+        let v = serde_json::to_value(offline_grace(&s).unwrap()).unwrap();
+        let json = v.to_string();
+        assert!(
+            !json.contains("TUNE-SECRET"),
+            "la clé ne doit jamais apparaître : {json}"
+        );
+        // Liste blanche stricte : un champ ajouté par mégarde tombe ici.
+        let mut champs: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        champs.sort_unstable();
+        assert_eq!(
+            champs,
+            [
+                "days_remaining",
+                "days_since_validation",
+                "phase",
+                "since",
+                "source",
+                "total_days",
+                "until",
+            ],
+            "seuls des dates et des compteurs sortent d'ici"
+        );
+    }
+
+    #[test]
+    fn grace_contrat_json_stable_pour_le_client() {
+        // Les noms de champs que le client web lit. Les renommer casse l'UI en
+        // silence — ce test le rend bruyant.
+        let v = serde_json::to_value(offline_grace(&key_state(
+            Tier::Premium,
+            None,
+            Some(past_iso(3)),
+        )))
+        .unwrap();
+        for champ in [
+            "phase",
+            "source",
+            "since",
+            "until",
+            "days_remaining",
+            "total_days",
+            "days_since_validation",
+        ] {
+            assert!(v.get(champ).is_some(), "champ manquant : {champ} dans {v}");
+        }
+        assert_eq!(v["phase"], "grace");
+        assert_eq!(v["source"], "key");
+    }
+
+    #[tokio::test]
+    async fn grace_expliquee_meme_apres_un_redemarrage_hors_ligne() {
+        // Le cas qui compte le plus : la grâce est écoulée, le premium a
+        // disparu, le serveur redémarre. `new_with_limit` dégrade `tier` en
+        // Free au chargement — plus rien en mémoire ne disait qu'il y avait eu
+        // une licence, et l'utilisateur restait sans explication. Le marqueur
+        // persisté rend la retombée explicable.
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set("license_key", "TUNE-TEST-1234").unwrap();
+        settings.set("license_tier", "premium").unwrap();
+        settings
+            .set("license_last_validated", &past_iso(20))
+            .unwrap();
+
+        let mgr = LicenseManager::new(backend);
+        // Politique inchangée : toujours Free au bout de 14 jours.
+        assert!(!mgr.is_premium().await);
+
+        let g = mgr
+            .offline_grace()
+            .await
+            .expect("la retombée doit s'expliquer");
+        assert_eq!(g.phase, GracePhase::Expired);
+        assert_eq!(g.source, GraceSource::Key);
+        assert_eq!(g.days_remaining, 0);
+        assert_eq!(g.total_days, 14);
+        assert!(g.since.is_some(), "on sait depuis quand : {g:?}");
+    }
+
+    #[tokio::test]
+    async fn grace_se_rearme_seule_au_retour_du_reseau() {
+        // Le point que Didier redoute : faut-il faire quelque chose ? Non. Le
+        // battement horaire revalide, `last_validated` est réhorodaté, et la
+        // fenêtre repart à 14 jours sans aucun geste de l'utilisateur.
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        // On simule une machine hors ligne depuis 10 jours en écrivant l'état
+        // que le serveur aurait relu au démarrage — aucun appel réseau réel.
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set("license_key", "TUNE-TEST-1234").unwrap();
+        settings.set("license_tier", "premium").unwrap();
+        settings
+            .set("license_last_validated", &past_iso(10))
+            .unwrap();
+
+        let mgr = LicenseManager::new(backend);
+        let avant = mgr.offline_grace().await.unwrap();
+        assert_eq!(avant.phase, GracePhase::Grace);
+        assert_eq!(avant.days_remaining, 4);
+        assert!(mgr.is_premium().await, "toujours premium pendant la grâce");
+
+        // Le réseau revient : un seul aller-retour du battement suffit.
+        mgr.update_from_server(Tier::Premium, None).await;
+
+        let apres = mgr.offline_grace().await.unwrap();
+        assert_eq!(apres.phase, GracePhase::Ok, "la grâce se réarme seule");
+        assert_eq!(
+            apres.days_remaining, 14,
+            "fenêtre remise à plein après revalidation"
+        );
+        assert_eq!(apres.days_since_validation, 0);
+        assert!(mgr.is_premium().await);
     }
 }

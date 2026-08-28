@@ -48,6 +48,36 @@ async fn resolve_cast_addresses(
     Ok(addresses)
 }
 
+/// Ce qu'une commande Cast en échec ajoute à son message : le temps réellement
+/// consommé, et le budget dont elle disposait.
+///
+/// **La mesure qui manquait (#2566).** Le journal de Dimitri portait 79 fois
+/// `media status: …` sans jamais dire combien de temps la commande avait duré.
+/// Impossible d'y distinguer les deux causes, qui n'appellent pas le même
+/// travail :
+///
+/// | ce qu'on lit | ce que ça veut dire |
+/// |---|---|
+/// | `after 2003ms of 2000ms budget` | le budget est épuisé — la chaîne est trop lente pour 2 s |
+/// | `after 40ms of 2000ms budget` | l'appareil a refusé, vite et franchement |
+///
+/// Le suffixe part dans le champ `error=` de la ligne déjà journalisée par le
+/// poller : **aucune ligne supplémentaire**, la mesure voyage avec l'erreur
+/// existante.
+///
+/// ⚠️ Ce suffixe MESURE, il ne corrige pas. Savoir si
+/// [`CAST_COMMAND_TIMEOUT`] doit grandir se décide sur ces chiffres, une fois
+/// qu'un journal les portera — pas ici, et pas au jugé : le poller est une
+/// tâche SÉQUENTIELLE sur toutes les zones, allonger le budget d'une sortie
+/// ralentit la détection de fin de piste de toutes les autres.
+fn with_elapsed(error: String, started: Instant, budget: Duration) -> String {
+    format!(
+        "{error} (after {}ms of {}ms budget)",
+        started.elapsed().as_millis(),
+        budget.as_millis()
+    )
+}
+
 async fn run_cast_command<T, F>(
     host: String,
     port: u16,
@@ -59,7 +89,27 @@ where
     T: Send + 'static,
     F: FnOnce(rust_cast::CastDevice<'static>) -> Result<T, String> + Send + 'static,
 {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    // Un seul point de sortie en erreur pour toute la fonction : sinon un
+    // chemin d'échec ajouté plus tard oublierait la mesure.
+    run_cast_command_inner(host, port, timeout, slots, operation, started)
+        .await
+        .map_err(|error| with_elapsed(error, started, timeout))
+}
+
+async fn run_cast_command_inner<T, F>(
+    host: String,
+    port: u16,
+    timeout: Duration,
+    slots: Arc<Semaphore>,
+    operation: F,
+    started: Instant,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(rust_cast::CastDevice<'static>) -> Result<T, String> + Send + 'static,
+{
+    let deadline = started + timeout;
     let permit = tokio::time::timeout(remaining_budget(deadline)?, slots.acquire_owned())
         .await
         .map_err(|_| "chromecast worker deadline elapsed".to_string())?
@@ -870,6 +920,172 @@ mod deadline_tests {
         let start = Instant::now();
         assert!(output.pause().await.is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// #2566 — le message ne doit plus envoyer chercher une ressource occupée.
+    ///
+    /// Le pair TCP accepte la connexion puis se tait : la poignée de main TLS
+    /// écrit son `ClientHello`, puis attend une réponse qui ne vient jamais.
+    /// C'est EXACTEMENT le chemin de Dimitri — un délai de socket qui expire
+    /// pendant un read — et avant le correctif il produisait
+    /// `Resource temporarily unavailable (os error 11)` sur Linux,
+    /// `(os error 35)` sur macOS.
+    ///
+    /// L'assertion négative porte sur **`os error`** et non sur le texte
+    /// anglais : le texte de l'errno est traduit par la libc selon la locale,
+    /// le suffixe `(os error N)` que Rust ajoute ne l'est pas. C'est donc la
+    /// seule signature portable d'un errno brut remonté tel quel.
+    #[tokio::test]
+    async fn un_delai_depasse_ne_parle_plus_de_ressource_indisponible() {
+        let (port, _active, _maximum, server) = silent_tcp_peer().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(120),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+
+        let error = output.get_status().await.expect_err("le pair se tait");
+
+        assert!(
+            !error.contains("os error"),
+            "l'errno brut ne doit plus remonter au journal : {error}"
+        );
+        assert!(
+            error.contains("deadline elapsed"),
+            "le message doit nommer l'échéance dépassée : {error}"
+        );
+        server.abort();
+    }
+
+    /// #2566 — l'échec porte la mesure qui manquait au journal de Dimitri.
+    ///
+    /// Sans elle, impossible de trancher entre « budget épuisé » et
+    /// « l'appareil a refusé » : les 79 lignes du testeur ne portaient aucune
+    /// durée. Le budget annoncé doit être celui de la sortie, pas une constante
+    /// recopiée — d'où les 120 ms explicites ici.
+    #[tokio::test]
+    async fn un_echec_porte_le_temps_ecoule_et_son_budget() {
+        let (port, _active, _maximum, server) = silent_tcp_peer().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(120),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+
+        let error = output.get_status().await.expect_err("le pair se tait");
+
+        assert!(
+            error.contains("of 120ms budget"),
+            "le budget de la commande doit figurer dans l'erreur : {error}"
+        );
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms >= 100,
+            "une commande qui épuise son budget de 120 ms ne peut pas rendre {elapsed_ms} ms"
+        );
+        server.abort();
+    }
+
+    /// La traduction doit rester SÉLECTIVE : elle ne remplace que l'expiration
+    /// d'un délai, jamais une panne de liaison.
+    ///
+    /// Sans ce garde-fou, écrire `as_deadline_error` en écrasant toute erreur
+    /// passerait les autres tests tout en détruisant l'information dans le cas
+    /// qui compte le plus — un appareil qui coupe la liaison.
+    ///
+    /// **Fermer la socket ne suffit PAS à l'éprouver** : une fermeture propre
+    /// rend `Ok(0)`, et c'est rustls — pas la socket — qui en fait une erreur.
+    /// Elle ne traverse donc jamais [`rust_cast::DeadlineTcpStream`], et le
+    /// garde-fou ne garderait rien (vérifié : la mutation « traduire toujours »
+    /// restait verte avec un simple `drop`).
+    ///
+    /// Il faut un vrai errno remonté PAR la socket : `SO_LINGER` à zéro fait
+    /// partir un RST à la fermeture, et le `read` suivant rend
+    /// `ECONNRESET` — la seule forme qui exerce réellement le test de `kind()`.
+    #[tokio::test]
+    async fn une_liaison_coupee_n_est_pas_maquillee_en_echeance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Laisser partir le `ClientHello` avant de couper, sinon le
+                    // client échoue à l'écriture et non à la lecture.
+                    let mut bytes = [0u8; 1024];
+                    let _ = socket.read(&mut bytes).await;
+                    let _ = socket.set_linger(Some(Duration::ZERO));
+                    drop(socket);
+                });
+            }
+        });
+        let output = test_output(port, Duration::from_secs(2), Arc::new(Semaphore::new(1)));
+
+        let error = output
+            .get_status()
+            .await
+            .expect_err("le pair coupe la liaison");
+
+        assert!(
+            !error.contains("deadline elapsed"),
+            "une liaison coupée n'est pas une échéance dépassée : {error}"
+        );
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms < 1_000,
+            "raccrocher est instantané, aucun budget n'est consommé ({elapsed_ms} ms)"
+        );
+        server.abort();
+    }
+
+    /// La mise en forme du suffixe, sans socket : c'est elle que le lecteur du
+    /// journal doit pouvoir comparer d'un coup d'œil (écoulé vs budget).
+    #[test]
+    fn le_suffixe_compare_l_ecoule_au_budget() {
+        let started = Instant::now() - Duration::from_millis(2_003);
+        let message = with_elapsed(
+            "media status: Cast command deadline elapsed".into(),
+            started,
+            Duration::from_secs(2),
+        );
+        assert!(message.starts_with("media status: Cast command deadline elapsed (after 2"));
+        assert!(message.ends_with("ms of 2000ms budget)"));
+    }
+
+    /// Un échec RAPIDE doit rester lisible comme tel : c'est le contre-cas qui
+    /// donne son sens au chiffre. Une connexion refusée n'épuise aucun budget,
+    /// et le suffixe doit le montrer.
+    #[tokio::test]
+    async fn un_refus_immediat_ne_consomme_pas_son_budget() {
+        let closed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let output = test_output(
+            closed_port,
+            Duration::from_secs(2),
+            Arc::new(Semaphore::new(1)),
+        );
+
+        let error = output.get_status().await.expect_err("le port est fermé");
+
+        assert!(error.contains("of 2000ms budget"), "{error}");
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms < 1_000,
+            "un refus immédiat ne doit pas être confondu avec un budget épuisé ({elapsed_ms} ms)"
+        );
     }
 }
 

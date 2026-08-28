@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use tune_core::db::backend::DbBackend;
+use tune_core::discovery::renderer_identity::{
+    IdentityVerdict, RendererIdentity, compare_at_same_location,
+};
 use tune_core::outputs::OutputRegistry;
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
@@ -150,6 +153,28 @@ struct KnownRenderer {
     device_id: String,
     location: String,
     name: String,
+    // Clés de reconnaissance (#2639) — voir `DiscoveredDlnaDevice`, même
+    // raison, même `#[serde(default)]` : un magasin écrit avant #2639 doit
+    // continuer de se relire, sinon `from_str` échoue et TOUTES les zones
+    // disparaissent au démarrage suivant.
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    manufacturer: String,
+    #[serde(default)]
+    model: String,
+}
+
+impl KnownRenderer {
+    fn identity(&self) -> RendererIdentity<'_> {
+        RendererIdentity {
+            udn: &self.device_id,
+            mac: &self.mac,
+            friendly_name: &self.name,
+            manufacturer: &self.manufacturer,
+            model_name: &self.model,
+        }
+    }
 }
 
 fn load_known_renderers(db: &Arc<dyn DbBackend>) -> Vec<KnownRenderer> {
@@ -190,12 +215,26 @@ fn dedup_renderers_by_location(renderers: Vec<KnownRenderer>) -> Vec<KnownRender
 /// Best-effort: a persistence failure is logged, never panics, and never
 /// blocks discovery. Skips the settings write when the stored entry is already
 /// identical, so the periodic SSDP re-discovery doesn't churn the DB.
-fn persist_known_renderer(db: &Arc<dyn DbBackend>, device_id: &str, location: &str, name: &str) {
+fn persist_known_renderer(
+    db: &Arc<dyn DbBackend>,
+    device_id: &str,
+    location: &str,
+    name: &str,
+    mac: &str,
+    manufacturer: &str,
+    model: &str,
+) {
     let mut renderers = load_known_renderers(db);
-    if renderers
-        .iter()
-        .any(|r| r.device_id == device_id && r.location == location && r.name == name)
-    {
+    if renderers.iter().any(|r| {
+        r.device_id == device_id
+            && r.location == location
+            && r.name == name
+            // Les clés de reconnaissance font partie de l'entrée (#2639) :
+            // sans ça une MAC fraîchement relevée ne serait jamais écrite.
+            && r.mac == mac
+            && r.manufacturer == manufacturer
+            && r.model == model
+    }) {
         return;
     }
     // Une `LOCATION` = un appareil physique (UPnP) : un HEOS Denon/Marantz
@@ -208,6 +247,9 @@ fn persist_known_renderer(db: &Arc<dyn DbBackend>, device_id: &str, location: &s
         device_id: device_id.to_string(),
         location: location.to_string(),
         name: name.to_string(),
+        mac: mac.to_string(),
+        manufacturer: manufacturer.to_string(),
+        model: model.to_string(),
     });
     save_known_renderers(db, &renderers);
 }
@@ -558,7 +600,15 @@ async fn handle_ssdp_discovered(
             // until it next answers multicast (#1126).
             if let Some(ref loc) = dev.location {
                 crate::routes::devices::persist_discovered_dlna(
-                    db, &dev.id, loc, &dev.name, &dev.host, dev.port,
+                    db,
+                    &crate::routes::devices::DiscoveredDlnaDevice::new(
+                        &dev.id, loc, &dev.name, &dev.host, dev.port,
+                    )
+                    .with_identity(
+                        dev.mac_address.as_deref().unwrap_or_default(),
+                        dev.manufacturer.as_deref().unwrap_or_default(),
+                        dev.model.as_deref().unwrap_or_default(),
+                    ),
                 );
             }
         }
@@ -567,7 +617,15 @@ async fn handle_ssdp_discovered(
     // Persist this renderer so it can be re-probed directly at the next startup,
     // even if it never answers SSDP M-SEARCH again (#1126). Best-effort.
     if registered && let Some(location) = dev.location.as_deref() {
-        persist_known_renderer(db, &dev.id, location, &dev.name);
+        persist_known_renderer(
+            db,
+            &dev.id,
+            location,
+            &dev.name,
+            dev.mac_address.as_deref().unwrap_or_default(),
+            dev.manufacturer.as_deref().unwrap_or_default(),
+            dev.model.as_deref().unwrap_or_default(),
+        );
     }
 
     let skip_keywords = [
@@ -822,34 +880,92 @@ pub async fn reregister_known_renderers(state: &AppState) {
     let mut recovered = 0usize;
     for kr in renderers {
         match tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location).await {
-            Some(dev) if dev.id == kr.device_id => {
-                handle_ssdp_discovered(
-                    &dev,
-                    &state.outputs,
-                    &state.backend,
-                    &state.config,
-                    &state.event_bus,
-                    &oh_listener,
-                    &state.playback,
-                    &state.license,
-                    &mut seen_hosts,
-                )
-                .await;
-                recovered += 1;
-                info!(
-                    id = %kr.device_id,
-                    name = %kr.name,
-                    location = %kr.location,
-                    "known_renderer_reregistered"
-                );
-            }
             Some(dev) => {
-                warn!(
-                    stored_id = %kr.device_id,
-                    live_id = %dev.id,
-                    location = %kr.location,
-                    "known_renderer_uuid_changed_skipping"
-                );
+                // `dev.id` est l'identifiant qu'on VIENT de passer en argument :
+                // `build_renderer_device` le recopie tel quel. Le comparer à
+                // `kr.device_id` était donc une tautologie, et la branche
+                // « uuid changed » ci-dessous n'a jamais pu s'exécuter depuis
+                // #1126. C'est ce qui explique le journal de #2639 : 20 ms
+                // après que `reprobe_persisted_dlna_devices` a EFFACÉ le
+                // Marantz sur un désaccord d'UDN, ce chemin-ci le réécrivait
+                // sans rien vérifier. Deux magasins, deux verdicts opposés sur
+                // le même appareil.
+                //
+                // `stable_id` porte maintenant l'UDN réellement annoncé par le
+                // descripteur, et les deux chemins appliquent la MÊME règle.
+                let observed = RendererIdentity {
+                    udn: dev.stable_id.as_deref().unwrap_or_default(),
+                    mac: dev.mac_address.as_deref().unwrap_or_default(),
+                    friendly_name: &dev.name,
+                    manufacturer: dev.manufacturer.as_deref().unwrap_or_default(),
+                    model_name: dev.model.as_deref().unwrap_or_default(),
+                };
+                // Précondition : `probe_renderer` a lu `kr.location` mot pour mot.
+                let verdict = compare_at_same_location(kr.identity(), observed);
+                match verdict {
+                    IdentityVerdict::NoDisagreement | IdentityVerdict::SameHardware(_) => {
+                        if let IdentityVerdict::SameHardware(evidence) = verdict {
+                            info!(
+                                nom = %kr.name,
+                                location = %kr.location,
+                                udn_memorise = %kr.device_id,
+                                udn_annonce = %observed.udn,
+                                reconnu_par = evidence.label(),
+                                action = "l'appareil a changé d'identifiant UPnP (redémarrage, \
+                                          mise à jour ou réinitialisation). Il reste reconnu : \
+                                          sa zone est conservée, rien à faire.",
+                                "known_renderer_identifiant_change_appareil_reconnu"
+                            );
+                        }
+                        handle_ssdp_discovered(
+                            &dev,
+                            &state.outputs,
+                            &state.backend,
+                            &state.config,
+                            &state.event_bus,
+                            &oh_listener,
+                            &state.playback,
+                            &state.license,
+                            &mut seen_hosts,
+                        )
+                        .await;
+                        recovered += 1;
+                        info!(
+                            id = %kr.device_id,
+                            name = %kr.name,
+                            location = %kr.location,
+                            "known_renderer_reregistered"
+                        );
+                    }
+                    IdentityVerdict::OtherHardware(evidence) => {
+                        warn!(
+                            nom_attendu = %kr.name,
+                            nom_trouve = %dev.name,
+                            location = %kr.location,
+                            udn_memorise = %kr.device_id,
+                            udn_annonce = %observed.udn,
+                            distingue_par = evidence.label(),
+                            action = "un AUTRE appareil occupe désormais cette adresse : la zone \
+                                      mémorisée n'y est PAS rattachée, pour ne pas faire jouer la \
+                                      mauvaise pièce. Rallumez l'appareil attendu, puis relancez \
+                                      une recherche — il sera redécouvert.",
+                            "known_renderer_appareil_remplace_non_rattache"
+                        );
+                    }
+                    IdentityVerdict::Undecidable => {
+                        warn!(
+                            nom = %kr.name,
+                            location = %kr.location,
+                            udn_memorise = %kr.device_id,
+                            udn_annonce = %observed.udn,
+                            action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
+                                      « même appareil redémarré » de « autre appareil à la même \
+                                      adresse ». L'entrée est CONSERVÉE et sera re-sondée : aucune \
+                                      zone n'est perdue.",
+                            "known_renderer_identite_indecidable_entree_conservee"
+                        );
+                    }
+                }
             }
             None => {
                 warn!(
@@ -2259,7 +2375,15 @@ mod tests {
             // et cinq re-sondages au démarrage suivant.
             let backend = memory_backend();
             for i in 0..5 {
-                persist_known_renderer(&backend, &format!("uuid:aios-{i}"), AIOS, "Marantz ND8006");
+                persist_known_renderer(
+                    &backend,
+                    &format!("uuid:aios-{i}"),
+                    AIOS,
+                    "Marantz ND8006",
+                    "",
+                    "",
+                    "",
+                );
             }
             let stored = super::super::load_known_renderers(&backend);
             assert_eq!(
@@ -2281,12 +2405,18 @@ mod tests {
                 "uuid:z1",
                 "http://192.168.1.11:8080/desc.xml",
                 "Zone 1",
+                "",
+                "",
+                "",
             );
             persist_known_renderer(
                 &backend,
                 "uuid:z2",
                 "http://192.168.1.11:8081/desc.xml",
                 "Zone 2",
+                "",
+                "",
+                "",
             );
             assert_eq!(super::super::load_known_renderers(&backend).len(), 2);
         }
@@ -2298,11 +2428,76 @@ mod tests {
                     device_id: format!("uuid:aios-{i}"),
                     location: AIOS.to_string(),
                     name: "Marantz ND8006".into(),
+                    mac: String::new(),
+                    manufacturer: String::new(),
+                    model: String::new(),
                 })
                 .collect();
             let collapsed = dedup_renderers_by_location(stored);
             assert_eq!(collapsed.len(), 1);
             assert_eq!(collapsed[0].device_id, "uuid:aios-0");
+        }
+
+        /// Trois champs ajoutés à une structure déjà sérialisée en base : sans
+        /// `#[serde(default)]`, `from_str` échoue, `load_known_renderers` rend
+        /// un magasin VIDE, et toutes les zones disparaissent au démarrage.
+        #[test]
+        fn un_magasin_d_avant_2639_se_relit_sans_perdre_ses_entrees() {
+            let ancien = r#"[{"device_id":"uuid:56fcb4ae","location":"http://192.168.1.11:60006/d.xml","name":"Marantz ND8006"}]"#;
+            let relu: Vec<KnownRenderer> = serde_json::from_str(ancien)
+                .expect("un magasin ecrit avant #2639 doit continuer de se relire");
+            assert_eq!(relu.len(), 1);
+            assert_eq!(relu[0].name, "Marantz ND8006");
+            assert!(relu[0].mac.is_empty());
+        }
+
+        /// La garde de `reregister_known_renderers` n'est plus une tautologie.
+        ///
+        /// Elle comparait `dev.id` — l'identifiant que l'appelant venait de
+        /// passer à `probe_renderer` — à ce même identifiant. Elle ne pouvait
+        /// donc rien détecter, et ce chemin réécrivait le Marantz 20 ms après
+        /// que l'autre magasin l'avait effacé (#2639). Le verdict porte
+        /// désormais sur l'UDN réellement annoncé par le descripteur.
+        #[test]
+        fn la_garde_du_second_magasin_voit_enfin_un_udn_qui_change() {
+            use tune_core::discovery::renderer_identity::{
+                Evidence, IdentityVerdict, RendererIdentity, compare_at_same_location,
+            };
+
+            let memorise = KnownRenderer {
+                device_id: "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26".into(),
+                location: AIOS.to_string(),
+                name: "Marantz ND8006".into(),
+                mac: String::new(),
+                manufacturer: String::new(),
+                model: String::new(),
+            };
+
+            // Le Marantz, UDN régénéré : reconnu, sa zone se rattache.
+            let marantz = RendererIdentity {
+                udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+                mac: "",
+                friendly_name: "Marantz ND8006",
+                manufacturer: "Marantz",
+                model_name: "ND8006",
+            };
+            assert_eq!(
+                compare_at_same_location(memorise.identity(), marantz),
+                IdentityVerdict::SameHardware(Evidence::FriendlyName)
+            );
+
+            // Un autre appareil ayant hérité de l'adresse : PAS rattaché.
+            let intrus = RendererIdentity {
+                udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+                mac: "",
+                friendly_name: "Ampli chambre",
+                manufacturer: "Denon",
+                model_name: "AVR-X2700H",
+            };
+            assert_eq!(
+                compare_at_same_location(memorise.identity(), intrus),
+                IdentityVerdict::OtherHardware(Evidence::FriendlyName)
+            );
         }
     }
 
