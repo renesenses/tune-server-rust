@@ -29,10 +29,16 @@ pub fn new_streaming_resampler(
     }
     let ratio = to_sr as f64 / from_sr as f64;
     let inv_ratio = 1.0 / ratio;
-    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-        (32_usize, 64_usize)
+    // A fixed short kernel makes the transition band wider in output-Hz as
+    // the decimation ratio grows. At the former 32/64 taps, 48 -> 44.1 kHz
+    // was already down 10.4 dB at 18 kHz (#2711). Scale the kernel at the
+    // supported rate boundaries so every path remains within 0.1 dB there.
+    let (sinc_len, oversampling_factor) = if inv_ratio > 4.0 {
+        (512_usize, 256_usize)
+    } else if inv_ratio > 2.0 {
+        (256_usize, 256_usize)
     } else {
-        (64_usize, 128_usize)
+        (128_usize, 256_usize)
     };
     let window = WindowFunction::BlackmanHarris2;
     let params = SincInterpolationParameters {
@@ -559,35 +565,47 @@ mod tests {
     }
 
     #[test]
-    fn downsampling_preserves_passband_and_rejects_out_of_band_alias() {
-        const FROM_SR: u32 = 96_000;
-        const TO_SR: u32 = 48_000;
+    fn downsampling_stepped_sweep_preserves_passband_and_rejects_alias() {
         const AMPLITUDE: f64 = 0.5;
 
-        for frequency_hz in [100.0, 1_000.0, 10_000.0] {
-            let input = sine_mono(FROM_SR, frequency_hz, AMPLITUDE);
-            let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
-            let response_db = gain_db(
-                measured_tone_amplitude(&output, TO_SR, frequency_hz),
-                AMPLITUDE,
-            );
-
-            assert!(
-                response_db.abs() < 0.1,
-                "la bande utile derive de {response_db:.3} dB a {frequency_hz} Hz"
-            );
+        for (from_sr, to_sr) in [
+            (384_000, 48_000),
+            (192_000, 48_000),
+            (96_000, 48_000),
+            (48_000, 44_100),
+        ] {
+            for frequency_hz in [
+                50.0, 100.0, 250.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 15_000.0, 18_000.0,
+            ] {
+                let input = sine_mono(from_sr, frequency_hz, AMPLITUDE);
+                let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
+                let response_db = gain_db(
+                    measured_tone_amplitude(&output, to_sr, frequency_hz),
+                    AMPLITUDE,
+                );
+                assert!(
+                    response_db.abs() < 0.1,
+                    "la bande utile {from_sr} -> {to_sr} Hz derive de \
+                     {response_db:.3} dB a {frequency_hz} Hz"
+                );
+            }
         }
 
         // 30 kHz cannot exist at 48 kHz. A converter which merely decimates
         // would fold it to |30 - 48| = 18 kHz at essentially full amplitude.
-        let input = sine_mono(FROM_SR, 30_000.0, AMPLITUDE);
-        let output = rubato_resample_batch_exact(&input, FROM_SR, TO_SR, 1);
-        let alias_db = gain_db(measured_tone_amplitude(&output, TO_SR, 18_000.0), AMPLITUDE);
+        for from_sr in [96_000, 192_000, 384_000] {
+            let input = sine_mono(from_sr, 30_000.0, AMPLITUDE);
+            let output = rubato_resample_batch_exact(&input, from_sr, 48_000, 1);
+            let alias_db = gain_db(
+                measured_tone_amplitude(&output, 48_000, 18_000.0),
+                AMPLITUDE,
+            );
 
-        assert!(
-            alias_db < -80.0,
-            "un sinus 30 kHz se replie a 18 kHz a {alias_db:.1} dB"
-        );
+            assert!(
+                alias_db < -80.0,
+                "un sinus 30 kHz a {from_sr} Hz se replie a 18 kHz a {alias_db:.1} dB"
+            );
+        }
     }
 
     #[test]
