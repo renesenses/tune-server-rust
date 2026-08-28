@@ -887,6 +887,18 @@ mod descriptif_illisible {
     }
 
     #[test]
+    fn la_quantite_de_corps_recopiee_reste_de_deux_cents_octets() {
+        // Valeur en dur, délibérément : tous les autres tests mesurent
+        // l'extrait CONTRE `BODY_EXCERPT_LIMIT`, si bien qu'élargir la
+        // constante élargirait aussi leur oracle et passerait inaperçu (une
+        // mutation l'a montré). Ce que la constante engage n'est pas un détail
+        // d'implémentation mais une décision de confidentialité : la page
+        // recopiée est celle d'un équipement du foyer, et le journal part sur
+        // un forum public. La relever se discute — pas en silence.
+        assert_eq!(BODY_EXCERPT_LIMIT, 200);
+    }
+
+    #[test]
     fn un_corps_plus_court_que_la_limite_n_est_pas_annonce_tronque() {
         let diag = describe_unreadable_body("<html>");
         assert_eq!(diag.total_bytes, 6);
@@ -1066,6 +1078,20 @@ mod descriptif_illisible {
         addr
     }
 
+    // De bout en bout : la chaîne d'erreur que six appelants relaient.
+    //
+    // Ce test ne regarde PAS le journal, et c'est délibéré. `tracing` met en
+    // cache, pour tout le processus, la décision « ce point d'appel
+    // intéresse-t-il quelqu'un ? » et le niveau maximal utile ; un abonné posé
+    // le temps d'un `await`, dans un binaire de test qui en crée des dizaines
+    // en parallèle, se voit priver d'évènements de façon imprévisible. Mesuré :
+    // capture vide **1 exécution sur 6** de la suite complète du crate, alors
+    // que le test seul passait 8 fois sur 8. Un test qui échoue une fois sur
+    // six ne prouve rien et fait perdre son temps à tout le monde.
+    //
+    // La ligne de journal est donc vérifiée là où elle peut l'être sans
+    // course : `tune-core/tests/journal_descriptif_illisible.rs`, un binaire de
+    // test dédié qui installe un abonné GLOBAL et ne contient que ce test.
     #[tokio::test]
     async fn l_erreur_d_analyse_nomme_l_adresse_et_la_nature_du_corps() {
         const CHEMIN: &str = "/rootDesc.xml";
@@ -1074,10 +1100,9 @@ mod descriptif_illisible {
         let err = fetch_device_description(&location)
             .await
             .expect_err("une page HTML ne peut pas produire un descriptif");
-        // Le contrat : la chaîne d'erreur seule, relayée par six appelants,
-        // doit suffire à agir. Les erreurs HTTP de cette même fonction
-        // portaient déjà l'URL ; l'erreur d'analyse était la seule à ne pas
-        // l'avoir, et la seule qui en avait besoin.
+        // Les erreurs HTTP de cette même fonction portaient déjà l'URL ;
+        // l'erreur d'analyse était la seule à ne pas l'avoir, et la seule qui
+        // en avait besoin.
         assert!(
             err.contains(&location),
             "l'erreur ne nomme pas l'adresse interrogée : {err}"
@@ -1087,92 +1112,13 @@ mod descriptif_illisible {
             "l'erreur ne dit pas que le corps était une page web : {err}"
         );
         assert!(
+            err.contains(&format!("{} octets", PAGE_HTML.len())),
+            "l'erreur ne dit pas la taille reçue : {err}"
+        );
+        assert!(
             !err.contains(NOM_DE_RESEAU),
             "aucun morceau du corps ne doit remonter dans une chaîne d'erreur \
              qui finit dans une réponse HTTP : {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn le_journal_porte_l_adresse_le_genre_et_un_extrait_borne() {
-        use tracing::instrument::WithSubscriber;
-        const CHEMIN: &str = "/desc.xml";
-        let addr = serveur_web(CHEMIN, PAGE_HTML).await;
-        let location = format!("http://{addr}{CHEMIN}");
-
-        let capture = JournalCapture::default();
-        let abonne = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        // `tracing` met en cache, par point d'appel et pour tout le processus,
-        // la décision « ce site intéresse-t-il quelqu'un ? ». Un autre test du
-        // même binaire qui traverse `warn!` SANS abonné y grave « jamais », et
-        // notre abonné, pourtant installé, ne voit alors plus rien : le test
-        // échouait une fois sur deux selon l'ordre d'ordonnancement. On crée le
-        // `Dispatch` d'abord, puis on force le recalcul — la décision inclut
-        // désormais notre abonné, qui reste vivant pendant tout l'await.
-        let dispatch = tracing::Dispatch::new(abonne);
-        tracing::callsite::rebuild_interest_cache();
-        let _ = fetch_device_description(&location)
-            .with_subscriber(dispatch)
-            .await;
-
-        let texte = capture.texte();
-        let ligne = texte
-            .lines()
-            .find(|l| l.contains("upnp_description_unreadable"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "aucune trace de descriptif illisible ; au niveau WARN, \
-                     c'est-à-dire dans un journal ORDINAIRE (log_level=info par \
-                     défaut) :\n{texte}"
-                )
-            });
-        assert!(
-            ligne.contains(&location),
-            "la trace ne nomme pas l'adresse : {ligne}"
-        );
-        assert!(
-            ligne.contains("page HTML"),
-            "la trace ne dit pas ce que le corps était : {ligne}"
-        );
-        assert!(
-            ligne.contains(&format!(" octets={}", PAGE_HTML.len())),
-            "la trace ne dit pas la taille reçue : {ligne}"
-        );
-        assert!(
-            !ligne.contains(NOM_DE_RESEAU),
-            "le corps ne doit jamais être journalisé en entier : {ligne}"
-        );
-    }
-
-    /// Récupère la sortie `tracing` d'un futur : c'est le journal, et lui
-    /// seul, qu'on aura entre les mains la prochaine fois.
-    #[derive(Clone, Default)]
-    struct JournalCapture(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl JournalCapture {
-        fn texte(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for JournalCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
-        type Writer = JournalCapture;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
     }
 }
