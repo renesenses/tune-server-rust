@@ -707,7 +707,31 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
     fetched_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
+-- Registre des executions automatisees (#2080 ; migration PG 039). Present ici
+-- pour la meme raison que `lyrics_cache` juste au-dessus : une base creee par
+-- cette bascule sqlite->pg enregistre schema_version 99 et ne rejoue donc
+-- jamais les scripts PG numerotes. Sans ce bloc, une telle base n'aurait pas
+-- de `task_runs` du tout, et la route d'observabilite rendrait une erreur SQL.
+--
+-- Cette table n'est PAS dans `MIGRATION_TABLES` : ses `boot_id` designent des
+-- incarnations d'un processus qui tournait sur l'AUTRE moteur. L'historique
+-- d'observabilite recommence avec le nouveau moteur, deliberement.
+CREATE TABLE IF NOT EXISTS task_runs (
+    boot_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms BIGINT,
+    outcome TEXT NOT NULL,
+    items BIGINT,
+    detail TEXT,
+    PRIMARY KEY (boot_id, task, seq)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
