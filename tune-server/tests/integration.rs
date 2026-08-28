@@ -767,6 +767,7 @@ async fn playback_manager_state_transitions() {
         // Une piste de bibliotheque porte ses identifiants (#2345).
         album_id: Some(10),
         artist_id: Some(20),
+        bitrate_kbps: None,
     };
     state.playback.play(zone_id, np).await;
     let zs = state.playback.get_state(zone_id).await;
@@ -793,6 +794,7 @@ async fn playback_manager_state_transitions() {
         // Une piste de bibliotheque porte ses identifiants (#2345).
         album_id: Some(10),
         artist_id: Some(20),
+        bitrate_kbps: None,
     };
     state.playback.play(zone_id, np2).await;
     let zs = state.playback.get_state(zone_id).await;
