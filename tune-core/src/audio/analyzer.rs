@@ -143,7 +143,97 @@ fn k_weighting_coefficients(fs: f64) -> (Biquad, Biquad) {
     )
 }
 
-/// Streaming EBU R128 (BS.1770-4) integrated-loudness + sample-peak accumulator.
+/// Streaming true-peak meter. BS.1770-5 Annex 2 requires the reconstructed
+/// signal to reach at least 192 kHz (4x at 48 kHz, 2x at 96 kHz). The shared
+/// sinc SRC reconstructs above that minimum and lets the same contract cover
+/// 44.1/88.2 kHz without rounding the ratio.
+struct TruePeakAccumulator {
+    channels: u16,
+    resampler: Option<rubato::Async<f32>>,
+    leftover: Vec<f32>,
+    peak: f64,
+}
+
+impl TruePeakAccumulator {
+    fn new(sample_rate: usize, channels: usize) -> Self {
+        let input_rate = u32::try_from(sample_rate).unwrap_or(0);
+        let channels = u16::try_from(channels).unwrap_or(0);
+        let factor = if input_rate == 0 {
+            1
+        } else {
+            192_000_u32.div_ceil(input_rate).max(1)
+        };
+        let output_rate = input_rate.saturating_mul(factor);
+        let resampler = if factor > 1 && channels > 0 {
+            match super::resample::new_streaming_resampler(input_rate, output_rate, channels) {
+                Ok(resampler) => Some(resampler),
+                Err(error) => {
+                    warn!(
+                        input_rate,
+                        output_rate,
+                        error = %error,
+                        "true_peak_resampler_creation_failed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            channels,
+            resampler,
+            leftover: Vec::new(),
+            peak: 0.0,
+        }
+    }
+
+    fn observe_f32(&mut self, samples: &[f32]) {
+        self.peak = samples
+            .iter()
+            .fold(self.peak, |peak, &sample| peak.max(sample.abs() as f64));
+    }
+
+    fn feed(&mut self, interleaved: &[f64]) {
+        self.peak = interleaved
+            .iter()
+            .fold(self.peak, |peak, &sample| peak.max(sample.abs()));
+        if self.resampler.is_none() || self.channels == 0 {
+            return;
+        }
+        // The caller feeds 30-second decoder segments. Rebuilding the whole
+        // segment at >=192 kHz would add tens of MB to the ReplayGain sweep;
+        // small frame-aligned slices keep the meter genuinely streaming.
+        let chunk_samples = 8_192 * usize::from(self.channels);
+        for chunk in interleaved.chunks(chunk_samples) {
+            let input: Vec<f32> = chunk.iter().map(|&sample| sample as f32).collect();
+            let output = super::resample::rubato_resample_chunk(
+                &mut self.resampler,
+                &input,
+                self.channels,
+                false,
+                &mut self.leftover,
+            );
+            self.observe_f32(&output);
+        }
+    }
+
+    fn finish(&mut self) -> f64 {
+        if self.resampler.is_some() && self.channels > 0 {
+            let output = super::resample::rubato_resample_chunk(
+                &mut self.resampler,
+                &[],
+                self.channels,
+                true,
+                &mut self.leftover,
+            );
+            self.observe_f32(&output);
+        }
+        self.peak
+    }
+}
+
+/// Streaming EBU R128 (BS.1770-5) integrated-loudness + true-peak accumulator.
 ///
 /// Feed interleaved, normalized (`[-1, 1]`) f64 samples in any chunking — the
 /// K-weighting filter state is continuous across `feed` calls, so feeding a
@@ -162,8 +252,8 @@ struct LoudnessAccumulator {
     bufs: Vec<std::collections::VecDeque<f64>>,
     /// Mean-square power per 400 ms block (channel-summed).
     block_powers: Vec<f64>,
-    /// Running linear sample peak on the *un-weighted* samples.
-    peak: f64,
+    /// Running true peak on the un-weighted reconstructed signal.
+    peak: TruePeakAccumulator,
     total_frames: usize,
 }
 
@@ -181,7 +271,7 @@ impl LoudnessAccumulator {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             block_powers: Vec::new(),
-            peak: 0.0,
+            peak: TruePeakAccumulator::new(sample_rate, channels),
             total_frames: 0,
         }
     }
@@ -193,11 +283,11 @@ impl LoudnessAccumulator {
         if self.channels == 0 {
             return;
         }
+        self.peak.feed(interleaved);
         let frames = interleaved.len() / self.channels;
         for f in 0..frames {
             for c in 0..self.channels {
                 let raw = interleaved[f * self.channels + c];
-                self.peak = self.peak.max(raw.abs());
                 let (s1, s2) = &mut self.filters[c];
                 self.bufs[c].push_back(s2.process(s1.process(raw)));
             }
@@ -224,10 +314,11 @@ impl LoudnessAccumulator {
         }
     }
 
-    /// Integrated loudness (LUFS, rounded to 0.1) + peak (clamped to 1.0). `None`
-    /// for silence / below-threshold / empty input.
-    fn finish(self) -> Option<(f64, f64)> {
-        let peak = self.peak.min(1.0);
+    /// Integrated loudness (LUFS, rounded to 0.1) + linear true peak. The peak
+    /// intentionally may exceed 1.0: clipping prevention needs to know by how
+    /// much the reconstructed waveform crosses full scale (#2713).
+    fn finish(mut self) -> Option<(f64, f64)> {
+        let peak = self.peak.finish();
 
         // Too short for even one 400 ms block: simple loudness over all samples
         // (nothing was drained, so the buffers still hold the whole signal).
@@ -316,8 +407,8 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
         .map(|(lufs, _)| lufs)
 }
 
-/// Measure both the EBU R128 integrated loudness (LUFS) and the linear sample
-/// peak (0.0–1.0) in a SINGLE decode pass — used by the ReplayGain analysis to
+/// Measure both the EBU R128 integrated loudness (LUFS) and the linear true
+/// peak (which may exceed 1.0) in a SINGLE decode pass — used by ReplayGain to
 /// derive `rg_track_gain` (reference − LUFS) and `rg_track_peak` without decoding
 /// the file twice.
 pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64)> {
@@ -576,6 +667,80 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quarter_rate_sine(sample_rate: usize, amplitude: f64, frames: usize) -> Vec<f64> {
+        (0..frames)
+            .map(|frame| {
+                let phase = std::f64::consts::FRAC_PI_4
+                    + 2.0 * std::f64::consts::PI * (sample_rate / 4) as f64 * frame as f64
+                        / sample_rate as f64;
+                amplitude * phase.sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn true_peak_finds_the_three_db_peak_hidden_between_samples() {
+        for sample_rate in [44_100, 48_000, 96_000] {
+            let samples = quarter_rate_sine(sample_rate, 1.0, sample_rate);
+            let sample_peak = samples
+                .iter()
+                .fold(0.0_f64, |peak, sample| peak.max(sample.abs()));
+            assert!(
+                (sample_peak - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9,
+                "sample peak {sample_peak:.12} a {sample_rate} Hz"
+            );
+
+            let mut meter = TruePeakAccumulator::new(sample_rate, 1);
+            meter.feed(&samples);
+            let true_peak = meter.finish();
+            assert!(
+                (true_peak - 1.0).abs() < 0.02,
+                "a {sample_rate} Hz : sample peak {sample_peak:.6}, true peak {true_peak:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn true_peak_keeps_overs_and_is_chunk_invariant() {
+        let samples = quarter_rate_sine(48_000, 1.1, 48_000);
+        assert!(samples.iter().all(|sample| sample.abs() < 0.8));
+
+        let mut whole = TruePeakAccumulator::new(48_000, 1);
+        whole.feed(&samples);
+        let whole_peak = whole.finish();
+
+        let mut chunked = TruePeakAccumulator::new(48_000, 1);
+        for chunk in samples.chunks(777) {
+            chunked.feed(chunk);
+        }
+        let chunked_peak = chunked.finish();
+
+        assert!(
+            whole_peak > 1.08,
+            "le dépassement est clampé : {whole_peak}"
+        );
+        assert!(
+            (chunked_peak - whole_peak).abs() < 1e-6,
+            "un découpage change le pic : {whole_peak} contre {chunked_peak}"
+        );
+    }
+
+    #[test]
+    fn loudness_accumulator_returns_true_peak_not_sample_peak() {
+        let samples = quarter_rate_sine(48_000, 1.0, 48_000);
+        let mut accumulator = LoudnessAccumulator::new(48_000, 1);
+        accumulator.feed(&samples);
+        let (_, peak) = accumulator.finish().expect("le sinus est mesurable");
+        assert!(peak > 0.99, "pic rendu {peak}");
+    }
+
+    #[test]
+    fn true_peak_silence_stays_zero() {
+        let mut meter = TruePeakAccumulator::new(44_100, 2);
+        meter.feed(&vec![0.0; 44_100 * 2]);
+        assert_eq!(meter.finish(), 0.0);
+    }
 
     // -----------------------------------------------------------------------
     // Biquad filter tests
