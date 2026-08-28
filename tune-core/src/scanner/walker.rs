@@ -287,9 +287,39 @@ fn read_file_with_retry(
     path: &PathBuf,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
-    match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
+    let result = match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
         Err(ReadFileError::Timeout) => read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT),
         other => other,
+    };
+    result.map(|(mut metadata, hash)| {
+        if let Some(meta) = metadata.as_mut() {
+            let corrections = meta.sanitize_text_fields();
+            if !corrections.is_empty() {
+                warn!(
+                    path = %path.display(),
+                    corrections = ?corrections,
+                    "scan_metadata_unsafe_text_sanitized"
+                );
+            }
+        }
+        (metadata, hash)
+    })
+}
+
+/// A path is an address on the real filesystem and cannot be rewritten in the
+/// DB without making the track unopenable. Report the exact unsafe codepoints
+/// and the safe spelling instead; ingest-generated destination components use
+/// the same sanitizer and therefore never create new paths like this.
+fn warn_unsafe_path_text(path: &str) {
+    let (safe_path, corrections) =
+        crate::metadata::sanitize_untrusted_single_line_text(path, "file_path");
+    if !corrections.is_empty() {
+        warn!(
+            path,
+            safe_path,
+            corrections = ?corrections,
+            "scan_path_contains_unsafe_text_preserved_for_io"
+        );
     }
 }
 
@@ -789,6 +819,7 @@ pub fn scan_files_parallel(
             // Without NFC normalization, metadata readers and DB lookups can
             // fail on paths containing accented characters.
             let path_str: String = path.to_string_lossy().nfc().collect();
+            warn_unsafe_path_text(&path_str);
 
             let file_meta = path.metadata().ok();
             let stat_ok = file_meta.is_some();
@@ -993,6 +1024,7 @@ pub fn scan_files_batched(
                 .map(|path| {
                     // NFC-normalize: see comment in scan_files_parallel
                     let path_str: String = path.to_string_lossy().nfc().collect();
+                    warn_unsafe_path_text(&path_str);
 
                     let file_meta = path.metadata().ok();
                     let stat_ok = file_meta.is_some();
