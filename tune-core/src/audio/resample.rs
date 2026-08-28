@@ -379,6 +379,13 @@ pub fn resample_i32(
 mod tests {
     use super::*;
 
+    // Rates that Tune advertises for local PCM output on every platform.
+    // Keep this matrix aligned with `outputs/local.rs`: it is the product
+    // contract whose SRC frame counts must remain deterministic (#2218).
+    const PRODUCT_PCM_SAMPLE_RATES: [u32; 8] = [
+        44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+    ];
+
     /// 1 s of a 440 Hz sine, stereo interleaved, at `sr`.
     fn sine_stereo(sr: u32) -> Vec<f32> {
         let mut out = Vec::with_capacity(sr as usize * 2);
@@ -538,28 +545,84 @@ mod tests {
     }
 
     #[test]
-    fn streaming_flush_is_invariant_to_chunk_boundaries() {
-        for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
-            for channels in [1_u16, 2] {
-                let input = signal(5_137, usize::from(channels));
-                let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
-                let (chunked, leftover) = resample_in_chunks(
-                    &input,
-                    from_sr,
-                    to_sr,
-                    channels,
-                    &[1, 17, 1_000, 3, 2_048, 511],
-                );
+    fn exact_frame_count_covers_every_product_rate_pair() {
+        // 4_417 is deliberately neither a resampler block boundary nor a
+        // common divisor of the advertised rates. It exercises the rounding
+        // contract without allowing an integer-ratio shortcut to hide a lost
+        // or duplicated tail frame.
+        const INPUT_FRAMES: usize = 4_417;
 
-                assert!(
-                    leftover.is_empty(),
-                    "le flush laisse des échantillons en attente pour {from_sr} -> {to_sr} Hz"
-                );
-                assert_eq!(
-                    chunked, reference,
-                    "le découpage change la sortie ou son nombre de trames pour \
-                     {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
-                );
+        for from_sr in PRODUCT_PCM_SAMPLE_RATES {
+            for to_sr in PRODUCT_PCM_SAMPLE_RATES {
+                for channels in [1_u16, 2] {
+                    let input = signal(INPUT_FRAMES, usize::from(channels));
+                    let output = rubato_resample_batch_exact(&input, from_sr, to_sr, channels);
+                    let expected =
+                        (INPUT_FRAMES as f64 * to_sr as f64 / from_sr as f64).round() as usize;
+
+                    assert_eq!(
+                        output.len(),
+                        expected * usize::from(channels),
+                        "{from_sr} -> {to_sr} Hz, {channels} canal(aux), {INPUT_FRAMES} trames"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_flush_is_invariant_to_chunk_boundaries() {
+        for from_sr in PRODUCT_PCM_SAMPLE_RATES {
+            for to_sr in PRODUCT_PCM_SAMPLE_RATES {
+                if from_sr == to_sr {
+                    continue;
+                }
+                for channels in [1_u16, 2] {
+                    let input = signal(5_137, usize::from(channels));
+                    let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
+                    let (chunked, leftover) = resample_in_chunks(
+                        &input,
+                        from_sr,
+                        to_sr,
+                        channels,
+                        &[1, 17, 1_000, 3, 2_048, 511],
+                    );
+
+                    assert!(
+                        leftover.is_empty(),
+                        "le flush laisse des échantillons en attente pour {from_sr} -> {to_sr} Hz"
+                    );
+                    assert_eq!(
+                        chunked, reference,
+                        "le découpage change la sortie ou son nombre de trames pour \
+                         {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_flush_covers_block_boundaries() {
+        for (from_sr, to_sr) in [(44_100, 384_000), (384_000, 44_100)] {
+            for channels in [1_u16, 2] {
+                for input_frames in [1_usize, 1_023, 1_024, 1_025, 2_047, 2_048, 2_049] {
+                    let input = signal(input_frames, usize::from(channels));
+                    let reference = rubato_resample_batch(&input, from_sr, to_sr, channels);
+                    let (chunked, leftover) =
+                        resample_in_chunks(&input, from_sr, to_sr, channels, &[1, 1_023, 2, 511]);
+
+                    assert!(
+                        leftover.is_empty(),
+                        "le flush laisse un reliquat pour {from_sr} -> {to_sr} Hz, \
+                         {channels} canal(aux), {input_frames} trames"
+                    );
+                    assert_eq!(
+                        chunked, reference,
+                        "le flush change la sortie a la frontiere de {input_frames} trames \
+                         pour {from_sr} -> {to_sr} Hz, {channels} canal(aux)"
+                    );
+                }
             }
         }
     }
