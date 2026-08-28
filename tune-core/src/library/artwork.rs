@@ -1130,6 +1130,13 @@ async fn batch_enrich_artist_artwork_inner(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Consentement explicite avant de rien remonter au cloud communautaire.
+    // Le seul garde-fou etait « avoir un instance_id » — or il est genere tout
+    // seul au demarrage, donc l'envoi des images d'artistes etait en pratique
+    // inconditionnel. Lu ICI, une fois, et non a chaque artiste : la boucle
+    // dure des heures et le choix de l'utilisateur au moment ou il lance
+    // l'enrichissement est celui qui fait foi pour cette passe.
+    let contribution_consentie = crate::cloud::consent::contribution_autorisee(&settings);
     // Discogs token as configured in the app UI (stored in settings), so the
     // by-name Discogs image lookup actually works (Progman: no artist images).
     let discogs_token = settings
@@ -1199,9 +1206,10 @@ async fn batch_enrich_artist_artwork_inner(
                     );
 
                     // Fire-and-forget: submit to community for sharing.
-                    // Only when we have an MBID — the community store is keyed by
-                    // MBID, so submitting with an empty one is meaningless.
-                    if !instance_id.is_empty() && !mbid.is_empty() {
+                    // Seulement si l'utilisateur l'a explicitement autorise, et
+                    // seulement quand on a un MBID — le depot communautaire est
+                    // indexe par MBID, y poster avec un MBID vide n'a aucun sens.
+                    if contribution_consentie && !instance_id.is_empty() && !mbid.is_empty() {
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
@@ -1951,8 +1959,8 @@ mod tests {
 
     #[test]
     fn save_to_cache_and_read() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_cache");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("cache");
 
         let data = b"fake image data";
         let result = save_to_cache(data, &dir, "test_hash_123", "jpg");
@@ -1961,25 +1969,22 @@ mod tests {
         let path = result.unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), data);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_to_cache_creates_dir() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_new_dir");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("nouveau");
         assert!(!dir.exists());
 
         save_to_cache(b"test", &dir, "hash", "png");
         assert!(dir.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_or_extract_nonexistent() {
-        let cache_dir = std::env::temp_dir().join("tune_test_extract_ne");
+        let base = tempfile::TempDir::new().unwrap();
+        let cache_dir = base.path().join("cache");
         let result = get_or_extract(Path::new("/tmp/nonexistent_audio_file.flac"), &cache_dir);
         assert!(result.is_none());
     }

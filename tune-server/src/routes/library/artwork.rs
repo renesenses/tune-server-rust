@@ -343,6 +343,70 @@ pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -
     }))
 }
 
+/// Décompte des artistes que la passe d'enrichissement va **réellement**
+/// traiter, ventilé par population.
+///
+/// Les quatre champs reprennent, une pour une, les quatre listes que
+/// `batch_enrich_artist_artwork_inner` empile avant de boucler
+/// (`tune-core/src/library/artwork.rs`) : c'est la seule façon d'annoncer un
+/// total qui corresponde au travail lancé.
+pub(super) struct ArtistesSansImage {
+    /// MBID connu, aucune image en base (`list_without_image`).
+    pub avec_mbid: usize,
+    /// MBID connu, `image_path` posé mais le fichier de cache a disparu.
+    pub cache_perdu_avec_mbid: usize,
+    /// Aucun MBID, aucune image (`list_without_image_no_mbid`).
+    pub sans_mbid: usize,
+    /// Aucun MBID, `image_path` posé mais le fichier de cache a disparu.
+    pub cache_perdu_sans_mbid: usize,
+}
+
+impl ArtistesSansImage {
+    /// Tout artiste que l'utilisateur voit sans photo.
+    ///
+    /// Les deux termes « sans MBID » manquaient : `list_without_image` et
+    /// `list_with_image_and_mbid` exigent l'une comme l'autre
+    /// `musicbrainz_id != ''`. Sur une bibliothèque non étiquetée le total
+    /// tombait donc à zéro alors que la passe traite tout le monde (#2184).
+    pub fn total(&self) -> usize {
+        self.avec_mbid + self.cache_perdu_avec_mbid + self.sans_mbid + self.cache_perdu_sans_mbid
+    }
+
+    /// Les images « fantômes » : la base annonce une photo, le fichier a disparu.
+    pub fn cache_perdu(&self) -> usize {
+        self.cache_perdu_avec_mbid + self.cache_perdu_sans_mbid
+    }
+}
+
+/// Compte les artistes sans image visible, MBID ou pas.
+pub(super) fn compter_artistes_sans_image(
+    artist_repo: &tune_core::db::artist_repo::ArtistRepo,
+    cache_dir: &std::path::Path,
+) -> ArtistesSansImage {
+    let perdu = |image_path: &str| {
+        !tune_core::library::artwork::cached_artwork_exists(cache_dir, image_path)
+    };
+    ArtistesSansImage {
+        avec_mbid: artist_repo.list_without_image().unwrap_or_default().len(),
+        cache_perdu_avec_mbid: artist_repo
+            .list_with_image_and_mbid()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, _, _, image_path)| perdu(image_path))
+            .count(),
+        sans_mbid: artist_repo
+            .list_without_image_no_mbid()
+            .unwrap_or_default()
+            .len(),
+        cache_perdu_sans_mbid: artist_repo
+            .list_with_image_no_mbid()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, _, image_path)| perdu(image_path))
+            .count(),
+    }
+}
+
 pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -353,24 +417,13 @@ pub(super) async fn batch_enrich_artist_artwork(
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
     let without_mbid = artist_repo.list_without_mbid().unwrap_or_default().len();
 
-    // Count artists missing images (Phase 2 candidates)
-    let missing = artist_repo.list_without_image().unwrap_or_default();
+    // Le décompte annoncé doit couvrir la MÊME population que celle que les
+    // phases vont traiter — y compris les artistes sans MBID, que toutes les
+    // listes « with_mbid » excluent par construction.
+    let sans_image = compter_artistes_sans_image(&artist_repo, &cache_dir);
+    let broken_cache = sans_image.cache_perdu();
 
-    // Also count artists whose DB image_path is set but the cache file is gone
-    // (moved/wiped artwork_cache): the normal pass would otherwise skip because
-    // the DB "claims" every artist has an image, so the enrichment never runs
-    // and the folder stays empty (Fabien: full scan + premium, no artist
-    // images). Phase 1 already re-downloads these — we just must not skip.
-    let broken_cache = artist_repo
-        .list_with_image_and_mbid()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, _, _, image_path)| {
-            !tune_core::library::artwork::cached_artwork_exists(&cache_dir, image_path)
-        })
-        .count();
-
-    if missing.is_empty() && broken_cache == 0 && without_mbid == 0 {
+    if sans_image.total() == 0 && without_mbid == 0 {
         return Json(json!({
             "status": "skipped",
             "message": "all artists already have MBID and images",
@@ -385,7 +438,7 @@ pub(super) async fn batch_enrich_artist_artwork(
     settings
         .set(
             "artist_artwork_enrich_result",
-            &json!({"total": missing.len(), "enriched": 0, "without_mbid": without_mbid, "status": "running"}).to_string(),
+            &json!({"total": sans_image.total(), "enriched": 0, "without_mbid": without_mbid, "status": "running"}).to_string(),
         )
         .ok();
 
@@ -453,7 +506,17 @@ pub(super) async fn batch_enrich_artist_artwork(
             //
             // Du point de vue de l'utilisateur, un artiste dont le fichier a
             // disparu n'a pas d'image. C'est ce total-là qui doit être annoncé.
-            "artists_without_image": missing.len() + broken_cache,
+            //
+            // Et il en va de même des artistes SANS MBID : `list_without_image`
+            // comme `list_with_image_and_mbid` exigent toutes deux
+            // `musicbrainz_id != ''`. Sur une bibliothèque non taguée — le cas
+            // courant, ~8 % d'identification MusicBrainz — ces deux termes
+            // valent zéro alors que la passe travaille des centaines
+            // d'artistes en phase 3. Le client lit `artists_without_image === 0`,
+            // annonce « Tous les artistes ont déjà une image » et cesse de
+            // sonder : deux secondes, aucune image (Bruno Lescarret, #2184,
+            // v0.9.44, 738 artistes Windows sans étiquette MusicBrainz).
+            "artists_without_image": sans_image.total(),
             // Détaillé à part pour que l'interface puisse expliquer la
             // différence entre « jamais eu d'image » et « image perdue ».
             "artists_with_broken_image": broken_cache,
@@ -522,7 +585,11 @@ pub(super) async fn batch_enrich_artist_artwork_status(
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
-    let still_missing = artist_repo.list_without_image().unwrap_or_default().len();
+    // Même population que la réponse 202 : le client se sert de ce nombre comme
+    // condition d'arrêt (`artistImgRemaining === 0` ⇒ « terminé »). Le limiter
+    // aux artistes porteurs d'un MBID faisait conclure « terminé » au premier
+    // sondage sur toute bibliothèque non taguée.
+    let still_missing = compter_artistes_sans_image(&artist_repo, &artwork_cache_dir()).total();
 
     Json(json!({
         "result": result,
@@ -606,4 +673,140 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
         StatusCode::ACCEPTED,
         Json(json!({"status": "accepted", "message": "artwork rescan started"})),
     )
+}
+
+#[cfg(test)]
+mod tests_decompte_artistes {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::artist_repo::ArtistRepo;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::models::Artist;
+
+    fn base_memoire() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Crée un artiste et pose son MBID / son `image_path` s'il y en a un.
+    fn artiste(repo: &ArtistRepo, nom: &str, mbid: Option<&str>, image: Option<&str>) {
+        let id = repo.create(&Artist::new(nom.into())).unwrap();
+        if let Some(m) = mbid {
+            repo.update_mbid(id, m).unwrap();
+        }
+        if let Some(i) = image {
+            repo.update_image(id, i, "test").unwrap();
+        }
+    }
+
+    /// Le cas Bruno Lescarret (#2184) : bibliothèque Windows sans la moindre
+    /// étiquette MusicBrainz. Toutes les listes « avec MBID » rendent zéro, et
+    /// c'est pourtant tout le travail de la passe.
+    #[test]
+    fn une_bibliotheque_sans_mbid_ne_compte_pas_zero_artiste_sans_image() {
+        let backend = base_memoire();
+        let repo = ArtistRepo::with_backend(backend);
+        for nom in ["Ange", "Magma", "Gong"] {
+            artiste(&repo, nom, None, None);
+        }
+        let cache = tempfile::tempdir().unwrap();
+
+        let compte = compter_artistes_sans_image(&repo, cache.path());
+
+        assert_eq!(compte.avec_mbid, 0, "aucun artiste n'a de MBID");
+        assert_eq!(
+            compte.sans_mbid, 3,
+            "les trois sont sans MBID et sans image"
+        );
+        assert_eq!(
+            compte.total(),
+            3,
+            "un artiste sans MBID et sans image est un artiste SANS IMAGE : \
+             en annoncer 0 fait afficher « tous les artistes ont déjà une image » \
+             et arrête le suivi au bout de deux secondes (#2184)"
+        );
+    }
+
+    /// Image « fantôme » sans MBID : la base annonce une photo, le fichier de
+    /// cache a disparu. La phase 2 la remet en file (`list_with_image_no_mbid`),
+    /// donc elle doit être annoncée.
+    #[test]
+    fn une_image_fantome_sans_mbid_compte_comme_manquante() {
+        let backend = base_memoire();
+        let repo = ArtistRepo::with_backend(backend);
+        artiste(
+            &repo,
+            "Heldon",
+            None,
+            Some("cafecafecafecafecafecafecafecafe"),
+        );
+        let cache = tempfile::tempdir().unwrap();
+
+        let compte = compter_artistes_sans_image(&repo, cache.path());
+
+        assert_eq!(compte.cache_perdu_sans_mbid, 1);
+        assert_eq!(compte.total(), 1);
+    }
+
+    /// Garde-fou inverse : une photo réellement présente en cache ne doit
+    /// jamais être recomptée comme manquante, MBID ou pas.
+    #[test]
+    fn une_image_presente_en_cache_ne_compte_pas() {
+        let backend = base_memoire();
+        let repo = ArtistRepo::with_backend(backend);
+        let cache = tempfile::tempdir().unwrap();
+        let hash = "aaaabbbbccccddddeeeeffff00001111";
+        std::fs::write(cache.path().join(format!("{hash}.jpg")), b"jpeg").unwrap();
+        artiste(&repo, "Pulsar", None, Some(hash));
+        artiste(
+            &repo,
+            "Shylock",
+            Some("11111111-2222-3333-4444-555555555555"),
+            Some(hash),
+        );
+
+        let compte = compter_artistes_sans_image(&repo, cache.path());
+
+        assert_eq!(compte.total(), 0, "les deux photos sont bien en cache");
+        assert_eq!(compte.cache_perdu(), 0);
+    }
+
+    /// Les quatre populations à la fois, pour que le total ne puisse pas être
+    /// juste « par hasard » sur un seul terme.
+    #[test]
+    fn le_total_couvre_les_quatre_populations() {
+        let backend = base_memoire();
+        let repo = ArtistRepo::with_backend(backend);
+        let cache = tempfile::tempdir().unwrap();
+        let present = "99998888777766665555444433332222";
+        std::fs::write(cache.path().join(format!("{present}.jpg")), b"jpeg").unwrap();
+
+        artiste(&repo, "avec mbid, sans image", Some("mbid-a"), None);
+        artiste(
+            &repo,
+            "avec mbid, image fantome",
+            Some("mbid-b"),
+            Some("00000000000000000000000000000000"),
+        );
+        artiste(&repo, "sans mbid, sans image", None, None);
+        artiste(
+            &repo,
+            "sans mbid, image fantome",
+            None,
+            Some("11111111111111111111111111111111"),
+        );
+        // Témoin : ne doit compter dans aucun terme.
+        artiste(&repo, "servi", Some("mbid-c"), Some(present));
+
+        let compte = compter_artistes_sans_image(&repo, cache.path());
+
+        assert_eq!(compte.avec_mbid, 1);
+        assert_eq!(compte.cache_perdu_avec_mbid, 1);
+        assert_eq!(compte.sans_mbid, 1);
+        assert_eq!(compte.cache_perdu_sans_mbid, 1);
+        assert_eq!(compte.total(), 4, "quatre artistes sans photo visible");
+        assert_eq!(compte.cache_perdu(), 2);
+    }
 }

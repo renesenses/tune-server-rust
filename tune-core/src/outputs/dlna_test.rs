@@ -19,6 +19,10 @@ mod tests {
         seek_count: Arc<AtomicU32>,
         set_next_count: Arc<AtomicU32>,
         volume_count: Arc<AtomicU32>,
+        /// Nombre d'actions SOAP `GetMute` reçues. Le poller interroge chaque
+        /// renderer à 1 Hz pendant toute la lecture (#2263) : ce compteur est
+        /// là pour prouver que `get_status` n'en émet plus AUCUNE.
+        get_mute_count: Arc<AtomicU32>,
         transport_state: Arc<Mutex<String>>,
         last_seek_target: Arc<Mutex<String>>,
         /// Simule Platinum/1.0.5.13 : tout SetAVTransportURI/SetNext dont le
@@ -45,6 +49,7 @@ mod tests {
                 seek_count: Arc::new(AtomicU32::new(0)),
                 set_next_count: Arc::new(AtomicU32::new(0)),
                 volume_count: Arc::new(AtomicU32::new(0)),
+                get_mute_count: Arc::new(AtomicU32::new(0)),
                 transport_state: Arc::new(Mutex::new("STOPPED".into())),
                 last_seek_target: Arc::new(Mutex::new(String::new())),
                 set_uri_max_corps: Arc::new(Mutex::new(None)),
@@ -175,7 +180,13 @@ mod tests {
             }
             "GetVolume" => soap_ok("GetVolume", "<CurrentVolume>50</CurrentVolume>"),
             "SetMute" => soap_ok("SetMute", ""),
-            "GetMute" => soap_ok("GetMute", "<CurrentMute>0</CurrentMute>"),
+            // Répond « coupé » exprès : si `get_status` interrogeait encore le
+            // renderer, le statut rendu porterait `muted = true` et les tests
+            // de #2263 le verraient.
+            "GetMute" => {
+                state.get_mute_count.fetch_add(1, Ordering::Relaxed);
+                soap_ok("GetMute", "<CurrentMute>1</CurrentMute>")
+            }
             _ => soap_ok(&action, ""),
         }
     }
@@ -521,6 +532,65 @@ mod tests {
         assert_eq!(status.state, TransportState::Playing);
         assert_eq!(status.position_ms, 90_000);
         assert_eq!(status.duration_ms, 300_000);
+        handle.abort();
+    }
+
+    // ---- #2263 : le poller ne réveille plus le renderer pour rien ----------
+
+    /// `get_status` n'émet plus l'action SOAP `GetMute`.
+    ///
+    /// Le poller interroge chaque zone DLNA à 1 Hz **pendant toute la
+    /// lecture**. Chaque tick valait quatre actions SOAP, dont un `GetMute`
+    /// dont personne ne lisait le résultat : l'état « coupé » que voient
+    /// l'interface, la base et les évènements est écrit uniquement par
+    /// `Orchestrator::set_mute`, jamais par `OutputStatus.muted`. Une action
+    /// sur quatre, à chaque seconde, pour rien.
+    #[tokio::test]
+    async fn dlna_get_status_n_interroge_plus_le_mute() {
+        let state = MockState::default();
+        *state.transport_state.lock().await = "PLAYING".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        for _ in 0..3 {
+            let status = output.get_status().await.unwrap();
+            // Le mock répond `CurrentMute = 1` : un `muted` vrai signerait un
+            // aller-retour SOAP encore vivant.
+            assert!(
+                !status.muted,
+                "get_status a lu le mute du renderer au lieu de l'état local"
+            );
+        }
+
+        assert_eq!(
+            state.get_mute_count.load(Ordering::Relaxed),
+            0,
+            "get_status émet encore des GetMute — le renderer est réveillé à 1 Hz pour rien"
+        );
+        handle.abort();
+    }
+
+    /// La suppression du `GetMute` ne casse pas la fonction : l'état coupé
+    /// reste celui que Tune a posé par `set_mute`, sans un seul aller-retour
+    /// de lecture.
+    #[tokio::test]
+    async fn dlna_set_mute_reste_visible_dans_le_statut() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        assert!(!output.get_status().await.unwrap().muted);
+
+        output.set_mute(true).await.unwrap();
+        assert!(
+            output.get_status().await.unwrap().muted,
+            "l'état coupé posé par Tune n'est plus rapporté"
+        );
+
+        output.set_mute(false).await.unwrap();
+        assert!(!output.get_status().await.unwrap().muted);
+
+        assert_eq!(state.get_mute_count.load(Ordering::Relaxed), 0);
         handle.abort();
     }
 

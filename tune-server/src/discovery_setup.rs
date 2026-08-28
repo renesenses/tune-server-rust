@@ -58,6 +58,55 @@ fn register_discovered_output(
     );
 }
 
+/// Registre des serveurs multimédia, tel que le porte `AppState`.
+type RegistreServeursMultimedia = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>,
+    >,
+>;
+
+/// Retirer un serveur multimédia du registre et prévenir les clients.
+///
+/// C'est le SEUL retrait du registre `media_servers`, et il n'arrive que sur
+/// disparition **confirmée** : un `ssdp:byebye` vérifié par une sonde unicast,
+/// ou un `CACHE-CONTROL: max-age` écoulé suivi d'une sonde qui échoue. Jamais
+/// sur un simple silence — voir `media_server_verdict` dans `ssdp.rs`.
+///
+/// Rien d'autre n'est à défaire, et c'est vérifié :
+/// - **aucune zone** ne peut être adossée à un serveur multimédia — la branche
+///   `is_media_server()` de `ssdp.rs` rend la main avant toute création
+///   d'appareil, donc un serveur n'entre jamais dans `OutputRegistry` ;
+/// - **aucune lecture en cours** n'en dépend — `play_media_server_item`
+///   (`routes/network.rs`) répond `not_implemented` ; seuls `browse` et
+///   `search` lisent le registre, et à la demande ;
+/// - **aucune ligne en base** — le registre est une carte en mémoire,
+///   reconstruite au démarrage par la découverte. Pas de table, pas de
+///   migration.
+///
+/// Rend `true` si une entrée a effectivement été retirée.
+async fn retirer_serveur_multimedia(
+    media_servers: &RegistreServeursMultimedia,
+    event_bus: &EventBus,
+    id: &str,
+) -> bool {
+    if media_servers.lock().await.remove(id).is_none() {
+        return false;
+    }
+    // `device.*` est le seul préfixe sur lequel le client web recharge
+    // Réglages > Réseau (#2273) : sans cet événement, le retrait n'apparaîtrait
+    // qu'au rechargement de la page — exactement le symptôme signalé
+    // (« il reste affiché même si on fait actualiser »).
+    event_bus.emit_typed(
+        EventType::DeviceLost,
+        serde_json::json!({
+            "device_id": id,
+            "kind": "media_server",
+        }),
+    );
+    info!(id = %id, "media_server_unregistered");
+    true
+}
+
 /// Set a zone's online state and, if it actually changed, broadcast a
 /// `zone.updated` event so controllers see availability flip in real time.
 /// (`set_online_by_device` alone is silent — clients never learned of it.)
@@ -234,6 +283,9 @@ pub fn spawn_ssdp_handler(
                     let id = ms.id.clone();
                     media_servers.lock().await.insert(id.clone(), ms);
                     info!(id = %id, "media_server_registered");
+                }
+                SsdpEvent::MediaServerLost(id) => {
+                    retirer_serveur_multimedia(&media_servers, &event_bus, &id).await;
                 }
             }
         }
@@ -2493,5 +2545,95 @@ mod tests {
         assert_ne!(refus_nommes(&passe(true)), refus);
         // Et un instantané vide (aucune passe encore) ne refuse rien.
         assert!(refus_nommes(&serde_json::Value::Null).is_empty());
+    }
+}
+
+/// #2139 — le retrait d'un serveur multimédia du registre `media_servers`.
+///
+/// Le registre était en écriture seule : `insert` et rien d'autre, pour toute
+/// la vie du processus. Ces tests fixent le contrat du retrait et, surtout,
+/// celui de l'événement sans lequel « actualiser » ne changerait toujours rien.
+#[cfg(test)]
+mod retrait_serveur_multimedia {
+    use super::retirer_serveur_multimedia;
+    use tune_core::discovery::ssdp::MediaServerInfo;
+    use tune_core::event_bus::EventBus;
+
+    fn registre(ids: &[&str]) -> super::RegistreServeursMultimedia {
+        let mut map = std::collections::HashMap::new();
+        for id in ids {
+            map.insert(
+                (*id).to_string(),
+                MediaServerInfo {
+                    id: (*id).to_string(),
+                    name: format!("Serveur {id}"),
+                    manufacturer: "Minim".into(),
+                    model: "MinimServer".into(),
+                    location: "http://192.0.2.10:9790/desc.xml".into(),
+                    content_directory_url: "http://192.0.2.10:9790/cd".into(),
+                    host: "192.0.2.10".into(),
+                    port: 9790,
+                    last_seen: std::time::Instant::now(),
+                    max_age: std::time::Duration::from_secs(1800),
+                },
+            );
+        }
+        std::sync::Arc::new(tokio::sync::Mutex::new(map))
+    }
+
+    /// Le retrait sort bien l'entrée du registre ET publie `device.lost`.
+    ///
+    /// L'événement n'est pas cosmétique : le client web ne recharge
+    /// Réglages > Réseau que sur un événement `device.*` (#2273). Sans lui, le
+    /// serveur éteint resterait affiché jusqu'au rechargement de la page —
+    /// c'est-à-dire le symptôme signalé, à peine déplacé.
+    #[tokio::test]
+    async fn le_retrait_vide_le_registre_et_previent_les_clients() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registre = registre(&["uuid:minim-1", "uuid:twonky-2"]);
+
+        let retire = retirer_serveur_multimedia(&registre, &bus, "uuid:minim-1").await;
+
+        assert!(retire, "le retrait doit signaler qu'il a bien eu lieu");
+        let restant = registre.lock().await;
+        assert!(
+            !restant.contains_key("uuid:minim-1"),
+            "le serveur éteint doit avoir disparu du registre"
+        );
+        assert!(
+            restant.contains_key("uuid:twonky-2"),
+            "le serveur voisin ne doit pas être emporté"
+        );
+        drop(restant);
+
+        let event = events.recv().await.expect("device.lost attendu");
+        assert_eq!(event.event_type, "device.lost");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "uuid:minim-1",
+                "kind": "media_server",
+            })
+        );
+    }
+
+    /// Retirer un identifiant inconnu ne publie RIEN : un `byebye` de renderer
+    /// traverse le même chemin, et un `device.lost` en double ferait recharger
+    /// l'interface pour rien.
+    #[tokio::test]
+    async fn un_identifiant_inconnu_ne_publie_aucun_evenement() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registre = registre(&["uuid:minim-1"]);
+
+        let retire = retirer_serveur_multimedia(&registre, &bus, "uuid:un-renderer").await;
+
+        assert!(!retire);
+        assert!(
+            events.try_recv().is_err(),
+            "aucun événement ne doit être publié pour un identifiant inconnu"
+        );
+        assert_eq!(registre.lock().await.len(), 1);
     }
 }

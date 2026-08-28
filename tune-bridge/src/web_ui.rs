@@ -250,11 +250,9 @@ mod tests {
     /// plus difficile a diagnostiquer qu'une absence franche.
     #[test]
     fn un_repertoire_sans_index_ne_monte_rien() {
-        let tmp = std::env::temp_dir().join("tune-bridge-web-vide");
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var(WEB_DIR_ENV, tmp.to_str().unwrap()) };
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var(WEB_DIR_ENV, tmp.path().to_str().unwrap()) };
         assert!(repertoire_web().is_none());
         unsafe { std::env::remove_var(WEB_DIR_ENV) };
-        let _ = std::fs::remove_dir(&tmp);
     }
 }

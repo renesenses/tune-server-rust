@@ -467,14 +467,31 @@ jobs:
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
+    #
+    # `denyWarnings: true` etend ce blocage aux avis INFORMATIFS (#2251). Par
+    # defaut `cargo audit` affiche un `informational = "unmaintained"` puis sort
+    # en 0 : mesure sur release/v0.9 (e608df16), « warning: 3 allowed warnings
+    # found », code de sortie 0. RUSTSEC-2026-0150 (audiopus_sys abandonne) est
+    # donc apparu le 21/05/2026 sans jamais rougir ici, alors meme que
+    # `deny.toml` le connaissait deja. Un avis informatif ne peut plus arriver
+    # en silence : soit il est corrige, soit il est inscrit dans la liste
+    # ci-dessous AVEC sa raison et sa date.
+    #
+    # La liste doit rester identique a celle de `deny.toml` et de
+    # `.cargo/audit.toml` (le preflight de release lance `cargo audit` nu, qui
+    # ne lit que ce dernier). C'est precisement cette derive qui a rendu
+    # RUSTSEC-2026-0150 invisible ; le test
+    # `les_trois_listes_dexceptions_rustsec_sont_identiques` la refuse
+    # desormais.
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
         with:
-          # Only the unmaintained-warning advisories with no available fix are
-          # ignored (paste, instant — transitive, no runtime path). Kept in sync
-          # with deny.toml. Every vulnerability, wasmtime included, now blocks.
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+          denyWarnings: true
+          # Avis « unmaintained » sans correctif disponible, chacun justifie
+          # dans .cargo/audit.toml : paste et instant (transitifs, hors chemin
+          # d'execution), audiopus_sys (arbitrage ouvert, cf #2251).
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0150
 
   ffi:
     name: FFI mobile (compilation)

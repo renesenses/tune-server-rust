@@ -74,6 +74,23 @@ pub struct DlnaOutput {
     /// remonté en cours de vie du process : la pile du renderer ne change pas ;
     /// un redémarrage de Tune repart du complet.
     didl_niveau_appris: AtomicU8,
+    /// Dernier état « coupé » que **Tune** a posé sur cet appareil, via
+    /// `set_mute`.
+    ///
+    /// `get_status` le rend tel quel au lieu d'aller le redemander au
+    /// renderer : le poller interroge chaque zone DLNA à 1 Hz pendant toute la
+    /// lecture, et l'action SOAP `GetMute` y valait une requête sur quatre —
+    /// pour une valeur que **personne ne lisait**. L'état coupé qu'affichent
+    /// l'interface, la base (`zones.muted`) et les évènements est écrit
+    /// uniquement par `Orchestrator::set_mute` ; `OutputStatus.muted` ne le
+    /// nourrit nulle part (#2263).
+    ///
+    /// Même convention que les autres sorties sans évènements — AirPlay,
+    /// SlimProto, Squeezebox tiennent déjà leur mute en local. Conséquence
+    /// assumée : une coupure faite **sur l'appareil lui-même** (télécommande
+    /// physique) n'est plus reflétée dans `GET /api/devices/{id}/status`,
+    /// seule route qui expose ce champ.
+    muted: AtomicBool,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
     /// URL for the ConnectionManager service (used to query GetProtocolInfo).
@@ -126,6 +143,7 @@ impl DlnaOutput {
             play_delay_ms: AtomicU64::new(0),
             next_item_id_flip: AtomicBool::new(false),
             didl_niveau_appris: AtomicU8::new(0),
+            muted: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
         }
@@ -858,6 +876,11 @@ impl OutputTarget for DlnaOutput {
         self.rc_action("SetMute", &format!(
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{val}</DesiredMute>"
         )).await?;
+        // Mémorisé seulement après un SetMute accepté : `get_status` ne
+        // redemande plus rien au renderer (#2263), donc ce champ est la seule
+        // source du `muted` rendu — il ne doit jamais annoncer une coupure que
+        // l'appareil a refusée.
+        self.muted.store(muted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -887,13 +910,10 @@ impl OutputTarget for DlnaOutput {
             )
             .await?
         };
-        let mute_resp = self
-            .rc_action(
-                "GetMute",
-                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
-            )
-            .await;
-
+        // Pas de `GetMute` ici. Le poller passe par cette fonction une fois
+        // par seconde et par zone pendant TOUTE la lecture : l'action valait
+        // un quart du trafic SOAP envoyé au renderer, pour une valeur que
+        // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let state = if transport_resp.contains("PLAYING") {
             TransportState::Playing
         } else if transport_resp.contains("PAUSED") {
@@ -914,11 +934,7 @@ impl OutputTarget for DlnaOutput {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v / 100.0)
             .unwrap_or(0.5);
-        let muted = mute_resp
-            .ok()
-            .and_then(|r| extract_tag(&r, "CurrentMute"))
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let muted = self.muted.load(Ordering::Relaxed);
         let current_uri = extract_tag(&position_resp, "TrackURI");
 
         Ok(OutputStatus {

@@ -51,6 +51,20 @@ pub struct NowPlaying {
     pub album_id: Option<i64>,
     #[serde(default)]
     pub artist_id: Option<i64>,
+    /// Débit CONSTANT du flux source, en kbit/s, quand la source le nomme
+    /// elle-même. `None` veut dire « on ne sait pas » — et rien n'est affiché.
+    ///
+    /// Il existe pour le 128 kbit/s de Bandcamp (#2074) : la qualité était
+    /// annoncée sur l'écran Bandcamp — « un flux à 128 kbit/s doit être
+    /// annoncé comme tel partout où il apparaît »,
+    /// `plugins/tune-bandcamp/src/lib.rs` — puis se perdait au passage en
+    /// zone, où le chemin du signal n'affichait plus qu'un « MP3 »
+    /// indiscernable d'un 320. Un fichier local n'en a pas besoin : sa
+    /// résolution réelle est déjà lue au scan.
+    ///
+    /// `#[serde(default)]` : un client plus ancien ne l'envoie pas.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl NowPlaying {
@@ -87,6 +101,11 @@ impl NowPlaying {
             year: track.year,
             album_id: track.album_id,
             artist_id: track.artist_id,
+            // Une piste de la bibliothèque n'annonce pas de débit : sa
+            // résolution réelle est lue au scan et déjà portée ci-dessus. Le
+            // champ existe pour les flux distants qui, eux, nomment leur
+            // encodage (#2074).
+            bitrate_kbps: None,
         }
     }
 }

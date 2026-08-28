@@ -591,6 +591,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
+        // émet lui aussi `library.scan.completed`. Son rapport ne portait
+        // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
+        // sur ce chemin-là également. Hissé pour que le rapport puisse le
+        // publier (#2146).
+        let mut pistes_supprimees = 0i64;
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
@@ -696,6 +702,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
+            pistes_supprimees = pruned;
             if pruned > 0 {
                 info!(pruned, "auto_scan_stale_tracks_removed");
             }
@@ -802,6 +809,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            // Ce que la purge a effectivement retiré. Le client lit cette clé
+            // pour le bandeau de fin de scan (#2146).
+            "removed": pistes_supprimees,
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,

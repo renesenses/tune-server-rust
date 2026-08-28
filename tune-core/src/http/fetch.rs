@@ -68,6 +68,19 @@ impl RateLimiter {
 /// CAA call in [`crate::library::artwork`] acquires this before requesting.
 pub static MUSICBRAINZ: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_second(1.0));
 
+/// Shared limiter for LRCLIB (<https://lrclib.net>), le service de paroles.
+///
+/// C'est un service communautaire **gratuit et sans clé d'API** : la seule
+/// protection dont il dispose est la retenue de ses clients. La passe de fond
+/// « paroles » (`crate::library::lyrics_pass`) l'acquiert avant chaque requête,
+/// à ~1 req/s — un rythme tenable pour une bibliothèque parcourue en fond, et
+/// le même que celui déjà appliqué à MusicBrainz.
+///
+/// La récupération **à la demande** (quand une piste est jouée) ne passe
+/// délibérément pas par ce limiteur : elle n'émet qu'une requête et l'utilisateur
+/// l'attend. La faire patienter derrière une passe de fond serait la punir.
+pub static LRCLIB: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_second(1.0));
+
 /// Typed result of fetching a binary resource (e.g. an image), so callers can
 /// tell a genuine "not found" from a transient rate-limit or network error.
 #[derive(Debug)]

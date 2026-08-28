@@ -165,10 +165,18 @@ struct AlbumByTitleBiosWrapper {
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Upload local bios to mozaiklabs.fr in batches of 100.
-/// Controlled by `TUNE_TELEMETRY` — returns early if telemetry is off.
+///
+/// **Consentement explicite requis.** Ces bios sont des donnees de la
+/// bibliotheque de l'utilisateur : elles ne partent que si
+/// `community_contribution_enabled` est pose a vrai. Le defaut est NON, et
+/// `TUNE_TELEMETRY=false` reste un coupe-circuit qui prime (voir
+/// `cloud::consent`). Le controle est en tete de fonction, avant meme la
+/// creation du `server_id` : au defaut, cette fonction ne touche a rien.
+///
 /// Fails silently: errors are logged as warnings.
 pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
-    if !crate::cloud::telemetry::TelemetryReporter::is_enabled() {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if !crate::cloud::consent::contribution_autorisee(&settings) {
         return;
     }
     upload_bios_to(db, UPLOAD_URL).await;
@@ -176,9 +184,14 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
 
 /// Corps du televersement, l'URL en parametre.
 ///
-/// Le drapeau `TUNE_TELEMETRY` reste dans `upload_bios` : ce corps-ci ne lit
-/// aucune variable d'environnement, ce qui le rend exercable par un test sans
+/// Le verrou de consentement — et avec lui la lecture de `TUNE_TELEMETRY` —
+/// reste dans `upload_bios` : ce corps-ci ne consulte ni reglage d'autorisation
+/// ni variable d'environnement, ce qui le rend exercable par un test sans
 /// dependre de l'ambiance du processus.
+///
+/// Corollaire a ne pas perdre de vue : **ce corps envoie sans rien demander**.
+/// Tout nouvel appelant doit donc passer par `upload_bios`, ou refaire le
+/// controle `cloud::consent::contribution_autorisee` lui-meme.
 async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
@@ -632,6 +645,46 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         Arc::new(db)
+    }
+
+    /// Contre-epreuve du consentement : au reglage par defaut, AUCUN envoi.
+    ///
+    /// Le temoin est `server_id`. `upload_bios` le cree en base — via
+    /// `get_or_create_server_id` — avant d'avoir seulement construit son client
+    /// HTTP, parce qu'il l'expedie dans la charge utile. Sa presence en base
+    /// prouve donc que le chemin d'envoi s'est deroule ; son absence prouve que
+    /// la fonction a rendu la main avant de rien entreprendre.
+    ///
+    /// La base porte un artiste avec bio ET MBID : sans le verrou de
+    /// consentement, cette bio partirait vers le cloud communautaire.
+    #[tokio::test]
+    async fn aucun_envoi_de_bios_sans_consentement_explicite() {
+        use crate::db::models::Artist;
+
+        let db = fresh_db();
+        let repo = ArtistRepo::with_backend(db.clone());
+        let mut artiste = Artist::new("Contre-epreuve".into());
+        artiste.musicbrainz_id = Some("mbid-contre-epreuve".into());
+        artiste.bio = Some("Cette bio ne doit jamais quitter la machine.".into());
+        repo.create(&artiste).unwrap();
+
+        let settings = SettingsRepo::with_backend(db.clone());
+        // Rien n'est pose : on est exactement au defaut d'une installation neuve.
+        assert_eq!(
+            settings.get("community_contribution_enabled").unwrap(),
+            None,
+            "le reglage doit etre absent pour que ce test mesure bien le DEFAUT"
+        );
+
+        upload_bios(&db).await;
+
+        assert_eq!(
+            settings.get("server_id").unwrap(),
+            None,
+            "au reglage par defaut, upload_bios ne doit RIEN entreprendre : \
+             un server_id en base prouve que le chemin d'envoi vers le cloud \
+             communautaire s'est deroule"
+        );
     }
 
     #[test]

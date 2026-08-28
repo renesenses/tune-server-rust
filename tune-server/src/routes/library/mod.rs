@@ -13,6 +13,7 @@ mod facets;
 mod folder_facet;
 mod genres;
 mod ingest;
+mod lyrics_pass;
 mod proposals;
 mod ratings;
 mod reports;
@@ -275,6 +276,9 @@ pub fn router() -> Router<AppState> {
         .route("/genres/{name}/albums", get(genres::genre_albums))
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
+        // Paroles (#2172) : l'indicateur d'abord, la passe de fond ensuite.
+        .route("/lyrics/status", get(lyrics_pass::lyrics_status))
+        .route("/lyrics/fetch", post(lyrics_pass::lyrics_fetch))
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
