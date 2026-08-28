@@ -43,6 +43,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tickets/{id}", get(detail))
         .route("/tickets/{id}/reply", post(reply))
+        // Dernier appel du support que le client web adressait encore en direct
+        // à mozaiklabs.fr, clé de licence dans le corps (#2559).
+        .route("/tickets/{id}/read", post(mark_read))
 }
 
 #[derive(Deserialize)]
@@ -310,6 +313,16 @@ async fn reply(
         Err(resp) => return resp,
     };
     finish(support::reply(&state.http_client, &auth, id, &payload.body).await)
+}
+
+/// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
+/// jamais d'une clé de licence fournie par la page.
+async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let auth = match auth(&state) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    finish(support::mark_read(&state.http_client, &auth, id).await)
 }
 
 /// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon

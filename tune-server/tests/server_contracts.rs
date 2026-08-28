@@ -27,6 +27,8 @@ mod rbac;
 mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "support_relais_marquer_lu.rs"]
+mod support_relais_marquer_lu;
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
 #[path = "uptime_process_scope.rs"]
