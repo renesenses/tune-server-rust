@@ -1705,3 +1705,118 @@ async fn mp3_repair_piste_inconnue_est_un_echec_explicite() {
         "l'identifiant inconnu doit apparaître dans failed, reçu {body}"
     );
 }
+
+// ── GROUPING : lue au scan depuis toujours, jamais ressortie (#2130) ──────────
+//
+// `ItemKey::ContentGroup` est lue par `read_extended_metadata` et rangée dans
+// `track_metadata` sous la clé `grouping` à chaque scan. Aucune route ne la
+// renvoyait : la fiche album ne pouvait donc pas découper ses pistes en
+// sections (mouvements, ensembles, titres bonus), alors que DISCSUBTITLE — qui
+// nomme le disque entier, un cran au-dessus — a sa colonne et son en-tête.
+//
+// Ces tests figent le contrat rendu par GET /library/albums/{id}/tracks : la
+// clé `grouping` n'apparaît QUE sur les pistes qui en portent une. Le tag étant
+// absent de la quasi-totalité des bibliothèques (relevé à 0 piste sur 1568
+// fichiers relus tag par tag), le cas « personne n'en a » est celui qui compte
+// le plus : il doit rendre exactement le JSON d'avant.
+
+fn insert_album_track(
+    state: &tune_server::state::AppState,
+    album_id: i64,
+    title: &str,
+    numero: i32,
+) -> i64 {
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    let mut t = tune_core::db::models::Track::new(title.into());
+    t.album_id = Some(album_id);
+    t.track_number = numero;
+    repo.create(&t).expect("insert track")
+}
+
+fn insert_album(state: &tune_server::state::AppState, titre: &str) -> i64 {
+    let repo = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone());
+    repo.create(&tune_core::db::models::Album::new(titre.into()))
+        .expect("insert album")
+}
+
+#[tokio::test]
+async fn album_tracks_sans_grouping_rend_le_json_inchange() {
+    let (app, state) = make_app_with_state();
+    let aid = insert_album(&state, "Sans sections");
+    insert_album_track(&state, aid, "I. Allegro", 1);
+    insert_album_track(&state, aid, "II. Adagio", 2);
+
+    let (status, body) = get(&app, &format!("/api/v1/library/albums/{aid}/tracks")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body.as_array().expect("tableau de pistes");
+    assert_eq!(items.len(), 2);
+    for t in items {
+        assert!(
+            t.get("grouping").is_none(),
+            "aucune clé grouping ne doit apparaître sans donnée, reçu {t}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn album_tracks_ressort_le_grouping_piste_par_piste() {
+    let (app, state) = make_app_with_state();
+    let aid = insert_album(&state, "Avec sections");
+    let t1 = insert_album_track(&state, aid, "I. Allegro", 1);
+    let t2 = insert_album_track(&state, aid, "II. Adagio", 2);
+    let t3 = insert_album_track(&state, aid, "Prise alternative", 3);
+
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    // Ce que le scanner écrit : la valeur brute de la balise, telle quelle.
+    meta.set(t1, "grouping", "Symphonie no 5").unwrap();
+    meta.set(t2, "grouping", "Symphonie no 5").unwrap();
+    meta.set(t3, "grouping", "Titres bonus").unwrap();
+    // Une clé voisine ne doit pas passer pour un grouping.
+    meta.set(t1, "composer", "Beethoven").unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/albums/{aid}/tracks")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body.as_array().expect("tableau de pistes");
+    assert_eq!(items.len(), 3, "body: {body}");
+
+    let par_id: std::collections::HashMap<i64, &Value> = items
+        .iter()
+        .map(|t| (t["id"].as_i64().expect("id de piste"), t))
+        .collect();
+    assert_eq!(par_id[&t1]["grouping"], "Symphonie no 5");
+    assert_eq!(par_id[&t2]["grouping"], "Symphonie no 5");
+    assert_eq!(par_id[&t3]["grouping"], "Titres bonus");
+    // `composer` est un champ de la structure `Track` : il est TOUJOURS présent
+    // dans le JSON. Ce qui doit rester vrai, c'est qu'il garde la valeur de la
+    // colonne — nulle ici — et qu'il n'hérite PAS de la ligne homonyme de
+    // `track_metadata`. Seule la clé `grouping` est reportée.
+    assert_eq!(
+        par_id[&t1]["composer"],
+        Value::Null,
+        "la ligne composer de track_metadata ne doit pas être reportée, reçu {}",
+        par_id[&t1]
+    );
+}
+
+#[tokio::test]
+async fn album_tracks_ignore_un_grouping_vide() {
+    let (app, state) = make_app_with_state();
+    let aid = insert_album(&state, "Grouping blanc");
+    let t1 = insert_album_track(&state, aid, "I. Allegro", 1);
+
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone());
+    // Un éditeur de tags qui écrit un champ vide ne doit pas créer de section.
+    meta.set(t1, "grouping", "   ").unwrap();
+
+    let (status, body) = get(&app, &format!("/api/v1/library/albums/{aid}/tracks")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let items = body.as_array().expect("tableau de pistes");
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0].get("grouping").is_none(),
+        "une valeur d'espaces vaut une absence, reçu {}",
+        items[0]
+    );
+}
