@@ -2355,19 +2355,20 @@ fn record_windows_exclusive_pcm_refusal(
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn record_wasapi_exclusive_open_failure(
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+fn record_exclusive_open_failure(
+    backend: &str,
     requested_device: &str,
     error: &str,
     failure_slot: &std::sync::Mutex<Option<String>>,
 ) {
     warn!(
-        requested_device,
-        error, "wasapi_exclusive_open_failed_without_fallback"
+        backend,
+        requested_device, error, "exclusive_open_failed_without_fallback"
     );
     if let Ok(mut slot) = failure_slot.lock() {
         *slot = Some(format!(
-            "Sortie « {requested_device} » : l'ouverture WASAPI exclusive a échoué ({error}). Aucun repli vers un autre endpoint ou vers le mode partagé n'a été effectué"
+            "Sortie « {requested_device} » : l'ouverture {backend} exclusive a échoué ({error}). Aucun repli vers un autre endpoint ou vers le mode partagé n'a été effectué"
         ));
     }
 }
@@ -3811,11 +3812,12 @@ impl OutputTarget for LocalOutput {
                 ) {
                     Ok(ex) => ex,
                     Err(e) => {
-                        warn!(error = %e, "coreaudio_exclusive_init_failed_falling_back_to_shared");
-                        // Fall through to cpal shared mode below
-                        // We need a goto-like mechanism; use a flag instead
-                        // (handled by the `if !exclusive_mode` block below)
-                        // Actually, we can't fall through in Rust. Log and return error.
+                        record_exclusive_open_failure(
+                            "CoreAudio",
+                            &device_name,
+                            &e.to_string(),
+                            &open_failure,
+                        );
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -4015,7 +4017,12 @@ impl OutputTarget for LocalOutput {
                 ) {
                     Ok(ex) => ex,
                     Err(e) => {
-                        warn!(error = %e, "asio_exclusive_init_failed_falling_back_to_shared");
+                        record_exclusive_open_failure(
+                            "ASIO",
+                            &device_name,
+                            &e.to_string(),
+                            &open_failure,
+                        );
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -4566,7 +4573,12 @@ impl OutputTarget for LocalOutput {
                 ) {
                     Ok(mut wasapi) => {
                         if let Err(e) = wasapi.start() {
-                            record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                            record_exclusive_open_failure(
+                                "WASAPI",
+                                &device_name,
+                                &e,
+                                &open_failure,
+                            );
                             playing.store(false, Ordering::SeqCst);
                             return;
                         } else {
@@ -4851,7 +4863,7 @@ impl OutputTarget for LocalOutput {
                         }
                     }
                     Err(e) => {
-                        record_wasapi_exclusive_open_failure(&device_name, &e, &open_failure);
+                        record_exclusive_open_failure("WASAPI", &device_name, &e, &open_failure);
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -7760,13 +7772,16 @@ mod tests {
     }
 
     #[test]
-    fn wasapi_open_failure_is_returned_without_authorising_a_fallback() {
-        let slot = std::sync::Mutex::new(None);
-        record_wasapi_exclusive_open_failure("DAC USB", "endpoint {usb-dac} absent", &slot);
-        let message = slot.lock().unwrap().clone().expect("erreur remontée");
-        assert!(message.contains("DAC USB"));
-        assert!(message.contains("{usb-dac}"));
-        assert!(message.contains("Aucun repli"));
+    fn exclusive_open_failure_is_returned_without_authorising_a_fallback() {
+        for backend in ["ASIO", "CoreAudio", "WASAPI"] {
+            let slot = std::sync::Mutex::new(None);
+            record_exclusive_open_failure(backend, "DAC USB", "endpoint {usb-dac} absent", &slot);
+            let message = slot.lock().unwrap().clone().expect("erreur remontée");
+            assert!(message.contains(backend));
+            assert!(message.contains("DAC USB"));
+            assert!(message.contains("{usb-dac}"));
+            assert!(message.contains("Aucun repli"));
+        }
     }
 
     #[test]
