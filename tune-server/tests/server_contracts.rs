@@ -31,6 +31,8 @@ mod smb_dialect_seam;
 mod tests_orphelins;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
+#[path = "web_response_contracts.rs"]
+mod web_response_contracts;
 #[path = "workflows_bornes.rs"]
 mod workflows_bornes;
 #[path = "ws_auth.rs"]

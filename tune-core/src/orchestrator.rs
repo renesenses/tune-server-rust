@@ -5051,6 +5051,13 @@ impl PlaybackOrchestrator {
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
             let is_dash_local = upstream_url.starts_with("file://");
+            // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
+            // atome `moov` a la fin : une source HTTP seekable permet a
+            // Symphonia de lire cet index puis de revenir aux premiers paquets,
+            // sans attendre le telechargement complet (#1885). Les autres
+            // services gardent leur chemin eprouve dans cette premiere vague.
+            let use_http_range = service_name.eq_ignore_ascii_case("youtube")
+                && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
 
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
@@ -5074,9 +5081,38 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // For DASH file:// URLs the fMP4 is already on disk — use it
-                // directly instead of downloading via HTTP.
-                let tmp_file = if is_dash_local {
+                // Sonde Range AVANT d'envoyer un en-tete WAV. Si le CDN le
+                // refuse, aucun octet n'a encore rejoint la session et le repli
+                // historique par fichier temporaire reste parfaitement propre.
+                let ranged_source = if use_http_range {
+                    let upstream = upstream_url.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::audio::http_range::HttpRangeSource::open(&upstream)
+                    })
+                    .await
+                    {
+                        Ok(Ok(source)) => {
+                            info!("streaming_http_range_decode_selected");
+                            Some(source)
+                        }
+                        Ok(Err(e)) => {
+                            info!(error = %e, "streaming_http_range_unavailable_falling_back");
+                            None
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_http_range_probe_task_failed");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Sans source Range, conserver strictement le chemin existant :
+                // fichier DASH deja local ou telechargement complet vers un temp.
+                let tmp_file = if ranged_source.is_some() {
+                    None
+                } else if is_dash_local {
                     let file_path = upstream_url
                         .strip_prefix("file://")
                         .unwrap_or(&upstream_url)
@@ -5090,9 +5126,8 @@ impl PlaybackOrchestrator {
                         file_size,
                         "streaming_dash_file_already_on_disk"
                     );
-                    file_path
+                    Some((file_path, false))
                 } else {
-                    // Download to temp file on a blocking thread
                     let tmp_path = std::env::temp_dir()
                         .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
                         .to_string_lossy()
@@ -5125,7 +5160,7 @@ impl PlaybackOrchestrator {
                     .await;
 
                     match download_result {
-                        Ok(Ok(path)) => path,
+                        Ok(Ok(path)) => Some((path, true)),
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
                             let _ = std::fs::remove_file(&tmp_path);
@@ -5139,27 +5174,42 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // Progressive decode: stream PCM chunks as they are decoded.
-                // The DLNA renderer can start fetching as soon as first chunks
-                // arrive, reducing transition latency after download completes.
-                let tmp_file_clone = tmp_file.clone();
-                let tx_clone = tx.clone();
+                let tx_for_decode = tx.clone();
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_seeked(
-                        &tmp_file_clone,
-                        Some(sr),
-                        Some(2),
-                        Some(bd),
-                        tx_clone,
-                        32768,
-                        data_ready,
-                        levels_tx,
-                        seek_s,
-                    )
-                })
-                .await;
+                let decode_result = if let Some(source) = ranged_source {
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                            source,
+                            &codec,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                } else {
+                    let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
+                            &tmp_file_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                };
 
                 // Clean up the temp file — but ONLY if WE downloaded it. For a
                 // file:// DASH source, tmp_file IS the Tidal-cache-owned
@@ -5170,7 +5220,9 @@ impl PlaybackOrchestrator {
                 // ~54MB DASH — while concurrent transcodes raced on the emptied
                 // file (file_size=0 → decode failed). That was the ASIO "repeat"
                 // runaway (also on Qobuz). Leave cache-owned files alone.
-                if !is_dash_local {
+                if let Some((tmp_file, owned)) = tmp_file
+                    && owned
+                {
                     let _ = std::fs::remove_file(&tmp_file);
                 }
 

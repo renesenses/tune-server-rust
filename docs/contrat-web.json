@@ -36,7 +36,8 @@
         "hardware_fingerprint"
       ],
       "champs_optionnels": [
-        "session_conflict"
+        "session_conflict",
+        "offline_grace"
       ]
     },
     {
@@ -74,6 +75,8 @@
       "champs_optionnels": [
         "available",
         "capabilities",
+        "zone_hidden",
+        "hidden_zone_device_id",
         "manufacturer",
         "model",
         "mac_address"
@@ -115,6 +118,8 @@
       "champs_optionnels": [
         "available",
         "capabilities",
+        "zone_hidden",
+        "hidden_zone_device_id",
         "manufacturer",
         "model",
         "mac_address"
@@ -220,8 +225,21 @@
       ],
       "champs_optionnels": [
         "art_id",
+        "pochette",
         "quality_note"
       ]
+    },
+    {
+      "route": "/ext/bandcamp/artist",
+      "methode": "GET",
+      "type": "BandcampDiscographie",
+      "liste": false,
+      "champs_obligatoires": [
+        "url",
+        "count",
+        "albums"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/ext/bandcamp/collection",
@@ -285,7 +303,9 @@
       "champs_obligatoires": [
         "tags"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "genres"
+      ]
     },
     {
       "route": "/home",
@@ -296,6 +316,34 @@
         "sections"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/home/artist-releases",
+      "methode": "GET",
+      "type": "ArtistReleaseGroup",
+      "liste": true,
+      "champs_obligatoires": [
+        "artist_name",
+        "is_favorite",
+        "library_albums",
+        "releases"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/home/other-versions",
+      "methode": "GET",
+      "type": "OtherVersionGroup",
+      "liste": true,
+      "champs_obligatoires": [
+        "title",
+        "artist_name",
+        "played_album",
+        "versions"
+      ],
+      "champs_optionnels": [
+        "streaming"
+      ]
     },
     {
       "route": "/library/albums",
@@ -455,6 +503,16 @@
       "champs_obligatoires": [
         "status",
         "cover_path"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/{}/better-quality",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "better"
       ],
       "champs_optionnels": []
     },
@@ -665,6 +723,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -696,6 +755,19 @@
       ],
       "champs_optionnels": [
         "artists_without_image"
+      ]
+    },
+    {
+      "route": "/library/artwork/enrich-artists/force",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "message",
+        "artists"
       ]
     },
     {
@@ -1078,6 +1150,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1116,6 +1189,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1135,6 +1209,19 @@
         "bpm",
         "comments",
         "musicbrainz_recording_id"
+      ]
+    },
+    {
+      "route": "/library/tracks/{}/better-quality",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "music_dirs"
+      ],
+      "champs_optionnels": [
+        "full"
       ]
     },
     {
@@ -1246,6 +1333,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -1263,6 +1351,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -1273,6 +1362,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -1308,6 +1398,25 @@
       "champs_obligatoires": [
         "mount_path",
         "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/smb/mounts",
+      "methode": "GET",
+      "type": "SmbMount",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "server",
+        "share",
+        "mount_path",
+        "username",
+        "active",
+        "mounted",
+        "mount_state",
+        "last_mount_error",
+        "smb_version"
       ],
       "champs_optionnels": []
     },
@@ -1430,17 +1539,6 @@
       ]
     },
     {
-      "route": "/playlists/all",
-      "methode": "GET",
-      "type": "UnifiedPlaylistsResponse",
-      "liste": false,
-      "champs_obligatoires": [
-        "local",
-        "services"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/playlists/diff",
       "methode": "POST",
       "type": "PlaylistDiffResponse",
@@ -1556,6 +1654,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1691,6 +1790,20 @@
       "champs_optionnels": []
     },
     {
+      "route": "/profiles/{}/favorites/facets{}",
+      "methode": "GET",
+      "type": "FacetFavorite",
+      "liste": true,
+      "champs_obligatoires": [
+        "profile_id",
+        "facet",
+        "value"
+      ],
+      "champs_optionnels": [
+        "created_at"
+      ]
+    },
+    {
       "route": "/profiles/{}/favorites/streaming{}",
       "methode": "GET",
       "type": "StreamingFavorite",
@@ -1788,6 +1901,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -1805,6 +1919,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -1815,6 +1930,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -1929,20 +2045,6 @@
       ]
     },
     {
-      "route": "/sonos/discover",
-      "methode": "POST",
-      "type": "SonosSpeaker",
-      "liste": true,
-      "champs_obligatoires": [
-        "uid",
-        "name",
-        "ip",
-        "is_coordinator",
-        "group_uid"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/sonos/speakers",
       "methode": "GET",
       "type": "SonosSpeaker",
@@ -2042,6 +2144,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -2059,6 +2162,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -2069,6 +2173,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -2150,6 +2255,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2244,6 +2350,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2285,7 +2392,7 @@
       ]
     },
     {
-      "route": "/streaming/{}/artists/{}/albums",
+      "route": "/streaming/{}/artists/{}/albums{}",
       "methode": "GET",
       "type": "Album",
       "liste": true,
@@ -2563,6 +2670,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2611,6 +2719,27 @@
         "username",
         "subscription"
       ]
+    },
+    {
+      "route": "/support/tickets",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tickets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/support/tickets/{}",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ticket",
+        "replies"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/system/admin/connections",
@@ -2702,6 +2831,29 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/audio/asio-warm-scan/rearm",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status",
+        "retry",
+        "message",
+        "asio_warm_scan"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/background-tasks",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tasks"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/system/backups",
       "methode": "GET",
       "type": "BackupInfo",
@@ -2773,7 +2925,9 @@
         "memory_rss_mb",
         "scan_status"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "asio_warm_scan"
+      ]
     },
     {
       "route": "/system/diagnostics/network",
@@ -2898,11 +3052,9 @@
       "liste": false,
       "champs_obligatoires": [
         "status",
-        "music_dirs"
+        "message"
       ],
-      "champs_optionnels": [
-        "full"
-      ]
+      "champs_optionnels": []
     },
     {
       "route": "/system/scan/report",
@@ -2970,6 +3122,16 @@
         "artists",
         "zones",
         "devices"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/stop",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "stopping"
       ],
       "champs_optionnels": []
     },
@@ -3088,6 +3250,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3105,6 +3268,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3115,6 +3279,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3204,6 +3369,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3221,6 +3387,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3231,6 +3398,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3254,6 +3422,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3271,6 +3440,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3281,6 +3451,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3303,7 +3474,9 @@
       "champs_obligatoires": [
         "enabled"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "applied_live"
+      ]
     },
     {
       "route": "/zones/{}/crossfade",
@@ -3390,6 +3563,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3407,6 +3581,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3417,6 +3592,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3452,6 +3628,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3469,6 +3646,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3479,6 +3657,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3556,6 +3735,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3573,6 +3753,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3583,6 +3764,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3658,6 +3840,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3675,6 +3858,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3685,6 +3869,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3708,6 +3893,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3725,6 +3911,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3735,6 +3922,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3795,6 +3983,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3812,6 +4001,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3822,6 +4012,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3845,6 +4036,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3862,6 +4054,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3872,6 +4065,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3880,7 +4074,7 @@
   "non_resolus": [
     {
       "route": "/zones",
-      "type": "T>(url: string, options?: RequestInit): Promise<T> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    if (response.status === 402) {\n      try {\n        const body = await response.json();\n        notifications.error(body?.message || 'Tune Premium requis pour cette fonctionnalite');\n      } catch {\n        notifications.error('Tune Premium requis pour cette fonctionnalite');\n      }\n      throw new Error('premium_required');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    } else {\n      // Surface actionable playback failures that callers would otherwise\n      // swallow (they fire play/next/resume without awaiting): a missing local\n      // file or a zone with no output device. Localised so it matches the UI.\n      const key = err.code ? PLAY_ERROR_KEYS[err.code] : undefined;\n      if (key) notifications.error(get(t)(key as any));\n    }\n    throw err;\n  }\n  const text = await response.text();\n  if (text.trimStart().startsWith('<!') || text.trimStart().toLowerCase().startsWith('<html')) {\n    throw new Error('Expected JSON but received HTML — check the endpoint URL');\n  }\n  // A 204, or any 2xx with an empty body, is a success with nothing to parse.\n  // Many mutating endpoints answer that way; treating it as a parse failure\n  // made successful writes surface as errors in the UI (the rating that saved\n  // fine but showed \"Erreur notation\").\n  if (response.status === 204 || text.trim() === '') {\n    return undefined as T;\n  }\n  try {\n    return JSON.parse(text) as T;\n  } catch {\n    throw new Error('Invalid JSON response');\n  }\n}\n\n/** Wrap a promise with a timeout — rejects with an Error after `ms` milliseconds. */\nexport function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);\n    promise.then(\n      (v) => { clearTimeout(timer); resolve(v); },\n      (e) => { clearTimeout(timer); reject(e); },\n    );\n  });\n}\n\nasync function fetchVoid(url: string, options?: RequestInit): Promise<void> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    }\n    throw err;\n  }\n}\n\n// --- Zones ---\n\nexport function getZones() {\n  return fetchJSON<Zone[]",
+      "type": "T>(url: string, options?: RequestInit): Promise<T> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n      ...entetesRelais(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    if (response.status === 402) {\n      // Ni le message du serveur ni le repli ne parlaient la langue de\n      // l'interface : `premium_guard.rs` compose le sien avec\n      // `feature.display_name()` — « Parametric EQ requires Tune Premium »,\n      // en anglais — et le repli etait du francais code en dur, montre tel\n      // quel a un anglophone. Les deux sont le meme defaut (#2419).\n      notifications.error(get(t)('premium.required'));\n      throw new Error('premium_required');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    } else {\n      // Surface actionable playback failures that callers would otherwise\n      // swallow (they fire play/next/resume without awaiting): a missing local\n      // file or a zone with no output device. Localised so it matches the UI.\n      const key = err.code ? PLAY_ERROR_KEYS[err.code] : undefined;\n      if (key) notifications.error(get(t)(key as any));\n    }\n    throw err;\n  }\n  const text = await response.text();\n  if (text.trimStart().startsWith('<!') || text.trimStart().toLowerCase().startsWith('<html')) {\n    throw new Error('Expected JSON but received HTML — check the endpoint URL');\n  }\n  // A 204, or any 2xx with an empty body, is a success with nothing to parse.\n  // Many mutating endpoints answer that way; treating it as a parse failure\n  // made successful writes surface as errors in the UI (the rating that saved\n  // fine but showed \"Erreur notation\").\n  if (response.status === 204 || text.trim() === '') {\n    return undefined as T;\n  }\n  try {\n    return JSON.parse(text) as T;\n  } catch {\n    throw new Error('Invalid JSON response');\n  }\n}\n\n/** Wrap a promise with a timeout — rejects with an Error after `ms` milliseconds. */\nexport function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);\n    promise.then(\n      (v) => { clearTimeout(timer); resolve(v); },\n      (e) => { clearTimeout(timer); reject(e); },\n    );\n  });\n}\n\nasync function fetchVoid(url: string, options?: RequestInit): Promise<void> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n      ...entetesRelais(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    }\n    throw err;\n  }\n}\n\n// --- Zones ---\n\nexport function getZones() {\n  return fetchJSON<Zone[]",
       "raison": "type non structurel"
     },
     {
@@ -4037,6 +4231,11 @@
       "route": "/network/media-servers",
       "type": "any",
       "raison": "type non structurel"
+    },
+    {
+      "route": "/network/media-servers/{}/search",
+      "type": "import('./types').MediaServerSearchResult",
+      "raison": "type introuvable dans les sources"
     },
     {
       "route": "/tags/{}",
@@ -4249,6 +4448,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/profiles/{}/favorites/facets/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/profiles/{}/favorites/check",
       "type": "Array<{ item_id: number; is_favorite: boolean }>",
       "raison": "type non structurel"
@@ -4375,11 +4579,6 @@
     },
     {
       "route": "/zones/{}/normalization",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/zones/{}/dsp",
       "type": "any",
       "raison": "type non structurel"
     },
@@ -4554,6 +4753,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/tracks/{}/versions",
+      "type": "TrackVersions",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/home/recommendations",
       "type": "any[]",
       "raison": "type non structurel"
@@ -4574,13 +4778,18 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/support/tickets/{}/reply",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/profile",
       "type": "Record<string, unknown>",
       "raison": "type non structurel"
     }
   ],
   "resume": {
-    "routes_cartographiees": 223,
-    "appels_non_resolus": 140
+    "routes_cartographiees": 234,
+    "appels_non_resolus": 143
   }
 }

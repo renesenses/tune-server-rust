@@ -9,7 +9,7 @@ use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
@@ -1299,6 +1299,7 @@ pub fn decode_to_pcm_streaming(
         None,
         None,
         0.0,
+        None,
     )
 }
 
@@ -1320,6 +1321,7 @@ pub fn decode_to_pcm_streaming_with_notify(
         Some(data_ready),
         None,
         0.0,
+        None,
     )
 }
 
@@ -1343,6 +1345,7 @@ pub fn decode_to_pcm_streaming_with_levels(
         Some(data_ready),
         Some(levels_tx),
         0.0,
+        None,
     )
 }
 
@@ -1367,6 +1370,37 @@ pub fn decode_to_pcm_streaming_seeked(
         Some(data_ready),
         Some(levels_tx),
         seek_s,
+        None,
+    )
+}
+
+/// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
+/// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
+/// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
+pub fn decode_http_range_to_pcm_streaming_seeked(
+    source: super::http_range::HttpRangeSource,
+    codec_hint: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    let source_name = format!("flux-distant.{codec_hint}");
+    decode_to_pcm_streaming_inner(
+        &source_name,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
+        Some(Box::new(source)),
     )
 }
 
@@ -1380,6 +1414,7 @@ fn decode_to_pcm_streaming_inner(
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
+    source_override: Option<Box<dyn MediaSource>>,
 ) -> Result<(u16, u32), String> {
     if target_sample_rate == Some(0) {
         return Err("stream target sample rate must be greater than zero".into());
@@ -1596,8 +1631,20 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = if let Some(source) = source_override {
+        MediaSourceStream::new(source, Default::default())
+    } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+        let source = crate::audio::staged_growth::SeekableGrowingSource::open(file_path, growth)
+            .map_err(|e| format!("open (staged growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
@@ -3213,6 +3260,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
@@ -3372,6 +3420,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
