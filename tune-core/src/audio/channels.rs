@@ -663,8 +663,8 @@ mod stereo_i32_tests {
         let trame = [plein, plein, plein, 0, plein, plein];
         let out = to_stereo_i32(&trame, 6);
         assert_eq!(out.len(), 2);
-        assert!(out[0] <= i32::MAX && out[0] > i32::MAX - 4096);
-        assert!(out[1] <= i32::MAX && out[1] > i32::MAX - 4096);
+        assert!(out[0] > i32::MAX - 4096);
+        assert!(out[1] > i32::MAX - 4096);
     }
 
     #[test]
