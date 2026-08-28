@@ -162,7 +162,69 @@ pub fn build_track_row(
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
     track.comments = meta.comment.clone();
+
+    // Dernière frontière avant TrackRepo. Le walker nettoie déjà les tags à
+    // leur lecture, mais ce constructeur est public et partagé avec l'auto-
+    // scan : aucun appelant ne doit pouvoir réintroduire un NUL ou un BOM dans
+    // une colonne texte. `file_path` reste l'adresse physique exacte ; la
+    // réécrire rendrait le fichier existant impossible à rouvrir.
+    let corrections = sanitize_track_row_text(&mut track);
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %sf.path,
+            corrections = ?corrections,
+            "scan_import_unsafe_text_sanitized_at_db_boundary"
+        );
+    }
     track
+}
+
+fn sanitize_track_row_text(track: &mut Track) -> Vec<tune_core::metadata::TextCorrection> {
+    fn clean(
+        field: &str,
+        value: &mut Option<String>,
+        corrections: &mut Vec<tune_core::metadata::TextCorrection>,
+    ) {
+        let Some(raw) = value.as_deref() else {
+            return;
+        };
+        let (sanitized, mut found) =
+            tune_core::metadata::sanitize_untrusted_single_line_text(raw, field);
+        if !found.is_empty() {
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+
+    let (title, mut corrections) =
+        tune_core::metadata::sanitize_untrusted_single_line_text(&track.title, "title");
+    if !corrections.is_empty() {
+        track.title = title;
+    }
+    clean("album_title", &mut track.album_title, &mut corrections);
+    clean("artist_name", &mut track.artist_name, &mut corrections);
+    clean("album_artist", &mut track.album_artist, &mut corrections);
+    clean("disc_subtitle", &mut track.disc_subtitle, &mut corrections);
+    clean("format", &mut track.format, &mut corrections);
+    clean("isrc", &mut track.isrc, &mut corrections);
+    clean("genre", &mut track.genre, &mut corrections);
+    clean("genres", &mut track.genres, &mut corrections);
+    clean("composer", &mut track.composer, &mut corrections);
+    clean("label", &mut track.label, &mut corrections);
+    clean(
+        "musicbrainz_recording_id",
+        &mut track.musicbrainz_recording_id,
+        &mut corrections,
+    );
+
+    if let Some(raw) = track.comments.as_deref() {
+        let (sanitized, mut found) = tune_core::metadata::sanitize_untrusted_text(raw, "comments");
+        if !found.is_empty() {
+            track.comments = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+    corrections
 }
 
 /// Batch-stateful importer that resolves a scanned file's artist and album in
@@ -952,5 +1014,63 @@ mod tests {
         assert_eq!(track.duration_ms, 0);
         assert_eq!(track.genres, None);
         assert_eq!(track.composer, None);
+    }
+
+    #[test]
+    fn build_track_row_ne_persiste_aucun_nul_ni_bom_hors_adresse_physique() {
+        let meta = TrackMetadata {
+            title: Some("Titre\0cache".into()),
+            album: Some("Album\u{feff}Live".into()),
+            album_artist: Some("Lisa\0Strings".into()),
+            disc_subtitle: Some("Disque\u{feff}I".into()),
+            format: Some("flac\0".into()),
+            isrc: Some("FR\u{feff}123".into()),
+            genre: Some("Jazz\0Fusion".into()),
+            genres: vec!["Jazz\u{feff}Fusion".into()],
+            credits: vec![TrackCredit {
+                name: "Miles\0Davis".into(),
+                role: "composer".into(),
+                instrument: None,
+            }],
+            label: Some("Columbia\u{feff}Records".into()),
+            musicbrainz_recording_id: Some("rec\0id".into()),
+            comment: Some("ligne 1\nligne\0 2".into()),
+            ..Default::default()
+        };
+        let scanned = sf("/m/Jacobs, Lisa\u{feff}The Strings/01.flac");
+        let track = build_track_row(
+            &meta,
+            &scanned,
+            Some(7),
+            Some(3),
+            "Lisa\0\u{feff}The Strings",
+        );
+
+        let persisted_text = [
+            Some(track.title.as_str()),
+            track.album_title.as_deref(),
+            track.artist_name.as_deref(),
+            track.album_artist.as_deref(),
+            track.disc_subtitle.as_deref(),
+            track.format.as_deref(),
+            track.isrc.as_deref(),
+            track.genre.as_deref(),
+            track.genres.as_deref(),
+            track.composer.as_deref(),
+            track.label.as_deref(),
+            track.musicbrainz_recording_id.as_deref(),
+            track.comments.as_deref(),
+        ];
+        assert!(
+            persisted_text
+                .into_iter()
+                .flatten()
+                .all(|value| !value.contains(['\0', '\u{feff}']))
+        );
+        assert_eq!(track.comments.as_deref(), Some("ligne 1\nligne 2"));
+        assert_eq!(
+            track.file_path.as_deref(),
+            Some("/m/Jacobs, Lisa\u{feff}The Strings/01.flac")
+        );
     }
 }
