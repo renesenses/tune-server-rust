@@ -148,6 +148,40 @@ async fn post_json(app: &axum::Router, chemin: &str) -> Result<Value, String> {
     })
 }
 
+async fn post_json_body(
+    app: &axum::Router,
+    chemin: &str,
+    body: Value,
+    statut_attendu: StatusCode,
+) -> Result<Value, String> {
+    let reponse = app
+        .clone()
+        .oneshot(
+            Request::post(chemin)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .map_err(|erreur| format!("{chemin}: routeur en echec: {erreur}"))?;
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .map_err(|erreur| format!("{chemin}: corps illisible: {erreur}"))?;
+    if statut != statut_attendu {
+        return Err(format!(
+            "{chemin}: statut {statut}, attendu {statut_attendu}, corps {}",
+            String::from_utf8_lossy(&octets)
+        ));
+    }
+    serde_json::from_slice(&octets).map_err(|erreur| {
+        format!(
+            "{chemin}: JSON invalide ({erreur}), corps {}",
+            String::from_utf8_lossy(&octets)
+        )
+    })
+}
+
 /// Routes sans secret, matériel ni service tiers. La vague commence par les
 /// écrans les plus centraux (accueil, bibliothèque, diagnostics et réglages).
 const VAGUE_INITIALE: &[(&str, &str)] = &[
@@ -249,6 +283,51 @@ async fn desactiver_spotify_connect_rend_le_statut_complet_annonce_au_web() {
 
     respecte_tous_les_contrats(&carte, "POST", "/spotify-connect/disable", &payload)
         .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
+}
+
+#[tokio::test]
+async fn sept_contrats_de_zone_passent_par_le_routeur_reel() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+
+    let creee = post_json_body(
+        &app,
+        "/api/v1/zones",
+        serde_json::json!({"name": "Contrat zone", "output_type": "local"}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la zone temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/zones", &creee)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/zones: {erreur}; payload={creee}"));
+    let zone_id = creee["id"].as_i64().expect("id de la zone temoin");
+
+    // Pins et quality sont volontairement absents : leur réponse réelle
+    // contredit déjà la carte et leur comportement est incomplet (#2722,
+    // #2723). Les ajouter ici en maquillant seulement le JSON fabriquerait
+    // deux preuves vertes pour des réglages toujours inertes.
+    for (route_contrat, chemin_reel) in [
+        ("/zones/{}", format!("/api/v1/zones/{zone_id}")),
+        (
+            "/zones/{}/audiophile",
+            format!("/api/v1/zones/{zone_id}/audiophile"),
+        ),
+        (
+            "/zones/{}/device-presets",
+            format!("/api/v1/zones/{zone_id}/device-presets"),
+        ),
+        ("/zones/{}/eq", format!("/api/v1/zones/{zone_id}/eq")),
+        ("/zones/{}/queue", format!("/api/v1/zones/{zone_id}/queue")),
+        ("/zones/{}/sleep", format!("/api/v1/zones/{zone_id}/sleep")),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
 }
 
 #[test]
