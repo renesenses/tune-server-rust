@@ -1,15 +1,19 @@
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
+use tune_core::db::facet_filter::{
+    Placeholders, TrackFilter, any_of, favorite_condition, untagged_condition,
+};
 
+use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct FacetQuery {
     /// Comma-separated facet fields to compute (default: the common set).
     fields: Option<String>,
@@ -18,52 +22,53 @@ pub(super) struct FacetQuery {
     pub(super) limit: Option<i64>,
     /// Pagination de `albums-detailed` uniquement — sans effet sur les facettes.
     pub(super) offset: Option<i64>,
-    /// Oxygen folder facet: absolute directory prefix. Not a facet field itself,
-    /// but an active selection that narrows every other facet's counts (the
-    /// folder-facet endpoint owns the drill-down; here it only filters).
-    pub(super) folder: Option<String>,
-    // Optional active filters — when present, each facet is counted over the
-    // narrowed track set (cumulative faceting, Dominique: "le genre filtre les
-    // labels"). Same names as /library/tracks. A facet never filters on its own
-    // field, so its other values stay visible to switch to.
-    genre: Option<String>,
-    year: Option<i32>,
-    format: Option<String>,
-    sample_rate: Option<i32>,
-    bit_depth: Option<i32>,
-    source: Option<String>,
-    label: Option<String>,
-    composer: Option<String>,
-    artist: Option<String>,
-    country: Option<String>,
-    mood: Option<String>,
-    source_media: Option<String>,
-    /// Album rating (1-5, profile 1) — tracks inherit their album's rating.
-    pub(super) rating: Option<i32>,
     /// Manual collection name — tracks whose album is in that collection. The
     /// album membership lives as a JSON `album_ids` array in the `collections`
     /// setting, resolved to ids by the handler (not a joinable table).
+    ///
+    /// MONOVALUÉE (#2168) : une collection n'est pas une valeur de métadonnée
+    /// mais un ensemble enregistré, résolu par deux moteurs distincts — leur
+    /// union appelle un autre chantier. Elle reste donc lisible par `serde`.
     pub(super) collection: Option<String>,
-    /// Favoris (profil 1) : `track` = la piste elle-même est en favori,
-    /// `album` = son album l'est. Deux valeurs distinctes plutôt qu'un booléen
-    /// unique : aimer un album et aimer un morceau ne se rangent pas pareil.
-    pub(super) favorite: Option<String>,
-    /// Nom d'une liste de lecture — les pistes qui en font partie.
-    pub(super) playlist: Option<String>,
-    /// Étiquette manquante : `genre`, `year`, `artist`, `album` ou `cover`.
-    /// Sert au nettoyage de bibliothèque, pas à l'écoute.
-    pub(super) untagged: Option<String>,
-    /// Année d'ENREGISTREMENT (`albums.original_year`), distincte de `year` qui
-    /// est celle de l'édition. L'écart n'est pas anecdotique : un Abbey Lincoln
-    /// enregistré en 1959 et réédité en 1987 se range sous 1959 pour qui écoute
-    /// du jazz, sous 1987 pour qui range des disques.
-    original_year: Option<i32>,
-    q: Option<String>,
+    /// Les valeurs actives de CHAQUE facette, lues dans la chaîne de requête
+    /// BRUTE par [`FacetQuery::hydrate`].
+    ///
+    /// ⚠️ Les facettes ne peuvent PAS être des champs de cette structure : la
+    /// `Deserialize` dérivée refuse une clé en double (`duplicate field`), donc
+    /// `?format=aiff&format=flac` rendait 400 tant qu'un champ `format`
+    /// existait ici. Elles se lisent toutes dans `query_multi`, qui reprend au
+    /// passage la validation de type que `serde` assurait (`?year=abc` → 400).
+    #[serde(skip)]
+    pub(super) sel: TrackFilter,
+}
+
+impl FacetQuery {
+    /// Lit les facettes dans la chaîne de requête brute.
+    ///
+    /// À appeler dans CHAQUE point d'entrée qui déserialise un `FacetQuery` :
+    /// sans elle, `sel` reste vide et plus aucune facette ne filtre.
+    pub(super) fn hydrate(mut self, raw: Option<&str>) -> Result<Self, AppError> {
+        self.sel = track_filter_from_raw(raw)?;
+        Ok(self)
+    }
 }
 
 /// Build the WHERE conditions (over alias `t` = tracks) for the active filters,
-/// skipping the facet's own field so its alternatives remain countable. Values
-/// are always bound parameters; column/key names come from fixed literals only.
+/// skipping the facet's own field so its alternatives remain countable.
+///
+/// **Sémantique (#2168)** : plusieurs valeurs DANS une facette se combinent en
+/// **OU**, deux facettes différentes en **ET**.
+///
+/// **Les effectifs restent justes en sélection multiple** grâce à `exclude`,
+/// qui était déjà là : en comptant la facette F, on applique toutes les AUTRES
+/// facettes mais jamais F elle-même. L'effectif affiché à côté d'une valeur v
+/// est donc « combien de pistes j'obtiendrais si v était la seule valeur cochée
+/// de F », ce qui reste vrai quel que soit le nombre de valeurs déjà cochées
+/// dans F — et ne change pas quand on en coche une deuxième, ce qui est
+/// précisément ce qu'un utilisateur attend d'une case à cocher.
+///
+/// Values are always bound parameters; column/key names come from fixed
+/// literals only.
 pub(super) fn build_conditions(
     q: &FacetQuery,
     engine: Engine,
@@ -74,106 +79,121 @@ pub(super) fn build_conditions(
 ) -> (Vec<String>, Vec<SqlValue>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
-    let mut idx = 1usize;
-    let ph = |i: usize| match engine {
-        Engine::Sqlite => "?".to_string(),
-        Engine::Postgres => format!("${i}"),
-    };
+    // ⚠️ UN SEUL compteur de marqueurs pour tout le WHERE. En SQLite ils
+    // s'écrivent tous `?` et seul l'ORDRE de liaison compte ; en PostgreSQL ils
+    // sont numérotés. Chaque valeur doit donc être empilée exactement quand son
+    // marqueur est demandé — c'est la règle qu'un `IN (…)` bâti à la main avait
+    // déjà enfreinte ici.
+    let mut ph = Placeholders::new(engine);
+    let sel = &q.sel;
 
-    if exclude != "genre" {
-        if let Some(g) = q.genre.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!(
-                "(LOWER(t.genre) = LOWER({p}) OR t.genres LIKE {p2})",
-                p = ph(idx),
-                p2 = ph(idx + 1)
-            ));
-            params.push(SqlValue::Text(g.to_string()));
+    // Genre : la colonne `t.genre` OU le tableau JSON `t.genres`. Avec
+    // plusieurs genres cochés, les deux tests s'étendent ensemble ; les valeurs
+    // sont empilées dans l'ordre de sortie des marqueurs (les N du `IN`, puis
+    // les N motifs `LIKE`).
+    if exclude != "genre" && !sel.genres.is_empty() {
+        let n = sel.genres.len();
+        let in_part = ph.in_list_ci("t.genre", n).expect("liste non vide");
+        let like_part = (0..n)
+            .map(|_| format!("t.genres LIKE {}", ph.take()))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        conds.push(format!("({in_part} OR {like_part})"));
+        for g in &sel.genres {
+            params.push(SqlValue::Text(g.clone()));
+        }
+        for g in &sel.genres {
             params.push(SqlValue::Text(format!("%\"{g}\"%")));
-            idx += 2;
         }
     }
     if exclude != "year" {
-        if let Some(y) = q.year {
-            conds.push(format!("t.year = {}", ph(idx)));
-            params.push(SqlValue::Int(y as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.year", sel.years.len()) {
+            conds.push(c);
+            for v in &sel.years {
+                params.push(SqlValue::Int(*v));
+            }
         }
     }
     if exclude != "format" {
-        if let Some(f) = q.format.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!("LOWER(t.format) = LOWER({})", ph(idx)));
-            params.push(SqlValue::Text(f.to_string()));
-            idx += 1;
+        if let Some(c) = ph.in_list_ci("t.format", sel.formats.len()) {
+            conds.push(c);
+            for v in &sel.formats {
+                params.push(SqlValue::Text(v.clone()));
+            }
         }
     }
     if exclude != "sample_rate" {
-        if let Some(sr) = q.sample_rate {
-            conds.push(format!("t.sample_rate = {}", ph(idx)));
-            params.push(SqlValue::Int(sr as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.sample_rate", sel.sample_rates.len()) {
+            conds.push(c);
+            for v in &sel.sample_rates {
+                params.push(SqlValue::Int(*v));
+            }
         }
     }
     if exclude != "bit_depth" {
-        if let Some(bd) = q.bit_depth {
-            conds.push(format!("t.bit_depth = {}", ph(idx)));
-            params.push(SqlValue::Int(bd as i64));
-            idx += 1;
+        if let Some(c) = ph.in_list("t.bit_depth", sel.bit_depths.len()) {
+            conds.push(c);
+            for v in &sel.bit_depths {
+                params.push(SqlValue::Int(*v));
+            }
         }
     }
-    if let Some(s) = q.source.as_deref().filter(|s| !s.is_empty()) {
-        conds.push(format!("t.source = {}", ph(idx)));
-        params.push(SqlValue::Text(s.to_string()));
-        idx += 1;
+    // `source` (colonne `tracks.source`) n'est pas une facette du rail : elle ne
+    // s'auto-exclut donc pas, comme avant #2168.
+    if let Some(c) = ph.in_list("t.source", sel.sources.len()) {
+        conds.push(c);
+        for v in &sel.sources {
+            params.push(SqlValue::Text(v.clone()));
+        }
     }
     if exclude != "label" {
-        if let Some(l) = q.label.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!("LOWER(t.label) LIKE LOWER({})", ph(idx)));
-            params.push(SqlValue::Text(format!("%{l}%")));
-            idx += 1;
+        if let Some(c) = ph.or_like_ci("t.label", sel.labels.len()) {
+            conds.push(c);
+            for v in &sel.labels {
+                params.push(SqlValue::Text(format!("%{v}%")));
+            }
         }
     }
-    // `composer` est désormais une facette à part entière : comme les autres,
-    // elle ne doit pas se filtrer elle-même, sinon sélectionner « Bach » ne
-    // laisserait plus que « Bach » dans la liste des compositeurs.
+    // `composer` est une facette à part entière : comme les autres, elle ne
+    // doit pas se filtrer elle-même, sinon sélectionner « Bach » ne laisserait
+    // plus que « Bach » dans la liste des compositeurs.
     if exclude != "composer" {
-        if let Some(c) = q.composer.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!("LOWER(t.composer) LIKE LOWER({})", ph(idx)));
-            params.push(SqlValue::Text(format!("%{c}%")));
-            idx += 1;
+        if let Some(c) = ph.or_like_ci("t.composer", sel.composers.len()) {
+            conds.push(c);
+            for v in &sel.composers {
+                params.push(SqlValue::Text(format!("%{v}%")));
+            }
         }
     }
     if exclude != "artist" {
-        if let Some(a) = q.artist.as_deref().filter(|s| !s.is_empty()) {
-            // `tracks` has no artist_name column (artist is a FK to `artists`),
-            // and these conditions run against `FROM tracks t` with no join, so
-            // resolve the name via a subquery rather than the phantom
-            // t.artist_name (forum #1189).
-            conds.push(format!(
-                "t.artist_id IN (SELECT id FROM artists WHERE name = {})",
-                ph(idx)
-            ));
-            params.push(SqlValue::Text(a.to_string()));
-            idx += 1;
+        // `tracks` has no artist_name column (artist is a FK to `artists`), and
+        // these conditions run against `FROM tracks t` with no join, so resolve
+        // the name via a subquery rather than the phantom t.artist_name (#1189).
+        if let Some(c) = ph.in_list("name", sel.artists.len()) {
+            conds.push(format!("t.artist_id IN (SELECT id FROM artists WHERE {c})"));
+            for v in &sel.artists {
+                params.push(SqlValue::Text(v.clone()));
+            }
         }
     }
     // Extended-tag filters via the open `track_metadata` k/v store. `source`
-    // facet == source_media key. Key is a fixed literal; value is bound.
-    for (opt, key, own) in [
-        (&q.country, "release_country", "country"),
-        (&q.mood, "mood", "mood"),
-        (&q.source_media, "source_media", "source"),
+    // facet == source_media key. Key is a fixed literal; values are bound.
+    for (values, key, own) in [
+        (&sel.countries, "release_country", "country"),
+        (&sel.moods, "mood", "mood"),
+        (&sel.source_medias, "source_media", "source"),
     ] {
         if exclude == own {
             continue;
         }
-        if let Some(v) = opt.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(c) = ph.in_list("tm.value", values.len()) {
             conds.push(format!(
                 "EXISTS (SELECT 1 FROM track_metadata tm \
-                 WHERE tm.track_id = t.id AND tm.key = '{key}' AND tm.value = {})",
-                ph(idx)
+                 WHERE tm.track_id = t.id AND tm.key = '{key}' AND {c})"
             ));
-            params.push(SqlValue::Text(v.to_string()));
-            idx += 1;
+            for v in values {
+                params.push(SqlValue::Text(v.clone()));
+            }
         }
     }
     // Folder selection (Oxygen drill-down) narrows every facet's counts. The
@@ -181,29 +201,28 @@ pub(super) fn build_conditions(
     // exclude="folder" to skip this redundant predicate; the flat /facets
     // endpoint (exclude = a real field name) always applies it.
     if exclude != "folder" {
-        if let Some(fld) = q.folder.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(fld) = sel.folder.as_deref().filter(|s| !s.is_empty()) {
             conds.push(format!(
                 "t.file_path LIKE {}{}",
-                ph(idx),
+                ph.take(),
                 tune_core::db::track_repo::like_escape_clause(engine)
             ));
             params.push(SqlValue::Text(
                 tune_core::db::track_repo::folder_like_pattern(fld),
             ));
-            idx += 1;
         }
     }
     // Album rating (profile 1). Tracks inherit their album's rating via a join
     // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
     if exclude != "rating" {
-        if let Some(r) = q.rating {
+        if let Some(c) = ph.in_list("arr.rating", sel.ratings.len()) {
             conds.push(format!(
                 "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND arr.rating = {})",
-                ph(idx)
+                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
             ));
-            params.push(SqlValue::Int(r as i64));
-            idx += 1;
+            for v in &sel.ratings {
+                params.push(SqlValue::Int(*v));
+            }
         }
     }
     // Manual collection: the resolved album ids are our own i64s (parsed from the
@@ -223,67 +242,68 @@ pub(super) fn build_conditions(
             }
         }
     }
-    // Favoris du profil 1. `EXISTS` reste sur l'alias `t`, comme la note.
-    // ⚠️ Ces trois prédicats sont dupliqués dans `TrackRepo::list_filtered`
-    // (crates distincts) : toute modification ici doit y être reportée, sans
-    // quoi une facette compterait autrement que la liste qu'elle filtre.
+    // ⚠️ Les prédicats de ce bloc sont les JUMEAUX de ceux de
+    // `TrackRepo::list_filtered` (autre crate). Depuis #2168 les deux passent
+    // par `tune_core::db::facet_filter` : les vocabulaires FERMÉS (favoris,
+    // étiquette manquante) et la construction des `IN (…)` n'y sont écrits
+    // qu'une fois. Ce qui reste écrit deux fois, ce sont les colonnes et les
+    // jointures — la liste dispose d'un `JOIN artists`, pas le compteur.
     // L'année d'enregistrement vit sur l'ALBUM, pas sur la piste : jointure par
-    // EXISTS pour rester sur l'alias `t`, comme la note et les favoris.
+    // EXISTS pour rester sur l'alias `t`.
     if exclude != "original_year" {
-        if let Some(y) = q.original_year {
+        if let Some(c) = ph.in_list("alo.original_year", sel.original_years.len()) {
             conds.push(format!(
-                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND alo.original_year = {})",
-                ph(idx)
+                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
             ));
-            params.push(SqlValue::Int(y as i64));
-            idx += 1;
+            for v in &sel.original_years {
+                params.push(SqlValue::Int(*v));
+            }
         }
     }
     if exclude != "favorite" {
-        if let Some(kind) = q.favorite.as_deref().filter(|s| !s.is_empty()) {
-            match kind {
-                "album" => conds.push(
-                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                     AND f.item_type = 'album' AND f.item_id = t.album_id)"
-                        .to_string(),
-                ),
-                "track" => conds.push(
-                    "EXISTS (SELECT 1 FROM favorites f WHERE f.profile_id = 1 \
-                     AND f.item_type = 'track' AND f.item_id = t.id)"
-                        .to_string(),
-                ),
-                // Valeur inconnue : ne rien filtrer plutôt que tout exclure.
-                _ => {}
-            }
+        // Vocabulaire FERMÉ : une valeur inconnue ne filtre RIEN plutôt que
+        // de tout exclure — ou, pire, de tout laisser passer.
+        if let Some(c) = any_of(
+            sel.favorites
+                .iter()
+                .filter_map(|k| favorite_condition(k))
+                .map(str::to_string)
+                .collect(),
+        ) {
+            conds.push(c);
         }
     }
     if exclude != "playlist" {
-        if let Some(name) = q.playlist.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(c) = ph.in_list_ci("pl.name", sel.playlists.len()) {
             conds.push(format!(
                 "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
-                 WHERE pt.track_id = t.id AND LOWER(pl.name) = LOWER({}))",
-                ph(idx)
+                 WHERE pt.track_id = t.id AND {c})"
             ));
-            params.push(SqlValue::Text(name.to_string()));
-            idx += 1;
-        }
-    }
-    if exclude != "untagged" {
-        if let Some(field) = q.untagged.as_deref().filter(|s| !s.is_empty()) {
-            // Champ choisi dans une liste fermée : le SQL formaté ci-dessous ne
-            // dépend jamais de l'entrée brute.
-            if let Some(cond) = untagged_condition(field) {
-                conds.push(cond);
+            for v in &sel.playlists {
+                params.push(SqlValue::Text(v.clone()));
             }
         }
     }
-    if let Some(query) = q.q.as_deref().filter(|s| !s.is_empty()) {
+    if exclude != "untagged" {
+        // Champs choisis dans une liste FERMÉE : le SQL formaté ci-dessous ne
+        // dépend jamais de l'entrée brute.
+        if let Some(c) = any_of(
+            sel.untagged
+                .iter()
+                .filter_map(|f| untagged_condition(f))
+                .map(str::to_string)
+                .collect(),
+        ) {
+            conds.push(c);
+        }
+    }
+    if let Some(query) = sel.q.as_deref().filter(|s| !s.is_empty()) {
         // Artist match via subquery — no artist_name column / no join here (#1189).
+        let p = ph.take();
+        let p2 = ph.take();
         conds.push(format!(
             "(LOWER(t.title) LIKE LOWER({p}) OR t.artist_id IN \
-             (SELECT id FROM artists WHERE LOWER(name) LIKE LOWER({p2})))",
-            p = ph(idx),
-            p2 = ph(idx + 1)
+             (SELECT id FROM artists WHERE LOWER(name) LIKE LOWER({p2})))"
         ));
         let like = format!("%{query}%");
         params.push(SqlValue::Text(like.clone()));
@@ -324,8 +344,13 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// cannot aggregate without a per-track fetch.
 pub(super) async fn library_facets(
     Query(q): Query<FacetQuery>,
+    RawQuery(raw): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // Les facettes à plusieurs valeurs se lisent dans la chaîne BRUTE : voir
+    // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
+    // filtre.
+    let q = q.hydrate(raw.as_deref())?;
     // `limit <= 0` means "no limit" (show every facet value); otherwise clamp to
     // a sane ceiling. Absent → the historical default of 200.
     let limit: Option<i64> = match q.limit {
@@ -387,28 +412,6 @@ pub(super) async fn library_facets(
         out.insert(field, Value::Array(arr));
     }
     Ok(Json(Value::Object(out)))
-}
-
-/// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
-/// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
-///
-/// « Manquant » vaut ici NULL **ou** chaîne vide : un tag effacé par un éditeur
-/// laisse souvent une chaîne vide, et l'utilisateur qui range sa bibliothèque
-/// ne fait pas la différence entre les deux.
-pub(super) fn untagged_condition(field: &str) -> Option<String> {
-    let c = match field {
-        "genre" => "(t.genre IS NULL OR t.genre = '')",
-        "year" => "(t.year IS NULL OR t.year = 0)",
-        "artist" => "t.artist_id IS NULL",
-        "album" => "t.album_id IS NULL",
-        // La pochette vit sur l'album : une piste sans album n'en a pas non plus.
-        "cover" => {
-            "(t.album_id IS NULL OR EXISTS (SELECT 1 FROM albums al \
-              WHERE al.id = t.album_id AND (al.cover_path IS NULL OR al.cover_path = '')))"
-        }
-        _ => return None,
-    };
-    Some(c.to_string())
 }
 
 /// Les cinq étiquettes surveillées, dans l'ordre où elles gênent l'écoute :
@@ -546,7 +549,7 @@ fn untagged_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Ve
             continue;
         };
         let mut all: Vec<String> = conds.to_vec();
-        all.push(missing);
+        all.push(missing.to_string());
         let sql = format!("SELECT COUNT(*) FROM tracks t WHERE {}", all.join(" AND "));
         let n = state
             .backend
@@ -918,8 +921,7 @@ fn kv_facet(
 
 #[cfg(test)]
 mod tests {
-    use super::smart_collection_where;
-    use super::untagged_condition;
+    use super::*;
     use crate::routes::smart_refs::{EmptyResolver, RefCtx};
 
     /// La liste des étiquettes surveillées est FERMÉE : c'est elle qui garantit
@@ -954,6 +956,294 @@ mod tests {
         // échapperait au ménage.
         assert!(cover.contains("t.album_id IS NULL"), "{cover}");
         assert!(cover.contains("cover_path"), "{cover}");
+    }
+
+    // ── #2168 : plusieurs valeurs par facette ────────────────────────────
+    //
+    // Ces tests portent sur le SQL TEXTUEL et sur l'ORDRE des valeurs liées.
+    // C'est le seul niveau où l'on peut prouver la correction sur les DEUX
+    // moteurs sans deux bases : en SQLite tous les marqueurs s'écrivent `?`
+    // (`SqliteDialect::placeholder` ignore son indice), donc seul l'ordre de
+    // liaison compte ; en PostgreSQL ils sont numérotés et doivent former la
+    // suite 1..N sans trou ni répétition.
+
+    /// Construit la sélection comme le fait la route : depuis la chaîne de
+    /// requête BRUTE, clé répétée comprise.
+    fn depuis(raw: &str) -> FacetQuery {
+        match FacetQuery::default().hydrate(Some(raw)) {
+            Ok(q) => q,
+            Err(_) => panic!("requête acceptable : {raw}"),
+        }
+    }
+
+    fn texte(v: &SqlValue) -> String {
+        match v {
+            SqlValue::Text(s) => s.clone(),
+            SqlValue::Int(i) => i.to_string(),
+            autre => format!("{autre:?}"),
+        }
+    }
+
+    /// La demande du fil 1513 : `aiff` OU `flac` dans la même facette.
+    #[test]
+    fn deux_valeurs_dans_une_facette_donnent_un_in_et_lient_dans_lordre() {
+        let q = depuis("format=aiff&format=flac");
+
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER($1), LOWER($2))"]);
+        assert_eq!(
+            params.iter().map(texte).collect::<Vec<_>>(),
+            vec!["aiff".to_string(), "flac".to_string()]
+        );
+
+        // SQLite : même prédicat, marqueurs anonymes — l'ordre EST le lien.
+        let (conds, params) = build_conditions(&q, Engine::Sqlite, "", None);
+        assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER(?), LOWER(?))"]);
+        assert_eq!(
+            params.iter().map(texte).collect::<Vec<_>>(),
+            vec!["aiff".to_string(), "flac".to_string()]
+        );
+    }
+
+    /// La sémantique retenue : OU dans une facette, ET entre facettes. Et le
+    /// OU interne est PARENTHÉSÉ — sans quoi `a OU b ET c` se lirait
+    /// `a OU (b ET c)` et la seconde facette cesserait de restreindre.
+    #[test]
+    fn ou_dans_une_facette_et_entre_facettes() {
+        let q = depuis("format=aiff&format=flac&sample_rate=44100&sample_rate=96000");
+        let (conds, _) = build_conditions(&q, Engine::Postgres, "", None);
+        assert_eq!(conds.len(), 2, "deux facettes = deux conditions ET-ées");
+        let where_clause = conds.join(" AND ");
+        assert!(
+            where_clause.contains("LOWER(t.format) IN ("),
+            "{where_clause}"
+        );
+        assert!(
+            where_clause.contains("t.sample_rate IN ($3, $4)"),
+            "{where_clause}"
+        );
+
+        // Le genre teste DEUX colonnes (colonne + tableau JSON) : son OU doit
+        // rester enfermé dans ses parenthèses.
+        let q = depuis("genre=Jazz&genre=Blues&year=1971");
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        assert_eq!(
+            conds[0],
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+        );
+        assert_eq!(conds[1], "t.year = $5");
+        assert_eq!(
+            params.iter().map(texte).collect::<Vec<_>>(),
+            vec![
+                "Jazz".to_string(),
+                "Blues".to_string(),
+                "%\"Jazz\"%".to_string(),
+                "%\"Blues\"%".to_string(),
+                "1971".to_string(),
+            ]
+        );
+    }
+
+    /// ⚠️ LE test des deux moteurs. Un `IN (…)` bâti à la main qui n'avance pas
+    /// le compteur produit un SQL parfaitement valide en SQLite et FAUX en
+    /// PostgreSQL. On exige donc, sur une requête qui active TOUTES les formes
+    /// de prédicat :
+    ///   * PostgreSQL : les marqueurs, lus de gauche à droite, sont exactement
+    ///     `$1 … $N` — pas de trou, pas de répétition, pas de décalage ;
+    ///   * SQLite : autant de `?` que de valeurs liées ;
+    ///   * les deux moteurs lient les MÊMES valeurs, dans le MÊME ordre.
+    #[test]
+    fn les_marqueurs_et_les_valeurs_restent_alignes_sur_les_deux_moteurs() {
+        let raw = "genre=Jazz&genre=Blues\
+                   &year=1971&year=1972\
+                   &format=aiff&format=flac\
+                   &sample_rate=44100&sample_rate=96000\
+                   &bit_depth=16&bit_depth=24\
+                   &source=local&source=qobuz\
+                   &label=ECM&label=Blue+Note\
+                   &composer=Bach&composer=Ravel\
+                   &artist=Miles+Davis&artist=Bill+Evans\
+                   &country=FR&country=US\
+                   &mood=calme&mood=intense\
+                   &source_media=CD&source_media=SACD\
+                   &rating=4&rating=5\
+                   &original_year=1959&original_year=1960\
+                   &playlist=Ma+liste&playlist=Autre\
+                   &favorite=track&favorite=album\
+                   &untagged=genre&untagged=cover\
+                   &folder=%2Fmnt%2Fmusic\
+                   &q=so+what";
+        let q = depuis(raw);
+
+        let (conds_pg, params_pg) = build_conditions(&q, Engine::Postgres, "", None);
+        let where_pg = conds_pg.join(" AND ");
+        let numeros: Vec<usize> = where_pg
+            .match_indices('$')
+            .map(|(i, _)| {
+                where_pg[i + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .expect("marqueur PostgreSQL numéroté")
+            })
+            .collect();
+        assert_eq!(
+            numeros,
+            (1..=params_pg.len()).collect::<Vec<_>>(),
+            "les marqueurs PostgreSQL doivent former 1..N dans l'ordre : {where_pg}"
+        );
+        assert!(
+            params_pg.len() >= 30,
+            "la requête d'épreuve doit couvrir toutes les formes de prédicat, \
+             {} valeurs liées seulement",
+            params_pg.len()
+        );
+
+        let (conds_sq, params_sq) = build_conditions(&q, Engine::Sqlite, "", None);
+        let where_sq = conds_sq.join(" AND ");
+        assert_eq!(
+            where_sq.matches('?').count(),
+            params_sq.len(),
+            "autant de marqueurs que de valeurs liées : {where_sq}"
+        );
+        assert_eq!(
+            conds_sq.len(),
+            conds_pg.len(),
+            "les deux moteurs doivent produire les mêmes prédicats"
+        );
+        assert_eq!(
+            params_sq.iter().map(texte).collect::<Vec<_>>(),
+            params_pg.iter().map(texte).collect::<Vec<_>>(),
+            "les deux moteurs doivent lier les mêmes valeurs dans le même ordre"
+        );
+    }
+
+    /// ⚠️ Le défaut redouté : une facette SANS valeur ne doit produire AUCUN
+    /// prédicat. Ni `IN ()` (erreur de syntaxe), ni `1 = 1` (bibliothèque
+    /// entière rendue en silence sous un filtre affiché).
+    #[test]
+    fn une_facette_sans_valeur_ne_produit_aucun_predicat() {
+        for raw in ["", "format=&genre=&label=&year=", "limit=200&fields=format"] {
+            for engine in [Engine::Sqlite, Engine::Postgres] {
+                let (conds, params) = build_conditions(&depuis(raw), engine, "", None);
+                assert!(conds.is_empty(), "{raw:?} → {conds:?}");
+                assert!(params.is_empty(), "{raw:?} → {params:?}");
+            }
+        }
+        // Et jamais de `IN ()` nulle part, quelle que soit la sélection.
+        let (conds, _) = build_conditions(
+            &depuis("format=flac&genre=Jazz&rating=5"),
+            Engine::Postgres,
+            "",
+            None,
+        );
+        assert!(
+            !conds.join(" AND ").contains("IN ()"),
+            "un IN vide est une erreur SQL : {conds:?}"
+        );
+    }
+
+    /// **Les effectifs restent justes en sélection multiple.** En comptant la
+    /// facette F, on applique toutes les AUTRES facettes et jamais F elle-même
+    /// — y compris quand F porte déjà plusieurs valeurs. L'effectif affiché à
+    /// côté d'une valeur v répond donc toujours à la même question : « combien
+    /// de pistes si v était cochée ? », et il ne bouge pas quand on coche une
+    /// deuxième valeur de la même facette.
+    #[test]
+    fn la_facette_comptee_sexclut_elle_meme_meme_en_multi() {
+        let q = depuis("format=aiff&format=flac&genre=Jazz&genre=Blues");
+
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "format", None);
+        let where_clause = conds.join(" AND ");
+        assert!(
+            !where_clause.contains("t.format"),
+            "la facette comptée ne doit pas se filtrer elle-même : {where_clause}"
+        );
+        assert!(where_clause.contains("t.genre"), "{where_clause}");
+        // Les marqueurs se renumérotent depuis 1 : le prédicat retiré ne doit
+        // pas laisser de trou dans la liaison.
+        assert_eq!(
+            conds[0],
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+        );
+        assert_eq!(params.len(), 4);
+
+        // Symétrique : en comptant le genre, c'est le format qui reste.
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "genre", None);
+        assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER($1), LOWER($2))"]);
+        assert_eq!(params.len(), 2);
+    }
+
+    /// Rétrocompatibilité : une URL d'avant #2168 produit EXACTEMENT le SQL
+    /// d'avant — `= ?`, pas `IN (?)`. Rien à migrer, et les plans d'exécution
+    /// ne changent pas pour la sélection simple, qui reste le cas courant.
+    #[test]
+    fn une_seule_valeur_produit_le_sql_davant() {
+        let q = depuis("genre=Jazz&format=flac&year=1971&label=ECM&rating=4");
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        assert_eq!(
+            conds,
+            vec![
+                "(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)".to_string(),
+                "t.year = $3".to_string(),
+                "LOWER(t.format) = LOWER($4)".to_string(),
+                "LOWER(t.label) LIKE LOWER($5)".to_string(),
+                "EXISTS (SELECT 1 FROM album_ratings arr WHERE arr.album_id = t.album_id \
+                 AND arr.profile_id = 1 AND arr.rating = $6)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            params.iter().map(texte).collect::<Vec<_>>(),
+            vec![
+                "Jazz".to_string(),
+                "%\"Jazz\"%".to_string(),
+                "1971".to_string(),
+                "flac".to_string(),
+                "%ECM%".to_string(),
+                "4".to_string(),
+            ]
+        );
+    }
+
+    /// Vocabulaires FERMÉS en sélection multiple : les deux conditions se
+    /// combinent en OU et restent parenthésées ; une valeur inconnue
+    /// disparaît sans rien laisser passer.
+    #[test]
+    fn les_vocabulaires_fermes_se_combinent_en_ou() {
+        let (conds, params) = build_conditions(
+            &depuis("favorite=track&favorite=album&untagged=genre&untagged=cover"),
+            Engine::Postgres,
+            "",
+            None,
+        );
+        assert_eq!(conds.len(), 2);
+        assert!(conds[0].starts_with("(EXISTS") && conds[0].contains(" OR EXISTS"));
+        assert!(conds[1].starts_with('(') && conds[1].contains(" OR "));
+        assert!(params.is_empty(), "ces prédicats ne lient aucune valeur");
+
+        // Valeurs hors vocabulaire : aucun prédicat, et surtout pas un `1 = 1`.
+        let (conds, _) = build_conditions(
+            &depuis("favorite=1&untagged=mbid"),
+            Engine::Postgres,
+            "",
+            None,
+        );
+        assert!(conds.is_empty(), "{conds:?}");
+    }
+
+    /// La virgule dans une valeur : la raison d'être de la clé répétée. Un
+    /// genre « Jazz, Blues » doit rester UNE valeur.
+    #[test]
+    fn une_valeur_a_virgule_reste_une_seule_valeur() {
+        let q = depuis("genre=Jazz%2C+Blues");
+        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        assert_eq!(
+            conds,
+            vec!["(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)"]
+        );
+        assert_eq!(texte(&params[0]), "Jazz, Blues");
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod folder_facet;
 mod genres;
 mod ingest;
 mod proposals;
+mod query_multi;
 mod ratings;
 mod reports;
 mod search;
