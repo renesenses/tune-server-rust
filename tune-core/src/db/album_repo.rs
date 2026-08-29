@@ -355,6 +355,14 @@ pub mod sql {
         )
     }
 
+    pub fn list_by_year<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.year = {} ORDER BY LOWER(a.title) ASC",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
     pub fn list_without_cover() -> &'static str {
         "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.cover_path IS NULL OR a.cover_path = '') AND a.source = 'local' ORDER BY a.id"
     }
@@ -1482,6 +1490,18 @@ impl AlbumRepo {
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// Les albums d'une année (colonne `year`), triés par titre.
+    ///
+    /// C'est la requête du conteneur UPnP « Years », comme `list_by_genre`
+    /// est celle de « Genres » : le serveur média ne doit pas inventer sa
+    /// propre lecture de la colonne.
+    pub fn list_by_year(&self, year: i64) -> Result<Vec<Album>, TuneError> {
+        let sql = self.dialect_sql(sql::list_by_year, sql::list_by_year);
+        let params: [&dyn ToSqlValue; 1] = [&year];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }

@@ -817,7 +817,7 @@ fn search_tracks_in_container(
     titres: &[PredicatTitre],
 ) -> Option<DidlResult> {
     match container_id {
-        "0" | "tracks" | "artists" | "albums" | "genres" => {
+        "0" | "tracks" | "artists" | "albums" | "genres" | "years" => {
             if titres.is_empty() {
                 // Sans predicat de titre, c'est le parcours d'indexation :
                 // la pagination reste celle de la base, pas de la memoire.
@@ -1236,6 +1236,13 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "object.container",
             None,
         )),
+        "years" => Some(didl_container(
+            "years",
+            "0",
+            "Years",
+            "object.container",
+            None,
+        )),
         "tracks" => Some(didl_container(
             "tracks",
             "0",
@@ -1302,6 +1309,10 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                 None,
             )
         }),
+        // Même règle que `genre/` : une année est un conteneur comme un autre,
+        // et un point de contrôle strict le décrit avant de l'ouvrir.
+        id if id.starts_with("year/") => decode_year_id(id)
+            .map(|annee| didl_container(id, "years", &annee.to_string(), "object.container", None)),
         _ => None,
     };
 
@@ -1332,6 +1343,7 @@ fn browse_direct_children(
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
         "genres" => browse_genres(state),
+        "years" => browse_years(state),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state),
         id if id.starts_with("artist/") => {
@@ -1357,6 +1369,12 @@ fn browse_direct_children(
             Some(genre) => browse_genre_albums(state, &genre, &base_url),
             None => empty_didl(),
         },
+        // La leçon de #1736 vaut pour les années : un conteneur publié par
+        // `browse_years` doit savoir s'ouvrir ici, sinon il se lit comme vide.
+        id if id.starts_with("year/") => match decode_year_id(id) {
+            Some(annee) => browse_year_albums(state, annee, &base_url),
+            None => empty_didl(),
+        },
         _ => empty_didl(),
     }
 }
@@ -1366,10 +1384,13 @@ fn browse_direct_children(
 /// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
 /// visible et vide se lit comme une bibliothèque cassée, pas comme une
 /// fonction manquante.
-const ROOT_CONTAINERS: [(&str, &str, &str); 5] = [
+const ROOT_CONTAINERS: [(&str, &str, &str); 6] = [
     ("artists", "Artists", "object.container"),
     ("albums", "Albums", "object.container"),
     ("genres", "Genres", "object.container"),
+    // Années des albums (#1789, Jean Valjean, fil forum #1439) : chaque année
+    // ouvre sur ses albums, exactement comme un genre ouvre sur les siens.
+    ("years", "Years", "object.container"),
     // Parcours à plat de toute la bibliothèque. Attendu par les points de
     // contrôle — le titre de #1390 le nomme explicitement (« Albums / All
     // tracks / Genres ») — et il manquait, sans qu'aucun ticket ne le suive.
@@ -1399,6 +1420,19 @@ fn decode_genre_id(object_id: &str) -> Option<String> {
         return None;
     }
     Some(decoded)
+}
+
+/// Décode l'identifiant d'un conteneur d'année (`year/1959`).
+///
+/// Une année est un entier strictement positif : `browse_years` n'en publie
+/// pas d'autre, et tout identifiant malformé rend `None` — donc un DIDL vide,
+/// jamais une erreur.
+fn decode_year_id(object_id: &str) -> Option<i64> {
+    object_id
+        .strip_prefix("year/")?
+        .parse::<i64>()
+        .ok()
+        .filter(|annee| *annee > 0)
 }
 
 fn browse_root(_state: &UpnpState) -> DidlResult {
@@ -1589,10 +1623,65 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
 fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlResult {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let albums = repo.list_by_genre(genre).unwrap_or_default();
-
     let parent_id = format!("genre/{}", urlencoding::encode(genre));
+    didl_albums_under(&albums, &parent_id, base_url)
+}
+
+/// Les années DISTINCT des albums, la plus récente d'abord.
+///
+/// Une année sans albums n'existe simplement pas dans la liste — la règle de
+/// `ROOT_CONTAINERS` (aucun conteneur annoncé qui s'ouvre vide) descend d'un
+/// niveau. Les albums sans année (`NULL` ou 0) restent visibles par les
+/// autres conteneurs, mais aucun dossier « année inconnue » n'est inventé.
+fn browse_years(state: &UpnpState) -> DidlResult {
+    let years: Vec<i64> = state
+        .backend
+        .query_many(
+            "SELECT DISTINCT year FROM albums \
+             WHERE year IS NOT NULL AND year > 0 ORDER BY year DESC",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_i64()))
+        .collect();
+
     let mut inner = String::new();
-    for album in &albums {
+    for annee in &years {
+        inner.push_str(&didl_container(
+            &format!("year/{annee}"),
+            "years",
+            &annee.to_string(),
+            "object.container",
+            None,
+        ));
+    }
+
+    let total = years.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
+}
+
+/// Les albums d'une année — le même rendu que ceux d'un genre.
+fn browse_year_albums(state: &UpnpState, annee: i64, base_url: &str) -> DidlResult {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let albums = repo.list_by_year(annee).unwrap_or_default();
+    didl_albums_under(&albums, &format!("year/{annee}"), base_url)
+}
+
+/// Le DIDL d'une liste d'albums sous un conteneur (genre, année) : créateur,
+/// pochette et nombre de pistes — pour que deux vues d'un même album disent
+/// exactement la même chose.
+fn didl_albums_under(
+    albums: &[crate::db::models::Album],
+    parent_id: &str,
+    base_url: &str,
+) -> DidlResult {
+    let mut inner = String::new();
+    for album in albums {
         let id = format!("album/{}", album.id.unwrap_or(0));
         let child_count = album.track_count.map(|c| c as u64);
         let mut extra = String::new();
@@ -1610,7 +1699,7 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
         }
         inner.push_str(&didl_container_ext(
             &id,
-            &parent_id,
+            parent_id,
             &album.title,
             "object.container.album.musicAlbum",
             child_count,
@@ -2210,6 +2299,96 @@ mod tests {
         assert_eq!(decode_genre_id("albums"), None);
         assert_eq!(decode_genre_id("genre/"), None);
         assert_eq!(decode_genre_id("genre/%20%20"), None);
+    }
+
+    /// Un état avec quatre albums : deux de 1959, un de 1970, un sans année.
+    fn state_with_years() -> UpnpState {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        for (titre, annee) in [
+            ("Kind of Blue", Some(1959)),
+            ("Time Out", Some(1959)),
+            ("Bitches Brew", Some(1970)),
+            ("Sans Année", None),
+        ] {
+            let mut album = album_with_genre(titre, "Jazz");
+            album.year = annee;
+            repo.create(&album).unwrap();
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #1789 — le conteneur racine « Years » liste les années DISTINCT,
+    /// la plus récente d'abord, et n'invente pas de dossier pour les albums
+    /// sans année.
+    #[test]
+    fn browser_les_annees_liste_les_annees_distinctes() {
+        let state = state_with_years();
+        let res = browse_direct_children(&state, "years", 0, 100);
+        assert_eq!(res.total, 2, "deux années distinctes : 1959 et 1970");
+        assert!(res.xml.contains("id=\"year/1959\""), "{}", res.xml);
+        assert!(res.xml.contains("id=\"year/1970\""), "{}", res.xml);
+        let pos_1970 = res.xml.find("year/1970").unwrap();
+        let pos_1959 = res.xml.find("year/1959").unwrap();
+        assert!(pos_1970 < pos_1959, "la plus récente d'abord : {}", res.xml);
+        assert!(res.xml.contains("parentID=\"years\""), "{}", res.xml);
+    }
+
+    /// #1789 — une année s'ouvre sur SES albums, comme un genre sur les siens.
+    #[test]
+    fn browser_une_annee_renvoie_ses_albums() {
+        let state = state_with_years();
+        let res = browse_direct_children(&state, "year/1959", 0, 100);
+        assert_eq!(res.total, 2);
+        assert!(res.xml.contains("Kind of Blue"), "{}", res.xml);
+        assert!(res.xml.contains("Time Out"), "{}", res.xml);
+        assert!(
+            !res.xml.contains("Bitches Brew"),
+            "un album d'une autre année n'a rien à faire ici"
+        );
+        assert!(
+            res.xml.contains("parentID=\"year/1959\""),
+            "le parentID doit ramener au conteneur d'année : {}",
+            res.xml
+        );
+    }
+
+    /// Contre-échec, même leçon que #1736 : un identifiant d'année inconnu ou
+    /// malformé rend un DIDL vide, jamais une erreur.
+    #[test]
+    fn une_annee_inconnue_reste_vide_sans_planter() {
+        let state = state_with_years();
+        for id in ["year/1234", "year/", "year/abc", "year/-5", "year/0"] {
+            assert_eq!(browse_direct_children(&state, id, 0, 100).total, 0, "{id}");
+        }
+    }
+
+    /// Un point de contrôle strict décrit l'objet avant de l'ouvrir — la
+    /// branche `year/` de BrowseMetadata, symétrique de celle de `genre/`.
+    #[test]
+    fn browse_metadata_decrit_le_conteneur_d_annee() {
+        let state = state_with_years();
+        let res = browse_metadata(&state, "year/1959");
+        assert_eq!(res.total, 1);
+        assert!(res.xml.contains("parentID=\"years\""), "{}", res.xml);
+        assert!(res.xml.contains("1959"), "{}", res.xml);
+
+        assert_eq!(browse_metadata(&state, "year/abc").total, 0);
+    }
+
+    /// `Search` sur le conteneur synthétique `years` est le même parcours à
+    /// plat que sur la racine — pas un 710.
+    #[test]
+    fn la_recherche_accepte_le_conteneur_years() {
+        let state = state_with_years();
+        assert!(
+            search_tracks_in_container(&state, "years", 0, 100, "http://127.0.0.1:8888", &[])
+                .is_some(),
+            "years est un conteneur racine annoncé : Search doit l'accepter"
+        );
     }
 
     /// Un point de contrôle strict décrit l'objet avant de l'ouvrir.
