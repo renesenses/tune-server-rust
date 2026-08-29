@@ -77,6 +77,91 @@ const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
 /// Attente entre deux vérifications quand la machine est trop chaude (#1576).
 const THERMAL_RETRY_SECS: u64 = 120;
 
+/// Cadence à laquelle on regarde si une zone s'est mise à jouer PENDANT
+/// l'analyse d'un fichier (#2495).
+///
+/// 250 ms est court devant le temps de démarrage qu'on protège (Thierry
+/// Clemont : 6 782 ms pour résoudre une piste locale pendant le balayage,
+/// contre 149 ms pour une piste Qobuz dans le même journal) et long devant le
+/// coût de la vérification, un `SELECT ... LIMIT 1` sur `zones` — quatre
+/// requêtes par seconde et par fichier en cours, uniquement pendant qu'un
+/// fichier est effectivement en cours d'analyse.
+const VEILLE_LECTURE_MS: u64 = 250;
+
+/// Ce qu'il advient d'une analyse qui peut être abandonnée au profit de la
+/// lecture.
+///
+/// Le point n'est pas le type, c'est le contrat qu'il impose au site d'appel :
+/// il devient impossible d'écrire la suite sans dire ce qu'on fait du cas
+/// « cédée ». C'est précisément ce qui manquait — une piste abandonnée ne doit
+/// SURTOUT pas être estampillée `rg_analyzed`, sinon elle sort du balayage pour
+/// toujours et ne sera jamais mesurée.
+pub(crate) enum Issue<T> {
+    Terminee(T),
+    CedeeALaLecture,
+}
+
+/// Attendre qu'une zone se mette à jouer.
+///
+/// Vérifie AVANT de dormir : entre le garde-fou d'entrée de fichier et le
+/// premier octet décodé, il y a la résolution du chemin — trois `stat` qui,
+/// sur un montage réseau endormi, ne sont pas instantanés. La lecture peut
+/// démarrer dans cette fenêtre-là aussi.
+async fn veiller_lecture(backend: Arc<dyn DbBackend>) {
+    loop {
+        if let Some(zone) = playing_zone_name(&backend) {
+            debug!(zone = %zone, "replaygain_veille_lecture — zone passee a playing");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(VEILLE_LECTURE_MS)).await;
+    }
+}
+
+/// Courir l'analyse d'UN fichier contre l'arrivée de la lecture.
+///
+/// `biased` n'est pas cosmétique : quand les deux futurs sont prêts au même
+/// réveil, la lecture doit gagner. Sans lui, `select!` tirerait au sort, et le
+/// garde-fou serait probabiliste.
+///
+/// Ce qu'on gagne, et rien de plus : `spawn_blocking` ne se rétracte pas. Le
+/// segment de 30 s déjà parti dans le pool bloquant ira jusqu'à son terme dans
+/// le vide. Ce qu'on cesse de faire, c'est de l'ATTENDRE — et surtout
+/// d'enchaîner les segments suivants, puis le fichier suivant. La fenêtre
+/// passe donc d'un fichier entier (borné à
+/// [`PER_TRACK_ANALYSIS_TIMEOUT_SECS`], soit 180 s) à un segment. Le journal ne
+/// doit pas laisser croire à une interruption immédiate.
+pub(crate) async fn analyser_ou_ceder<T>(
+    travail: impl std::future::Future<Output = T>,
+    ceder: impl std::future::Future<Output = ()>,
+) -> Issue<T> {
+    tokio::select! {
+        biased;
+        () = ceder => Issue::CedeeALaLecture,
+        resultat = travail => Issue::Terminee(resultat),
+    }
+}
+
+/// Mesurer une piste sans jamais faire attendre la lecture (#2495).
+///
+/// Le site d'appel passait par un simple `tokio::time::timeout` : une fois
+/// `measure_loudness_and_peak` lancée, plus rien ne pouvait la rendre avant
+/// 180 s. Le garde-fou existait bien, mais il ne s'exerçait qu'ENTRE deux
+/// fichiers — inutile quand un seul fichier de 4,5 Go sur partage réseau tient
+/// le chemin d'E/S pendant des minutes.
+pub(crate) async fn mesurer_en_cedant_a_la_lecture<T>(
+    backend: &Arc<dyn DbBackend>,
+    travail: impl std::future::Future<Output = T>,
+) -> Issue<Result<T, tokio::time::error::Elapsed>> {
+    analyser_ou_ceder(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+            travail,
+        ),
+        veiller_lecture(backend.clone()),
+    )
+    .await
+}
+
 /// How long the sweep backs off after finding a zone actively playing. The
 /// track pass fully decodes files — often over a network (SMB/NAS) mount — and
 /// on a busy link that starves the same disk/network the player reads from,
@@ -298,6 +383,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         analyze_track_batch(&backend).await
                     }
                 };
+                // La lecture peut avoir démarré PENDANT le lot, qui a alors
+                // cédé et rendu 0 sans avoir fini son travail (#2495). Relire
+                // l'état ici : sinon ce 0 se lirait « plus rien à analyser »,
+                // la boucle inscrirait au registre un « rien à faire » faux et
+                // dormirait 15 minutes au lieu des 30 s de report lecture.
+                let playing = playing || any_zone_playing(&backend);
                 let albums = analyze_album_batch(&backend);
 
                 if did > 0 || albums > 0 {
@@ -415,6 +506,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     let mut deferred = 0usize;
+    let mut cedees = 0usize;
     for r in &rows {
         // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à 180 s
         // chacun, c'est plus d'une heure de décodage après un « Désactivé » si
@@ -496,11 +588,33 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // `sur_disque`, PAS `path` : c'est la graphie que le système a
         // reconnue. Le chemin de la base reste ce qu'il est — on ne le
         // réécrit pas, on ne le normalise pas non plus (#1865).
-        let measured = tokio::time::timeout(
-            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+        //
+        // La course contre la lecture est ici, pas seulement au tour de boucle
+        // au-dessus (#2495) : le contrôle d'entrée ne sert à rien quand UN
+        // fichier monopolise le disque pendant des minutes.
+        let measured = match mesurer_en_cedant_a_la_lecture(
+            backend,
             crate::audio::analyzer::measure_loudness_and_peak(&sur_disque),
         )
-        .await;
+        .await
+        {
+            Issue::Terminee(m) => m,
+            Issue::CedeeALaLecture => {
+                cedees += 1;
+                // AUCUN `rg_analyzed` ici, et c'est tout l'enjeu : on n'a pas
+                // essayé, on a renoncé. Estampiller sortirait la piste du
+                // balayage pour toujours — le défaut #1865 exactement, mais
+                // déclenché par un simple appui sur « Lecture ».
+                info!(
+                    track_id,
+                    path = %path,
+                    "replaygain_cede_en_cours_d_analyse — lecture demarree, fichier \
+                     abandonne SANS temoin (il sera repris) ; le segment deja parti \
+                     finit dans le vide, il n'est pas annulable (#2495)"
+                );
+                break;
+            }
+        };
         match measured {
             Ok(Some((lufs, peak))) => {
                 let gain = track_gain_db(lufs);
@@ -554,10 +668,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     }
 
     // `deferred` est porté par la ligne de journal : sans lui, un lot où tout
-    // est introuvable ressemblerait à un lot analysé (#1865).
+    // est introuvable ressemblerait à un lot analysé (#1865). `cedees` dit la
+    // même chose pour l'abandon au profit de la lecture (#2495) : sans elle,
+    // un lot rendu à zéro serait indistinguable d'une bibliothèque finie.
     info!(
         analyzed = done - deferred,
-        deferred, "replaygain_track_batch"
+        deferred, cedees, "replaygain_track_batch"
     );
     done
 }
@@ -1650,5 +1766,309 @@ mod tests {
             !meta.get_all(4).unwrap().contains_key("rg_analyzed"),
             "la dernière piste du lot ne devait jamais être décodée après la coupure"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2495 — céder PENDANT le décodage, pas seulement entre deux fichiers.
+    // ---------------------------------------------------------------------
+
+    /// Base de test dont la zone se met à jouer d'elle-même, à un rang de
+    /// lecture CHOISI.
+    ///
+    /// Le déclencheur n'est pas une horloge mais un compteur de requêtes : le
+    /// garde-fou d'entrée de fichier et la veille interrogent la même table,
+    /// et faire dépendre le test d'un `sleep` bien placé le rendrait
+    /// intermittent — donc muet le jour où il aurait quelque chose à dire.
+    /// Ici, « la lecture démarre juste après la N-ième vérification » est un
+    /// fait, pas une chance.
+    struct ZoneQuiDemarre {
+        interne: Arc<dyn DbBackend>,
+        lectures: std::sync::atomic::AtomicUsize,
+        demarre_apres: usize,
+    }
+
+    impl ZoneQuiDemarre {
+        fn poser(interne: Arc<dyn DbBackend>, demarre_apres: usize) -> Arc<dyn DbBackend> {
+            Arc::new(Self {
+                interne,
+                lectures: std::sync::atomic::AtomicUsize::new(0),
+                demarre_apres,
+            })
+        }
+        fn lectures(&self) -> usize {
+            self.lectures.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DbBackend for ZoneQuiDemarre {
+        fn engine(&self) -> crate::db::engine::Engine {
+            self.interne.engine()
+        }
+        fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+            self.interne.execute(sql, p)
+        }
+        fn last_insert_rowid(&self) -> i64 {
+            self.interne.last_insert_rowid()
+        }
+        fn query_one(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            if sql.contains("last_play_state = 'playing'") {
+                let rang = self
+                    .lectures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                return Ok((rang > self.demarre_apres)
+                    .then(|| vec![crate::db::backend::SqlValue::Text("Salon".to_string())]));
+            }
+            self.interne.query_one(sql, p)
+        }
+        fn query_many(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many(sql, p)
+        }
+        fn write_tx(
+            &self,
+            f: &mut dyn FnMut(&dyn crate::db::backend::DbTxHandle) -> Result<(), String>,
+        ) -> Result<(), String> {
+            self.interne.write_tx(f)
+        }
+        fn execute_batch(&self, sql: &str) -> Result<(), String> {
+            self.interne.execute_batch(sql)
+        }
+        // Les variantes « strong » de SQLite lisent par la connexion
+        // d'écriture. Laisser l'implémentation par défaut les rabattrait sur
+        // la lecture faible et ferait mentir le test sur autre chose que ce
+        // qu'il examine.
+        fn query_one_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            if sql.contains("last_play_state = 'playing'") {
+                return self.query_one(sql, p);
+            }
+            self.interne.query_one_strong(sql, p)
+        }
+        fn query_many_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many_strong(sql, p)
+        }
+    }
+
+    /// LE défaut de #2495, mesuré. Le garde-fou ne s'exerçait qu'entre deux
+    /// fichiers : une fois `measure_loudness_and_peak` lancée, la seule borne
+    /// était le délai par piste — 180 s. Un décodage de 4,5 Go sur partage
+    /// réseau tenait donc le chemin d'E/S bien après l'appui sur « Lecture »
+    /// (6 782 ms pour démarrer, journal de Thierry Clemont).
+    ///
+    /// La contre-épreuve est DANS le test : le même travail est chronométré
+    /// avec l'ancienne forme (un simple `timeout`) puis avec la nouvelle. Si le
+    /// correctif est retiré, les deux durées se rejoignent et le test tombe.
+    #[tokio::test]
+    async fn l_analyse_cede_pendant_le_travail_pas_seulement_entre_deux_fichiers() {
+        /// Tient lieu du décodage interminable. Court devant les 180 s réelles,
+        /// long devant la veille (250 ms) : le rapport est ce qu'on mesure.
+        const TRAVAIL_LONG: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let (_db, interne) = sweep_db(1);
+
+        // AVANT — l'ancien site d'appel, tel quel : rien ne peut le rendre.
+        let t0 = std::time::Instant::now();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+            tokio::time::sleep(TRAVAIL_LONG),
+        )
+        .await;
+        let avant = t0.elapsed();
+
+        // APRÈS — la même attente, mise en course avec la lecture. La zone
+        // passe à `playing` juste après la première vérification de la veille,
+        // c'est-à-dire ALORS QUE le travail est déjà en cours.
+        let backend = ZoneQuiDemarre::poser(interne, 1);
+        let t0 = std::time::Instant::now();
+        let issue =
+            mesurer_en_cedant_a_la_lecture(&backend, tokio::time::sleep(TRAVAIL_LONG)).await;
+        let apres = t0.elapsed();
+
+        assert!(
+            matches!(issue, Issue::CedeeALaLecture),
+            "l'analyse devait être abandonnée au profit de la lecture (avant={avant:?}, après={apres:?})"
+        );
+        assert!(
+            avant >= TRAVAIL_LONG,
+            "la mesure « avant » ne prouve rien si elle n'a pas attendu : {avant:?}"
+        );
+        // Une tolérance large : ce qui est démontré est l'ordre de grandeur,
+        // pas la milliseconde. La veille rend la main au premier réveil après
+        // VEILLE_LECTURE_MS.
+        assert!(
+            apres < std::time::Duration::from_millis(1_000),
+            "la lecture a attendu la fin du travail : avant={avant:?}, après={apres:?}"
+        );
+        assert!(
+            apres * 3 < avant,
+            "aucun effondrement du temps de démarrage : avant={avant:?}, après={apres:?}"
+        );
+    }
+
+    /// L'autre moitié du contrat, et la plus dangereuse à rater : une piste
+    /// ABANDONNÉE n'a pas été analysée. L'estampiller `rg_analyzed` la sortirait
+    /// du balayage pour toujours — 114 pistes avaient déjà été gelées ainsi
+    /// (#1865), et un simple appui sur « Lecture » suffirait à en geler d'autres.
+    ///
+    /// Contre-épreuve intégrée : le MÊME lot, sur le MÊME fichier, sans zone qui
+    /// démarre — la piste y est bien estampillée. L'absence de témoin dans le
+    /// premier cas vient donc de la cession, pas d'un fichier écarté pour une
+    /// autre raison.
+    #[tokio::test]
+    async fn une_piste_cedee_n_est_pas_estampillee_analysee() {
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+
+        // La zone démarre après le garde-fou d'entrée de fichier (1re lecture) :
+        // la passe est donc engagée sur ce fichier quand la lecture arrive.
+        let veilleur = Arc::new(ZoneQuiDemarre {
+            interne: interne.clone(),
+            lectures: std::sync::atomic::AtomicUsize::new(0),
+            demarre_apres: 1,
+        });
+        let backend: Arc<dyn DbBackend> = veilleur.clone();
+
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "le lot a cédé sur son premier fichier : il n'a rien accompli"
+        );
+        assert!(
+            veilleur.lectures() >= 2,
+            "le test ne prouve rien si la veille n'a jamais interrogé les zones"
+        );
+
+        let meta = TrackMetadataRepo::with_backend(interne.clone());
+        let temoins = meta.get_all(1).unwrap();
+        assert!(
+            !temoins.contains_key("rg_analyzed"),
+            "une piste cédée doit rester CANDIDATE ; témoins = {temoins:?}"
+        );
+        assert!(
+            !temoins.contains_key(PATH_UNRESOLVED_KEY),
+            "le fichier répond : céder n'est pas le reporter ; témoins = {temoins:?}"
+        );
+
+        // Contre-épreuve : sans zone qui démarre, ce même fichier est traité.
+        assert_eq!(
+            analyze_track_batch(&interne).await,
+            1,
+            "la piste devait rester candidate et être reprise au lot suivant"
+        );
+        assert!(
+            meta.get_all(1).unwrap().contains_key("rg_analyzed"),
+            "sans cession, ce fichier est bel et bien estampillé — c'est ce qui \
+             donne son sens à l'absence de témoin ci-dessus"
+        );
+    }
+
+    /// La démonstration en vraie grandeur : un VRAI décodage, déjà en vol,
+    /// abandonné en cours de route.
+    ///
+    /// Les deux tests précédents isolent chacun une moitié du contrat sur un
+    /// travail simulé. Celui-ci ne simule rien : le fichier est un WAV assez
+    /// long pour que `measure_loudness_and_peak` enchaîne plusieurs segments,
+    /// et la zone se met à jouer APRÈS la première vérification de la veille —
+    /// donc alors que le décodeur tourne déjà dans le pool bloquant. C'est
+    /// exactement la situation de #2495, en petit.
+    #[tokio::test]
+    async fn un_decodage_reel_deja_en_vol_est_abandonne_en_cours_de_route() {
+        let (tmp, _db, interne) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        // Un fichier réellement décodable, et assez long pour occuper le
+        // décodeur plus d'un tour de veille.
+        // 60 s de 96 kHz/24 bits : ~3,4 s d'analyse mesurees sur la machine de
+        // compilation, soit plus de dix tours de veille de marge. Le test ne
+        // depend donc pas de la vitesse de la machine — et s'il finissait quand
+        // meme avant la cession, le premier `assert_eq!` le dirait.
+        let wav = tmp.path().join("i2495.wav");
+        ecrire_wav_long(&wav, 60);
+        interne
+            .execute(
+                "UPDATE tracks SET file_path = ?, duration_ms = 60000, sample_rate = 96000 \
+                 WHERE id = 1",
+                &[&wav.to_string_lossy().to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        // 2 lectures avant que ça joue : le garde-fou d'entrée de fichier, puis
+        // la première vérification de la veille. La suivante n'arrive qu'un
+        // tour de VEILLE_LECTURE_MS plus tard — le décodage est parti.
+        let veilleur = Arc::new(ZoneQuiDemarre {
+            interne: interne.clone(),
+            lectures: std::sync::atomic::AtomicUsize::new(0),
+            demarre_apres: 2,
+        });
+        let backend: Arc<dyn DbBackend> = veilleur.clone();
+
+        let t0 = std::time::Instant::now();
+        let traites = analyze_track_batch(&backend).await;
+        let cession = t0.elapsed();
+
+        assert_eq!(traites, 0, "le lot a cédé sur son unique fichier");
+        assert!(
+            cession >= std::time::Duration::from_millis(VEILLE_LECTURE_MS),
+            "la cession est arrivée avant le premier tour de veille : le décodage              n'avait pas commencé, le test ne prouve pas ce qu'il annonce ({cession:?})"
+        );
+        let temoins = TrackMetadataRepo::with_backend(interne.clone())
+            .get_all(1)
+            .unwrap();
+        assert!(
+            !temoins.contains_key("rg_analyzed"),
+            "décodage abandonné ⇒ piste toujours candidate ; témoins = {temoins:?}"
+        );
+        assert!(
+            !temoins.contains_key("rg_track_gain"),
+            "aucun gain ne peut sortir d'une analyse abandonnée ; témoins = {temoins:?}"
+        );
+    }
+
+    /// Un WAV 96 kHz / 24 bits / stéréo de `secondes` secondes — assez de
+    /// matière pour que l'analyse enchaîne plusieurs segments de 30 s au lieu
+    /// de rendre la main en une poignée de millisecondes.
+    fn ecrire_wav_long(path: &std::path::Path, secondes: usize) {
+        const HZ: usize = 96_000;
+        let frames = HZ * secondes;
+        let mut donnees = Vec::with_capacity(frames * 6);
+        for frame in 0..frames {
+            let g = ((frame as i32 % 200) - 100) * 40_000;
+            for e in [g, g / 2] {
+                donnees.extend_from_slice(&e.to_le_bytes()[..3]);
+            }
+        }
+        let mut w = Vec::with_capacity(donnees.len() + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&(HZ as u32).to_le_bytes());
+        w.extend_from_slice(&((HZ * 6) as u32).to_le_bytes());
+        w.extend_from_slice(&6u16.to_le_bytes());
+        w.extend_from_slice(&24u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(path, w).unwrap();
     }
 }
