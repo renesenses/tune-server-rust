@@ -51,6 +51,15 @@ async fn fetch_bio_via_wikidata(
     mbid: &str,
     lang: &str,
 ) -> Option<BioResult> {
+    // Sans MBID il n'y a rien à demander : l'URL deviendrait
+    // `.../ws/2/artist/?inc=url-rels`, une requête que MusicBrainz rejette,
+    // mais qui consommerait quand même le budget d'une requête par seconde.
+    // Depuis #1311 les artistes sans MBID entrent dans la boucle, ce chemin
+    // est donc réellement emprunté — `fetch_artist_bio_theaudiodb` se garde
+    // déjà de la même façon.
+    if mbid.is_empty() {
+        return None;
+    }
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -359,6 +368,61 @@ fn strip_html(s: &str) -> String {
     re.replace_all(s, "").trim().to_string()
 }
 
+/// Les noms sous lesquels la clé Last.fm peut avoir été posée dans
+/// l'environnement, du plus officiel au plus ancien.
+///
+/// `TUNE_LASTFM_API_KEY` est celui que `.env.tune.example` documente et que
+/// `config.rs` lit (`env_str("TUNE_LASTFM_API_KEY", ..)`) ; `artwork.rs` lit
+/// bien les trois. L'enrichissement des biographies était le seul endroit à
+/// ignorer le nom officiel — voir `cle_lastfm_dans`.
+const NOMS_CLE_LASTFM: [&str; 3] = ["TUNE_LASTFM_API_KEY", "LASTFM_API_KEY", "TUNE_LASTFM_KEY"];
+
+/// Première valeur non vide parmi [`NOMS_CLE_LASTFM`], lue par `lecture`.
+///
+/// ## Ce qui manquait (#1311)
+///
+/// Ce module lisait `LASTFM_API_KEY` puis `TUNE_LASTFM_KEY`, et **jamais**
+/// `TUNE_LASTFM_API_KEY` — le seul nom que la documentation d'installation
+/// et `config.rs` retiennent. Une installation configurée comme la doc le
+/// dit se retrouvait donc avec une clé vide ici : le repli Last.fm, qui est
+/// la seule source de biographie pour un artiste sans MBID, était court-
+/// circuité en silence (`if lastfm_key.is_empty() { failed += 1; continue }`).
+///
+/// Le paramètre `lecture` rend la liste des noms vérifiable sans toucher à
+/// l'environnement du processus de test.
+fn cle_lastfm_dans(lecture: impl Fn(&str) -> Option<String>) -> String {
+    NOMS_CLE_LASTFM
+        .iter()
+        .find_map(|nom| {
+            lecture(nom)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+/// La clé Last.fm telle que l'utilisateur l'a réellement rangée : d'abord le
+/// réglage saisi dans Tune, sinon l'environnement.
+///
+/// `routes/lastfm_social.rs` écrit la clé de l'interface dans le réglage
+/// `lastfm_api_key`. Personne ne la relisait ici : un utilisateur qui saisit
+/// sa clé dans Tune n'en tirait aucune biographie (#1311).
+fn cle_lastfm_avec_reglage(reglage: Option<String>) -> String {
+    if let Some(depuis_reglages) = reglage
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return depuis_reglages;
+    }
+    cle_lastfm_dans(|nom| std::env::var(nom).ok())
+}
+
+/// Idem, en allant chercher le réglage dans la base.
+fn cle_lastfm(db: &std::sync::Arc<dyn crate::db::backend::DbBackend>) -> String {
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    cle_lastfm_avec_reglage(reglages.get("lastfm_api_key").ok().flatten())
+}
+
 /// TheAudioDB API key. Defaults to the public test key ("2"); production
 /// installs can override with a Patreon key via env.
 fn theaudiodb_key() -> String {
@@ -503,17 +567,32 @@ pub async fn batch_enrich_artist_bios_scoped(
         return;
     }
 
-    info!(count = artists.len(), "batch_artist_bio_enrichment_started");
-
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
-    let lastfm_key = std::env::var("LASTFM_API_KEY")
-        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
-        .unwrap_or_default();
+    let lastfm_key = cle_lastfm(&db);
+
+    // Le journal dit maintenant ce qui départage une passe muette d'une passe
+    // qui travaille : combien d'artistes n'ont pas de MBID (donc pas de chemin
+    // Wikipédia/Wikidata ni TheAudioDB), et si une clé Last.fm — la seule
+    // source par le NOM — est configurée. C'est exactement l'extrait que
+    // #1311 réclamait sans jamais l'obtenir.
+    let sans_mbid = artists.iter().filter(|(_, _, m)| m.is_empty()).count();
+    info!(
+        count = artists.len(),
+        sans_mbid,
+        lastfm_configure = !lastfm_key.is_empty(),
+        "batch_artist_bio_enrichment_started"
+    );
+    if sans_mbid > 0 && lastfm_key.is_empty() {
+        warn!(
+            sans_mbid,
+            "batch_artist_bio_sans_source_par_nom: ces artistes n'ont ni MBID ni cle Last.fm — aucune source ne peut les servir"
+        );
+    }
 
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
 
@@ -522,7 +601,11 @@ pub async fn batch_enrich_artist_bios_scoped(
 
     for (artist_id, name, mbid) in &artists {
         if mbid.is_empty() {
-            // No MusicBrainz ID — can't fetch via Wikidata, try Last.fm only
+            // No MusicBrainz ID — can't fetch via Wikidata, try Last.fm only.
+            //
+            // Cette branche existait depuis l'origine mais était INATTEIGNABLE :
+            // `sql::list_without_bio` exigeait un MBID non vide, donc `mbid`
+            // ne pouvait pas être vide ici. La requête ne filtre plus (#1311).
             if lastfm_key.is_empty() {
                 failed += 1;
                 continue;
@@ -623,11 +706,12 @@ pub async fn batch_enrich_album_bios_scoped(
         return;
     }
 
-    info!(count = albums.len(), "batch_album_bio_enrichment_started");
-
-    let lastfm_key = std::env::var("LASTFM_API_KEY")
-        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
-        .unwrap_or_default();
+    let lastfm_key = cle_lastfm(&db);
+    info!(
+        count = albums.len(),
+        lastfm_configure = !lastfm_key.is_empty(),
+        "batch_album_bio_enrichment_started"
+    );
 
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
@@ -692,6 +776,68 @@ pub async fn batch_enrich_album_bios_scoped(
             .to_string(),
         )
         .ok();
+}
+
+#[cfg(test)]
+mod tests_cle_lastfm {
+    use super::{cle_lastfm_avec_reglage, cle_lastfm_dans};
+
+    /// #1311 — le nom documenté était le seul que ce module ne lisait pas.
+    ///
+    /// `.env.tune.example` et `config.rs` ne connaissent que
+    /// `TUNE_LASTFM_API_KEY`. `bio_batch` cherchait `LASTFM_API_KEY` puis
+    /// `TUNE_LASTFM_KEY` : une installation configurée selon la doc n'avait
+    /// donc pas de clé ici, et le repli Last.fm — seule source par le nom —
+    /// ne partait jamais.
+    ///
+    /// Contre-épreuve : retirer `"TUNE_LASTFM_API_KEY"` de `NOMS_CLE_LASTFM`
+    /// fait rougir ce test.
+    #[test]
+    fn le_nom_documente_de_la_cle_est_lu() {
+        let cle = cle_lastfm_dans(|nom| {
+            (nom == "TUNE_LASTFM_API_KEY").then(|| "cle-de-la-doc".to_string())
+        });
+        assert_eq!(
+            cle, "cle-de-la-doc",
+            "TUNE_LASTFM_API_KEY est le nom que la doc et config.rs retiennent"
+        );
+    }
+
+    /// Les deux noms historiques restent acceptés : personne ne doit perdre
+    /// une clé qui fonctionnait.
+    #[test]
+    fn les_noms_historiques_restent_acceptes() {
+        assert_eq!(
+            cle_lastfm_dans(|nom| (nom == "LASTFM_API_KEY").then(|| "ancienne".to_string())),
+            "ancienne"
+        );
+        assert_eq!(
+            cle_lastfm_dans(|nom| (nom == "TUNE_LASTFM_KEY").then(|| "tres-ancienne".to_string())),
+            "tres-ancienne"
+        );
+    }
+
+    /// Une variable posée mais vide ne doit pas masquer la suivante.
+    #[test]
+    fn une_variable_vide_ne_masque_pas_les_suivantes() {
+        let cle = cle_lastfm_dans(|nom| match nom {
+            "TUNE_LASTFM_API_KEY" => Some("   ".to_string()),
+            "LASTFM_API_KEY" => Some("la-vraie".to_string()),
+            _ => None,
+        });
+        assert_eq!(cle, "la-vraie");
+    }
+
+    /// La clé saisie dans l'interface (réglage `lastfm_api_key`) prime, et
+    /// surtout : elle est enfin lue. Aucun chemin ne la consultait (#1311).
+    #[test]
+    fn la_cle_saisie_dans_l_interface_est_prise_en_compte() {
+        assert_eq!(
+            cle_lastfm_avec_reglage(Some("  cle-interface  ".to_string())),
+            "cle-interface",
+            "le reglage lastfm_api_key ecrit par l'interface doit servir a l'enrichissement"
+        );
+    }
 }
 
 #[cfg(test)]

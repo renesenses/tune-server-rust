@@ -271,7 +271,15 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let total_artists = artist_repo.count().unwrap_or(0);
     let total_albums = album_repo.count().unwrap_or(0);
 
-    // Artists with bios
+    // Artists with bios — par soustraction, ce chiffre ne vaut que ce que vaut
+    // la requête retranchée.
+    //
+    // `list_without_bio` exigeait un identifiant MusicBrainz non vide : tout
+    // artiste sans MBID sortait de `v` et se retrouvait donc compté ICI, du
+    // côté des artistes « pourvus d'une biographie ». Avec 0,9 % de couverture
+    // MBID mesurée sur une bibliothèque réelle, le panneau annonçait ~99 % de
+    // biographies devant des fiches vides (#1311). La requête ne filtre plus
+    // sur le MBID ; ce calcul devient exact sans changer de forme.
     let artists_with_bio = artist_repo
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
