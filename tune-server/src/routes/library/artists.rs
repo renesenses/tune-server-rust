@@ -152,7 +152,7 @@ pub(super) async fn artist_bio(
 /// chaque fiche. On ne dispose d'aucune preuve que ces bios soient dans la
 /// mauvaise langue ; un ré-enrichissement renseignera `bio_lang` et la
 /// comparaison redeviendra exacte.
-fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
+pub(super) fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
     let Some(stockee) = stockee.map(str::trim).filter(|s| !s.is_empty()) else {
         return true;
     };

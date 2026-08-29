@@ -175,7 +175,13 @@ jobs:
         with:
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --no-default-features --features oaat
+      # `-p tune-bridge` et `cloud-relay` : le chemin de l'ecoute distante
+      # n'etait couvert par AUCUNE porte. Le relais (`tune-bridge`) n'etait ni
+      # teste ni compile ici, et `tune-core/src/cloud/relay.rs` vit derriere
+      # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
+      # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
+      # ne rougisse : une requete de flux distante finissait en 504, muette.
+      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -457,7 +463,7 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
