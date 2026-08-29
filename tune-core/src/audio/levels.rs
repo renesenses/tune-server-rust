@@ -41,6 +41,67 @@ impl AudioLevels {
 /// c'est du silence, et un client n'a rien à y afficher.
 pub const SPECTRUM_FLOOR_DB: f32 = -96.0;
 
+/// Fenêtre de tenue du peak-hold serveur (#1694) : max glissant ~300 ms.
+///
+/// Le forwarder émet une crête PAR fenêtre (~40 ms) ; si un client rate une
+/// trame, le transitoire disparaît. La crête tenue survit à quelques trames
+/// perdues sans figer l'instrument. La balistique d'affichage (hold ~750 ms,
+/// retombée) reste côté client — ici on ne fait que porter le transitoire.
+pub const PEAK_HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Crête TENUE sur les dernières [`PEAK_HOLD_WINDOW`] de signal — l'état vit
+/// dans le forwarder d'une lecture, un par piste, donc la tenue repart
+/// naturellement de zéro au changement de titre.
+///
+/// Chemin temps réel : aucune allocation par trame en régime établi — le
+/// tampon est borné par `MAX_ENTRIES` et `VecDeque` ne réalloue qu'à la
+/// croissance initiale (~8 entrées à 25 trames/s).
+#[derive(Debug, Default)]
+pub struct PeakHold {
+    /// (fin de fenêtre sur l'horloge cumulée, crête G, crête D) — linéaire.
+    entries: std::collections::VecDeque<(std::time::Duration, f64, f64)>,
+    /// Horloge cumulée des fenêtres reçues (pas l'horloge murale : le
+    /// forwarder cadence déjà l'émission sur l'horloge de lecture).
+    elapsed: std::time::Duration,
+}
+
+impl PeakHold {
+    /// Borne dure du tampon : des fenêtres dégénérées (durée nulle) ne
+    /// doivent pas le faire croître sans limite.
+    const MAX_ENTRIES: usize = 64;
+
+    /// Intègre la crête d'une fenêtre et rend la crête tenue `(gauche,
+    /// droite)` en dBFS, sur la même échelle que `peak_*_db`.
+    pub fn update(
+        &mut self,
+        window: std::time::Duration,
+        peak_left: f64,
+        peak_right: f64,
+    ) -> (f32, f32) {
+        self.elapsed += window;
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries
+            .push_back((self.elapsed, peak_left, peak_right));
+        // Ne garder que les fenêtres dont la fin tombe dans la tenue.
+        let cutoff = self.elapsed.saturating_sub(PEAK_HOLD_WINDOW);
+        while let Some(&(end, _, _)) = self.entries.front() {
+            if end <= cutoff {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (mut l, mut r) = (0.0f64, 0.0f64);
+        for &(_, pl, pr) in &self.entries {
+            l = l.max(pl);
+            r = r.max(pr);
+        }
+        (to_db(l), to_db(r))
+    }
+}
+
 fn to_db(linear: f64) -> f32 {
     if linear <= 0.0 {
         -96.0
@@ -308,6 +369,65 @@ pub fn analyze_spectrum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #1694 — crête tenue (max glissant ~300 ms) dans le flux audio_levels.
+    // ------------------------------------------------------------------
+
+    /// Un transitoire sur UNE fenêtre doit rester lisible pendant toute la
+    /// tenue (~300 ms), puis disparaître : c'est exactement ce qu'une trame
+    /// WebSocket perdue ne pardonne pas à `peak_*_db` seul.
+    #[test]
+    fn peak_hold_survives_the_window_then_expires() {
+        let w = std::time::Duration::from_millis(100);
+        let mut ph = PeakHold::default();
+
+        // Fenêtre 1 : transitoire pleine échelle à gauche, -6 dB à droite.
+        let (l, r) = ph.update(w, 1.0, 0.5);
+        assert!(l.abs() < 1e-3, "0 dBFS attendu, obtenu {l}");
+        assert!((r - (-6.0206)).abs() < 0.01, "-6 dBFS attendu, obtenu {r}");
+
+        // Fenêtres 2 et 3 : silence — le transitoire est TENU (sa fenêtre
+        // reste dans les 300 ms glissantes).
+        for _ in 0..2 {
+            let (l, r) = ph.update(w, 0.0, 0.0);
+            assert!(l.abs() < 1e-3, "tenue attendue, obtenu {l}");
+            assert!((r - (-6.0206)).abs() < 0.01, "tenue attendue, obtenu {r}");
+        }
+
+        // Fenêtre 4 : le transitoire est sorti de la tenue — retour plancher.
+        let (l, r) = ph.update(w, 0.0, 0.0);
+        assert!(l <= -96.0, "expiration attendue, obtenu {l}");
+        assert!(r <= -96.0, "expiration attendue, obtenu {r}");
+    }
+
+    /// La tenue rend le MAX de la fenêtre glissante, pas la dernière valeur :
+    /// une crête plus forte remplace immédiatement une plus faible, jamais
+    /// l'inverse.
+    #[test]
+    fn peak_hold_is_a_sliding_max_not_a_last_value() {
+        let w = std::time::Duration::from_millis(100);
+        let mut ph = PeakHold::default();
+        ph.update(w, 0.25, 0.25);
+        let (l, _) = ph.update(w, 1.0, 0.25);
+        assert!(l.abs() < 1e-3, "la crête forte doit primer, obtenu {l}");
+        let (l, _) = ph.update(w, 0.25, 0.25);
+        assert!(
+            l.abs() < 1e-3,
+            "la crête forte est encore tenue, obtenu {l}"
+        );
+    }
+
+    /// Des fenêtres dégénérées (durée nulle) ne doivent pas faire croître le
+    /// tampon sans borne — chemin temps réel, mémoire bornée par contrat.
+    #[test]
+    fn peak_hold_buffer_is_bounded_on_zero_length_windows() {
+        let mut ph = PeakHold::default();
+        for _ in 0..10_000 {
+            ph.update(std::time::Duration::ZERO, 0.1, 0.1);
+        }
+        assert!(ph.entries.len() <= PeakHold::MAX_ENTRIES);
+    }
 
     #[test]
     fn silence_returns_low_db() {

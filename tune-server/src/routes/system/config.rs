@@ -161,6 +161,10 @@ pub(super) async fn get_config(
         ("replaygain_mode", json!("off")),
         ("replaygain_preamp_db", json!(0.0)),
         ("replaygain_prevent_clipping", json!(true)),
+        // Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut, comportement
+        // historique), -0.5 ou -1. Persisté par PATCH /config comme les
+        // autres ; honoré dans `gain_factor` (tune-core).
+        ("replaygain_true_peak_ceiling_db", json!(0.0)),
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),

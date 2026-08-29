@@ -269,6 +269,10 @@ fn spawn_paced_levels_forwarder(
         // pour le reste de la piste.
         let mut last_reported: Option<i64> = None;
         let mut reported_advancing = false;
+        // Crête tenue ~300 ms (#1694) : un transitoire survit à une trame
+        // perdue. Un état par forwarder = remise à zéro au changement de
+        // piste, gratuite par construction.
+        let mut peak_hold = crate::audio::levels::PeakHold::default();
         while let Some(raw) = rx.recv().await {
             let mut reported_position_ms: i64 = 0;
             loop {
@@ -358,6 +362,8 @@ fn spawn_paced_levels_forwarder(
                 raw.channels,
                 raw.sample_rate,
             );
+            let (peak_hold_left_db, peak_hold_right_db) =
+                peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
             bus.emit(
                 "playback.audio_levels",
                 serde_json::json!({
@@ -370,6 +376,12 @@ fn spawn_paced_levels_forwarder(
                     "rms_right_db": lvl.rms_right_db(),
                     "peak_left_db": lvl.peak_left_db(),
                     "peak_right_db": lvl.peak_right_db(),
+                    // Crête TENUE (max glissant ~300 ms) — champ ADDITIF
+                    // (#1694) : un client ancien l'ignore, un client neuf y
+                    // lit le transitoire même s'il a raté la trame qui le
+                    // portait. Sample peak, avant DSP, comme `peak_*_db`.
+                    "peak_hold_left_db": peak_hold_left_db,
+                    "peak_hold_right_db": peak_hold_right_db,
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
