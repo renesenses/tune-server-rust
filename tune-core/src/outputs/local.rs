@@ -1715,53 +1715,89 @@ impl RingBuf {
     }
 }
 
+/// Exécute une période du callback entier CPAL partagé.
+///
+/// La conversion applique exactement le même facteur de volume que l'ancien
+/// scratch `f32`, mais `pop_mapped` écrit dans le tampon fourni par le backend :
+/// aucune capacité n'est à deviner ni à agrandir pendant la période audio.
+fn render_local_shared_integer_callback<T>(
+    ring: &RingBuf,
+    volume: &AtomicU32,
+    paused: &AtomicBool,
+    silent: &AtomicBool,
+    data_started: &AtomicBool,
+    min_buffer_samples: usize,
+    zero: T,
+    output: &mut [T],
+) -> usize
+where
+    T: Copy,
+    f32: symphonia::core::audio::conv::IntoSample<T>,
+{
+    use symphonia::core::audio::conv::IntoSample;
+
+    if paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed) {
+        output.fill(zero);
+        return 0;
+    }
+    if !data_started.load(Ordering::Acquire) {
+        if ring.available() < min_buffer_samples {
+            output.fill(zero);
+            return 0;
+        }
+        data_started.store(true, Ordering::Release);
+    }
+
+    let factor = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let read = ring.pop_mapped(output, |sample| (sample * factor).into_sample());
+    output[read..].fill(zero);
+    read
+}
+
 #[cfg(test)]
 mod ringbuf_tests {
     use super::{
         AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HRESULT, NativePcmRing, RingBuf, WasapiInitDecision,
-        wasapi_aligned_duration_100ns, wasapi_init_decision,
+        render_local_shared_integer_callback, wasapi_aligned_duration_100ns, wasapi_init_decision,
     };
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
 
     struct AllocationTracker;
 
     thread_local! {
         static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static TRACKED_ALLOCATOR_CALLS: Cell<usize> = const { Cell::new(0) };
     }
-    static TRACKED_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_allocator_call() {
+        TRACK_ALLOCATIONS.with(|tracking| {
+            if tracking.get() {
+                TRACKED_ALLOCATOR_CALLS.with(|calls| calls.set(calls.get() + 1));
+            }
+        });
+    }
 
     unsafe impl GlobalAlloc for AllocationTracker {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            TRACK_ALLOCATIONS.with(|tracking| {
-                if tracking.get() {
-                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            record_allocator_call();
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            record_allocator_call();
             unsafe { System.dealloc(ptr, layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            TRACK_ALLOCATIONS.with(|tracking| {
-                if tracking.get() {
-                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            record_allocator_call();
             unsafe { System.alloc_zeroed(layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            TRACK_ALLOCATIONS.with(|tracking| {
-                if tracking.get() {
-                    TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+            record_allocator_call();
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
@@ -1769,18 +1805,23 @@ mod ringbuf_tests {
     #[global_allocator]
     static TEST_ALLOCATOR: AllocationTracker = AllocationTracker;
 
-    fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {
+    fn count_allocator_calls<T>(operation: impl FnOnce() -> T) -> (T, usize) {
         // Initialise le TLS avant d'armer la mesure : son premier accès peut
         // appartenir à l'infrastructure de test, pas au chemin temps réel.
         TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
-        TRACKED_ALLOCATIONS.store(0, Ordering::SeqCst);
+        TRACKED_ALLOCATOR_CALLS.with(|calls| calls.set(0));
         TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
         let result = operation();
         TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+        let calls = TRACKED_ALLOCATOR_CALLS.with(Cell::get);
+        (result, calls)
+    }
+
+    fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {
+        let (result, calls) = count_allocator_calls(operation);
         assert_eq!(
-            TRACKED_ALLOCATIONS.load(Ordering::SeqCst),
-            0,
-            "la section simulant le callback audio a alloué"
+            calls, 0,
+            "la section simulant le callback audio a appelé l'allocateur"
         );
         result
     }
@@ -1867,6 +1908,99 @@ mod ringbuf_tests {
         let written = assert_no_allocation(|| native_ring.pop_pcm_bytes(&mut pcm, 24));
         assert_eq!(written, 6);
         assert_eq!(&pcm[..3], &[0x56, 0x34, 0x12]);
+    }
+
+    /// #2218 — le fallback entier local passe directement du ring `f32` au
+    /// tampon fourni par CPAL. Plusieurs tailles de période et changements de
+    /// volume couvrent le helper réellement appelé dans la closure de rendu.
+    #[test]
+    fn callback_entier_local_partage_convertit_sans_appeler_l_allocateur() {
+        let ring = RingBuf::new(16);
+        let volume = AtomicU32::new(1000);
+        let paused = AtomicBool::new(false);
+        let silent = AtomicBool::new(false);
+        let data_started = AtomicBool::new(false);
+        assert_eq!(ring.push(&[0.25, -0.5, 0.75, -1.0]), 4);
+
+        let mut periode_avant_amorcage = [7i16; 8];
+        let read = assert_no_allocation(|| {
+            render_local_shared_integer_callback(
+                &ring,
+                &volume,
+                &paused,
+                &silent,
+                &data_started,
+                5,
+                0,
+                &mut periode_avant_amorcage,
+            )
+        });
+        assert_eq!(read, 0);
+        assert_eq!(periode_avant_amorcage, [0; 8]);
+        assert_eq!(ring.available(), 4, "l'amorçage ne consomme rien");
+
+        data_started.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut premiere_periode = [0i16; 1];
+        let read = assert_no_allocation(|| {
+            render_local_shared_integer_callback(
+                &ring,
+                &volume,
+                &paused,
+                &silent,
+                &data_started,
+                5,
+                0,
+                &mut premiere_periode,
+            )
+        });
+        assert_eq!(read, 1);
+        assert_eq!(premiere_periode, [8192]);
+
+        volume.store(500, std::sync::atomic::Ordering::Relaxed);
+        let mut seconde_periode = [0i16; 2];
+        let read = assert_no_allocation(|| {
+            render_local_shared_integer_callback(
+                &ring,
+                &volume,
+                &paused,
+                &silent,
+                &data_started,
+                5,
+                0,
+                &mut seconde_periode,
+            )
+        });
+        assert_eq!(read, 2);
+        assert_eq!(seconde_periode, [-8192, 12288]);
+
+        volume.store(250, std::sync::atomic::Ordering::Relaxed);
+        let mut grande_periode = [7i16; 8];
+        let read = assert_no_allocation(|| {
+            render_local_shared_integer_callback(
+                &ring,
+                &volume,
+                &paused,
+                &silent,
+                &data_started,
+                5,
+                0,
+                &mut grande_periode,
+            )
+        });
+        assert_eq!(read, 1);
+        assert_eq!(grande_periode[0], -8192);
+        assert_eq!(grande_periode[1..], [0; 7]);
+    }
+
+    /// Contre-épreuve de l'instrument : l'ancien `scratch.resize(n, 0.0)`
+    /// appelle bien l'allocateur lorsqu'une période dépasse sa capacité. Cette
+    /// mutation ferait donc rougir la garde ci-dessus au lieu de passer en
+    /// silence.
+    #[test]
+    fn instrumentation_temps_reel_detecte_l_ancien_resize() {
+        let mut ancien_scratch = Vec::<f32>::new();
+        let (_, calls) = count_allocator_calls(|| ancien_scratch.resize(64, 0.0));
+        assert!(calls > 0, "la mutation resize doit appeler l'allocateur");
     }
 
     #[test]
@@ -5136,32 +5270,12 @@ impl OutputTarget for LocalOutput {
             {
                 use symphonia::core::audio::conv::IntoSample;
                 let zero: T = 0.0f32.into_sample();
-                let mut scratch: Vec<f32> = Vec::new();
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                        let n = data.len();
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
-                            data.fill(zero);
-                            return;
-                        }
-                        if !ds_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buf {
-                                data.fill(zero);
-                                return;
-                            }
-                            ds_cb.store(true, Ordering::Release);
-                        }
-                        if scratch.len() < n {
-                            scratch.resize(n, 0.0);
-                        }
-                        let buf = &mut scratch[..n];
-                        let read = ring_cb.pop(buf);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                            *o = (*s * v).into_sample();
-                        }
-                        data[read..].fill(zero);
+                        render_local_shared_integer_callback(
+                            &ring_cb, &vol_cb, &paused_cb, &silent_cb, &ds_cb, min_buf, zero, data,
+                        );
                     },
                     make_stream_error_cb(device_gone),
                     None,
