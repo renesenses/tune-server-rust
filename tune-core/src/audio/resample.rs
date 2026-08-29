@@ -424,53 +424,73 @@ mod tests {
     fn measured_tone_amplitude(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
         let trim = (samples.len() / 10).min(4_800);
         let stable = &samples[trim..samples.len() - trim];
-        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
-            (0.0_f64, 0.0_f64),
-            |(sin_sum, cos_sum), (frame, &sample)| {
-                let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
-                (
-                    sin_sum + sample as f64 * phase.sin(),
-                    cos_sum + sample as f64 * phase.cos(),
-                )
-            },
-        );
-        2.0 * sin_sum.hypot(cos_sum) / stable.len() as f64
+        let (sin_gain, cos_gain) = fit_sinusoid(stable, sr, frequency_hz);
+        sin_gain.hypot(cos_gain)
     }
 
     fn gain_db(measured: f64, reference: f64) -> f64 {
         20.0 * (measured / reference).log10()
     }
 
-    /// Fit the fundamental in quadrature and report everything left over as
-    /// distortion plus noise. This is deliberately a time-domain least-squares
-    /// measurement, independent from both the resampler and the FFT display.
-    fn thd_plus_noise_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
-        let trim = (samples.len() / 10).min(4_800);
-        let stable = &samples[trim..samples.len() - trim];
-        let (sin_sum, cos_sum) = stable.iter().enumerate().fold(
-            (0.0_f64, 0.0_f64),
-            |(sin_sum, cos_sum), (frame, &sample)| {
+    /// Exact two-parameter least-squares fit for `a sin(wt) + b cos(wt)`.
+    ///
+    /// The shortcut `2 * dot / N` is only valid when the analyzed window holds
+    /// an integer number of periods. That happened accidentally for the former
+    /// 1 kHz test but biases a 997 Hz measurement. Solving the 2x2 Gram system
+    /// keeps the instrument valid for arbitrary frequencies and window sizes.
+    fn fit_sinusoid(samples: &[f32], sr: u32, frequency_hz: f64) -> (f64, f64) {
+        let (sin_sq, sin_cos, cos_sq, sample_sin, sample_cos) = samples.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64),
+            |(sin_sq, sin_cos, cos_sq, sample_sin, sample_cos), (frame, &sample)| {
                 let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
+                let sin = phase.sin();
+                let cos = phase.cos();
                 (
-                    sin_sum + sample as f64 * phase.sin(),
-                    cos_sum + sample as f64 * phase.cos(),
+                    sin_sq + sin * sin,
+                    sin_cos + sin * cos,
+                    cos_sq + cos * cos,
+                    sample_sin + sample as f64 * sin,
+                    sample_cos + sample as f64 * cos,
                 )
             },
         );
-        let sin_gain = 2.0 * sin_sum / stable.len() as f64;
-        let cos_gain = 2.0 * cos_sum / stable.len() as f64;
-        let fundamental_rms = sin_gain.hypot(cos_gain) / std::f64::consts::SQRT_2;
-        let residual_rms = (stable
-            .iter()
-            .enumerate()
-            .map(|(frame, &sample)| {
+        let determinant = sin_sq * cos_sq - sin_cos * sin_cos;
+        assert!(
+            determinant > f64::EPSILON,
+            "fenetre de mesure singuliere a {frequency_hz} Hz"
+        );
+        (
+            (sample_sin * cos_sq - sample_cos * sin_cos) / determinant,
+            (sample_cos * sin_sq - sample_sin * sin_cos) / determinant,
+        )
+    }
+
+    /// Fit the fundamental in quadrature and report the unweighted, full-band
+    /// residual relative to it.
+    ///
+    /// This is deliberately a time-domain least-squares instrument, independent
+    /// from both the resampler and the FFT display. It is a useful deterministic
+    /// regression metric, but it must not be presented as an AES17 THD+N result:
+    /// it applies neither the analyzer bandwidth nor the filters prescribed by
+    /// that standard. The name records that limitation so a future standards
+    /// harness cannot silently reuse this value as a conformance measurement.
+    fn unweighted_full_band_residual_db(samples: &[f32], sr: u32, frequency_hz: f64) -> f64 {
+        let trim = (samples.len() / 10).min(4_800);
+        let stable = &samples[trim..samples.len() - trim];
+        let (sin_gain, cos_gain) = fit_sinusoid(stable, sr, frequency_hz);
+        let (fundamental_energy, residual_energy) = stable.iter().enumerate().fold(
+            (0.0_f64, 0.0_f64),
+            |(fundamental, residual), (frame, &sample)| {
                 let phase = 2.0 * std::f64::consts::PI * frequency_hz * frame as f64 / sr as f64;
                 let fitted = sin_gain * phase.sin() + cos_gain * phase.cos();
-                (sample as f64 - fitted).powi(2)
-            })
-            .sum::<f64>()
-            / stable.len() as f64)
-            .sqrt();
+                (
+                    fundamental + fitted * fitted,
+                    residual + (sample as f64 - fitted).powi(2),
+                )
+            },
+        );
+        let fundamental_rms = (fundamental_energy / stable.len() as f64).sqrt();
+        let residual_rms = (residual_energy / stable.len() as f64).sqrt();
         20.0 * (residual_rms / fundamental_rms).log10()
     }
 
@@ -697,18 +717,50 @@ mod tests {
     }
 
     #[test]
-    fn resampling_keeps_sine_thd_plus_noise_below_minus_100_db() {
-        const FREQUENCY_HZ: f64 = 1_000.0;
+    fn residual_meter_recovers_a_known_injected_distortion() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const FUNDAMENTAL_HZ: f64 = 997.0;
+        const FUNDAMENTAL_AMPLITUDE: f64 = 0.5;
+        const INJECTED_RESIDUAL_DB: f64 = -60.0;
+
+        let residual_amplitude = FUNDAMENTAL_AMPLITUDE * 10.0_f64.powf(INJECTED_RESIDUAL_DB / 20.0);
+        let samples = (0..SAMPLE_RATE)
+            .map(|frame| {
+                let time = frame as f64 / SAMPLE_RATE as f64;
+                let fundamental = FUNDAMENTAL_AMPLITUDE
+                    * (2.0 * std::f64::consts::PI * FUNDAMENTAL_HZ * time).sin();
+                let second_harmonic =
+                    residual_amplitude * (4.0 * std::f64::consts::PI * FUNDAMENTAL_HZ * time).sin();
+                (fundamental + second_harmonic) as f32
+            })
+            .collect::<Vec<_>>();
+
+        let measured = unweighted_full_band_residual_db(&samples, SAMPLE_RATE, FUNDAMENTAL_HZ);
+        assert!(
+            (measured - INJECTED_RESIDUAL_DB).abs() < 0.05,
+            "le residumetre annonce {measured:.3} dB pour un defaut injecte a \
+             {INJECTED_RESIDUAL_DB:.1} dB"
+        );
+    }
+
+    #[test]
+    fn resampling_keeps_unweighted_full_band_residual_below_minus_100_db() {
+        // Published measurement contract for this regression test (#2218):
+        // 997 Hz stimulus, -6.02 dBFS peak, one second, the central 80% of the
+        // output analyzed, no weighting and the full 0..Nyquist bandwidth.
+        // This is intentionally not labelled AES17 THD+N; see the meter above.
+        const FREQUENCY_HZ: f64 = 997.0;
         const AMPLITUDE: f64 = 0.5;
 
         for (from_sr, to_sr) in [(44_100, 48_000), (96_000, 44_100)] {
             let input = sine_mono(from_sr, FREQUENCY_HZ, AMPLITUDE);
             let output = rubato_resample_batch_exact(&input, from_sr, to_sr, 1);
-            let thd_n_db = thd_plus_noise_db(&output, to_sr, FREQUENCY_HZ);
+            let residual_db = unweighted_full_band_residual_db(&output, to_sr, FREQUENCY_HZ);
 
             assert!(
-                thd_n_db < -100.0,
-                "THD+N du SRC {from_sr} -> {to_sr} Hz mesuree a {thd_n_db:.1} dB"
+                residual_db < -100.0,
+                "residu large bande non pondere du SRC {from_sr} -> {to_sr} Hz mesure a \
+                 {residual_db:.1} dB"
             );
         }
     }
