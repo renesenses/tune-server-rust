@@ -114,7 +114,7 @@ Para reproducir **la misma pista en varias zonas simultáneamente**:
 
 **Ajustes → Grupos de zonas → Crear un grupo**
 
-El servidor sincroniza las salidas mediante NTP. La latencia es ajustable por zona (**Ajustes → Zonas → Retardo de sync**).
+Solo los endpoints Tune agrupados mediante **OAAT** comparten un reloj y reciben marcas de tiempo de presentación. Los grupos de salidas DLNA, AirPlay, Chromecast u otras salidas independientes permiten un control común, pero Tune no los presenta como un sistema multiroom sincronizado. El retardo por zona es una corrección manual, no una medición automática de la latencia acústica.
 
 ---
 

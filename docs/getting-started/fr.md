@@ -114,7 +114,7 @@ Pour jouer **la même piste sur plusieurs zones simultanément** :
 
 **Réglages → Groupes de zones → Créer un groupe**
 
-Le serveur synchronise les sorties via NTP. La latence est ajustable par zone (**Réglages → Zones → Délai de sync**).
+Seuls les points de diffusion Tune regroupés par **OAAT** partagent une horloge et reçoivent des timestamps de présentation. Les groupes de sorties DLNA, AirPlay, Chromecast ou autres permettent un pilotage commun, mais Tune ne les présente pas comme un système multiroom synchronisé. Le délai réglable par zone est une correction manuelle, pas une mesure automatique de la latence acoustique.
 
 ---
 
