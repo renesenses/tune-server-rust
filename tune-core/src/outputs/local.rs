@@ -1715,6 +1715,86 @@ impl RingBuf {
     }
 }
 
+/// Rend le prochain bloc du callback **local partagé**.
+///
+/// C'est le dernier tampon `f32` commun aux callbacks CPAL flottant et entier :
+/// le premier le remet directement au backend, le second le convertit ensuite
+/// dans le type entier exigé par le périphérique. Les chemins exclusifs ont
+/// leurs propres anneaux/callbacks et n'appellent volontairement pas cette
+/// fonction.
+fn drain_local_shared_callback(ring: &RingBuf, volume: &AtomicU32, output: &mut [f32]) -> usize {
+    let read = ring.pop(output);
+    let factor = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    for sample in &mut output[..read] {
+        *sample *= factor;
+    }
+
+    #[cfg(test)]
+    local_shared_callback_capture::record(&output[..read]);
+
+    read
+}
+
+#[cfg(test)]
+mod local_shared_callback_capture {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn start() {
+        CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(super) fn record(samples: &[f32]) {
+        CAPTURE.with(|capture| {
+            if let Some(captured) = capture.borrow_mut().as_mut() {
+                captured.extend_from_slice(samples);
+            }
+        });
+    }
+
+    pub(super) fn finish() -> Vec<f32> {
+        CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+/// Assemble une frontière entre deux producteurs PCM du chemin local partagé.
+///
+/// `Some(n)` signifie qu'un vrai recouvrement de `n` trames a été calculé ;
+/// `None` garde les deux producteurs strictement séquentiels (crossfade
+/// désactivé, aucune queue retenue ou DoP non mélangeable).
+fn compose_local_shared_transition(
+    tail: &mut crate::playback::crossfade::CrossfadeTail,
+    next_head: Vec<f32>,
+    next_is_dop: bool,
+    channels: u16,
+) -> (Vec<f32>, Option<usize>) {
+    let previous_tail = tail.drain();
+    if previous_tail.is_empty() {
+        let ready = if next_is_dop {
+            tail.bypass_with(next_head)
+        } else {
+            tail.push(next_head)
+        };
+        return (ready, None);
+    }
+    if next_is_dop {
+        let mut ready = previous_tail;
+        ready.extend(next_head);
+        return (tail.bypass_with(ready), None);
+    }
+
+    let mixed =
+        crate::playback::crossfade::equal_power_crossfade(&previous_tail, &next_head, channels);
+    let overlap_frames = mixed.overlap.len() / channels.max(1) as usize;
+    let mut ready = mixed.tail_prefix;
+    ready.extend(mixed.overlap);
+    ready.extend(tail.push(mixed.head_suffix));
+    (ready, Some(overlap_frames))
+}
+
 #[cfg(test)]
 mod ringbuf_tests {
     use super::{
@@ -5097,11 +5177,7 @@ impl OutputTarget for LocalOutput {
                             }
                             ds_cb.store(true, Ordering::Release);
                         }
-                        let read = ring_cb.pop(data);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for sample in &mut data[..read] {
-                            *sample *= v;
-                        }
+                        let read = drain_local_shared_callback(&ring_cb, &vol_cb, data);
                         if read < data.len() {
                             data[read..].fill(0.0);
                         }
@@ -5156,10 +5232,9 @@ impl OutputTarget for LocalOutput {
                             scratch.resize(n, 0.0);
                         }
                         let buf = &mut scratch[..n];
-                        let read = ring_cb.pop(buf);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        let read = drain_local_shared_callback(&ring_cb, &vol_cb, buf);
                         for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                            *o = (*s * v).into_sample();
+                            *o = (*s).into_sample();
                         }
                         data[read..].fill(zero);
                     },
@@ -6045,8 +6120,7 @@ impl OutputTarget for LocalOutput {
                 // tail. The two buffers now coexist in memory before either is
                 // published: this is the actual two-producer overlap #2211
                 // requires, as opposed to two sequential device-volume ramps.
-                let previous_tail = crossfade_tail.drain();
-                let overlap_target = previous_tail.len();
+                let overlap_target = crossfade_tail.len();
                 let mut next_head = Vec::with_capacity(overlap_target);
                 let mut next_is_dop = false;
 
@@ -6142,25 +6216,13 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
-                let ready = if previous_tail.is_empty() {
-                    if next_is_dop {
-                        crossfade_tail.bypass_with(next_head)
-                    } else {
-                        crossfade_tail.push(next_head)
-                    }
-                } else if next_is_dop {
-                    // DoP is a DSD bitstream, not PCM. Preserve both tracks in
-                    // sequence and disable arithmetic for this transition.
-                    let mut unmixed = previous_tail;
-                    unmixed.extend(next_head);
-                    crossfade_tail.bypass_with(unmixed)
-                } else {
-                    let mixed = crate::playback::crossfade::equal_power_crossfade(
-                        &previous_tail,
-                        &next_head,
-                        output_ch,
-                    );
-                    let overlap_frames = mixed.overlap.len() / output_ch.max(1) as usize;
+                let (ready, overlap_frames) = compose_local_shared_transition(
+                    &mut crossfade_tail,
+                    next_head,
+                    next_is_dop,
+                    output_ch,
+                );
+                if let Some(overlap_frames) = overlap_frames {
                     info!(
                         overlap_frames,
                         duration_ms = overlap_frames as u64 * 1000 / output_sr.max(1) as u64,
@@ -6175,11 +6237,7 @@ impl OutputTarget for LocalOutput {
                             reasons: vec![OutputSignalReason::DspApplied],
                         });
                     }
-                    let mut ready = mixed.tail_prefix;
-                    ready.extend(mixed.overlap);
-                    ready.extend(crossfade_tail.push(mixed.head_suffix));
-                    ready
-                };
+                }
                 if !feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent)) {
                     http_eof = false;
                     break;
@@ -7257,6 +7315,122 @@ pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rejoue les blocs produits par la chaîne locale dans le dernier point
+    /// `f32` que les callbacks CPAL partagés ont en commun. Le découpage en
+    /// petits appels imite plusieurs périodes du périphérique sans ouvrir de
+    /// carte son et rend la capture indépendante des helpers de crossfade.
+    fn capture_local_partage(chunks: &[Vec<f32>]) -> Vec<f32> {
+        let sample_count = chunks.iter().map(Vec::len).sum::<usize>();
+        let ring = RingBuf::new(sample_count.max(1));
+        for chunk in chunks {
+            assert_eq!(ring.push(chunk), chunk.len());
+        }
+
+        let volume = AtomicU32::new(1000);
+        local_shared_callback_capture::start();
+        while ring.available() > 0 {
+            // Trois trames stéréo : une frontière de callback peut tomber au
+            // milieu d'un bloc produit, mais jamais modifier son contenu.
+            let mut callback_period = [0.0f32; 6];
+            assert_ne!(
+                drain_local_shared_callback(&ring, &volume, &mut callback_period),
+                0
+            );
+        }
+        local_shared_callback_capture::finish()
+    }
+
+    /// Sans crossfade, la frontière gapless locale partagée est la
+    /// concaténation exacte des deux producteurs : aucun zéro ajouté et aucun
+    /// échantillon rejoué au passage d'une piste à l'autre.
+    #[test]
+    fn local_partage_gapless_n_a_ni_trou_ni_doublon_au_callback() {
+        let piste_a = vec![0.125, -0.125, 0.25, -0.25, 0.375, -0.375];
+        let piste_b = vec![0.5, -0.5, 0.625, -0.625, 0.75, -0.75, 0.875, -0.875];
+        let mut tail = crate::playback::crossfade::CrossfadeTail::disabled();
+
+        let avant_frontiere = tail.push(piste_a.clone());
+        let (apres_frontiere, overlap_frames) =
+            compose_local_shared_transition(&mut tail, piste_b.clone(), false, 2);
+        let fin = tail.drain();
+        let capture = capture_local_partage(&[avant_frontiere, apres_frontiere, fin]);
+
+        let mut attendu = piste_a;
+        attendu.extend(piste_b);
+        assert_eq!(overlap_frames, None);
+        assert_eq!(capture, attendu);
+    }
+
+    /// Les deux signatures atteignent réellement le callback local partagé
+    /// pendant exactement N trames. Ici A n'occupe que le canal gauche et B
+    /// que le droit : chaque trame intérieure non nulle sur les deux canaux
+    /// prouve le recouvrement des deux producteurs, pas deux rampes successives.
+    #[test]
+    fn local_partage_crossfade_contient_les_deux_signatures_pendant_exactement_n_trames() {
+        const N: usize = 4;
+        const CHANNELS: usize = 2;
+        let piste_a = (0..8).flat_map(|_| [1.0, 0.0]).collect::<Vec<_>>();
+        let piste_b = (0..8).flat_map(|_| [0.0, 1.0]).collect::<Vec<_>>();
+        let mut tail = crate::playback::crossfade::CrossfadeTail::new(1.0, N as u32, 2);
+
+        let avant_frontiere = tail.push(piste_a);
+        let (frontiere, overlap_frames) =
+            compose_local_shared_transition(&mut tail, piste_b[..N * CHANNELS].to_vec(), false, 2);
+        let apres_frontiere = tail.push(piste_b[N * CHANNELS..].to_vec());
+        let fin = tail.drain();
+        let capture = capture_local_partage(&[
+            avant_frontiere.clone(),
+            frontiere,
+            apres_frontiere,
+            fin.clone(),
+        ]);
+
+        assert_eq!(overlap_frames, Some(N));
+        let overlap = &capture[avant_frontiere.len()..avant_frontiere.len() + N * CHANNELS];
+        assert_eq!(&overlap[..2], &[1.0, 0.0]);
+        assert!((overlap[N * CHANNELS - 2]).abs() < 1.0e-6);
+        assert!((overlap[N * CHANNELS - 1] - 1.0).abs() < 1.0e-6);
+        for frame in overlap[2..N * CHANNELS - 2].chunks_exact(2) {
+            assert!(frame[0] > 0.0 && frame[1] > 0.0);
+        }
+        assert_eq!(fin, piste_b[N * CHANNELS..]);
+        assert_eq!(capture.len(), (8 + 8 - N) * CHANNELS);
+    }
+
+    /// Quand aucun producteur suivant n'arrive, la queue retenue pour un
+    /// éventuel crossfade est rendue telle quelle au callback partagé.
+    #[test]
+    fn local_partage_rend_la_fin_de_la_derniere_piste_intacte_au_callback() {
+        let piste = vec![
+            0.0625, -0.0625, 0.1875, -0.1875, 0.3125, -0.3125, 0.4375, -0.4375, 0.5625, -0.5625,
+            0.6875, -0.6875,
+        ];
+        let mut tail = crate::playback::crossfade::CrossfadeTail::new(1.0, 3, 2);
+        let debut = tail.push(piste.clone());
+        let fin = tail.drain();
+
+        assert_eq!(capture_local_partage(&[debut, fin]), piste);
+    }
+
+    /// La preuve de capture ne doit jamais être présentée comme une preuve des
+    /// callbacks exclusifs : ils refusent le crossfade et un `RingBuf::pop`
+    /// direct (forme employée par CoreAudio exclusif) ne traverse pas le hook.
+    #[test]
+    fn les_exclusifs_restent_hors_crossfade_et_hors_crochet_local_partage() {
+        let sortie = LocalOutput::new_with_exclusive("DAC exclusif".to_string(), true);
+        sortie.set_crossfade(true, 3.0);
+        assert!(!sortie.supports_pcm_crossfade());
+        assert!(!sortie.crossfade_enabled.load(Ordering::SeqCst));
+
+        let ring = RingBuf::new(2);
+        assert_eq!(ring.push(&[0.25, -0.25]), 2);
+        local_shared_callback_capture::start();
+        let mut sortie_exclusive = [0.0; 2];
+        assert_eq!(ring.pop(&mut sortie_exclusive), 2);
+        assert!(local_shared_callback_capture::finish().is_empty());
+        assert_eq!(sortie_exclusive, [0.25, -0.25]);
+    }
 
     // -----------------------------------------------------------------------
     // Fin de piste sur le chemin cpal partagé (#1919, Alain — #2047)
