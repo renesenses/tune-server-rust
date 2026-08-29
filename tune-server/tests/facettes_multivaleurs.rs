@@ -478,3 +478,142 @@ async fn une_valeur_a_virgule_reste_filtrable() {
     .await;
     assert_eq!(total(&r), 8, "1 + 7");
 }
+
+/// Une bibliothèque minuscule mais complète : chaque famille de facette a au
+/// moins une valeur, et une piste sans étiquettes alimente `untagged`.
+///
+/// Les identifiants sont explicites pour que les collections, favoris et
+/// listes de lecture puissent viser les mêmes lignes sans dépendre de l'ordre
+/// d'insertion ni du contenu semé par les migrations.
+fn bibliotheque_contrat_facettes() -> axum::Router {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    for sql in [
+        "INSERT INTO artists (id, name) VALUES (93001, 'ArtisteA')",
+        "INSERT INTO artists (id, name) VALUES (93002, 'ArtisteB')",
+        "INSERT INTO albums (id, title, artist_id, original_year, cover_path) \
+         VALUES (92001, 'AlbumA', 93001, 1959, '/covers/a.jpg')",
+        "INSERT INTO albums (id, title, artist_id, original_year, cover_path) \
+         VALUES (92002, 'AlbumB', 93002, 1960, NULL)",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91001, 'PisteA', 92001, 93001, '/contrat/a.flac', 1000, 'flac', 96000, \
+          24, 'local', 'Jazz', 'Bach', 1959, 'ECM')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91002, 'PisteB', 92002, 93002, '/contrat/b.flac', 1000, 'flac', 44100, \
+          16, 'qobuz', 'Rock', 'Ravel', 1960, 'BlueNote')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91003, 'PisteC', 92001, 93001, '/contrat/c.aiff', 1000, 'aiff', 48000, \
+          24, 'local', 'Jazz', 'Bach', 1959, 'ECM')",
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91004, 'SansTags', NULL, NULL, '/contrat/sans-tags.flac', 1000, 'flac', \
+          44100, 16, 'local', NULL, NULL, NULL, NULL)",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'release_country', 'FR')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'mood', 'Calme')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'source_media', 'CD')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'release_country', 'US')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'mood', 'Intense')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'source_media', 'SACD')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'release_country', 'FR')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'mood', 'Calme')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'source_media', 'Vinyle')",
+        "INSERT OR IGNORE INTO profiles (id, username) VALUES (1, 'contrat-facettes')",
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92001, 1, 5)",
+        "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92002, 1, 4)",
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', 91001)",
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', 92002)",
+        "INSERT INTO playlists (id, name, profile_id) VALUES (94001, 'ListeA', 1)",
+        "INSERT INTO playlists (id, name, profile_id) VALUES (94002, 'ListeB', 1)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94001, 91001, 0)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94001, 91004, 1)",
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (94002, 91002, 0)",
+    ] {
+        state.backend.execute(sql, &[]).expect(sql);
+    }
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            "collections",
+            r#"[{"name":"CollectionA","album_ids":[92001]},{"name":"CollectionB","album_ids":[92002]}]"#,
+        )
+        .expect("collections d'épreuve");
+    tune_server::routes::router(state)
+}
+
+/// #1864 : pour chaque valeur annoncée par le rail, cocher cette valeur doit
+/// rendre exactement le nombre de pistes promis par le rail.
+///
+/// Ce test traverse les deux constructeurs SQL réels — `build_conditions`
+/// pour les effectifs et `TrackRepo::list_filtered` pour les pistes — au lieu
+/// de comparer leurs chaînes. Une divergence de colonne, de jointure ou de
+/// paramètre rougit donc sur la facette précise qui a dérivé.
+#[tokio::test]
+async fn chaque_effectif_de_facette_est_tenu_par_la_liste_filtree() {
+    let app = bibliotheque_contrat_facettes();
+    // `source` est le nom public de la facette issue de la métadonnée
+    // `source_media`; la clé de filtre reste explicitement `source_media`.
+    let cas = [
+        ("genre", "genre"),
+        ("label", "label"),
+        ("composer", "composer"),
+        ("year", "year"),
+        ("artist", "artist"),
+        ("format", "format"),
+        ("sample_rate", "sample_rate"),
+        ("bit_depth", "bit_depth"),
+        ("country", "country"),
+        ("mood", "mood"),
+        ("source", "source_media"),
+        ("rating", "rating"),
+        ("collection", "collection"),
+        ("original_year", "original_year"),
+        ("favorite", "favorite"),
+        ("playlist", "playlist"),
+        ("untagged", "untagged"),
+    ];
+
+    for (champ, cle) in cas {
+        // La facette comptée s'auto-exclut. Un filtre croisé la force à
+        // emprunter aussi le chemin cumulatif ; pour `format`, on croise par
+        // genre afin de ne pas filtrer la facette avant son propre comptage.
+        let croise = if champ == "format" {
+            "genre=Jazz"
+        } else {
+            "format=flac"
+        };
+        let chemin = format!("/api/v1/library/facets?fields={champ}&limit=0&{croise}");
+        let (status, facettes) = get(&app, &chemin).await;
+        assert_eq!(status, StatusCode::OK, "facette {champ}");
+        let valeurs = facettes
+            .get(champ)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("facette {champ} absente : {facettes}"));
+        assert!(
+            !valeurs.is_empty(),
+            "la fixture doit exercer la facette {champ}"
+        );
+
+        for entree in valeurs {
+            let valeur = entree
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("valeur absente pour {champ}: {entree}"));
+            let annonce = entree.get("count").and_then(Value::as_i64).unwrap_or(-1);
+            let valeur = urlencoding::encode(valeur);
+            let chemin = format!("/api/v1/library/tracks?limit=1000&{croise}&{cle}={valeur}");
+            let (status, pistes) = get(&app, &chemin).await;
+            assert_eq!(status, StatusCode::OK, "{champ}={valeur}");
+            assert_eq!(
+                total(&pistes),
+                annonce,
+                "la facette {champ}={valeur} annonce {annonce}, mais sa liste rend {}",
+                total(&pistes)
+            );
+        }
+    }
+}
