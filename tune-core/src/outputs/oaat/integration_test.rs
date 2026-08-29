@@ -2329,6 +2329,47 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "oaat")]
+    async fn des_stats_du_flux_courant_ne_valent_pas_refus_de_format() {
+        use crate::outputs::oaat::output::{PolitiqueAdaptation, attendre_accord_format_sur_canal};
+        use oaat_controller::EndpointResponse;
+
+        let contrat = contrat_pcm();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(EndpointResponse::StreamStats(
+            oaat_core::message::StreamStats {
+                stream_id: contrat.stream_id.clone(),
+                buffer_frames: 0,
+                drift_us: 0,
+                corrections_net_frames: 0,
+                packets_lost: 0,
+                packets_recovered: 0,
+                bit_perfect: true,
+            },
+        ))
+        .await
+        .unwrap();
+        tx.send(EndpointResponse::FormatAccept(
+            oaat_core::message::FormatAccept {
+                stream_id: contrat.stream_id.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let negocie = attendre_accord_format_sur_canal(
+            &mut rx,
+            "endpoint-temoin",
+            &contrat,
+            PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect("StreamStats partage le canal mais ne repond pas a la proposition de format");
+        assert_eq!(negocie, contrat);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oaat")]
     async fn une_reponse_perimee_ne_masque_pas_le_refus_du_flux_courant() {
         use crate::outputs::oaat::output::{PolitiqueAdaptation, attendre_accord_format_sur_canal};
         use oaat_controller::EndpointResponse;

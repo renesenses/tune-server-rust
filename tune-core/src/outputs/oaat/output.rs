@@ -3608,12 +3608,15 @@ fn stream_id_reponse(reponse: &oaat_controller::EndpointResponse) -> &str {
     }
 }
 
-/// Attend la première réponse du flux courant dans un délai GLOBAL.
+/// Attend la première réponse DE FORMAT du flux courant dans un délai GLOBAL.
 ///
 /// Le canal peut encore contenir une réponse tardive d'une lecture précédente.
 /// Elle est consommée et ignorée, sans remettre le délai à zéro : un endpoint
 /// qui enverrait sans fin des trames étrangères ne peut donc pas retenir la
-/// négociation indéfiniment (#2730).
+/// négociation indéfiniment (#2730). Les trames asynchrones du flux courant
+/// (`StreamStats`, `NextTrack*`) sont elles aussi consommées sans devenir un
+/// refus de format : elles partagent le canal de contrôle mais ne répondent pas
+/// à la proposition en cours (#2758).
 pub(crate) async fn attendre_accord_format_sur_canal(
     response_rx: &mut tokio::sync::mpsc::Receiver<oaat_controller::EndpointResponse>,
     device_name: &str,
@@ -3628,7 +3631,21 @@ pub(crate) async fn attendre_accord_format_sur_canal(
             };
             let stream_id_recu = stream_id_reponse(&reponse);
             if stream_id_recu == contrat.stream_id {
-                return Some(reponse);
+                if matches!(
+                    reponse,
+                    oaat_controller::EndpointResponse::FormatAccept(_)
+                        | oaat_controller::EndpointResponse::FormatCounter(_)
+                        | oaat_controller::EndpointResponse::FormatReject(_)
+                ) {
+                    return Some(reponse);
+                }
+                warn!(
+                    device = %device_name,
+                    stream_id = %contrat.stream_id,
+                    reponse = ?reponse,
+                    "oaat: trame asynchrone ignoree pendant la negociation"
+                );
+                continue;
             }
             warn!(
                 device = %device_name,
