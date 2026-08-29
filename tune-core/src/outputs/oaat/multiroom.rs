@@ -171,6 +171,7 @@ impl OaatMultiroomOutput {
             "name": zone.name,
             "streaming": zone.is_streaming(),
             "multiroom": zone.is_multiroom(),
+            "synchronization": oaat_synchronization_contract(),
             "master_volume": vol.master,
             "endpoints": snaps.iter().map(|s| serde_json::json!({
                 "endpoint_id": s.endpoint_id,
@@ -200,6 +201,26 @@ impl OaatMultiroomOutput {
         }
         zone.prune_disconnected()
     }
+}
+
+/// Ce que Tune garantit structurellement pour un groupe OAAT.
+///
+/// Le contrôleur envoie un PTS absolu dans chaque paquet et les points de
+/// diffusion Tune entretiennent leur offset d'horloge avec lui. La latence
+/// fixe du DAC et du chemin acoustique n'est en revanche pas mesurée ici :
+/// aucune précision chiffrée ne doit être inventée avant une validation
+/// matérielle de bout en bout (#2215).
+pub fn oaat_synchronization_contract() -> serde_json::Value {
+    serde_json::json!({
+        "supported": true,
+        "transport": "oaat",
+        "mechanism": "clock_sync_and_presentation_timestamps",
+        "clock_sync_required": true,
+        "presentation_timestamps": true,
+        "runtime_sync_status_observed": false,
+        "render_latency_calibrated": false,
+        "accuracy_claim_ms": null,
+    })
 }
 
 #[async_trait::async_trait]
@@ -712,6 +733,21 @@ impl OutputTarget for OaatMultiroomOutput {
 
 #[cfg(test)]
 mod pacing_regression_tests {
+    use super::oaat_synchronization_contract;
+
+    #[test]
+    fn seul_oaat_annonce_le_contrat_d_horodatage_de_presentation() {
+        let contract = oaat_synchronization_contract();
+
+        assert_eq!(contract["supported"], true);
+        assert_eq!(contract["transport"], "oaat");
+        assert_eq!(contract["clock_sync_required"], true);
+        assert_eq!(contract["presentation_timestamps"], true);
+        assert_eq!(contract["runtime_sync_status_observed"], false);
+        assert_eq!(contract["render_latency_calibrated"], false);
+        assert!(contract["accuracy_claim_ms"].is_null());
+    }
+
     /// #2214 : le premier correctif a remplacé les octets compressés pour le
     /// PTS et la position, mais a laissé le pacing multiroom sur son ancienne
     /// branche `is_flac`. Le débit FLAC varie : ce chemin doit demander la

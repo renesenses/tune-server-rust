@@ -114,7 +114,7 @@ To play **the same track on multiple zones simultaneously**:
 
 **Settings → Zone groups → Create a group**
 
-The server synchronizes outputs via NTP. Latency is adjustable per zone (**Settings → Zones → Sync delay**).
+Only Tune endpoints grouped through **OAAT** share a clock and receive presentation timestamps. Groups of DLNA, AirPlay, Chromecast, or other independent outputs provide shared control, but Tune does not present them as a synchronized multi-room system. The per-zone delay is a manual correction, not an automatic measurement of acoustic latency.
 
 ---
 
