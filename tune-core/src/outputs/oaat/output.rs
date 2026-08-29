@@ -3502,6 +3502,25 @@ impl std::fmt::Display for RefusNegociation {
 /// par `Ok(())` (#2297, JP Robbe). Fonction pure, donc verifiable sur les huit
 /// issues : accord, accord d'un autre flux, contre-proposition identique,
 /// contre-proposition ecartee, refus, reponse hors sujet, fermeture, silence.
+/// L'identifiant de flux que porte un message de l'endpoint, quand il en porte un.
+///
+/// Sert au seul discernement qui compte pendant une negociation : ce message
+/// parle-t-il de MON flux, ou d'un flux precedent dont la reponse traine encore
+/// dans le canal ? Les six variantes du protocole portent un `stream_id` ;
+/// l'ecrire ici plutot que dans le `match` evite d'oublier une variante quand
+/// le protocole en gagnera une.
+fn stream_id_de(reponse: &oaat_controller::EndpointResponse) -> Option<&str> {
+    use oaat_controller::EndpointResponse as R;
+    Some(match reponse {
+        R::FormatAccept(m) => &m.stream_id,
+        R::FormatCounter(m) => &m.stream_id,
+        R::FormatReject(m) => &m.stream_id,
+        R::NextTrackReady(m) => &m.stream_id,
+        R::NextTrackReformat(m) => &m.stream_id,
+        R::StreamStats(m) => &m.stream_id,
+    })
+}
+
 pub(crate) fn juger_reponse(
     contrat: &ContratPropose,
     reponse: ReponseNegociation<'_>,
@@ -3573,10 +3592,34 @@ pub(crate) fn juger_reponse(
                     )
                 }
             }
-            autre => refus(
-                format!("reponse inattendue pendant la negociation de format : {autre:?}"),
-                false,
-            ),
+            // Les autres messages du protocole portent EUX AUSSI un
+            // `stream_id`, et le reliquat d'une session precedente arrive par
+            // le meme canal. Les refuser sans regarder cet identifiant arrete
+            // la zone pour un message qui ne nous etait pas destine — c'est le
+            // meme defaut que ci-dessus, une variante plus loin.
+            //
+            // Steve Taylor, 29/08/2026, journal du fil forum : DEUX echecs a
+            // six minutes d'intervalle sur son DigiOne Signature, de formes
+            // differentes. Le second (13h31) est bien un `FormatCounter` en
+            // retard, deja traite plus haut. Le PREMIER (13h25) ne l'est pas :
+            //
+            //   raison=reponse inattendue pendant la negociation de format :
+            //   StreamStats(StreamStats { stream_id: "tune-1", ... })
+            //
+            // Il negociait `tune-2` et recevait les statistiques de `tune-1`,
+            // le flux qu'il venait d'arreter. Sans ce bras, corriger seulement
+            // le cas du FormatCounter lui aurait laisse un echec sur deux.
+            autre => {
+                if let Some(flux) = stream_id_de(autre)
+                    && flux != contrat.stream_id
+                {
+                    return reliquat(flux);
+                }
+                refus(
+                    format!("reponse inattendue pendant la negociation de format : {autre:?}"),
+                    false,
+                )
+            }
         },
     }
 }

@@ -2359,6 +2359,25 @@ mod tests {
                     reason: "cadence non supportee".into(),
                 }),
             ),
+            // Un message HORS negociation compte autant : il arrive par le
+            // meme canal. C'est l'un d'eux — NextTrackReady — qui tombait
+            // dans le fourre-tout « reponse inattendue » sans qu'on regarde
+            // son `stream_id`, et arretait la zone.
+            //
+            // Steve Taylor, 29/08/2026, DigiOne Signature : DEUX echecs de
+            // formes DIFFERENTES a six minutes d'intervalle. Celui de 13h31
+            // est un FormatCounter en retard, couvert plus haut. Celui de
+            // 13h25 ne l'etait pas :
+            //   « reponse inattendue pendant la negociation de format :
+            //     StreamStats(StreamStats { stream_id: "tune-1", ... }) »
+            // Il negociait `tune-2` et recevait les statistiques de `tune-1`,
+            // le flux qu'il venait d'arreter.
+            (
+                "piste suivante prete",
+                EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
+                    stream_id: perime.into(),
+                }),
+            ),
         ];
 
         for (nom, reponse) in etrangeres {
