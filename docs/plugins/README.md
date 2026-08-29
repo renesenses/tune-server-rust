@@ -187,13 +187,14 @@ The filter applies to the *offer* only.  A plugin that is actually **running**
 stays listed whatever `catalogued` says: hiding it would make it impossible to
 uninstall, and would misreport what the machine is doing.
 
-**Uncatalogued today** (both are compiled into every published binary — see the
-`--features` lines in `release.yml` — and both keep their tests):
+**Uncatalogued today** (all three are compiled into every published binary — see
+the `--features` lines in `release.yml` — and all three keep their tests):
 
 | Plugin    | Why it is not offered |
 |-----------|-----------------------|
 | `dj`      | **Not ready.** `HostServices` carries only the DB backend — no `PlaybackManager`, no output registry — so the plugin has no access to the audio path at all. 11 of its 13 routes change nothing: 7 echo their argument without writing anything, `/sync-tempo` answers `"tempo sync not yet implemented"`, and `/enable` `/disable` `/status` only write and re-read `dj_enabled_{zone}` — a setting those three handlers are the sole readers of. `/status` reports decks permanently `loaded: false`, contradicting `/load` one call earlier. Only `/waveform` and `/analyze` do real work. |
 | `karaoke` | **Ready, but redundant — and narrower.** All three routes work. The product already ships karaoke and it is already reachable: the lyrics panel offers a "Karaoke" toggle and highlights the current line itself, from the same core `/lyrics/{id}` data this plugin reuses. Worse, `/now/{zone_id}` gives up when the current track has no library id, while the client falls back to `/lyrics/by-meta` and so keeps karaoke working on streaming. Installing it would buy a second, smaller door — at the cost of an install and a restart. `/now/{zone_id}` keeps a use of its own for a client with no position loop; re-catalogue it when such a client exists. |
+| `concerts` | **Ready, but there is nothing to show yet — twice over.** The routes work; what they relay does not. The cloud table `concert_events` is empty and stays empty: its only writer is an endpoint nobody calls, and the one source wired behind it is MusicBrainz, whose `event` entity is an archive — 0 future dates across Coldplay, Taylor Swift and Metallica combined (measured 2026-08-27). And no client screen reaches `/api/v1/ext/concerts/upcoming`: `git grep -i concert` in `tune-web-client` returns nothing of the feature. Catalogue it when both are true — a source that knows the future, and a screen. See #2363. |
 
 `PLUGIN_PROTOCOL_VERSION` is **enforced**: `setup_all` refuses a plugin whose
 major differs, or whose minor is newer than the server's.  With plugins

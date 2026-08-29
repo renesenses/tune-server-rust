@@ -212,7 +212,7 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
