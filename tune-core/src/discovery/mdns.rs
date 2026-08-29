@@ -310,7 +310,45 @@ async fn handle_event(
 
             // Skip duplicate services for the same host+type (e.g. RAOP vs
             // AirPlay2, or _musc vs _musp vs _musz for BluOS).
-            if output_type == OutputType::Airplay || output_type == OutputType::Bluos {
+            //
+            // AirPlay : le verdict se rend sur l'identité (MAC) et plus
+            // seulement sur l'adresse. Une même enceinte annonce `_raop` ET
+            // `_airplay`, et chaque résolution peut retenir une adresse
+            // différente (IPv4 pour l'une, IPv6 pour l'autre) : comparées à
+            // l'adresse, ces deux annonces devenaient deux sorties
+            // concurrentes dont une seule était jouable — la zone ancrée sur
+            // l'adresse IPv6 échouait en « Network is unreachable » là où
+            // IPv6 n'est pas routé, Docker en tête (#197, paire Devialet
+            // Phantom « SALON »). Et quand l'adresse IPv4 arrive après coup,
+            // on RÉPARE l'appareil retenu au lieu de jeter l'annonce.
+            if output_type == OutputType::Airplay {
+                match verdict_doublon_airplay(st.devices.values(), &device) {
+                    DoublonAirplay::Nouveau => {}
+                    DoublonAirplay::Ignorer => {
+                        debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_dup_skipped");
+                        drop(st);
+                        return;
+                    }
+                    DoublonAirplay::Reprendre { id_retenu } => {
+                        if let Some(d) = st.devices.get_mut(&id_retenu) {
+                            d.host = device.host.clone();
+                            let repris = d.clone();
+                            st.service_to_device
+                                .insert(info.get_fullname().to_string(), id_retenu.clone());
+                            drop(st);
+                            info!(
+                                id = %id_retenu,
+                                name = %repris.name,
+                                host = %repris.host,
+                                service = service_type,
+                                "mdns_airplay_ipv6_repris_en_ipv4"
+                            );
+                            let _ = event_tx.send(MdnsEvent::DeviceUpdated(repris)).await;
+                        }
+                        return;
+                    }
+                }
+            } else if output_type == OutputType::Bluos {
                 let host_already = st.devices.values().any(|d| {
                     d.device_type == output_type && d.host == device.host && d.id != dev_id
                 });
@@ -369,7 +407,14 @@ fn service_to_device(
         .trim()
         .to_string();
 
-    // RAOP names look like "800A805D4DEE@DMP-A8" — strip the hex MAC prefix
+    // RAOP names look like "800A805D4DEE@DMP-A8" — keep the MAC as identity…
+    let raop_mac = if output_type == OutputType::Airplay {
+        mac_depuis_nom_raop(&raw_name)
+    } else {
+        None
+    };
+
+    // …and strip the hex MAC prefix from the display name.
     let name = if output_type == OutputType::Airplay {
         if let Some(pos) = raw_name.find('@') {
             let after = &raw_name[pos + 1..];
@@ -427,6 +472,13 @@ fn service_to_device(
         .or_else(|| info.get_property_val_str("id"))
     {
         device.mac_address = Some(mac.to_string());
+    } else if output_type == OutputType::Airplay {
+        // Le nom d'instance RAOP porte la MAC de l'appareil
+        // (« 800A805D4DEE@DMP-A8 ») : c'est la même identité que le TXT
+        // `deviceid` de `_airplay`. La retenir permet au dédoublonnage de
+        // reconnaître les deux services comme UN appareil même quand leurs
+        // résolutions ont retenu des adresses différentes (#197).
+        device.mac_address = raop_mac;
     }
 
     // AirPlay version detection + features/flags parsing.
@@ -467,6 +519,29 @@ fn service_to_device(
                     );
                 }
             }
+        }
+
+        // Groupe AirPlay 2 (paire stéréo, multi-room) : `gid` identifie le
+        // groupe, `igl` dit si CET appareil en est le meneur, `gpn` porte le
+        // nom public du groupe. Capturé tel quel pour le diagnostic (#197,
+        // paire Devialet « SALON ») — aucun comportement n'en dépend encore.
+        if let Some(gid) = info.get_property_val_str("gid") {
+            caps.insert(
+                "airplay_group_id".to_string(),
+                serde_json::Value::String(gid.to_string()),
+            );
+        }
+        if let Some(igl) = info.get_property_val_str("igl") {
+            caps.insert(
+                "airplay_group_leader".to_string(),
+                serde_json::Value::Bool(igl.trim() == "1"),
+            );
+        }
+        if let Some(gpn) = info.get_property_val_str("gpn") {
+            caps.insert(
+                "airplay_group_name".to_string(),
+                serde_json::Value::String(gpn.to_string()),
+            );
         }
     }
 
@@ -535,6 +610,75 @@ fn service_to_device(
     // the TXT record carried no manufacturer.
     super::mac::enrich_identity(&mut device);
     device
+}
+
+/// La MAC portée par un nom d'instance RAOP (« 800A805D4DEE@DMP-A8 »),
+/// normalisée. `None` si le nom n'en porte pas (pas de `@`, ou un préfixe qui
+/// n'est pas une MAC).
+fn mac_depuis_nom_raop(raw_name: &str) -> Option<String> {
+    let pos = raw_name.find('@')?;
+    super::mac::normalize_mac(&raw_name[..pos])
+}
+
+/// Verdict du dédoublonnage AirPlay — voir l'appelant dans `handle_event`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoublonAirplay {
+    /// Aucun appareil connu ne correspond : on l'insère.
+    Nouveau,
+    /// Un appareil connu correspond et son adresse vaut mieux (ou autant) :
+    /// on jette l'annonce.
+    Ignorer,
+    /// Un appareil connu correspond mais il est ancré sur une adresse IPv6
+    /// alors que l'annonce apporte une IPv4 : on répare l'appareil retenu en
+    /// place (même identifiant, donc même zone) au lieu de jeter l'annonce.
+    /// C'est ce qui sort une zone du « Network is unreachable (os error 101) »
+    /// quand IPv6 n'est pas routé (#197).
+    Reprendre { id_retenu: String },
+}
+
+/// Deux appareils AirPlay sont LE MÊME appareil physique s'ils partagent
+/// l'adresse… ou la MAC : `_raop` la porte dans son nom d'instance,
+/// `_airplay` dans son TXT `deviceid`, et chaque service peut avoir résolu
+/// une adresse différente (IPv4 contre IPv6).
+fn meme_appareil_airplay(a: &DiscoveredDevice, b: &DiscoveredDevice) -> bool {
+    if a.host == b.host && !a.host.is_empty() {
+        return true;
+    }
+    match (
+        a.mac_address.as_deref().and_then(super::mac::normalize_mac),
+        b.mac_address.as_deref().and_then(super::mac::normalize_mac),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn est_ipv6(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
+}
+
+fn est_ipv4(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_ipv4())
+        .unwrap_or(false)
+}
+
+fn verdict_doublon_airplay<'a>(
+    existants: impl Iterator<Item = &'a DiscoveredDevice>,
+    nouveau: &DiscoveredDevice,
+) -> DoublonAirplay {
+    let doublon = existants
+        .filter(|d| d.device_type == OutputType::Airplay && d.id != nouveau.id)
+        .find(|d| meme_appareil_airplay(d, nouveau));
+    match doublon {
+        None => DoublonAirplay::Nouveau,
+        Some(d) if est_ipv6(&d.host) && est_ipv4(&nouveau.host) => DoublonAirplay::Reprendre {
+            id_retenu: d.id.clone(),
+        },
+        Some(_) => DoublonAirplay::Ignorer,
+    }
 }
 
 /// L'identifiant durable d'un appareil.
@@ -740,6 +884,139 @@ mod tests {
         assert!(CHROMECAST_SERVICE.ends_with(".local."));
         assert!(SQUEEZEBOX_SERVICE.ends_with(".local."));
         assert!(TUNE_SERVICE.ends_with(".local."));
+    }
+
+    fn appareil(id: &str, host: &str, mac: Option<&str>, t: OutputType) -> DiscoveredDevice {
+        let mut d = DiscoveredDevice::new(id.into(), "SALON".into(), t, host.into(), 7000);
+        d.mac_address = mac.map(str::to_string);
+        d
+    }
+
+    #[test]
+    fn le_nom_raop_porte_la_mac_normalisee() {
+        assert_eq!(
+            mac_depuis_nom_raop("800A805D4DEE@DMP-A8").as_deref(),
+            Some("80:0A:80:5D:4D:EE")
+        );
+        // Pas de préfixe MAC : rien à inventer.
+        assert_eq!(mac_depuis_nom_raop("Mac Studio"), None);
+        assert_eq!(mac_depuis_nom_raop("pasunemac@Salon"), None);
+    }
+
+    #[test]
+    fn une_enceinte_vue_en_raop_et_airplay_reste_un_seul_appareil() {
+        // Le cœur de #197 : `_raop` résolu sur une adresse, `_airplay` sur une
+        // autre — même MAC, donc même enceinte. Avant, la comparaison ne
+        // portait que sur l'adresse et fabriquait deux sorties « SALON ».
+        let stocke = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        let nouveau = appareil(
+            "airplay-2a02:842a::17bc-7000",
+            "2a02:842a:3cca:d601:1d57:b33:38e8:17bc",
+            Some("800A805D4DEE"), // graphie du nom RAOP, sans séparateurs
+            OutputType::Airplay,
+        );
+        // L'adresse stockée (IPv4) vaut mieux que l'annonce (IPv6) : on jette.
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            DoublonAirplay::Ignorer
+        );
+    }
+
+    #[test]
+    fn une_ipv4_tardive_repare_l_appareil_ancre_sur_une_ipv6() {
+        // L'erreur du terrain (#197) : « airplay connect 2a02:…:7000: Network
+        // is unreachable (os error 101) ». L'appareil retenu est ancré sur une
+        // IPv6 que Docker ne route pas ; quand l'autre service apporte enfin
+        // l'IPv4, il faut REPRENDRE l'appareil en place — même identifiant,
+        // donc même zone — et non jeter l'annonce.
+        let stocke = appareil(
+            "airplay-2a02:842a:3cca:d601:1d57:b33:38e8:17bc-7000",
+            "2a02:842a:3cca:d601:1d57:b33:38e8:17bc",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        let nouveau = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            DoublonAirplay::Reprendre {
+                id_retenu: stocke.id.clone()
+            }
+        );
+    }
+
+    #[test]
+    fn les_deux_enceintes_d_une_paire_restent_deux_appareils() {
+        // Deux MAC différentes, deux adresses différentes : rien ne permet de
+        // les confondre, même si elles portent le même nom (« SALON »).
+        let gauche = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        let droite = appareil(
+            "airplay-80:0A:80:5D:4D:F0",
+            "192.168.1.51",
+            Some("80:0A:80:5D:4D:F0"),
+            OutputType::Airplay,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&gauche].into_iter(), &droite),
+            DoublonAirplay::Nouveau
+        );
+    }
+
+    #[test]
+    fn le_dedoublonnage_par_adresse_est_conserve() {
+        // Comportement historique : même hôte, identifiants différents
+        // (`_raop` sans TXT deviceid contre `_airplay` avec) → doublon.
+        let stocke = appareil(
+            "airplay-192.168.1.50-7000",
+            "192.168.1.50",
+            None,
+            OutputType::Airplay,
+        );
+        let nouveau = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&stocke].into_iter(), &nouveau),
+            DoublonAirplay::Ignorer
+        );
+    }
+
+    #[test]
+    fn un_appareil_d_un_autre_protocole_ne_compte_pas_comme_doublon() {
+        // La zone DLNA « Salon » du même hôte n'est pas un doublon AirPlay.
+        let dlna = appareil(
+            "dlna-192.168.1.50-1400",
+            "192.168.1.50",
+            None,
+            OutputType::Dlna,
+        );
+        let nouveau = appareil(
+            "airplay-80:0A:80:5D:4D:EE",
+            "192.168.1.50",
+            Some("80:0A:80:5D:4D:EE"),
+            OutputType::Airplay,
+        );
+        assert_eq!(
+            verdict_doublon_airplay([&dlna].into_iter(), &nouveau),
+            DoublonAirplay::Nouveau
+        );
     }
 
     #[test]
