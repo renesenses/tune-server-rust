@@ -650,6 +650,132 @@ impl SuiteDuScan {
         })
     }
 }
+
+/// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
+/// consommateurs du rapport de fin de scan (#2012).
+///
+/// Ces trois consommateurs sont :
+///
+/// | consommateur | forme | lu par |
+/// |---|---|---|
+/// | réglage `scan_result` | `settings.set("scan_result", …)` | `GET /scan/status` |
+/// | bus d'événements | `library.scan.completed` | le bandeau de fin de scan |
+/// | fichier de rapport | `<db>-scan-report.json` | `GET /scan/report` |
+///
+/// Ils étaient trois `json!` d'une vingtaine de clés, recopiés à la main. Le
+/// mode d'échec est silencieux par construction : ajouter une clé à deux
+/// exemplaires sur trois ne casse aucune compilation et ne fait échouer aucun
+/// test fonctionnel — le champ manque simplement chez un consommateur, et
+/// personne ne s'en aperçoit avant de chercher pourquoi une information
+/// « qu'on envoie pourtant » n'arrive pas. C'est arrivé trois fois :
+///
+/// - `skipped_unsupported_by_ext` et `skipped_unsupported_reasons` (#1763),
+///   dans le seul fichier de rapport — écart VOULU, voir
+///   [`ChiffresDeFinDeScan::rapport_du_fichier`] ;
+/// - `metadata_failed`, dans `scan_result` et le fichier mais PAS sur le bus —
+///   écart non voulu, jamais décidé, résorbé ici en publiant la clé partout ;
+/// - `removed` (#2146), qui ne figurait dans aucun des trois.
+///
+/// Ce type ne DÉCIDE rien : il nomme les chiffres et les met en forme. Les
+/// émissions dégradées de `library.scan.completed` (sorties d'échec précoces,
+/// annulation) ne passent pas par ici — leur charge utile réduite est voulue,
+/// et les uniformiser les rendrait indiscernables d'un scan abouti.
+pub(crate) struct ChiffresDeFinDeScan<'a> {
+    pub(crate) total_discovered: usize,
+    pub(crate) missing_dirs: &'a [String],
+    pub(crate) missing_dir_reasons: &'a [String],
+    pub(crate) error_dirs: &'a [String],
+    /// Ce que la purge a effectivement retiré : le client lit cette clé pour
+    /// le bandeau de fin de scan (#2146).
+    pub(crate) pistes_supprimees: i64,
+    pub(crate) racines_videes: &'a [String],
+    pub(crate) sous_arbres_proteges: &'a [String],
+    pub(crate) pistes_protegees: i64,
+    pub(crate) pistes_hors_perimetre: i64,
+    /// Le plafond volumétrique a-t-il refusé, et sur quel nombre ? C'est ce
+    /// nombre qu'il faut renvoyer dans `?confirm_purge=` pour autoriser la
+    /// purge. 0 = pas de refus. Sans ça, le refus n'existe que dans les logs :
+    /// l'utilisateur ne peut pas connaître le geste à faire.
+    pub(crate) purge_refusee_candidats: i64,
+    pub(crate) scan_stats: &'a tune_core::scanner::walker::ScanStats,
+    pub(crate) inserted: i64,
+    pub(crate) updated: i64,
+    pub(crate) skipped: i64,
+    pub(crate) skipped_unchanged: i64,
+    pub(crate) skipped_duplicate: i64,
+    pub(crate) skipped_no_metadata: i64,
+    pub(crate) skipped_unsupported: i64,
+    pub(crate) db_insert_failed: i64,
+    pub(crate) db_update_failed: i64,
+    pub(crate) artwork_extracted: i64,
+    /// Le sort de la passe d'enrichissement (#2507) — [`SuiteDuScan::rapport`].
+    pub(crate) auto_enrichment: Value,
+    /// Fichiers audio rencontrés mais dont Tune ne lit pas le format, comptés
+    /// par extension (`{"mpc": 280, "cue": 132}`) — #1763.
+    pub(crate) skipped_by_ext: &'a std::collections::HashMap<String, usize>,
+    /// Motif lisible associé à chaque compteur ci-dessus.
+    pub(crate) skipped_reasons: &'a std::collections::HashMap<String, String>,
+}
+
+impl ChiffresDeFinDeScan<'_> {
+    /// Le rapport de fin de scan, tel que le lisent les trois consommateurs.
+    ///
+    /// Une seule vérité : `scan_result` et `library.scan.completed` le
+    /// publient tel quel, le fichier de `/scan/report` l'étend de deux clés
+    /// (voir [`Self::rapport_du_fichier`]). Toute clé ajoutée ici arrive donc
+    /// chez les trois d'un coup — c'est tout l'objet de ce type.
+    pub(crate) fn rapport(&self) -> Value {
+        json!({
+            "total_files": self.total_discovered,
+            "missing_dirs": self.missing_dirs,
+            "missing_dir_reasons": self.missing_dir_reasons,
+            "error_dirs": self.error_dirs,
+            "removed": self.pistes_supprimees,
+            "emptied_roots": self.racines_videes,
+            "protected_subtrees": self.sous_arbres_proteges,
+            "tracks_protected": self.pistes_protegees,
+            "tracks_out_of_scope": self.pistes_hors_perimetre,
+            "purge_refused": self.purge_refusee_candidats > 0,
+            "purge_refused_candidates": self.purge_refusee_candidats,
+            "parsed": self.scan_stats.total_files,
+            "metadata_ok": self.scan_stats.metadata_ok,
+            // Manquait sur le bus d'événements, et sur lui seul. Aucune
+            // décision ne l'en avait écarté : une recopie a sauté la ligne.
+            "metadata_failed": self.scan_stats.metadata_failed,
+            "metadata_timeout": self.scan_stats.metadata_timeout,
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "skipped": self.skipped,
+            "skipped_unchanged": self.skipped_unchanged,
+            "skipped_duplicate": self.skipped_duplicate,
+            "skipped_no_metadata": self.skipped_no_metadata,
+            "skipped_unsupported": self.skipped_unsupported,
+            "db_insert_failed": self.db_insert_failed,
+            "db_update_failed": self.db_update_failed,
+            "artwork_extracted": self.artwork_extracted,
+            "auto_enrichment": self.auto_enrichment,
+            "failed_paths": self.scan_stats.failed_paths,
+        })
+    }
+
+    /// Le rapport écrit dans `<db>-scan-report.json`, lu par `GET /scan/report`.
+    ///
+    /// Seul écart légitime avec [`Self::rapport`] : l'inventaire des formats
+    /// non lus (#1763). Presque toujours vide ; quand il ne l'est pas, c'est
+    /// la seule chose qui explique à l'utilisateur pourquoi des albums
+    /// manquent, au lieu de le laisser chercher un bug de scanner. Il tient
+    /// dans un fichier qu'on va chercher, pas dans un réglage relu à chaque
+    /// `/scan/status` ni dans un événement diffusé à tous les clients.
+    pub(crate) fn rapport_du_fichier(&self) -> Value {
+        let mut rapport = self.rapport();
+        rapport["skipped_unsupported_by_ext"] = json!(self.skipped_by_ext);
+        // Motif lisible associé à chaque compteur. Additif pour les clients
+        // existants qui ne connaissent que `skipped_unsupported_by_ext`.
+        rapport["skipped_unsupported_reasons"] = json!(self.skipped_reasons);
+        rapport
+    }
+}
+
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -1809,127 +1935,52 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "scan_and_import_complete"
         );
 
+        // UNE seule construction pour les trois consommateurs (#2012). Les
+        // trois `json!` recopiés à la main qui vivaient ici avaient déjà
+        // divergé : `metadata_failed` manquait sur le bus d'événements, et
+        // `skipped_unsupported_by_ext` n'existait que dans le fichier.
+        //
+        // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi, est publié
+        // par `purge_refused*` — voir `ChiffresDeFinDeScan`.
+        let chiffres = ChiffresDeFinDeScan {
+            total_discovered,
+            missing_dirs: &missing_dirs,
+            missing_dir_reasons: &missing_dir_reasons,
+            error_dirs: &error_dirs,
+            pistes_supprimees,
+            racines_videes: &racines_videes,
+            sous_arbres_proteges: &sous_arbres_proteges,
+            pistes_protegees,
+            pistes_hors_perimetre,
+            purge_refusee_candidats,
+            scan_stats: &scan_stats,
+            inserted,
+            updated,
+            skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
+            skipped_unsupported,
+            db_insert_failed,
+            db_update_failed,
+            artwork_extracted,
+            auto_enrichment: suite_du_scan.rapport(),
+            skipped_by_ext: &skipped_by_ext,
+            skipped_reasons: &skipped_reasons,
+        };
+        let rapport_scan = chiffres.rapport();
+
         settings
-            .set(
-                "scan_result",
-                &json!({
-                    "total_files": total_discovered,
-                    "missing_dirs": missing_dirs.clone(),
-                    "missing_dir_reasons": missing_dir_reasons.clone(),
-                    "error_dirs": error_dirs.clone(),
-                    // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi.
-                    // (Ces quatre clés étaient écrites DEUX fois — deux
-                    // sessions ont ajouté le même bloc ; `json!` gardait
-                    // silencieusement la dernière.)
-                    // Ce que la purge a effectivement retiré. Le client lit
-                    // cette clé pour le bandeau de fin de scan (#2146).
-                    "removed": pistes_supprimees,
-                    "emptied_roots": racines_videes.clone(),
-                    "protected_subtrees": sous_arbres_proteges.clone(),
-                    "tracks_protected": pistes_protegees,
-                    "tracks_out_of_scope": pistes_hors_perimetre,
-                    // Le plafond volumétrique a-t-il refusé, et sur quel
-                    // nombre ? C'est ce nombre qu'il faut renvoyer dans
-                    // `?confirm_purge=` pour autoriser la purge. 0 = pas de
-                    // refus. Sans ça, le refus n'existe que dans les logs :
-                    // l'utilisateur ne peut pas connaître le geste à faire.
-                    "purge_refused": purge_refusee_candidats > 0,
-                    "purge_refused_candidates": purge_refusee_candidats,
-                    "parsed": scan_stats.total_files,
-                    "metadata_ok": scan_stats.metadata_ok,
-                    "metadata_failed": scan_stats.metadata_failed,
-                    "metadata_timeout": scan_stats.metadata_timeout,
-                    "inserted": inserted,
-                    "updated": updated,
-                    "skipped": skipped,
-                    "skipped_unchanged": skipped_unchanged,
-                    "skipped_duplicate": skipped_duplicate,
-                    "skipped_no_metadata": skipped_no_metadata,
-                    "skipped_unsupported": skipped_unsupported,
-                    "db_insert_failed": db_insert_failed,
-                    "db_update_failed": db_update_failed,
-                    "artwork_extracted": artwork_extracted,
-                    "auto_enrichment": suite_du_scan.rapport(),
-                    "failed_paths": scan_stats.failed_paths,
-                })
-                .to_string(),
-            )
+            .set("scan_result", &rapport_scan.to_string())
             .ok();
 
-        event_bus.emit(
-            "library.scan.completed",
-            json!({
-                "total_files": total_discovered,
-                "missing_dirs": missing_dirs.clone(),
-                "missing_dir_reasons": missing_dir_reasons.clone(),
-                "error_dirs": error_dirs.clone(),
-                "removed": pistes_supprimees,
-                "emptied_roots": racines_videes.clone(),
-                "protected_subtrees": sous_arbres_proteges.clone(),
-                "tracks_protected": pistes_protegees,
-                "tracks_out_of_scope": pistes_hors_perimetre,
-                "purge_refused": purge_refusee_candidats > 0,
-                "purge_refused_candidates": purge_refusee_candidats,
-                "parsed": scan_stats.total_files,
-                "metadata_ok": scan_stats.metadata_ok,
-                "metadata_timeout": scan_stats.metadata_timeout,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "skipped_unchanged": skipped_unchanged,
-                "skipped_duplicate": skipped_duplicate,
-                "skipped_no_metadata": skipped_no_metadata,
-                "skipped_unsupported": skipped_unsupported,
-                "db_insert_failed": db_insert_failed,
-                "db_update_failed": db_update_failed,
-                "artwork_extracted": artwork_extracted,
-                "auto_enrichment": suite_du_scan.rapport(),
-                "failed_paths": scan_stats.failed_paths,
-            }),
-        );
+        event_bus.emit("library.scan.completed", rapport_scan);
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
         // Write scan report JSON for the /scan/report endpoint
-        let report = serde_json::json!({
-            "total_files": total_discovered,
-            "missing_dirs": missing_dirs.clone(),
-            "missing_dir_reasons": missing_dir_reasons.clone(),
-            "error_dirs": error_dirs.clone(),
-            "removed": pistes_supprimees,
-            "emptied_roots": racines_videes.clone(),
-            "protected_subtrees": sous_arbres_proteges.clone(),
-            "tracks_protected": pistes_protegees,
-            "tracks_out_of_scope": pistes_hors_perimetre,
-            "purge_refused": purge_refusee_candidats > 0,
-            "purge_refused_candidates": purge_refusee_candidats,
-            "parsed": scan_stats.total_files,
-            "metadata_ok": scan_stats.metadata_ok,
-            "metadata_failed": scan_stats.metadata_failed,
-            "metadata_timeout": scan_stats.metadata_timeout,
-            "inserted": inserted,
-            "updated": updated,
-            "skipped": skipped,
-            "skipped_unchanged": skipped_unchanged,
-            "skipped_duplicate": skipped_duplicate,
-            "skipped_no_metadata": skipped_no_metadata,
-            "skipped_unsupported": skipped_unsupported,
-            "db_insert_failed": db_insert_failed,
-            "db_update_failed": db_update_failed,
-            "artwork_extracted": artwork_extracted,
-            "auto_enrichment": suite_du_scan.rapport(),
-            "failed_paths": scan_stats.failed_paths,
-            // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
-            // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
-            // vide ; quand il ne l'est pas, c'est la seule chose qui explique à
-            // l'utilisateur pourquoi des albums manquent, au lieu de le laisser
-            // chercher un bug de scanner (#1763).
-            "skipped_unsupported_by_ext": skipped_by_ext,
-            // Motif lisible associé à chaque compteur. Additif pour les clients
-            // existants qui ne connaissent que `skipped_unsupported_by_ext`.
-            "skipped_unsupported_reasons": skipped_reasons,
-        });
+        let report = chiffres.rapport_du_fichier();
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
@@ -3194,91 +3245,237 @@ mod tests {
     }
 }
 
-/// Garde-fou : le rapport de fin de scan est construit QUATRE fois, et les
-/// quatre doivent publier ce que la purge a retiré.
+/// Le rapport de fin de scan complet n'est plus construit qu'UNE fois (#2012).
 ///
-/// Le bandeau de fin de scan annonçait « 0 supprimés » quoi que la purge ait
-/// fait : le client lit `d.removed`, et aucune des constructions du rapport
-/// n'envoyait cette clé (#2146). Le compte existait pourtant — il mourait avec
-/// le bloc qui le calculait.
+/// Il l'était trois : `scan_result`, `library.scan.completed` et le fichier de
+/// `/scan/report` étaient trois `json!` d'une vingtaine de clés recopiés à la
+/// main. Ils avaient déjà divergé trois fois — `removed` (#2146) absent des
+/// trois, `metadata_failed` absent du seul bus, `skipped_unsupported_by_ext`
+/// (#1763) présent dans le seul fichier.
 ///
-/// Ces constructions ne sont reliées par rien de mécanique : ce sont quatre
-/// `json!` recopiés à la main, et ils ont DÉJÀ divergé une fois
-/// (`skipped_unsupported_by_ext`, qui n'existe que dans un seul — #2012).
-/// Ajouter une clé à trois d'entre eux et pas au quatrième ne casse aucune
-/// compilation et ne fait échouer aucun test fonctionnel : le champ manque
-/// simplement chez un consommateur, en silence. D'où ce test, sur le modèle de
-/// `tests/smb_dialect_seam.rs`.
-///
-/// Le quatrième exemplaire est celui du scan AUTOMATIQUE (`auto_scan.rs`) :
-/// l'issue ne le comptait pas parmi les trois, mais il purge (`pruned`) et il
-/// émet `library.scan.completed`, donc il alimente le même bandeau.
+/// Ces tests jugent la construction elle-même, pas le texte du fichier : ils
+/// comparent ce que les trois consommateurs reçoivent réellement. Le garde-fou
+/// textuel qui les précédait n'a plus lieu d'être ici — il ne reste qu'un
+/// exemplaire écrit à la main, celui du scan AUTOMATIQUE (`auto_scan.rs`), et
+/// c'est lui seul que le dernier test surveille.
 #[cfg(test)]
-mod rapport_de_scan_publie_la_purge {
+mod rapport_de_fin_de_scan {
+    use super::{ChiffresDeFinDeScan, SuiteDuScan};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
-    /// Une clé de rapport, sous sa forme littérale exacte. `"removed"` tout
-    /// court apparaît aussi dans les noms d'événements de journal
-    /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait passer
-    /// le test sans qu'aucune clé soit publiée.
-    const CLE_PURGE: &str = "\"removed\":";
-
-    /// Présent dans les quatre rapports, et nulle part ailleurs : sert à
-    /// reconnaître un rapport de fin de scan sans compter d'accolades.
-    const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
-
-    fn source(chemin: &str) -> String {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(chemin);
-        fs::read_to_string(&p).unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()))
+    /// Des chiffres tous DISTINCTS : un rapport qui rangerait deux compteurs
+    /// sous la mauvaise clé passerait inaperçu si tout valait zéro.
+    fn chiffres(stats: &tune_core::scanner::walker::ScanStats) -> ChiffresDeFinDeScan<'_> {
+        // Fuites volontaires : ces `Box::leak` durent le temps du test et
+        // évitent d'écrire une structure porteuse rien que pour tenir les
+        // emprunts.
+        let missing: &[String] = Box::leak(Box::new(["/Volumes/absent".to_string()]));
+        let raisons: &[String] = Box::leak(Box::new(["not mounted".to_string()]));
+        let erreurs: &[String] = Box::leak(Box::new(["/Volumes/erreur".to_string()]));
+        let racines: &[String] = Box::leak(Box::new(["/Volumes/vidée".to_string()]));
+        let proteges: &[String] = Box::leak(Box::new(["/Volumes/protégé".to_string()]));
+        let par_ext: &HashMap<String, usize> =
+            Box::leak(Box::new(HashMap::from([("mpc".to_string(), 280usize)])));
+        let motifs: &HashMap<String, String> = Box::leak(Box::new(HashMap::from([(
+            "mpc".to_string(),
+            "format non pris en charge".to_string(),
+        )])));
+        ChiffresDeFinDeScan {
+            total_discovered: 1_651,
+            missing_dirs: missing,
+            missing_dir_reasons: raisons,
+            error_dirs: erreurs,
+            pistes_supprimees: 41,
+            racines_videes: racines,
+            sous_arbres_proteges: proteges,
+            pistes_protegees: 7,
+            pistes_hors_perimetre: 13,
+            purge_refusee_candidats: 900,
+            scan_stats: stats,
+            inserted: 101,
+            updated: 102,
+            skipped: 103,
+            skipped_unchanged: 104,
+            skipped_duplicate: 105,
+            skipped_no_metadata: 106,
+            skipped_unsupported: 107,
+            db_insert_failed: 108,
+            db_update_failed: 109,
+            artwork_extracted: 110,
+            auto_enrichment: SuiteDuScan::decider(true, true).rapport(),
+            skipped_by_ext: par_ext,
+            skipped_reasons: motifs,
+        }
     }
 
-    /// Le corps du `json!` qui précède le marqueur, commentaires ÔTÉS.
+    fn stats_de_scan() -> tune_core::scanner::walker::ScanStats {
+        tune_core::scanner::walker::ScanStats {
+            total_files: 1_600,
+            metadata_ok: 1_500,
+            metadata_failed: 60,
+            metadata_timeout: 40,
+            failed_paths: vec!["/Volumes/musique/piste.flac".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// Le cœur de #2012 : les trois consommateurs lisent le MÊME rapport.
     ///
-    /// Les commentaires nomment le défaut corrigé — « le client lit
-    /// `d.removed` » — et raconter l'histoire ne doit pas suffire à faire
-    /// passer le test. Seul le code compte.
-    fn corps_du_rapport(texte: &str, fin: usize) -> String {
-        let debut = texte[..fin]
-            .rfind("json!(")
-            .expect("un rapport doit être construit par un json!(");
-        texte[debut..fin]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// `scan_result` et `library.scan.completed` reçoivent la valeur telle
+    /// quelle ; le fichier de `/scan/report` l'étend. Sur les clés communes,
+    /// aucun écart n'est tolérable — c'est exactement ce qui a été perdu trois
+    /// fois par recopie.
+    #[test]
+    fn les_trois_consommateurs_recoivent_le_meme_rapport() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+
+        // Ce que reçoivent les trois, dans leur forme réelle.
+        let reglage: serde_json::Value =
+            serde_json::from_str(&c.rapport().to_string()).expect("scan_result est du JSON");
+        let evenement = c.rapport();
+        let fichier = c.rapport_du_fichier();
+
+        assert_eq!(
+            reglage, evenement,
+            "`scan_result` et `library.scan.completed` doivent être identiques (#2012)"
+        );
+
+        let commun = evenement.as_object().expect("un objet");
+        let du_fichier = fichier.as_object().expect("un objet");
+        for (cle, valeur) in commun {
+            assert_eq!(
+                du_fichier.get(cle),
+                Some(valeur),
+                "`{cle}` diverge entre le bus d'événements et le fichier de /scan/report (#2012)"
+            );
+        }
+
+        // Le seul écart, et il est voulu : l'inventaire des formats non lus
+        // (#1763) ne sort que par le fichier. Le test le NOMME, pour qu'un
+        // écart ajouté par mégarde ne se glisse pas dans son ombre.
+        let ajouts: Vec<&String> = du_fichier
+            .keys()
+            .filter(|k| !commun.contains_key(*k))
+            .collect();
+        assert_eq!(
+            ajouts,
+            vec!["skipped_unsupported_by_ext", "skipped_unsupported_reasons"],
+            "seul l'inventaire des formats non lus (#1763) doit distinguer /scan/report"
+        );
     }
 
+    /// Les valeurs sont justes, et rangées sous la bonne clé.
+    ///
+    /// Une factorisation qui intervertirait deux compteurs produirait un
+    /// rapport unique — et faux partout à la fois.
     #[test]
-    fn les_quatre_constructions_du_rapport_publient_la_cle_lue_par_le_client() {
-        let fichiers = ["src/routes/system/scan.rs", "src/auto_scan.rs"];
+    fn les_valeurs_publiees_sont_celles_du_scan() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+        let r = c.rapport_du_fichier();
+
+        assert_eq!(r["total_files"], serde_json::json!(1_651));
+        assert_eq!(r["parsed"], serde_json::json!(1_600));
+        assert_eq!(r["metadata_ok"], serde_json::json!(1_500));
+        // Manquait sur le bus d'événements, et sur lui seul, avant #2012.
+        assert_eq!(r["metadata_failed"], serde_json::json!(60));
+        assert_eq!(r["metadata_timeout"], serde_json::json!(40));
+        // Le bandeau de fin de scan lit `removed` (#2146).
+        assert_eq!(r["removed"], serde_json::json!(41));
+        assert_eq!(r["emptied_roots"], serde_json::json!(["/Volumes/vidée"]));
+        assert_eq!(
+            r["protected_subtrees"],
+            serde_json::json!(["/Volumes/protégé"])
+        );
+        assert_eq!(r["tracks_protected"], serde_json::json!(7));
+        assert_eq!(r["tracks_out_of_scope"], serde_json::json!(13));
+        // Le nombre à renvoyer dans `?confirm_purge=` (#1943).
+        assert_eq!(r["purge_refused"], serde_json::json!(true));
+        assert_eq!(r["purge_refused_candidates"], serde_json::json!(900));
+        assert_eq!(r["inserted"], serde_json::json!(101));
+        assert_eq!(r["updated"], serde_json::json!(102));
+        assert_eq!(r["skipped"], serde_json::json!(103));
+        assert_eq!(r["skipped_unchanged"], serde_json::json!(104));
+        assert_eq!(r["skipped_duplicate"], serde_json::json!(105));
+        assert_eq!(r["skipped_no_metadata"], serde_json::json!(106));
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+        assert_eq!(r["db_insert_failed"], serde_json::json!(108));
+        assert_eq!(r["db_update_failed"], serde_json::json!(109));
+        assert_eq!(r["artwork_extracted"], serde_json::json!(110));
+        assert_eq!(r["auto_enrichment"]["started"], serde_json::json!(true));
+        assert_eq!(r["missing_dirs"], serde_json::json!(["/Volumes/absent"]));
+        assert_eq!(r["missing_dir_reasons"], serde_json::json!(["not mounted"]));
+        assert_eq!(r["error_dirs"], serde_json::json!(["/Volumes/erreur"]));
+        assert_eq!(
+            r["failed_paths"],
+            serde_json::json!(["/Volumes/musique/piste.flac"])
+        );
+        assert_eq!(
+            r["skipped_unsupported_by_ext"],
+            serde_json::json!({"mpc": 280})
+        );
+        assert_eq!(
+            r["skipped_unsupported_reasons"],
+            serde_json::json!({"mpc": "format non pris en charge"})
+        );
+    }
+
+    /// Il ne reste qu'UNE construction manuscrite : celle du scan automatique.
+    ///
+    /// `auto_scan.rs` publie son propre rapport — moins de clés, d'autres
+    /// variables — et il émet lui aussi `library.scan.completed`, donc il
+    /// alimente le même bandeau. Il doit porter `removed` (#2146). Ce garde-fou
+    /// vérifie aussi qu'il n'y a plus qu'un exemplaire à surveiller : si un
+    /// second réapparaissait dans `scan.rs`, le compte le dirait.
+    #[test]
+    fn une_seule_construction_manuscrite_subsiste_et_elle_publie_la_purge() {
+        /// La clé, sous sa forme littérale exacte. `"removed"` tout court
+        /// apparaît aussi dans les noms d'événements de journal
+        /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait
+        /// passer le test sans qu'aucune clé soit publiée.
+        const CLE_PURGE: &str = "\"removed\":";
+        /// Présent dans tout rapport de fin de scan, et nulle part ailleurs.
+        const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
+
         let mut examines = 0usize;
-        for fichier in fichiers {
-            let texte = source(fichier);
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
             let mut depuis = 0usize;
             while let Some(rel) = texte[depuis..].find(MARQUEUR_RAPPORT) {
                 let fin = depuis + rel;
                 examines += 1;
-                let corps = corps_du_rapport(&texte, fin);
+                let debut = texte[..fin]
+                    .rfind("json!(")
+                    .expect("un rapport doit être construit par un json!(");
+                // Commentaires ôtés : raconter l'histoire du défaut ne doit
+                // pas suffire à faire passer le test.
+                let corps = texte[debut..fin]
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 assert!(
                     corps.contains(CLE_PURGE),
                     "{fichier} : la construction de rapport n° {examines} ne publie pas \
-                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan. \
-                     Un rapport qui ne l'envoie pas fait annoncer « 0 supprimés » quoi que la \
-                     purge ait fait (#2146). Les quatre constructions doivent porter la clé \
-                     (#2012)."
+                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan (#2146)."
                 );
                 depuis = fin + MARQUEUR_RAPPORT.len();
             }
         }
         // Contrôle positif : sans lui, un marqueur renommé ferait passer le
-        // test en n'examinant RIEN. Quatre, c'est `scan_result`,
-        // `library.scan.completed`, `/scan/report`, et le rapport du scan
-        // automatique.
+        // test en n'examinant RIEN. Deux, c'est la construction unique de
+        // `ChiffresDeFinDeScan::rapport` et celle du scan automatique. Un
+        // troisième compte signale une recopie réintroduite (#2012).
         assert_eq!(
-            examines, 4,
-            "quatre constructions de rapport attendues, {examines} trouvée(s) — le marqueur \
-             {MARQUEUR_RAPPORT} a dû être renommé, ou un exemplaire ajouté/supprimé"
+            examines, 2,
+            "deux constructions attendues (la source unique de scan.rs et celle d'auto_scan.rs), \
+             {examines} trouvée(s) — le marqueur {MARQUEUR_RAPPORT} a dû être renommé, ou une \
+             recopie manuelle réintroduite (#2012)"
         );
     }
 }
@@ -3785,63 +3982,36 @@ mod suite_du_scan_apres_scan {
     }
 }
 
-/// La clé doit être dans les TROIS rapports de fin de scan complet.
+/// Le sort de la passe d'enrichissement est publié — #2507.
 ///
-/// `scan_result` (lu par `/scan/status`), `library.scan.completed` (le bandeau
-/// de fin de scan) et le fichier de `/scan/report` sont trois `json!` recopiés
-/// à la main. Ils ont déjà divergé deux fois — `skipped_unsupported_by_ext`
-/// (#2012) puis `removed` (#2146) — et une clé posée dans deux d'entre eux sur
-/// trois ne casse aucune compilation : elle manque simplement chez un
-/// consommateur, en silence. Même garde que
-/// `rapport_de_scan_publie_la_purge`, sur la clé de #2507.
+/// Sans cette clé, une installation sans licence scanne, ne voit aucune
+/// vignette d'artiste, et rien ne lui dit que la passe n'a pas eu lieu.
+///
+/// Ce test était un garde-fou textuel comptant TROIS `json!` recopiés à la
+/// main ; il n'y en a plus qu'un (#2012), et la clé se vérifie désormais sur
+/// la valeur construite plutôt que sur le texte du fichier.
 #[cfg(test)]
 mod rapport_de_scan_publie_le_sort_de_lenrichissement {
-    use std::fs;
-    use std::path::PathBuf;
+    use super::SuiteDuScan;
 
-    /// La clé, sous sa forme littérale exacte. `auto_enrichment` tout court
-    /// apparaît aussi dans le nom de l'événement de journal
-    /// (`auto_enrichment_after_scan_skipped`) : chercher le mot nu ferait
-    /// passer le test sans qu'aucun rapport ne publie quoi que ce soit.
-    const CLE: &str = "\"auto_enrichment\": suite_du_scan.rapport(),";
-    /// Dernière clé commune aux trois rapports, et postérieure à celle-ci :
-    /// borne la portion de texte examinée.
-    const MARQUEUR: &str = "\"failed_paths\": scan_stats.failed_paths,";
-
+    /// Les trois motifs de `SuiteDuScan` traversent le rapport intacts.
     #[test]
-    fn les_trois_rapports_du_scan_complet_publient_la_cle() {
-        let chemin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/routes/system/scan.rs");
-        let texte = fs::read_to_string(&chemin)
-            .unwrap_or_else(|e| panic!("lecture de {} : {e}", chemin.display()));
-        let mut examines = 0usize;
-        let mut depuis = 0usize;
-        while let Some(rel) = texte[depuis..].find(MARQUEUR) {
-            let fin = depuis + rel;
-            examines += 1;
-            let debut = texte[..fin]
-                .rfind("json!(")
-                .expect("un rapport doit être construit par un json!(");
-            let corps = texte[debut..fin]
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                corps.contains(CLE),
-                "rapport n° {examines} : {CLE} manque.\nSans cette clé, une \
-                 installation sans licence scanne, ne voit aucune vignette \
-                 d'artiste, et rien ne lui dit que la passe n'a pas eu lieu \
-                 (#2507)."
+    fn le_rapport_porte_le_sort_de_la_passe() {
+        for (sous_licence, reglage, motif) in [
+            (true, true, None),
+            (true, false, Some("disabled_by_setting")),
+            (false, true, Some("premium_required")),
+        ] {
+            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport();
+            assert_eq!(bloc["started"], serde_json::json!(motif.is_none()));
+            assert_eq!(
+                bloc["skipped_reason"],
+                match motif {
+                    Some(m) => serde_json::json!(m),
+                    None => serde_json::Value::Null,
+                },
+                "le motif doit rester lisible par le client (#2507)"
             );
-            depuis = fin + MARQUEUR.len();
         }
-        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
-        // test en n'examinant RIEN. Trois, c'est `scan_result`,
-        // `library.scan.completed` et le fichier de `/scan/report`.
-        assert_eq!(
-            examines, 3,
-            "trois rapports attendus, {examines} trouvé(s) — le marqueur \
-             {MARQUEUR} a dû être renommé, ou un exemplaire ajouté/supprimé"
-        );
     }
 }
