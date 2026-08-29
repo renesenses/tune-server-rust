@@ -54,6 +54,15 @@ const IDLE_SLEEP_SECS: u64 = 900;
 /// est repris tout seul.
 const PATH_UNRESOLVED_KEY: &str = "rg_path_unresolved";
 
+/// Provenance of values computed by Tune. The legacy `rg_analyzed` sentinel
+/// only says that a decode attempt reached a terminal state; it is deliberately
+/// absent for a deferred ENOENT (#1865), and therefore must not double as a
+/// result/provenance marker. A versioned key makes the next algorithm upgrade
+/// able to invalidate Tune values without guessing from that sentinel again.
+const TRACK_ANALYSIS_VERSION_KEY: &str = "rg_track_analysis_version";
+const ALBUM_ANALYSIS_VERSION_KEY: &str = "rg_album_analysis_version";
+const TRUE_PEAK_ANALYSIS_VERSION: &str = "bs1770-5-true-peak-v1";
+
 /// Ceiling on the ESTIMATED decoded footprint of one track before analysis.
 ///
 /// `measure_loudness_and_peak` holds the whole track twice: the decoder's
@@ -620,6 +629,11 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
+                let _ = repo.set(
+                    track_id,
+                    TRACK_ANALYSIS_VERSION_KEY,
+                    TRUE_PEAK_ANALYSIS_VERSION,
+                );
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -687,8 +701,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
 /// track peak. Written to EVERY track of the album (ReplayGain album tags are
 /// per-track).
 pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
-    // An album that has track gains but no album gain yet. One at a time keeps
-    // it cheap (pure arithmetic, no decode) and interleaved with the track pass.
+    // An album that has track gains but no album gain yet. Do not aggregate a
+    // partially re-analysed album: after the true-peak migration a track can
+    // temporarily have neither a gain nor a terminal sentinel, and computing
+    // at that point would freeze an album peak from only a subset of tracks.
+    // A deferred path (#1865) also has neither marker, so it blocks instead of
+    // silently producing a partial album result.
     let album_row = backend
         .query_one(
             "SELECT t.album_id FROM tracks t \
@@ -696,6 +714,12 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
              WHERE t.album_id IS NOT NULL \
                AND NOT EXISTS (SELECT 1 FROM track_metadata a \
                      WHERE a.track_id = t.id AND a.key = 'rg_album_gain') \
+               AND NOT EXISTS (SELECT 1 FROM tracks pending \
+                     WHERE pending.album_id = t.album_id \
+                       AND NOT EXISTS (SELECT 1 FROM track_metadata pg \
+                             WHERE pg.track_id = pending.id AND pg.key = 'rg_track_gain') \
+                       AND NOT EXISTS (SELECT 1 FROM track_metadata pa \
+                             WHERE pa.track_id = pending.id AND pa.key = 'rg_analyzed')) \
              LIMIT 1",
             &[],
         )
@@ -760,8 +784,23 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let peak_str = format_peak(peak_max);
 
     for tid in &track_ids {
-        let _ = repo.set(*tid, "rg_album_gain", &gain_str);
-        let _ = repo.set(*tid, "rg_album_peak", &peak_str);
+        // File tags remain authoritative per track. The old implementation
+        // overwrote them whenever another track of the album lacked a value.
+        // Only fill missing fields and mark provenance solely when Tune wrote
+        // at least one of them.
+        let existing = repo.get_all(*tid).unwrap_or_default();
+        let mut computed = false;
+        if !existing.contains_key("rg_album_gain") {
+            let _ = repo.set(*tid, "rg_album_gain", &gain_str);
+            computed = true;
+        }
+        if !existing.contains_key("rg_album_peak") {
+            let _ = repo.set(*tid, "rg_album_peak", &peak_str);
+            computed = true;
+        }
+        if computed {
+            let _ = repo.set(*tid, ALBUM_ANALYSIS_VERSION_KEY, TRUE_PEAK_ANALYSIS_VERSION);
+        }
     }
     info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
     1
@@ -1479,6 +1518,24 @@ mod tests {
     }
 
     #[test]
+    fn true_peak_above_one_attenuates_even_at_zero_db_gain() {
+        let settings = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        };
+        let factor = gain_factor(
+            TrackGain {
+                gain_db: 0.0,
+                peak: Some(1.1),
+            },
+            settings,
+        );
+        assert!((factor - 1.0 / 1.1).abs() < 1e-12, "{factor}");
+        assert!(factor * 1.1 <= 1.0 + 1e-12);
+    }
+
+    #[test]
     fn apply_gain_halves_16bit_samples() {
         let mut pcm = Vec::new();
         for v in [1000i16, -1000, 32767, -32768] {
@@ -2070,5 +2127,55 @@ mod tests {
         w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
         w.extend_from_slice(&donnees);
         std::fs::write(path, w).unwrap();
+    }
+    #[test]
+    fn album_true_peak_attend_toutes_les_pistes_et_preserve_les_tags() {
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms)
+                 VALUES (1, 'Tag', 1, 1, '/tag.flac', 1000),
+                        (2, 'Tune', 1, 1, '/tune.flac', 1000);",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set(MODE_KEY, "album").unwrap();
+        let metadata = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Piste 1 vient du fichier : aucun rg_analyzed, valeurs d'album à
+        // préserver octet pour octet. La piste 2 est encore en attente.
+        metadata.set(1, "rg_track_gain", "-3.00 dB").unwrap();
+        metadata.set(1, "rg_track_peak", "0.800000").unwrap();
+        metadata.set(1, "rg_album_gain", "-4.25 dB").unwrap();
+        metadata.set(1, "rg_album_peak", "0.812345").unwrap();
+        assert_eq!(
+            analyze_album_batch(&backend),
+            0,
+            "un album partiellement analyse ne doit pas etre fige"
+        );
+
+        metadata.set(2, "rg_track_gain", "-6.00 dB").unwrap();
+        metadata.set(2, "rg_track_peak", "1.100000").unwrap();
+        metadata.set(2, "rg_analyzed", "1700000000").unwrap();
+        assert_eq!(analyze_album_batch(&backend), 1);
+
+        let tagged = metadata.get_all(1).unwrap();
+        assert_eq!(tagged["rg_album_gain"], "-4.25 dB");
+        assert_eq!(tagged["rg_album_peak"], "0.812345");
+        assert!(!tagged.contains_key(ALBUM_ANALYSIS_VERSION_KEY));
+
+        let computed = metadata.get_all(2).unwrap();
+        assert!(computed.contains_key("rg_album_gain"));
+        assert_eq!(computed["rg_album_peak"], "1.100000");
+        assert_eq!(
+            computed[ALBUM_ANALYSIS_VERSION_KEY],
+            TRUE_PEAK_ANALYSIS_VERSION
+        );
     }
 }
