@@ -7,17 +7,15 @@ name: Références d'issues
 # mois, au point de faire classer en tete d'un bilan une perte de donnees
 # (#1943) deja reparee.
 #
-# ⚠️ Sur ce depot, AUCUN mot-cle de fermeture ne ferme quoi que ce soit — pas
-# meme en anglais. GitHub n'auto-ferme que sur la branche PAR DEFAUT, et la
-# doctrine impose que tout correctif cible `release/v0.9`. Mesure du 20/08/2026
-# sur 18 PR portant Closes/Fixes fusionnees sur cette branche : 0 fermeture
-# automatique, 18 faites a la main. GitHub n'enregistre meme pas le LIEN —
-# `closingIssuesReferences` rend une liste vide.
+# Un mot-cle reste inerte sur `release/v0.9`, puis devient actif lorsque le tag
+# publie rejoint la branche par defaut. Le 29/08, GitHub a donc ferme #1897 en
+# lisant « does not close #1897 » dans un ancien message de commit : la
+# negation n'annule pas son parseur (#2785).
 #
-# Ce controle ne fait donc pas la police de la langue : ce serait imposer une
-# forme sans effet. Il rassemble ce que la PR declare corriger et rend la
-# commande de fermeture MANUELLE prete a coller, puisque c'est le seul
-# mecanisme qui marche ici. Il n'echoue jamais.
+# Ce controle classe toujours les references et prepare la commande manuelle,
+# mais refuse desormais ces formulations negatives avant qu'elles atteignent
+# main. Il lit le titre/corps filtre ET les messages bruts des commits propres
+# a la PR ; une citation du corps est ignoree, jamais une citation historique.
 #
 # La logique et ses cas de preuve vivent dans scripts/verifier-refs-issues.sh,
 # qui porte son propre --autotest. Il est joue A CHAQUE FOIS, avant l'analyse :
@@ -45,11 +43,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Contre-épreuve du garde-fou
         run: bash scripts/verifier-refs-issues.sh --autotest
 
-      - name: Analyser le corps de la PR
+      - name: Analyser le titre, le corps et les commits propres à la PR
         env:
           # Le corps passe par l'ENVIRONNEMENT, jamais par une interpolation
           # ${{ }} dans `run:` — un corps de PR est du texte fourni par
@@ -57,4 +57,13 @@ jobs:
           # d'y injecter des commandes.
           CORPS: ${{ github.event.pull_request.body }}
           TITRE: ${{ github.event.pull_request.title }}
-        run: printf '%s\n%s\n' "$TITRE" "$CORPS" | bash scripts/verifier-refs-issues.sh
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git cat-file -e "$BASE_SHA^{commit}"
+          git cat-file -e "$HEAD_SHA^{commit}"
+          git log --format='%B%n--- fin du commit ---%n' \
+            "$BASE_SHA..$HEAD_SHA" > "$RUNNER_TEMP/messages-commits"
+          printf '%s\n%s\n' "$TITRE" "$CORPS" \
+            | bash scripts/verifier-refs-issues.sh \
+                --commits "$RUNNER_TEMP/messages-commits"
