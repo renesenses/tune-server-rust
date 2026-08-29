@@ -190,6 +190,33 @@ fn les_runs_obsoletes_de_pr_sont_annules() {
 }
 
 #[test]
+fn chaque_release_prepare_une_pr_du_tag_vers_main_sans_la_fusionner() {
+    let garde = workflow("post-release-main-sync.yml");
+    assert!(garde.contains("workflow_run:"));
+    assert!(garde.contains("workflows: [\"Release\"]"));
+    assert!(garde.contains("types: [completed]"));
+    assert!(garde.contains("github.event.workflow_run.conclusion == 'success'"));
+    assert!(garde.contains("pull-requests: write"));
+    assert!(garde.contains("scripts/synchroniser-release-main.py --self-test"));
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(racine.join("../scripts/synchroniser-release-main.py"))
+        .expect("garde-fou post-release lisible");
+    assert!(script.contains("merge-base"));
+    assert!(script.contains("--is-ancestor"));
+    assert!(script.contains("\"pr\",\n            \"create\""));
+    assert!(script.contains("\"pr\", \"reopen\""));
+    assert!(script.contains("refs/heads/{branche}"));
+    assert!(script.contains("PR créée sans auto-merge"));
+    assert!(!script.contains("git reset"));
+    assert!(!script.contains("push --force"));
+    assert!(!script.contains("pr merge"));
+
+    let ci = workflow("ci.yml");
+    assert!(ci.contains("python3 scripts/synchroniser-release-main.py --self-test"));
+}
+
+#[test]
 fn les_pr_empilees_declenchent_la_ci_rapide() {
     let source = workflow("ci.yml");
     let declencheurs = source
