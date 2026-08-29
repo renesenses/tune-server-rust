@@ -646,6 +646,67 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     collect_recent_logs(q.lines.unwrap_or(1000)).await
 }
 
+#[derive(Deserialize)]
+pub(super) struct RegistreQuery {
+    /// Filtrer sur une passe. Sans ce parametre, tout le registre.
+    task: Option<String>,
+    /// Nombre maximum de lignes rendues. Borne a 500 par le registre.
+    limit: Option<i64>,
+}
+
+/// `GET /system/task-runs` — le registre des executions automatisees (#2080).
+///
+/// Ce que cette route repond, et que rien ne repondait avant : « la passe
+/// a-t-elle tourne, quand, combien de temps, et avec quel resultat ». Le
+/// journal defile et se perd ; `/system/background-tasks` ne connait que le
+/// PRESENT (les taches en cours, en memoire, perdues au redemarrage). Ici,
+/// c'est le PASSE, et il survit au redemarrage.
+///
+/// `boot_id` distingue les incarnations du processus : deux executions de boots
+/// differents ne se confondent pas, et c'est ce qui rend lisible « la passe a
+/// ete interrompue par un redemarrage ».
+///
+/// La reponse ne contient ni chemin, ni cle, ni jeton — des compteurs et des
+/// verdicts. Elle peut donc etre collee telle quelle dans un ticket.
+pub(super) async fn task_runs(
+    State(state): State<AppState>,
+    Query(q): Query<RegistreQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(state.backend.clone());
+    let limite = q.limit.unwrap_or(100);
+
+    let runs = registre.lister(q.task.as_deref(), limite).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    let dernieres = registre.resume().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+
+    Ok(Json(json!({
+        // L'incarnation COURANTE. Une ligne qui ne porte pas ce boot_id vient
+        // d'un demarrage anterieur — c'est la lecture qui evite de prendre une
+        // vieille execution pour l'actuelle.
+        "boot_id": tune_core::db::task_run_repo::boot_id(),
+        // Les passes que le registre sait ecrire aujourd'hui. Une passe de
+        // cette liste ABSENTE de `latest` n'a jamais tourne sur cette
+        // installation ; sans la liste, on ne saurait pas la distinguer d'une
+        // passe qu'on aurait oublie de cabler.
+        "wired_tasks": tune_core::db::task_run_repo::TACHES_CABLEES,
+        "retention": {
+            "runs_per_task": tune_core::db::task_run_repo::RETENTION_EXECUTIONS_PAR_PASSE,
+            "days": tune_core::db::task_run_repo::RETENTION_JOURS,
+        },
+        "latest": dernieres,
+        "runs": runs,
+    })))
+}
+
 /// Collect the most recent server logs (tail): log file first, then
 /// journalctl/syslog (Linux) or stderr files / unified log (macOS). Returns a
 /// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint

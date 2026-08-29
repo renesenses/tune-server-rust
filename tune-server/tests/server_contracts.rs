@@ -13,6 +13,8 @@ mod bump_natifs_android;
 mod collections_ordre_albums;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "favoris_facettes_routes.rs"]
+mod favoris_facettes_routes;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]
@@ -25,6 +27,8 @@ mod licence_grace_visible;
 mod notarisation_bornes;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
+#[path = "paroles_ecriture_fichiers.rs"]
+mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
 #[path = "radios_validation_url.rs"]

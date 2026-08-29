@@ -248,6 +248,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
+    ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     cleanup_orphan_queues(state);
@@ -417,6 +418,49 @@ fn marquer_enrichissements_interrompus(state: &AppState) {
         {
             warn!(cle, error = %e, "enrichissement_drapeau_interrompu_echec");
         }
+    }
+}
+
+/// Rendre le registre des executions automatisees utilisable pour ce
+/// demarrage (#2080).
+///
+/// Deux gestes, dans cet ORDRE, et l'ordre porte le raisonnement :
+///
+/// 1. **Clore les orphelines.** Toute execution que la base croit encore en
+///    cours a ete ecrite par un processus qui n'existe plus — aucune passe ne
+///    survit au processus qui la portait, et etre ici le prouve. C'est le
+///    defaut #2002 transpose : un `running` fige a jamais verrouillait le
+///    bouton de relance sur une passe morte. Ici on ne verrouille rien, mais un
+///    registre qui affirme pour toujours « ca tourne » serait pire qu'un
+///    registre vide.
+/// 2. **Purger par age.** Apres, jamais avant : une orpheline tres ancienne est
+///    d'abord fermee proprement, puis effacee si elle depasse la retention.
+///    Dans l'autre ordre elle disparaitrait sans avoir jamais ete close, et le
+///    nombre de fermetures journalise ne dirait plus la verite.
+///
+/// Ce doit etre le PREMIER contact avec le registre au demarrage : les passes
+/// cablees ouvrent leurs lignes bien apres, depuis `spawn_background_tasks`.
+fn ouvrir_le_registre_des_executions(state: &AppState) {
+    let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(state.backend.clone());
+
+    match registre.clore_orphelines() {
+        Ok(0) => {}
+        Ok(n) => info!(
+            closes = n,
+            boot_id = tune_core::db::task_run_repo::boot_id(),
+            "registre_executions_orphelines_closes — passes que la base croyait encore en cours"
+        ),
+        Err(e) => warn!(error = %e, "registre_executions_cloture_echouee"),
+    }
+
+    match registre.purger_par_age() {
+        Ok(0) => {}
+        Ok(n) => info!(
+            effacees = n,
+            jours = tune_core::db::task_run_repo::RETENTION_JOURS,
+            "registre_executions_purge_par_age"
+        ),
+        Err(e) => warn!(error = %e, "registre_executions_purge_echouee"),
     }
 }
 
@@ -1790,6 +1834,100 @@ mod demarrage_sans_doublon_tests {
             1,
             "le marquage des enrichissements interrompus doit etre appele une \
              fois et une seule dans init_state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod registre_executions_tests {
+    use std::sync::Arc;
+
+    use tune_core::db::backend::{DbBackend, ToSqlValue};
+    use tune_core::db::migrations;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::task_run_repo::{TACHE_SCAN_DEMARRAGE, TaskRunRepo, boot_id};
+
+    /// Le registre doit etre ouvert DANS `init_state` : c'est le demarrage du
+    /// processus qui prouve qu'aucune passe encore inscrite « en cours » ne
+    /// tourne. Appele ailleurs — dans une tache de fond, par exemple — il
+    /// fermerait des passes vivantes ou n'en fermerait aucune.
+    #[test]
+    fn le_registre_est_ouvert_au_demarrage() {
+        let source = include_str!("startup.rs");
+        let init = source
+            .split("pub async fn init_state")
+            .nth(1)
+            .expect("init_state introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de init_state introuvable");
+        assert_eq!(
+            init.matches("ouvrir_le_registre_des_executions").count(),
+            1,
+            "l'ouverture du registre doit etre appelee une fois et une seule \
+             dans init_state"
+        );
+    }
+
+    /// L'ordre porte le raisonnement : clore d'abord, purger ensuite. Purger
+    /// en premier effacerait une orpheline ancienne SANS l'avoir close, et le
+    /// nombre de fermetures journalise ne dirait plus la verite.
+    #[test]
+    fn on_clot_les_orphelines_avant_de_purger_par_age() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split("fn ouvrir_le_registre_des_executions")
+            .nth(1)
+            .expect("fonction introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de fonction introuvable");
+        let cloture = corps.find("clore_orphelines").expect("cloture absente");
+        let purge = corps.find("purger_par_age").expect("purge absente");
+        assert!(
+            cloture < purge,
+            "la cloture des orphelines doit preceder la purge par age"
+        );
+    }
+
+    /// Le chemin complet, bout en bout : une passe que la base croit encore en
+    /// cours au demarrage est close, et le bouton — ou l'ecran — ne reste pas
+    /// suspendu a une passe morte (#2002).
+    #[test]
+    fn une_passe_orpheline_survit_au_redemarrage_puis_est_close() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+
+        // Le processus precedent a ouvert un scan et n'est jamais revenu.
+        db.execute(
+            "INSERT INTO task_runs (boot_id, task, seq, started_at, outcome) \
+             VALUES ('boot-mort', ?, 1, '2026-08-27T22:00:00Z', 'en_cours')",
+            &[&TACHE_SCAN_DEMARRAGE as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        let registre = TaskRunRepo::with_backend(db.clone());
+        assert_eq!(
+            registre.lister(Some(TACHE_SCAN_DEMARRAGE), 1).unwrap()[0].outcome,
+            "en_cours",
+            "temoin : sans cloture, la base ment pour toujours"
+        );
+
+        assert_eq!(registre.clore_orphelines().unwrap(), 1);
+
+        let apres = &registre.lister(Some(TACHE_SCAN_DEMARRAGE), 1).unwrap()[0];
+        assert_eq!(apres.outcome, "interrompu");
+        assert_ne!(
+            apres.boot_id,
+            boot_id(),
+            "la ligne garde son boot d'origine"
+        );
+        assert!(apres.finished_at.is_some());
+        assert!(
+            apres.duration_ms.is_none(),
+            "on n'a jamais vu la fin de cette passe"
         );
     }
 }

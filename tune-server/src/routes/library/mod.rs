@@ -282,6 +282,7 @@ pub fn router() -> Router<AppState> {
         // Paroles (#2172) : l'indicateur d'abord, la passe de fond ensuite.
         .route("/lyrics/status", get(lyrics_pass::lyrics_status))
         .route("/lyrics/fetch", post(lyrics_pass::lyrics_fetch))
+        .route("/lyrics/write", post(lyrics_pass::lyrics_write))
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
