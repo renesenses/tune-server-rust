@@ -308,6 +308,32 @@ impl DlnaOutput {
         .await
     }
 
+    /// Réenvoie `SetAVTransportURI` au niveau de DIDL qui a fini par passer
+    /// pour cet appareil : rejouer le complet referait échouer la lecture chez
+    /// Platinum. Deux appelants — le réarmement d'un 701 sans média (#2581) et
+    /// la relance d'un Play acquitté mais jamais appliqué.
+    async fn reposer_uri(
+        &self,
+        media: &PlayMedia<'_>,
+        item_id: &'static str,
+        mime: &str,
+        niveau_didl: u8,
+    ) -> Result<String, String> {
+        let metadata = match niveau_didl {
+            0 => Self::didl_metadata_mime(media, item_id, mime),
+            1 => Self::didl_metadata_minimale(media, item_id, mime),
+            _ => String::new(),
+        };
+        self.av_action(
+            "SetAVTransportURI",
+            &format!(
+                "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+                media.url
+            ),
+        )
+        .await
+    }
+
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         Self::didl_metadata_mime(media, item_id, media.mime_type)
     }
@@ -526,6 +552,7 @@ impl OutputTarget for DlnaOutput {
         // complet à chaque piste coûtait un aller-retour et un warn par SetURI
         // (DMP-A8, #2394) pour finir au même DIDL minimal de toute façon.
         let mut niveau_didl: u8 = self.didl_niveau_appris.load(Ordering::Relaxed);
+        let debut_set_uri = std::time::Instant::now();
         loop {
             let metadata = match niveau_didl {
                 0 => Self::didl_metadata_mime(media, item_id, &attempt_mime),
@@ -554,6 +581,19 @@ impl OutputTarget for DlnaOutput {
             if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
                 self.didl_niveau_appris
                     .store(niveau_didl, Ordering::Relaxed);
+                // Le SUCCÈS se journalise, pas seulement l'échec. Sans cette
+                // ligne, un SetAVTransportURI lent laisse un trou muet et
+                // l'incident n'est plus instruisable : dans le journal de
+                // FabienM (#2581), 23,5 s s'écoulent entre « flux prêt » et le
+                // premier refus de Play sans une seule trace de la sortie.
+                info!(
+                    device = %self.name,
+                    url = media.url,
+                    niveau_didl,
+                    advertised_mime = %attempt_mime,
+                    duree_ms = debut_set_uri.elapsed().as_millis() as u64,
+                    "dlna_set_uri_ok"
+                );
                 break;
             }
 
@@ -644,7 +684,20 @@ impl OutputTarget for DlnaOutput {
         // reject Play immediately after SetAVTransportURI while still loading the URI.
         // On first 501, send another Stop then retry — the Revox needs an explicit
         // Stop after SetAVTransportURI when it was already playing.
+        //
+        // Le 701 « Transition not available » ne dit pas « je suis en panne » :
+        // il dit « pas CETTE transition, MAINTENANT » — et le renderer sait
+        // dans quel état il est. Le barème aveugle répondait à côté (#2581,
+        // journal FabienM du 27/08) : cinq refus 701 en 11,4 s, zone arrêtée
+        // après 36 s… et la MÊME piste vers le MÊME appareil part du premier
+        // coup 1,8 s plus tard, dès qu'un SetAVTransportURI est rejoué. On lit
+        // donc le transport avant de réessayer : il charge encore → le laisser
+        // finir, sans le Stop du barème qui le ferait retomber ; il ne tient
+        // plus de média → lui réarmer l'URI, sans quoi chaque Play suivant est
+        // un 701 de plus. Le renderer qui ne dit rien d'exploitable garde le
+        // barème historique, au mot près.
         let mut last_err = String::new();
+        let mut reprise = RepriseApresRefus::StopPuisPlay;
         for attempt in 0..5u32 {
             if attempt > 0 {
                 let delay = match attempt {
@@ -653,13 +706,24 @@ impl OutputTarget for DlnaOutput {
                     3 => 3000,
                     _ => 4000,
                 };
-                if attempt == 1 {
-                    debug!(device = %self.name, "dlna_play_retry_sending_stop");
-                    let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    let _ = self
-                        .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-                        .await;
+                match reprise {
+                    RepriseApresRefus::StopPuisPlay if attempt == 1 => {
+                        debug!(device = %self.name, "dlna_play_retry_sending_stop");
+                        let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        let _ = self
+                            .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                            .await;
+                    }
+                    RepriseApresRefus::ReArmerUri => {
+                        info!(device = %self.name, attempt, "dlna_play_701_rearmement_uri");
+                        let _ = self
+                            .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
+                            .await;
+                    }
+                    // Chargement en cours, ou barème historique hors du premier
+                    // essai : ne rien envoyer de plus.
+                    _ => {}
                 }
                 info!(device = %self.name, attempt, delay_ms = delay, "dlna_play_retry");
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -677,6 +741,26 @@ impl OutputTarget for DlnaOutput {
             }
             warn!(device = %self.name, attempt, response = %play_resp, "dlna_play_error");
             last_err = format!("Play rejected: {play_resp}");
+            // Un 701 nomme un état : on va le LIRE plutôt que le deviner. Un
+            // renderer sans GetTransportInfo ne change rien au barème.
+            reprise = if est_701(&play_resp) {
+                let etat = self
+                    .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                    .ok()
+                    .and_then(|xml| extract_tag(&xml, "CurrentTransportState"));
+                let choix = reprise_apres_refus_play(&play_resp, etat.as_deref());
+                info!(
+                    device = %self.name,
+                    attempt,
+                    etat = etat.as_deref().unwrap_or("-"),
+                    reprise = ?choix,
+                    "dlna_play_701_transport_lu"
+                );
+                choix
+            } else {
+                RepriseApresRefus::StopPuisPlay
+            };
         }
         if !last_err.is_empty() {
             return Err(last_err);
@@ -713,17 +797,9 @@ impl OutputTarget for DlnaOutput {
             }
             if relance == 0 {
                 warn!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
-                // Rejouer au niveau de DIDL qui a fini par passer : renvoyer le
-                // complet referait échouer la lecture chez Platinum.
-                let metadata = match niveau_didl {
-                    0 => Self::didl_metadata_mime(media, item_id, &attempt_mime),
-                    1 => Self::didl_metadata_minimale(media, item_id, &attempt_mime),
-                    _ => String::new(),
-                };
-                let _ = self.av_action("SetAVTransportURI", &format!(
-                    "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
-                    media.url
-                )).await;
+                let _ = self
+                    .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
+                    .await;
                 let _ = self
                     .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
                     .await;
@@ -1389,9 +1465,150 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
     UriVerdict::Indeterminee
 }
 
+/// Un refus SOAP portant le code UPnP **701 « Transition not available »**.
+/// Ce n'est pas une panne : le renderer refuse LA TRANSITION à cet instant.
+fn est_701(reponse_play: &str) -> bool {
+    reponse_play.contains(">701<")
+        || reponse_play
+            .to_ascii_lowercase()
+            .contains("transition not available")
+}
+
+/// Ce qu'il faut envoyer — ou ne pas envoyer — avant de redemander `Play`
+/// après un refus.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RepriseApresRefus {
+    /// Barème historique : au PREMIER essai, un Stop puis un Play (écrit pour
+    /// le Revox S100 et son 501). Conduite par défaut, inchangée.
+    StopPuisPlay,
+    /// 701 alors que le transport charge encore l'URI : le laisser finir. Un
+    /// Stop ici le ferait retomber et rendrait le 701 suivant certain.
+    Attendre,
+    /// 701 alors que le transport ne tient plus de média : sans réarmement de
+    /// l'URI, chaque `Play` suivant est un 701 de plus. C'est ce que montre le
+    /// journal de FabienM (#2581) — cinq refus, puis un succès immédiat dès
+    /// qu'un `SetAVTransportURI` est rejoué.
+    ReArmerUri,
+}
+
+/// Décide de la reprise à partir du refus reçu et de l'état que le transport
+/// déclare (`CurrentTransportState`). On ne dévie du barème historique que sur
+/// une information POSITIVE : un renderer muet, ou qui n'a pas
+/// `GetTransportInfo`, garde exactement l'ancienne conduite.
+fn reprise_apres_refus_play(reponse_play: &str, etat_transport: Option<&str>) -> RepriseApresRefus {
+    if !est_701(reponse_play) {
+        return RepriseApresRefus::StopPuisPlay;
+    }
+    match etat_transport.map(|e| e.trim().to_ascii_uppercase()) {
+        Some(e) if e.contains("TRANSITIONING") => RepriseApresRefus::Attendre,
+        Some(e) if e.contains("NO_MEDIA_PRESENT") || e.contains("STOPPED") => {
+            RepriseApresRefus::ReArmerUri
+        }
+        _ => RepriseApresRefus::StopPuisPlay,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La faute SOAP EXACTE relevée dans le journal de FabienM (#2581).
+    const FAUTE_701: &str = concat!(
+        "<s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>",
+        "<detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">",
+        "<errorCode>701</errorCode>",
+        "<errorDescription>Transition not available</errorDescription>",
+        "</UPnPError></detail></s:Fault>"
+    );
+
+    /// 501 Action Failed — le refus pour lequel le barème Stop+Play a été écrit
+    /// (Revox S100). Il ne doit RIEN changer de son comportement.
+    const FAUTE_501: &str = "<UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError>";
+
+    #[test]
+    fn le_701_se_reconnait_au_code_comme_au_libelle() {
+        assert!(est_701(FAUTE_701));
+        assert!(est_701(
+            "<errorDescription>Transition not available</errorDescription>"
+        ));
+        // Un 7010 n'est pas un 701, et les autres codes du fichier non plus.
+        assert!(!est_701("<errorCode>7010</errorCode>"));
+        assert!(!est_701(FAUTE_501));
+        assert!(!est_701("<errorCode>714</errorCode>"));
+    }
+
+    /// #2581 — le renderer charge encore l'URI : lui envoyer le Stop du barème
+    /// le ferait retomber. On attend.
+    #[test]
+    fn un_701_pendant_le_chargement_fait_attendre_sans_stop() {
+        assert_eq!(
+            reprise_apres_refus_play(FAUTE_701, Some("TRANSITIONING")),
+            RepriseApresRefus::Attendre
+        );
+    }
+
+    /// #2581 — le transport ne tient plus de média : sans réarmement de l'URI,
+    /// les cinq tentatives sont cinq 701 d'avance.
+    #[test]
+    fn un_701_sans_media_rearme_l_uri() {
+        for etat in ["NO_MEDIA_PRESENT", "STOPPED", " no_media_present "] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_701, Some(etat)),
+                RepriseApresRefus::ReArmerUri,
+                "état {etat}"
+            );
+        }
+    }
+
+    /// Zéro régression : un renderer qui ne dit rien d'exploitable garde le
+    /// barème historique, au mot près.
+    #[test]
+    fn un_701_muet_ne_devie_pas_du_bareme_historique() {
+        for etat in [None, Some(""), Some("PLAYING"), Some("RECORDING")] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_701, etat),
+                RepriseApresRefus::StopPuisPlay,
+                "état {etat:?}"
+            );
+        }
+    }
+
+    /// Zéro régression : le 501 du Revox garde son Stop+Play, QUEL QUE SOIT
+    /// l'état déclaré par le transport.
+    #[test]
+    fn un_refus_qui_n_est_pas_un_701_garde_le_stop_du_revox() {
+        for etat in [
+            None,
+            Some("TRANSITIONING"),
+            Some("NO_MEDIA_PRESENT"),
+            Some("STOPPED"),
+        ] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_501, etat),
+                RepriseApresRefus::StopPuisPlay,
+                "état {etat:?}"
+            );
+        }
+    }
+
+    /// L'état lu dans la boucle vient d'un `GetTransportInfo` complet : le
+    /// chaînage extraction → décision doit tenir sur la réponse RÉELLE.
+    #[test]
+    fn l_etat_se_lit_dans_la_reponse_get_transport_info() {
+        let reponse = concat!(
+            "<u:GetTransportInfoResponse>",
+            "<CurrentTransportState>NO_MEDIA_PRESENT</CurrentTransportState>",
+            "<CurrentTransportStatus>OK</CurrentTransportStatus>",
+            "<CurrentSpeed>1</CurrentSpeed>",
+            "</u:GetTransportInfoResponse>"
+        );
+        let etat = extract_tag(reponse, "CurrentTransportState");
+        assert_eq!(etat.as_deref(), Some("NO_MEDIA_PRESENT"));
+        assert_eq!(
+            reprise_apres_refus_play(FAUTE_701, etat.as_deref()),
+            RepriseApresRefus::ReArmerUri
+        );
+    }
 
     #[test]
     fn caps_from_sink_maps_advertised_formats() {
