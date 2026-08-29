@@ -323,6 +323,7 @@ impl DeezerService {
             disc_number: item["disk_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit_lyrics"].as_bool().unwrap_or(false),
             isrc: item["isrc"].as_str().map(Into::into),
+            composer: None,
             // Le catalogue Deezer ne dit pas sous quel format la piste sera
             // servie : cette valeur décrivait l'extrait public de 30 s, et était
             // donc affichée « MP3 44,1/16 » pour TOUTES les pistes, y compris
