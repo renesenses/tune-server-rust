@@ -6,7 +6,7 @@
 //! confrontent la réponse à la carte commitée.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -148,6 +148,43 @@ async fn post_json(app: &axum::Router, chemin: &str) -> Result<Value, String> {
     })
 }
 
+async fn mutation_json(
+    app: &axum::Router,
+    methode: axum::http::Method,
+    chemin: &str,
+    body: Value,
+    statut_attendu: StatusCode,
+) -> Result<Value, String> {
+    let reponse = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(methode)
+                .uri(chemin)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .map_err(|erreur| format!("{chemin}: routeur en echec: {erreur}"))?;
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .map_err(|erreur| format!("{chemin}: corps illisible: {erreur}"))?;
+    if statut != statut_attendu {
+        return Err(format!(
+            "{chemin}: statut {statut}, attendu {statut_attendu}, corps {}",
+            String::from_utf8_lossy(&octets)
+        ));
+    }
+    serde_json::from_slice(&octets).map_err(|erreur| {
+        format!(
+            "{chemin}: JSON invalide ({erreur}), corps {}",
+            String::from_utf8_lossy(&octets)
+        )
+    })
+}
+
 /// Routes sans secret, matériel ni service tiers. La vague commence par les
 /// écrans les plus centraux (accueil, bibliothèque, diagnostics et réglages).
 const VAGUE_INITIALE: &[(&str, &str)] = &[
@@ -249,6 +286,159 @@ async fn desactiver_spotify_connect_rend_le_statut_complet_annonce_au_web() {
 
     respecte_tous_les_contrats(&carte, "POST", "/spotify-connect/disable", &payload)
         .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
+}
+
+#[tokio::test]
+async fn objets_persistes_respectent_leurs_contrats_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let piste_id = pistes
+        .create(&tune_core::db::models::Track::new(
+            "Piste du contrat persiste".into(),
+        ))
+        .expect("creation de la piste temoin");
+    let app = tune_server::routes::router(etat);
+
+    let playlist = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/playlists",
+        serde_json::json!({"name": "Contrat initial", "description": "Temoin"}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la playlist temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/playlists", &playlist)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/playlists: {erreur}; payload={playlist}"));
+    let playlist_id = playlist["id"].as_i64().expect("id de playlist");
+
+    let playlist = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/playlists/{playlist_id}"),
+        serde_json::json!({"name": "Contrat renomme"}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la playlist temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/playlists/{}", &playlist).unwrap_or_else(
+        |erreur| panic!("PUT /api/v1/playlists/{{id}}: {erreur}; payload={playlist}"),
+    );
+    assert_eq!(playlist["name"], "Contrat renomme");
+
+    let playlist = mutation_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/playlists/{playlist_id}/tracks"),
+        serde_json::json!({"track_ids": [piste_id]}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("ajout de la piste temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/playlists/{}/tracks", &playlist).unwrap_or_else(
+        |erreur| panic!("POST /playlists/{{id}}/tracks: {erreur}; payload={playlist}"),
+    );
+    assert_eq!(playlist["track_count"], 1);
+
+    for (route_contrat, chemin_reel) in [
+        ("/playlists", "/api/v1/playlists".to_string()),
+        ("/playlists/{}", format!("/api/v1/playlists/{playlist_id}")),
+        (
+            "/playlists/{}/tracks",
+            format!("/api/v1/playlists/{playlist_id}/tracks"),
+        ),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let radio = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/radios",
+        serde_json::json!({
+            "name": "Radio contrat",
+            "stream_url": "https://example.invalid/contrat.aac",
+            "genre": "Test"
+        }),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la radio temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/radios", &radio)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/radios: {erreur}; payload={radio}"));
+    let radio_id = radio["id"].as_i64().expect("id de radio");
+
+    let radio = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/radios/{radio_id}"),
+        serde_json::json!({"favorite": true}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la radio temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/radios/{}", &radio)
+        .unwrap_or_else(|erreur| panic!("PUT /api/v1/radios/{{id}}: {erreur}; payload={radio}"));
+    assert_eq!(radio["favorite"], true);
+
+    for (route_contrat, chemin_reel) in [
+        ("/radios{}", "/api/v1/radios".to_string()),
+        ("/radios/{}", format!("/api/v1/radios/{radio_id}")),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let tag = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/tags",
+        serde_json::json!({"name": "Tag contrat", "color": "#123456"}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation du tag temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/tags", &tag)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/tags: {erreur}; payload={tag}"));
+    let tag_id = tag["id"].as_i64().expect("id de tag");
+
+    let ajout = mutation_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tags/{tag_id}/items/batch"),
+        serde_json::json!({"item_type": "track", "item_ids": [piste_id]}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("etiquetage de la piste temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/tags/{}/items/batch", &ajout).unwrap_or_else(
+        |erreur| panic!("POST /tags/{{id}}/items/batch: {erreur}; payload={ajout}"),
+    );
+
+    for (route_contrat, chemin_reel) in [
+        ("/tags/{}", "/api/v1/tags?item_type=track".to_string()),
+        ("/tags/search", "/api/v1/tags/search?q=contrat".to_string()),
+        (
+            "/tags/for/{}/{}",
+            format!("/api/v1/tags/for/track/{piste_id}"),
+        ),
+        ("/tags/{}/albums", format!("/api/v1/tags/{tag_id}/albums")),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
 }
 
 #[test]
