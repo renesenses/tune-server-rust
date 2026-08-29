@@ -16,6 +16,62 @@ const SVC_TRANSPORT: &str = "urn:av-openhome-org:service:Transport:1";
 const SVC_VOLUME: &str = "urn:av-openhome-org:service:Volume:1";
 const SVC_INFO: &str = "urn:av-openhome-org:service:Info:1";
 const SVC_TIME: &str = "urn:av-openhome-org:service:Time:1";
+const SVC_PINS: &str = "urn:av-openhome-org:service:Pins:1";
+
+/// A device pin returned by the OpenHome `Pins:1` service.
+///
+/// `index` is not part of `ReadList`'s JSON.  It is reconstructed from the
+/// position of `id` in `GetIdArray`, whose zero entries are empty slots.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenHomePin {
+    pub id: u32,
+    pub index: u32,
+    pub mode: String,
+    #[serde(rename = "type")]
+    pub pin_type: String,
+    pub uri: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, rename = "artworkUri")]
+    pub artwork_uri: String,
+    #[serde(default)]
+    pub shuffle: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct OpenHomePinsSnapshot {
+    pub max_slots: u32,
+    pub pins: Vec<OpenHomePin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenHomePinDraft {
+    pub index: u32,
+    pub mode: String,
+    pub pin_type: String,
+    pub uri: String,
+    pub title: String,
+    pub description: String,
+    pub artwork_uri: String,
+    pub shuffle: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenHomePinWire {
+    id: u32,
+    mode: String,
+    #[serde(rename = "type")]
+    pin_type: String,
+    uri: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default, rename = "artworkUri")]
+    artwork_uri: String,
+    #[serde(default)]
+    shuffle: bool,
+}
 
 pub struct OpenHomeOutput {
     name: String,
@@ -69,6 +125,119 @@ impl OpenHomeOutput {
 
     fn svc_url(&self, key: &str) -> Option<&String> {
         self.service_urls.get(key)
+    }
+
+    pub fn supports_pins(&self) -> bool {
+        self.svc_url("pins").is_some()
+    }
+
+    fn pins_url(&self) -> Result<&str, String> {
+        self.svc_url("pins")
+            .map(String::as_str)
+            .ok_or_else(|| "OpenHome Pins:1 service is not advertised".to_string())
+    }
+
+    async fn pins_call(&self, action: &str, args: &[(&str, &str)]) -> Result<String, String> {
+        let response = self
+            .soap_call(self.pins_url()?, SVC_PINS, action, args)
+            .await?;
+        if response.contains(":Fault") || response.contains("<Fault") {
+            return Err(format!("OpenHome Pins {action} was rejected: {response}"));
+        }
+        Ok(response)
+    }
+
+    async fn pin_ids(&self) -> Result<Vec<u32>, String> {
+        let response = self.pins_call("GetIdArray", &[]).await?;
+        let value = extract_tag_decoded(&response, "IdArray")
+            .ok_or_else(|| "OpenHome Pins GetIdArray returned no IdArray".to_string())?;
+        serde_json::from_str(&value)
+            .map_err(|e| format!("OpenHome Pins IdArray is not valid JSON: {e}"))
+    }
+
+    pub async fn pins_snapshot(&self) -> Result<OpenHomePinsSnapshot, String> {
+        let max_response = self.pins_call("GetDeviceMax", &[]).await?;
+        let max_slots = extract_tag_decoded(&max_response, "DeviceMax")
+            .ok_or_else(|| "OpenHome Pins GetDeviceMax returned no DeviceMax".to_string())?
+            .parse::<u32>()
+            .map_err(|e| format!("OpenHome Pins DeviceMax is invalid: {e}"))?;
+
+        let ids = self.pin_ids().await?;
+        let occupied: Vec<u32> = ids.iter().copied().filter(|id| *id != 0).collect();
+        if occupied.is_empty() {
+            return Ok(OpenHomePinsSnapshot {
+                max_slots,
+                pins: Vec::new(),
+            });
+        }
+
+        let ids_json = serde_json::to_string(&occupied)
+            .map_err(|e| format!("cannot encode OpenHome pin IDs: {e}"))?;
+        let list_response = self.pins_call("ReadList", &[("Ids", &ids_json)]).await?;
+        let list = extract_tag_decoded(&list_response, "List")
+            .ok_or_else(|| "OpenHome Pins ReadList returned no List".to_string())?;
+        let wire: Vec<OpenHomePinWire> = serde_json::from_str(&list)
+            .map_err(|e| format!("OpenHome Pins List is not valid JSON: {e}"))?;
+
+        let mut pins = Vec::with_capacity(wire.len());
+        for pin in wire {
+            let Some(index) = ids.iter().position(|id| *id == pin.id) else {
+                warn!(device = %self.name, pin_id = pin.id, "oh_pins_list_id_absent_from_id_array");
+                continue;
+            };
+            pins.push(OpenHomePin {
+                id: pin.id,
+                index: index as u32,
+                mode: pin.mode,
+                pin_type: pin.pin_type,
+                uri: pin.uri,
+                title: pin.title,
+                description: pin.description,
+                artwork_uri: pin.artwork_uri,
+                shuffle: pin.shuffle,
+            });
+        }
+        pins.sort_by_key(|pin| pin.index);
+        Ok(OpenHomePinsSnapshot { max_slots, pins })
+    }
+
+    pub async fn set_device_pin(&self, pin: &OpenHomePinDraft) -> Result<(), String> {
+        let index = pin.index.to_string();
+        let shuffle = if pin.shuffle { "1" } else { "0" };
+        self.pins_call(
+            "SetDevice",
+            &[
+                ("Index", &index),
+                ("Mode", &pin.mode),
+                ("Type", &pin.pin_type),
+                ("Uri", &pin.uri),
+                ("Title", &pin.title),
+                ("Description", &pin.description),
+                ("ArtworkUri", &pin.artwork_uri),
+                ("Shuffle", shuffle),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn invoke_pin_index(&self, index: u32) -> Result<(), String> {
+        self.pins_call("InvokeIndex", &[("Index", &index.to_string())])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_pin_index(&self, index: u32) -> Result<(), String> {
+        let ids = self.pin_ids().await?;
+        let id = ids
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| format!("OpenHome pin index {index} is out of range"))?;
+        if id == 0 {
+            return Err(format!("OpenHome pin index {index} is empty"));
+        }
+        self.pins_call("Clear", &[("Id", &id.to_string())]).await?;
+        Ok(())
     }
 
     async fn soap_call(
@@ -332,6 +501,10 @@ impl OutputTarget for OpenHomeOutput {
         "openhome"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn capabilities(&self) -> OutputCapabilities {
         let transport = self.svc_url("transport").is_some() || self.svc_url("playlist").is_some();
         let volume = self.svc_url("volume").is_some();
@@ -593,6 +766,14 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+fn extract_tag_decoded(xml: &str, tag: &str) -> Option<String> {
+    extract_tag(xml, tag).map(|value| {
+        quick_xml::escape::unescape(&value)
+            .map(|decoded| decoded.into_owned())
+            .unwrap_or(value)
+    })
+}
+
 /// Index of the `Playlist` source in an OpenHome Product `SourceXml` Value.
 ///
 /// The Value is an *escaped* XML string (`&lt;SourceList&gt;&lt;Source&gt;…`),
@@ -618,6 +799,112 @@ fn playlist_source_index(source_xml_value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fake_pins_service(
+        axum::extract::State(calls): axum::extract::State<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        body: String,
+    ) -> String {
+        calls.lock().await.push(body.clone());
+        let payload = if body.contains("<u:GetDeviceMax") {
+            "<DeviceMax>4</DeviceMax>".to_string()
+        } else if body.contains("<u:GetIdArray") {
+            "<IdArray>[0,17,0,42]</IdArray>".to_string()
+        } else if body.contains("<u:ReadList") {
+            let list = serde_json::json!([
+                {
+                    "id": 42,
+                    "mode": "url",
+                    "type": "stream",
+                    "uri": "url://stream?path=https%3A%2F%2Fradio.example%2Flive&version=1",
+                    "title": "Radio & Jazz",
+                    "description": "soirée",
+                    "artworkUri": "https://radio.example/cover.jpg",
+                    "shuffle": false
+                },
+                {
+                    "id": 17,
+                    "mode": "qobuz",
+                    "type": "album",
+                    "uri": "qobuz://album?id=123&version=1",
+                    "title": "Album",
+                    "description": "",
+                    "artworkUri": "",
+                    "shuffle": true
+                }
+            ])
+            .to_string();
+            format!("<List>{}</List>", quick_xml::escape::escape(&list))
+        } else {
+            String::new()
+        };
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>{payload}</s:Body></s:Envelope>"
+        )
+    }
+
+    async fn output_with_fake_pins() -> (OpenHomeOutput, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use axum::{Router, routing::post};
+
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/pins", post(fake_pins_service))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let output = OpenHomeOutput::new(
+            "Fake Pins renderer".into(),
+            "uuid:fake-pins".into(),
+            "127.0.0.1".into(),
+            port,
+            HashMap::from([("pins".into(), "/pins".into())]),
+            None,
+            HashMap::new(),
+        );
+        (output, calls)
+    }
+
+    /// #2722 — contre-épreuve réseau complète.  Le test ne valide pas un
+    /// cache local : un vrai endpoint SOAP doit voir lecture, invocation,
+    /// écriture et suppression, avec la distinction index/id de `Clear`.
+    #[tokio::test]
+    async fn pins_service_is_read_and_receives_every_mutation() {
+        let (output, calls) = output_with_fake_pins().await;
+
+        let snapshot = output.pins_snapshot().await.unwrap();
+        assert_eq!(snapshot.max_slots, 4);
+        assert_eq!(snapshot.pins.len(), 2);
+        assert_eq!((snapshot.pins[0].index, snapshot.pins[0].id), (1, 17));
+        assert_eq!((snapshot.pins[1].index, snapshot.pins[1].id), (3, 42));
+        assert_eq!(snapshot.pins[1].title, "Radio & Jazz");
+
+        output.invoke_pin_index(3).await.unwrap();
+        output
+            .set_device_pin(&OpenHomePinDraft {
+                index: 2,
+                mode: "url".into(),
+                pin_type: "stream".into(),
+                uri: "url://stream?path=https%3A%2F%2Fexample.test%2Flive&version=1".into(),
+                title: "Rock & Roll".into(),
+                description: "Direct".into(),
+                artwork_uri: "https://example.test/cover.jpg".into(),
+                shuffle: false,
+            })
+            .await
+            .unwrap();
+        output.clear_pin_index(3).await.unwrap();
+
+        let bodies = calls.lock().await.join("\n");
+        assert!(bodies.contains("<Ids>[17,42]</Ids>"));
+        assert!(bodies.contains("<u:InvokeIndex"));
+        assert!(bodies.contains("<Index>3</Index>"));
+        assert!(bodies.contains("<u:SetDevice"));
+        assert!(bodies.contains("<Title>Rock &amp; Roll</Title>"));
+        assert!(bodies.contains("<u:Clear"));
+        assert!(bodies.contains("<Id>42</Id>"));
+    }
 
     #[test]
     fn didl_with_all_fields() {
