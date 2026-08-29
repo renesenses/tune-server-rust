@@ -150,15 +150,42 @@ async fn fetch_bio_lastfm(
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let bio = data
-        .pointer("/artist/bio/content")
-        .and_then(|v| v.as_str())?;
+    bio_lastfm_depuis_json(&data, "/artist/bio/content", "/artist/url", lang)
+}
+
+/// Construit le `BioResult` d'une reponse Last.fm — la part testable des deux
+/// recuperations Last.fm (artiste et album), dont les corps etaient identiques
+/// a deux pointeurs JSON pres.
+///
+/// ## Ce qui change ici (#1849)
+///
+/// `lang` est desormais **inscrit dans le resultat**. Les deux fonctions
+/// appelantes recevaient deja la langue demandee et la transmettaient bien a
+/// Last.fm (`("lang", lang)`), mais estampillaient ensuite `lang: "fr"` en dur.
+/// Ce champ finit dans `artists.bio_lang` / `albums.bio_lang` via
+/// `update_bio_full`, et c'est lui que les routes interrogent pour decider si
+/// la bio stockee convient au lecteur : une bio rapportee en anglais etait
+/// etiquetee francaise, donc rejetee pour tout lecteur anglophone a chaque
+/// ouverture de fiche. La promesse de #2126 — « un re-enrichissement
+/// renseignera `bio_lang` » — ne tenait pas pour ce chemin.
+///
+/// ⚠️ Reserve : Last.fm retombe silencieusement sur l'anglais quand il n'a rien
+/// dans la langue demandee, et ne dit pas ce qu'il a rendu. On enregistre donc
+/// l'intention, pas une certitude — ce qui reste strictement plus juste que
+/// « fr » en toute circonstance.
+fn bio_lastfm_depuis_json(
+    data: &serde_json::Value,
+    pointeur_texte: &str,
+    pointeur_url: &str,
+    lang: &str,
+) -> Option<BioResult> {
+    let bio = data.pointer(pointeur_texte).and_then(|v| v.as_str())?;
     let clean = strip_html(bio);
     if clean.len() < 50 {
         return None;
     }
     let source_url = data
-        .pointer("/artist/url")
+        .pointer(pointeur_url)
         .and_then(|v| v.as_str())
         .map(String::from);
     Some(BioResult {
@@ -166,7 +193,7 @@ async fn fetch_bio_lastfm(
         source: "lastfm".to_string(),
         source_url,
         license: "CC-BY-SA-3.0".to_string(),
-        lang: "fr".to_string(),
+        lang: lang.to_ascii_lowercase(),
     })
 }
 
@@ -324,24 +351,7 @@ async fn fetch_album_bio_lastfm(
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let wiki = data
-        .pointer("/album/wiki/content")
-        .and_then(|v| v.as_str())?;
-    let clean = strip_html(wiki);
-    if clean.len() < 50 {
-        return None;
-    }
-    let source_url = data
-        .pointer("/album/url")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    Some(BioResult {
-        text: clean,
-        source: "lastfm".to_string(),
-        source_url,
-        license: "CC-BY-SA-3.0".to_string(),
-        lang: "fr".to_string(),
-    })
+    bio_lastfm_depuis_json(&data, "/album/wiki/content", "/album/url", lang)
 }
 
 fn strip_html(s: &str) -> String {
@@ -642,4 +652,118 @@ pub async fn batch_enrich_album_bios(
             .to_string(),
         )
         .ok();
+}
+
+#[cfg(test)]
+mod tests_bio_lastfm {
+    use super::bio_lastfm_depuis_json;
+    use serde_json::json;
+
+    fn reponse_artiste(texte: &str) -> serde_json::Value {
+        json!({
+            "artist": {
+                "bio": { "content": texte },
+                "url": "https://www.last.fm/music/Pink+Floyd"
+            }
+        })
+    }
+
+    const ASSEZ_LONG: &str =
+        "Pink Floyd were an English rock band formed in London in nineteen sixty-five.";
+
+    /// Le defaut de #1849 : la langue demandee etait jetee et remplacee par
+    /// « fr » en dur, quelle que soit la langue reclamee a Last.fm.
+    ///
+    /// Contre-epreuve (mesuree) : remettre `lang: "fr".to_string()` dans
+    /// `bio_lastfm_depuis_json` fait rougir les TROIS tests de langue de ce
+    /// module — celui-ci, `la_bio_d_album_partage_le_parseur_et_la_langue` et
+    /// `la_langue_est_normalisee_en_minuscules` — et eux seuls. Les trois
+    /// autres (balisage, bio trop courte, reponse vide) restent verts : ils
+    /// gardent le parseur, pas la langue, et ne font donc pas doublon.
+    #[test]
+    fn la_langue_demandee_est_inscrite_et_non_fr_en_dur() {
+        let bio = bio_lastfm_depuis_json(
+            &reponse_artiste(ASSEZ_LONG),
+            "/artist/bio/content",
+            "/artist/url",
+            "en",
+        )
+        .expect("une bio assez longue doit etre retenue");
+        assert_eq!(
+            bio.lang, "en",
+            "une bio reclamee en anglais ne doit pas etre etiquetee francaise"
+        );
+    }
+
+    /// Une bio d'album passe par le meme parseur, aux pointeurs pres.
+    #[test]
+    fn la_bio_d_album_partage_le_parseur_et_la_langue() {
+        let data = json!({
+            "album": {
+                "wiki": { "content": ASSEZ_LONG },
+                "url": "https://www.last.fm/music/Pink+Floyd/Animals"
+            }
+        });
+        let bio = bio_lastfm_depuis_json(&data, "/album/wiki/content", "/album/url", "de")
+            .expect("une bio assez longue doit etre retenue");
+        assert_eq!(bio.lang, "de");
+        assert_eq!(
+            bio.source_url.as_deref(),
+            Some("https://www.last.fm/music/Pink+Floyd/Animals")
+        );
+    }
+
+    /// `fr-FR` et `FR` designent la meme chose que `fr` pour `langue_convient`,
+    /// qui compare en minuscules : on normalise a l'ecriture plutot que de
+    /// laisser une casse etrangere dormir en base.
+    #[test]
+    fn la_langue_est_normalisee_en_minuscules() {
+        let bio = bio_lastfm_depuis_json(
+            &reponse_artiste(ASSEZ_LONG),
+            "/artist/bio/content",
+            "/artist/url",
+            "EN",
+        )
+        .expect("une bio assez longue doit etre retenue");
+        assert_eq!(bio.lang, "en");
+    }
+
+    /// Le balisage de Last.fm ne doit pas atterrir dans la fiche.
+    #[test]
+    fn le_balisage_html_est_retire() {
+        let brut = format!("<p>{ASSEZ_LONG}</p> <a href=\"x\">Read more</a>");
+        let bio = bio_lastfm_depuis_json(
+            &reponse_artiste(&brut),
+            "/artist/bio/content",
+            "/artist/url",
+            "en",
+        )
+        .expect("une bio assez longue doit etre retenue");
+        assert!(!bio.text.contains('<'), "balisage restant : {}", bio.text);
+        assert!(bio.text.contains("Pink Floyd were an English rock band"));
+    }
+
+    /// Last.fm rend un pied de page (« Read more on Last.fm ») pour les
+    /// artistes qu'il ne connait pas : trop court, donc pas une biographie.
+    #[test]
+    fn une_bio_trop_courte_est_refusee() {
+        assert!(
+            bio_lastfm_depuis_json(
+                &reponse_artiste("<a href=\"x\">Read more</a>"),
+                "/artist/bio/content",
+                "/artist/url",
+                "en",
+            )
+            .is_none()
+        );
+    }
+
+    /// Champ absent : rien a inscrire, surtout pas une bio vide etiquetee.
+    #[test]
+    fn une_reponse_sans_bio_ne_rend_rien() {
+        assert!(
+            bio_lastfm_depuis_json(&json!({}), "/artist/bio/content", "/artist/url", "en")
+                .is_none()
+        );
+    }
 }
