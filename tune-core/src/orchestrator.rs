@@ -179,7 +179,36 @@ use crate::outputs::registry::OutputRegistry;
 use crate::outputs::{OutputCommand, OutputCommandError, OutputCommandResult};
 use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
+use crate::streaming::quality::StreamingQualityPreference;
 use crate::streaming::registry::ServiceRegistry;
+use crate::streaming::{StreamUrl, StreamingService};
+
+async fn request_stream_at_quality(
+    service: &mut dyn StreamingService,
+    source_id: &str,
+    quality: Option<&str>,
+) -> Result<StreamUrl, String> {
+    match service.get_track_url(source_id, quality).await {
+        Ok(data) => Ok(data),
+        Err(ref error)
+            if {
+                let message = error.to_string();
+                message.contains("401") || message.contains("403")
+            } =>
+        {
+            info!(error = %error, "streaming_auth_error_attempting_refresh");
+            if service.refresh_if_needed().await.unwrap_or(false) {
+                service
+                    .get_track_url(source_id, quality)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Err(error.to_string())
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 /// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
 ///
@@ -4850,6 +4879,16 @@ impl PlaybackOrchestrator {
         })
     }
 
+    fn streaming_quality_preference(&self, zone_id: i64) -> StreamingQualityPreference {
+        let key = format!("zone_{zone_id}_quality");
+        SettingsRepo::with_backend(self.db.clone())
+            .get(&key)
+            .ok()
+            .flatten()
+            .map(|raw| StreamingQualityPreference::from_stored_json(&raw))
+            .unwrap_or_default()
+    }
+
     async fn resolve_streaming_url(
         &self,
         service_name: &str,
@@ -4873,7 +4912,12 @@ impl PlaybackOrchestrator {
         // attaches, leaving the stream with 0 frames → playback stops.
         // (DEvir: seek on a TIDAL track → title stays but music stops.)
         // Only consider the prefetch buffer when NOT seeking.
-        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0) {
+        let quality_preference = self.streaming_quality_preference(req.zone_id);
+        let provider_quality = quality_preference.service_token(service_name);
+
+        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0)
+            || quality_preference != StreamingQualityPreference::Max
+        {
             None
         } else {
             self.prefetch.take_prefetched(service_name, source_id).await
@@ -4929,32 +4973,31 @@ impl PlaybackOrchestrator {
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
         let mut svc = svc.write().await;
 
-        // Try to get the track URL; if it fails with an auth error, attempt
-        // a token refresh and retry once. This handles Qobuz tokens expiring
-        // mid-session (search still works without auth, but playback doesn't).
-        let stream_data = match svc.get_track_url(source_id, None).await {
-            Ok(data) => data,
-            Err(ref e)
-                if {
-                    let msg = e.to_string();
-                    msg.contains("401") || msg.contains("403")
-                } =>
-            {
-                info!(
-                    service = service_name,
-                    error = %e,
-                    "streaming_auth_error_attempting_refresh"
-                );
-                if svc.refresh_if_needed().await.unwrap_or(false) {
-                    svc.get_track_url(source_id, None)
-                        .await
-                        .map_err(|e| e.to_string())?
-                } else {
-                    return Err(e.to_string());
-                }
-            }
-            Err(e) => return Err(e.to_string()),
-        };
+        if !quality_preference.provider_can_select(service_name) {
+            warn!(
+                service = service_name,
+                requested_quality = %quality_preference,
+                "streaming_quality_not_selectable_using_provider_result"
+            );
+        }
+
+        // Ask for the zone preference on the primary request and on the auth
+        // retry. Passing `None` means the provider's highest/default quality.
+        let stream_data =
+            request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        let quality_observation = quality_preference.observe(service_name, &stream_data);
+
+        info!(
+            service = service_name,
+            source_id,
+            requested_quality = quality_observation.requested,
+            provider_quality = quality_observation.provider_token,
+            delivered_codec = %quality_observation.delivered_codec,
+            delivered_sample_rate = quality_observation.delivered_sample_rate,
+            delivered_bit_depth = quality_observation.delivered_bit_depth,
+            delivered_bitrate = ?quality_observation.delivered_bitrate,
+            "streaming_quality_resolved"
+        );
 
         let info = StreamInfo {
             format: stream_data.quality.codec.to_lowercase(),
@@ -6193,10 +6236,12 @@ impl PlaybackOrchestrator {
                         let services = self.services.clone();
                         let service_name = service_name.to_string();
                         let source_id = source_id.to_string();
+                        let provider_quality = provider_quality.map(str::to_string);
                         Some(std::sync::Arc::new(move || {
                             let services = services.clone();
                             let service_name = service_name.clone();
                             let source_id = source_id.clone();
+                            let provider_quality = provider_quality.clone();
                             Box::pin(async move {
                                 let registry = services.lock().await;
                                 let svc = registry
@@ -6204,9 +6249,12 @@ impl PlaybackOrchestrator {
                                     .ok_or_else(|| format!("unknown service: {service_name}"))?;
                                 let mut svc = svc.write().await;
                                 // Best-effort token refresh, then re-resolve with
-                                // the same default quality the initial play used.
+                                // exactly the quality used by the initial play.
                                 let _ = svc.refresh_if_needed().await;
-                                match svc.get_track_url(&source_id, None).await {
+                                match svc
+                                    .get_track_url(&source_id, provider_quality.as_deref())
+                                    .await
+                                {
                                     Ok(data) => Ok(data.url),
                                     Err(e) => Err(e.to_string()),
                                 }
@@ -7098,6 +7146,13 @@ impl PlaybackOrchestrator {
             if source.is_empty() || source_id.is_empty() {
                 return;
             }
+            let quality_preference = SettingsRepo::with_backend(db.clone())
+                .get(&format!("zone_{zone_id}_quality"))
+                .ok()
+                .flatten()
+                .map(|raw| StreamingQualityPreference::from_stored_json(&raw))
+                .unwrap_or_default();
+            let provider_quality = quality_preference.service_token(&source);
 
             // Resolve the next track's stream. Only a DASH (file://) result is
             // worth caching — a direct proxy stream isn't transcoded.
@@ -7107,7 +7162,7 @@ impl PlaybackOrchestrator {
                     return;
                 };
                 let svc = svc.read().await;
-                match svc.get_track_url(&source_id, None).await {
+                match svc.get_track_url(&source_id, provider_quality).await {
                     Ok(d) => d,
                     Err(_) => return,
                 }
@@ -9203,6 +9258,7 @@ impl PlaybackOrchestrator {
             if advance_source != "local" && advance_source != "radio" {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
+                let db = self.db.clone();
                 let source = advance_source.clone();
                 // Épinglé AVANT la tâche : la résolution d'URL du service peut
                 // prendre plusieurs secondes, et lire la génération à son issue
@@ -9212,6 +9268,13 @@ impl PlaybackOrchestrator {
                 // la piste précédente sur l'horloge de la nouvelle (#1110).
                 let play_seq = self.playback.current_play_seq(zone_id).await;
                 tokio::spawn(async move {
+                    let quality_preference = SettingsRepo::with_backend(db)
+                        .get(&format!("zone_{zone_id}_quality"))
+                        .ok()
+                        .flatten()
+                        .map(|raw| StreamingQualityPreference::from_stored_json(&raw))
+                        .unwrap_or_default();
+                    let provider_quality = quality_preference.service_token(&source);
                     let resolved = {
                         let registry = services.lock().await;
                         let Some(svc) = registry.get(&source) else {
@@ -9220,7 +9283,7 @@ impl PlaybackOrchestrator {
                         let svc = svc.clone();
                         drop(registry);
                         let svc = svc.read().await;
-                        svc.get_track_url(&source_id, None).await.ok()
+                        svc.get_track_url(&source_id, provider_quality).await.ok()
                     };
                     let Some(data) = resolved else {
                         debug!(zone_id, source = %source, "gapless_streaming_levels_url_unresolved");

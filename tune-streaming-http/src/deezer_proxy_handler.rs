@@ -47,7 +47,11 @@ pub async fn handle_deezer_proxy(
             Some(d) => d,
             None => return (StatusCode::INTERNAL_SERVER_ERROR, "not deezer").into_response(),
         };
-        match deezer.get_full_stream_url(sng_id, 0).await {
+        let quality = if ext == "flac" { "FLAC" } else { "MP3_320" };
+        match deezer
+            .get_full_stream_url_at_quality(sng_id, 0, quality)
+            .await
+        {
             Ok(url) => url,
             Err(e) => {
                 warn!(sng_id, error = %e, "deezer_proxy_no_upstream");

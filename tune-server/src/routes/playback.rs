@@ -12,6 +12,7 @@ use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
 use tune_core::outputs::OutputCommandError;
+use tune_core::streaming::quality::StreamingQualityPreference;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
@@ -3404,27 +3405,58 @@ async fn set_audiophile(
     .into_response()
 }
 
-async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+#[derive(Debug, Deserialize)]
+struct StreamingQualityBody {
+    quality: String,
+}
+
+fn quality_from_stored(raw: Option<&str>) -> StreamingQualityPreference {
+    raw.map(StreamingQualityPreference::from_stored_json)
+        .unwrap_or_default()
+}
+
+async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_quality");
-    let val = settings
-        .get(&key)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(json!({ "max_sample_rate": null, "max_bit_depth": null, "prefer_hires": true }));
-    Json(val)
+    match settings.get(&key) {
+        Ok(raw) => Json(json!({
+            "quality": quality_from_stored(raw.as_deref()).as_str()
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "streaming_quality_read_failed", "message": error })),
+        )
+            .into_response(),
+    }
 }
 
 async fn set_quality(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+    Json(body): Json<StreamingQualityBody>,
+) -> impl IntoResponse {
+    let Some(quality) = StreamingQualityPreference::parse(&body.quality) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "invalid_streaming_quality",
+                "allowed": ["max", "hires", "cd", "low"],
+            })),
+        )
+            .into_response();
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_quality");
-    settings.set(&key, &body.to_string()).ok();
-    Json(body)
+    let response = json!({ "quality": quality.as_str() });
+    match settings.set(&key, &response.to_string()) {
+        Ok(()) => Json(response).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "streaming_quality_write_failed", "message": error })),
+        )
+            .into_response(),
+    }
 }
 
 async fn share_now_playing(
@@ -4384,5 +4416,32 @@ mod tests_crossfade_local_seulement {
 
         assert_eq!(validate_crossfade_update(&too_long, false), Ok(12.0));
         assert_eq!(validate_crossfade_update(&default, false), Ok(3.0));
+    }
+}
+
+#[cfg(test)]
+mod tests_qualite_streaming {
+    use super::{StreamingQualityPreference, quality_from_stored};
+
+    #[test]
+    fn le_contrat_persistant_relit_exactement_les_quatre_paliers() {
+        for (raw, expected) in [
+            (r#"{"quality":"max"}"#, StreamingQualityPreference::Max),
+            (r#"{"quality":"hires"}"#, StreamingQualityPreference::Hires),
+            (r#"{"quality":"cd"}"#, StreamingQualityPreference::Cd),
+            (r#"{"quality":"low"}"#, StreamingQualityPreference::Low),
+        ] {
+            assert_eq!(quality_from_stored(Some(raw)), expected);
+        }
+    }
+
+    #[test]
+    fn lancien_json_inerte_ne_devient_pas_une_fausse_preference() {
+        assert_eq!(
+            quality_from_stored(Some(
+                r#"{"max_sample_rate":96000,"max_bit_depth":24,"prefer_hires":true}"#
+            )),
+            StreamingQualityPreference::Max
+        );
     }
 }

@@ -1444,9 +1444,14 @@ impl StreamingService for TidalService {
         track_id: &str,
         quality: Option<&str>,
     ) -> Result<StreamUrl, TuneError> {
+        let requested_quality = quality.unwrap_or(self.quality.as_str());
+        // A signed URL is only reusable for the quality it was resolved at.
+        // Keying on the track alone made a prior `max` play silently defeat a
+        // later per-zone `cd`/`low` selection (and vice versa).
+        let cache_key = format!("{track_id}:{requested_quality}");
         {
             let cache = self.url_cache.lock().await;
-            if let Some(cached) = cache.get(track_id) {
+            if let Some(cached) = cache.get(&cache_key) {
                 // A cached DASH `file://` entry becomes stale once the temp file
                 // is consumed and deleted after playback. Serving it again makes
                 // the transcode open a missing/empty file (os error 2) and the
@@ -1478,8 +1483,6 @@ impl StreamingService for TidalService {
                 );
             }
         }
-
-        let requested_quality = quality.unwrap_or(self.quality.as_str());
 
         // Quality fallback cascade: HI_RES_LOSSLESS → HI_RES → LOSSLESS → HIGH
         // Try the highest quality first, fall back only on API errors or
@@ -1760,7 +1763,7 @@ impl StreamingService for TidalService {
         {
             let mut cache = self.url_cache.lock().await;
             cache.set(
-                track_id.to_string(),
+                cache_key,
                 CachedUrl {
                     url: url.clone(),
                     mime_type: mime_type.to_string(),
