@@ -298,6 +298,11 @@ where
 
 // ---------------------------------------------------------------------------
 
+/// `?limit=` est un nombre d'éléments PAR CATÉGORIE (albums, artistes, titres,
+/// playlists), pas un total. `limit=0` demande « Tous », à la charge du service
+/// de le borner — la recherche Qobuz pagine et s'arrête au plafond documenté
+/// dans `qobuz.rs` (#2160). Absent, la valeur reste 20, ce que les clients
+/// antérieurs obtenaient déjà.
 async fn service_search(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,

@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use tune_core::db::tag_repo::TagRepo;
+use tune_core::db::tag_repo::{TagRepo, is_taggable_item_type, item_type_rejette};
 
 use crate::state::AppState;
 
@@ -55,6 +55,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/albums", get(list_tag_albums))
         .route("/{id}/tracks", get(list_tag_tracks))
         .route("/{id}/artists", get(list_tag_artists))
+        .route("/{id}/playlists", get(list_tag_playlists))
         .route("/for/{item_type}/{item_id}", get(tags_for_item))
 }
 
@@ -138,6 +139,9 @@ async fn add_tag_item(
     Path(id): Path<i64>,
     Json(body): Json<AddTagItem>,
 ) -> impl IntoResponse {
+    if !is_taggable_item_type(&body.item_type) {
+        return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
+    }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.tag_item(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::CREATED.into_response(),
@@ -150,6 +154,9 @@ async fn batch_tag_items(
     Path(id): Path<i64>,
     Json(body): Json<BatchTagRequest>,
 ) -> impl IntoResponse {
+    if !is_taggable_item_type(&body.item_type) {
+        return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
+    }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.batch_tag(id, &body.item_type, &body.item_ids) {
         Ok(count) => Json(json!({"tagged": count})).into_response(),
@@ -220,6 +227,37 @@ async fn list_tag_artists(State(state): State<AppState>, Path(id): Path<i64>) ->
         })
         .collect();
     Json(json!({"tag_id": id, "artists": artists, "count": artists.len()}))
+}
+
+/// Les playlists d'une étiquette.
+///
+/// Même forme que ses trois sœurs (`albums`, `tracks`, `artists`) : une
+/// enveloppe `{tag_id, <pluriel>, count}`, les objets résolus par leur dépôt,
+/// et un identifiant introuvable simplement **omis** — `items_by_tag` peut
+/// désigner une playlist supprimée entre-temps, et une liste amputée vaut
+/// mieux qu'une erreur qui masquerait les autres.
+///
+/// La playlist locale porte un `INTEGER PRIMARY KEY` : contrairement au label,
+/// elle entre dans `item_tags` telle quelle. C'est la même frontière que celle
+/// tracée par `favorite_facets_repo` pour les favoris.
+async fn list_tag_playlists(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+    let tag_repo = TagRepo::with_backend(state.backend.clone());
+    let playlist_ids = tag_repo.items_by_tag(id, "playlist").unwrap_or_default();
+    let playlist_repo =
+        tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
+    let playlists: Vec<Value> = playlist_ids
+        .into_iter()
+        .filter_map(|pid| playlist_repo.get(pid).ok().flatten())
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "track_count": p.track_count,
+            })
+        })
+        .collect();
+    Json(json!({"tag_id": id, "playlists": playlists, "count": playlists.len()}))
 }
 
 async fn tags_for_item(

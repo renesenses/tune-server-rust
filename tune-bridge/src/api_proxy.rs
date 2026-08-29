@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -90,21 +89,7 @@ pub async fn proxy_api(
 
     // Wait for response with timeout
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) => {
-            let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut response = Response::builder().status(status);
-
-            for (key, value) in &resp.headers {
-                if let Some(v) = value.as_str() {
-                    response = response.header(key.as_str(), v);
-                }
-            }
-
-            let body = resp.body.unwrap_or_default();
-            response
-                .body(Body::from(body))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
+        Ok(Ok(resp)) => crate::stream_proxy::reponse_relayee(resp),
         Ok(Err(_)) => {
             warn!(request_id = %request_id, "response channel dropped");
             StatusCode::BAD_GATEWAY.into_response()
