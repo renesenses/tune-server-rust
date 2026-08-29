@@ -616,10 +616,15 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             }
         };
         match measured {
-            Ok(Some((lufs, peak))) => {
+            Ok(Some((lufs, peak, true_peak))) => {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
+                // True peak inter-échantillons 4× (#1694). Clé à part :
+                // `rg_track_peak` garde sa sémantique sample-peak (compat
+                // tags, #1382) ; `prevent_clipping` PRÉFÈRE celle-ci quand
+                // elle existe. Peut dépasser 1.0 — c'est l'information.
+                let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -710,7 +715,8 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let rows = match backend.query_many(
         "SELECT t.id, t.duration_ms, \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_gain'), \
-                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak') \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak') \
          FROM tracks t WHERE t.album_id = ?",
         &[&album_id as &dyn ToSqlValue],
     ) {
@@ -724,6 +730,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let mut energy_sum = 0.0f64; // duration-weighted linear energy
     let mut dur_sum = 0.0f64;
     let mut peak_max = 0.0f64;
+    // True peak d'album (#1694) : max des true peaks de pistes — mais
+    // SEULEMENT si toutes les pistes en ont un. Un max partiel pourrait
+    // rater la piste la plus chaude, et `prevent_clipping` s'y fierait.
+    let mut true_peak_max = 0.0f64;
+    let mut true_peak_complete = true;
     let mut n = 0usize;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut track_ids: Vec<i64> = Vec::new();
@@ -749,6 +760,16 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         {
             peak_max = peak_max.max(p);
         }
+        match r
+            .get(4)
+            .and_then(|v| v.as_string())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(tp) => true_peak_max = true_peak_max.max(tp),
+            // Piste analysée avant #1694 : pas de true peak. L'album n'en
+            // reçoit pas non plus tant qu'elle n'est pas ré-analysée.
+            None => true_peak_complete = false,
+        }
     }
 
     if n == 0 || dur_sum <= 0.0 {
@@ -759,9 +780,15 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let gain_str = format_gain(album_gain);
     let peak_str = format_peak(peak_max);
 
+    let true_peak_str =
+        (true_peak_complete && true_peak_max > 0.0).then(|| format_peak(true_peak_max));
+
     for tid in &track_ids {
         let _ = repo.set(*tid, "rg_album_gain", &gain_str);
         let _ = repo.set(*tid, "rg_album_peak", &peak_str);
+        if let Some(tp) = &true_peak_str {
+            let _ = repo.set(*tid, "rg_album_true_peak", tp);
+        }
     }
     info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
     1
@@ -790,6 +817,12 @@ pub const MODE_KEY: &str = "replaygain_mode";
 pub const PREAMP_KEY: &str = "replaygain_preamp_db";
 /// Setting: pull the gain back when the tagged peak says it would clip.
 pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
+/// Setting (#1694) : plafond dBTP de l'anti-écrêtage — `0` (défaut, plein
+/// niveau, comportement historique), `-0.5` ou `-1`. N'agit que si
+/// `prevent_clipping` est actif : le facteur est tiré pour que
+/// `peak × factor` ne dépasse pas `10^(plafond/20)`. Avec le true peak
+/// stocké, cela laisse la marge inter-échantillons aux DAC qui la demandent.
+pub const TRUE_PEAK_CEILING_KEY: &str = "replaygain_true_peak_ceiling_db";
 
 /// How the gain is chosen for a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -826,6 +859,10 @@ pub struct ReplayGainSettings {
     pub mode: ReplayGainMode,
     pub preamp_db: f64,
     pub prevent_clipping: bool,
+    /// Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut) = pleine
+    /// échelle, comportement historique ; −0.5 ou −1 laissent une marge.
+    /// Toujours ≤ 0 — un plafond positif serait une demande d'écrêter.
+    pub true_peak_ceiling_db: f64,
 }
 
 impl Default for ReplayGainSettings {
@@ -834,6 +871,7 @@ impl Default for ReplayGainSettings {
             mode: ReplayGainMode::Off,
             preamp_db: 0.0,
             prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
         }
     }
 }
@@ -855,6 +893,12 @@ impl ReplayGainSettings {
             prevent_clipping: get(PREVENT_CLIPPING_KEY)
                 .map(|v| v != "false")
                 .unwrap_or(true),
+            // Borné à [−1, 0] : l'UI ne propose que 0 / −0.5 / −1, et une
+            // valeur cassée en base ne doit jamais creuser le niveau.
+            true_peak_ceiling_db: get(TRUE_PEAK_CEILING_KEY)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(-1.0, 0.0),
         }
     }
 }
@@ -886,19 +930,28 @@ pub fn stored_gain_detail(
     let meta = TrackMetadataRepo::with_backend(backend.clone())
         .get_all(track_id)
         .ok()?;
-    let pick = |gain_key: &str, peak_key: &str| -> Option<TrackGain> {
+    let pick = |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<TrackGain> {
         let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
-        let peak = meta
-            .get(peak_key)
-            .and_then(|p| p.trim().parse::<f64>().ok())
-            .filter(|p| *p > 0.0);
+        let read_peak = |key: &str| {
+            meta.get(key)
+                .and_then(|p| p.trim().parse::<f64>().ok())
+                .filter(|p| *p > 0.0)
+        };
+        // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
+        // c'est lui qui voit les overs que le sample peak rate, et c'est
+        // contre lui que `prevent_clipping` et le plafond dBTP doivent tirer.
+        let peak = read_peak(true_peak_key).or_else(|| read_peak(peak_key));
         Some(TrackGain { gain_db, peak })
     };
     match mode {
-        ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak")
+        ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak", "rg_album_true_peak")
             .map(|g| (g, ReplayGainMode::Album))
-            .or_else(|| pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track))),
-        _ => pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track)),
+            .or_else(|| {
+                pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
+                    .map(|g| (g, ReplayGainMode::Track))
+            }),
+        _ => pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
+            .map(|g| (g, ReplayGainMode::Track)),
     }
 }
 
@@ -917,9 +970,14 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
     let total_db = (gain.gain_db + settings.preamp_db).clamp(-30.0, 30.0);
     let mut factor = 10f64.powf(total_db / 20.0);
     if settings.prevent_clipping {
+        // Plafond dBTP (#1694) : 0 dB = pleine échelle (comportement
+        // historique, à l'identique) ; −0.5 / −1 laissent une marge
+        // inter-échantillons. Le peak stocké est le true peak quand
+        // l'analyse l'a mesuré (`stored_gain_detail` le préfère).
+        let ceiling = 10f64.powf(settings.true_peak_ceiling_db.min(0.0) / 20.0);
         if let Some(peak) = gain.peak {
-            if peak > 0.0 && factor * peak > 1.0 {
-                factor = 1.0 / peak;
+            if peak > 0.0 && factor * peak > ceiling {
+                factor = ceiling / peak;
             }
         }
     }
@@ -1414,6 +1472,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 6.0206,
             prevent_clipping: false,
+            ..Default::default()
         };
         // -6 dB tag + 6 dB pre-amp ⇒ unity.
         let f = gain_factor(
@@ -1432,6 +1491,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 0.0,
             prevent_clipping: true,
+            ..Default::default()
         };
         // +6 dB on a track already peaking at 0.95 would reach 1.9 — clipped.
         let f = gain_factor(
@@ -1459,6 +1519,138 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // #1694 — plafond dBTP optionnel + préférence au true peak stocké.
+    // ------------------------------------------------------------------
+
+    /// Plafond à 0 dBTP (défaut) : STRICTEMENT le comportement historique.
+    /// Un réglage absent ne doit changer aucun facteur déjà en production.
+    #[test]
+    fn ceiling_zero_is_the_historical_behavior() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let g = TrackGain {
+            gain_db: 6.0,
+            peak: Some(0.95),
+        };
+        let f = gain_factor(g, s);
+        assert!((f - 1.0 / 0.95).abs() < 1e-9, "{f}");
+    }
+
+    /// Plafond −1 dBTP : le facteur est tiré pour que `peak × factor` ne
+    /// dépasse pas 10^(−1/20) — la marge inter-échantillons demandée.
+    #[test]
+    fn dbtp_ceiling_pulls_the_factor_under_the_ceiling() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let ceiling = 10f64.powf(-1.0 / 20.0);
+        // Un master loudness-war : true peak au-delà de la pleine échelle.
+        let g = TrackGain {
+            gain_db: 2.0,
+            peak: Some(1.20),
+        };
+        let f = gain_factor(g, s);
+        assert!((f * 1.20 - ceiling).abs() < 1e-9, "{f}");
+
+        // Sans `prevent_clipping`, le plafond n'agit pas : c'est un mode de
+        // l'anti-écrêtage, pas un limiteur indépendant.
+        let loose = ReplayGainSettings {
+            prevent_clipping: false,
+            ..s
+        };
+        assert!(gain_factor(g, loose) * 1.20 > 1.0);
+    }
+
+    /// Le plafond ne touche jamais une piste qui reste dessous : ce n'est pas
+    /// une normalisation vers −1 dBTP, c'est un plafond.
+    #[test]
+    fn dbtp_ceiling_leaves_quiet_results_alone() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let g = TrackGain {
+            gain_db: -6.0,
+            peak: Some(0.9),
+        };
+        let f = gain_factor(g, s);
+        // -6 dB sur un pic 0.9 : résultat ~0.45, loin sous 10^(-1/20).
+        assert!((f - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9, "{f}");
+    }
+
+    /// Le réglage relu de la base est borné à [−1, 0] : une valeur cassée ne
+    /// doit ni creuser le niveau ni écrêter.
+    #[test]
+    fn ceiling_setting_is_parsed_and_clamped() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        assert_eq!(ReplayGainSettings::load(&backend).true_peak_ceiling_db, 0.0);
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "-0.5").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            -0.5
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "-12").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            -1.0,
+            "borne basse : jamais plus d'un dB de marge"
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "3").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            0.0,
+            "borne haute : un plafond positif n'existe pas"
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "junk").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            0.0,
+            "illisible ⇒ défaut, jamais une surprise sonore"
+        );
+    }
+
+    /// `prevent_clipping` PRÉFÈRE le true peak stocké : c'est lui qui voit
+    /// les overs inter-échantillons. Le sample peak reste le repli des
+    /// bibliothèques analysées avant #1694.
+    #[test]
+    fn stored_gain_prefers_the_true_peak_when_present() {
+        let (_db, backend) = sweep_db(1);
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        meta.set(1, "rg_track_gain", "-3.00 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.950000").unwrap();
+
+        // Sans true peak : repli sur le sample peak (compat, #1382).
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Track).unwrap();
+        assert_eq!(g.peak, Some(0.95));
+
+        // Avec true peak : c'est LUI qui arme l'anti-écrêtage.
+        meta.set(1, "rg_track_true_peak", "1.230000").unwrap();
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Track).unwrap();
+        assert_eq!(g.peak, Some(1.23));
+
+        // Mode album : même préférence sur les clés d'album.
+        meta.set(1, "rg_album_gain", "-2.00 dB").unwrap();
+        meta.set(1, "rg_album_peak", "0.900000").unwrap();
+        meta.set(1, "rg_album_true_peak", "1.100000").unwrap();
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Album).unwrap();
+        assert_eq!(g.peak, Some(1.10));
+    }
+
     #[test]
     fn clipping_prevention_never_boosts_a_quiet_track() {
         // A track peaking at 0.2 with a -3 dB tag must still be attenuated:
@@ -1467,6 +1659,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 0.0,
             prevent_clipping: true,
+            ..Default::default()
         };
         let f = gain_factor(
             TrackGain {
