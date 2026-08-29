@@ -88,6 +88,7 @@ impl RelayState {
                 server_name,
                 ws_tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                flux: Arc::new(Mutex::new(HashMap::new())),
                 active_streams: AtomicU32::new(0),
                 active_clients: AtomicU32::new(0),
                 connected_at: Instant::now(),
@@ -113,16 +114,41 @@ pub struct ServerConnection {
     pub server_name: String,
     pub ws_tx: mpsc::Sender<String>,
     pub pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingResponse>>>>,
+    /// Puits des morceaux audio en vol, par identifiant de requete.
+    ///
+    /// Une reponse d'API se resout d'un coup : le `oneshot` de `pending`
+    /// suffit. Un flux audio, non — il arrive en morceaux, longtemps apres
+    /// l'en-tete. Le `oneshot` livre le debut de la reponse, et ce puits
+    /// recoit la suite jusqu'a `relay.stream_end`.
+    ///
+    /// La carte vit dans la connexion : un serveur qui se deconnecte emporte
+    /// ses puits, donc ferme les corps HTTP restes ouverts au lieu de les
+    /// laisser pendre.
+    pub flux: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
     pub active_streams: AtomicU32,
     pub active_clients: AtomicU32,
     pub connected_at: Instant,
     pub last_heartbeat: Instant,
 }
 
+/// Corps d'une reponse relayee.
+///
+/// Le relais transporte deux choses de nature differente. Une reponse d'API
+/// tient en memoire et arrive d'un bloc. Un flux audio ne tient pas en
+/// memoire — un FLAC fait des dizaines de megaoctets — et arrive au fil de
+/// l'eau. Les distinguer ici evite d'avoir a se demander, plus loin, si un
+/// `Option<String>` vide veut dire « corps vide » ou « corps a venir ».
+pub enum CorpsRelaye {
+    /// Corps complet, deja recu.
+    Entier(Option<String>),
+    /// Morceaux a venir, jusqu'a la fermeture du canal.
+    Morceaux(mpsc::Receiver<Vec<u8>>),
+}
+
 pub struct PendingResponse {
     pub status: u16,
     pub headers: serde_json::Map<String, serde_json::Value>,
-    pub body: Option<String>,
+    pub body: CorpsRelaye,
 }
 
 #[cfg(test)]
