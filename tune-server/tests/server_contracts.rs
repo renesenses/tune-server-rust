@@ -11,6 +11,8 @@ mod auth_security;
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "etiquettes_types_et_playlists.rs"]
+mod etiquettes_types_et_playlists;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_facettes_routes.rs"]
