@@ -256,6 +256,28 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
         // Garde thermique de cette passe (#1576) : ReplayGain décode des
         // fichiers entiers, c'est l'autre moitié de la charge qui a éteint .18.
         let mut thermal = crate::audio::thermal::ThermalGate::new();
+
+        // ─── Registre des exécutions automatisées (#2080) ────────────────
+        //
+        // L'unité inscrite n'est PAS le lot : cette boucle en enchaîne des
+        // centaines, et cinquante lignes de registre seraient consommées en
+        // quelques minutes sans jamais raconter autre chose que « ça avance ».
+        // L'unité est la CAMPAGNE — de la première piste trouvée jusqu'au
+        // retour au repos. C'est la phrase que l'utilisateur attend : « la
+        // passe a tourné de 21h04 à 21h37 et a analysé 812 pistes ».
+        //
+        // Le repos sans campagne ouverte est inscrit AUSSI, une seule fois par
+        // transition (`repos_deja_inscrit`). C'est la réponse littérale à « ça
+        // n'a rien fait » : la passe a tourné, elle n'a rien trouvé. Sans
+        // cette ligne, une bibliothèque déjà entièrement analysée serait
+        // indistinguable d'une passe jamais lancée. Sans le drapeau, la même
+        // ligne se réécrirait toutes les IDLE_SLEEP_SECS et chasserait tout
+        // l'historique utile hors de la rétention.
+        let registre = crate::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
+        let mut campagne: Option<crate::db::task_run_repo::Execution> = None;
+        let mut analysees: i64 = 0;
+        let mut repos_deja_inscrit = false;
+
         loop {
             if analysis_enabled(&backend) {
                 if thermal.should_hold("replaygain") {
@@ -277,9 +299,27 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     }
                 };
                 let albums = analyze_album_batch(&backend);
+
+                if did > 0 || albums > 0 {
+                    // Du travail : ouvrir la campagne si elle ne l'est pas déjà.
+                    if campagne.is_none() {
+                        campagne =
+                            Some(registre.ouvrir(crate::db::task_run_repo::TACHE_REPLAYGAIN));
+                        analysees = 0;
+                    }
+                    analysees += did as i64 + albums as i64;
+                    repos_deja_inscrit = false;
+                }
+
                 if playing {
                     tokio::time::sleep(std::time::Duration::from_secs(PLAYBACK_BACKOFF_SECS)).await;
                 } else if did == 0 && albums == 0 {
+                    clore_campagne(
+                        &registre,
+                        &mut campagne,
+                        &mut analysees,
+                        &mut repos_deja_inscrit,
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
                 } else {
                     // More to do — loop again promptly (the per-file pauses
@@ -287,10 +327,49 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             } else {
+                // Passe désactivée en cours de route : la campagne ouverte est
+                // terminée, pas suspendue. La laisser ouverte la ferait
+                // apparaître « en cours » jusqu'au prochain redémarrage.
+                clore_campagne(
+                    &registre,
+                    &mut campagne,
+                    &mut analysees,
+                    &mut repos_deja_inscrit,
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             }
         }
     });
+}
+
+/// Fermer la campagne ReplayGain en cours, ou inscrire un « rien à faire ».
+///
+/// Un seul endroit pour les deux transitions vers le repos, sinon le drapeau
+/// `repos_deja_inscrit` finirait par diverger entre les deux branches et le
+/// registre se remplirait de lignes vides.
+fn clore_campagne(
+    registre: &crate::db::task_run_repo::TaskRunRepo,
+    campagne: &mut Option<crate::db::task_run_repo::Execution>,
+    analysees: &mut i64,
+    repos_deja_inscrit: &mut bool,
+) {
+    if let Some(e) = campagne.take() {
+        let n = *analysees;
+        e.terminer(
+            crate::db::task_run_repo::Verdict::Succes,
+            Some(n),
+            Some(&format!("{n} elements analyses")),
+        );
+        *analysees = 0;
+        *repos_deja_inscrit = true;
+        return;
+    }
+    if !*repos_deja_inscrit {
+        registre
+            .ouvrir(crate::db::task_run_repo::TACHE_REPLAYGAIN)
+            .rien_a_faire(Some("aucune piste ni album sans ReplayGain"));
+        *repos_deja_inscrit = true;
+    }
 }
 
 /// Analyse up to `TRACK_BATCH` local tracks that have no ReplayGain yet. Returns
@@ -791,6 +870,112 @@ fn now_epoch_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod registre_tests {
+    use std::sync::Arc;
+
+    use crate::db::backend::DbBackend;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::task_run_repo::{Execution, TACHE_REPLAYGAIN, TaskRunRepo};
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Une campagne, c'est du premier lot trouvé jusqu'au retour au repos —
+    /// PAS un lot. La boucle en enchaîne des centaines : une ligne par lot
+    /// consommerait toute la rétention en quelques minutes sans jamais rien
+    /// raconter d'autre que « ça avance ».
+    #[test]
+    fn une_campagne_couvre_toute_la_serie_de_lots_et_pas_un_lot() {
+        let db = base();
+        let registre = TaskRunRepo::with_backend(db.clone());
+        let mut campagne: Option<Execution> = None;
+        let mut analysees: i64 = 0;
+        let mut repos = false;
+
+        // Trois lots successifs, comme la boucle les enchaîne.
+        for lot in [12i64, 30, 8] {
+            if campagne.is_none() {
+                campagne = Some(registre.ouvrir(TACHE_REPLAYGAIN));
+                analysees = 0;
+            }
+            analysees += lot;
+            repos = false;
+        }
+        assert_eq!(
+            registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap().len(),
+            1,
+            "trois lots, UNE ligne"
+        );
+
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+
+        let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].outcome, "succes");
+        assert_eq!(l[0].items, Some(50), "12 + 30 + 8, la campagne entière");
+    }
+
+    /// Le repos sans campagne s'inscrit UNE fois. C'est la réponse à « ça n'a
+    /// rien fait » — sans elle, une bibliothèque déjà entièrement analysée
+    /// serait indistinguable d'une passe jamais lancée.
+    #[test]
+    fn le_repos_s_inscrit_une_seule_fois_par_transition() {
+        let db = base();
+        let registre = TaskRunRepo::with_backend(db.clone());
+        let mut campagne: Option<Execution> = None;
+        let mut analysees: i64 = 0;
+        let mut repos = false;
+
+        for _ in 0..5 {
+            super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        }
+
+        let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
+        assert_eq!(
+            l.len(),
+            1,
+            "cinq tours de boucle au repos, une seule ligne — sinon la \
+             rétention serait remplie de lignes vides et l'historique utile \
+             chassé"
+        );
+        assert_eq!(l[0].outcome, "rien_a_faire");
+        assert_eq!(l[0].items, Some(0));
+    }
+
+    /// Fermer une campagne ne doit PAS écrire en plus une ligne « rien à
+    /// faire » : la campagne est déjà la trace du passage. Deux lignes pour un
+    /// seul retour au repos rendraient le registre illisible.
+    #[test]
+    fn fermer_une_campagne_n_ajoute_pas_une_ligne_de_repos() {
+        let db = base();
+        let registre = TaskRunRepo::with_backend(db.clone());
+        let mut campagne: Option<Execution> = None;
+        let mut analysees: i64 = 0;
+        let mut repos = false;
+
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        campagne = Some(registre.ouvrir(TACHE_REPLAYGAIN));
+        analysees = 7;
+        repos = false;
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+        super::clore_campagne(&registre, &mut campagne, &mut analysees, &mut repos);
+
+        let l = registre.lister(Some(TACHE_REPLAYGAIN), 10).unwrap();
+        assert_eq!(l.len(), 2, "un repos, puis une campagne — et rien de plus");
+        let verdicts: Vec<&str> = l.iter().map(|x| x.outcome.as_str()).collect();
+        assert!(verdicts.contains(&"rien_a_faire"), "{verdicts:?}");
+        assert!(verdicts.contains(&"succes"), "{verdicts:?}");
+        let campagne_close = l.iter().find(|x| x.outcome == "succes").unwrap();
+        assert_eq!(campagne_close.items, Some(7));
+    }
 }
 
 #[cfg(test)]
