@@ -2956,132 +2956,247 @@ fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+type SharedOutput =
+    std::sync::Arc<tokio::sync::Mutex<Box<dyn tune_core::outputs::traits::OutputTarget>>>;
+
 #[derive(Deserialize, serde::Serialize, Clone)]
-struct ZonePin {
-    index: usize,
+struct ZonePinRequest {
+    index: u32,
     title: String,
-    uri: String,
-    #[serde(rename = "type")]
-    pin_type: String,
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default, rename = "type")]
+    pin_type: Option<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    artwork_uri: String,
+    #[serde(default)]
+    shuffle: bool,
 }
 
-fn pins_key(zone_id: i64) -> String {
-    format!("zone_{zone_id}_pins")
+#[derive(Deserialize)]
+struct SaveQueueAsPinRequest {
+    title: String,
+    index: Option<u32>,
 }
 
-fn load_pins(state: &AppState, zone_id: i64) -> Vec<ZonePin> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings
-        .get(&pins_key(zone_id))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn pins_error(
+    status: StatusCode,
+    error: &str,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    (
+        status,
+        Json(json!({ "error": error, "message": message.into() })),
+    )
+        .into_response()
 }
 
-fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings
-        .set(
-            &pins_key(zone_id),
-            &serde_json::to_string(pins).unwrap_or_default(),
+async fn openhome_output_for_zone(
+    state: &AppState,
+    zone_id: i64,
+) -> Result<Option<SharedOutput>, axum::response::Response> {
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .map_err(|e| {
+            pins_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pins_zone_lookup_failed",
+                e,
+            )
+        })?
+        .ok_or_else(|| pins_error(StatusCode::NOT_FOUND, "zone_not_found", "zone not found"))?;
+    if zone.output_type.as_deref() != Some("openhome") {
+        return Ok(None);
+    }
+    let device_id = zone.output_device_id.ok_or_else(|| {
+        pins_error(
+            StatusCode::CONFLICT,
+            "zone_no_output_device",
+            "OpenHome zone has no output device",
         )
-        .ok();
+    })?;
+    let output = state.outputs.lock().await.get(&device_id).ok_or_else(|| {
+        pins_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "zone_output_unavailable",
+            "OpenHome output is not currently registered",
+        )
+    })?;
+    Ok(Some(output))
 }
 
-async fn get_zone_pins(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let pins = load_pins(&state, zone_id);
-    Json(json!(pins))
+fn as_openhome(
+    output: &dyn tune_core::outputs::traits::OutputTarget,
+) -> Result<&tune_core::outputs::openhome::OpenHomeOutput, axum::response::Response> {
+    output
+        .as_any()
+        .downcast_ref::<tune_core::outputs::openhome::OpenHomeOutput>()
+        .ok_or_else(|| {
+            pins_error(
+                StatusCode::CONFLICT,
+                "zone_output_type_mismatch",
+                "registered output is not OpenHome",
+            )
+        })
+}
+
+async fn get_zone_pins(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(output) = (match openhome_output_for_zone(&state, zone_id).await {
+        Ok(output) => output,
+        Err(response) => return response,
+    }) else {
+        return Json(json!({ "supported": false, "pins": [], "max_slots": 0 })).into_response();
+    };
+    let output = output.lock().await;
+    let openhome = match as_openhome(output.as_ref()) {
+        Ok(openhome) => openhome,
+        Err(response) => return response,
+    };
+    if !openhome.supports_pins() {
+        return Json(json!({ "supported": false, "pins": [], "max_slots": 0 })).into_response();
+    }
+    match openhome.pins_snapshot().await {
+        Ok(snapshot) => Json(json!({
+            "supported": true,
+            "pins": snapshot.pins,
+            "max_slots": snapshot.max_slots,
+        }))
+        .into_response(),
+        Err(e) => pins_error(StatusCode::BAD_GATEWAY, "openhome_pins_failed", e),
+    }
 }
 
 async fn set_zone_pin(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<ZonePin>,
+    Json(body): Json<ZonePinRequest>,
 ) -> impl IntoResponse {
-    let mut pins = load_pins(&state, zone_id);
-    // Replace at index or append
-    if let Some(existing) = pins.iter_mut().find(|p| p.index == body.index) {
-        *existing = body.clone();
-    } else {
-        pins.push(body.clone());
+    let Some(mode) = body.mode.clone().filter(|value| !value.trim().is_empty()) else {
+        return pins_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "openhome_pin_mode_required",
+            "mode is required by OpenHome Pins:1",
+        );
+    };
+    let Some(uri) = body.uri.clone().filter(|value| !value.trim().is_empty()) else {
+        return pins_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "openhome_pin_uri_required",
+            "uri is required by OpenHome Pins:1",
+        );
+    };
+    let Some(output) = (match openhome_output_for_zone(&state, zone_id).await {
+        Ok(output) => output,
+        Err(response) => return response,
+    }) else {
+        return pins_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "openhome_pins_unsupported",
+            "zone is not an OpenHome output",
+        );
+    };
+    let output = output.lock().await;
+    let openhome = match as_openhome(output.as_ref()) {
+        Ok(openhome) => openhome,
+        Err(response) => return response,
+    };
+    let draft = tune_core::outputs::openhome::OpenHomePinDraft {
+        index: body.index,
+        mode,
+        pin_type: body.pin_type.clone().unwrap_or_default(),
+        uri,
+        title: body.title.clone(),
+        description: body.description.clone(),
+        artwork_uri: body.artwork_uri.clone(),
+        shuffle: body.shuffle,
+    };
+    match openhome.set_device_pin(&draft).await {
+        Ok(()) => (StatusCode::CREATED, Json(json!(body))).into_response(),
+        Err(e) => pins_error(StatusCode::BAD_GATEWAY, "openhome_pins_set_failed", e),
     }
-    save_pins(&state, zone_id, &pins);
-    (StatusCode::CREATED, Json(json!(body))).into_response()
 }
 
 async fn clear_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
-    let mut pins = load_pins(&state, zone_id);
-    pins.retain(|p| p.index != index);
-    save_pins(&state, zone_id, &pins);
-    StatusCode::NO_CONTENT
+    let Some(output) = (match openhome_output_for_zone(&state, zone_id).await {
+        Ok(output) => output,
+        Err(response) => return response,
+    }) else {
+        return pins_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "openhome_pins_unsupported",
+            "zone is not an OpenHome output",
+        );
+    };
+    let output = output.lock().await;
+    let openhome = match as_openhome(output.as_ref()) {
+        Ok(openhome) => openhome,
+        Err(response) => return response,
+    };
+    match openhome.clear_pin_index(index as u32).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.ends_with(" is empty") || e.ends_with(" is out of range") => {
+            pins_error(StatusCode::NOT_FOUND, "openhome_pin_not_found", e)
+        }
+        Err(e) => pins_error(StatusCode::BAD_GATEWAY, "openhome_pins_clear_failed", e),
+    }
 }
 
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
-    let pins = load_pins(&state, zone_id);
-    let Some(pin) = pins.iter().find(|p| p.index == index) else {
-        return (StatusCode::NOT_FOUND, "pin not found").into_response();
+    let Some(output) = (match openhome_output_for_zone(&state, zone_id).await {
+        Ok(output) => output,
+        Err(response) => return response,
+    }) else {
+        return pins_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "openhome_pins_unsupported",
+            "zone is not an OpenHome output",
+        );
     };
-
-    // Build a play request from the pin
-    let output_device_id = get_zone_device_id(&state, zone_id);
-    let orch_req = tune_core::orchestrator::PlayRequest {
-        zone_id,
-        output_device_id,
-        track_id: None,
-        source: Some(pin.pin_type.clone()),
-        source_id: Some(pin.uri.clone()),
-        title: Some(pin.title.clone()),
-        artist_name: None,
-        album_title: None,
-        cover_url: None,
-        duration_ms: None,
-        seek_ms: None,
-        temp_file_path: None,
-        sample_rate: None,
-        bit_depth: None,
-        media_format: None,
-        track_number: None,
-        disc_number: None,
+    let output = output.lock().await;
+    let openhome = match as_openhome(output.as_ref()) {
+        Ok(openhome) => openhome,
+        Err(response) => return response,
     };
-    match state.orchestrator.play(orch_req).await {
-        Ok(result) => {
-            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
-        }
-        Err(e) => play_error_response(e),
+    match openhome.invoke_pin_index(index as u32).await {
+        Ok(()) => Json(json!({ "invoked": true, "index": index })).into_response(),
+        Err(e) => pins_error(StatusCode::BAD_GATEWAY, "openhome_pins_invoke_failed", e),
     }
 }
 
 async fn save_queue_as_pin(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<ZonePin>,
+    Json(body): Json<SaveQueueAsPinRequest>,
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if items.is_empty() {
         return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
     }
-    let mut pins = load_pins(&state, zone_id);
-    let pin = ZonePin {
-        index: body.index,
-        title: body.title,
-        uri: format!("queue:zone:{zone_id}"),
-        pin_type: "queue".into(),
-    };
-    if let Some(existing) = pins.iter_mut().find(|p| p.index == pin.index) {
-        *existing = pin.clone();
-    } else {
-        pins.push(pin.clone());
-    }
-    save_pins(&state, zone_id, &pins);
-    (StatusCode::CREATED, Json(json!(pin))).into_response()
+    let _ = (body.title, body.index);
+    // OpenHome SetDevice accepts a renderer-understood Pin URI, not Tune's
+    // private queue rows.  The former implementation persisted
+    // `queue:zone:<id>` locally and reported success although no renderer had
+    // received (or could invoke) it.  Until Tune exposes its queue through a
+    // supported Pin mode, fail explicitly rather than recreate that lie.
+    pins_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "openhome_queue_pin_unrepresentable",
+        "Tune queues cannot yet be represented as an OpenHome Pin URI",
+    )
 }
 
 // ---------------------------------------------------------------------------
