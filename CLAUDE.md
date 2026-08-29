@@ -200,13 +200,11 @@ pousser** : un merge sans conflit peut casser la compilation.
 
 ## 6. Pièges qui coûtent cher
 
-- **AUCUNE ligne de fermeture ne ferme quoi que ce soit ici — pas même en
-  anglais.** Ce point disait le contraire, et c'était faux. GitHub n'auto-ferme
-  que sur la branche **par défaut** ; or la doctrine impose de cibler
-  `release/v0.9`. Mesuré sur 18 PR portant `Closes`/`Fixes`/`Resolves`
-  fusionnées ici : **0 fermeture automatique, 18 fermetures à la main**. Le
-  **lien** lui-même n'est pas enregistré — `closingIssuesReferences` rend une
-  liste vide. Ce n'est pas non plus une affaire de squash.
+- **Une ligne de fermeture peut agir avec retard.** GitHub n'auto-ferme pas au
+  merge sur `release/v0.9`, mais relit les mots-clés lorsque cet historique
+  rejoint la branche par défaut. La synchronisation de v0.9.125 vers `main` a
+  ainsi fermé #1897 à partir d'un ancien message qui disait littéralement
+  `This does not close #1897` : la négation est ignorée par GitHub (#2785).
 
   Le test qui tranche : l'événement `closed` porte un `commit_id` quand c'est
   GitHub qui ferme, et **aucun** quand c'est un humain.
@@ -216,9 +214,12 @@ pousser** : un merge sans conflit peut casser la compilation.
     --jq '.[]|select(.event=="closed")|"\(.actor.login) \(.commit_id//"aucun")"'
   ```
 
-  Écrivez la ligne quand même (elle aide qui relira), **dans les deux langues
-  si vous voulez** — mais prévoyez toujours `gh issue close` à la main, puis
-  `gh issue view <n> --json state` pour vérifier au lieu de supposer.
+  Pour déclarer une vraie fermeture, utilisez `Closes`/`Fixes`/`Resolves` et
+  attendez la preuve dans la release publiée. Pour dire explicitement qu'un
+  commit **ne ferme pas** une issue, n'écrivez jamais ces mots-clés après une
+  négation : écrivez seulement `Refs #N`. Le garde-fou lit aussi les messages
+  des commits propres à la PR, car filtrer le seul corps ne protège pas le
+  prochain passage tag → `main`.
 
   ⚠️ Une PR de `tune-web-client` qui vise une issue de `tune-server-rust` doit
   écrire la forme complète — `Closes renesenses/tune-server-rust#2036` — sinon
@@ -245,9 +246,9 @@ pousser** : un merge sans conflit peut casser la compilation.
 
 ## 6 bis. Une release publiée se solde — clôture et réponse aux testeurs
 
-**Le stock d'issues doit refléter l'état du code.** Il ne le fait pas tout
-seul : `Closes` ne ferme rien ici (voir ci-dessus), et un correctif fusionné
-n'est pas un correctif livré. Sans cette étape, on accumule des issues
+**Le stock d'issues doit refléter l'état du code.** Il ne le fait pas au bon
+moment : `Closes` peut n'agir qu'au passage différé vers `main`, et un correctif
+fusionné n'est pas un correctif livré. Sans cette étape, on accumule des issues
 ouvertes dont le défaut n'existe plus — mesuré le 28/08/2026 : **23 issues P2
 traitées dans la journée, 0 fermée, 373 issues ouvertes**. Le compteur ne
 mesurait plus le travail, il mesurait l'oubli.
