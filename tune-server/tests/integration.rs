@@ -1254,6 +1254,170 @@ async fn queue_add_empty_body_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+// ── « Lecture suivante » doit se confirmer (#2079, Sandro, fil 1493) ──
+//
+// « on ne sait donc jamais si la commande a réussi et il faut aller vérifier
+// dans la file d'attente ». La réponse ne portait que `added` et
+// `queue_length` : de quoi dire « quelque chose est parti », pas ce qui est
+// parti ni où c'est arrivé. Un client ne pouvait confirmer qu'en relisant la
+// file entière — et pendant ces allers-retours, le second clic enfile deux
+// fois.
+
+#[tokio::test]
+async fn queue_add_nomme_la_piste_enfilee_et_sa_position() {
+    let (app, state) = make_app_with_state();
+    let ids: Vec<i64> = ["A", "B", "C"]
+        .iter()
+        .map(|t| insert_track(&state, t))
+        .collect();
+    let zid = make_zone(&app, "Q-2079-next").await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": ids }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // « Lecture suivante » sur la piste en cours (position 0) → position 1.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({
+            "source": "qobuz",
+            "source_id": "q-next",
+            "title": "Le Sacre du printemps",
+            "artist_name": "Stravinsky",
+            "position": 1
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "le statut ne change pas: {body}"
+    );
+    // Les deux champs historiques restent, au même sens : aucun client
+    // déployé ne bouge.
+    assert_eq!(body["added"], 1, "{body}");
+    assert_eq!(body["queue_length"], 4, "{body}");
+    // Et la confirmation exploitable : où, et quoi.
+    assert_eq!(
+        body["position"], 1,
+        "la position effective manquait: {body}"
+    );
+    let items = body["items"].as_array().expect("items[]");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["position"], 1, "{body}");
+    assert_eq!(items[0]["source"], "qobuz", "{body}");
+    assert_eq!(items[0]["source_id"], "q-next", "{body}");
+    assert_eq!(
+        items[0]["title"], "Le Sacre du printemps",
+        "la réponse doit nommer la piste, sinon rien à afficher: {body}"
+    );
+    assert_eq!(items[0]["artist"], "Stravinsky", "{body}");
+
+    // La file confirme que la réponse ne mentait pas.
+    let (status, queue) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(queue["tracks"][1]["source_id"], "q-next", "{queue}");
+}
+
+#[tokio::test]
+async fn queue_add_hors_file_dit_qu_il_a_ajoute_a_la_fin() {
+    // Le cœur du ticket : une position hors file est RAMENÉE en fin de file et
+    // l'écriture réussit quand même. Renvoyer la position demandée rendrait
+    // « lu ensuite » et « ajouté à la fin » identiques ; on renvoie l'effective.
+    let (app, state) = make_app_with_state();
+    let ids: Vec<i64> = ["A", "B"].iter().map(|t| insert_track(&state, t)).collect();
+    let zid = make_zone(&app, "Q-2079-clamp").await;
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": ids }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({
+            "source": "qobuz",
+            "source_id": "q-clamp",
+            "title": "Hors file",
+            "position": 99
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["position"], 2,
+        "la piste atterrit en fin de file, la réponse doit le dire: {body}"
+    );
+    assert_ne!(body["position"], 99, "on rend le résultat, pas la demande");
+    assert_eq!(body["items"][0]["position"], 2, "{body}");
+
+    let (_, queue) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(queue["tracks"][2]["source_id"], "q-clamp", "{queue}");
+}
+
+#[tokio::test]
+async fn queue_add_un_echec_reste_distinguable_d_un_succes() {
+    // La contre-partie : l'ajout d'un champ de confirmation ne doit pas rendre
+    // un refus confirmable. Un corps vide reste 400, sans `position` ni
+    // `items` à afficher.
+    let app = make_app();
+    let zid = make_zone(&app, "Q-2079-echec").await;
+
+    let (status, body) =
+        post_json(&app, &format!("/api/v1/zones/{zid}/queue/add"), json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["position"].is_null(),
+        "un refus n'annonce pas de position: {body}"
+    );
+    assert!(body["items"].is_null(), "un refus n'enfile rien: {body}");
+    assert!(body["added"].is_null(), "un refus n'ajoute rien: {body}");
+}
+
+#[tokio::test]
+async fn queue_add_decrit_chaque_piste_d_un_lot() {
+    // Un lot `tracks[]` enfile plusieurs pistes d'un coup : chacune doit
+    // porter SA position, sinon un client ne peut pas dire « 3 pistes après la
+    // piste en cours » sans relire la file.
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "A");
+    let zid = make_zone(&app, "Q-2079-lot").await;
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [tid] }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({
+            "position": 1,
+            "tracks": [
+                { "source": "qobuz", "source_id": "l1", "title": "Un" },
+                { "source": "qobuz", "source_id": "l2", "title": "Deux" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["added"], 2, "{body}");
+    assert_eq!(body["position"], 1, "{body}");
+    let items = body["items"].as_array().expect("items[]");
+    assert_eq!(items.len(), 2, "{body}");
+    assert_eq!(items[0]["position"], 1, "{body}");
+    assert_eq!(items[0]["source_id"], "l1", "{body}");
+    assert_eq!(items[1]["position"], 2, "{body}");
+    assert_eq!(items[1]["source_id"], "l2", "{body}");
+}
+
 // ── Orphan zone guard (Yacine, 24/07) ───────────────────────────────
 //
 // A zone row without output_device_id (leftover from manual creation or

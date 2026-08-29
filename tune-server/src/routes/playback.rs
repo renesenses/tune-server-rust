@@ -2115,10 +2115,13 @@ async fn queue_add(
     }
 
     let count = inputs.len();
-    if let Err(e) = queue_repo.insert_at(zone_id, &inputs, body.position) {
-        warn!(zone_id, error = %e, "queue_insert_failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
+    let start = match queue_repo.insert_at(zone_id, &inputs, body.position) {
+        Ok(start) => start,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_insert_failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    };
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
     state
@@ -2129,23 +2132,91 @@ async fn queue_add(
     // Le succès aussi doit laisser une trace : c'est elle qui permet de dire à
     // un utilisateur « votre ajout est bien arrivé, à telle position » plutôt
     // que de lui demander de réessayer. `position` vaut `None` pour un ajout
-    // en fin de file, `Some(n)` pour un « Lire ensuite ».
+    // en fin de file, `Some(n)` pour un « Lire ensuite » ; `inserted_at` dit où
+    // la piste a RÉELLEMENT atterri, ce qui n'est pas la même chose (#2079).
     info!(
         zone_id,
         added = count,
         position = ?body.position,
+        inserted_at = ?start,
         queue_length = total,
         "queue_add_ok"
     );
+    let enfiles = decrire_enfilage(&inputs, start);
     state.event_bus.emit(
         "playback.queue.track_added",
-        json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
+        json!({
+            "zone_id": zone_id,
+            "added": count,
+            "queue_length": total,
+            "position": start,
+        }),
     );
     (
         StatusCode::CREATED,
-        Json(json!({ "added": count, "queue_length": total })),
+        // `added` + `queue_length` ne disaient QUE « quelque chose est parti ».
+        // Sandro (#2079, fil forum 1493) allait rouvrir la file après chaque
+        // « Lecture suivante » parce que rien dans la réponse ne nommait la
+        // piste ni ne disait où elle avait atterri — et la parade naturelle,
+        // recliquer, l'enfilait deux fois.
+        //
+        // Les deux champs sont ADDITIFS : le statut reste 201, `added` et
+        // `queue_length` gardent leur sens et leur place, donc aucun client
+        // déployé ne change de comportement.
+        //
+        // `position` est la position EFFECTIVE, pas celle demandée : le dépôt
+        // ramène toute position hors file en fin de file, si bien qu'un « juste
+        // après la piste en cours » calculé sur une file périmée réussit… en
+        // ajoutant à la fin. Renvoyer la demande plutôt que le résultat
+        // rendrait ces deux cas identiques, ce qui est exactement le défaut.
+        Json(json!({
+            "added": count,
+            "queue_length": total,
+            "position": start,
+            "items": enfiles,
+        })),
     )
         .into_response()
+}
+
+/// Ce qui vient d'être enfilé, une entrée par ligne insérée, dans l'ordre des
+/// positions.
+///
+/// Dérivé de `inputs` plutôt que construit au fil des `push` : les trois
+/// chemins d'alimentation (piste de service isolée, lot `tracks[]`, pistes
+/// locales dont l'album) écriraient sinon chacun leur description, et la
+/// quatrième oublierait la sienne — un « enfilé » muet de plus.
+///
+/// N'interroge RIEN : tout est déjà résolu dans `inputs` (le titre d'une piste
+/// de service y est passé par `resolve_streaming_queue_meta`). Un album de
+/// trente pistes ne coûte donc pas trente requêtes de plus.
+fn decrire_enfilage(inputs: &[QueueInput], start: Option<i64>) -> Vec<serde_json::Value> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let position = start.map(|s| s + i as i64);
+            match item {
+                QueueInput::Local { track_id } => json!({
+                    "position": position,
+                    "track_id": track_id,
+                }),
+                QueueInput::Streaming {
+                    source,
+                    source_id,
+                    title,
+                    artist,
+                    ..
+                } => json!({
+                    "position": position,
+                    "source": source,
+                    "source_id": source_id,
+                    "title": title,
+                    "artist": artist,
+                }),
+            }
+        })
+        .collect()
 }
 
 async fn queue_move(
