@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
 #[derive(Debug, Clone, Default)]
 pub struct AudioLevels {
     pub rms_left: f64,
@@ -16,6 +19,25 @@ pub struct AudioLevels {
     /// Les deux coexistent volontairement : `spectrum` reste le contrat des
     /// clients déjà déployés (application iOS comprise).
     pub spectrum_db: Vec<f32>,
+    /// Fréquence centrale RÉELLE de chaque bande, en Hz — voir
+    /// [`band_center_frequencies`]. Même longueur que `spectrum`.
+    ///
+    /// Sans elle, `spectrum` n'est qu'une suite de nombres anonymes : rien
+    /// dans l'événement ne dit à quelle fréquence répond la barre n° 12. Un
+    /// client ne pouvait graduer son analyseur qu'en RECOPIANT le découpage
+    /// d'ici — y compris ses arrondis — et en devinant la fréquence
+    /// d'échantillonnage depuis les métadonnées de la piste (#2081).
+    ///
+    /// `Arc` et non `Vec` : la table ne dépend que du format, elle est
+    /// calculée une fois puis partagée par toutes les trames.
+    pub spectrum_hz: Arc<[f32]>,
+    /// Taille de FFT réellement employée pour cette trame.
+    ///
+    /// Elle vaut [`SPECTRUM_FFT_SIZE`] en régime établi, mais une fenêtre plus
+    /// courte que 2048 trames donne une FFT plus petite, donc une résolution
+    /// plus grossière — un client qui suppose 2048 se trompe d'axe sur ces
+    /// trames-là.
+    pub spectrum_fft_size: usize,
     /// Durée audio couverte par ces niveaux — permet au forwarder de
     /// l'orchestrateur de cadencer l'émission sur l'horloge de lecture
     /// (le décodage va bien plus vite que le temps réel).
@@ -40,6 +62,110 @@ impl AudioLevels {
 /// Plancher des niveaux par bande. Aligné sur celui de `to_db` : au-dessous,
 /// c'est du silence, et un client n'a rien à y afficher.
 pub const SPECTRUM_FLOOR_DB: f32 = -96.0;
+
+/// Nombre de bandes du spectre émis sur `playback.audio_levels`.
+pub const SPECTRUM_BANDS: usize = 32;
+
+/// Plafond de la FFT d'analyse, en échantillons.
+///
+/// Une fenêtre plus courte donne une FFT plus petite (`next_power_of_two`),
+/// donc une résolution plus grossière — d'où [`AudioLevels::spectrum_fft_size`],
+/// qui rapporte celle qui a réellement servi.
+pub const SPECTRUM_FFT_SIZE: usize = 2048;
+
+/// Bas de l'axe fréquentiel de l'analyseur, en Hz.
+pub const SPECTRUM_FREQ_MIN_HZ: f64 = 20.0;
+
+/// Haut de l'axe, avant bornage par le Nyquist du flux, en Hz.
+pub const SPECTRUM_FREQ_MAX_HZ: f64 = 20_000.0;
+
+/// Raies FFT `[f_low, f_high)` agrégées par la bande `b`.
+///
+/// Point de vérité UNIQUE du découpage : l'analyse et la table de fréquences
+/// l'appellent toutes les deux, donc le repère annoncé ne peut pas dériver de
+/// la barre mesurée. `half` doit valoir au moins 1.
+#[inline]
+fn band_bin_range(
+    b: usize,
+    bins: usize,
+    log_ratio: f64,
+    nyquist: f64,
+    half: usize,
+) -> (usize, usize) {
+    let hz_low = SPECTRUM_FREQ_MIN_HZ * log_ratio.powf(b as f64 / bins as f64);
+    let hz_high = SPECTRUM_FREQ_MIN_HZ * log_ratio.powf((b + 1) as f64 / bins as f64);
+    let f_low = (((hz_low / nyquist) * half as f64) as usize).min(half - 1);
+    let f_high = (((hz_high / nyquist) * half as f64) as usize)
+        .max(f_low + 1)
+        .min(half);
+    (f_low, f_high)
+}
+
+type BandTables = RwLock<HashMap<(usize, u32, usize), Arc<[f32]>>>;
+
+fn band_tables() -> &'static BandTables {
+    static TABLES: OnceLock<BandTables> = OnceLock::new();
+    TABLES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Fréquence centrale RÉELLE de chaque bande, en Hz.
+///
+/// « Réelle » et non « annoncée » : les bornes de bande sont logarithmiques,
+/// mais elles sont ramenées à des raies FFT entières par une TRONCATURE. Dans
+/// le grave, plusieurs bandes annoncées sont plus étroites que la résolution
+/// de la FFT (21,5 Hz à 44,1 kHz, 46,9 Hz à 96 kHz) et retombent sur les mêmes
+/// raies. Le centre rendu ici est celui de l'intervalle de fréquences
+/// effectivement agrégé, donc **ce que la barre montre vraiment**.
+///
+/// Conséquence exploitable côté client : deux bandes voisines qui portent la
+/// même valeur lisent les mêmes raies — l'analyseur ne sait pas les
+/// distinguer, et y poser deux repères différents serait une invention.
+///
+/// Chemin temps réel : la table ne dépend que de `(bins, sample_rate,
+/// fft_size)`, elle est mémorisée et rendue par `Arc` — aucune allocation par
+/// trame une fois le format vu une première fois.
+pub fn band_center_frequencies(bins: usize, sample_rate: u32, fft_size: usize) -> Arc<[f32]> {
+    let key = (bins, sample_rate, fft_size);
+    if let Ok(tables) = band_tables().read() {
+        if let Some(table) = tables.get(&key) {
+            return Arc::clone(table);
+        }
+    }
+
+    let table = compute_band_center_frequencies(bins, sample_rate, fft_size);
+    if let Ok(mut tables) = band_tables().write() {
+        // Une poignée de fréquences d'échantillonnage existent ; la borne
+        // empêche qu'un flux malformé fasse enfler le cache indéfiniment.
+        if tables.len() < 64 {
+            tables.insert(key, Arc::clone(&table));
+        }
+    }
+    table
+}
+
+fn compute_band_center_frequencies(bins: usize, sample_rate: u32, fft_size: usize) -> Arc<[f32]> {
+    if bins == 0 {
+        return Arc::from(Vec::new());
+    }
+    let half = fft_size / 2;
+    let nyquist = sample_rate as f64 / 2.0;
+    let freq_max = nyquist.min(SPECTRUM_FREQ_MAX_HZ);
+    // Sans Nyquist utilisable, aucune fréquence ne peut être annoncée : on rend
+    // des zéros plutôt qu'un axe inventé.
+    if half == 0 || freq_max <= SPECTRUM_FREQ_MIN_HZ {
+        return Arc::from(vec![0.0f32; bins]);
+    }
+
+    let log_ratio = freq_max / SPECTRUM_FREQ_MIN_HZ;
+    let resolution = sample_rate as f64 / fft_size as f64;
+    let mut out = Vec::with_capacity(bins);
+    for b in 0..bins {
+        let (f_low, f_high) = band_bin_range(b, bins, log_ratio, nyquist, half);
+        // Centre de l'intervalle [f_low, f_high) × résolution.
+        out.push((((f_low + f_high) as f64 / 2.0) * resolution) as f32);
+    }
+    Arc::from(out)
+}
 
 /// Fenêtre de tenue du peak-hold serveur (#1694) : max glissant ~300 ms.
 ///
@@ -150,7 +276,7 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
 
     // Une seule FFT pour les deux formes : les recalculer séparément
     // doublerait le coût d'analyse, déjà en cause dans #1110.
-    let spectrum = analyze_spectrum(pcm, bit_depth, channels, 32, sample_rate);
+    let spectrum = analyze_spectrum(pcm, bit_depth, channels, SPECTRUM_BANDS, sample_rate);
 
     AudioLevels {
         rms_left: (sum_sq_l / frames as f64).sqrt(),
@@ -158,6 +284,8 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
         peak_left: peak_l,
         peak_right: peak_r,
         spectrum_db: spectrum.db,
+        spectrum_hz: spectrum.hz,
+        spectrum_fft_size: spectrum.fft_size,
         spectrum: spectrum.shape,
         window: if sample_rate > 0 {
             std::time::Duration::from_secs_f64(frames as f64 / sample_rate as f64)
@@ -201,6 +329,11 @@ pub struct Spectrum {
     pub shape: Vec<f32>,
     /// Niveau absolu par bande, en dBFS.
     pub db: Vec<f32>,
+    /// Fréquence centrale réelle de chaque bande — voir
+    /// [`band_center_frequencies`].
+    pub hz: Arc<[f32]>,
+    /// Taille de FFT réellement employée.
+    pub fft_size: usize,
 }
 
 /// Compute spectrum bins from PCM data using a simple FFT.
@@ -231,9 +364,14 @@ pub fn analyze_spectrum(
     bins: usize,
     sample_rate: u32,
 ) -> Spectrum {
+    // Même sans signal, l'axe reste calculable à partir du format : un client
+    // qui reçoit une trame vide garde ses graduations au lieu de les voir
+    // retomber à 0 Hz.
     let empty = || Spectrum {
         shape: vec![0.0; bins],
         db: vec![SPECTRUM_FLOOR_DB; bins],
+        hz: band_center_frequencies(bins, sample_rate, SPECTRUM_FFT_SIZE),
+        fft_size: SPECTRUM_FFT_SIZE,
     };
     if pcm.is_empty() || channels == 0 || bins == 0 {
         return empty();
@@ -246,7 +384,7 @@ pub fn analyze_spectrum(
     }
 
     // Extract mono samples (mix L+R), max 2048 samples for FFT
-    let fft_size = 2048usize;
+    let fft_size = SPECTRUM_FFT_SIZE;
     let mut samples: Vec<f64> = Vec::with_capacity(fft_size);
     for frame in pcm.chunks_exact(frame_size).take(fft_size) {
         let left = read_sample(frame, 0, bytes_per_sample, bit_depth);
@@ -310,6 +448,11 @@ pub fn analyze_spectrum(
 
     // Compute magnitudes for the first half (positive frequencies)
     let half = n / 2;
+    // Une fenêtre d'une seule trame donne n = 1, donc aucune raie : le
+    // découpage en bandes n'a alors rien à agréger (et `half - 1` déborderait).
+    if half == 0 {
+        return empty();
+    }
     let mut mags: Vec<f64> = Vec::with_capacity(half);
     let mut max_mag: f64 = 1e-10;
     for i in 0..half {
@@ -322,20 +465,14 @@ pub fn analyze_spectrum(
     // Each output bin covers one equal fraction of the audible range on a
     // log axis (20 Hz – 20 kHz), matching human pitch perception.
     let nyquist = sample_rate as f64 / 2.0;
-    let freq_min = 20.0_f64;
-    let freq_max = nyquist.min(20000.0);
-    let log_ratio = freq_max / freq_min;
+    let freq_max = nyquist.min(SPECTRUM_FREQ_MAX_HZ);
+    let log_ratio = freq_max / SPECTRUM_FREQ_MIN_HZ;
     let mut result = vec![0.0f32; bins];
     let mut result_db = vec![SPECTRUM_FLOOR_DB; bins];
     // Sinusoïde pleine échelle au centre d'une raie, fenêtre de Hann : n/4.
     let full_scale = (n as f64) / 4.0;
     for b in 0..bins {
-        let hz_low = freq_min * log_ratio.powf(b as f64 / bins as f64);
-        let hz_high = freq_min * log_ratio.powf((b + 1) as f64 / bins as f64);
-        let f_low = ((hz_low / nyquist) * half as f64) as usize;
-        let f_high = ((hz_high / nyquist) * half as f64) as usize;
-        let f_low = f_low.min(half - 1);
-        let f_high = f_high.max(f_low + 1).min(half);
+        let (f_low, f_high) = band_bin_range(b, bins, log_ratio, nyquist, half);
 
         let mut sum = 0.0;
         let mut sum_sq = 0.0;
@@ -363,6 +500,8 @@ pub fn analyze_spectrum(
     Spectrum {
         shape: result,
         db: result_db,
+        hz: band_center_frequencies(bins, sample_rate, n),
+        fft_size: n,
     }
 }
 
@@ -591,6 +730,150 @@ mod tests {
         assert!(
             peak_bin >= 8 && peak_bin <= 14,
             "440Hz peak at bin {peak_bin}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #2081 — repères de fréquence : chaque bande dit à quelle fréquence
+    // elle répond, au lieu de laisser le client la deviner.
+    // ------------------------------------------------------------------
+
+    /// Indice de la bande la plus forte, en niveau absolu.
+    fn loudest_band(db: &[f32]) -> usize {
+        db.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn spectrum_hz_accompanies_every_band() {
+        let lvl = compute_levels(&sine_pcm(1000.0, 0.5, 44100, 2048), 16, 2, 44100);
+        assert_eq!(lvl.spectrum.len(), SPECTRUM_BANDS);
+        assert_eq!(
+            lvl.spectrum_hz.len(),
+            lvl.spectrum.len(),
+            "un repère par bande, sinon l'axe ne s'aligne pas sur les barres"
+        );
+        assert_eq!(lvl.spectrum_fft_size, SPECTRUM_FFT_SIZE);
+        // L'axe monte : une bande ne peut pas répondre plus bas que sa voisine
+        // de gauche.
+        for w in lvl.spectrum_hz.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "axe non monotone : {:?}",
+                &lvl.spectrum_hz[..]
+            );
+        }
+        // Et il reste dans le Nyquist du flux.
+        assert!(
+            *lvl.spectrum_hz.last().unwrap() <= 44100.0 / 2.0,
+            "dernier repère à {} Hz, au-delà du Nyquist",
+            lvl.spectrum_hz.last().unwrap()
+        );
+    }
+
+    /// LE test de l'issue : le repère annoncé désigne la barre qui s'allume.
+    ///
+    /// Une sinusoïde pure à `freq` doit allumer une bande dont la fréquence
+    /// centrale ANNONCÉE vaut `freq` à la largeur de bande près. C'est ce qui
+    /// distingue un axe honnête d'un axe recalculé à côté : jusqu'ici le
+    /// serveur n'en annonçait aucun, et l'axe logarithmique « annoncé » se
+    /// décale d'une à deux barres dans le grave à cause de la troncature en
+    /// raies FFT.
+    #[test]
+    fn spectrum_hz_designates_the_band_that_lights_up() {
+        // Une bande fait 10^(3/32) ≈ 1,24× de large : ±25 % couvre le pire cas.
+        for (sr, freq) in [
+            (44100u32, 1000.0f64),
+            (44100, 4000.0),
+            (44100, 8000.0),
+            (96000, 1000.0),
+            (96000, 5000.0),
+            (192000, 2000.0),
+        ] {
+            let s = analyze_spectrum(&sine_pcm(freq, 1.0, sr, 4096), 16, 2, SPECTRUM_BANDS, sr);
+            let b = loudest_band(&s.db);
+            let annonce = s.hz[b] as f64;
+            let ratio = annonce / freq;
+            assert!(
+                (0.75..1.33).contains(&ratio),
+                "{freq} Hz à {sr} Hz allume la bande {b}, annoncée à {annonce} Hz \
+                 (rapport {ratio:.3}) — axe : {:?}",
+                &s.hz[..]
+            );
+        }
+    }
+
+    /// L'axe SUIT la fréquence d'échantillonnage.
+    ///
+    /// C'est la raison pour laquelle il ne peut pas être écrit en dur côté
+    /// client : à 44,1 kHz l'axe monte jusqu'à 20 kHz, à 32 kHz il s'arrête au
+    /// Nyquist, et les mêmes 32 bandes ne couvrent alors pas la même chose.
+    #[test]
+    fn spectrum_hz_follows_the_sample_rate() {
+        let a = band_center_frequencies(SPECTRUM_BANDS, 44100, SPECTRUM_FFT_SIZE);
+        let b = band_center_frequencies(SPECTRUM_BANDS, 32000, SPECTRUM_FFT_SIZE);
+        assert_ne!(
+            a[SPECTRUM_BANDS - 1],
+            b[SPECTRUM_BANDS - 1],
+            "le haut de l'axe doit être borné par le Nyquist"
+        );
+        assert!(b[SPECTRUM_BANDS - 1] <= 16000.0);
+        assert!(a[SPECTRUM_BANDS - 1] > 16000.0);
+    }
+
+    /// Dans le grave, plusieurs bandes lisent les MÊMES raies FFT : la
+    /// résolution (21,5 Hz à 44,1 kHz) est plus grossière que les bandes
+    /// annoncées. On l'assume au lieu de le cacher — le repère répété DIT au
+    /// client que ces bandes ne sont pas distinctes, au lieu de le laisser
+    /// étiqueter « 31 Hz » une barre qui ne s'allume jamais.
+    #[test]
+    fn spectrum_hz_repeats_where_the_analysis_cannot_separate() {
+        let hz = band_center_frequencies(SPECTRUM_BANDS, 44100, SPECTRUM_FFT_SIZE);
+        let doublons = hz.windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(
+            doublons > 0,
+            "à 44,1 kHz les bandes graves se confondent — l'axe doit le montrer : {hz:?}"
+        );
+        // Au-dessus de 1 kHz, en revanche, chaque bande est bien séparée.
+        let hauts: Vec<f32> = hz.iter().copied().filter(|f| *f > 1000.0).collect();
+        for w in hauts.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "bandes confondues au-dessus de 1 kHz : {hauts:?}"
+            );
+        }
+    }
+
+    /// Chemin temps réel : la table ne se recalcule pas à chaque trame.
+    #[test]
+    fn spectrum_hz_table_is_computed_once() {
+        let a = band_center_frequencies(SPECTRUM_BANDS, 48000, SPECTRUM_FFT_SIZE);
+        let b = band_center_frequencies(SPECTRUM_BANDS, 48000, SPECTRUM_FFT_SIZE);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "la table de fréquences doit être partagée, pas réallouée par trame"
+        );
+
+        // Et deux trames consécutives partagent bien la même allocation.
+        let pcm = sine_pcm(1000.0, 0.5, 48000, 2048);
+        let l1 = compute_levels(&pcm, 16, 2, 48000);
+        let l2 = compute_levels(&pcm, 16, 2, 48000);
+        assert!(Arc::ptr_eq(&l1.spectrum_hz, &l2.spectrum_hz));
+    }
+
+    /// Une trame vide garde un axe exploitable : le client ne voit pas ses
+    /// graduations retomber à 0 Hz sur un silence.
+    #[test]
+    fn spectrum_hz_survives_an_empty_frame() {
+        let s = analyze_spectrum(&[], 16, 2, SPECTRUM_BANDS, 44100);
+        assert_eq!(s.hz.len(), SPECTRUM_BANDS);
+        assert!(
+            s.hz[SPECTRUM_BANDS - 1] > 1000.0,
+            "axe perdu : {:?}",
+            &s.hz[..]
         );
     }
 }

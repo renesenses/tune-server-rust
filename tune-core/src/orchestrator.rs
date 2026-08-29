@@ -389,6 +389,26 @@ fn spawn_paced_levels_forwarder(
                     // forme normalisée trame par trame (contrat des clients
                     // déjà déployés) ; ce champ dit le vrai niveau.
                     "spectrum_db": lvl.spectrum_db,
+                    // Fréquence centrale RÉELLE de chaque bande, en Hz —
+                    // champ ADDITIF (#2081). Jusqu'ici `spectrum` était une
+                    // suite de nombres anonymes : rien ne disait à quelle
+                    // fréquence répondait la barre n° 12, et un client ne
+                    // pouvait graduer son analyseur qu'en recopiant le
+                    // découpage de `levels.rs`, arrondis compris, avec une
+                    // fréquence d'échantillonnage devinée depuis les
+                    // métadonnées de la piste. C'est la même grille que celle
+                    // que l'égaliseur Expert affiche en ISO.
+                    //
+                    // Deux bandes voisines de même valeur lisent les mêmes
+                    // raies FFT : l'analyse ne les distingue pas, et un client
+                    // honnête n'y pose qu'un seul repère.
+                    "spectrum_hz": &*lvl.spectrum_hz,
+                    // De quoi refaire le calcul soi-même si besoin : la
+                    // fréquence d'échantillonnage RÉELLEMENT analysée (celle
+                    // du décodage, pas celle du tag) et la taille de FFT qui a
+                    // servi — elle tombe sous 2048 sur une fenêtre courte.
+                    "sample_rate": raw.sample_rate,
+                    "spectrum_fft_size": lvl.spectrum_fft_size,
                 }),
             );
             next_emit += window;
