@@ -12,6 +12,17 @@ use crate::http::error as http_error;
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+/// Fenêtre maximale pendant laquelle un renderer qui sort de veille peut
+/// répondre à GetMediaInfo avec une CurrentURI vide. Les Denon/Marantz HEOS
+/// gardent leur pile SOAP joignable en Network Standby, acquittent Play, puis
+/// mettent couramment 15 à 30 s à sélectionner Media Player et publier l'URI.
+#[cfg(not(test))]
+const URI_WAKEUP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Même machine d'état en test, avec une borne courte pour prouver
+/// l'expiration sans ajouter 30 s à chaque validation ciblée.
+#[cfg(test)]
+const URI_WAKEUP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const URI_APPLICATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Préfixe des erreurs SOAP dues à un **timeout**, par opposition à un refus de
 /// connexion.
@@ -687,15 +698,37 @@ impl OutputTarget for DlnaOutput {
         // la zone affichait « playing » sur la position de l'ancienne piste,
         // et l'utilisateur relançait à la main. On relit l'URI courante ; en
         // cas d'écart, UNE relance complète, puis un échec VISIBLE plutôt
-        // qu'un état menteur. Une URI qu'on ne sait pas interpréter (renderer
-        // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
+        // qu'un état menteur. Une URI VIDE est différente : les Denon/Marantz
+        // HEOS la rendent pendant leur réveil. On attend alors, mais jamais
+        // plus de 30 s et jamais en transformant l'expiration en succès. Une
+        // URI qu'on ne sait pas interpréter (renderer qui réécrit) ne conclut
+        // rien — zéro régression sur ces appareils.
         let mut applique = UriVerdict::Indeterminee;
         let mut uri_tenue: Option<String> = None;
+        let mut reveil_deadline: Option<tokio::time::Instant> = None;
         'verif: for relance in 0..2u32 {
-            for essai in 0..3u32 {
-                let resp = self
-                    .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
-                    .await;
+            let mut conflits_confirmes = 0u32;
+            loop {
+                let resp = if let Some(deadline) = reveil_deadline {
+                    let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if reste.is_zero() {
+                        break 'verif;
+                    }
+                    match tokio::time::timeout(
+                        reste,
+                        self.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>"),
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        // Le délai de réveil est une vraie borne murale : un
+                        // GetMediaInfo lent ne peut pas la repousser.
+                        Err(_) => break 'verif,
+                    }
+                } else {
+                    self.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+                        .await
+                };
                 let uri = match &resp {
                     Ok(xml) => extract_tag(xml, "CurrentURI"),
                     // Un renderer sans GetMediaInfo ne doit rien bloquer.
@@ -705,13 +738,24 @@ impl OutputTarget for DlnaOutput {
                 applique = verdict_uri_appliquee(uri.as_deref(), media.url);
                 match applique {
                     UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'verif,
-                    UriVerdict::PasAppliquee if essai < 2 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    UriVerdict::EnAttenteDeReveil => {
+                        let deadline = *reveil_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + URI_WAKEUP_MAX_WAIT
+                        });
+                        let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if reste.is_zero() {
+                            break 'verif;
+                        }
+                        tokio::time::sleep(URI_APPLICATION_POLL_INTERVAL.min(reste)).await;
                     }
-                    UriVerdict::PasAppliquee => {}
+                    UriVerdict::PasAppliquee if conflits_confirmes < 2 => {
+                        conflits_confirmes += 1;
+                        tokio::time::sleep(URI_APPLICATION_POLL_INTERVAL).await;
+                    }
+                    UriVerdict::PasAppliquee => break,
                 }
             }
-            if relance == 0 {
+            if applique == UriVerdict::PasAppliquee && relance == 0 {
                 warn!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
                 // Rejouer au niveau de DIDL qui a fini par passer : renvoyer le
                 // complet referait échouer la lecture chez Platinum.
@@ -728,6 +772,19 @@ impl OutputTarget for DlnaOutput {
                     .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
                     .await;
             }
+        }
+        if applique == UriVerdict::EnAttenteDeReveil {
+            warn!(
+                device = %self.name,
+                url = media.url,
+                ctrl = %self.av_transport_url,
+                wait_ms = URI_WAKEUP_MAX_WAIT.as_millis(),
+                "dlna_reveil_expire_uri_toujours_vide"
+            );
+            return Err(format!(
+                "Le renderer a acquitté Play mais son réveil n'a pas abouti : CurrentURI est restée vide pendant {} s",
+                URI_WAKEUP_MAX_WAIT.as_secs()
+            ));
         }
         if applique == UriVerdict::PasAppliquee {
             warn!(
@@ -1352,8 +1409,10 @@ fn arret_effectif(transport_resp: &str) -> bool {
 enum UriVerdict {
     /// C'est bien la nôtre : le Play est appliqué.
     Appliquee,
-    /// Vide, ou un flux Tune qui n'est pas le nôtre : le renderer a acquitté
-    /// toute la séquence et joue toujours autre chose.
+    /// Le renderer sort peut-être de veille : aucune URI n'est encore publiée.
+    EnAttenteDeReveil,
+    /// Un flux Tune qui n'est pas le nôtre : le renderer a acquitté toute la
+    /// séquence et joue toujours autre chose.
     PasAppliquee,
     /// Une URI étrangère qu'on ne sait pas interpréter (un renderer qui
     /// réécrit, un GetMediaInfo exotique) : on ne conclut rien.
@@ -1376,7 +1435,7 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
     };
     let uri = uri.trim();
     if uri.is_empty() {
-        return UriVerdict::PasAppliquee;
+        return UriVerdict::EnAttenteDeReveil;
     }
     if uri.contains(chemin_du_flux(url_attendue)) {
         return UriVerdict::Appliquee;
@@ -1603,13 +1662,14 @@ mod tests {
     }
 
     #[test]
-    fn verdict_uri_vide_ou_flux_perime_n_est_pas_applique() {
+    fn verdict_uri_vide_attend_le_reveil_sans_masquer_un_flux_perime() {
         let url = "http://192.168.1.42:8888/stream/abc-123.wav";
-        // L'Eversolo qui garde l'URI d'avant : vide, ou un autre flux Tune.
+        // Le Denon/HEOS en réveil ne tient encore aucune source.
         assert_eq!(
             verdict_uri_appliquee(Some(""), url),
-            UriVerdict::PasAppliquee
+            UriVerdict::EnAttenteDeReveil
         );
+        // L'Eversolo qui garde l'URI d'avant est un vrai conflit, distinct.
         assert_eq!(
             verdict_uri_appliquee(Some("http://192.168.1.42:8888/stream/vieux-flux.flac"), url),
             UriVerdict::PasAppliquee
