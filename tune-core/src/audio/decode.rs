@@ -1164,10 +1164,10 @@ fn decode_opus_to_pcm(
     let track = format
         .default_track(TrackType::Audio)
         .ok_or("opus: no audio track")?;
-    let track_id = track.id;
+    let mut track_id = track.id;
     // Timebase to map packet.pts → sample index @ 48 kHz. Opus is always
     // 1/48000, but honour the container's declared timebase if present.
-    let time_base = track.time_base;
+    let mut time_base = track.time_base;
     let ch: usize = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => {
             p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
@@ -1183,7 +1183,7 @@ fn decode_opus_to_pcm(
 
     // Coarse container seek to land near the target page before sample-accurate
     // skipping. Best-effort: on failure we still skip from the start via pts.
-    let skip_frames: i64 = if seek_s > 0.0 {
+    let mut skip_frames: i64 = if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         if let Some(time) = Time::try_new(seconds, nanos) {
@@ -1219,6 +1219,52 @@ fn decode_opus_to_pcm(
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg-Opus boundary (icecast rip, concatenated files).
+                // Symphonia's OggReader starts a new physical stream and
+                // returns `ResetRequired`; treating it as EOF truncated the
+                // track to its first link — the output signalled a natural end
+                // a few seconds in and the poller replayed the head of the
+                // track over and over (#1270, « boucle de 2-3 s »). The
+                // Vorbis/FLAC-in-Ogg path got this guard in #1632
+                // (`rebuild_decoder_after_ogg_chain_reset`); this is the same
+                // guard specialised for libopus: re-fetch the track, rebuild
+                // the decoder, keep pulling packets.
+                let Some(track) = format.default_track(TrackType::Audio) else {
+                    break;
+                };
+                let new_ch = match &track.codec_params {
+                    Some(CodecParameters::Audio(p)) => {
+                        p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+                    }
+                    _ => 2,
+                }
+                .clamp(1, 2);
+                if new_ch != ch {
+                    // The PCM contract (channel count) is already announced —
+                    // a mid-stream layout change cannot be represented. Stop
+                    // at the boundary, which is the pre-fix behaviour.
+                    tracing::warn!(
+                        file = file_path,
+                        expect_channels = ch,
+                        channels = new_ch,
+                        "ogg_opus_chain_params_changed_stopping_at_boundary"
+                    );
+                    break;
+                }
+                let Ok(dec) = OpusDecoder::new(SampleRate::Hz48000, channels_enum) else {
+                    break;
+                };
+                decoder = dec;
+                track_id = track.id;
+                time_base = track.time_base;
+                // The seek point was consumed in the first link and pts
+                // restarts at 0 in the new physical stream — never re-skip,
+                // or the head of every following link would be dropped.
+                skip_frames = 0;
+                debug!(file = file_path, track_id, "ogg_opus_chain_decoder_rebuilt");
+                continue;
+            }
             Err(_) => break,
         };
         if packet.track_id != track_id {
@@ -3614,6 +3660,38 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(
             result.samples_i32.iter().any(|s| *s != 0),
             "decoded Opus PCM must not be all silence (the pre-fix failure mode)"
+        );
+    }
+
+    #[test]
+    fn decode_chained_ogg_opus_decodes_past_first_link() {
+        // Two Ogg-Opus physical streams back-to-back (an icecast rip, or
+        // `cat a.opus b.opus`). Symphonia signals the mid-file boundary with
+        // `Error::ResetRequired`; the Opus loop treated it as EOF, truncating
+        // playback to the first link — natural end a few seconds in, poller
+        // replays the head of the track: the same « boucle de 2-3 s » of
+        // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
+        let single = std::fs::read(fixture_path("test.opus")).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("tune_chained_opus_{}.opus", std::process::id()));
+        let mut chained = single.clone();
+        chained.extend_from_slice(&single);
+        std::fs::write(&path, &chained).unwrap();
+
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let result = result.unwrap();
+
+        // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
+        // stop at the first boundary (~2 s).
+        assert!(
+            result.duration_s > 3.0,
+            "chained Ogg-Opus must decode past the first chain boundary, got {} s",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "chained Ogg-Opus PCM must not be all silence"
         );
     }
 
