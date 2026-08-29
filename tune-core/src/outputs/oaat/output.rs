@@ -3579,7 +3579,7 @@ pub(crate) fn juger_reponse(
 /// l'a cause, et ne se voit donc pas la ou il est ne.
 ///
 /// Tout le jugement est delegue a `juger_reponse` : ici il ne reste que
-/// l'attente et la trace.
+/// l'attente, l'appariement au flux courant et la trace.
 async fn attendre_accord_format(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
@@ -3587,7 +3587,75 @@ async fn attendre_accord_format(
     politique: PolitiqueAdaptation,
     delai: std::time::Duration,
 ) -> Result<ContratPropose, RefusNegociation> {
-    let recue = tokio::time::timeout(delai, endpoint.response_rx.recv()).await;
+    attendre_accord_format_sur_canal(
+        &mut endpoint.response_rx,
+        device_name,
+        contrat,
+        politique,
+        delai,
+    )
+    .await
+}
+
+fn stream_id_reponse(reponse: &oaat_controller::EndpointResponse) -> &str {
+    match reponse {
+        oaat_controller::EndpointResponse::FormatAccept(r) => &r.stream_id,
+        oaat_controller::EndpointResponse::FormatCounter(r) => &r.stream_id,
+        oaat_controller::EndpointResponse::FormatReject(r) => &r.stream_id,
+        oaat_controller::EndpointResponse::NextTrackReady(r) => &r.stream_id,
+        oaat_controller::EndpointResponse::NextTrackReformat(r) => &r.stream_id,
+        oaat_controller::EndpointResponse::StreamStats(r) => &r.stream_id,
+    }
+}
+
+/// Attend la première réponse DE FORMAT du flux courant dans un délai GLOBAL.
+///
+/// Le canal peut encore contenir une réponse tardive d'une lecture précédente.
+/// Elle est consommée et ignorée, sans remettre le délai à zéro : un endpoint
+/// qui enverrait sans fin des trames étrangères ne peut donc pas retenir la
+/// négociation indéfiniment (#2730). Les trames asynchrones du flux courant
+/// (`StreamStats`, `NextTrack*`) sont elles aussi consommées sans devenir un
+/// refus de format : elles partagent le canal de contrôle mais ne répondent pas
+/// à la proposition en cours (#2758).
+pub(crate) async fn attendre_accord_format_sur_canal(
+    response_rx: &mut tokio::sync::mpsc::Receiver<oaat_controller::EndpointResponse>,
+    device_name: &str,
+    contrat: &ContratPropose,
+    politique: PolitiqueAdaptation,
+    delai: std::time::Duration,
+) -> Result<ContratPropose, RefusNegociation> {
+    let recue = tokio::time::timeout(delai, async {
+        loop {
+            let Some(reponse) = response_rx.recv().await else {
+                return None;
+            };
+            let stream_id_recu = stream_id_reponse(&reponse);
+            if stream_id_recu == contrat.stream_id {
+                if matches!(
+                    reponse,
+                    oaat_controller::EndpointResponse::FormatAccept(_)
+                        | oaat_controller::EndpointResponse::FormatCounter(_)
+                        | oaat_controller::EndpointResponse::FormatReject(_)
+                ) {
+                    return Some(reponse);
+                }
+                warn!(
+                    device = %device_name,
+                    stream_id = %contrat.stream_id,
+                    reponse = ?reponse,
+                    "oaat: trame asynchrone ignoree pendant la negociation"
+                );
+                continue;
+            }
+            warn!(
+                device = %device_name,
+                stream_id_attendu = %contrat.stream_id,
+                stream_id_recu,
+                "oaat: reponse perimee ignoree pendant la negociation"
+            );
+        }
+    })
+    .await;
 
     let verdict = match &recue {
         Ok(Some(reponse)) => juger_reponse(contrat, ReponseNegociation::Recue(reponse), politique),
