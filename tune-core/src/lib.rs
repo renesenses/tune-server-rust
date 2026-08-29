@@ -61,6 +61,7 @@ pub mod smb_discovery;
 pub mod social;
 pub mod stream_cache;
 pub mod streaming;
+mod system_sleep;
 pub mod transcode_cache;
 pub mod updater;
 pub mod upnp_renderer;
