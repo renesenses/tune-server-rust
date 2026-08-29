@@ -521,6 +521,33 @@ async fn smart_collections_conservent_la_limite_du_contrat_web() {
     .unwrap_or_else(|erreur| panic!("POST preview smart collection: {erreur}; payload={preview}"));
 }
 
+#[tokio::test]
+async fn les_alertes_de_sante_sont_la_liste_annoncee_au_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+
+    // Produit une vraie alerte sans dépendre de la mémoire ou du disque de la
+    // machine qui exécute le test. Quinze erreurs récentes dépassent le seuil
+    // du moniteur et garantissent une liste non vide, nécessaire pour prouver
+    // aussi les champs de chaque élément du contrat TypeScript.
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("horloge système")
+        .as_secs();
+    etat.health_monitor
+        .check_error_spike(&[maintenant; 15])
+        .await;
+
+    let app = tune_server::routes::router(etat);
+    let payload = get_json(&app, "/api/v1/system/health/alerts")
+        .await
+        .expect("réponse des alertes de santé");
+
+    respecte_tous_les_contrats(&carte, "GET", "/system/health/alerts", &payload)
+        .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
+}
+
 #[test]
 fn la_contre_epreuve_refuse_un_champ_obligatoire_absent() {
     let contrat = ContratRoute {
@@ -533,6 +560,24 @@ fn la_contre_epreuve_refuse_un_champ_obligatoire_absent() {
     let erreur = respecte_contrat(&serde_json::json!({"items": []}), &contrat)
         .expect_err("une reponse sans total doit casser le contrat");
     assert!(erreur.contains("champ obligatoire absent: total"));
+}
+
+#[test]
+fn la_contre_epreuve_refuse_l_ancienne_enveloppe_des_alertes() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let ancienne_reponse = serde_json::json!({
+        "alerts": [{
+            "timestamp": "2026-08-29T00:00:00Z",
+            "level": "warning",
+            "category": "errors",
+            "message": "alerte témoin"
+        }]
+    });
+
+    let erreur =
+        respecte_tous_les_contrats(&carte, "GET", "/system/health/alerts", &ancienne_reponse)
+            .expect_err("une enveloppe objet ne doit pas satisfaire un contrat de liste");
+    assert!(erreur.contains("tableau JSON attendu"));
 }
 
 #[test]
