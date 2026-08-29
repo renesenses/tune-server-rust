@@ -390,11 +390,31 @@ pub(super) async fn album_bio(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let lang = q.lang.as_deref().unwrap_or("fr");
+
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
+    //
+    // MAIS seulement si elle est dans la bonne langue (#1849, Dimitri). La
+    // route artiste a recu ce garde-fou en #2126 ; la route album, que le
+    // ticket cite pourtant dans sa portee, ne l'a jamais eu. Elle rendait donc
+    // la bio stockee sans regarder ni sa langue ni celle qu'on demande, et le
+    // `lang` ci-dessus ne servait qu'a nommer l'entree de cache -- il n'etait
+    // meme JAMAIS atteint pour un album qui possedait deja une bio.
+    //
+    // L'enrichissement des bios d'album prend la langue de CELUI QUI LE LANCE
+    // (`routes/system/enrich.rs`, `lang_from_header` puis
+    // `batch_enrich_album_bios(.., &lang)`) : une bibliotheque enrichie depuis
+    // une interface en francais stocke tout en francais, et le ressert ensuite
+    // a tout le monde.
+    let prov = album_repo.bio_provenance(id).ok().flatten();
+    let bio_lang = prov
+        .as_ref()
+        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
+    let stored_ok = super::artists::langue_convient(bio_lang, lang);
+
     if let Some(ref bio) = album.bio {
-        if !bio.is_empty() {
-            let prov = album_repo.bio_provenance(id).ok().flatten();
+        if !bio.is_empty() && stored_ok {
             return Json(json!({
                 "album": album.title,
                 "bio": bio,
@@ -417,7 +437,6 @@ pub(super) async fn album_bio(
         })
     });
     let artist_q = artist_name.as_deref().unwrap_or("");
-    let lang = q.lang.as_deref().unwrap_or("fr");
     let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
     if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
@@ -425,7 +444,16 @@ pub(super) async fn album_bio(
     match state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/albums/bio")
-        .query(&[("title", album.title.as_str()), ("artist", artist_q)])
+        // `lang` est transmis au site, qui ne le recevait pas : il ne servait
+        // qu'a nommer l'entree de cache. Meme reserve que pour la route
+        // artiste (#2126) : l'effet depend de `site-mozaiklabs`. S'il ignore le
+        // parametre, il rendra la meme langue qu'avant -- sans regression, mais
+        // sans gain non plus.
+        .query(&[
+            ("title", album.title.as_str()),
+            ("artist", artist_q),
+            ("lang", lang),
+        ])
         .send()
         .await
     {
@@ -441,7 +469,31 @@ pub(super) async fn album_bio(
             }
             Json(out).into_response()
         }
-        _ => Json(json!({"album": album.title, "bio": null})).into_response(),
+        _ => repli_sur_la_bio_stockee(&album.title, album.bio.as_deref(), prov),
+    }
+}
+
+/// Ressert la bio d'album stockee quand la langue demandee n'a rien donne.
+///
+/// « Une biographie en francais vaut mieux qu'un panneau vide » -- #1849 le dit,
+/// et c'est juste : refuser une bio dans la mauvaise langue serait remplacer un
+/// defaut par un pire. La provenance part avec elle, donc le client sait dans
+/// quelle langue elle est et peut le signaler. Pendant du
+/// `repli_sur_la_bio_stockee` de la route artiste, dont seule la cle JSON
+/// (`album` au lieu de `artist`) differe.
+fn repli_sur_la_bio_stockee(
+    titre: &str,
+    bio: Option<&str>,
+    prov: Option<Value>,
+) -> axum::response::Response {
+    match bio.filter(|b| !b.is_empty()) {
+        Some(b) => Json(json!({
+            "album": titre,
+            "bio": b,
+            "bio_provenance": prov,
+        }))
+        .into_response(),
+        None => Json(json!({"album": titre, "bio": null})).into_response(),
     }
 }
 
