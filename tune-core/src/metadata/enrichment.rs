@@ -37,6 +37,9 @@ pub struct RecordingDetails {
     pub release_id: Option<String>,
     pub release_group_id: Option<String>,
     pub musicbrainz_artist_id: Option<String>,
+    /// L'oeuvre interpretee, quand l'enregistrement en declare une. Le
+    /// compositeur se lit sur elle, pas sur l'enregistrement.
+    pub work_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +219,14 @@ impl MetadataEnricher {
     /// - label: `releases[0].label-info[0].label.name`
     /// - isrc: first ISRC if present
     /// - release_id / release_group_id from the first release
+    /// - work_id: the work this recording performs, source of the composer
+    ///
+    /// `work-rels` est demande parce que MusicBrainz ne range PAS le
+    /// compositeur sur l'enregistrement : l'enregistrement *interprete* une
+    /// oeuvre, et c'est l'oeuvre qui porte la relation `composer`. Sans cette
+    /// inclusion la reponse ne contient tout simplement pas l'information, et
+    /// `composer` restait `None` a chaque passage — champ cable de bout en
+    /// bout, alimente par rien (#1890).
     pub async fn fetch_recording_details(
         &self,
         recording_id: &str,
@@ -225,7 +236,7 @@ impl MetadataEnricher {
             .client
             .get(&url)
             .query(&[
-                ("inc", "releases+tags+isrcs+artist-credits"),
+                ("inc", "releases+tags+isrcs+artist-credits+work-rels"),
                 ("fmt", "json"),
             ])
             .send()
@@ -296,6 +307,8 @@ impl MetadataEnricher {
             .and_then(|ac| ac["artist"]["id"].as_str())
             .map(String::from);
 
+        let work_id = Self::pick_work_id(&data["relations"]);
+
         debug!(
             recording_id,
             genre = ?genre,
@@ -319,7 +332,77 @@ impl MetadataEnricher {
             release_id,
             release_group_id,
             musicbrainz_artist_id,
+            work_id,
         })
+    }
+
+    /// L'identifiant de l'oeuvre interpretee par cet enregistrement.
+    ///
+    /// La relation porte le type `performance` ; on se contente d'exiger une
+    /// cible `work`, car MusicBrainz emploie aussi `medley of`, `partial
+    /// performance` et quelques autres pour la meme arete, et toutes menent a
+    /// l'oeuvre dont on veut le compositeur.
+    pub fn pick_work_id(relations: &serde_json::Value) -> Option<String> {
+        relations
+            .as_array()?
+            .iter()
+            .find_map(|rel| rel["work"]["id"].as_str())
+            .map(String::from)
+    }
+
+    /// Le ou les compositeurs d'une oeuvre MusicBrainz.
+    ///
+    /// Requete distincte : `inc=work-rels` sur l'enregistrement ne rend que
+    /// l'oeuvre et son titre, jamais ses propres relations d'artiste. Le
+    /// compositeur exige donc un second aller-retour, que l'appelant ne paie
+    /// que pour les pistes qui en manquent reellement.
+    ///
+    /// Seul le type `composer` est retenu : `lyricist`, `arranger` et
+    /// `orchestrator` designent d'autres roles, et les confondre remplirait le
+    /// champ avec quelque chose que l'utilisateur n'a pas demande.
+    pub async fn fetch_work_composer(&self, work_id: &str) -> Result<Option<String>, String> {
+        let url = format!("{MUSICBRAINZ_API}/work/{work_id}");
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("inc", "artist-rels"), ("fmt", "json")])
+            .send()
+            .await
+            .map_err(|e| format!("mb work: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("mb work: HTTP {}", resp.status()));
+        }
+
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("mb parse: {e}"))?;
+
+        Ok(Self::pick_composers(&data["relations"]))
+    }
+
+    /// Concatene les compositeurs d'une oeuvre, dedupliques, dans l'ordre rendu
+    /// par MusicBrainz. Une oeuvre a co-ecrite en cite plusieurs, et n'en
+    /// retenir qu'un attribuerait l'oeuvre entiere a une seule personne.
+    pub fn pick_composers(relations: &serde_json::Value) -> Option<String> {
+        let mut noms: Vec<String> = Vec::new();
+        for rel in relations.as_array()? {
+            if rel["type"].as_str() != Some("composer") {
+                continue;
+            }
+            let Some(nom) = rel["artist"]["name"].as_str() else {
+                continue;
+            };
+            let nom = nom.trim();
+            if nom.is_empty() || noms.iter().any(|n| n == nom) {
+                continue;
+            }
+            noms.push(nom.to_string());
+        }
+
+        if noms.is_empty() {
+            None
+        } else {
+            Some(noms.join(", "))
+        }
     }
 
     /// Pick the best genre from a MusicBrainz `tags` array.
@@ -443,6 +526,28 @@ impl MetadataEnricher {
             }
         };
 
+        // Le compositeur exige un second aller-retour sur l'oeuvre. A ~1,1 s
+        // par requete MusicBrainz, l'ajouter partout allongerait d'un tiers une
+        // passe qui se compte deja en heures — pour un champ que l'ecriture
+        // COALESCE ignorerait de toute facon si la piste en a un. On ne le paie
+        // donc que pour les pistes qui en manquent (#1890).
+        let composer = match (
+            track.composer.as_deref().map(str::trim).unwrap_or(""),
+            details.work_id.as_deref(),
+        ) {
+            ("", Some(work_id)) => {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                match self.fetch_work_composer(work_id).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(work_id, error = %e, "fetch_work_composer_failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let cover_url = if let Some(ref rg_id) = details
             .release_group_id
             .as_ref()
@@ -462,7 +567,7 @@ impl MetadataEnricher {
             genre: details.genre,
             year: details.year,
             label: details.label,
-            composer: details.composer,
+            composer: composer.or(details.composer),
         };
 
         info!(
@@ -471,6 +576,7 @@ impl MetadataEnricher {
             genre = ?result.genre,
             year = ?result.year,
             label = ?result.label,
+            composer = ?result.composer,
             "track_enriched"
         );
         Ok(Some(result))
@@ -574,9 +680,219 @@ fn string_similarity(a: &str, b: &str) -> f64 {
     common as f64 / max_len as f64
 }
 
+/// Ecrit en base ce qu'un enrichissement MusicBrainz vient de trouver pour UNE
+/// piste, puis remonte le resultat au niveau de son album.
+///
+/// Extrait de `tune-server/src/routes/library/enrich.rs` (`enrich_all_library`)
+/// pour etre testable : la boucle appelante fait des allers-retours reseau, la
+/// partie base de donnees non.
+///
+/// **La remontee vers l'album n'est pas cosmetique.** Les cartes de l'ecran
+/// Metadonnees comptent `albums.genre` et `albums.year`
+/// (`tune-server/src/routes/library/stats.rs`, requete `completeness_stats`),
+/// jamais `tracks.*` : le compte par piste ne collait pas a la liste d'albums
+/// affichee (#1091, Reivax66). Or l'enrichissement n'ecrivait que `tracks.genre`
+/// et `tracks.year`. Les deux seuls ecrivains de `albums.genre` / `albums.year`
+/// a partir des pistes — `AlbumRepo::update_quality_from_tracks` et
+/// `AlbumRepo::update_dates` — ne sont appeles que par le scan
+/// (`auto_scan.rs`, `scan_import.rs`). Rien ne faisait donc le pont hors d'un
+/// scan, et le compteur « Genre manquant » restait fige sur sa valeur d'avant,
+/// quel que soit le nombre de rafraichissements (#2259, fil forum 788).
+///
+/// Renvoie le resultat de l'ecriture sur la piste — c'est lui qui decide si la
+/// piste compte comme enrichie ou en erreur.
+pub fn write_track_enrichment(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    track_id: i64,
+    album_id: Option<i64>,
+    mb_id: &str,
+    composer: Option<String>,
+    details: &RecordingDetails,
+) -> Result<usize, String> {
+    use crate::db::backend::ToSqlValue;
+
+    // COALESCE partout : on comble un trou, on n'ecrase jamais une valeur en place.
+    let genre_val: Option<String> = details.genre.clone();
+    let year_val: Option<i32> = details.year;
+    let label_val: Option<String> = details.label.clone();
+    let composer_val: Option<String> = composer;
+    let isrc_val: Option<String> = details.isrc.clone();
+    let mb_id_val: Option<String> = Some(mb_id.to_string());
+
+    let result = backend.execute(
+        "UPDATE tracks SET \
+         genre = COALESCE(genre, ?), \
+         year = COALESCE(year, ?), \
+         label = COALESCE(label, ?), \
+         composer = COALESCE(composer, ?), \
+         isrc = COALESCE(isrc, ?), \
+         musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?) \
+         WHERE id = ?",
+        &[
+            &genre_val as &dyn ToSqlValue,
+            &year_val as &dyn ToSqlValue,
+            &label_val as &dyn ToSqlValue,
+            &composer_val as &dyn ToSqlValue,
+            &isrc_val as &dyn ToSqlValue,
+            &mb_id_val as &dyn ToSqlValue,
+            &track_id as &dyn ToSqlValue,
+        ],
+    );
+
+    // Les metadonnees de niveau release remontent sur l'album.
+    if let Some(album_id) = album_id {
+        let release_id = details.release_id.clone();
+        let release_group_id = details.release_group_id.clone();
+        let catalog_number = details.catalog_number.clone();
+        let barcode = details.barcode.clone();
+        let album_label = details.label.clone();
+        let original_year = details.original_year;
+        backend
+            .execute(
+                "UPDATE albums SET \
+                 musicbrainz_release_id = COALESCE(musicbrainz_release_id, ?), \
+                 musicbrainz_release_group_id = COALESCE(musicbrainz_release_group_id, ?), \
+                 catalog_number = COALESCE(catalog_number, ?), \
+                 barcode = COALESCE(barcode, ?), \
+                 label = COALESCE(label, ?), \
+                 original_year = COALESCE(original_year, ?) \
+                 WHERE id = ?",
+                &[
+                    &release_id as &dyn ToSqlValue,
+                    &release_group_id as &dyn ToSqlValue,
+                    &catalog_number as &dyn ToSqlValue,
+                    &barcode as &dyn ToSqlValue,
+                    &album_label as &dyn ToSqlValue,
+                    &original_year as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                ],
+            )
+            .ok();
+
+        // Et enfin la remontee vers les colonnes que lisent les cartes de
+        // l'ecran Metadonnees. Ce sont exactement les deux appels que le scan
+        // fait deja (`auto_scan.rs:201` et `auto_scan.rs:705`) — d'ou le
+        // contraste que decrivait le fil 788 : un scan rafraichissait les
+        // compteurs, un enrichissement jamais. On ne duplique aucune requete :
+        // les deux methodes sont fill-only (COALESCE / NULLIF) et n'ecrasent
+        // aucune valeur en place.
+        let album_repo = crate::db::album_repo::AlbumRepo::with_backend(backend.clone());
+        // albums.genre / albums.genres, repris des pistes de l'album.
+        album_repo.update_quality_from_tracks(album_id).ok();
+        // albums.year, repris de l'annee que MusicBrainz vient de donner.
+        album_repo
+            .update_dates(album_id, year_val, None, None, None)
+            .ok();
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contre-epreuve #2259 — le compteur de l'ecran Metadonnees doit bouger
+    /// apres un enrichissement.
+    ///
+    /// On ne teste pas le rafraichissement de l'ecran : on teste la seule chose
+    /// dont il depend, la valeur que sa requete lit. Les deux comptes ci-dessous
+    /// sont copies mot pour mot de `completeness_stats`
+    /// (`tune-server/src/routes/library/stats.rs`) — ce sont les cartes « Genre »
+    /// et « Annee » que Philippe voyait rester a 24.
+    ///
+    /// Avant le correctif, `write_track_enrichment` ne remplissait que
+    /// `tracks.genre` / `tracks.year` : les deux comptes restaient a 0, et aucun
+    /// rafraichissement, manuel ou par WebSocket, ne pouvait y changer quoi que
+    /// ce soit.
+    #[test]
+    fn enrichment_moves_the_album_completeness_counters() {
+        use crate::db::album_repo::AlbumRepo;
+        use crate::db::artist_repo::ArtistRepo;
+        use crate::db::backend::DbBackend;
+        use crate::db::models::Track;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::track_repo::TrackRepo;
+        use std::sync::Arc;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Un album sans genre ni annee, avec une piste elle aussi nue : le cas
+        // exact des 24 albums du fil 788.
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&crate::db::models::Artist::new("Miles Davis".into()))
+            .unwrap();
+        let album_repo = AlbumRepo::new(db.clone());
+        let album = album_repo
+            .get_or_create("Kind of Blue", artist_id, None)
+            .unwrap();
+        let album_id = album.id.unwrap();
+
+        let mut track = Track::new("So What".to_string());
+        track.album_id = Some(album_id);
+        track.artist_id = Some(artist_id);
+        track.file_path = Some("/music/so_what.flac".into());
+        track.genre = None;
+        track.year = None;
+        let track_id = TrackRepo::new(db.clone()).create(&track).unwrap();
+
+        // L'album part bien sans genre ni annee — sinon le test ne prouverait rien.
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let count = |sql: &str| -> i64 {
+            backend
+                .query_one(sql, &[])
+                .unwrap()
+                .and_then(|r| r.first().and_then(|v| v.as_i64()))
+                .unwrap()
+        };
+        const ALBUMS_WITH_GENRE: &str =
+            "SELECT COUNT(*) FROM albums WHERE genre IS NOT NULL AND genre != ''";
+        const ALBUMS_WITH_YEAR: &str =
+            "SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0";
+        assert_eq!(count(ALBUMS_WITH_GENRE), 0, "pre-condition: pas de genre");
+        assert_eq!(count(ALBUMS_WITH_YEAR), 0, "pre-condition: pas d'annee");
+
+        // MusicBrainz repond : Jazz, 1959.
+        let details = RecordingDetails {
+            genre: Some("Jazz".into()),
+            year: Some(1959),
+            ..Default::default()
+        };
+        write_track_enrichment(
+            &backend,
+            track_id,
+            Some(album_id),
+            "mb-recording-id",
+            None,
+            &details,
+        )
+        .unwrap();
+
+        // La piste est bien enrichie : ce n'est pas la question.
+        let track_genre: Option<String> = backend
+            .query_one(
+                "SELECT genre FROM tracks WHERE id = ?",
+                &[&track_id as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        assert_eq!(track_genre.as_deref(), Some("Jazz"));
+
+        // La question est celle-ci : le compteur bouge-t-il ?
+        assert_eq!(
+            count(ALBUMS_WITH_GENRE),
+            1,
+            "#2259 : l'enrichissement a rempli tracks.genre mais pas albums.genre — \
+             la carte « Genre » de l'ecran Metadonnees ne bougera jamais"
+        );
+        assert_eq!(
+            count(ALBUMS_WITH_YEAR),
+            1,
+            "#2259 : l'enrichissement a rempli tracks.year mais pas albums.year — \
+             la carte « Annee » de l'ecran Metadonnees ne bougera jamais"
+        );
+    }
 
     #[test]
     fn enrichment_result_serialize() {
@@ -604,6 +920,88 @@ mod tests {
         assert!(d.label.is_none());
         assert!(d.composer.is_none());
         assert!(d.isrc.is_none());
+    }
+
+    // --- Compositeur : oeuvre puis relations d'artiste (#1890) ---
+
+    #[test]
+    fn pick_work_id_lit_la_relation_de_performance() {
+        // Forme reelle d'une reponse `inc=work-rels` : la cible `work` est
+        // imbriquee dans la relation, pas a la racine de l'enregistrement.
+        let v = serde_json::json!([
+            {"type": "performance", "work": {"id": "w-1", "title": "Nocturne"}}
+        ]);
+        assert_eq!(MetadataEnricher::pick_work_id(&v).as_deref(), Some("w-1"));
+    }
+
+    #[test]
+    fn pick_work_id_ignore_les_relations_sans_oeuvre() {
+        let v = serde_json::json!([
+            {"type": "engineer", "artist": {"id": "a-1", "name": "Ingenieur"}},
+            {"type": "performance", "work": {"id": "w-2"}}
+        ]);
+        assert_eq!(MetadataEnricher::pick_work_id(&v).as_deref(), Some("w-2"));
+    }
+
+    #[test]
+    fn pick_work_id_absent_quand_aucune_oeuvre() {
+        assert!(MetadataEnricher::pick_work_id(&serde_json::json!([])).is_none());
+        assert!(MetadataEnricher::pick_work_id(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn pick_composers_retient_le_compositeur() {
+        let v = serde_json::json!([
+            {"type": "composer", "artist": {"name": "Frederic Chopin"}}
+        ]);
+        assert_eq!(
+            MetadataEnricher::pick_composers(&v).as_deref(),
+            Some("Frederic Chopin")
+        );
+    }
+
+    #[test]
+    fn pick_composers_ecarte_parolier_et_arrangeur() {
+        // Les confondre remplirait le champ compositeur avec un autre role.
+        let v = serde_json::json!([
+            {"type": "lyricist", "artist": {"name": "Bernie Taupin"}},
+            {"type": "arranger", "artist": {"name": "Paul Buckmaster"}},
+            {"type": "orchestrator", "artist": {"name": "Anne Dudley"}}
+        ]);
+        assert!(MetadataEnricher::pick_composers(&v).is_none());
+    }
+
+    #[test]
+    fn pick_composers_concatene_une_oeuvre_co_ecrite() {
+        let v = serde_json::json!([
+            {"type": "composer", "artist": {"name": "John Lennon"}},
+            {"type": "lyricist", "artist": {"name": "Quelqu'un"}},
+            {"type": "composer", "artist": {"name": "Paul McCartney"}}
+        ]);
+        assert_eq!(
+            MetadataEnricher::pick_composers(&v).as_deref(),
+            Some("John Lennon, Paul McCartney")
+        );
+    }
+
+    #[test]
+    fn pick_composers_deduplique_et_ignore_les_noms_vides() {
+        let v = serde_json::json!([
+            {"type": "composer", "artist": {"name": "Erik Satie"}},
+            {"type": "composer", "artist": {"name": "  Erik Satie  "}},
+            {"type": "composer", "artist": {"name": "   "}},
+            {"type": "composer", "artist": {}}
+        ]);
+        assert_eq!(
+            MetadataEnricher::pick_composers(&v).as_deref(),
+            Some("Erik Satie")
+        );
+    }
+
+    #[test]
+    fn pick_composers_absent_quand_aucune_relation() {
+        assert!(MetadataEnricher::pick_composers(&serde_json::json!([])).is_none());
+        assert!(MetadataEnricher::pick_composers(&serde_json::Value::Null).is_none());
     }
 
     #[test]

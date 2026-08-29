@@ -411,6 +411,106 @@ fn init_logging() -> Option<(
     Some((path, guard))
 }
 
+/// Dossiers de cache web à jeter quand la version du widget change.
+///
+/// L'interface du mini-lecteur est une page servie au moteur de rendu du
+/// système ; celui-ci en garde une copie sur disque, que ni la désinstallation
+/// ni la réinstallation n'emportaient. Une correction d'interface pouvait donc
+/// rester invisible pour toujours — c'est ce qu'a vécu Sandro,
+/// qui voyait le bouton ⤢ dans un bac à sable Windows vierge et pas sur sa
+/// machine, même après désinstallation puis réinstallation (#1704).
+///
+/// On ne rend QUE le cache HTTP. Le reste du profil (`Local Storage` en
+/// particulier) contient l'adresse du serveur choisie par l'utilisateur, que
+/// `app.js` y range sous la clé `tune-server` : la purger le renverrait sur
+/// l'adresse en dur du code, c'est-à-dire le réseau de quelqu'un d'autre.
+fn webview_http_cache_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs_to_clear = Vec::new();
+
+    // Windows. Aucun `dataDirectory` n'est déclaré dans tauri.conf.json et wry
+    // ne pose rien à la place : WebView2 retombe donc sur son emplacement par
+    // défaut, documenté par Microsoft comme « le chemin de l'exécutable suivi
+    // de .WebView2 » — soit, ici, à l'intérieur même du dossier d'installation.
+    // C'est aussi pourquoi le désinstalleur le laisse : il termine par un
+    // `RMDir "$INSTDIR"` sans /r, qui échoue en silence sur un dossier non vide.
+    // On le déduit de l'exécutable en cours plutôt que de recomposer un chemin
+    // à partir du nom du produit : c'est la seule façon de rester juste si
+    // l'installation a été déplacée ou renommée.
+    #[cfg(target_os = "windows")]
+    if let Ok(exe) = std::env::current_exe() {
+        let mut udf = exe.into_os_string();
+        udf.push(".WebView2");
+        let ebwebview = std::path::PathBuf::from(udf).join("EBWebView");
+        // Un profil par sous-dossier (« Default » sauf configuration
+        // contraire) : on les balaie tous plutôt que de parier sur le nom.
+        if let Ok(entries) = std::fs::read_dir(&ebwebview) {
+            for entry in entries.flatten() {
+                let profile = entry.path();
+                if profile.is_dir() {
+                    dirs_to_clear.push(profile.join("Cache"));
+                    dirs_to_clear.push(profile.join("Code Cache"));
+                }
+            }
+        }
+    }
+
+    // macOS. WKWebView range son cache disque sous ~/Library/Caches/<identifiant
+    // du paquet>, à côté — et non à l'intérieur — des données de site, qui
+    // vivent dans ~/Library/WebKit. Le piège y est donc le même que sous
+    // Windows (rien n'est effacé en déplaçant l'application à la corbeille), et
+    // le dossier ne contient que du cache : le vider ne coûte rien.
+    #[cfg(target_os = "macos")]
+    if let Some(caches) = dirs::cache_dir() {
+        dirs_to_clear.push(caches.join("fr.mozaiklabs.tune-widget"));
+    }
+
+    dirs_to_clear
+}
+
+/// Le cache doit-il être jeté, au vu du témoin laissé par le dernier démarrage ?
+///
+/// Sans témoin, oui : c'est le cas de l'utilisateur qui installe cette version
+/// par-dessus une ancienne, donc exactement celui qu'on cherche à rattraper.
+fn cache_is_stale(seen: Option<&str>, current: &str) -> bool {
+    seen.map(str::trim) != Some(current)
+}
+
+/// Jette le cache web dès que la version diffère de celle du dernier démarrage.
+///
+/// À appeler AVANT que Tauri ne construise la fenêtre : une fois le moteur de
+/// rendu démarré, les fichiers du cache sont ouverts et ne peuvent plus être
+/// supprimés.
+///
+/// Le témoin de version est rangé à côté de la configuration et du journal,
+/// dans un dossier que ni la mise à jour ni la purge ne touchent — sinon la
+/// purge se redéclencherait à chaque démarrage.
+fn purge_webview_cache_on_version_change() {
+    let Some(dir) = dirs::config_dir().map(|d| d.join("tune-widget")) else {
+        return;
+    };
+    let stamp = dir.join("webview-cache-version");
+    let current = env!("CARGO_PKG_VERSION");
+
+    if !cache_is_stale(std::fs::read_to_string(&stamp).ok().as_deref(), current) {
+        return;
+    }
+
+    for path in webview_http_cache_dirs() {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(cache = %path.display(), "webview_cache_purged"),
+            // Absent = rien à faire ; c'est le cas courant, pas une anomalie.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(cache = %path.display(), error = %e, "webview_cache_purge_failed")
+            }
+        }
+    }
+
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&stamp, current);
+    }
+}
+
 /// Bascule mini ↔ complet depuis l'interface elle-même.
 ///
 /// Le menu de la barre système la proposait déjà, mais il faut savoir qu'il
@@ -684,6 +784,10 @@ fn main() {
         guard
     });
 
+    // Avant toute construction de fenêtre : le moteur de rendu verrouille les
+    // fichiers de son cache dès qu'il démarre.
+    purge_webview_cache_on_version_change();
+
     let run = tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -882,7 +986,25 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, MINI_LAYOUT_MIN_VERSION};
+    use super::{cache_is_stale, parse_version, MINI_LAYOUT_MIN_VERSION};
+
+    #[test]
+    fn the_cache_is_kept_only_for_the_version_that_wrote_it() {
+        // Même version : on ne touche à rien, sinon la purge se redéclencherait
+        // à chaque démarrage.
+        assert!(!cache_is_stale(Some("0.1.4"), "0.1.4"));
+        // Le témoin est écrit sans retour à la ligne, mais un éditeur ou une
+        // copie manuelle peut en ajouter un : ce n'est pas un changement de
+        // version.
+        assert!(!cache_is_stale(Some("0.1.4\n"), "0.1.4"));
+        // Version différente : c'est le cas d'une mise à jour.
+        assert!(cache_is_stale(Some("0.1.3"), "0.1.4"));
+        // Aucun témoin : première exécution après l'arrivée de ce correctif,
+        // donc très probablement au-dessus d'un cache périmé (#1704).
+        assert!(cache_is_stale(None, "0.1.4"));
+        // Témoin illisible ou tronqué : on purge plutôt que de parier.
+        assert!(cache_is_stale(Some(""), "0.1.4"));
+    }
 
     #[test]
     fn parses_the_shapes_a_server_actually_returns() {

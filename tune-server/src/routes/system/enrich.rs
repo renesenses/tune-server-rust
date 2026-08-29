@@ -214,10 +214,16 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
         let mut enriched = 0u64;
         let mut batch: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
         for (track_id, file_path) in &tracks {
-            let path = std::path::Path::new(file_path);
-            if !path.exists() {
+            // Le `!path.exists()` nu sautait en silence toute piste dont le nom
+            // est en NFD sur le disque alors que la base le tient en NFC
+            // (#1865). On resout la graphie que le systeme reconnait, et c'est
+            // celle-la qu'on lit — la base n'est pas reecrite.
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(file_path)
+            else {
                 continue;
-            }
+            };
+            let path = std::path::Path::new(&sur_disque);
             let ext =
                 tokio::task::block_in_place(|| tune_core::metadata::read_extended_metadata(path));
             if !ext.is_empty() {
@@ -449,10 +455,16 @@ pub(super) async fn enrichment_run(
         let mut enriched = 0u64;
         let mut batch: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
         for (track_id, file_path) in &tracks {
-            let path = std::path::Path::new(file_path);
-            if !path.exists() {
+            // Le `!path.exists()` nu sautait en silence toute piste dont le nom
+            // est en NFD sur le disque alors que la base le tient en NFC
+            // (#1865). On resout la graphie que le systeme reconnait, et c'est
+            // celle-la qu'on lit — la base n'est pas reecrite.
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(file_path)
+            else {
                 continue;
-            }
+            };
+            let path = std::path::Path::new(&sur_disque);
             let ext =
                 tokio::task::block_in_place(|| tune_core::metadata::read_extended_metadata(path));
             if !ext.is_empty() {

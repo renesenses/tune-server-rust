@@ -106,9 +106,29 @@ impl UrlCache {
     }
 }
 
+/// Les rangées de la page d'accueil Tidal, AVEC leurs albums.
+///
+/// La forme était juste depuis le début ; elle n'a simplement jamais été
+/// remplie. `get_featured_sections` construit ces paires puis n'en rendait que
+/// les sections, et `get_featured_section` — qui a besoin des albums — repartait
+/// alors chercher `/pages/home` pour jeter le résultat (#2096).
 struct FeaturedCache {
     sections: Vec<(FeaturedSection, Vec<StreamAlbum>)>,
     fetched_at: Instant,
+}
+
+/// Durée de vie des rangées « À la une ».
+///
+/// 300 s est la valeur qu'avaient déjà les deux gardes de fraîcheur ; on la
+/// nomme sans la changer. Le contenu éditorial Tidal bouge au mieux une fois
+/// par jour, donc un TTL plus long serait défendable — mais ce serait une
+/// décision de produit, pas la correction d'un défaut.
+const TTL_FEATURED: Duration = Duration::from_secs(300);
+
+impl FeaturedCache {
+    fn frais(&self) -> bool {
+        self.fetched_at.elapsed() < TTL_FEATURED
+    }
 }
 
 pub struct TidalService {
@@ -125,7 +145,15 @@ pub struct TidalService {
     /// Legacy Device Code pending state (fallback auth flow).
     pending_device_auth: Option<DeviceAuthResponse>,
     device_auth_started: Option<Instant>,
-    featured_cache: Option<FeaturedCache>,
+    /// ⚠️ `std::sync::Mutex` et non `tokio::sync::Mutex` (importé plus haut
+    /// sous le nom nu `Mutex`) : les accès sont courts et purement mémoire, et
+    /// un verrou asynchrone tenu à travers un `await` bloquerait l'ordonnanceur
+    /// sans rien gagner. C'est le choix fait côté Qobuz pour le même besoin.
+    ///
+    /// Le `Mutex` est ce qui rend ce cache possible : les méthodes de
+    /// `StreamingService` reçoivent `&self`, donc sans mutabilité intérieure il
+    /// ne peut pas être rempli — c'est exactement ce qui l'avait condamné.
+    featured_cache: std::sync::Mutex<Option<FeaturedCache>>,
     enabled_override: Option<bool>,
 }
 
@@ -156,7 +184,7 @@ impl TidalService {
             pending_pkce: None,
             pending_device_auth: None,
             device_auth_started: None,
-            featured_cache: None,
+            featured_cache: std::sync::Mutex::new(None),
             enabled_override: None,
         }
     }
@@ -585,6 +613,109 @@ impl TidalService {
         Ok(true)
     }
 
+    /// Lit le cache des rangées s'il est frais, en appliquant `extraire`.
+    ///
+    /// `None` couvre les trois cas où il ne faut pas servir : verrou empoisonné,
+    /// cache jamais rempli, cache périmé. L'appelant repart alors au réseau.
+    fn featured_depuis_le_cache<T>(&self, extraire: impl Fn(&FeaturedCache) -> T) -> Option<T> {
+        let cache = self.featured_cache.lock().ok()?;
+        let entree = cache.as_ref()?;
+        entree.frais().then(|| extraire(entree))
+    }
+
+    /// Les albums d'une rangée, si le cache est frais ET la porte.
+    fn albums_de_la_section(&self, section_id: &str) -> Option<Vec<StreamAlbum>> {
+        self.featured_depuis_le_cache(|c| {
+            c.sections
+                .iter()
+                .find(|(s, _)| s.id == section_id)
+                .map(|(_, albums)| albums.clone())
+        })
+        .flatten()
+    }
+
+    /// Analyse `/pages/home`, REMPLIT le cache, et rend la liste des rangées.
+    ///
+    /// Séparée de `get_featured_sections` pour une raison précise : sans elle,
+    /// le remplissage du cache n'est atteignable qu'à travers un appel réseau,
+    /// donc intestable. Mes premiers tests de #2096 étaient AVEUGLES pour
+    /// exactement ce motif — ils exerçaient les accesseurs en vase clos, et
+    /// retirer le remplissage ne les faisait pas échouer. Ici la contre-épreuve
+    /// mord : ôter `remplir_le_cache` casse `la_page_remplit_le_cache`.
+    fn absorber_la_page(&self, data: &serde_json::Value) -> Vec<FeaturedSection> {
+        let mut sections = Vec::new();
+        if let Some(rows) = data["rows"].as_array() {
+            for (i, row) in rows.iter().enumerate() {
+                let title = row["modules"]
+                    .as_array()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m["title"].as_str())
+                    .unwrap_or("");
+                if title.is_empty() {
+                    continue;
+                }
+                let albums: Vec<StreamAlbum> = row["modules"]
+                    .as_array()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m["pagedList"]["items"].as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|item| {
+                                item["type"].as_str() == Some("ALBUM")
+                                    || item["id"].as_u64().is_some()
+                            })
+                            .map(Self::map_album)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if albums.is_empty() {
+                    continue;
+                }
+                sections.push((
+                    FeaturedSection {
+                        id: format!("home-{i}"),
+                        name: title.into(),
+                    },
+                    albums,
+                ));
+            }
+        }
+        let result: Vec<FeaturedSection> = sections.iter().map(|(s, _)| s.clone()).collect();
+        // Le commentaire d'origine disait ici « Can't cache here since &self is
+        // immutable, will use the route-level cache ». Ce cache au niveau route
+        // n'a jamais existé, et le champ est resté `None` pour toujours — donc
+        // les deux gardes de fraîcheur n'étaient jamais franchies et
+        // `get_featured_section` rendait systématiquement du vide (#2096).
+        // La mutabilité intérieure lève l'obstacle : on garde les albums, pas
+        // seulement les sections, puisque ce sont eux qui manquaient.
+        self.remplir_le_cache(sections);
+        result
+    }
+
+    /// Les albums d'une rangée de la page d'accueil.
+    ///
+    /// ⚠️ Cette fonction rendait `Ok(vec![])` — TOUJOURS, pour tout le monde,
+    /// depuis `76876f5b`. Elle appelait pourtant `get_featured_sections`, donc
+    /// payait l'aller-retour réseau complet, puis jetait le résultat par un
+    /// `let _ = sections;`. Entrer dans une rangée « À la une » Tidal ne
+    /// pouvait donc rien afficher (#2096).
+    ///
+    /// Les albums existaient : `get_featured_sections` les parse et les range
+    /// dans ses paires, avant de n'en rendre que les sections. Il suffisait de
+    /// les garder.
+
+    /// Remplace les rangées en cache. Un verrou empoisonné fait perdre la mise
+    /// en cache, jamais la réponse : l'appelant a déjà ses données.
+    fn remplir_le_cache(&self, sections: Vec<(FeaturedSection, Vec<StreamAlbum>)>) {
+        if let Ok(mut cache) = self.featured_cache.lock() {
+            *cache = Some(FeaturedCache {
+                sections,
+                fetched_at: Instant::now(),
+            });
+        }
+    }
+
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
@@ -1008,6 +1139,15 @@ impl TidalService {
         }
     }
 
+    /// Les playlists d'une réponse de recherche. Isolé de `search` pour être
+    /// testable : le reste de l'extraction demande un aller-retour HTTP.
+    fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_playlist).collect())
+            .unwrap_or_default()
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -1268,7 +1408,7 @@ impl StreamingService for TidalService {
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(&format!(
-                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
+                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS,PLAYLISTS",
                 urlencoding::encode(query)
             ))
             .await?;
@@ -1290,7 +1430,7 @@ impl StreamingService for TidalService {
             tracks,
             albums,
             artists,
-            playlists: vec![],
+            playlists: Self::search_playlists(&data),
         })
     }
 
@@ -1768,65 +1908,27 @@ impl StreamingService for TidalService {
     }
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
-        if let Some(ref cache) = self.featured_cache
-            && cache.fetched_at.elapsed() < Duration::from_secs(300)
+        if let Some(sections) =
+            self.featured_depuis_le_cache(|c| c.sections.iter().map(|(s, _)| s.clone()).collect())
         {
-            return Ok(cache.sections.iter().map(|(s, _)| s.clone()).collect());
+            debug!("tidal_featured_cache_hit");
+            return Ok(sections);
         }
         let data = self.api_get("/pages/home").await?;
-        let mut sections = Vec::new();
-        if let Some(rows) = data["rows"].as_array() {
-            for (i, row) in rows.iter().enumerate() {
-                let title = row["modules"]
-                    .as_array()
-                    .and_then(|m| m.first())
-                    .and_then(|m| m["title"].as_str())
-                    .unwrap_or("");
-                if title.is_empty() {
-                    continue;
-                }
-                let albums: Vec<StreamAlbum> = row["modules"]
-                    .as_array()
-                    .and_then(|m| m.first())
-                    .and_then(|m| m["pagedList"]["items"].as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter(|item| {
-                                item["type"].as_str() == Some("ALBUM")
-                                    || item["id"].as_u64().is_some()
-                            })
-                            .map(Self::map_album)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if albums.is_empty() {
-                    continue;
-                }
-                sections.push((
-                    FeaturedSection {
-                        id: format!("home-{i}"),
-                        name: title.into(),
-                    },
-                    albums,
-                ));
-            }
-        }
-        let result = sections.iter().map(|(s, _)| s.clone()).collect();
-        // Can't cache here since &self is immutable, will use the route-level cache
-        Ok(result)
+        Ok(self.absorber_la_page(&data))
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
-        if let Some(ref cache) = self.featured_cache
-            && cache.fetched_at.elapsed() < Duration::from_secs(300)
-            && let Some((_, albums)) = cache.sections.iter().find(|(s, _)| s.id == section_id)
-        {
-            return Ok(albums.clone());
+        if let Some(albums) = self.albums_de_la_section(section_id) {
+            debug!(section_id, "tidal_featured_section_cache_hit");
+            return Ok(albums);
         }
-        let sections = self.get_featured_sections().await?;
-        let _ = sections;
-        Ok(vec![])
+        // Le cache est froid ou périmé : cet appel le remplit.
+        self.get_featured_sections().await?;
+        // Second passage : la section demandée est là si Tidal l'a servie.
+        // Une absence n'est pas une erreur — une rangée peut disparaître de la
+        // page d'accueil entre deux affichages du client.
+        Ok(self.albums_de_la_section(section_id).unwrap_or_default())
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
@@ -2473,6 +2575,222 @@ fn extract_dash_base_url(mpd: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /*
+    | Le cache des rangées « À la une » (#2096).
+    |
+    | Avant ce correctif, `featured_cache` était `Option<FeaturedCache>` sans
+    | mutabilité intérieure : il valait `None` depuis `new()` et rien ne
+    | pouvait l'écrire. Conséquence invisible en lecture rapide :
+    | `get_featured_section` payait un aller-retour réseau vers `/pages/home`,
+    | jetait le résultat par `let _ = sections;` et rendait `Ok(vec![])`.
+    | TOUJOURS. Entrer dans une rangée Tidal ne pouvait rien afficher.
+    |
+    | Ces tests portent sur les accesseurs, pas sur le réseau : c'est là que
+    | vivait le défaut, et ça les rend exécutables sans compte Tidal.
+    */
+
+    fn rangee(id: &str, titre_album: &str) -> (FeaturedSection, Vec<StreamAlbum>) {
+        (
+            FeaturedSection {
+                id: id.into(),
+                name: format!("Rangée {id}"),
+            },
+            vec![StreamAlbum {
+                title: titre_album.into(),
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn un_cache_neuf_ne_sert_rien() {
+        let svc = TidalService::new();
+        // L'état de départ, et l'état PERMANENT avant le correctif.
+        assert!(svc.albums_de_la_section("home-0").is_none());
+    }
+
+    #[test]
+    fn ce_qui_est_mis_en_cache_ressort() {
+        let svc = TidalService::new();
+        svc.remplir_le_cache(vec![rangee("home-0", "Kind of Blue")]);
+
+        let albums = svc
+            .albums_de_la_section("home-0")
+            .expect("la rangée mise en cache doit ressortir");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].title, "Kind of Blue");
+    }
+
+    #[test]
+    fn une_section_inconnue_ne_rend_rien_sans_masquer_les_autres() {
+        let svc = TidalService::new();
+        svc.remplir_le_cache(vec![rangee("home-0", "A"), rangee("home-1", "B")]);
+
+        assert!(svc.albums_de_la_section("home-9").is_none());
+        // Garde-fou inverse : la recherche d'une absente ne casse pas les présentes.
+        assert_eq!(svc.albums_de_la_section("home-1").unwrap()[0].title, "B");
+    }
+
+    #[test]
+    fn le_cache_perime_cesse_de_servir() {
+        let svc = TidalService::new();
+        svc.remplir_le_cache(vec![rangee("home-0", "A")]);
+        // On vieillit l'entrée au-delà du TTL sans attendre 300 s.
+        {
+            let mut c = svc.featured_cache.lock().unwrap();
+            let e = c.as_mut().unwrap();
+            e.fetched_at = Instant::now() - TTL_FEATURED - Duration::from_secs(1);
+        }
+        assert!(
+            svc.albums_de_la_section("home-0").is_none(),
+            "au-delà du TTL, le cache doit se taire pour qu'on reparte au réseau"
+        );
+    }
+
+    #[test]
+    fn les_sections_et_leurs_albums_survivent_ensemble() {
+        // C'est le nœud du défaut : les albums étaient construits puis jetés,
+        // seules les sections étaient rendues. Les deux doivent tenir.
+        let svc = TidalService::new();
+        svc.remplir_le_cache(vec![rangee("home-0", "A"), rangee("home-1", "B")]);
+
+        let sections: Vec<String> = svc
+            .featured_depuis_le_cache(|c| c.sections.iter().map(|(s, _)| s.id.clone()).collect())
+            .expect("le cache est frais");
+        assert_eq!(sections, vec!["home-0", "home-1"]);
+        assert_eq!(svc.albums_de_la_section("home-0").unwrap()[0].title, "A");
+        assert_eq!(svc.albums_de_la_section("home-1").unwrap()[0].title, "B");
+    }
+
+    /// Une réponse `/pages/home` réduite à ce que le code lit vraiment.
+    fn page_home() -> serde_json::Value {
+        json!({"rows": [
+            {"modules": [{"title": "Nouveautés", "pagedList": {"items": [
+                {"type": "ALBUM", "id": 1, "title": "Kind of Blue"},
+                {"type": "ALBUM", "id": 2, "title": "Blue Train"}
+            ]}}]},
+            {"modules": [{"title": "Pour vous", "pagedList": {"items": [
+                {"type": "ALBUM", "id": 3, "title": "A Love Supreme"}
+            ]}}]}
+        ]})
+    }
+
+    /*
+    | ⚠️ LES TESTS CI-DESSUS SONT NÉCESSAIRES MAIS PAS SUFFISANTS.
+    |
+    | Écrits seuls, ils étaient AVEUGLES : j'ai réintroduit le défaut — retiré
+    | `remplir_le_cache` de la lecture de la page — et les six passaient
+    | toujours. Ils exerçaient les accesseurs en vase clos, jamais le CÂBLAGE.
+    |
+    | C'est exactement le reproche fait aux fermetures du 21/08, commis sur mon
+    | propre correctif. Une contre-épreuve qui ne mord pas ne prouve rien.
+    |
+    | Les deux tests suivants couvrent le câblage : ils passent par
+    | `absorber_la_page`, le seul endroit où le cache se remplit.
+    */
+
+    #[test]
+    fn la_page_remplit_le_cache() {
+        let svc = TidalService::new();
+        assert!(
+            svc.albums_de_la_section("home-0").is_none(),
+            "état de départ"
+        );
+
+        let sections = svc.absorber_la_page(&page_home());
+
+        assert_eq!(sections.len(), 2, "les deux rangées sont rendues");
+        // LE point : après lecture de la page, les albums sont joignables.
+        // Retirer `remplir_le_cache` fait échouer ici, et nulle part ailleurs.
+        let albums = svc
+            .albums_de_la_section("home-0")
+            .expect("la page lue doit avoir rempli le cache");
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].title, "Kind of Blue");
+    }
+
+    #[test]
+    fn entrer_dans_une_rangee_rend_ses_albums_et_non_du_vide() {
+        // Le défaut de #2096 raconté en un test : `get_featured_section`
+        // rendait `Ok(vec![])` pour tout le monde, toujours. On rejoue son
+        // chemin sans réseau — le cache est chaud, donc elle n'appelle pas
+        // `get_featured_sections`.
+        let svc = TidalService::new();
+        svc.absorber_la_page(&page_home());
+
+        let albums = svc
+            .albums_de_la_section("home-1")
+            .expect("la rangée « Pour vous » existe");
+        assert_eq!(
+            albums.len(),
+            1,
+            "entrer dans une rangée doit rendre ses albums, pas un vecteur vide"
+        );
+        assert_eq!(albums[0].title, "A Love Supreme");
+    }
+
+    #[test]
+    fn une_rangee_sans_album_est_ecartee() {
+        // Garde-fou inverse : le code saute les rangées vides. Sans lui, le
+        // client afficherait des rangées cliquables qui ne mènent nulle part —
+        // le symptôme même de #2096, sous une autre forme.
+        let svc = TidalService::new();
+        let page = json!({"rows": [
+            {"modules": [{"title": "Vide", "pagedList": {"items": []}}]},
+            {"modules": [{"title": "Pleine", "pagedList": {"items": [
+                {"type": "ALBUM", "id": 9, "title": "Giant Steps"}
+            ]}}]}
+        ]});
+        let sections = svc.absorber_la_page(&page);
+        assert_eq!(sections.len(), 1, "la rangée vide ne doit pas être offerte");
+        assert_eq!(sections[0].name, "Pleine");
+    }
+
+    #[test]
+    fn un_remplissage_remplace_le_precedent() {
+        // Tidal peut retirer une rangée entre deux passages. Le cache doit
+        // refléter la dernière réponse, pas accumuler.
+        let svc = TidalService::new();
+        svc.remplir_le_cache(vec![rangee("home-0", "A"), rangee("home-1", "B")]);
+        svc.remplir_le_cache(vec![rangee("home-0", "A2")]);
+
+        assert_eq!(svc.albums_de_la_section("home-0").unwrap()[0].title, "A2");
+        assert!(
+            svc.albums_de_la_section("home-1").is_none(),
+            "une rangée disparue de la réponse ne doit pas survivre en cache"
+        );
+    }
+
+    #[test]
+    fn search_playlists_read_from_the_search_payload() {
+        // Forme réelle d'une réponse /search avec types=…,PLAYLISTS.
+        let data = json!({
+            "tracks": {"items": []},
+            "albums": {"items": []},
+            "artists": {"items": []},
+            "playlists": {"items": [{
+                "uuid": "9f2c-77",
+                "title": "Late Night Jazz",
+                "numberOfTracks": 58,
+                "squareImage": "aa-bb-cc-dd",
+                "creator": {"name": "TIDAL"}
+            }]}
+        });
+        let found = TidalService::search_playlists(&data);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "9f2c-77");
+        assert_eq!(found[0].name, "Late Night Jazz");
+        assert_eq!(found[0].track_count, 58);
+        assert_eq!(found[0].owner.as_deref(), Some("TIDAL"));
+    }
+
+    #[test]
+    fn search_playlists_absent_is_empty_not_a_panic() {
+        // Un compte sans droit sur les playlists, ou une API qui omet le bloc :
+        // la recherche doit rendre les autres résultats, pas échouer.
+        assert!(TidalService::search_playlists(&json!({"tracks": {"items": []}})).is_empty());
+    }
 
     #[test]
     fn map_track_basic() {

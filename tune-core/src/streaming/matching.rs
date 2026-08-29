@@ -18,6 +18,14 @@ use crate::streaming::traits::StreamTrack;
 /// (a same-title different song, a cover, a live take).
 pub const MATCH_ACCEPT_SCORE: f64 = 0.7;
 
+/// Plancher « approximatif » : sous [`MATCH_ACCEPT_SCORE`] mais au-dessus de ce
+/// seuil, le fuzzy matcher a bien trouvé quelque chose (son propre plancher
+/// interne est 0.6) — c'était jusqu'ici jeté en silence, et la bande 0.6–0.7
+/// devenait « not_found » pour les favoris radio (#1235) alors qu'une recherche
+/// manuelle Qobuz trouvait la piste. Les appelants qui savent présenter la
+/// nuance à l'utilisateur peuvent l'exploiter via [`best_stream_match_scored`].
+pub const MATCH_APPROX_SCORE: f64 = 0.6;
+
 /// Pick the streaming track that best matches a known `(title, artist)` — with an
 /// optional `isrc` and `duration_ms` for extra confidence — from a service's
 /// search results. Returns `None` when nothing clears [`MATCH_ACCEPT_SCORE`],
@@ -33,6 +41,22 @@ pub fn best_stream_match<'a>(
     duration_ms: u64,
     tracks: &'a [StreamTrack],
 ) -> Option<&'a StreamTrack> {
+    best_stream_match_scored(title, artist, isrc, duration_ms, tracks)
+        .filter(|(_, score)| *score >= MATCH_ACCEPT_SCORE)
+        .map(|(t, _)| t)
+}
+
+/// Comme [`best_stream_match`], mais renvoie aussi le score et accepte dès
+/// [`MATCH_APPROX_SCORE`]. À charge de l'appelant de distinguer un match sûr
+/// (`score >= MATCH_ACCEPT_SCORE`) d'un match approximatif à présenter comme
+/// tel — utilisé par les favoris radio, qui n'ont ni ISRC ni durée.
+pub fn best_stream_match_scored<'a>(
+    title: &str,
+    artist: &str,
+    isrc: &str,
+    duration_ms: u64,
+    tracks: &'a [StreamTrack],
+) -> Option<(&'a StreamTrack, f64)> {
     if tracks.is_empty() {
         return None;
     }
@@ -59,11 +83,11 @@ pub fn best_stream_match<'a>(
 
     let result = find_best_match(title, artist, isrc, duration_ms as i64, &candidates);
     let best = result.best_match?;
-    if best.score < MATCH_ACCEPT_SCORE {
+    if best.score < MATCH_APPROX_SCORE {
         return None;
     }
     let idx: usize = best.source_id.parse().ok()?;
-    tracks.get(idx)
+    tracks.get(idx).map(|t| (t, best.score))
 }
 
 #[cfg(test)]
@@ -114,6 +138,33 @@ mod tests {
     fn empty_results_return_none() {
         let m = best_stream_match("X", "Y", "", 0, &[]);
         assert!(m.is_none());
+    }
+
+    #[test]
+    fn la_bande_approximative_est_accessible_via_la_variante_scoree() {
+        // Titre proche mais pas identique + artiste identique : le fuzzy tombe
+        // dans la bande 0.6–0.7. `best_stream_match` refuse (comportement
+        // historique conservé), mais la variante scorée l'expose pour que les
+        // favoris radio puissent le présenter comme « approximate » au lieu de
+        // « not_found » (#1235).
+        let tracks = vec![track("1", "Nightswimming (Live at the BBC)", "R.E.M.", 0)];
+        let strict = best_stream_match("Nightswimming demo", "R.E.M.", "", 0, &tracks);
+        let scored = best_stream_match_scored("Nightswimming demo", "R.E.M.", "", 0, &tracks);
+        match scored {
+            Some((t, score)) => {
+                assert_eq!(t.id, "1");
+                assert!(
+                    score >= MATCH_APPROX_SCORE,
+                    "score {score} sous le plancher approx"
+                );
+                // Cohérence : si le strict a refusé, c'est que le score est
+                // bien dans la bande intermédiaire.
+                if strict.is_none() {
+                    assert!(score < MATCH_ACCEPT_SCORE);
+                }
+            }
+            None => panic!("la variante scorée devrait au moins trouver un approximatif"),
+        }
     }
 
     #[test]

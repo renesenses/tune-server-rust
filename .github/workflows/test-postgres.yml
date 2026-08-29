@@ -10,13 +10,14 @@ name: Tests (PostgreSQL)
 
 on:
   push:
-    branches: [main, "feature/postgres-support"]
+    branches: [main, release/v0.9, "feature/postgres-support"]
     paths:
       - "tune-core/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/test-postgres.yml"
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "tune-core/**"
       - "Cargo.toml"
@@ -24,9 +25,19 @@ on:
       - ".github/workflows/test-postgres.yml"
   workflow_dispatch:
 
+concurrency:
+  group: postgres-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-postgres:
+    name: Test (PostgreSQL)
+    # Une PR de correctif vers batch/* garde le noyau Rust de ci.yml. Cette
+    # suite revient sur l'integration du lot vers release/v0.9, sur toute PR
+    # directe, ou des que le label ci:full l'exige.
+    if: github.event_name != 'pull_request' || !startsWith(github.base_ref, 'batch/') || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -44,7 +55,6 @@ jobs:
           --health-retries 10
 
     env:
-      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
       CARGO_TERM_COLOR: always
 
     steps:
@@ -56,11 +66,40 @@ jobs:
         with:
           shared-key: tune-core-postgres
 
-      # `--no-default-features` drops `local-audio` (which pulls
-      # alsa-sys via cpal). We don't need it to exercise the engine +
-      # postgres modules, so skip it here to keep this job fast.
-      - name: Engine module tests (no DB needed)
-        run: cargo test -p tune-core --no-default-features --features postgres db::engine
+      # Suite unique et superset des anciens jobs : elle couvre engine,
+      # PostgresDb et tout tune-core avec le meme jeu postgres+oaat que le job
+      # retire de ci.yml. On ne compile donc plus deux fois le crate pour deux
+      # filtres qui etaient deja inclus dans cette execution.
+      - name: Tests tune-core avec PostgreSQL
+        run: cargo test -p tune-core --no-default-features --features postgres,oaat
 
-      - name: PostgresDb smoke tests
-        run: cargo test -p tune-core --no-default-features --features postgres db::postgres
+      # Real-schema regression for #1706: the self-healing DDL in
+      # `ensure_schema` and migration 026 can only be proven against an actual
+      # PostgreSQL. Applies the numbered migrations first (as scripts/pg-e2e.sh
+      # does), then runs the #1706 test with TUNE_TEST_PG_URL set so it does not
+      # skip. Scoped to that one test on purpose: the older E2E tests stay
+      # opt-in via scripts/pg-e2e.sh.
+      - name: Apply PG migrations
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          export PGPASSWORD=tune
+          psql -h localhost -U tune -d tune_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+          for migration in tune-core/migrations/postgres/*.sql; do
+            echo "  $(basename "$migration")"
+            psql -h localhost -U tune -d tune_test -v ON_ERROR_STOP=1 -q -f "$migration"
+          done
+
+      - name: Schema-drift regression (#1706)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+
+      # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
+      # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
+      # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
+      # migration n'ajoute. Sans lui, la prochaine colonne oubliee se
+      # decouvrirait comme les colonnes CUE : par hasard, des mois plus tard.
+      - name: Parité du schéma PG (#2111)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture

@@ -36,6 +36,35 @@ pub struct NowPlaying {
     pub bit_depth: Option<u32>,
     pub genre: Option<String>,
     pub year: Option<i32>,
+    /// L'album et l'artiste de la piste, par IDENTIFIANT.
+    ///
+    /// Ils manquaient. Le client web devait donc DEVINER l'album depuis son
+    /// titre : cliquer sur « Entreat (2010) » dans la lecture en cours lancait
+    /// une recherche sur « Entreat » et atterrissait sur la page de The Cure,
+    /// pas sur celle de l'album (FabienM, v0.9.102). `Track` les porte tous
+    /// deux, `from_track` les jetait.
+    ///
+    /// `Option`, et `#[serde(default)]` : une piste en streaming ou une radio
+    /// n'a pas d'entree en bibliotheque, et un client plus ancien ne les envoie
+    /// pas.
+    #[serde(default)]
+    pub album_id: Option<i64>,
+    #[serde(default)]
+    pub artist_id: Option<i64>,
+    /// Débit CONSTANT du flux source, en kbit/s, quand la source le nomme
+    /// elle-même. `None` veut dire « on ne sait pas » — et rien n'est affiché.
+    ///
+    /// Il existe pour le 128 kbit/s de Bandcamp (#2074) : la qualité était
+    /// annoncée sur l'écran Bandcamp — « un flux à 128 kbit/s doit être
+    /// annoncé comme tel partout où il apparaît »,
+    /// `plugins/tune-bandcamp/src/lib.rs` — puis se perdait au passage en
+    /// zone, où le chemin du signal n'affichait plus qu'un « MP3 »
+    /// indiscernable d'un 320. Un fichier local n'en a pas besoin : sa
+    /// résolution réelle est déjà lue au scan.
+    ///
+    /// `#[serde(default)]` : un client plus ancien ne l'envoie pas.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl NowPlaying {
@@ -70,6 +99,13 @@ impl NowPlaying {
             bit_depth: track.bit_depth.map(|v| v as u32),
             genre: track.genre.clone(),
             year: track.year,
+            album_id: track.album_id,
+            artist_id: track.artist_id,
+            // Une piste de la bibliothèque n'annonce pas de débit : sa
+            // résolution réelle est lue au scan et déjà portée ci-dessus. Le
+            // champ existe pour les flux distants qui, eux, nomment leur
+            // encodage (#2074).
+            bitrate_kbps: None,
         }
     }
 }
@@ -97,6 +133,50 @@ pub struct ZoneState {
     /// shuffle track is `shuffle_order[shuffle_index + 1]`.
     #[serde(skip)]
     pub shuffle_index: i64,
+    /// La piste est en cours de résolution : Tune a accepté la demande mais
+    /// n'a pas encore d'URL jouable.
+    ///
+    /// Ajouté pour YouTube, où l'extraction peut prendre très longtemps. Mesuré
+    /// chez un testeur (forum #1359) : **32 secondes** entre le clic et le
+    /// premier son, parce que les deux surfaces natives sont refusées par
+    /// YouTube (« Sign in to confirm you're not a bot ») et que tout repart sur
+    /// `yt-dlp`. Pendant ce temps l'écran ne montrait rien, et il a signalé
+    /// « la lecture ne se lance pas » — ce qui, de son point de vue, était vrai.
+    ///
+    /// Champ ADDITIF volontairement : `PlayState` est traité dans 77 `match`,
+    /// dont dix-huit dans le poller qui pilote la fin de piste et l'enchaînement.
+    /// Y ajouter une variante aurait obligé à trancher son cas partout, pour un
+    /// besoin d'affichage. Ce booléen ne modifie aucune décision de lecture.
+    #[serde(default)]
+    pub resolving: bool,
+    /// La zone sert un flux DoP en ce moment — donc **son curseur de volume ne
+    /// fait rien**.
+    ///
+    /// Le serveur épingle le volume à l'unité tant que dure le DoP : tout autre
+    /// facteur réécrit le marqueur du flux, le DAC quitte le mode DSD et se
+    /// coupe (#1735). Le client a besoin de le savoir pour le dire, sans quoi
+    /// on aura remplacé un silence inexpliqué par une commande morte
+    /// inexpliquée.
+    ///
+    /// Recopié du `OutputStatus` de la sortie, qui le **détecte sur les octets**
+    /// (`is_dop_pcm`). Ce n'est pas le mode DSD de la zone : celui-ci dit ce qui
+    /// a été demandé, pas ce qui part sur le fil — le plafond « Fréquence max »
+    /// peut faire retomber en PCM sans rien annoncer. Déduire l'un de l'autre
+    /// est exactement ce qui a fait mentir le chemin du signal (#1595).
+    ///
+    /// Additif, comme `resolving` : ne modifie aucune décision de lecture.
+    #[serde(default)]
+    pub dop_active: bool,
+    /// Verdict réellement observé à la frontière du backend de sortie.
+    ///
+    /// Interne au serveur : les routes le fondent dans `signal_path`, contrat
+    /// public déjà consommé par les clients. `None` conserve le calcul
+    /// historique pour les sorties qui ne publient pas encore cette sonde.
+    #[serde(skip)]
+    pub output_signal_path: Option<crate::outputs::traits::OutputSignalPathStatus>,
+    /// Compteurs DSP observés par la sortie pendant la piste courante.
+    #[serde(skip)]
+    pub output_dsp_metrics: Option<crate::outputs::traits::OutputDspMetrics>,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -145,6 +225,31 @@ pub struct ZoneState {
     /// (server-initiated, no owner) rather than misattributed to a person.
     #[serde(default)]
     pub session_profile_id: Option<i64>,
+    /// Ce que l'auditeur a demande en lancant cette session : le TYPE de
+    /// l'objet sur lequel il a clique « Lire » (`track`, `album`, `playlist`,
+    /// `artist`, `label`) et son identifiant. Pose par le gestionnaire de
+    /// `POST /zones/:id/play` a partir du corps de la requete ; relu par
+    /// l'orchestrateur au moment d'ecrire `listen_history`.
+    ///
+    /// Meme mecanique que `session_profile_id`, et pour la meme raison : les
+    /// avances automatiques (autoplay, gapless, file d'attente) reutilisent la
+    /// zone sans y toucher, donc elles heritent du contexte — la deuxieme
+    /// piste d'une playlist reste une ecoute « playlist ».
+    ///
+    /// `None` = l'appelant n'a pas dit d'ou venait le geste. On ecrit NULL
+    /// plutot que de deviner : une intention inventee est pire qu'une absence.
+    #[serde(default)]
+    pub session_context_type: Option<String>,
+    #[serde(default)]
+    pub session_context_id: Option<String>,
+    /// Instant de la dernière mise en pause (`None` hors pause). Pour une
+    /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
+    /// un flux live continue de se périmer pendant la pause (connexion
+    /// icecast, tampon de la sortie, horodatage des paquets), et au-delà de
+    /// quelques secondes la reprise doit REJOUER la station comme au premier
+    /// lancement plutôt que de reprendre un pipeline mort (#1629).
+    #[serde(skip)]
+    pub paused_at: Option<Instant>,
     /// Horloge murale (epoch ms UTC) du dernier changement de métadonnée
     /// titre/artiste du now-playing. Pour une radio, c'est l'instant où le
     /// serveur a détecté le changement de morceau dans le flux (ICY / API
@@ -155,6 +260,29 @@ pub struct ZoneState {
     /// ne doit pas faire repartir l'ancrage de zéro.
     #[serde(default)]
     pub metadata_changed_at_ms: Option<i64>,
+    /// Instant où Tune a CONSTATÉ que la lecture de cette zone navigateur
+    /// n'était reçue par aucun onglet — pas l'instant présent, celui du
+    /// constat.
+    ///
+    /// `output_reach` ne pouvait dire `browser_unattended` que d'une zone
+    /// en `Playing` : la valeur retombait à `"ok"` dès que la lecture
+    /// cessait, et le bandeau qui porte cette explication disparaissait avec
+    /// elle. Or la lecture cesse précisément à cet instant-là — soit parce
+    /// que l'utilisateur arrête une zone muette, soit parce que le poller
+    /// l'abandonne au MÊME seuil que celui qui déclenche le bandeau
+    /// (`DELAI_SILENCE_ETABLI`, #2630). Le seul message qui explique le
+    /// silence s'effaçait donc au geste qu'il était censé prévenir : Pierre M
+    /// l'a vu passer et l'a rapporté de travers, ce qui a détourné
+    /// l'instruction de #2571 pendant plusieurs échanges (#2588).
+    ///
+    /// Horodater le CONSTAT sépare la durée du défaut de la durée de son
+    /// affichage. Effacé par `play()` : une nouvelle lecture rouvre la
+    /// question, la réponse d'avant ne vaut plus.
+    ///
+    /// `#[serde(skip)]`, comme `last_play_started_at` : après une
+    /// restauration d'état on ne conclut rien.
+    #[serde(skip)]
+    pub browser_unattended_at: Option<Instant>,
 }
 
 /// Vrai quand la nouvelle métadonnée now-playing change d'identité
@@ -197,6 +325,10 @@ impl Default for ZoneState {
             zone_id: 0,
             state: PlayState::Stopped,
             now_playing: None,
+            resolving: false,
+            dop_active: false,
+            output_signal_path: None,
+            output_dsp_metrics: None,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -208,12 +340,16 @@ impl Default for ZoneState {
             shuffle_index: -1,
             track_generation: 0,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         }
     }
 }
@@ -333,6 +469,8 @@ impl PlaybackManager {
             zone_id,
             ..Default::default()
         });
+        // On tient une URL jouable : la recherche est finie.
+        state.resolving = false;
         state.position_ms = position_ms;
         state.now_playing = Some(np);
         state.state = PlayState::Stopped;
@@ -366,6 +504,73 @@ impl PlaybackManager {
             .unwrap_or(0)
     }
 
+    /// Marque la zone comme « en cours de résolution », ou lève le drapeau.
+    ///
+    /// Levé avant une extraction potentiellement longue (YouTube via `yt-dlp` :
+    /// 32 s mesurées), retombé dès que `play()` s'exécute — c'est-à-dire dès
+    /// qu'une URL jouable existe. N'influence aucune décision de lecture : ce
+    /// drapeau ne sert qu'à ce que l'interface puisse dire « je cherche »
+    /// plutôt que de rester muette.
+    pub async fn set_resolving(&self, zone_id: i64, value: bool) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .resolving = value;
+    }
+
+    /// Reporte l'état DoP lu sur la sortie dans l'état de zone servi au client.
+    ///
+    /// Appelée à chaque tour du poller, sur les deux chemins (zone au repos et
+    /// zone en lecture) : un flux peut basculer en DoP ou en sortir d'une piste
+    /// à l'autre sans que la zone change d'état, et le curseur de volume doit
+    /// suivre dans les deux sens.
+    pub async fn set_dop_active(&self, zone_id: i64, value: bool) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .dop_active = value;
+    }
+
+    /// Reporte le contrat réellement constaté par le backend dans l'état de
+    /// lecture dont les routes construisent le chemin du signal.
+    pub async fn set_output_signal_path(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::OutputSignalPathStatus>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .output_signal_path = value;
+    }
+
+    pub async fn set_output_dsp_metrics(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::OutputDspMetrics>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .output_dsp_metrics = value;
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -383,13 +588,31 @@ impl PlaybackManager {
             .last_seek_at
             .map(|t| t.elapsed().as_secs() < 5)
             .unwrap_or(false);
+        // La recherche est finie : on tient une URL jouable, c'est tout l'objet
+        // de cet appel. Sans cette ligne le drapeau levé par l'orchestrateur
+        // avant `resolve_stream` n'était JAMAIS abaissé sur le chemin qui
+        // réussit — seuls deux chemins d'erreur le faisaient. Le commentaire de
+        // `play_inner` affirmait pourtant « le drapeau retombe dans play() » :
+        // l'intention était écrite, l'instruction manquait, et la zone restait
+        // annoncée « recherche en cours » pendant toute la lecture.
+        state.resolving = false;
         state.state = PlayState::Playing;
+        // Le verdict appartient au flux qui l'a produit. Tant que le backend
+        // n'a pas observé le premier buffer du nouveau flux, mieux vaut
+        // annoncer « non observé » que réutiliser la promesse de la piste
+        // précédente.
+        state.output_signal_path = None;
+        state.paused_at = None;
         if !is_recent_seek {
             state.position_ms = 0;
         }
         // Stamp the (re)start instant so the orchestrator can coalesce a
         // redundant controller double-dispatch of this same track (#1271).
         state.last_play_started_at = Some(Instant::now());
+        // Une nouvelle lecture rouvre la question « quelqu'un reçoit-il ce
+        // son ? » : le constat de silence précédent ne décrit plus rien
+        // (#2588).
+        state.browser_unattended_at = None;
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
@@ -415,6 +638,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Paused;
+            state.paused_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
             event: "paused".into(),
@@ -427,6 +651,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Playing;
+            state.paused_at = None;
         }
         self.emit(PlaybackEvent {
             event: "resumed".into(),
@@ -438,7 +663,13 @@ impl PlaybackManager {
     pub async fn stop(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         let data = if let Some(state) = zones.get_mut(&zone_id) {
+            // Un arrêt met fin à toute recherche en cours : sans cela, une
+            // lecture interrompue pendant `resolve_stream` laissait la zone
+            // annoncée « recherche en cours » alors qu'elle est à l'arrêt.
+            state.resolving = false;
             state.state = PlayState::Stopped;
+            state.output_signal_path = None;
+            state.paused_at = None;
             state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
@@ -458,7 +689,9 @@ impl PlaybackManager {
     pub async fn stop_and_clear(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
+            state.resolving = false;
             state.state = PlayState::Stopped;
+            state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
             state.metadata_changed_at_ms = None;
@@ -480,6 +713,26 @@ impl PlaybackManager {
         if let Some(state) = zones.get_mut(&zone_id) {
             state.last_restart_at = Some(Instant::now());
         }
+    }
+    /// Consigner — ou lever — le constat « aucun onglet ne reçoit le son de
+    /// cette zone ».
+    ///
+    /// `true` horodate le constat À CET INSTANT ; tant qu'il reste vrai, la
+    /// marque est rafraîchie, si bien qu'elle date toujours du DERNIER instant
+    /// où le silence a été observé, et non du premier. `false` la lève : la
+    /// zone est de nouveau reçue, il n'y a plus rien à expliquer.
+    ///
+    /// Deux appelants, une seule chose dite : la vue des zones, qui ne peut
+    /// annoncer `browser_unattended` à un client sans que le serveur en garde
+    /// trace, et le poller, qui abandonne la lecture au même seuil et
+    /// l'arrêterait sinon sans laisser d'explication derrière lui (#2588).
+    pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.browser_unattended_at = unattended.then(Instant::now);
     }
 
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
@@ -585,6 +838,34 @@ impl PlaybackManager {
                 ..Default::default()
             })
             .session_profile_id = profile_id;
+    }
+
+    /// Enregistrer ce que l'auditeur a demande en lancant cette session.
+    ///
+    /// Meme `entry` que `set_session_profile`, et pour la meme raison : le
+    /// gestionnaire pose le contexte AVANT que le premier `play()` ne cree la
+    /// zone, sinon la premiere piste — la seule dont l'intention soit connue —
+    /// partirait sans contexte.
+    ///
+    /// Ecrase toujours, y compris avec `None` : un nouveau geste de lecture
+    /// remplace le precedent. Sans cela, jouer une piste isolee apres une
+    /// playlist laisserait la piste marquee « playlist ».
+    ///
+    /// Aucun evenement emis — c'est de l'attribution interne, pas de l'etat
+    /// d'interface.
+    pub async fn set_session_context(
+        &self,
+        zone_id: i64,
+        context_type: Option<String>,
+        context_id: Option<String>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        z.session_context_type = context_type;
+        z.session_context_id = context_id;
     }
 
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
@@ -709,6 +990,10 @@ mod tests {
         let mut state = ZoneState {
             zone_id: 1,
             state: PlayState::Playing,
+            resolving: false,
+            dop_active: false,
+            output_signal_path: None,
+            output_dsp_metrics: None,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),
@@ -728,12 +1013,16 @@ mod tests {
             shuffle_index: -1,
             track_generation: 7,
             play_seq: 0,
+            paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -810,6 +1099,36 @@ mod tests {
         assert!(data["metadata_age_ms"].as_i64().unwrap() >= 0);
     }
 
+    /// #2588 — le constat de silence tient à travers l'arrêt, et pas au-delà
+    /// de la lecture suivante.
+    #[tokio::test]
+    async fn le_constat_de_silence_survit_a_larret_et_meurt_a_la_relecture() {
+        let pm = PlaybackManager::new();
+        let np = || NowPlaying {
+            title: "Track".into(),
+            ..Default::default()
+        };
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une lecture qui démarre n'a encore rien à expliquer"
+        );
+        pm.note_browser_unattended(4, true).await;
+        pm.stop(4).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_some(),
+            "l'arrêt ne doit pas emporter l'explication du silence"
+        );
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une nouvelle lecture rouvre la question"
+        );
+        // Et la vue peut lever le constat sans attendre l'échéance.
+        pm.note_browser_unattended(4, true).await;
+        pm.note_browser_unattended(4, false).await;
+        assert!(pm.get_state(4).await.browser_unattended_at.is_none());
+    }
     #[tokio::test]
     async fn set_shuffle_emits_event() {
         let pm = PlaybackManager::new();
@@ -906,5 +1225,49 @@ mod tests {
         assert_eq!(np.bit_depth, None);
         assert_eq!(np.sample_rate, None);
         assert_eq!(np.format, None);
+    }
+
+    /// Le drapeau de recherche doit retomber quand la lecture démarre.
+    ///
+    /// Il ne retombait QUE sur deux chemins d'erreur de `play_inner`. Sur le
+    /// chemin qui réussit, rien ne l'abaissait : `play()` n'y touchait pas, et
+    /// son `entry().or_insert_with()` ne réinitialise une zone existante pour
+    /// personne. Une zone restait donc annoncée « recherche en cours » pendant
+    /// toute sa lecture — au point que l'indication ne voulait plus rien dire,
+    /// ce qui est pire que son absence.
+    ///
+    /// Le commentaire de `play_inner` affirmait pourtant : « Le drapeau retombe
+    /// dans `play()`, dès qu'une URL jouable existe ». L'intention était écrite
+    /// et l'instruction manquait ; seul un test pouvait faire la différence.
+    #[tokio::test]
+    async fn la_recherche_se_termine_quand_la_lecture_demarre() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        assert!(
+            pm.get_state(1).await.resolving,
+            "le drapeau doit être levé avant la résolution"
+        );
+
+        pm.play(1, super::NowPlaying::default()).await;
+
+        assert!(
+            !pm.get_state(1).await.resolving,
+            "une lecture qui démarre signifie qu'une URL jouable existe : la \
+             recherche est finie"
+        );
+    }
+
+    /// Même exigence à l'arrêt : une lecture interrompue pendant la résolution
+    /// laissait la zone à l'arrêt ET annoncée « recherche en cours ».
+    #[tokio::test]
+    async fn un_arret_met_fin_a_la_recherche() {
+        let pm = super::PlaybackManager::new();
+        pm.set_resolving(1, true).await;
+        pm.stop(1).await;
+        assert!(!pm.get_state(1).await.resolving);
+
+        pm.set_resolving(2, true).await;
+        pm.stop_and_clear(2).await;
+        assert!(!pm.get_state(2).await.resolving);
     }
 }

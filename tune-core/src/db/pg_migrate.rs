@@ -151,6 +151,9 @@ const MIGRATION_TABLES: &[&str] = &[
     "tags",
     "item_tags",
     "favorites",
+    // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
+    // seraient perdus à la bascule SQLite → PostgreSQL.
+    "favorite_facets",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -180,7 +183,11 @@ const MIGRATION_TABLES: &[&str] = &[
 ///
 /// Every CREATE TABLE uses IF NOT EXISTS and every INSERT for seed data
 /// uses ON CONFLICT DO NOTHING, making this fully idempotent.
-const PG_FULL_SCHEMA: &str = r#"
+///
+/// `pub(crate)` pour le seul test `pg_schema_parity`, qui monte ce schema et
+/// celui des scripts numerotes dans deux bases distinctes et refuse tout ecart
+/// (#2111).
+pub(crate) const PG_FULL_SCHEMA: &str = r#"
 -- Core tables
 CREATE TABLE IF NOT EXISTS artists (
     id TEXT PRIMARY KEY,
@@ -229,7 +236,11 @@ CREATE TABLE IF NOT EXISTS albums (
     original_date TEXT,
     -- The folder on disk holding this release. What identifies an album: see
     -- `scanner::album_folder`.
-    folder_path TEXT
+    folder_path TEXT,
+    -- Drapeau « compilation » (#1957). TEXT ici comme tout le reste de ce
+    -- schéma de copie (voir l'en-tête) ; la migration PG 028 le ramène à
+    -- SMALLINT après la copie.
+    is_compilation TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -266,7 +277,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     acoustid_confidence TEXT,
     trailing_silence_ms TEXT,
     synced_lyrics TEXT,
-    cover_path TEXT
+    cover_path TEXT,
+    -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
+    cue_media_path TEXT,
+    cue_start_ms BIGINT,
+    cue_end_ms BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -347,6 +362,7 @@ CREATE TABLE IF NOT EXISTS zones (
     dlna_native_flac TEXT DEFAULT 0,
     host TEXT,
     alac_passthrough TEXT DEFAULT 0,
+    aac_passthrough TEXT DEFAULT 0,
     dlna_lpcm TEXT DEFAULT 0,
     dlna_cap_16bit TEXT DEFAULT 0,
     lyrics_offset_ms TEXT DEFAULT 0
@@ -417,7 +433,9 @@ CREATE TABLE IF NOT EXISTS listen_history (
     cover_url TEXT,
     source_id TEXT,
     album_id TEXT,
-    profile_id TEXT
+    profile_id TEXT,
+    context_type TEXT,
+    context_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -463,6 +481,17 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     email TEXT,
     password_hash_v2 TEXT
+);
+
+-- Favoris de VALEUR de facette (label…), #2442. Pas de colonne `id` : la clé
+-- naturelle est la clé primaire. `profile_id` en TEXT comme partout ici (la
+-- copie lie tout en texte) ; la migration 036 la ramène en BIGINT après coup.
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, facet, value)
 );
 
 CREATE TABLE IF NOT EXISTS favorites (
@@ -597,6 +626,11 @@ CREATE TABLE IF NOT EXISTS network_mounts (
     username TEXT,
     password TEXT,
     active TEXT DEFAULT 1,
+    -- `active` = l'intention, les trois suivantes = le constat du dernier
+    -- montage. Voir migrations/postgres/027 et tune-server/src/smb.rs.
+    smb_version TEXT,
+    mount_state TEXT,
+    last_mount_error TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
@@ -673,7 +707,31 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
     fetched_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
+-- Registre des executions automatisees (#2080 ; migration PG 039). Present ici
+-- pour la meme raison que `lyrics_cache` juste au-dessus : une base creee par
+-- cette bascule sqlite->pg enregistre schema_version 99 et ne rejoue donc
+-- jamais les scripts PG numerotes. Sans ce bloc, une telle base n'aurait pas
+-- de `task_runs` du tout, et la route d'observabilite rendrait une erreur SQL.
+--
+-- Cette table n'est PAS dans `MIGRATION_TABLES` : ses `boot_id` designent des
+-- incarnations d'un processus qui tournait sur l'AUTRE moteur. L'historique
+-- d'observabilite recommence avec le nouveau moteur, deliberement.
+CREATE TABLE IF NOT EXISTS task_runs (
+    boot_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms BIGINT,
+    outcome TEXT NOT NULL,
+    items BIGINT,
+    detail TEXT,
+    PRIMARY KEY (boot_id, task, seq)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
@@ -740,6 +798,10 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 
+-- albums: drapeau « compilation » (SQLite migration v79, #1957). TEXT 0/1 comme
+-- les autres booléens copiés ; la migration PG 028 le ramène à SMALLINT après.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
+
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
 
@@ -754,6 +816,7 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_native_flac TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS alac_passthrough TEXT DEFAULT 0;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS aac_passthrough TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 
@@ -761,6 +824,9 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
+-- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
@@ -771,6 +837,17 @@ ALTER TABLE podcast_subscriptions ADD COLUMN IF NOT EXISTS source_id TEXT;
 -- queue_items: per-album numbering for streaming tracks (SQLite migration v64)
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number TEXT;
+
+-- tracks: colonnes du chantier CUE (SQLite migration v76, #1763). Elles sont
+-- ici pour la meme raison que les autres : la copie qui suit lit la table
+-- SQLite colonne par colonne, et la source les possede. Sans ce rattrapage,
+-- une base PG creee par une version anterieure de ce schema ferait echouer
+-- l'INSERT de `tracks` en entier — la bibliotheque arriverait vide. La
+-- migration 031 repare le meme manque pour les bases montees par les scripts
+-- numerotes, qui ne passent jamais par ici (#2111).
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

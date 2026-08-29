@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge", "plugins/tune-dj", "plugins/tune-karaoke"]
+members = ["tune-core", "tune-server", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
@@ -8,7 +8,7 @@ exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.69"
+version = "0.9.125"
 edition = "2024"
 # Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
 # old value misdeclared far broader rights to audit/SBOM tools (issue #1147).
@@ -26,6 +26,11 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 lofty = "0.24"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "query", "form", "multipart"] }
 walkdir = "2"
+# Décodage des pochettes pour l'empreinte perceptuelle (#1470). Uniquement
+# JPEG et PNG : ce sont les seuls formats que `COVER_FILE_NAMES` accepte, et
+# les codecs par défaut de la crate (AVIF, TIFF, EXR…) tireraient une dizaine
+# de dépendances transitives qui ne serviraient jamais.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rayon = "1.10"
 notify = "7"
 md-5 = "0.10"
@@ -82,6 +87,20 @@ debug = 0
 [profile.release]
 opt-level = 2
 lto = "thin"
-strip = true
+# `strip = true` est un alias de `strip = "symbols"` : il detruit la table des
+# symboles, donc les NOMS dont le backtrace a besoin. Les rapports de crash
+# Windows designaient alors des fonctions voisines encore exportees — des
+# `onig_*` de la bibliotheque de regex — au lieu du code fautif (#2306).
+# `"debuginfo"` retire les informations de debogage, mais garde les symboles.
+strip = "debuginfo"
 codegen-units = 4
-panic = "abort"
+# `panic = "abort"` neutralisait TOUS les `catch_unwind` du binaire : ceux du
+# decodeur (`audio/decode.rs`), celui de l'installateur de mise a jour, et le
+# hook qui ecrit `tune-crash.log`. Un seul fichier AAC malforme tuait donc le
+# serveur entier, au lieu d'echouer sur ce fichier (#2305).
+#
+# Ce reglage venait de 40002253 (« release profile — 8.3 MB binary », 19 mai),
+# une optimisation de TAILLE du debut de la migration : `tune-ffi` n'existait
+# pas encore (22 juin) et l'encodeur ALAC non plus (13 aout). Ce n'etait donc
+# pas un choix d'architecture lie a l'ABI (arbitrage JP Robbe).
+panic = "unwind"

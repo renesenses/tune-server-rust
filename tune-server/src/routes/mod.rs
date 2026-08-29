@@ -4,7 +4,7 @@ pub mod airplay_pairing;
 pub mod appliance;
 pub mod appliance_storage;
 pub mod archive;
-pub mod bandcamp;
+pub mod artist_releases;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
@@ -13,7 +13,7 @@ pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
-pub mod deezer_proxy_handler;
+pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
 pub mod digest;
@@ -72,14 +72,22 @@ pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
-pub mod stream_handler;
-pub mod streaming;
+// Le transport HTTP des flux ne depend d'aucun etat propre au serveur. Il vit
+// dans une branche soeur du graphe de compilation, tout en gardant le chemin
+// historique `routes::stream_handler` pour les appelants internes et externes.
+pub use tune_stream_http as stream_handler;
+// L'API des services de streaming dépend d'un sous-ensemble explicite de
+// l'état serveur. Elle compile dans une crate sœur, tout en conservant le
+// chemin historique `routes::streaming` pour les appelants.
+pub use tune_streaming_http as streaming;
 pub mod support;
 pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_media_renderer;
 pub mod upnp_media_server;
+pub mod versions;
 pub mod visualizer;
 pub mod voice;
 pub mod widget;
@@ -195,6 +203,22 @@ async fn cache_control_middleware(
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    // Un gestionnaire qui a DÉJÀ décidé de sa politique de cache garde la main.
+    //
+    // Sans ce garde, la branche `!path.contains('.')` plus bas écrasait tout :
+    // elle vise les routes de l'application web, mais les chemins d'API n'ont
+    // pas de point non plus, donc `/api/v1/streaming/qobuz/featured` recevait
+    // `no-cache, must-revalidate` — par EFFET DE BORD, jamais par décision.
+    // Le commentaire d'origine ne parle que de « HTML pages and SPA routes ».
+    //
+    // Poser la politique dans le gestionnaire plutôt qu'une liste de chemins
+    // ici n'est pas un détail de style : `/playlist-tags` et
+    // `/featured-playlists` sont éditoriaux, `/playlists` ne l'est pas. Une
+    // règle par préfixe finirait par mettre en cache les playlists d'un
+    // utilisateur (#1969).
+    if headers.contains_key(axum::http::header::CACHE_CONTROL) {
+        return response;
+    }
     if path.starts_with("/assets/") {
         // Hashed assets (index-Bmb2F8zZ.js) — immutable, cache forever
         headers.insert(
@@ -326,7 +350,6 @@ pub fn router_with_plugins(
         .nest("/listenbrainz", listenbrainz::router())
         .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
-        .nest("/bandcamp", bandcamp::router())
         .nest("/archive", archive::router())
         .nest("/discogs", discogs::router())
         .nest("/setlistfm", setlistfm::router())
@@ -454,7 +477,7 @@ pub fn router_with_plugins(
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
-        .with_state(state)
+        .with_state(state.clone())
         .route("/add-station", get(|axum::extract::Query(q): axum::extract::Query<radios::AddFromWebQuery>| async move {
             // q.name is attacker-controlled and reflected into HTML on the
             // server's own origin — escape it or it is a reflected XSS.
@@ -469,6 +492,14 @@ pub fn router_with_plugins(
     if let Some(upnp) = upnp_routes {
         app = app.nest("/upnp", upnp);
     }
+
+    // MediaRenderer:1 par zone (#1750) — routes toujours montées, mais
+    // chaque handler vérifie l'opt-in `zone_{id}_upnp_renderer` (404 sinon)
+    // et seules les zones opt-in sont annoncées en SSDP.
+    app = app.nest(
+        "/upnp/renderer",
+        upnp_media_renderer::router().with_state(state.clone()),
+    );
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {
@@ -524,5 +555,239 @@ mod escape_tests {
         );
         assert_eq!(html_escape("O'Brien"), "O&#x27;Brien");
         assert_eq!(html_escape("plain radio"), "plain radio");
+    }
+}
+
+/// Garde-fou : écrire `zone_{id}_eq_profile` sans rafraîchir la sortie qui joue.
+///
+/// L'égaliseur n'atteint le son d'une zone locale que si quelqu'un rebâtit
+/// l'`EqProcessor` et l'installe — `Orchestrator::refresh_zone_eq`. Persister
+/// la clé ne suffit pas : le réglage n'agit alors qu'à la piste SUIVANTE, et la
+/// route répond quand même 200 (ou `applied: true`). C'est ce silence qui a
+/// produit #1372, #1555 et #1688, et le correctif de #1725 n'avait branché
+/// qu'un des quatre points d'écriture.
+///
+/// Ce test relit les sources plutôt que d'exercer les routes : la propriété à
+/// garder est structurelle — « tout fichier qui écrit cette clé rafraîchit » —
+/// et aucun harnais HTTP ne la vérifierait aussi simplement.
+///
+/// Granularité volontairement au FICHIER, pas à la ligne : plus grossier, mais
+/// robuste aux déplacements de code. Un fichier qui ne ferait que LIRE la clé
+/// déclencherait un faux positif ; il irait dans `LECTURE_SEULE` avec sa raison.
+#[cfg(test)]
+mod eq_refresh_guard {
+    use std::fs;
+    use std::path::Path;
+
+    /// Couples (clé, fichier) dispensés du garde-fou, avec leur raison.
+    ///
+    /// Indexé par clé et pas seulement par fichier : dispenser `zones.rs` en
+    /// bloc le retirerait aussi des deux autres clés, dont il n'a aucune raison
+    /// d'être exempté. Une dispense doit être aussi étroite que son motif.
+    const LECTURE_SEULE: &[(&str, &str, &str)] = &[(
+        "_audiophile",
+        "zones.rs",
+        "n'écrit la clé que dans ses propres tests (chemin du signal en PURE) ; \
+         le code de production la LIT via `audiophile::zone_enabled`",
+    )];
+
+    /// Les réglages DSP par zone qui n'atteignent le son que si quelqu'un
+    /// rafraîchit la sortie vivante, et la méthode qui le fait.
+    ///
+    /// `zone_*_eq_profile` a coûté quatre omissions (#1725), `zone_*_crossfeed`
+    /// une de plus (#1786). Toute nouvelle clé de ce type doit rejoindre cette
+    /// table AVANT sa première route d'écriture, pas après le signalement.
+    ///
+    /// L'égaliseur exige `apply_eq_change` et non `refresh_zone_eq` depuis
+    /// #1710 : le premier couvre AUSSI les chemins non locaux, en programmant
+    /// un redémarrage de flux. Une route qui n'appellerait que le second
+    /// laisserait les zones DLNA et navigateur muettes jusqu'à la piste
+    /// suivante — le défaut d'origine, à moitié réparé.
+    ///
+    /// `zone_*_audiophile` (mode PURE) est la troisième, et la plus coûteuse :
+    /// les deux premières ne promettaient qu'un réglage tardif, celle-ci promet
+    /// que RIEN ne touche le signal — pendant que l'`EqProcessor` déjà installé
+    /// continuait de filtrer (#1986). Elle exige `apply_audiophile_change`,
+    /// pour la même raison que l'EQ exige `apply_eq_change` : le cas non local
+    /// (DLNA, navigateur) n'est réglé que par un redémarrage de flux.
+    const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
+        ("_eq_profile", "apply_eq_change"),
+        ("_crossfeed", "refresh_zone_crossfeed"),
+        ("_audiophile", "apply_audiophile_change"),
+    ];
+
+    #[test]
+    fn every_route_writing_a_dsp_setting_refreshes_the_live_output() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        let mut sources: Vec<(String, String)> = Vec::new();
+
+        let mut piles = vec![racine.clone()];
+        while let Some(dir) = piles.pop() {
+            for entree in fs::read_dir(&dir).expect("lecture de src/routes") {
+                let chemin = entree.expect("entrée de répertoire").path();
+                if chemin.is_dir() {
+                    piles.push(chemin);
+                    continue;
+                }
+                if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let nom = chemin
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                sources.push((
+                    nom,
+                    fs::read_to_string(&chemin).expect("lecture du fichier"),
+                ));
+            }
+        }
+
+        for (cle, rafraichisseur) in REGLAGES_A_RAFRAICHIR {
+            let concernes: Vec<&(String, String)> =
+                sources.iter().filter(|(_, s)| s.contains(cle)).collect();
+            assert!(
+                !concernes.is_empty(),
+                "le garde-fou ne trouve aucun fichier touchant `zone_*{cle}` — \
+                 la clé a probablement été renommée, et ce test ne garde plus rien"
+            );
+            let fautifs: Vec<&str> = concernes
+                .iter()
+                .filter(|(nom, _)| {
+                    !LECTURE_SEULE
+                        .iter()
+                        .any(|(k, f, _)| k == cle && f == &nom.as_str())
+                })
+                .filter(|(_, s)| !s.contains(rafraichisseur))
+                .map(|(nom, _)| nom.as_str())
+                .collect();
+            assert!(
+                fautifs.is_empty(),
+                "ces routes écrivent `zone_*{cle}` sans appeler \
+                 `Orchestrator::{rafraichisseur}` : {fautifs:?}\n\
+                 Sans lui, le réglage n'atteint le son qu'à la piste SUIVANTE sur une \
+                 zone locale, alors que la réponse annonce un succès (#1725, #1786).\n\
+                 Ajouter, après le `settings.set(...)` :\n    \
+                 let applique = state.orchestrator.{rafraichisseur}(zone_id).await;\n\
+                 puis exposer `applied_live` dans la réponse. Si le fichier ne fait que \
+                 LIRE la clé, l'inscrire dans `LECTURE_SEULE` avec sa raison."
+            );
+        }
+    }
+}
+
+/// Garde-fou : une feature de plugin absente des builds de release.
+///
+/// Les binaires publiés sont construits avec `--no-default-features` et une
+/// liste EXPLICITE de features (`.github/workflows/ci.yml`). Mettre une feature
+/// dans `[features] default` n'a donc **aucun effet** sur ce qui est livré —
+/// `default` n'est jamais consulté.
+///
+/// C'est exactement l'erreur commise sur Bandcamp (#1768) : la feature a été
+/// ajoutée à `default`, tout est passé au vert, et le plugin était absent des
+/// binaires 0.9.82. Le job `Test (jeu de fonctionnalités livré)` disait la
+/// vérité — il teste la liste explicite, qui ne le contenait pas.
+///
+/// Ce test relit `ci.yml` **et `release.yml`** et exige que toute feature
+/// déclarant un plugin in-tree (`dep:tune-*`) figure dans chaque liste de
+/// features qui produit un binaire.
+///
+/// ⚠️ La première version de ce garde-fou ne lisait que `ci.yml` — le fichier
+/// des PR. Or les binaires téléchargés sont construits par `release.yml`. Le
+/// correctif de Bandcamp y a donc été déclaré vert alors que le plugin restait
+/// absent des cinq listes de `release.yml` : la même erreur, un cran plus haut.
+/// Dans `release.yml` les listes vivent à DEUX endroits — les lignes de build
+/// explicites, et les entrées `features:` de la matrice, injectées plus loin
+/// via `--features ${{ matrix.features }}`. Les deux sont vérifiées.
+#[cfg(test)]
+mod plugin_feature_ships_guard {
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn every_in_tree_plugin_feature_is_in_the_release_builds() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo = fs::read_to_string(racine.join("Cargo.toml")).expect("Cargo.toml");
+        let ci = fs::read_to_string(racine.join("../.github/workflows/ci.yml")).expect("ci.yml");
+        let rel = fs::read_to_string(racine.join("../.github/workflows/release.yml"))
+            .expect("release.yml");
+
+        // Une feature « plugin » se reconnaît à sa dépendance optionnelle
+        // `dep:tune-<nom>` — c'est la forme qu'ont dj, karaoke et bandcamp.
+        let plugins: Vec<String> = cargo
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let (nom, reste) = l.split_once(" = [")?;
+                if !reste.contains("dep:tune-") {
+                    return None;
+                }
+                Some(nom.trim().to_string())
+            })
+            .collect();
+
+        assert!(
+            plugins.len() >= 3,
+            "le garde-fou n'a reconnu que {} feature(s) de plugin — la forme              `nom = [\"dep:tune-…\"]` a changé, et ce test ne garde plus rien",
+            plugins.len()
+        );
+
+        // Toutes les listes de features qui produisent un binaire, dans les
+        // DEUX fichiers. Une liste interpolée (`${{ matrix.features }}`) est
+        // ignorée : sa vraie valeur est l'entrée `features:` de la matrice,
+        // captée juste en dessous.
+        let mut listes: Vec<(&str, String)> = Vec::new();
+        for (fichier, contenu) in [("ci.yml", &ci), ("release.yml", &rel)] {
+            for l in contenu.lines() {
+                let t = l.trim();
+                if t.contains("build --release") && t.contains("--features") {
+                    let liste = t
+                        .split("--features")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                } else if let Some(liste) = t.strip_prefix("features:") {
+                    let liste = liste.trim();
+                    if !liste.is_empty() && !liste.contains("${{") {
+                        listes.push((fichier, liste.to_string()));
+                    }
+                }
+            }
+        }
+        assert!(
+            listes.iter().any(|(f, _)| *f == "ci.yml"),
+            "aucune liste de features trouvée dans ci.yml — le garde-fou ne garde plus rien"
+        );
+        assert!(
+            listes.iter().any(|(f, _)| *f == "release.yml"),
+            "aucune liste de features trouvée dans release.yml — or c'est CE \
+             fichier qui construit les binaires téléchargés"
+        );
+
+        let mut manquants = Vec::new();
+        for p in &plugins {
+            for (fichier, liste) in &listes {
+                let present = liste.split(',').any(|f| f.trim() == p);
+                if !present {
+                    manquants.push(format!("{p} absent d'une liste de {fichier} : {liste}"));
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            manquants.is_empty(),
+            "ces plugins ne seront PAS dans les binaires publiés : {manquants:?}\n\
+             Les builds de release utilisent `--no-default-features` : ajouter la \
+             feature à `[features] default` ne change RIEN à ce qui est livré.\n\
+             Il faut l'ajouter aux listes `--features …` de \
+             `.github/workflows/ci.yml` (#1768)."
+        );
     }
 }

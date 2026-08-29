@@ -43,6 +43,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tickets/{id}", get(detail))
         .route("/tickets/{id}/reply", post(reply))
+        // Dernier appel du support que le client web adressait encore en direct
+        // à mozaiklabs.fr, clé de licence dans le corps (#2559).
+        .route("/tickets/{id}/read", post(mark_read))
 }
 
 #[derive(Deserialize)]
@@ -312,6 +315,16 @@ async fn reply(
     finish(support::reply(&state.http_client, &auth, id, &payload.body).await)
 }
 
+/// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
+/// jamais d'une clé de licence fournie par la page.
+async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let auth = match auth(&state) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    finish(support::mark_read(&state.http_client, &auth, id).await)
+}
+
 /// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
 /// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
 /// 412 seulement si NI l'un NI l'autre n'est disponible.
@@ -351,13 +364,26 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
 
 /// Traduit le `SupportResult` en réponse HTTP, en préservant le status renvoyé
 /// par mozaiklabs (401/403/422…).
+///
+/// Sur un 429, `tune_core::cloud::support` a déjà déposé `retry_after` dans le
+/// corps ; on le réémet aussi en en-tête `Retry-After`, forme standard que
+/// lisent les clients non web (#2178).
 fn finish(result: support::SupportResult) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err((status, value)) => (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(value),
-        )
-            .into_response(),
+        Err((status, value)) => {
+            let retry_after = value.get("retry_after").and_then(serde_json::Value::as_u64);
+            let mut resp = (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(value),
+            )
+                .into_response();
+            if let Some(secs) = retry_after {
+                if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+            resp
+        }
     }
 }

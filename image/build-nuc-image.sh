@@ -274,10 +274,31 @@ EOF
 ok "System configured"
 
 # --- Install Tune Server ---
-log "Downloading Tune Server v${TUNE_VERSION}..."
-curl -sL "$TUNE_TARBALL_URL" -o "${WORK_DIR}/tune.tar.gz"
+# TUNE_TARBALL_PATH : archive déjà récupérée par l'appelant (la CI la télécharge
+# avec le jeton, seule façon de lire les assets d'une release en BROUILLON —
+# c'est l'état dans lequel naît toute release depuis #1588). Sans lui, on
+# retombe sur l'URL publique, qui ne marche que sur une release publiée.
+if [[ -n "${TUNE_TARBALL_PATH:-}" && -f "${TUNE_TARBALL_PATH}" ]]; then
+    log "Using pre-fetched Tune Server tarball: ${TUNE_TARBALL_PATH}"
+    cp "${TUNE_TARBALL_PATH}" "${WORK_DIR}/tune.tar.gz"
+else
+    log "Downloading Tune Server v${TUNE_VERSION}..."
+    # -f : un 404 doit échouer ici, et non se transformer en page HTML écrite
+    # dans tune.tar.gz — non vide, donc indétectable par un simple test -s.
+    curl -fsSL "$TUNE_TARBALL_URL" -o "${WORK_DIR}/tune.tar.gz" || {
+        err "Download failed: ${TUNE_TARBALL_URL}"
+        exit 1
+    }
+fi
+
 if [[ ! -s "${WORK_DIR}/tune.tar.gz" ]]; then
-    err "Download failed: ${TUNE_TARBALL_URL}"
+    err "Empty tarball: ${TUNE_TARBALL_URL}"
+    exit 1
+fi
+# Le test qui manquait : une page d'erreur passe le test de taille, pas celui-ci.
+if ! gzip -t "${WORK_DIR}/tune.tar.gz" 2>/dev/null; then
+    err "Not a gzip archive (page d'erreur ?): ${TUNE_TARBALL_URL}"
+    head -c 200 "${WORK_DIR}/tune.tar.gz" >&2 || true
     exit 1
 fi
 

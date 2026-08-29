@@ -4,6 +4,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 use crate::streaming::ServiceRegistry;
@@ -83,6 +84,15 @@ impl TelemetryReporter {
         }
 
         let settings = SettingsRepo::with_backend(db.clone());
+        if let Some(backoff) = rate_limit::active(&settings, CloudScope::Telemetry) {
+            warn!(
+                scope = backoff.scope,
+                until_epoch = backoff.until_epoch,
+                retry_after_seconds = backoff.retry_after_seconds,
+                "telemetry_deferred_rate_limit"
+            );
+            return;
+        }
         let server_id = Self::get_or_create_server_id(&settings);
 
         // Collect connected service names (authenticated == true)
@@ -91,7 +101,7 @@ impl TelemetryReporter {
             let mut names = Vec::new();
             for name in registry.list() {
                 if let Some(svc) = registry.get(&name) {
-                    let svc = svc.lock().await;
+                    let svc = svc.read().await;
                     let status = svc.auth_status().await;
                     if status.authenticated {
                         names.push(name);
@@ -145,6 +155,13 @@ impl TelemetryReporter {
             }
             Ok(resp) => {
                 let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    rate_limit::defer_from_headers(
+                        &settings,
+                        CloudScope::Telemetry,
+                        resp.headers(),
+                    );
+                }
                 warn!(status = %status, "telemetry_heartbeat_rejected");
             }
             Err(e) => {

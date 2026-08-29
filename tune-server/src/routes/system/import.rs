@@ -249,7 +249,8 @@ pub(super) async fn import_plex(
         .ok();
 
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        // Client partagé : voir `tune_core::http::client`.
+        let client = tune_core::http::client::shared();
         let settings = SettingsRepo::with_backend(backend.clone());
         let track_repo = TrackRepo::with_backend(backend.clone());
         let artist_repo = ArtistRepo::with_backend(backend.clone());

@@ -137,9 +137,12 @@ fn resolve_dest_root(
     // configured music directory (or inside one), otherwise the album lands
     // somewhere the scanner will never look.
     let dirs = music_dirs(state);
+    // Même défaut de séparateur que dans `scan.rs` : `{d}/` code `/` en dur,
+    // donc sous Windows AUCUNE destination n'était jamais jugée « dedans » et
+    // tout import était refusé. Constaté sur .42 (`D:\data\music`).
     let inside = dirs.iter().any(|d| {
         let d = tune_core::scanner::walker::normalize_path(d);
-        root == d || root.starts_with(&format!("{d}/"))
+        crate::routes::system::scan::sous_le_dossier(&root, &d)
     });
     if !dirs.is_empty() && !inside {
         return Err(AppError::bad_request(format!(
@@ -668,13 +671,8 @@ async fn run_job(
     // when nothing landed, to avoid kicking off a scan for a no-op job.
     let scanned = if report.files_placed() > 0 {
         if let Some(ref dir) = report.album_dir {
-            crate::routes::system::scan::spawn_library_scan(
-                state.clone(),
-                false,
-                Some(dir.clone()),
-            )
-            .await;
-            true
+            crate::routes::system::scan::spawn_library_scan(state.clone(), false, Some(dir.clone()))
+                .await
         } else {
             false
         }

@@ -114,8 +114,21 @@ jobs:
       # release fails loudly rather than silently shipping a placeholder.
       - name: Build airplay-daemon (amd64)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libasound2-dev pkg-config
+          # Le `sudo apt-get update` NON BORNE qui precedait la boucle annulait
+          # tout le garde-fou : si le miroir pend, on pend la, avant d'avoir
+          # arme le moindre `timeout`. La boucle fait deja l'update, bornee.
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y --no-install-recommends cmake clang libasound2-dev pkg-config; then
+              break
+            fi
+            if [ "$essai" = "3" ]; then
+              echo "::error::apt injoignable apres 3 essais"
+              exit 1
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
           cargo install --git https://github.com/renesenses/airplay2-rs \
             --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
             airplay-daemon --root /tmp/ap --locked

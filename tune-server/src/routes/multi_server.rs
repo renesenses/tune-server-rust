@@ -421,11 +421,13 @@ async fn unified_zones(State(state): State<AppState>) -> impl IntoResponse {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let local_zones = zone_repo.list().unwrap_or_default();
 
-    let server_name = settings
-        .get("server_name")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "Local".to_string());
+    // Même résolution que l'étiquette de l'interface (#2110) : nommer sa
+    // machine une fois doit suffire partout. L'ancien défaut « Local » ne
+    // nommait aucune machine — dans une liste censée distinguer des serveurs,
+    // c'était précisément le mot qui n'apprend rien.
+    let server_name = crate::routes::system::resolve_server_name(
+        settings.get("server_name").ok().flatten().as_deref(),
+    );
 
     let mut all_zones: Vec<Value> = local_zones
         .iter()

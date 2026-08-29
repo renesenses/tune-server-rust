@@ -17,6 +17,27 @@ pub(super) struct StreamInfo {
 
 /// Detect stream format from the first bytes and parse header.
 /// Drains the header from `buf`, leaving only audio data.
+/// Nombre d'octets suffisant pour reconnaître un format ici : `detect_and_parse`
+/// n'inspecte jamais au-delà.
+pub(super) const ENTETE_DETECTION: usize = 92;
+
+/// Cet en-tête est-il celui d'un WAV, seul format que la lecture directe OAAT
+/// sait réellement jouer ?
+///
+/// Le FLAC n'a pas de chemin de lecture directe ici (il repart sur le flux HTTP
+/// que l'orchestrateur sert déjà), le DSD doit être converti en PCM, et les
+/// formats compressés ne sont pas parsés du tout. Tout sauf le WAV finit donc
+/// en HTTP — autant s'en apercevoir sur 12 octets plutôt qu'après avoir chargé
+/// le fichier entier.
+///
+/// Mesuré sur .42, DSD128 de 868 Mo : quinze secondes de silence entre
+/// `play_media` et la bascule, et un pic mémoire de presque un gigaoctet sur un
+/// mini PC. L'utilisateur monte le volume, n'entend rien, met en pause — et la
+/// conversion démarre après qu'il a abandonné.
+pub(super) fn entete_est_wav(entete: &[u8]) -> bool {
+    entete.len() >= 12 && &entete[..4] == b"RIFF" && &entete[8..12] == b"WAVE"
+}
+
 pub(super) fn detect_and_parse(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     if buf.len() >= 44 && &buf[..4] == b"RIFF" && &buf[8..12] == b"WAVE" {
         return parse_wav(buf);
@@ -219,9 +240,118 @@ pub(super) fn format_rate_display(rate: u32, bits: u16, format: AudioFormat) -> 
     }
 }
 
+/// Payload restant a l'EOF, avec le drapeau de fin porte par le dernier
+/// payload reel. Un flux vide produit tout de meme un unique paquet LAST vide.
+#[derive(Debug)]
+pub(super) struct PayloadFinFlux {
+    pub bytes: Vec<u8>,
+    pub dernier: bool,
+}
+
+/// Decoupe le tampon final sans perdre d'octet.
+///
+/// `taille_trame = Some(n)` impose l'alignement PCM : un residu incomplet est
+/// une erreur de contrat, pas un octet a jeter. `None` conserve chaque octet
+/// d'un format compresse comme FLAC.
+pub(super) fn extraire_payloads_fin_flux(
+    buf: &mut Vec<u8>,
+    taille_paquet: usize,
+    taille_trame: Option<usize>,
+) -> Result<Vec<PayloadFinFlux>, String> {
+    if taille_paquet == 0 {
+        return Err("taille de paquet finale nulle".into());
+    }
+    if let Some(taille_trame) = taille_trame {
+        if taille_trame == 0 {
+            return Err("taille de trame finale nulle".into());
+        }
+        if !taille_paquet.is_multiple_of(taille_trame) {
+            return Err(format!(
+                "taille de paquet {taille_paquet} non alignee sur une trame de {taille_trame} octets"
+            ));
+        }
+        if !buf.len().is_multiple_of(taille_trame) {
+            return Err(format!(
+                "residu PCM de {} octets non aligne sur une trame de {taille_trame} octets",
+                buf.len()
+            ));
+        }
+    }
+
+    if buf.is_empty() {
+        return Ok(vec![PayloadFinFlux {
+            bytes: Vec::new(),
+            dernier: true,
+        }]);
+    }
+
+    let bytes = std::mem::take(buf);
+    let nombre = bytes.len().div_ceil(taille_paquet);
+    Ok(bytes
+        .chunks(taille_paquet)
+        .enumerate()
+        .map(|(index, chunk)| PayloadFinFlux {
+            bytes: chunk.to_vec(),
+            dernier: index + 1 == nombre,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verifier_payloads_finaux(taille: usize, taille_paquet: usize, taille_trame: Option<usize>) {
+        let attendu: Vec<u8> = (0..taille).map(|i| i as u8).collect();
+        let mut buf = attendu.clone();
+        let payloads = extraire_payloads_fin_flux(&mut buf, taille_paquet, taille_trame).unwrap();
+
+        assert!(buf.is_empty());
+        assert_eq!(payloads.iter().filter(|p| p.dernier).count(), 1);
+        assert!(payloads.last().unwrap().dernier);
+        assert!(payloads.iter().all(|p| p.bytes.len() <= taille_paquet));
+        if let Some(taille_trame) = taille_trame {
+            assert!(
+                payloads
+                    .iter()
+                    .all(|p| p.bytes.len().is_multiple_of(taille_trame))
+            );
+        }
+        let obtenu: Vec<u8> = payloads.into_iter().flat_map(|p| p.bytes).collect();
+        assert_eq!(obtenu, attendu);
+    }
+
+    #[test]
+    fn fin_pcm_conserve_toutes_les_trames_mono_stereo_et_24_bits() {
+        for taille_trame in [2, 4, 6] {
+            let taille_paquet = taille_trame * 8;
+            for taille in [
+                0,
+                taille_trame,
+                taille_paquet - taille_trame,
+                taille_paquet,
+                taille_paquet + taille_trame,
+            ] {
+                verifier_payloads_finaux(taille, taille_paquet, Some(taille_trame));
+            }
+        }
+    }
+
+    #[test]
+    fn fin_flac_conserve_tous_les_octets_sans_alignement_pcm() {
+        let taille_paquet = 16;
+        for taille in [0, 1, taille_paquet - 1, taille_paquet, taille_paquet + 1] {
+            verifier_payloads_finaux(taille, taille_paquet, None);
+        }
+    }
+
+    #[test]
+    fn fin_pcm_refuse_un_octet_incomplet_sans_le_jeter() {
+        let mut buf = vec![1, 2, 3];
+        let erreur = extraire_payloads_fin_flux(&mut buf, 16, Some(4)).unwrap_err();
+        assert!(erreur.contains("non aligne"));
+        assert_eq!(buf, vec![1, 2, 3]);
+    }
 
     fn make_wav(sample_rate: u32, channels: u16, bits: u16, data_size: u32) -> Vec<u8> {
         let byte_rate = sample_rate * channels as u32 * bits as u32 / 8;
@@ -440,6 +570,79 @@ pub(crate) fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+/// Base de temps du cadencement OAAT.
+///
+/// PCM et FLAC avancent avec un nombre de samples. Seul un flux dont le débit
+/// en octets est réellement constant — le porteur DSD — peut être cadencé
+/// depuis les octets envoyés. Le type rend ce choix visible à chaque appel et
+/// empêche de remettre FLAC dans la branche octets par commodité (#2214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BaseDeTempsOaat {
+    Samples,
+    OctetsADebitConstant,
+}
+
+pub(super) fn duree_audio_envoyee(
+    base: BaseDeTempsOaat,
+    sample_offset: u64,
+    byte_offset: u64,
+    sample_rate: u32,
+    bytes_per_frame: usize,
+) -> std::time::Duration {
+    let (unites, unites_par_seconde) = match base {
+        BaseDeTempsOaat::Samples => (sample_offset as u128, sample_rate as u128),
+        BaseDeTempsOaat::OctetsADebitConstant => (
+            byte_offset as u128,
+            sample_rate as u128 * bytes_per_frame as u128,
+        ),
+    };
+    if unites_par_seconde == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let nanos = unites
+        .saturating_mul(1_000_000_000)
+        .checked_div(unites_par_seconde)
+        .unwrap_or(0)
+        .min(u64::MAX as u128) as u64;
+    std::time::Duration::from_nanos(nanos)
+}
+
+#[cfg(test)]
+mod tests_cadencement_oaat {
+    use super::{BaseDeTempsOaat, duree_audio_envoyee};
+
+    #[test]
+    fn la_duree_flac_depend_des_samples_pas_de_la_taille_compressee() {
+        let depuis_petit_corps =
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 44_100, 4_096, 44_100, 4);
+        let depuis_gros_corps =
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 44_100, 4_000_000, 44_100, 4);
+
+        assert_eq!(depuis_petit_corps, std::time::Duration::from_secs(1));
+        assert_eq!(depuis_gros_corps, depuis_petit_corps);
+    }
+
+    #[test]
+    fn le_porteur_dsd_conserve_son_horloge_a_debit_octets_constant() {
+        let duree = duree_audio_envoyee(
+            BaseDeTempsOaat::OctetsADebitConstant,
+            99,
+            1_152_000,
+            192_000,
+            6,
+        );
+        assert_eq!(duree, std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn une_cadence_inconnue_ne_divise_jamais_par_zero() {
+        assert_eq!(
+            duree_audio_envoyee(BaseDeTempsOaat::Samples, 1, 0, 0, 0),
+            std::time::Duration::ZERO
+        );
+    }
 }
 
 /// Process-wide OAAT clock sync responder port (one clock master identity
@@ -801,5 +1004,356 @@ mod staged_track_tests {
             24,
             2
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests_entete_wav {
+    use super::*;
+
+    fn entete(magic: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; 92];
+        v[..magic.len().min(12)].copy_from_slice(&magic[..magic.len().min(12)]);
+        v
+    }
+
+    #[test]
+    fn un_wav_est_reconnu() {
+        assert!(entete_est_wav(&entete(b"RIFF\0\0\0\0WAVE")));
+    }
+
+    /// Les trois formats qui finissaient chargés entièrement puis jetés.
+    #[test]
+    fn flac_dsd_et_compresses_basculent_immediatement() {
+        assert!(!entete_est_wav(&entete(b"fLaC")), "FLAC part en HTTP");
+        assert!(!entete_est_wav(&entete(b"DSD ")), "DSD doit être converti");
+        assert!(!entete_est_wav(&entete(b"ID3\x03")), "MP3 non parsé ici");
+        assert!(
+            !entete_est_wav(&entete(b"ftypM4A ")),
+            "AAC/ALAC non parsé ici"
+        );
+    }
+
+    /// Un RIFF qui n'est pas du WAVE — AVI, RMI — ne doit pas passer.
+    #[test]
+    fn un_riff_non_wave_ne_passe_pas() {
+        assert!(!entete_est_wav(&entete(b"RIFF\0\0\0\0AVI ")));
+    }
+
+    /// Un fichier plus court que l'en-tête ne doit ni paniquer ni passer.
+    /// `read` peut rendre moins que demandé, et un fichier tronqué existe.
+    #[test]
+    fn un_entete_trop_court_ne_panique_pas() {
+        for n in 0..12 {
+            let court = vec![b'R'; n];
+            assert!(!entete_est_wav(&court), "n={n}");
+        }
+        assert!(!entete_est_wav(b""));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compteur de trames FLAC — la position VRAIE d'un flux compressé (#2214)
+// ---------------------------------------------------------------------------
+
+/// Suit la position réelle, en samples, d'un flux FLAC servi par tranches
+/// arbitraires.
+///
+/// PTS, barre de position et cadence étaient calculés comme si les octets
+/// FLAC étaient du PCM : `byte_offset / (rate × bytes_per_frame)`. Or le débit
+/// FLAC est variable — la position dérivait selon le taux de compression du
+/// morceau, et `sample_offset` n'était jamais incrémenté sur ce chemin
+/// (JP Robbe, #2214).
+///
+/// L'en-tête de chaque trame FLAC porte sa position ABSOLUE — numéro de sample
+/// en blocage variable, numéro de trame en blocage fixe — et sa taille de
+/// bloc. On scanne donc les octets au fil de l'envoi : chaque en-tête validé
+/// (code de synchro, champs réservés, CRC-8) remet la position à sa valeur
+/// exacte. Pas d'accumulation, pas de dérive : une trame manquée est rattrapée
+/// à la suivante.
+///
+/// La fenêtre de recouvrement entre deux tranches est de 15 octets — la
+/// taille maximale d'un en-tête — pour qu'un en-tête à cheval sur deux
+/// paquets ne soit pas perdu.
+pub struct CompteurDeTramesFlac {
+    /// Queue de la tranche précédente, pour les en-têtes à cheval.
+    reste: Vec<u8>,
+    /// Position absolue du DÉBUT de la dernière trame vue, en samples.
+    position_samples: u64,
+    /// Taille de bloc de la dernière trame vue (blocage fixe : sert à
+    /// convertir un numéro de trame en samples).
+    dernier_blocsize: u64,
+    /// Au moins un en-tête valide a été vu.
+    synchronise: bool,
+}
+
+impl CompteurDeTramesFlac {
+    pub fn new() -> Self {
+        Self {
+            reste: Vec::new(),
+            position_samples: 0,
+            dernier_blocsize: 4096,
+            synchronise: false,
+        }
+    }
+
+    /// Le flux a-t-il livré au moins un en-tête de trame valide ?
+    pub fn est_synchronise(&self) -> bool {
+        self.synchronise
+    }
+
+    /// Position absolue, en samples, du début de la dernière trame envoyée.
+    pub fn position_samples(&self) -> u64 {
+        self.position_samples
+    }
+
+    /// Avaler une tranche du flux telle qu'elle part sur le réseau.
+    pub fn avaler(&mut self, tranche: &[u8]) {
+        // Fenêtre = queue précédente + tranche. 15 octets suffisent : un
+        // en-tête FLAC fait au plus 16 octets, et il faut qu'il COMMENCE dans
+        // la partie déjà vue pour avoir été manqué.
+        let mut fenetre = std::mem::take(&mut self.reste);
+        fenetre.extend_from_slice(tranche);
+
+        let mut i = 0usize;
+        while i + 5 <= fenetre.len() {
+            if fenetre[i] == 0xFF && (fenetre[i + 1] & 0xFE) == 0xF8 {
+                match lire_entete_de_trame(&fenetre[i..]) {
+                    LectureEntete::Valide { position, blocsize } => {
+                        self.position_samples = position;
+                        self.dernier_blocsize = blocsize;
+                        self.synchronise = true;
+                        // L'en-tête est validé : on peut sauter au-delà. Le
+                        // corps de la trame ne contient pas d'autre en-tête
+                        // qui nous concerne — et s'il contient une fausse
+                        // synchro, le CRC l'écartera.
+                        i += 5;
+                        continue;
+                    }
+                    LectureEntete::Tronque => break, // il en manque : garder la queue
+                    LectureEntete::Invalide => {}
+                }
+            }
+            i += 1;
+        }
+        // Garder la queue non examinée pour la prochaine tranche.
+        let garde = fenetre.len().saturating_sub(16).max(i.min(fenetre.len()));
+        let debut_queue = garde.min(fenetre.len());
+        self.reste = fenetre[debut_queue..].to_vec();
+        // Borner la queue : jamais plus de 16 octets.
+        if self.reste.len() > 16 {
+            let n = self.reste.len();
+            self.reste.drain(..n - 16);
+        }
+    }
+}
+
+enum LectureEntete {
+    Valide { position: u64, blocsize: u64 },
+    Tronque,
+    Invalide,
+}
+
+/// Lire un en-tête de trame FLAC posé au début de `b`, et rendre la position
+/// absolue qu'il déclare. Validation complète : champs réservés, codes
+/// interdits, et CRC-8 de l'en-tête — sans quoi les données compressées
+/// offrent des fausses synchros en pagaille.
+fn lire_entete_de_trame(b: &[u8]) -> LectureEntete {
+    if b.len() < 5 {
+        return LectureEntete::Tronque;
+    }
+    let variable = (b[1] & 0x01) == 1;
+    let code_bloc = (b[2] >> 4) & 0x0F;
+    let code_rate = b[2] & 0x0F;
+    // 0 = réservé pour la taille de bloc ; 15 = invalide pour la cadence.
+    if code_bloc == 0 || code_rate == 15 {
+        return LectureEntete::Invalide;
+    }
+    // Bit réservé de l'octet 3 : doit être 0.
+    if (b[3] & 0x01) != 0 {
+        return LectureEntete::Invalide;
+    }
+    let mut i = 4usize;
+
+    // Numéro codé en UTF-8 étendu (1 à 7 octets).
+    let premier = match b.get(i) {
+        Some(v) => *v,
+        None => return LectureEntete::Tronque,
+    };
+    let (mut numero, suite): (u64, usize) = match premier {
+        0x00..=0x7F => (premier as u64, 0),
+        0xC0..=0xDF => ((premier & 0x1F) as u64, 1),
+        0xE0..=0xEF => ((premier & 0x0F) as u64, 2),
+        0xF0..=0xF7 => ((premier & 0x07) as u64, 3),
+        0xF8..=0xFB => ((premier & 0x03) as u64, 4),
+        0xFC..=0xFD => ((premier & 0x01) as u64, 5),
+        0xFE => (0, 6),
+        _ => return LectureEntete::Invalide,
+    };
+    i += 1;
+    for _ in 0..suite {
+        let o = match b.get(i) {
+            Some(v) => *v,
+            None => return LectureEntete::Tronque,
+        };
+        if (o & 0xC0) != 0x80 {
+            return LectureEntete::Invalide;
+        }
+        numero = (numero << 6) | (o & 0x3F) as u64;
+        i += 1;
+    }
+
+    // Taille de bloc, selon le code.
+    let blocsize: u64 = match code_bloc {
+        1 => 192,
+        2..=5 => 576u64 << (code_bloc - 2),
+        6 => {
+            let v = match b.get(i) {
+                Some(v) => *v as u64,
+                None => return LectureEntete::Tronque,
+            };
+            i += 1;
+            v + 1
+        }
+        7 => {
+            if b.len() < i + 2 {
+                return LectureEntete::Tronque;
+            }
+            let v = ((b[i] as u64) << 8) | b[i + 1] as u64;
+            i += 2;
+            v + 1
+        }
+        8..=15 => 256u64 << (code_bloc - 8),
+        _ => return LectureEntete::Invalide,
+    };
+    // Cadence explicite : octets supplémentaires à sauter.
+    match code_rate {
+        12 => {
+            if b.len() < i + 1 {
+                return LectureEntete::Tronque;
+            }
+            i += 1;
+        }
+        13 | 14 => {
+            if b.len() < i + 2 {
+                return LectureEntete::Tronque;
+            }
+            i += 2;
+        }
+        _ => {}
+    }
+    // CRC-8 (polynôme 0x07, init 0) sur tout l'en-tête, octet de CRC exclu.
+    let crc_lu = match b.get(i) {
+        Some(v) => *v,
+        None => return LectureEntete::Tronque,
+    };
+    let mut crc: u8 = 0;
+    for &o in &b[..i] {
+        crc ^= o;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
+        }
+    }
+    if crc != crc_lu {
+        return LectureEntete::Invalide;
+    }
+
+    // Blocage variable : le numéro EST la position en samples. Blocage fixe :
+    // c'est un numéro de trame — la position est numero × blocsize (exact tant
+    // que toutes les trames précédentes ont la même taille, ce que le blocage
+    // fixe garantit, dernière trame exceptée).
+    let position = if variable {
+        numero
+    } else {
+        numero.saturating_mul(blocsize)
+    };
+    LectureEntete::Valide { position, blocsize }
+}
+
+#[cfg(test)]
+mod tests_trames_flac {
+    use super::CompteurDeTramesFlac;
+
+    // --- Compteur de trames FLAC (#2214) -----------------------------------
+
+    /// Construire un en-tête de trame FLAC valide, CRC compris.
+    /// Blocage fixe, blocksize 4096 (code 12 → 256<<4), cadence 44,1 kHz
+    /// (code 9), stéréo (code 1), 16 bits (code 4).
+    fn entete_de_trame(numero_de_trame: u64) -> Vec<u8> {
+        let mut h = vec![0xFF, 0xF8, 0xC9, 0x18];
+        // Numéro en UTF-8 étendu — ici < 128 : un seul octet.
+        assert!(numero_de_trame < 128, "test limité aux petits numéros");
+        h.push(numero_de_trame as u8);
+        let mut crc: u8 = 0;
+        for &o in &h {
+            crc ^= o;
+            for _ in 0..8 {
+                crc = if crc & 0x80 != 0 {
+                    (crc << 1) ^ 0x07
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        h.push(crc);
+        h
+    }
+
+    #[test]
+    fn la_position_flac_vient_des_en_tetes_pas_des_octets() {
+        let mut c = CompteurDeTramesFlac::new();
+        assert!(!c.est_synchronise());
+
+        // Trame 0 puis un corps compressé quelconque, PLUS GROS que la trame :
+        // au prorata des octets, la position exploserait.
+        let mut flux = entete_de_trame(0);
+        flux.extend(std::iter::repeat(0xA5).take(9000));
+        c.avaler(&flux);
+        assert!(c.est_synchronise());
+        assert_eq!(c.position_samples(), 0, "trame 0 = position 0");
+
+        // Trame 3 (on saute la 1 et la 2 : peu importe, la position est ABSOLUE).
+        let mut flux2 = entete_de_trame(3);
+        flux2.extend(std::iter::repeat(0x5A).take(500));
+        c.avaler(&flux2);
+        assert_eq!(
+            c.position_samples(),
+            3 * 4096,
+            "blocage fixe : numéro de trame × blocksize — pas un prorata d'octets"
+        );
+    }
+
+    #[test]
+    fn un_en_tete_a_cheval_sur_deux_tranches_est_vu() {
+        let mut c = CompteurDeTramesFlac::new();
+        let h = entete_de_trame(5);
+        // Couper l'en-tête en deux, au milieu.
+        c.avaler(&h[..3]);
+        assert!(!c.est_synchronise(), "en-tête incomplet : rien à déclarer");
+        c.avaler(&h[3..]);
+        assert!(
+            c.est_synchronise(),
+            "la fenêtre de recouvrement doit le recoller"
+        );
+        assert_eq!(c.position_samples(), 5 * 4096);
+    }
+
+    #[test]
+    fn une_fausse_synchro_est_ecartee_par_le_crc() {
+        let mut c = CompteurDeTramesFlac::new();
+        // 0xFF 0xF8 plausible, champs valides, mais CRC faux.
+        let mut faux = entete_de_trame(7);
+        let n = faux.len();
+        faux[n - 1] ^= 0xFF; // CRC corrompu
+        c.avaler(&faux);
+        assert!(
+            !c.est_synchronise(),
+            "un CRC faux doit écarter la trame : les données compressées sont \
+             pleines de pseudo-synchros"
+        );
     }
 }

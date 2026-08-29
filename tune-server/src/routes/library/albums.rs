@@ -15,6 +15,7 @@ use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
+use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
 use super::Pagination;
@@ -27,6 +28,9 @@ pub(super) struct AlbumFilters {
     format: Option<String>,
     sort: Option<String>,
     order: Option<String>,
+    /// `?compilation=true` ne rend que les compilations, `false` que le reste,
+    /// absent = tout (#1957).
+    compilation: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +72,7 @@ pub(super) async fn list_albums(
         order,
         p.format.as_deref(),
         p.quality.as_deref(),
+        p.compilation,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -149,6 +154,9 @@ pub(super) async fn create_album(
         release_date: None,
         original_date: None,
         added_at: None,
+        // Un album créé à la main n'est pas une compilation : c'est le scan
+        // qui lève ce drapeau, d'après les tags (#1957).
+        is_compilation: false,
     };
     let id = repo
         .create(&album)
@@ -157,10 +165,29 @@ pub(super) async fn create_album(
 }
 
 pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    // `LOWER(TRIM(...))`, sinon deux valeurs qui ne diffèrent que par la casse
+    // font deux entrées — et l'écran les rend IDENTIQUES, puisqu'il met tout en
+    // majuscules à l'affichage (`LibraryView.svelte`, `toUpperCase()`).
+    //
+    // C'est ainsi que « DSD » apparaissait deux fois dans les types de fichiers,
+    // en deux lignes visuellement indiscernables : `dsd` et `DSD` en base
+    // (Cyrille Moutia, #1612). Le chemin de scan actuel écrit bien en
+    // minuscules, mais toute valeur venue d'ailleurs — une version antérieure,
+    // un import — traverse sans être repliée.
+    //
+    // Le repli se fait ICI et pas dans `normalize_format` : le passthrough
+    // sensible à la casse de cette fonction est délibéré et figé par un test
+    // (`normalize_format_case_sensitivity` : « MPEG » ne doit pas devenir
+    // « mp3 »). Le lever changerait le format écrit pour d'autres fichiers.
+    //
+    // `TRIM` en plus de `LOWER` : un espace de fin produit exactement le même
+    // doublon invisible, pour la même raison.
     let formats: Vec<String> = state
         .backend
         .query_many(
-            "SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format",
+            "SELECT DISTINCT LOWER(TRIM(format)) FROM albums \
+             WHERE format IS NOT NULL AND TRIM(format) != '' \
+             ORDER BY LOWER(TRIM(format))",
             &[],
         )
         .unwrap_or_default()
@@ -204,6 +231,13 @@ pub(super) async fn get_album(
             if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
                 obj.insert("bio_provenance".into(), prov);
             }
+            // Dynamic Range, when the files carry the tag (#303, #1418). Absent
+            // from the payload rather than null when untagged, so a client can
+            // simply test for the key instead of distinguishing "no tag" from
+            // "measured zero" — DR0 is a real value.
+            if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range(id)) {
+                obj.insert("dynamic_range".into(), Value::String(dr));
+            }
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -225,7 +259,43 @@ pub(super) async fn album_tracks(
         repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
             .unwrap_or_default(),
     );
-    Json(json!(items))
+
+    // GROUPING (#2130) : lu au scan et rangé dans `track_metadata`, il n'était
+    // jusqu'ici ressorti par aucune route. Une seule requête indexée par album
+    // suffit ; le tag étant absent de l'immense majorité des bibliothèques,
+    // elle ne ramène le plus souvent aucune ligne et la clé `grouping` reste
+    // absente du JSON — ce qui laisse le contrat inchangé pour les clients qui
+    // ne la connaissent pas.
+    let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
+    let grouping = TrackMetadataRepo::with_backend(state.backend.clone())
+        .get_key_for_tracks("grouping", &track_ids)
+        .unwrap_or_default();
+
+    Json(json!(attach_grouping(items, &grouping)))
+}
+
+/// Recopie le tag GROUPING sur les pistes sérialisées d'un album.
+///
+/// La clé n'est ajoutée que pour les pistes qui en portent réellement une
+/// (`get_key_for_tracks` a déjà écarté les valeurs vides) : une piste sans
+/// GROUPING sort exactement comme avant, sans champ supplémentaire.
+fn attach_grouping(
+    items: Vec<tune_core::db::models::Track>,
+    grouping: &std::collections::HashMap<i64, String>,
+) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|t| {
+            let track_id = t.id;
+            let mut v = serde_json::to_value(&t).unwrap_or_default();
+            if let (Some(track_id), Some(obj)) = (track_id, v.as_object_mut()) {
+                if let Some(g) = grouping.get(&track_id) {
+                    obj.insert("grouping".into(), json!(g));
+                }
+            }
+            v
+        })
+        .collect()
 }
 
 pub(super) async fn quick_fav_album(
@@ -320,11 +390,31 @@ pub(super) async fn album_bio(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let lang = q.lang.as_deref().unwrap_or("fr");
+
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
+    //
+    // MAIS seulement si elle est dans la bonne langue (#1849, Dimitri). La
+    // route artiste a recu ce garde-fou en #2126 ; la route album, que le
+    // ticket cite pourtant dans sa portee, ne l'a jamais eu. Elle rendait donc
+    // la bio stockee sans regarder ni sa langue ni celle qu'on demande, et le
+    // `lang` ci-dessus ne servait qu'a nommer l'entree de cache -- il n'etait
+    // meme JAMAIS atteint pour un album qui possedait deja une bio.
+    //
+    // L'enrichissement des bios d'album prend la langue de CELUI QUI LE LANCE
+    // (`routes/system/enrich.rs`, `lang_from_header` puis
+    // `batch_enrich_album_bios(.., &lang)`) : une bibliotheque enrichie depuis
+    // une interface en francais stocke tout en francais, et le ressert ensuite
+    // a tout le monde.
+    let prov = album_repo.bio_provenance(id).ok().flatten();
+    let bio_lang = prov
+        .as_ref()
+        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
+    let stored_ok = super::artists::langue_convient(bio_lang, lang);
+
     if let Some(ref bio) = album.bio {
-        if !bio.is_empty() {
-            let prov = album_repo.bio_provenance(id).ok().flatten();
+        if !bio.is_empty() && stored_ok {
             return Json(json!({
                 "album": album.title,
                 "bio": bio,
@@ -347,7 +437,6 @@ pub(super) async fn album_bio(
         })
     });
     let artist_q = artist_name.as_deref().unwrap_or("");
-    let lang = q.lang.as_deref().unwrap_or("fr");
     let cache_key = format!("cache:albumbio:{}:{artist_q}:{lang}", album.title);
     if let Some(cached) = super::api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
@@ -355,7 +444,16 @@ pub(super) async fn album_bio(
     match state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/albums/bio")
-        .query(&[("title", album.title.as_str()), ("artist", artist_q)])
+        // `lang` est transmis au site, qui ne le recevait pas : il ne servait
+        // qu'a nommer l'entree de cache. Meme reserve que pour la route
+        // artiste (#2126) : l'effet depend de `site-mozaiklabs`. S'il ignore le
+        // parametre, il rendra la meme langue qu'avant -- sans regression, mais
+        // sans gain non plus.
+        .query(&[
+            ("title", album.title.as_str()),
+            ("artist", artist_q),
+            ("lang", lang),
+        ])
         .send()
         .await
     {
@@ -371,7 +469,31 @@ pub(super) async fn album_bio(
             }
             Json(out).into_response()
         }
-        _ => Json(json!({"album": album.title, "bio": null})).into_response(),
+        _ => repli_sur_la_bio_stockee(&album.title, album.bio.as_deref(), prov),
+    }
+}
+
+/// Ressert la bio d'album stockee quand la langue demandee n'a rien donne.
+///
+/// « Une biographie en francais vaut mieux qu'un panneau vide » -- #1849 le dit,
+/// et c'est juste : refuser une bio dans la mauvaise langue serait remplacer un
+/// defaut par un pire. La provenance part avec elle, donc le client sait dans
+/// quelle langue elle est et peut le signaler. Pendant du
+/// `repli_sur_la_bio_stockee` de la route artiste, dont seule la cle JSON
+/// (`album` au lieu de `artist`) differe.
+fn repli_sur_la_bio_stockee(
+    titre: &str,
+    bio: Option<&str>,
+    prov: Option<Value>,
+) -> axum::response::Response {
+    match bio.filter(|b| !b.is_empty()) {
+        Some(b) => Json(json!({
+            "album": titre,
+            "bio": b,
+            "bio_provenance": prov,
+        }))
+        .into_response(),
+        None => Json(json!({"album": titre, "bio": null})).into_response(),
     }
 }
 
@@ -804,4 +926,55 @@ pub(super) async fn batch_update_albums(
     }
 
     Json(serde_json::json!({ "updated": updated, "total": body.album_ids.len() })).into_response()
+}
+
+#[cfg(test)]
+mod tests_grouping {
+    use super::attach_grouping;
+    use std::collections::HashMap;
+    use tune_core::db::models::Track;
+
+    fn track(id: i64, title: &str) -> Track {
+        let mut t = Track::new(title.to_string());
+        t.id = Some(id);
+        t
+    }
+
+    /// Sans GROUPING en base, la réponse d'un album est celle d'avant #2130 :
+    /// aucune clé supplémentaire. C'est le cas mesuré sur les bibliothèques
+    /// réelles, donc le cas qui doit rester gratuit.
+    #[test]
+    fn attach_grouping_leaves_tracks_untouched_when_absent() {
+        let items = vec![track(1, "I. Allegro"), track(2, "II. Adagio")];
+        let out = attach_grouping(items, &HashMap::new());
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert!(
+                v.get("grouping").is_none(),
+                "aucune clé grouping ne doit apparaître sans donnée"
+            );
+        }
+        assert_eq!(out[0]["title"], "I. Allegro");
+    }
+
+    /// Une valeur en base ressort sur la piste concernée, et sur elle seule.
+    #[test]
+    fn attach_grouping_reports_the_value_on_the_right_track() {
+        let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
+        let mut map = HashMap::new();
+        map.insert(2i64, "Titres bonus".to_string());
+        let out = attach_grouping(items, &map);
+        assert!(out[0].get("grouping").is_none());
+        assert_eq!(out[1]["grouping"], "Titres bonus");
+    }
+
+    /// Une entrée pour une piste absente de l'album ne contamine personne.
+    #[test]
+    fn attach_grouping_ignores_unknown_track_ids() {
+        let items = vec![track(1, "I. Allegro")];
+        let mut map = HashMap::new();
+        map.insert(99i64, "Autre album".to_string());
+        let out = attach_grouping(items, &map);
+        assert!(out[0].get("grouping").is_none());
+    }
 }

@@ -37,11 +37,30 @@ numéro de fil (#1312 → PR #1344). Une seule commande `git grep` l'aurait
 Cherchez par **contenu**, pas par numéro : le même bug arrive souvent sous
 deux numéros — celui de l'issue GitHub et celui du fil forum.
 
-Et si vous touchez au schéma : une colonne s'ajoute **aux trois endroits**
-(`CORE_SCHEMA` SQLite, migration, schéma PG) et **jamais par un
-`ALTER TABLE ADD COLUMN` dans `up:`** — sur une base neuve la colonne existe
-déjà, l'ALTER échoue en « duplicate column name » et fait planter tout
-`run_migrations` au premier démarrage. Utilisez `add_column_if_missing`.
+Et si vous touchez au schéma : une colonne s'ajoute **aux quatre endroits**
+
+| # | endroit | pour qui |
+|---|---|---|
+| 1 | `CORE_SCHEMA` (`db/sqlite.rs`) | base SQLite neuve |
+| 2 | migration SQLite (`db/migrations.rs`) | base SQLite existante |
+| 3 | `PG_FULL_SCHEMA` (`db/pg_migrate.rs`) | base PG neuve, et bascule SQLite→PG |
+| 4 | migration PG (`migrations/postgres/NNN_….sql` + `PG_MIGRATIONS`) | **base PG existante** |
+
+**Longtemps on en comptait trois** — et c'est le quatrième qui manquait. Les
+colonnes du chantier CUE n'existaient que dans le `CREATE TABLE` de
+`pg_migrate.rs` : aucune base PostgreSQL existante ne les a jamais reçues, et
+personne ne s'en est aperçu pendant des mois parce qu'aucune requête ne les
+nommait encore (#2111). Le test `pg_schema_parity` refuse désormais tout écart
+entre 3 et 4.
+
+Si la copie SQLite→PG lit la colonne, l'ajouter **aussi** au bloc de rattrapage
+en fin de `PG_FULL_SCHEMA` : sans quoi l'`INSERT` de la table entière échoue et
+la bibliothèque arrive vide.
+
+Et **jamais par un `ALTER TABLE ADD COLUMN` dans `up:`** — sur une base neuve la
+colonne existe déjà, l'ALTER échoue en « duplicate column name » et fait
+planter tout `run_migrations` au premier démarrage. Utilisez
+`add_column_if_missing`.
 
 ---
 
@@ -181,9 +200,29 @@ pousser** : un merge sans conflit peut casser la compilation.
 
 ## 6. Pièges qui coûtent cher
 
-- **`Ferme #123` ne ferme rien.** GitHub ne reconnaît que les mots-clés
-  **anglais** : `Closes` / `Fixes` / `Resolves`. Le corps de PR peut rester en
-  français, la ligne de liaison doit être en anglais.
+- **AUCUNE ligne de fermeture ne ferme quoi que ce soit ici — pas même en
+  anglais.** Ce point disait le contraire, et c'était faux. GitHub n'auto-ferme
+  que sur la branche **par défaut** ; or la doctrine impose de cibler
+  `release/v0.9`. Mesuré sur 18 PR portant `Closes`/`Fixes`/`Resolves`
+  fusionnées ici : **0 fermeture automatique, 18 fermetures à la main**. Le
+  **lien** lui-même n'est pas enregistré — `closingIssuesReferences` rend une
+  liste vide. Ce n'est pas non plus une affaire de squash.
+
+  Le test qui tranche : l'événement `closed` porte un `commit_id` quand c'est
+  GitHub qui ferme, et **aucun** quand c'est un humain.
+
+  ```bash
+  gh api repos/renesenses/tune-server-rust/issues/<n>/events \
+    --jq '.[]|select(.event=="closed")|"\(.actor.login) \(.commit_id//"aucun")"'
+  ```
+
+  Écrivez la ligne quand même (elle aide qui relira), **dans les deux langues
+  si vous voulez** — mais prévoyez toujours `gh issue close` à la main, puis
+  `gh issue view <n> --json state` pour vérifier au lieu de supposer.
+
+  ⚠️ Une PR de `tune-web-client` qui vise une issue de `tune-server-rust` doit
+  écrire la forme complète — `Closes renesenses/tune-server-rust#2036` — sinon
+  GitHub résout le numéro dans le dépôt **de la PR** et ne désigne rien.
 
 - **Lisez les versions sur `origin/`, jamais dans la copie de travail.** Les
   dépôts locaux traînent souvent sur une vieille branche d'une autre session :
@@ -201,3 +240,158 @@ pousser** : un merge sans conflit peut casser la compilation.
 
 - **Le bump et le tag sont la décision de Bertrand.** Ne les lancez pas de
   votre propre initiative.
+
+---
+
+## 6 bis. Une release publiée se solde — clôture et réponse aux testeurs
+
+**Le stock d'issues doit refléter l'état du code.** Il ne le fait pas tout
+seul : `Closes` ne ferme rien ici (voir ci-dessus), et un correctif fusionné
+n'est pas un correctif livré. Sans cette étape, on accumule des issues
+ouvertes dont le défaut n'existe plus — mesuré le 28/08/2026 : **23 issues P2
+traitées dans la journée, 0 fermée, 373 issues ouvertes**. Le compteur ne
+mesurait plus le travail, il mesurait l'oubli.
+
+**Pendant le cycle de développement**, on ne touche pas au suivi : ni triage,
+ni fermeture, ni commentaire spontané. **Dès qu'une release est PUBLIÉE**, on
+solde ce qu'elle livre.
+
+### Ce qu'il faut faire, dans cet ordre
+
+1. **Établir ce que la release livre réellement**, issue par issue.
+2. **Fermer à la main** — `gh issue close`, puis `gh issue view <n> --json state`
+   pour vérifier au lieu de supposer.
+3. **Commenter** en disant **à partir de quelle version** c'est corrigé. Un
+   testeur en version antérieure verra encore le défaut : sans le numéro de
+   version, la réponse est inutilisable.
+
+### La preuve exigée avant de fermer
+
+**Le contenu de l'artefact publié**, jamais autre chose. Ni « PR mergée », ni
+`git tag --contains`, ni `--is-ancestor` — une fusion peut écraser du contenu,
+et un correctif peut manquer son tag de quelques minutes. C'est arrivé **trois
+fois en août** : #2317 raté de 17 min, #2404 de 30 min, le kiosque d'un jour.
+
+Un `grep` dans le binaire ou dans le `web/` du tarball, **avec un cas témoin
+sur une version antérieure où le marqueur doit être ABSENT** (`rc=1`). Sans
+témoin, une absence de résultat ne prouve rien : elle peut venir d'un marqueur
+mal choisi. Choisir un littéral qui survit à la compilation — message de
+journal, code d'erreur, champ sérialisé — **jamais un nom de fonction**, que
+la minification et le linker effacent.
+
+### Ce qu'on ne ferme pas
+
+- les issues portant **`keep-open`** ;
+- celles dont le correctif est fusionné mais **absent de l'artefact publié** —
+  elles attendent la release suivante ;
+- **jamais de fermeture en masse au jugé.** Une issue fermée à tort ne se
+  rouvre pratiquement jamais, et le testeur qui l'avait ouverte le vit comme
+  un abandon.
+
+
+---
+
+## 7. Plusieurs agents travaillent ce dépôt — le verrou est obligatoire
+
+Vous n'êtes pas seul. Le 2026-08-20, **quatre PR ont touché `verdict_purge`
+dans la même journée** (#1983, #2016, #2017, #2038) : trois ont conflité, et
+l'une a failli livrer un `sudo` dans un conteneur `debian:bookworm` nu, ce qui
+aurait cassé la construction de Tune OS **à tous les coups**. Aucune n'était
+mauvaise ; elles s'ignoraient.
+
+### DEUX verrous, dans cet ordre : l'issue d'abord, la zone ensuite
+
+**Jamais deux agents sur la même issue.** Le verrou de zone ne suffit pas : il
+protège le fichier, pas le sujet. Deux agents peuvent parfaitement prendre la
+même issue si elle touche deux zones, ou si l'un travaille sans rien réserver.
+
+Le verrou d'issue emploie le même mécanisme atomique, et il se prend **en
+premier** — c'est le moins cher et le plus précis :
+
+```bash
+set -o pipefail
+gh label create "verrou:issue-<n>" --repo renesenses/tune-server-rust \
+  --color 5319E7 --description "<qui> — <ISO8601>"          # échec ⇒ prise
+gh issue edit <n> --repo renesenses/tune-server-rust --add-label "en-cours"
+```
+
+L'étiquette `verrou:issue-<n>` est le verrou (invisible, atomique) ;
+`en-cours` posée SUR l'issue est là pour qu'un humain voie d'un coup d'œil ce
+qui est pris. Les deux se rendent ensemble, à la fusion ou à l'abandon :
+
+```bash
+gh label delete "verrou:issue-<n>" --repo renesenses/tune-server-rust --yes
+gh issue edit <n> --repo renesenses/tune-server-rust --remove-label "en-cours"
+```
+
+**Échec du `label create` = l'issue est prise. On en choisit une autre.** Ne
+jamais se contenter de regarder si `en-cours` est posée : cette lecture-là
+n'est pas atomique, et deux agents qui regardent en même temps concluent tous
+les deux que c'est libre.
+
+### Prendre le verrou de la zone AVANT d'écrire
+
+`gh label create` **échoue si l'étiquette existe déjà** : c'est un test-and-set
+atomique, donc un vrai mutex.
+
+```bash
+set -o pipefail   # sinon un `| tail` masque l'échec et le verrou ne sert à rien
+gh label create "verrou:<zone>" --repo renesenses/tune-server-rust \
+  --color B60205 --description "<qui> — issue #<n> — <ISO8601>"
+```
+
+**Échec = quelqu'un tient la zone.** On prend une issue ailleurs. On ne « passe
+pas quand même ».
+
+Rendre le verrou dès que la PR est fusionnée ou abandonnée :
+
+```bash
+gh label delete "verrou:<zone>" --repo renesenses/tune-server-rust --yes
+```
+
+Zones : `scan` · `queue` · `qobuz` · `tidal` · `dsd` · `dlna` · `chromecast` ·
+`bluos` · `airplay` · `enrichissement` · `acoustique` · `licence` · `ci` ·
+`web`. Une issue qui en traverse deux prend **les deux**, dans l'ordre
+alphabétique — sinon deux agents se bloquent mutuellement.
+
+Un verrou dont l'horodatage dépasse quelques heures sans PR ouverte peut être
+cassé, mais **en le disant** dans l'issue concernée, jamais en silence.
+
+### Le circuit des tickets est automatisé — n'y touchez pas à la main
+
+Quatre agents s'en chargent (`~/.claude/agents/`) :
+
+| agent | rôle | déclencheur |
+|---|---|---|
+| `tune-tri` | lit les tickets, ouvre les issues | forum modifié (toutes les 10 min) |
+| `tune-chef` | classe, attribue, tient le verrou | sur appel |
+| `tune-retour` | établit ce qui est livré, ferme les issues | nouveau tag |
+| `tune-parole` | écrit aux testeurs, sous l'identité de Bertrand | nouveau tag |
+
+Conséquences pour vous :
+
+- **N'écrivez pas aux testeurs de votre propre initiative.** Deux réponses en
+  doublon ont dû être supprimées le 2026-08-16, dont une qui prescrivait ce que
+  l'utilisateur venait de dire avoir essayé.
+- **Ne fermez pas une issue sur un merge — fermez sur un TAG.** Vérifiez :
+  `git merge-base --is-ancestor <sha> <tag>`. Un correctif fusionné après le
+  tag n'est pas livré, et l'annoncer est pire que se taire.
+- **Vérifiez le périmètre avant de fermer.** Le défaut dominant est le
+  demi-correctif déclaré complet : #1893 fermée avec trois routes sur six,
+  #1969 fermée sans son cache. Relisez ce que l'issue demandait, point par
+  point. Certains messages de commit disent eux-mêmes « ne prétend PAS
+  résoudre #N » — lisez-les.
+
+### Vérifier, pas supposer
+
+- `cargo clippy --all-targets`, **jamais** `cargo check` seul : il ne compile
+  pas les tests et laisse filer les erreurs jusqu'à la CI (vécu sur #2016).
+- **Ne jamais fusionner sur `mergeable_state: unknown`** — GitHub n'a pas fini
+  de calculer et le merge peut consommer un sha périmé. Attendre `clean`,
+  `behind` ou `unstable`, et épingler `-f sha=$head`.
+- **L'auto-merge n'actualise PAS la branche.** Avec `strict: true`, une PR
+  entièrement verte mais `BEHIND` reste armée indéfiniment sans que rien ne se
+  passe. Il faut pousser `update-branch`.
+- **Pendant un gel : désarmez les auto-merge.** Un auto-merge armé fusionne dès
+  que sa CI passe, y compris au milieu d'une fenêtre de release — c'est ce qui
+  a fait tomber la première tentative de la v0.9.92.

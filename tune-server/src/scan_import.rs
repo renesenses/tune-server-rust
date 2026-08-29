@@ -162,7 +162,69 @@ pub fn build_track_row(
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
     track.comments = meta.comment.clone();
+
+    // Dernière frontière avant TrackRepo. Le walker nettoie déjà les tags à
+    // leur lecture, mais ce constructeur est public et partagé avec l'auto-
+    // scan : aucun appelant ne doit pouvoir réintroduire un NUL ou un BOM dans
+    // une colonne texte. `file_path` reste l'adresse physique exacte ; la
+    // réécrire rendrait le fichier existant impossible à rouvrir.
+    let corrections = sanitize_track_row_text(&mut track);
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %sf.path,
+            corrections = ?corrections,
+            "scan_import_unsafe_text_sanitized_at_db_boundary"
+        );
+    }
     track
+}
+
+fn sanitize_track_row_text(track: &mut Track) -> Vec<tune_core::metadata::TextCorrection> {
+    fn clean(
+        field: &str,
+        value: &mut Option<String>,
+        corrections: &mut Vec<tune_core::metadata::TextCorrection>,
+    ) {
+        let Some(raw) = value.as_deref() else {
+            return;
+        };
+        let (sanitized, mut found) =
+            tune_core::metadata::sanitize_untrusted_single_line_text(raw, field);
+        if !found.is_empty() {
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+
+    let (title, mut corrections) =
+        tune_core::metadata::sanitize_untrusted_single_line_text(&track.title, "title");
+    if !corrections.is_empty() {
+        track.title = title;
+    }
+    clean("album_title", &mut track.album_title, &mut corrections);
+    clean("artist_name", &mut track.artist_name, &mut corrections);
+    clean("album_artist", &mut track.album_artist, &mut corrections);
+    clean("disc_subtitle", &mut track.disc_subtitle, &mut corrections);
+    clean("format", &mut track.format, &mut corrections);
+    clean("isrc", &mut track.isrc, &mut corrections);
+    clean("genre", &mut track.genre, &mut corrections);
+    clean("genres", &mut track.genres, &mut corrections);
+    clean("composer", &mut track.composer, &mut corrections);
+    clean("label", &mut track.label, &mut corrections);
+    clean(
+        "musicbrainz_recording_id",
+        &mut track.musicbrainz_recording_id,
+        &mut corrections,
+    );
+
+    if let Some(raw) = track.comments.as_deref() {
+        let (sanitized, mut found) = tune_core::metadata::sanitize_untrusted_text(raw, "comments");
+        if !found.is_empty() {
+            track.comments = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+    corrections
 }
 
 /// Batch-stateful importer that resolves a scanned file's artist and album in
@@ -375,7 +437,16 @@ impl TrackImporter {
         if let Some(ref album_title) = meta.album {
             let t = album_title.to_lowercase();
             if t.contains("best") || t.contains("greatest") || t.contains("hits") {
-                tracing::info!(
+                // `debug!`, et non `info!` : cette sonde est émise UNE FOIS PAR
+                // PISTE de tout album dont le titre contient « best »,
+                // « greatest » ou « hits ». Chez un testeur, 311 lignes en dix
+                // minutes sur 35 albums — dont 31 pour le seul « Very Best of
+                // Maria Callas » — soit 31 % de la fenêtre du rapport de bogue,
+                // qui ne retient que l'INFO et au-dessus (#2028). Elle a servi
+                // à instruire les compilations ; laissée en `info!`, elle coûte
+                // désormais plus qu'elle ne rapporte : elle chasse du rapport
+                // ce qu'on y cherchait.
+                tracing::debug!(
                     album = %album_title,
                     album_artist_tag = ?meta.album_artist,
                     artist_tag = ?meta.artist,
@@ -494,6 +565,19 @@ impl TrackImporter {
         };
 
         let album_id = album.as_ref().and_then(|a| a.id);
+
+        // Garder la décision qui vient d'être prise (#1957). C'est elle qui a
+        // envoyé l'album sous « Various Artists » quelques lignes plus haut ;
+        // sans cette écriture elle mourait ici, et rien dans la base ne disait
+        // plus pourquoi vingt artistes tiennent dans un même disque.
+        // `mark_compilation` ne fait que lever le drapeau : la décision est
+        // prise par piste, et une anthologie dont la première piste, seule, ne
+        // ressemble à rien ne doit pas dépendre de l'ordre des fichiers.
+        if let Some(aid) = album_id
+            && is_compilation
+        {
+            self.album_repo.mark_compilation(aid).ok();
+        }
 
         // Propagate date metadata from track tags to the album.
         if let Some(aid) = album_id {
@@ -622,6 +706,7 @@ mod tests {
         ScannedFile {
             path: path.to_string(),
             metadata: None,
+            unsupported: None,
             audio_hash: Some("hash-1".into()),
             file_size: 4096,
             mtime: 1_700_000_000,
@@ -673,6 +758,93 @@ mod tests {
             albums.len(),
             4,
             "quatre dossiers, quatre pochettes ⇒ quatre albums (obtenu : {albums:?})"
+        );
+    }
+
+    /// LE FAIT de #1957, joué de bout en bout : le drapeau `TCMP` du fichier
+    /// arrive jusqu'à la LIGNE ALBUM, au lieu de servir au regroupement puis
+    /// d'être jeté. Un album ordinaire, dans le même scan, reste à « non ».
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : `albums` n'avait pas de colonne.
+    #[test]
+    fn le_drapeau_compilation_atteint_la_ligne_album() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let mut imp = TrackImporter::new(backend.clone(), true, tmp.path().to_path_buf());
+        let albums = AlbumRepo::with_backend(backend.clone());
+
+        // L'anthologie : deux pistes, deux artistes, `TCMP` posé sur les deux.
+        let dossier = tmp.path().join("Jazz sur Seine");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let mut anthologie = Vec::new();
+        for (n, artiste) in ["Django", "Stéphane"].iter().enumerate() {
+            let chemin = dossier
+                .join(format!("0{}.flac", n + 1))
+                .to_string_lossy()
+                .into_owned();
+            let mut f = sf(&chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("titre {n}")),
+                artist: Some((*artiste).to_string()),
+                album: Some("Jazz sur Seine".into()),
+                album_artist: Some((*artiste).to_string()),
+                track_number: Some(n as u32 + 1),
+                compilation: true,
+                ..Default::default()
+            });
+            anthologie.push(f);
+        }
+
+        // Le témoin : un vrai album d'un seul artiste, sans `TCMP`.
+        let d2 = tmp.path().join("Kind of Blue");
+        std::fs::create_dir_all(&d2).unwrap();
+        let chemin = d2.join("01.flac").to_string_lossy().into_owned();
+        let mut temoin = sf(&chemin);
+        temoin.metadata = Some(TrackMetadata {
+            title: Some("So What".into()),
+            artist: Some("Miles Davis".into()),
+            album: Some("Kind of Blue".into()),
+            album_artist: Some("Miles Davis".into()),
+            track_number: Some(1),
+            ..Default::default()
+        });
+
+        let lot: Vec<_> = anthologie
+            .into_iter()
+            .chain(std::iter::once(temoin))
+            .collect();
+        imp.begin_batch(&lot);
+
+        let mut id_compilation = None;
+        let mut id_temoin = None;
+        for f in &lot {
+            let (_, album_id) = imp.import(f).expect("import");
+            let album_id = album_id.expect("un album");
+            if f.path.contains("Kind of Blue") {
+                id_temoin = Some(album_id);
+            } else {
+                id_compilation = Some(album_id);
+            }
+        }
+
+        let compilation = albums.get(id_compilation.unwrap()).unwrap().unwrap();
+        assert!(
+            compilation.is_compilation,
+            "le drapeau TCMP doit atteindre la ligne album « {} »",
+            compilation.title
+        );
+
+        let temoin = albums.get(id_temoin.unwrap()).unwrap().unwrap();
+        assert!(
+            !temoin.is_compilation,
+            "un album ordinaire du même scan ne doit pas être marqué : « {} »",
+            temoin.title
         );
     }
 
@@ -842,5 +1014,63 @@ mod tests {
         assert_eq!(track.duration_ms, 0);
         assert_eq!(track.genres, None);
         assert_eq!(track.composer, None);
+    }
+
+    #[test]
+    fn build_track_row_ne_persiste_aucun_nul_ni_bom_hors_adresse_physique() {
+        let meta = TrackMetadata {
+            title: Some("Titre\0cache".into()),
+            album: Some("Album\u{feff}Live".into()),
+            album_artist: Some("Lisa\0Strings".into()),
+            disc_subtitle: Some("Disque\u{feff}I".into()),
+            format: Some("flac\0".into()),
+            isrc: Some("FR\u{feff}123".into()),
+            genre: Some("Jazz\0Fusion".into()),
+            genres: vec!["Jazz\u{feff}Fusion".into()],
+            credits: vec![TrackCredit {
+                name: "Miles\0Davis".into(),
+                role: "composer".into(),
+                instrument: None,
+            }],
+            label: Some("Columbia\u{feff}Records".into()),
+            musicbrainz_recording_id: Some("rec\0id".into()),
+            comment: Some("ligne 1\nligne\0 2".into()),
+            ..Default::default()
+        };
+        let scanned = sf("/m/Jacobs, Lisa\u{feff}The Strings/01.flac");
+        let track = build_track_row(
+            &meta,
+            &scanned,
+            Some(7),
+            Some(3),
+            "Lisa\0\u{feff}The Strings",
+        );
+
+        let persisted_text = [
+            Some(track.title.as_str()),
+            track.album_title.as_deref(),
+            track.artist_name.as_deref(),
+            track.album_artist.as_deref(),
+            track.disc_subtitle.as_deref(),
+            track.format.as_deref(),
+            track.isrc.as_deref(),
+            track.genre.as_deref(),
+            track.genres.as_deref(),
+            track.composer.as_deref(),
+            track.label.as_deref(),
+            track.musicbrainz_recording_id.as_deref(),
+            track.comments.as_deref(),
+        ];
+        assert!(
+            persisted_text
+                .into_iter()
+                .flatten()
+                .all(|value| !value.contains(['\0', '\u{feff}']))
+        );
+        assert_eq!(track.comments.as_deref(), Some("ligne 1\nligne 2"));
+        assert_eq!(
+            track.file_path.as_deref(),
+            Some("/m/Jacobs, Lisa\u{feff}The Strings/01.flac")
+        );
     }
 }

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 #[derive(Debug, Clone)]
 pub struct PlayCall {
@@ -22,6 +22,8 @@ pub struct MockOutput {
     state: Arc<Mutex<TransportState>>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
+    volume: Arc<Mutex<f64>>,
+    muted: Arc<Mutex<bool>>,
     current_uri: Arc<Mutex<Option<String>>>,
     next_uri: Arc<Mutex<Option<String>>>,
     play_calls: Arc<Mutex<Vec<PlayCall>>>,
@@ -39,6 +41,8 @@ impl MockOutput {
             state: Arc::new(Mutex::new(TransportState::Stopped)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(Mutex::new(0.5)),
+            muted: Arc::new(Mutex::new(false)),
             current_uri: Arc::new(Mutex::new(None)),
             next_uri: Arc::new(Mutex::new(None)),
             play_calls: Arc::new(Mutex::new(Vec::new())),
@@ -123,6 +127,10 @@ impl OutputTarget for MockOutput {
         &self.output_type
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, true)
+    }
+
     fn host(&self) -> Option<&str> {
         self.host.as_deref()
     }
@@ -160,11 +168,13 @@ impl OutputTarget for MockOutput {
         Ok(())
     }
 
-    async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+    async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        *self.volume.lock().await = volume.clamp(0.0, 1.0);
         Ok(())
     }
 
-    async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+    async fn set_mute(&self, muted: bool) -> Result<(), String> {
+        *self.muted.lock().await = muted;
         Ok(())
     }
 
@@ -173,19 +183,26 @@ impl OutputTarget for MockOutput {
             state: *self.state.lock().await,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
-            volume: 0.5,
-            muted: false,
+            volume: *self.volume.lock().await,
+            muted: *self.muted.lock().await,
             current_uri: self.current_uri.lock().await.clone(),
             track_title: None,
             track_artist: None,
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

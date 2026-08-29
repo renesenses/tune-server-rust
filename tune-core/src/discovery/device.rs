@@ -58,6 +58,19 @@ pub struct DiscoveredDevice {
     pub location: Option<String>,
     pub airplay_version: Option<String>,
     pub mac_address: Option<String>,
+    /// L'identifiant que l'appareil annonce lui-meme, brut.
+    ///
+    /// A ne JAMAIS deriver ni remplacer : c'est la seule valeur dont la
+    /// stabilite soit garantie par le protocole, et c'est ce qui permet a une
+    /// zone de survivre a un changement d'adresse IP (#1528).
+    ///
+    /// Distinct de `mac_address`, qui est une identite « au mieux » :
+    /// `mac::enrich_identity` la reecrit depuis l'ARP quand la valeur annoncee
+    /// n'est pas une MAC — le TXT `id` d'un Chromecast est un UUID — et bascule
+    /// donc entre deux valeurs selon l'etat du cache ARP. La confondre avec une
+    /// identite stable remplacerait le defaut par un autre, plus difficile a
+    /// reproduire.
+    pub stable_id: Option<String>,
 }
 
 impl DiscoveredDevice {
@@ -75,6 +88,7 @@ impl DiscoveredDevice {
             location: None,
             airplay_version: None,
             mac_address: None,
+            stable_id: None,
         }
     }
 }

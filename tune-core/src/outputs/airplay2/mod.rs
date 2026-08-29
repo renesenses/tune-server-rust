@@ -11,7 +11,16 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use crate::outputs::traits::{
+    OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
+};
+
+/// Appairage par code façon HomeKit (pair-setup SRP-6a + pair-verify
+/// Curve25519). Protocole complet et testé hors ligne, mais **dormant** :
+/// aucun chemin de découverte ou de sortie ne l'appelle, et le transport RTSP
+/// réel n'a jamais été confronté à un appareil. Voir l'en-tête du module.
+#[cfg(unix)]
+pub mod pairing;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
 
@@ -26,6 +35,7 @@ pub struct Airplay2Output {
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     volume: Arc<Mutex<f64>>,
+    muted: Arc<AtomicBool>,
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
     process: Arc<Mutex<Option<DaemonProcess>>>,
@@ -86,6 +96,7 @@ impl Airplay2Output {
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             volume: Arc::new(Mutex::new(1.0)),
+            muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
             process: Arc::new(Mutex::new(None)),
@@ -279,6 +290,12 @@ impl OutputTarget for Airplay2Output {
         "airplay2"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        // La reprise restera fausse tant que le daemon AirPlay 2 livré ne
+        // possède pas la commande `resume` (#2238).
+        OutputCapabilities::v1(true, false, false, true, true, false)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -309,16 +326,14 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.paused.store(true, Ordering::SeqCst);
         self.send(&serde_json::json!({"cmd": "stop"})).await?;
+        self.paused.store(true, Ordering::SeqCst);
         info!(device = %self.name, "airplay2: pause");
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
-        self.paused.store(false, Ordering::SeqCst);
-        info!(device = %self.name, "airplay2: resume");
-        Ok(())
+        Err("resume not supported by the shipped AirPlay 2 daemon".into())
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -343,12 +358,15 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        *self.volume.lock().await = volume;
+        let volume = volume.clamp(0.0, 1.0);
         self.send(&serde_json::json!({
             "cmd": "volume",
             "level": volume,
         }))
-        .await
+        .await?;
+        *self.volume.lock().await = volume;
+        self.muted.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
@@ -361,7 +379,9 @@ impl OutputTarget for Airplay2Output {
             "cmd": "volume",
             "level": vol,
         }))
-        .await
+        .await?;
+        self.muted.store(muted, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -380,13 +400,16 @@ impl OutputTarget for Airplay2Output {
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
             volume: *self.volume.lock().await,
-            muted: false,
+            muted: self.muted.load(Ordering::Relaxed),
             current_uri: None,
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 

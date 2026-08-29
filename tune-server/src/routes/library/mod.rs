@@ -1,7 +1,10 @@
+mod album_order;
 mod albums;
+mod albums_detailed;
 mod ambiances;
 mod artists;
 mod artwork;
+mod better_quality;
 mod browse;
 mod collections;
 mod credits;
@@ -11,7 +14,11 @@ mod facets;
 mod folder_facet;
 mod genres;
 mod ingest;
+mod lyrics_pass;
+mod proposals;
+mod query_multi;
 mod ratings;
+mod reidentify;
 mod reports;
 mod search;
 mod stats;
@@ -179,6 +186,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/count", get(albums::album_count))
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
+        .route("/albums-detailed", get(albums_detailed::albums_detailed))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
@@ -204,6 +212,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
+        .route("/tracks/{id}/versions", get(tracks::track_versions))
         .route(
             "/tracks/{id}/synced-lyrics",
             get(tracks::track_synced_lyrics),
@@ -235,6 +244,10 @@ pub fn router() -> Router<AppState> {
             "/reports",
             get(reports::list_reports).post(reports::create_report),
         )
+        // Corrections que la communaute propose sur cette bibliotheque.
+        .route("/proposals", get(proposals::list_proposals))
+        .route("/proposals/{id}/decision", post(proposals::decide_proposal))
+        .route("/proposals/auto-apply", post(proposals::set_auto_apply))
         .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
         .route(
             "/tracks/{id}/metadata",
@@ -266,6 +279,10 @@ pub fn router() -> Router<AppState> {
         .route("/genres/{name}/albums", get(genres::genre_albums))
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
+        // Paroles (#2172) : l'indicateur d'abord, la passe de fond ensuite.
+        .route("/lyrics/status", get(lyrics_pass::lyrics_status))
+        .route("/lyrics/fetch", post(lyrics_pass::lyrics_fetch))
+        .route("/lyrics/write", post(lyrics_pass::lyrics_write))
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
@@ -309,6 +326,15 @@ pub fn router() -> Router<AppState> {
             get(artwork::batch_enrich_artist_artwork_status),
         )
         .route("/duplicates", get(duplicates::list_duplicates))
+        .route(
+            "/tracks/{id}/better-quality",
+            get(better_quality::track_better_quality),
+        )
+        .route(
+            "/albums/{id}/better-quality",
+            get(better_quality::album_better_quality),
+        )
+        .route("/duplicates/scan", post(duplicates::scan_duplicates))
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
         .route("/albums/{id}/bio", get(albums::album_bio))
@@ -316,6 +342,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}/artwork/rescan",
             post(artwork::rescan_album_artwork),
+        )
+        // Refaire l'identification d'UN album (#2128). Bornée à cet album :
+        // ni scan, ni passe de fond — voir l'en-tête de `reidentify.rs`.
+        .route(
+            "/albums/{id}/reidentify",
+            post(reidentify::reidentify_album),
         )
         .route(
             "/albums/merge-duplicates",

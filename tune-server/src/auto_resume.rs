@@ -90,6 +90,8 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         sample_rate: None,
         bit_depth: None,
         media_format: None,
+        track_number: None,
+        disc_number: None,
     };
 
     // Auto-resume must not block on a slow track resolution. Login-gated
@@ -107,10 +109,14 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
             let position_ms = zone.last_position_ms;
             if position_ms > 0 {
                 let device_id = zone.output_device_id.as_deref();
-                state
+                if let Err(error) = state
                     .orchestrator
                     .seek(zone_id, position_ms as u64, device_id)
-                    .await;
+                    .await
+                {
+                    warn!(zone_id, error = %error, "auto_resume_seek_failed");
+                    return false;
+                }
             }
             info!(
                 zone_id,

@@ -1,7 +1,9 @@
 mod api_proxy;
+mod licence;
 mod protocol;
 mod state;
 mod stream_proxy;
+mod web_ui;
 mod ws_client;
 mod ws_server;
 
@@ -56,7 +58,13 @@ async fn main() {
         .route(
             "/stream/relay/{server_id}/{*stream_path}",
             get(stream_proxy::proxy_stream),
-        )
+        );
+    // Le client web, s'il est fourni. Monte APRES les routes du relais : axum
+    // fait primer les segments statiques (`/api`, `/ws`, `/stream`, `/health`)
+    // sur le segment dynamique `{server_id}`, mais l'ordre rend l'intention
+    // lisible plutot que dependante d'une regle implicite.
+    let app = web_ui::monter(app);
+    let app = app
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

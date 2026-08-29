@@ -7,8 +7,35 @@ services:
     environment:
       - BRIDGE_PORT=9090
       - RUST_LOG=tune_bridge=info
+      # Client web servi sous /{server_id}/. Sans cette variable — ou si le
+      # repertoire est vide — le relais NE MONTE PAS ces routes et se comporte
+      # comme avant : un deploiement qui oublie le volume ne casse rien.
+      - TUNE_BRIDGE_WEB_DIR=/srv/web
+      # Verification d'eligibilite premium. SANS ce jeton, le relais accepte
+      # tout serveur qui se presente et le DIT au demarrage
+      # (bridge_eligibilite_non_appliquee). On ne refuse pas tout le monde en
+      # son absence : un deploiement qui l'oublie mettrait dehors tous les
+      # utilisateurs premium, et le symptome ne pointerait pas vers la cause.
+      - TUNE_CLOUD_SERVICE_TOKEN=${TUNE_CLOUD_SERVICE_TOKEN:-}
+      # Surchargeable pour une recette ; par defaut https://mozaiklabs.fr
+      - TUNE_CLOUD_BASE_URL=${TUNE_CLOUD_BASE_URL:-}
     ports:
       - "9090:9090"
+    volumes:
+      # A remplir avec le client web CONSTRUIT (le contenu de `dist/`), pris
+      # dans l'archive de la version publiee pour que l'interface servie a
+      # distance corresponde a celle du serveur. En lecture seule : le relais
+      # n'a aucune raison d'y ecrire.
+      #
+      #   mkdir -p bridge-web
+      #   tar xzf tune-server-<version>-linux-x86_64.tar.gz --strip-components=2 \
+      #       -C bridge-web '*/web/*'
+      #
+      # Un repertoire absent ou sans index.html laisse le relais sans
+      # interface, ce qui est le comportement d'avant — pas une panne.
+      - ./bridge-web:/srv/web:ro
     restart: unless-stopped
-    # TLS: handled by the existing mozaiklabs nginx container
-    # Add bridge.mozaiklabs.fr vhost in /opt/mozaiklabs/docker/nginx/
+    # TLS : assure par le conteneur nginx de mozaiklabs. Le vhost
+    # bridge.mozaiklabs.fr existe depuis site-mozaiklabs#151 — il vit DANS
+    # docker/nginx/nginx.conf, ce fichier etant monte a l'unite : un
+    # bridge.conf pose a cote ne serait jamais charge.

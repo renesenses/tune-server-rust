@@ -1,11 +1,12 @@
 {
   "productName": "Tune Widget",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "identifier": "fr.mozaiklabs.tune-widget",
   "build": {
     "frontendDist": "../src"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -36,6 +37,11 @@
     ],
     "macOS": {
       "minimumSystemVersion": "13.0"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
     }
   }
 }

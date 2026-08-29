@@ -12,9 +12,42 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::metadata::auto_fix::AutoFixEngine;
 use tune_core::metadata::{MetadataUpdate, write_metadata};
 
 use crate::state::AppState;
+
+/// Le moteur porte l'état d'un balayage en cours : il doit donc survivre à la
+/// requête qui le démarre, sans quoi `/auto-fix/status` interrogerait un objet
+/// neuf et répondrait éternellement « idle ». Un `OnceLock` de module plutôt
+/// qu'un champ d'`AppState` — même procédé que le cache du changelog, et sans
+/// faire enfler une structure partagée par tout le serveur.
+static AUTO_FIX: std::sync::OnceLock<std::sync::Arc<AutoFixEngine>> = std::sync::OnceLock::new();
+
+/// `AutoFixEngine` est bâti sur `SqliteDb`, et `AppState.db` vaut `None` en
+/// PostgreSQL. Renvoyer `None` ici permet aux routes de répondre un 501
+/// explicite — très supérieur au 404 muet d'aujourd'hui, qui laissait croire
+/// à un bouton cassé plutôt qu'à une fonction indisponible sur ce moteur.
+fn auto_fix_engine(state: &AppState) -> Option<std::sync::Arc<AutoFixEngine>> {
+    let db = state.db.as_ref()?;
+    Some(
+        AUTO_FIX
+            .get_or_init(|| std::sync::Arc::new(AutoFixEngine::new(db.clone())))
+            .clone(),
+    )
+}
+
+/// Réponse commune aux routes auto-fix quand la base n'est pas SQLite.
+fn auto_fix_unavailable() -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "ok": false,
+            "error": "auto-fix requires the SQLite backend",
+        })),
+    )
+        .into_response()
+}
 
 #[derive(Deserialize)]
 pub(crate) struct TrackEdit {
@@ -80,6 +113,20 @@ pub fn router() -> Router<AppState> {
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/suggestions/auto-apply", post(auto_apply_suggestions))
+        // Le moteur d'auto-correction vit dans tune-core depuis longtemps ;
+        // aucune route ne l'exposait, et le bouton « Correction automatique »
+        // partait en 404 (#1893).
+        .route("/auto-fix", post(start_auto_fix))
+        .route("/auto-fix/status", get(auto_fix_status))
+        // Un balayage qui dure des heures doit pouvoir s'interrompre, et ce
+        // qu'il trouve doit pouvoir se lire. Le moteur sait faire les deux
+        // depuis toujours ; aucune route ne les atteignait (#1893, #1993).
+        .route("/auto-fix/stop", post(auto_fix_stop))
+        .route("/auto-fix/suggestions", get(auto_fix_suggestions))
+        .route(
+            "/reclassify-genres-by-path",
+            post(reclassify_genres_by_path),
+        )
         .route("/suggestions/tracks/{track_id}", get(suggestions_for_track))
         .route("/suggestions/albums/{album_id}", get(suggestions_for_album))
         // Artist enrichment
@@ -101,6 +148,8 @@ pub fn router() -> Router<AppState> {
         // (Reivax66, #1089).
         .route("/fix-years-tags", post(fix_years_tags))
         .route("/fix-years-from-path", post(fix_years_from_path))
+        .route("/mp3/diagnose", post(diagnose_mp3))
+        .route("/mp3/repair", post(repair_mp3))
         // Album merge (targeted, by IDs)
         .route("/albums/merge", post(merge_albums))
         // Batch rename artist (used by web client)
@@ -199,6 +248,209 @@ async fn fix_years_tags(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /metadata/fix-years-from-path — infer missing album years from the
 /// folder/file path (e.g. "1973 - Dark Side" or "Album (1973)").
+/// Le rapport d'une anomalie MP3, tel que l'ecran Metadonnees le lit.
+fn anomalie(track_id: i64, chemin: &str, motifs: Vec<&str>) -> serde_json::Value {
+    json!({
+        "track_id": track_id,
+        "path": chemin,
+        "issues": motifs,
+    })
+}
+
+/// Les pistes MP3 de la bibliotheque : (id, chemin, duree, taille).
+fn pistes_mp3(state: &AppState) -> Vec<(i64, String, Option<i64>, Option<i64>)> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, file_path, duration_ms, file_size FROM tracks              WHERE file_path IS NOT NULL AND LOWER(file_path) LIKE '%.mp3'",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.first().and_then(|v| v.as_i64())?,
+                r.get(1).and_then(|v| v.as_string())?,
+                r.get(2).and_then(|v| v.as_i64()),
+                r.get(3).and_then(|v| v.as_i64()),
+            ))
+        })
+        .collect()
+}
+
+/// La duree en base porte-t-elle la signature du rognage ?
+///
+/// La borne inversee ecrivait `file_size * 8 * 1000 / 320_000`, soit
+/// `file_size / 40` (#2027). Tolerance de 1 ms pour absorber un arrondi
+/// ulterieur — une egalite stricte raterait une piste pour un millieme.
+///
+/// Un MP3 reellement encode a 320 kbps constant porte cette signature SANS
+/// avoir ete rogne : la relecture confirmera sa duree et ne signalera rien.
+fn signature_de_rognage(duree_ms: i64, taille: i64) -> bool {
+    taille > 0 && (duree_ms - taille / 40).abs() <= 1
+}
+
+/// POST /metadata/mp3/diagnose
+///
+/// Cherche les MP3 dont quelque chose de VERIFIABLE cloche. Le contrat du web
+/// laisse la liste des anomalies libre (`issues: string[]`) : on n'y met donc
+/// que ce qu'on sait etablir, jamais une supposition.
+///
+/// **Bornage.** Un `stat` sur chaque MP3 est bon marche ; relire chaque fichier
+/// ne l'est pas — sur un partage reseau, ce serait des heures. On ne relit donc
+/// que les pistes portant la signature de rognage, que le SQL isole sans
+/// toucher au disque.
+async fn diagnose_mp3(State(state): State<AppState>) -> impl IntoResponse {
+    let pistes = pistes_mp3(&state);
+
+    let resultat = tokio::task::spawn_blocking(move || {
+        let mut anomalies = Vec::new();
+        let mut manquants = 0usize;
+        let mut sains = 0usize;
+        let total = pistes.len();
+
+        for (id, chemin, duree, taille) in pistes {
+            // Le diagnostic accusait de `missing_file` des fichiers bien
+            // presents dont le nom est en NFD sur le disque alors que la base
+            // le tient en NFC (#1865). On resout la graphie reelle, et c'est
+            // ELLE qu'on sonde ensuite — jamais une chaine normalisee par nos
+            // soins.
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(&chemin)
+            else {
+                manquants += 1;
+                anomalies.push(anomalie(id, &chemin, vec!["missing_file"]));
+                continue;
+            };
+
+            let suspecte = matches!(
+                (duree, taille),
+                (Some(d), Some(t)) if signature_de_rognage(d, t)
+            );
+            if !suspecte {
+                sains += 1;
+                continue;
+            }
+
+            match tune_core::metadata::probe_duration_ms(std::path::Path::new(&sur_disque)) {
+                None => anomalies.push(anomalie(id, &chemin, vec!["unreadable"])),
+                Some(reelle) => {
+                    let ecart = (reelle as i64 - duree.unwrap_or(0)).abs();
+                    // Une seconde : en-deca, la valeur en base est deja juste.
+                    if ecart > 1000 {
+                        anomalies.push(anomalie(id, &chemin, vec!["duration_clamped"]));
+                    } else {
+                        sains += 1;
+                    }
+                }
+            }
+        }
+
+        (total, sains, manquants, anomalies)
+    })
+    .await;
+
+    let (total, sains, manquants, anomalies) = match resultat {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("diagnostic interrompu : {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    Json(json!({
+        "scanned": total,
+        "ok_files": sains,
+        "missing_files": manquants,
+        "issues_found": anomalies.len(),
+        "issues": anomalies,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct DemandeReparation {
+    #[serde(default)]
+    track_ids: Vec<i64>,
+}
+
+/// POST /metadata/mp3/repair
+///
+/// Relit les fichiers demandes et corrige leur duree en base.
+///
+/// Meme moteur que la passe automatique de #2034, mais sur une SELECTION : la
+/// passe ne tourne qu'une fois, et un utilisateur qui repare un fichier a la
+/// main a besoin de la relancer sur celui-la seulement.
+///
+/// `probe_duration_ms` lit sans garde-fou de vraisemblance : passer par
+/// `read_metadata` relirait la valeur par le chemin meme qui l'a corrompue.
+async fn repair_mp3(
+    State(state): State<AppState>,
+    Json(demande): Json<DemandeReparation>,
+) -> impl IntoResponse {
+    let demandees = demande.track_ids.len();
+    if demande.track_ids.is_empty() {
+        return Json(json!({
+            "repaired": 0, "requested": 0, "skipped": 0, "failed": [],
+        }))
+        .into_response();
+    }
+
+    let connues: std::collections::HashMap<i64, (String, Option<i64>)> = pistes_mp3(&state)
+        .into_iter()
+        .map(|(id, chemin, duree, _)| (id, (chemin, duree)))
+        .collect();
+
+    let mut reparees = 0usize;
+    let mut ignorees = 0usize;
+    let mut echecs = Vec::new();
+
+    for id in demande.track_ids {
+        let Some((chemin, ancienne)) = connues.get(&id).cloned() else {
+            echecs.push(json!({"track_id": id, "error": "piste inconnue ou non MP3"}));
+            continue;
+        };
+
+        let chemin_lecture = chemin.clone();
+        let reelle = tokio::task::spawn_blocking(move || {
+            tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin_lecture))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let Some(reelle) = reelle else {
+            echecs.push(json!({"track_id": id, "error": "fichier illisible ou absent"}));
+            continue;
+        };
+
+        let reelle = reelle as i64;
+        if (reelle - ancienne.unwrap_or(0)).abs() <= 1000 {
+            ignorees += 1;
+            continue;
+        }
+
+        match state.backend.execute(
+            "UPDATE tracks SET duration_ms = ? WHERE id = ?",
+            &[&reelle as &dyn tune_core::db::backend::ToSqlValue, &id],
+        ) {
+            Ok(_) => reparees += 1,
+            Err(e) => echecs.push(json!({"track_id": id, "error": e.to_string()})),
+        }
+    }
+
+    Json(json!({
+        "repaired": reparees,
+        "requested": demandees,
+        "skipped": ignorees,
+        "failed": echecs,
+    }))
+    .into_response()
+}
+
 async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse {
     let albums = match albums_missing_year(&state) {
         Ok(a) => a,
@@ -680,7 +932,9 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         return Json(json!({"error": "no lastfm api key configured"})).into_response();
     }
 
-    let client = reqwest::Client::new();
+    // Client partagé : voir `tune_core::http::client`. Apporte aussi un délai
+    // d'attente, qu'un client reqwest construit à la main n'a pas du tout.
+    let client = tune_core::http::client::shared();
     let resp = client
         .get("http://ws.audioscrobbler.com/2.0/")
         .query(&[
@@ -846,16 +1100,23 @@ async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> 
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // Voir auto_dj::similar_artist_names : pas de repli codé en dur, le client
+    // porte l'adresse de référence (#1730).
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let api_base = settings
-        .get("artist_enrichment_api")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+    let api_base = settings.get("artist_enrichment_api").ok().flatten();
 
-    let mut client =
-        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
-    let data = client.get_similar(&artist.name).await;
+    let mut client = tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(
+        api_base.as_deref(),
+        10,
+    );
+    // Même correction qu'en auto_dj : l'API est indexée par MBID, la route
+    // lui passait le nom de l'artiste (#1730). Un artiste inconnu du cloud
+    // rend une liste vide, pas une erreur — la vue « artistes similaires »
+    // reste affichable.
+    let data = match client.resolve_mbid(&artist.name).await {
+        Some(mbid) => client.get_similar(&mbid).await,
+        None => Vec::new(),
+    };
     Json(json!(data)).into_response()
 }
 
@@ -2120,5 +2381,309 @@ mod year_path_tests {
         assert_eq!(extract_year_from_path("/Music/2200/x.flac"), None);
         // No 4-digit token at all.
         assert_eq!(extract_year_from_path("/Music/Greatest Hits/x.flac"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-fix — le moteur existait, la porte manquait
+// ---------------------------------------------------------------------------
+//
+// `tune_core::metadata::auto_fix::AutoFixEngine` est complet depuis longtemps :
+// il balaie les pistes incomplètes, enrichit, et tient un état de progression
+// dont les champs (`status`, `current`, `total`, `fixed`, `suggestions`) sont
+// exactement ceux que lit `MetadataView.svelte`. Aucune route ne l'exposait :
+// le bouton « Correction automatique » partait en 404 depuis toujours.
+
+#[derive(Deserialize, Default)]
+struct AutoFixBody {
+    /// À partir de ce degré de confiance, une suggestion est appliquée sans
+    /// demander. En deçà, elle est proposée. Même valeur par défaut que
+    /// `/suggestions/auto-apply`, pour que les deux chemins se comportent pareil.
+    threshold: Option<f64>,
+    batch_size: Option<usize>,
+}
+
+/// POST /metadata/auto-fix — démarre un balayage en tâche de fond.
+async fn start_auto_fix(
+    State(state): State<AppState>,
+    body: Option<Json<AutoFixBody>>,
+) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+
+    match engine
+        .start_scan(b.threshold.unwrap_or(0.9), b.batch_size.unwrap_or(50))
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true, "status": "running" })).into_response(),
+        // Un balayage déjà lancé n'est pas une erreur du client : le web
+        // s'en protège déjà (`if (autoFixStatus === 'running') return`), mais
+        // deux onglets ouverts contournent cette garde. On répond l'état réel.
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "ok": false, "error": e, "status": "running" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Coût réel d'une piste : au moins deux appels MusicBrainz, espacés de
+/// 1100 ms par la limitation de `enrichment.rs`. Sur les 5 000 pistes que
+/// `find_incomplete_tracks` peut retenir, le balayage dure des HEURES.
+const SECONDES_PAR_PISTE: u64 = 3;
+
+/// GET /metadata/auto-fix/status — progression du balayage.
+async fn auto_fix_status(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    let p = engine.status().await;
+    let restantes = p.total.saturating_sub(p.current) as u64;
+    Json(json!({
+        "status": p.status,
+        "current": p.current,
+        "total": p.total,
+        "fixed": p.fixed,
+        "suggestions": p.suggestions,
+        "running": engine.is_running().await,
+        // Sans estimation, l'utilisateur ne distingue pas dix minutes de trois
+        // heures et conclut que « ça ne marche pas ». C'est exactement le
+        // silence qui a produit #1372, #1555 et #1688 sur l'égaliseur.
+        "eta_seconds": restantes * SECONDES_PAR_PISTE,
+        // Le seuil transmis au moteur decide maintenant entre application et
+        // suggestion. Le client peut donc annoncer le comportement reel.
+        "applies_changes": true,
+    }))
+    .into_response()
+}
+
+/// POST /metadata/auto-fix/stop — interrompre le balayage.
+///
+/// `AutoFixEngine::stop` existe depuis toujours et n'était atteignable par
+/// aucune route. Un travail de plusieurs heures qu'on ne peut pas arrêter
+/// n'est pas une fonctionnalité, c'est un piège.
+async fn auto_fix_stop(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    engine.stop().await;
+    Json(json!({ "ok": true, "status": "stopping" })).into_response()
+}
+
+/// GET /metadata/auto-fix/suggestions — ce que le balayage a trouvé.
+///
+/// Le moteur accumule ses trouvailles en mémoire ; sans cette route, elles
+/// n'étaient lisibles par personne.
+async fn auto_fix_suggestions(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = auto_fix_engine(&state) else {
+        return auto_fix_unavailable();
+    };
+    let s = engine.get_suggestions().await;
+    Json(json!({ "count": s.len(), "suggestions": s })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Reclassement des genres d'après le chemin
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReclassifyQuery {
+    /// Prévisualiser sans écrire. Le web appelle d'abord ainsi, affiche le
+    /// nombre et un exemple, puis rappelle sans le drapeau si l'utilisateur
+    /// confirme.
+    dry_run: Option<bool>,
+}
+
+/// Les genres candidats sont ceux qui existent DÉJÀ dans la bibliothèque.
+///
+/// C'est le choix central de cette route : aucune taxonomie n'est inventée ni
+/// embarquée. Si un dossier s'appelle « Jazz » et qu'aucune piste n'est taguée
+/// « Jazz », rien n'est proposé — on ne devine pas ce que l'utilisateur appelle
+/// ses genres. À l'inverse, une bibliothèque rangée par genre se reclasse avec
+/// son propre vocabulaire, accents et casse compris.
+fn known_genres(state: &AppState) -> Vec<String> {
+    state
+        .backend
+        .query_many(
+            "SELECT DISTINCT genre FROM tracks \
+             WHERE genre IS NOT NULL AND genre <> '' ORDER BY genre",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.into_iter().next().and_then(|v| v.as_string()))
+        .filter(|g| g.chars().count() >= 3)
+        .collect()
+}
+
+/// Les pistes sans genre, avec leur chemin — ce sont les seules concernées.
+/// Écraser un genre existant d'après un nom de dossier serait une perte
+/// d'information : le tag est une donnée, le dossier une commodité.
+fn tracks_missing_genre(state: &AppState) -> Vec<(i64, String, String)> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, title, file_path FROM tracks \
+             WHERE (genre IS NULL OR genre = '') \
+               AND file_path IS NOT NULL AND file_path <> ''",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let id = it.next()?.as_i64()?;
+            let title = it.next().and_then(|v| v.as_string()).unwrap_or_default();
+            let path = it.next()?.as_string()?;
+            Some((id, title, path))
+        })
+        .collect()
+}
+
+/// Un segment du chemin correspond-il à un genre connu ?
+///
+/// La comparaison ignore la casse et exige le segment ENTIER : un dossier
+/// « Rockabilly » ne doit pas être lu comme « Rock ». C'est la raison du
+/// découpage par séparateur plutôt qu'une recherche de sous-chaîne.
+fn genre_from_path(path: &str, genres: &[String]) -> Option<String> {
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    // Du plus proche du fichier vers la racine : le dossier le plus spécifique
+    // l'emporte sur un dossier de tête qui se trouverait porter le même nom.
+    for seg in segments.iter().rev() {
+        for g in genres {
+            if seg.eq_ignore_ascii_case(g) {
+                return Some(g.clone());
+            }
+        }
+    }
+    None
+}
+
+/// POST /metadata/reclassify-genres-by-path?dry_run=true
+async fn reclassify_genres_by_path(
+    State(state): State<AppState>,
+    Query(q): Query<ReclassifyQuery>,
+) -> impl IntoResponse {
+    let dry_run = q.dry_run.unwrap_or(false);
+    let genres = known_genres(&state);
+    let candidates = tracks_missing_genre(&state);
+    let scanned = candidates.len();
+
+    let mut details: Vec<serde_json::Value> = Vec::new();
+    let mut fixed = 0usize;
+
+    for (id, title, path) in candidates {
+        let Some(genre) = genre_from_path(&path, &genres) else {
+            continue;
+        };
+        if dry_run {
+            // Un aperçu ne doit pas grossir sans fin : le web n'en affiche
+            // qu'un exemple, le total est porté par `suggestions_total`.
+            if details.len() < 200 {
+                details.push(json!({ "title": title, "suggested": genre }));
+            }
+            fixed += 1;
+        } else {
+            let ok = state
+                .backend
+                .execute(
+                    "UPDATE tracks SET genre = ? WHERE id = ?",
+                    &[&genre as &dyn tune_core::db::backend::ToSqlValue, &id],
+                )
+                .is_ok();
+            if ok {
+                fixed += 1;
+            }
+        }
+    }
+
+    tracing::info!(scanned, fixed, dry_run, "reclassify_genres_by_path_done");
+
+    if dry_run {
+        Json(json!({
+            "ok": true,
+            "scanned": scanned,
+            "suggestions_total": fixed,
+            "details": details,
+        }))
+        .into_response()
+    } else {
+        Json(json!({ "ok": true, "scanned": scanned, "fixed": fixed })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod genre_from_path_tests {
+    use super::genre_from_path;
+
+    fn genres() -> Vec<String> {
+        ["Rock", "Jazz", "Classique", "Musique du monde"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Le cas nominal : une bibliothèque rangée par genre.
+    #[test]
+    fn un_dossier_nomme_comme_un_genre_est_reconnu() {
+        assert_eq!(
+            genre_from_path(
+                "/mnt/music/Jazz/Miles Davis/Kind of Blue/01.flac",
+                &genres()
+            ),
+            Some("Jazz".to_string())
+        );
+    }
+
+    /// LA décision de conception : le segment doit correspondre ENTIÈREMENT.
+    /// Une recherche de sous-chaîne classerait « Rockabilly » en « Rock », et
+    /// l'utilisateur retrouverait un genre qu'il n'a jamais choisi.
+    #[test]
+    fn un_dossier_qui_contient_un_genre_sans_l_etre_est_ignore() {
+        assert_eq!(
+            genre_from_path("/mnt/music/Rockabilly/Stray Cats/01.flac", &genres()),
+            None
+        );
+    }
+
+    /// Le dossier le plus proche du fichier l'emporte : sur
+    /// `/Jazz/…/Rock/…`, c'est l'intention la plus précise qui compte.
+    #[test]
+    fn le_dossier_le_plus_specifique_gagne() {
+        assert_eq!(
+            genre_from_path("/mnt/Jazz/compilations/Rock/01.flac", &genres()),
+            Some("Rock".to_string())
+        );
+    }
+
+    /// La casse ne doit pas faire échouer la reconnaissance.
+    #[test]
+    fn la_casse_est_ignoree() {
+        assert_eq!(
+            genre_from_path("/mnt/music/JAZZ/x/01.flac", &genres()),
+            Some("Jazz".to_string())
+        );
+    }
+
+    /// Les chemins Windows utilisent l'antislash.
+    #[test]
+    fn les_chemins_windows_sont_decoupes() {
+        assert_eq!(
+            genre_from_path(r"C:\Musique\Classique\Bach\01.flac", &genres()),
+            Some("Classique".to_string())
+        );
+    }
+
+    /// Aucun genre connu dans le chemin : on ne propose rien plutôt que
+    /// d'inventer. C'est ce qui rend la route sûre sur une bibliothèque
+    /// rangée par artiste.
+    #[test]
+    fn rien_nest_propose_hors_correspondance() {
+        assert_eq!(
+            genre_from_path("/mnt/music/Miles Davis/Kind of Blue/01.flac", &genres()),
+            None
+        );
     }
 }

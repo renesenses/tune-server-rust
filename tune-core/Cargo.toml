@@ -3,6 +3,7 @@ name = "tune-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 tune-output-api = { path = "../tune-output-api" }
@@ -20,6 +21,7 @@ socket2 = { workspace = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+image = { workspace = true }
 zip = { workspace = true }
 realfft = "3"
 rayon = { workspace = true }
@@ -66,11 +68,6 @@ webpki-roots = "0.26"
 # env-only derivation collided every instance on "tune-server" (#1112, #1127).
 # Already in the lockfile transitively, so this is a near-free direct dep.
 hostname = "0.4"
-# Embedded WASM runtime for the plugin ABI (RFC §3, P0). Optional and gated
-# behind the `plugins-wasm` feature so the default server build is unchanged.
-# default-features trimmed to compiler + runtime + WAT parsing; no async,
-# component-model, gc, threads, profiling, pooling, coredump, debug.
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -96,15 +93,49 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
+# AirPlay 2 HomeKit-style pairing (pair-setup SRP-6a + pair-verify Curve25519).
+# All pinned to the RustCrypto digest 0.10 / sha2 0.10 generation used across
+# the workspace so no duplicate hashing stack is pulled in.
+srp = "0.6"
+hkdf = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[test]]
+name = "integration_contracts"
+path = "tests/integration_contracts.rs"
+
+# `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
+# tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
+# que tune_core, déjà construit (#2213).
+[[test]]
+name = "terminologie_eq"
+path = "tests/terminologie_eq.rs"
+
+# Binaire de test a lui seul, DELIBEREMENT (#2665). `tracing` met en cache pour
+# tout le processus la decision « ce point d appel interesse-t-il quelqu un ? »
+# et le niveau maximal utile ; un abonne pose le temps d un await, dans un
+# binaire qui en cree des dizaines en parallele, se voit priver d evenements de
+# facon imprevisible — capture vide 1 execution sur 6 de la suite du crate,
+# quand le meme test seul passait 8 fois sur 8. Ici l abonne est GLOBAL et ce
+# fichier ne contient qu un test : plus aucun ordonnancement n entre en jeu.
+[[test]]
+name = "journal_descriptif_illisible"
+path = "tests/journal_descriptif_illisible.rs"
 
 [[bench]]
 name = "dsd_to_pcm"
@@ -112,15 +143,11 @@ harness = false
 
 [features]
 default = ["local-audio"]
-local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
 plugin-http = ["dep:axum"]
-# P0 of the plugin ABI: embed wasmtime to load/instantiate/call wasm plugins
-# with JSON-over-linear-memory marshalling under resource limits. NOT in
-# default — the default server build must not pull in wasmtime.
-plugins-wasm = ["dep:wasmtime"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 cloud-relay = ["dep:tokio-tungstenite"]
@@ -129,3 +156,16 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
+
+[build-dependencies]
+cc = "1"
+
+# AAC natif Windows (#1527) : Media Foundation via le crate `windows` —
+# même version 0.62 que celle que cpal tire déjà, donc aucune compilation
+# dupliquée sur les cibles Windows.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }

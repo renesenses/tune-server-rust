@@ -8,19 +8,24 @@
 //! status is read back from the shared player registry (updated by STAT).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 use crate::slimproto::{
-    CommandChannels, PlayerRegistry, ServerMessage, build_strm_start, strm_control,
+    CommandChannels, PlayerRegistry, ServerMessage, SlimProtoPlayback, build_strm_start,
+    lock_playback, new_playback_state, strm_control,
 };
 
-/// Transport state stored as a `u8` so it can live behind an `Arc<AtomicU8>`.
-const ST_STOPPED: u8 = 0;
-const ST_PLAYING: u8 = 1;
-const ST_PAUSED: u8 = 2;
+#[derive(Debug, Default)]
+struct CurrentMedia {
+    uri: Option<String>,
+    duration_ms: u64,
+    title: Option<String>,
+    artist: Option<String>,
+}
 
 /// A native SlimProto audio output bound to one connected player (by MAC).
 pub struct SlimProtoOutput {
@@ -32,8 +37,15 @@ pub struct SlimProtoOutput {
     players: PlayerRegistry,
     /// Per-player command senders owned by the server (push `strm`/`audg`).
     command_channels: CommandChannels,
-    /// Locally-tracked transport state (set by the playback commands).
-    state: Arc<AtomicU8>,
+    /// Functional state shared with the SlimProto TCP reader.  STAT confirms
+    /// playback and is the authority for decoder completion/final drain.
+    playback: SlimProtoPlayback,
+    /// Contract of the last accepted `PlayMedia`, which SlimProto STAT does not
+    /// carry back to the server.
+    current_media: Arc<Mutex<CurrentMedia>>,
+    /// Last volume command accepted by the player's command channel.
+    volume: Arc<Mutex<f64>>,
+    muted: Arc<AtomicBool>,
 }
 
 impl SlimProtoOutput {
@@ -44,21 +56,34 @@ impl SlimProtoOutput {
         players: PlayerRegistry,
         command_channels: CommandChannels,
     ) -> Self {
+        Self::new_with_playback(
+            name,
+            device_id,
+            mac_str,
+            players,
+            command_channels,
+            new_playback_state(),
+        )
+    }
+
+    pub(crate) fn new_with_playback(
+        name: String,
+        device_id: String,
+        mac_str: String,
+        players: PlayerRegistry,
+        command_channels: CommandChannels,
+        playback: SlimProtoPlayback,
+    ) -> Self {
         Self {
             name,
             device_id,
             mac_str,
             players,
             command_channels,
-            state: Arc::new(AtomicU8::new(ST_STOPPED)),
-        }
-    }
-
-    fn transport(&self) -> TransportState {
-        match self.state.load(Ordering::Relaxed) {
-            ST_PLAYING => TransportState::Playing,
-            ST_PAUSED => TransportState::Paused,
-            _ => TransportState::Stopped,
+            playback,
+            current_media: Arc::new(Mutex::new(CurrentMedia::default())),
+            volume: Arc::new(Mutex::new(1.0)),
+            muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -106,6 +131,10 @@ impl OutputTarget for SlimProtoOutput {
         "slimproto"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, false, true, true, false)
+    }
+
     /// Native SlimProto has no internal next-track staging yet (phase 3 wires
     /// `set_next_url` → `strm s` autostart). Rely on the poller's natural-end
     /// advance for now so a single-track Repeat queue still loops.
@@ -117,54 +146,70 @@ impl OutputTarget for SlimProtoOutput {
         let (port, path) = parse_stream_url(media.url)
             .ok_or_else(|| format!("slimproto: unparseable stream url {}", media.url))?;
         self.send(build_strm_start(port, &path)).await?;
-        self.state.store(ST_PLAYING, Ordering::Relaxed);
+        {
+            let mut current = self.current_media.lock().await;
+            current.uri = Some(media.url.to_string());
+            current.duration_ms = media.duration_ms.unwrap_or(0);
+            current.title = media.title.map(str::to_string);
+            current.artist = media.artist.map(str::to_string);
+        }
+        lock_playback(&self.playback).begin_playback();
         Ok(())
     }
 
     async fn pause(&self) -> Result<(), String> {
         self.send(strm_control(b'p')).await?;
-        self.state.store(ST_PAUSED, Ordering::Relaxed);
+        lock_playback(&self.playback).pause();
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
         self.send(strm_control(b'u')).await?;
-        self.state.store(ST_PLAYING, Ordering::Relaxed);
+        lock_playback(&self.playback).resume();
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
         // Best-effort: the player may already be gone; ignore a closed channel.
         let _ = self.send(strm_control(b'q')).await;
-        self.state.store(ST_STOPPED, Ordering::Relaxed);
+        lock_playback(&self.playback).stop();
         Ok(())
     }
 
     async fn seek(&self, _position_ms: u64) -> Result<(), String> {
-        // Precise seek on the sequential stream needs a re-issued positioned
-        // stream (phase 3). No-op for now so a seek request doesn't error.
-        Ok(())
+        Err("seek not supported on SlimProto".into())
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         // SlimProto digital gain is fixed-point with 65536 = unity.
-        let g = (volume.clamp(0.0, 1.0) * 65536.0).round() as u32;
+        let volume = volume.clamp(0.0, 1.0);
+        let g = (volume * 65536.0).round() as u32;
         self.send(ServerMessage::Audg {
             left_gain: g,
             right_gain: g,
             digital_volume: 1,
         })
-        .await
+        .await?;
+        *self.volume.lock().await = volume;
+        self.muted.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let g = if muted { 0 } else { 65536 };
+        let volume = *self.volume.lock().await;
+        let g = if muted {
+            0
+        } else {
+            (volume * 65536.0).round() as u32
+        };
         self.send(ServerMessage::Audg {
             left_gain: g,
             right_gain: g,
             digital_volume: 1,
         })
-        .await
+        .await?;
+        self.muted.store(muted, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -172,18 +217,35 @@ impl OutputTarget for SlimProtoOutput {
             let reg = self.players.lock().await;
             reg.get(&self.mac_str).map(|p| p.elapsed_ms as u64)
         };
+        let (state, ended_naturally) = {
+            let playback = lock_playback(&self.playback);
+            (playback.transport, playback.ended_naturally)
+        };
+        let (duration_ms, current_uri, track_title, track_artist) = {
+            let current = self.current_media.lock().await;
+            (
+                current.duration_ms,
+                current.uri.clone(),
+                current.title.clone(),
+                current.artist.clone(),
+            )
+        };
+        let volume = *self.volume.lock().await;
         Ok(OutputStatus {
-            state: self.transport(),
+            state,
             position_ms: position_ms.unwrap_or(0),
-            duration_ms: 0,
-            volume: 1.0,
-            muted: false,
-            current_uri: None,
-            track_title: None,
-            track_artist: None,
-            ended_naturally: false,
+            duration_ms,
+            volume,
+            muted: self.muted.load(Ordering::Relaxed),
+            current_uri,
+            track_title,
+            track_artist,
+            ended_naturally,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 
@@ -198,18 +260,111 @@ impl OutputTarget for SlimProtoOutput {
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         let reg = self.players.try_lock().ok()?;
         let p = reg.get(&self.mac_str)?;
+        let playback = lock_playback(&self.playback);
         Some(serde_json::json!({
             "mac": self.mac_str,
-            "transport": match self.transport() {
+            "transport": match playback.transport {
                 TransportState::Playing => "playing",
                 TransportState::Paused => "paused",
                 TransportState::Transitioning => "transitioning",
                 TransportState::Stopped => "stopped",
             },
+            "decoder_finished": playback.decoder_finished,
+            "ended_naturally": playback.ended_naturally,
+            "playback_error": playback.failure.map(|failure| failure.diagnostic()),
             "elapsed_ms": p.elapsed_ms,
             "bytes_received": p.bytes_received,
             "last_stat_event": String::from_utf8_lossy(&p.last_event).trim_end_matches('\0'),
             "last_stat_secs_ago": p.last_stat.elapsed().as_secs(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::slimproto::SlimProtoPlayer;
+
+    #[tokio::test]
+    async fn stat_pilote_le_statut_complet_et_la_fin_naturelle() {
+        let mac_str = "00:11:22:33:44:55".to_string();
+        let playback = new_playback_state();
+        let players = Arc::new(Mutex::new(HashMap::new()));
+        players.lock().await.insert(
+            mac_str.clone(),
+            SlimProtoPlayer {
+                mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                mac_str: mac_str.clone(),
+                name: "Squeezelite Test".into(),
+                addr: "127.0.0.1:12345".parse().unwrap(),
+                device_type: 12,
+                firmware_version: 1,
+                last_stat: Instant::now(),
+                elapsed_ms: 0,
+                bytes_received: 0,
+                last_event: [0; 4],
+                playback: Arc::clone(&playback),
+            },
+        );
+
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        channels.lock().await.insert(mac_str.clone(), tx);
+        let output = SlimProtoOutput::new_with_playback(
+            "Squeezelite Test".into(),
+            "slimproto-test".into(),
+            mac_str.clone(),
+            Arc::clone(&players),
+            channels,
+            Arc::clone(&playback),
+        );
+
+        output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:8080/audio/42",
+                mime_type: "audio/flac",
+                title: Some("Piste témoin"),
+                artist: Some("Artiste témoin"),
+                duration_ms: Some(180_000),
+                ..PlayMedia::default()
+            })
+            .await
+            .unwrap();
+        rx.recv().await.expect("commande strm s");
+
+        let pending = output.get_status().await.unwrap();
+        assert_eq!(pending.state, TransportState::Transitioning);
+        assert_eq!(pending.duration_ms, 180_000);
+        assert_eq!(
+            pending.current_uri.as_deref(),
+            Some("http://127.0.0.1:8080/audio/42")
+        );
+        assert_eq!(pending.track_title.as_deref(), Some("Piste témoin"));
+        assert_eq!(pending.track_artist.as_deref(), Some("Artiste témoin"));
+
+        {
+            let mut player = players.lock().await;
+            let player = player.get_mut(&mac_str).unwrap();
+            player.elapsed_ms = 12_345;
+            player.last_event = *b"STMs";
+            lock_playback(&player.playback).apply_stat(*b"STMs");
+        }
+        let playing = output.get_status().await.unwrap();
+        assert_eq!(playing.state, TransportState::Playing);
+        assert_eq!(playing.position_ms, 12_345);
+        assert!(!playing.ended_naturally);
+
+        lock_playback(&playback).apply_stat(*b"STMd");
+        let decoded = output.get_status().await.unwrap();
+        assert_eq!(decoded.state, TransportState::Playing);
+        assert!(!decoded.ended_naturally);
+
+        lock_playback(&playback).apply_stat(*b"STMu");
+        let drained = output.get_status().await.unwrap();
+        assert_eq!(drained.state, TransportState::Stopped);
+        assert!(drained.ended_naturally);
     }
 }

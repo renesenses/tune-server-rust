@@ -1,4 +1,6 @@
+pub mod aac_encoder;
 pub mod aiff;
+pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
@@ -17,20 +19,28 @@ pub mod embedding;
 pub mod embedding_store;
 pub mod encoder;
 pub mod eq;
+pub mod eq_presets;
 pub mod faststart;
 pub mod formats;
+pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
+pub mod m4a;
 pub mod mixer;
+pub mod opus_ogg;
 pub mod pipeline;
 pub mod replaygain;
+pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+pub mod staged_growth;
+pub mod support;
 pub mod tap;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
+pub mod thermal;
 pub mod wav;
 pub mod wavpack;
 

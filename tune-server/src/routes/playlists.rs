@@ -855,7 +855,11 @@ async fn fetch_url_guarded(
         return Err((StatusCode::BAD_GATEWAY, "host did not resolve".to_string()));
     }
 
-    let client = reqwest::Client::builder()
+    // Construit depuis `tune_core::http::client::builder()` pour hériter du TLS
+    // webpki, en conservant les deux réglages voulus ici : aucune redirection
+    // (une redirection contournerait le contrôle d'adresse privée ci-dessus) et
+    // un délai d'attente court.
+    let client = tune_core::http::client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1031,10 +1035,13 @@ async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) ->
     for tid in &track_ids {
         let (title, artist, present) = match trepo.get(*tid) {
             Ok(Some(t)) => {
+                // Repli de graphie NFC/NFD (#1865) : un `Path::exists()`
+                // nu declarait « indisponible » des pistes bien presentes,
+                // ecrites en NFD par macOS ou un partage SMB.
                 let ok = t
                     .file_path
                     .as_deref()
-                    .map(|p| std::path::Path::new(p).exists())
+                    .map(|p| !tune_core::library::local_path::resolve_local_path(p).is_missing())
                     .unwrap_or(false);
                 (t.title, t.artist_name.unwrap_or_default(), ok)
             }
@@ -1228,10 +1235,12 @@ async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> i
         match track_repo.get(*tid) {
             Ok(Some(t)) if t.file_path.is_some() => {
                 let path = t.file_path.as_ref().unwrap();
-                if std::path::Path::new(path).exists() {
-                    recovered += 1;
-                } else {
+                // Meme repli qu'au-dessus (#1865) : « encore manquante » ne
+                // doit pas vouloir dire « ecrite dans l'autre forme Unicode ».
+                if tune_core::library::local_path::resolve_local_path(path).is_missing() {
                     missing += 1;
+                } else {
+                    recovered += 1;
                 }
             }
             _ => missing += 1,

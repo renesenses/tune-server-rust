@@ -92,30 +92,150 @@ const COVER_FILE_NAMES: &[&str] = &[
     "front.png",
 ];
 
-/// Empreinte de la pochette POSÉE DANS le dossier, `None` s'il n'y en a pas.
+/// Écart maximal, en bits, entre deux empreintes réputées porter la MÊME
+/// pochette.
+///
+/// Mesuré sur les 32 albums que la première version de ce découpage a séparés
+/// sur .18 : les paires de dossiers portant visuellement la même image tombent
+/// entre **0 et 2** bits d'écart, les pochettes réellement différentes
+/// commencent à **6**. Quatre coupe l'intervalle sans frôler ni l'un ni
+/// l'autre bord.
+pub const COVER_DISTANCE_MAX: u32 = 4;
+
+// Sortir de cet intervalle ferait revenir l'un des deux défauts : sous 3, les
+// ré-encodages recoupent et les albums se redécoupent ; à partir de 6, deux
+// volumes distincts se confondent. Vérifié à la compilation plutôt qu'en test,
+// pour que la borne arrête celui qui touche à la constante, pas celui qui
+// lance la suite.
+const _: () = assert!(COVER_DISTANCE_MAX > 2 && COVER_DISTANCE_MAX < 6);
+
+/// Empreinte PERCEPTUELLE d'une pochette : ce que l'image montre, pas les
+/// octets qui la codent.
+///
+/// La première version hachait le fichier (SHA-256). Elle a fait la preuve de
+/// son insuffisance en production : sur .18, dix-sept albums légitimes ont été
+/// coupés en deux parce que le même artwork y était présent deux fois avec un
+/// ré-encodage différent. Cas mesuré — la pochette Stockfisch, 750×750 des deux
+/// côtés, pixel pour pixel identique à l'œil, 40 562 octets d'un côté et 41 823
+/// de l'autre. Deux SHA-256 sans rapport, donc deux disques pour la machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverFingerprint(u64);
+
+impl CoverFingerprint {
+    /// Les deux empreintes désignent-elles la même pochette ?
+    ///
+    /// Volontairement pas `PartialEq` : une égalité stricte inviterait à s'en
+    /// servir comme clé de table de hachage, ce qu'une empreinte à seuil ne
+    /// permet pas (la relation n'est pas transitive). Il faut comparer deux à
+    /// deux, d'où une méthode qui se voit.
+    pub fn matches(&self, other: &Self) -> bool {
+        (self.0 ^ other.0).count_ones() <= COVER_DISTANCE_MAX
+    }
+}
+
+/// Empreinte de la pochette POSÉE DANS le dossier, `None` s'il n'y en a pas
+/// ou si l'image est illisible.
 ///
 /// À ne pas confondre avec la jaquette extraite des pistes, ré-encodée fichier
 /// par fichier par certains fournisseurs (Qobuz) — celle-là diffère d'une piste
 /// à l'autre et ne regroupe rien. Le `cover.jpg` déposé à côté des fichiers,
-/// lui, est copié à l'identique dans tous les dossiers d'un même disque.
+/// lui, accompagne tous les dossiers d'un même disque.
 ///
 /// C'est ce qui permet de séparer plusieurs VOLUMES portant le même titre :
 /// mesuré sur .18, les 41 dossiers « ALLOPOP » se répartissent exactement en
 /// quatre pochettes distinctes — quatre volumes (idée de Bertrand, #1444).
-pub fn folder_cover_fingerprint(folder: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
+///
+/// L'empreinte est un *dHash* 8×8 : l'image est ramenée en 9×8 niveaux de gris,
+/// puis chaque bit dit si un pixel est plus sombre que son voisin de droite.
+/// Comparer des gradients plutôt que des valeurs absolues rend l'empreinte
+/// insensible à la résolution, à la qualité JPEG et aux écarts de luminosité —
+/// exactement les trois choses qui varient entre deux copies d'une pochette.
+///
+/// Une image qu'on n'arrive pas à décoder ne donne pas d'empreinte : sans
+/// signal, l'appelant ne regroupe ni ne sépare, ce qui est le côté prudent.
+pub fn folder_cover_fingerprint(folder: &str) -> Option<CoverFingerprint> {
     for name in COVER_FILE_NAMES {
         let path = Path::new(folder).join(name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if bytes.is_empty() {
-                continue;
-            }
-            let mut h = Sha256::new();
-            h.update(&bytes);
-            return Some(format!("{:x}", h.finalize()));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
         }
+        return cover_fingerprint_from_bytes(&bytes);
     }
     None
+}
+
+/// Répartit des éléments en groupes portant la même pochette.
+///
+/// Rend `(groupes, sans_pochette)` : les indices des éléments dont l'empreinte
+/// est absente sortent à part, l'appelant seul sachant si les ignorer ou les
+/// laisser en place.
+///
+/// L'appartenance se décide contre le PREMIER membre de chaque groupe, jamais
+/// de proche en proche. [`CoverFingerprint::matches`] tolère un écart, donc la
+/// relation n'est pas transitive : `a≈b` et `b≈c` n'entraînent pas `a≈c`, et
+/// un rattachement transitif laisserait un groupe glisser d'une pochette à
+/// une autre par petits pas. Avec un seuil de quatre bits sur soixante-quatre
+/// la dérive resterait théorique, mais le coût de s'en prémunir est nul.
+pub fn group_by_cover(empreintes: &[Option<CoverFingerprint>]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut groupes: Vec<(CoverFingerprint, Vec<usize>)> = Vec::new();
+    let mut sans_pochette = Vec::new();
+    for (i, empreinte) in empreintes.iter().enumerate() {
+        let Some(empreinte) = empreinte else {
+            sans_pochette.push(i);
+            continue;
+        };
+        match groupes.iter_mut().find(|(chef, _)| chef.matches(empreinte)) {
+            Some((_, membres)) => membres.push(i),
+            None => groupes.push((*empreinte, vec![i])),
+        }
+    }
+    (
+        groupes.into_iter().map(|(_, membres)| membres).collect(),
+        sans_pochette,
+    )
+}
+
+/// Le cœur de [`folder_cover_fingerprint`], séparé pour être testable sans
+/// toucher au disque.
+fn cover_fingerprint_from_bytes(bytes: &[u8]) -> Option<CoverFingerprint> {
+    use image::imageops::FilterType;
+    let image = image::load_from_memory(bytes).ok()?;
+    // 9 colonnes pour 8 comparaisons par ligne, 8 lignes ⇒ 64 bits.
+    let petit = image.resize_exact(9, 8, FilterType::Lanczos3).to_luma8();
+    let mut bits = 0u64;
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let gauche = petit.get_pixel(x, y).0[0];
+            let droite = petit.get_pixel(x + 1, y).0[0];
+            bits = (bits << 1) | u64::from(gauche < droite);
+        }
+    }
+    Some(CoverFingerprint(bits))
+}
+
+/// Une pochette de test : un damier 8×8 de gris déterminés par `motif`,
+/// agrandi à `cote` pixels puis encodé en JPEG à la qualité demandée.
+///
+/// Les trois paramètres reproduisent les trois façons dont deux copies d'une
+/// même pochette diffèrent dans une vraie bibliothèque : la taille, la qualité
+/// d'encodage, et le dessin lui-même. Partagée avec les tests de migration,
+/// qui ont besoin des mêmes images.
+#[cfg(test)]
+pub(crate) fn pochette_de_test(motif: u32, cote: u32, qualite: u8) -> Vec<u8> {
+    let mut img = image::RgbImage::new(cote, cote);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        let (bx, by) = (x * 8 / cote, y * 8 / cote);
+        let v = (((bx * 37 + by * 91 + motif * 53) % 7) * 36) as u8;
+        *pixel = image::Rgb([v, v, v]);
+    }
+    let mut octets = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut octets, qualite)
+        .encode_image(&img)
+        .unwrap();
+    octets
 }
 
 #[cfg(test)]
@@ -130,8 +250,10 @@ mod tests {
     const GREATEST_BENATAR: &str = "/data/music/NEW_FLAC/POP-ROCK/P/Pat Benatar/2005-Greatest Hits";
     const GREATEST_POLICE: &str = "/data/music/NEW_FLAC/POP-ROCK/P/Police/1992-Greatest Hits";
 
+    use super::pochette_de_test as pochette;
+
     #[test]
-    fn a_folder_cover_fingerprints_by_content() {
+    fn a_folder_cover_fingerprints_by_what_the_image_shows() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("Artiste A/ALLOPOP");
         let b = dir.path().join("Artiste B/ALLOPOP");
@@ -139,25 +261,40 @@ mod tests {
         for d in [&a, &b, &c] {
             std::fs::create_dir_all(d).unwrap();
         }
-        // A et B : MÊME pochette, octet pour octet (ce que fait Qobuz en
-        // copiant cover.jpg dans chaque dossier d'un volume).
-        std::fs::write(a.join("cover.jpg"), b"VOLUME-1-IMAGE").unwrap();
-        std::fs::write(b.join("cover.jpg"), b"VOLUME-1-IMAGE").unwrap();
+        // A et B : MÊME pochette, mais ré-encodée — taille et qualité
+        // différentes, donc pas un octet en commun. C'est le cas Stockfisch
+        // relevé sur .18, celui qui coupait l'album en deux.
+        std::fs::write(a.join("cover.jpg"), pochette(1, 144, 92)).unwrap();
+        std::fs::write(b.join("cover.jpg"), pochette(1, 96, 60)).unwrap();
         // C : autre volume, autre pochette.
-        std::fs::write(c.join("cover.jpg"), b"VOLUME-2-IMAGE").unwrap();
+        std::fs::write(c.join("cover.jpg"), pochette(4, 144, 92)).unwrap();
 
-        let fa = folder_cover_fingerprint(a.to_str().unwrap());
-        let fb = folder_cover_fingerprint(b.to_str().unwrap());
-        let fc = folder_cover_fingerprint(c.to_str().unwrap());
-        assert!(fa.is_some());
-        assert_eq!(fa, fb, "un même volume donne une même empreinte");
-        assert_ne!(fa, fc, "deux volumes se séparent");
+        assert_ne!(
+            std::fs::read(a.join("cover.jpg")).unwrap(),
+            std::fs::read(b.join("cover.jpg")).unwrap(),
+            "les deux fichiers diffèrent bien octet pour octet"
+        );
+
+        let fa = folder_cover_fingerprint(a.to_str().unwrap()).expect("pochette A lisible");
+        let fb = folder_cover_fingerprint(b.to_str().unwrap()).expect("pochette B lisible");
+        let fc = folder_cover_fingerprint(c.to_str().unwrap()).expect("pochette C lisible");
+        assert!(fa.matches(&fb), "un même volume ré-encodé reste un volume");
+        assert!(!fa.matches(&fc), "deux volumes se séparent");
     }
 
     #[test]
     fn a_folder_without_a_cover_has_no_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(folder_cover_fingerprint(dir.path().to_str().unwrap()), None);
+        assert!(folder_cover_fingerprint(dir.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_cover_gives_no_fingerprint() {
+        // Fichier présent mais indécodable : pas d'empreinte, donc l'appelant
+        // ne regroupe ni ne sépare. Le silence vaut mieux qu'une devinette.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cover.jpg"), b"CECI N'EST PAS UNE IMAGE").unwrap();
+        assert!(folder_cover_fingerprint(dir.path().to_str().unwrap()).is_none());
     }
 
     #[test]

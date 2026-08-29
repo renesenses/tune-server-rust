@@ -11,36 +11,177 @@ on:
     # test OAAT instable (#1358), une migration PG non declaree (#1364), et
     # l'incident #875 en juillet avait deja le meme mecanisme.
     branches: [main, release/v0.9]
+  # Toutes les PR, y compris les PR empilees dont la base est une branche de
+  # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
-    branches: [main, release/v0.9]
+    # Poser `ci:full` sur une PR de lot doit relancer immediatement le routage.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+
+concurrency:
+  # Un nouveau SHA rend tous les resultats de l'ancien SHA inutiles. Sans
+  # annulation, trois matrices completes de la meme PR occupaient les runners
+  # simultanement et la bonne execution attendait derriere les obsoletes.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Une PR qui ne touche que la documentation ou les garde-fous GitHub ne
+  # gagne rien a compiler Rust sur Linux, macOS et Windows. #2428 l'a mesure :
+  # 29 min 44 de runners et 9 min 38 de mur pour deux fichiers shell/YAML.
+  #
+  # La classification est fail-closed : seul un petit ensemble explicite prend
+  # la voie rapide. Tout chemin inconnu garde la batterie complete. Un push
+  # non-Rust peut lui aussi reutiliser la validation du PR ; un lancement
+  # manuel reste toujours complet.
+  impact:
+    name: Impact et garde-fous légers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.classer.outputs.rust }}
+      full: ${{ steps.classer.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classer le diff
+        id: classer
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          BASE_REF_CI: ${{ github.base_ref }}
+          FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AVANT_SHA: ${{ github.event.before }}
+          SHA_COURANT: ${{ github.sha }}
+        run: |
+          # Le seul verdict qui ouvre la voie rapide est la sortie exacte
+          # `rapide`. Script absent, erreur ou sortie inconnue => complet.
+          PROFIL_CI="$(
+            EVENEMENT="$EVENEMENT" \
+            BASE_REF="$BASE_REF_CI" \
+            FORCER_COMPLET="$FORCER_COMPLET" \
+            bash scripts/determiner-profil-ci.sh
+          )" || PROFIL_CI=complet
+          if [ "$PROFIL_CI" = rapide ]; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "PR de correctif vers $BASE_REF_CI : noyau CI rapide"
+          else
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
+          case "$EVENEMENT" in
+            pull_request)
+              DEBUT="$BASE_SHA"
+              FIN="$HEAD_SHA"
+              ;;
+            push)
+              # Un premier push (SHA avant rempli de zeros) n'a pas de base
+              # fiable : fail-closed, comme un chemin inconnu.
+              if printf '%s\n' "$AVANT_SHA" | grep -qE '^0{40}$'; then
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "premier push sans base : batterie complete"
+                exit 0
+              fi
+              DEBUT="$AVANT_SHA"
+              FIN="$SHA_COURANT"
+              ;;
+            *)
+              echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "lancement manuel : batterie complete"
+              exit 0
+              ;;
+          esac
+
+          if ! git cat-file -e "$DEBUT^{commit}" || ! git cat-file -e "$FIN^{commit}"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "base du diff introuvable : batterie complete"
+            exit 0
+          fi
+          # `--no-renames` rend les deux noms : renommer du Rust en .md ne doit
+          # pas cacher le chemin Rust d'origine au classifieur.
+          if ! git diff --no-renames --name-only -z "$DEBUT" "$FIN" > /tmp/chemins-ci; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "diff impossible : batterie complete"
+            exit 0
+          fi
+          if bash scripts/detecter-impact-ci.sh < /tmp/chemins-ci; then
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Contre-épreuves du classifieur
+        run: |
+          bash scripts/detecter-impact-ci.sh --autotest
+          bash scripts/determiner-profil-ci.sh --autotest
+
+      - name: Contre-épreuves des garde-fous d issues
+        run: |
+          bash scripts/verifier-fermeture.sh --autotest
+          bash scripts/verifier-refs-issues.sh --autotest
+          python3 scripts/preflight-check.py --self-test
+          python3 scripts/measure-compile.py --self-test
+
+      - name: Syntaxe des scripts de garde-fou
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/determiner-profil-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh
+
+      # Les workflows historiques portent quelques remarques shellcheck, mais
+      # leur YAML et leurs expressions sont valides. On garde le controle
+      # structurel et on ignore seulement ces deux familles connues.
+      - name: Syntaxe des workflows GitHub
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
+
   fmt:
     name: Format
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # fmt — 27 s observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
+          cache: false
       - run: cargo fmt --all -- --check
 
   test:
     name: Test
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # test — 4 min observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
+      # `-p tune-bridge` et `cloud-relay` : le chemin de l'ecoute distante
+      # n'etait couvert par AUCUNE porte. Le relais (`tune-bridge`) n'etait ni
+      # teste ni compile ici, et `tune-core/src/cloud/relay.rs` vit derriere
+      # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
+      # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
+      # ne rougisse : une requete de flux distante finissait en 504, muette.
+      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -52,44 +193,147 @@ jobs:
   # redeviennent invisibles a la premiere occasion.
   test-shipped-features:
     name: Test (jeu de fonctionnalites livre)
+    needs: impact
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # Meme dependance systeme que le job de build : sans elle, la compilation
       # s'arrete sur « Package alsa was not found in the pkg-config ».
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,plugins-wasm,audio-embedding
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
   # job compile-checks it in isolation so a break surfaces on the PR rather than
   # only at release time. `load-dynamic` needs no onnxruntime binary at build.
+  #
+  # Il EXECUTE aussi les tests de `tune-core` derriere cette fonctionnalite —
+  # dix-sept a ce jour — que rien ne lancait. Aucune tache ne les couvrait :
+  #   `test`                  : --features oaat, donc sans audio-embedding ;
+  #   `test-shipped-features` : -p tune-server SEUL, donc pas tune-core ;
+  #   ce job                  : `cargo check`, donc compilation sans execution.
+  #
+  # Le module entier est sous `#[cfg(feature = "audio-embedding")]`
+  # (`audio/mod.rs`) : ces tests ne s'executaient donc QUE sur la machine de
+  # celui qui pensait a passer la fonctionnalite a la main. Meme motif que
+  # `test-shipped-features`, qui existe parce que neuf tests de greffons
+  # echouaient en silence depuis la 0.9.61 (#1427).
+  #
+  # `provision_and_embed` est `#[ignore]` (il telecharge le modele) : il reste
+  # hors de cette execution, comme avant.
   audio-embedding:
     name: Audio embedding feature
+    needs: impact
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # `audio-embedding` pulls audio crates (via ort/cpal deps) that link ALSA;
       # install it like the main build job does, or the compile-check fails on
       # `Package alsa was not found in the pkg-config`.
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
       - run: cargo check -p tune-server --features audio-embedding
+      - run: cargo test -p tune-core --features audio-embedding
 
+  # Signal Windows sur une PR complete : les deux configurations qui ont deja
+  # casse uniquement sur cet OS sont compilees sur l'integration du lot, ou
+  # immediatement avec `ci:full`. La matrice de livraison les rejoue au push.
+  windows-pr:
+    name: Windows + ASIO (compilation PR)
+    needs: impact
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Meme partition que le build de livraison : la PR restaure ses
+          # dependances deja compilees, mais `save-if: false` l'empeche de
+          # remplacer ce cache de confiance.
+          key: x86_64-pc-windows-msvc
+          save-if: false
+      - name: Windows livré sans ASIO
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+      - name: Download ASIO SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.steinberg.net/asiosdk" -OutFile asiosdk.zip
+          Expand-Archive -Path asiosdk.zip -DestinationPath asiosdk -Force
+          $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
+          echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+      - name: ASIO
+        run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
+
+  # Un seul ABI/configuration macOS suffit sur une PR complete : les deux
+  # architectures partagent le meme cfg Rust. Les deux vrais binaires restent
+  # construits au push, puis par le workflow qui fabrique la release taguee.
+  macos-pr:
+    name: macOS (compilation PR)
+    needs: impact
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-apple-darwin
+          save-if: false
+      - run: cargo check --package tune-server --features dj,karaoke,bandcamp,plugins-wasm
+
+  # Matrice de LIVRAISON : elle ne fabrique plus cinq artefacts jetables sur
+  # chaque SHA de PR. Elle tourne sur chaque push de main/release (et en lancement
+  # manuel), et demarre sans attendre le test Linux. Le workflow `release.yml`
+  # reconstruit ensuite ses propres artefacts a partir du tag.
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: impact
+    if: github.event_name != 'pull_request' && needs.impact.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -112,16 +356,18 @@ jobs:
             artifact: tune-server-windows-x86_64
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
           rustflags: ""
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
 
       - name: Install cross
         if: matrix.cross
@@ -129,19 +375,36 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        timeout-minutes: 18
+        run: |
+          # Les runners Ubuntu de GitHub ont deux fois bloque cette commande
+          # indefiniment (0.9.86 : 6 h avant que le plafond ne tue le job et
+          # emporte la release ; 0.9.87 : rebelote). apt n'a pas de delai par
+          # defaut et githubstatus ne declare rien : sans garde-fou, une panne
+          # de miroir passagere coute une version entiere.
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              echo "libasound2-dev installe (essai $essai)"
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+          exit 1
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -159,11 +422,11 @@ jobs:
 
       - name: ASIO feature compile-check (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,plugins-wasm
+        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -187,64 +450,117 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
-  test-postgres:
-    name: Test (PostgreSQL)
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: tune
-          POSTGRES_PASSWORD: tune
-          POSTGRES_DB: tune_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U tune -d tune_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: tune-core-postgres
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run tests with postgres feature
-        run: cargo test -p tune-core --no-default-features --features postgres,oaat
-
   clippy:
     name: Clippy
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # clippy — 2 min observe
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
           rustflags: ""
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,plugins-wasm -- -D clippy::correctness
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
+    #
+    # `denyWarnings: true` etend ce blocage aux avis INFORMATIFS (#2251). Par
+    # defaut `cargo audit` affiche un `informational = "unmaintained"` puis sort
+    # en 0 : mesure sur release/v0.9 (e608df16), « warning: 3 allowed warnings
+    # found », code de sortie 0. RUSTSEC-2026-0150 (audiopus_sys abandonne) est
+    # donc apparu le 21/05/2026 sans jamais rougir ici, alors meme que
+    # `deny.toml` le connaissait deja. Un avis informatif ne peut plus arriver
+    # en silence : soit il est corrige, soit il est inscrit dans la liste
+    # ci-dessous AVEC sa raison et sa date.
+    #
+    # La liste doit rester identique a celle de `deny.toml` et de
+    # `.cargo/audit.toml` (le preflight de release lance `cargo audit` nu, qui
+    # ne lit que ce dernier). C'est precisement cette derive qui a rendu
+    # RUSTSEC-2026-0150 invisible ; le test
+    # `les_trois_listes_dexceptions_rustsec_sont_identiques` la refuse
+    # desormais.
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
         with:
-          # Only the unmaintained-warning advisories with no available fix are
-          # ignored (paste, instant — transitive, no runtime path). Kept in sync
-          # with deny.toml. Every vulnerability, wasmtime included, now blocks.
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+          denyWarnings: true
+          # Avis « unmaintained » sans correctif disponible, chacun justifie
+          # dans .cargo/audit.toml : paste et instant (transitifs, hors chemin
+          # d'execution), audiopus_sys (arbitrage ouvert, cf #2251).
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0150
+
+  ffi:
+    name: FFI mobile (compilation)
+    needs: impact
+    if: needs.impact.outputs.rust == 'true'
+    # `tune-ffi` prend `tune-server` en `default-features = false` : c'est la
+    # SEULE configuration du depot ou la feature `oaat` est absente. Les sept
+    # cibles de release.yml l'activent toutes, `cargo test --workspace` aussi.
+    # Personne ne compilait donc cette combinaison.
+    #
+    # Resultat : b557a96f (reparation des durees MP3, livre en 0.9.93) a insere
+    # sa fonction ENTRE un `#[cfg(feature = "oaat")]` et la fonction que cet
+    # attribut protegeait. L'attribut s'est reporte sur la mauvaise, et
+    # `spawn_mp3_duration_repair` a disparu de toute build sans `oaat`.
+    # Le .so Android n'a plus compile pendant deux versions ; son propre
+    # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
+    # jamais remonte jusqu'ici.
+    #
+    # Un `cargo check` sur l'hote suffit : il reproduit exactement la resolution
+    # de features du build Android, sans NDK ni compilation croisee.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
+      # 16 et pas 6 : la boucle fait au pire 3 x (100 + 200) + 2 x 20 = 940 s.
+      # A 6 min la marche se fait tuer PENDANT le deuxieme essai — on paie le
+      # cout de la reprise sans en avoir le benefice, et le message d'erreur
+      # final ne s'affiche meme pas. C'est ce qui a tue la 0.9.89 a 6 min 07.
+      # `le_plafond_de_letape_apt_laisse_passer_les_trois_essais` le verifie —
+      # et il lit les 400 premiers caracteres qui SUIVENT le `- name:`, donc ce
+      # commentaire reste ici, au-dessus, ou il ne compte pas dans la fenetre.
+      - name: Install ALSA dev
+        timeout-minutes: 16
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              echo "libasound2-dev installe (essai $essai)"
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3) — nouvel essai dans 20 s"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais — miroir Ubuntu probablement en panne"
+          exit 1
+      # RUSTFLAGS vide, deliberement. Ce job compile la SEULE configuration du
+      # depot sans `oaat` ni les features par defaut, et cette configuration n'a
+      # JAMAIS ete lintee : `-D warnings` y promeut en erreurs du code mort
+      # (vivant ailleurs), des `mut` inutiles et des blocs `unsafe` superflus.
+      # Au premier essai j'ai cru qu'un `-A dead_code` suffirait ; la fournee
+      # suivante a rendu `unused_mut` et `unused_unsafe`. Chasser les lints un
+      # par un revenait a bloquer toute la file de PR sur du bruit.
+      #
+      # Ce job s'appelle « compilation » et ne cherche que cela : la CASSE — le
+      # E0425 qui a fige le moteur Android deux versions durant. Une erreur de
+      # compilation reste une erreur sans `-D warnings` ; c'est exactement ce
+      # qu'on veut attraper, et rien de plus. Les autres jobs gardent
+      # `-D warnings` entier, donc les lints restent tenus la ou ils comptent.
+      #
+      # Nettoyer les lints de la configuration mobile est un chantier a part.
+      - run: cargo check -p tune-ffi --all-targets
+        env:
+          RUSTFLAGS: ""

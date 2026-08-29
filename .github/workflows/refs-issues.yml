@@ -1,0 +1,60 @@
+name: Références d'issues
+
+# Rendre visible, et actionnable, ce qu'une PR declare corriger.
+#
+# Le probleme mesure le 20/08/2026 : 27 issues corrigees ET LIVREES etaient
+# restees ouvertes, la plus ancienne depuis la v0.9.63. Le suivi mentait d'un
+# mois, au point de faire classer en tete d'un bilan une perte de donnees
+# (#1943) deja reparee.
+#
+# ⚠️ Sur ce depot, AUCUN mot-cle de fermeture ne ferme quoi que ce soit — pas
+# meme en anglais. GitHub n'auto-ferme que sur la branche PAR DEFAUT, et la
+# doctrine impose que tout correctif cible `release/v0.9`. Mesure du 20/08/2026
+# sur 18 PR portant Closes/Fixes fusionnees sur cette branche : 0 fermeture
+# automatique, 18 faites a la main. GitHub n'enregistre meme pas le LIEN —
+# `closingIssuesReferences` rend une liste vide.
+#
+# Ce controle ne fait donc pas la police de la langue : ce serait imposer une
+# forme sans effet. Il rassemble ce que la PR declare corriger et rend la
+# commande de fermeture MANUELLE prete a coller, puisque c'est le seul
+# mecanisme qui marche ici. Il n'echoue jamais.
+#
+# La logique et ses cas de preuve vivent dans scripts/verifier-refs-issues.sh,
+# qui porte son propre --autotest. Il est joue A CHAQUE FOIS, avant l'analyse :
+# un garde-fou dont la contre-epreuve ne tourne pas finit par repondre vert sur
+# le defaut qu'il devait attraper (deux fois cette semaine dans ce depot).
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  group: refs-issues-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  refs:
+    name: Issues déclarées corrigées
+    runs-on: ubuntu-latest
+    # Sans plafond, un blocage tourne SIX HEURES avant que GitHub ne le tue.
+    # Trois releases l'ont paye (0.9.86, 0.9.87, 0.9.88).
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Contre-épreuve du garde-fou
+        run: bash scripts/verifier-refs-issues.sh --autotest
+
+      - name: Analyser le corps de la PR
+        env:
+          # Le corps passe par l'ENVIRONNEMENT, jamais par une interpolation
+          # ${{ }} dans `run:` — un corps de PR est du texte fourni par
+          # l'exterieur, et l'interpoler directement dans le shell permettrait
+          # d'y injecter des commandes.
+          CORPS: ${{ github.event.pull_request.body }}
+          TITRE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n%s\n' "$TITRE" "$CORPS" | bash scripts/verifier-refs-issues.sh

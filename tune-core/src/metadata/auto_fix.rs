@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
@@ -96,7 +96,7 @@ impl AutoFixEngine {
         *self.cancel.lock().await = true;
     }
 
-    async fn scan_loop(&self, _auto_apply_threshold: f64, batch_size: usize) {
+    async fn scan_loop(&self, auto_apply_threshold: f64, batch_size: usize) {
         let repo = TrackRepo::new(self.db.clone());
         let enricher = MetadataEnricher::new(self.db.clone());
 
@@ -132,19 +132,28 @@ impl AutoFixEngine {
                     if let Some(ref genre) = result.genre
                         && (track.genre.is_none() || track.genre.as_deref() == Some(""))
                     {
-                        self.add_suggestion(*track_id, "genre", "", genre, 0.85, "musicbrainz")
-                            .await;
+                        self.handle_candidate(
+                            *track_id,
+                            "genre",
+                            "",
+                            genre,
+                            0.85,
+                            auto_apply_threshold,
+                            "musicbrainz",
+                        )
+                        .await;
                     }
 
                     if let Some(year) = result.year
                         && (track.year.is_none() || track.year == Some(0))
                     {
-                        self.add_suggestion(
+                        self.handle_candidate(
                             *track_id,
                             "year",
                             "",
                             &year.to_string(),
                             0.9,
+                            auto_apply_threshold,
                             "musicbrainz",
                         )
                         .await;
@@ -153,8 +162,16 @@ impl AutoFixEngine {
                     if let Some(ref isrc) = result.isrc
                         && track.isrc.is_none()
                     {
-                        self.add_suggestion(*track_id, "isrc", "", isrc, 0.95, "musicbrainz")
-                            .await;
+                        self.handle_candidate(
+                            *track_id,
+                            "isrc",
+                            "",
+                            isrc,
+                            0.95,
+                            auto_apply_threshold,
+                            "musicbrainz",
+                        )
+                        .await;
                     }
                 }
                 Ok(None) => {}
@@ -176,6 +193,40 @@ impl AutoFixEngine {
             suggestions = p.suggestions,
             "auto_fix_scan_complete"
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_candidate(
+        &self,
+        track_id: i64,
+        field: &str,
+        current: &str,
+        suggested: &str,
+        confidence: f64,
+        auto_apply_threshold: f64,
+        source: &str,
+    ) {
+        if confidence >= auto_apply_threshold {
+            match self.apply_suggestion(track_id, field, suggested).await {
+                Ok(()) => return,
+                Err(error) => {
+                    // Ne jamais perdre une proposition parce que son application
+                    // automatique a echoue : elle reste disponible pour validation
+                    // manuelle, avec la cause dans le journal.
+                    warn!(
+                        track_id,
+                        field,
+                        confidence,
+                        auto_apply_threshold,
+                        %error,
+                        "auto_fix_apply_failed_kept_as_suggestion"
+                    );
+                }
+            }
+        }
+
+        self.add_suggestion(track_id, field, current, suggested, confidence, source)
+            .await;
     }
 
     async fn add_suggestion(
@@ -281,5 +332,50 @@ mod tests {
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["track_id"], 42);
         assert_eq!(json["suggested_value"], "Rock");
+    }
+
+    #[tokio::test]
+    async fn threshold_applies_at_or_above_and_keeps_lower_confidence_as_suggestion() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Kind of Blue', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) \
+             VALUES (1, 'So What', 1, 1, 545000)",
+            &[],
+        )
+        .unwrap();
+
+        let engine = AutoFixEngine::new(db);
+
+        // 0,85 reste sous le seuil : la base ne doit pas etre modifiee.
+        engine
+            .handle_candidate(1, "genre", "", "Jazz", 0.85, 0.9, "musicbrainz")
+            .await;
+        let track = TrackRepo::new(engine.db.clone()).get(1).unwrap().unwrap();
+        assert_eq!(track.genre, None);
+        assert_eq!(engine.get_suggestions().await.len(), 1);
+
+        // La borne est inclusive : une confiance exactement egale au seuil
+        // applique la correction et n'ajoute pas une seconde suggestion.
+        engine
+            .handle_candidate(1, "year", "", "1959", 0.9, 0.9, "musicbrainz")
+            .await;
+        let track = TrackRepo::new(engine.db.clone()).get(1).unwrap().unwrap();
+        assert_eq!(track.year, Some(1959));
+        assert_eq!(engine.get_suggestions().await.len(), 1);
+
+        let progress = engine.status().await;
+        assert_eq!(progress.fixed, 1);
+        assert_eq!(progress.suggestions, 1);
     }
 }

@@ -558,7 +558,21 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
         f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut conn = self.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| format!("begin tx: {e}"))?;
+        // Nommer le détenteur quand il y en a un.
+        //
+        // « cannot start a transaction within a transaction » ne disait pas QUI
+        // tenait la connexion. Bilou (#1997) a vu sa file d'attente vidée après
+        // 2,4 s d'essais, sans que rien ne relie l'échec au scan qui tournait.
+        // La corrélation était forte et jamais établie ; elle l'est maintenant
+        // dans le message lui-même.
+        let tx = conn.transaction().map_err(|e| {
+            let brut = e.to_string();
+            if brut.contains("within a transaction") {
+                format!("begin tx: {brut}{}", crate::db::tx_holder::mention())
+            } else {
+                format!("begin tx: {brut}")
+            }
+        })?;
         let result = {
             let handle = SqliteTxHandle { tx: &tx };
             f(&handle)

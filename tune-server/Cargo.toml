@@ -3,9 +3,10 @@ name = "tune-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
@@ -14,11 +15,11 @@ postgres = ["tune-core/postgres"]
 # Acoustic Smart Radio: CLAP audio embeddings (onnxruntime). Opt-in build — NOT
 # in default, so the standard matrix never links ort.
 audio-embedding = ["tune-core/audio-embedding"]
-# P2 of the plugin ABI: wire the embedded wasmtime runtime (tune-core's
-# `plugins-wasm`) into the real server — AppState-backed HostContext, a
+# P2 of the plugin ABI: wire the isolated Wasmtime runtime into the real
+# server — AppState-backed HostContext, a
 # registry of loaded wasm plugins, and the `/api/v1/plugins/{id}/…` route
 # mount. NOT in default: the stock server build must not pull in wasmtime.
-plugins-wasm = ["tune-core/plugins-wasm"]
+plugins-wasm = ["dep:tune-plugin-runtime-wasm"]
 # P5 of the plugin ABI (#917): DJ mode extracted from the always-on core into a
 # native in-tree plugin. NOT in default: the stock server no longer serves /dj;
 # build `--features dj` to mount the plugin's routes at /api/v1/ext/dj.
@@ -27,12 +28,34 @@ dj = ["dep:tune-dj"]
 # `tune_core::lyrics` (no LRC parse/fetch reimplemented). NOT in default; build
 # `--features karaoke` to mount its routes at /api/v1/ext/karaoke.
 karaoke = ["dep:tune-karaoke"]
+# Bandcamp (#1768) : la recherche/découverte quittent le cœur toujours-compilé
+# pour un plugin natif, comme `dj` avant elle.
+#
+# DANS default, contrairement à `dj` et `karaoke`, et c'est délibéré. Le double
+# verrou — feature à la compilation ET installation dans le gestionnaire —
+# rendait le second inatteignable : sans la feature, le plugin n'est pas
+# enregistré, donc jamais proposé à l'installation. Or la demande était
+# « AJOUTER le plugin Bandcamp » : il faut qu'il y ait quelque chose à ajouter.
+#
+# La feature décide si le code est COMPILÉ ; `default_enabled = false` décide
+# s'il TOURNE. Le plugin est donc présent et visible, mais dormant jusqu'à ce
+# que l'utilisateur l'installe.
+#
+# `dj` et `karaoke` sont tranchés depuis #2090 : compilés dans tous les binaires
+# publiés (voir les lignes `--features` de release.yml) mais HORS CATALOGUE
+# (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
+# écran ne les atteint. Voir docs/plugins/README.md.
+bandcamp = ["dep:tune-bandcamp"]
 
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-stream-http = { path = "../tune-stream-http" }
+tune-streaming-http = { path = "../tune-streaming-http" }
+tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
+tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -69,7 +92,27 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only : fabriquer des horodatages passés pour rejouer une machine restée
+# hors ligne (tests/licence_grace_visible.rs, #1999).
+chrono = { workspace = true }
 # Test-only: implementing `TunePlugin` and giving it a scratch data dir in
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+
+[[test]]
+name = "server_contracts"
+path = "tests/server_contracts.rs"
+
+[[test]]
+name = "appliance_contracts"
+path = "tests/appliance_contracts.rs"
+
+[[test]]
+name = "plugin_contracts"
+path = "tests/plugin_contracts.rs"
+
+[[test]]
+name = "plugin_wasm_contracts"
+path = "tests/plugin_wasm_contracts.rs"
+required-features = ["plugins-wasm"]

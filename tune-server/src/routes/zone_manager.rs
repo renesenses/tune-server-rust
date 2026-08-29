@@ -6,9 +6,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use tracing::info;
+use tracing::{info, warn};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::zones::latency::measure_control_rtt;
 
 use crate::state::AppState;
 
@@ -92,7 +93,7 @@ fn next_id(items: &[Value]) -> i64 {
         + 1
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -280,23 +281,19 @@ async fn mute_zone(
 ) -> impl IntoResponse {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
 
-    // Persist to DB
-    if let Err(e) = zone_repo.update_muted(id, body.muted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-
-    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
     let device_id = zone_repo
         .get(id)
         .ok()
         .flatten()
         .and_then(|z| z.output_device_id);
-    state
+    match state
         .orchestrator
         .set_mute(id, body.muted, device_id.as_deref())
-        .await;
-
-    Json(json!({ "zone_id": id, "muted": body.muted })).into_response()
+        .await
+    {
+        Ok(()) => Json(json!({ "zone_id": id, "muted": body.muted })).into_response(),
+        Err(error) => crate::routes::playback::output_command_error_response(error),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +411,7 @@ async fn group_volume(
                 .unwrap_or_default();
             save_json_setting(&settings, "zone_groups", &groups);
 
-            // Apply volume to each zone
-            let repo = ZoneRepo::with_backend(state.backend.clone());
+            // Apply volume to each zone only after its renderer accepts it.
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -424,9 +420,18 @@ async fn group_volume(
                     .copied()
                     .unwrap_or(0.0);
                 let effective = (master + offset).clamp(0.0, 1.0);
-                let vol_int = (effective * 100.0) as i32;
-                repo.update_volume(*zid, vol_int).ok();
-                state.orchestrator.set_volume(*zid, effective, None).await;
+                let device_id = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten()
+                    .and_then(|zone| zone.output_device_id);
+                if let Err(error) = state
+                    .orchestrator
+                    .set_volume(*zid, effective, device_id.as_deref())
+                    .await
+                {
+                    return crate::routes::playback::output_command_error_response(error);
+                }
             }
 
             Json(json!({"group_id": id, "master_volume": master})).into_response()
@@ -439,6 +444,22 @@ async fn group_volume(
 // Calibrate
 // ---------------------------------------------------------------------------
 
+fn audio_calibration_unavailable_payload(group_id: i64) -> Value {
+    json!({
+        "error": "audio_calibration_unavailable",
+        "group_id": group_id,
+        "message": "Le RTT de commande ne mesure pas la latence de restitution audio. Utilisez les corrections manuelles jusqu'à la disponibilité de timestamps de présentation ou d'une mesure acoustique.",
+    })
+}
+
+pub(crate) fn audio_calibration_unavailable(group_id: i64) -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(audio_calibration_unavailable_payload(group_id)),
+    )
+        .into_response()
+}
+
 async fn calibrate_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
@@ -450,48 +471,7 @@ async fn calibrate_group(
         .iter()
         .find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match group {
-        Some(group) => {
-            let zone_ids: Vec<i64> = group["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-
-            let outputs = state.outputs.lock().await;
-            let mut latencies = Vec::new();
-            for zid in &zone_ids {
-                let zone = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten();
-                if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
-                    if let Some(output) = outputs.get(device_id) {
-                        let output = output.lock().await;
-                        let start = std::time::Instant::now();
-                        let _ = output.get_status().await;
-                        let rtt_ms = start.elapsed().as_millis() as i64;
-                        latencies.push((*zid, rtt_ms / 2));
-                    } else {
-                        latencies.push((*zid, 0));
-                    }
-                } else {
-                    latencies.push((*zid, 0));
-                }
-            }
-            drop(outputs);
-
-            let leader_latency = latencies.first().map(|(_, l)| *l).unwrap_or(0);
-            let mut calibration = serde_json::Map::new();
-            for (zid, lat) in &latencies {
-                let sync_delay = leader_latency - lat;
-                calibration.insert(zid.to_string(), json!(sync_delay));
-            }
-
-            Json(json!({
-                "group_id": group_id,
-                "calibration": calibration,
-            }))
-            .into_response()
-        }
+        Some(_) => audio_calibration_unavailable(group_id),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -759,15 +739,28 @@ async fn activate_zone_profile(
         if let Some(ot) = zc.get("output_type").and_then(|v| v.as_str()) {
             zone_repo.update_output_type(zone_id, ot).ok();
         }
+        let device_id = zone_repo
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.output_device_id);
         if let Some(vol) = zc.get("volume").and_then(|v| v.as_i64()) {
-            zone_repo.update_volume(zone_id, vol as i32).ok();
-            state
+            if let Err(error) = state
                 .orchestrator
-                .set_volume(zone_id, vol as f64 / 100.0, None)
-                .await;
+                .set_volume(zone_id, vol as f64 / 100.0, device_id.as_deref())
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
         }
         if let Some(muted) = zc.get("muted").and_then(|v| v.as_bool()) {
-            zone_repo.update_muted(zone_id, muted).ok();
+            if let Err(error) = state
+                .orchestrator
+                .set_mute(zone_id, muted, device_id.as_deref())
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
         }
         applied += 1;
     }
@@ -838,10 +831,13 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Measure Latency
+// Measure control RTT
 // ---------------------------------------------------------------------------
 
-/// Measure round-trip time to all zone output devices.
+/// Mesure le trajet aller-retour d'une COMMANDE vers chaque sortie.
+///
+/// Ce diagnostic ne prétend pas connaître la latence audio. En particulier,
+/// aucun demi-RTT n'est publié comme estimation de restitution (#2215).
 async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
@@ -853,24 +849,42 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         if let Some(ref device_id) = z.output_device_id {
             if let Some(output) = outputs.get(device_id) {
                 let output = output.lock().await;
-                let start = std::time::Instant::now();
-                let _ = output.get_status().await;
-                let rtt_ms = start.elapsed().as_millis() as u64;
-                results.push(json!({
-                    "zone_id": zone_id,
-                    "zone_name": z.name,
-                    "device_id": device_id,
-                    "rtt_ms": rtt_ms,
-                    "estimated_latency_ms": rtt_ms / 2,
-                    "status": "reachable",
-                }));
+                match measure_control_rtt(&**output, 5).await {
+                    Some(stats) => results.push(json!({
+                        "zone_id": zone_id,
+                        "zone_name": z.name,
+                        "device_id": device_id,
+                        "measurement": "control_rtt",
+                        "control_rtt": {
+                            "samples": stats.samples,
+                            "min_ms": stats.min_ms,
+                            "p50_ms": stats.p50_ms,
+                            "p95_ms": stats.p95_ms,
+                            "p99_ms": stats.p99_ms,
+                            "max_ms": stats.max_ms,
+                            "uncertainty_ms": stats.uncertainty_ms,
+                        },
+                        "audio_latency_ms": null,
+                        "status": "reachable",
+                    })),
+                    None => results.push(json!({
+                        "zone_id": zone_id,
+                        "zone_name": z.name,
+                        "device_id": device_id,
+                        "measurement": "control_rtt",
+                        "control_rtt": null,
+                        "audio_latency_ms": null,
+                        "status": "probe_failed",
+                    })),
+                }
             } else {
                 results.push(json!({
                     "zone_id": zone_id,
                     "zone_name": z.name,
                     "device_id": device_id,
-                    "rtt_ms": null,
-                    "estimated_latency_ms": null,
+                    "measurement": "control_rtt",
+                    "control_rtt": null,
+                    "audio_latency_ms": null,
                     "status": "output_not_registered",
                 }));
             }
@@ -879,8 +893,9 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
                 "zone_id": zone_id,
                 "zone_name": z.name,
                 "device_id": null,
-                "rtt_ms": null,
-                "estimated_latency_ms": null,
+                "measurement": "control_rtt",
+                "control_rtt": null,
+                "audio_latency_ms": null,
                 "status": "no_output_assigned",
             }));
         }
@@ -888,6 +903,9 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(json!({
         "latencies": results,
+        "measurement": "control_rtt",
+        "audio_latency_available": false,
+        "warning": "Le RTT de commande ne mesure pas la latence de restitution audio.",
         "measured_at": now_iso(),
     }))
 }
@@ -900,6 +918,53 @@ async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "oaat_groups");
     Json(json!({ "oaat_groups": groups }))
+}
+
+/// Délai laissé à un point de diffusion pour accepter une connexion TCP.
+///
+/// Court volontairement : les points de diffusion sont sur le réseau local, et
+/// cette sonde s'exécute pendant que l'utilisateur attend devant son écran. Un
+/// appareil qui n'a pas répondu en une seconde et demie sur son propre réseau
+/// ne jouera pas non plus.
+const ENDPOINT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Ceux des membres qui n'acceptent pas une connexion sur le port OAAT.
+///
+/// Un groupe multiroom est servi par `OaatMultiroomOutput`, qui ouvre une
+/// connexion TCP vers chaque membre sur le port du protocole OAAT. Un renderer
+/// DLNA n'écoute rien là : la connexion est refusée, `connected` retombe à
+/// zéro, et le groupe ne peut plus jamais jouer.
+///
+/// Rien ne vérifiait cela à la création. Cyrille Moutia a donc pu grouper deux
+/// Yamaha DLNA, voir le groupe s'afficher comme actif, et chercher pendant un
+/// moment ce qu'il avait mal réglé — alors que le seul endroit où l'échec
+/// apparaissait était une ligne d'erreur dans un journal (#1779).
+///
+/// Les sondes partent en parallèle : le coût du contrôle est celui du membre
+/// le plus lent, pas leur somme.
+pub(crate) async fn unreachable_endpoints(endpoints: &[(String, u16)]) -> Vec<String> {
+    let probes = endpoints.iter().map(|(host, port)| {
+        let host = host.clone();
+        let port = *port;
+        async move {
+            let ok = tokio::time::timeout(
+                ENDPOINT_PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok());
+            if ok {
+                None
+            } else {
+                Some(format!("{host}:{port}"))
+            }
+        }
+    });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
@@ -917,6 +982,29 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 
     if endpoints.is_empty() {
         return Json(json!({ "error": "at least one endpoint required" }));
+    }
+
+    // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
+    // Avant ce contrôle, le groupe était accepté, persisté et réenregistré à
+    // chaque démarrage ; l'échec n'apparaissait que dans les journaux.
+    let unreachable = unreachable_endpoints(&endpoints).await;
+    if !unreachable.is_empty() {
+        warn!(
+            name,
+            unreachable = unreachable.join(", "),
+            total = endpoints.len(),
+            "oaat_multiroom_group_refused_unreachable_endpoints"
+        );
+        return Json(json!({
+            "error": format!(
+                "Ces appareils ne répondent pas comme des points de diffusion Tune : {}. \
+                 Le multiroom synchronisé relie des points de diffusion Tune entre eux ; \
+                 un lecteur DLNA ou AirPlay ne peut pas en faire partie. \
+                 Le groupe n'a pas été créé.",
+                unreachable.join(", ")
+            ),
+            "unreachable_endpoints": unreachable,
+        }));
     }
 
     let group_id = format!(
@@ -1146,4 +1234,98 @@ fn downcast_oaat_multiroom(
     output
         .as_any()
         .downcast_ref::<tune_core::outputs::oaat::OaatMultiroomOutput>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un port fermé sur la boucle locale : on ouvre un écouteur pour obtenir
+    /// un numéro de port réellement libre, puis on le referme. Tirer un numéro
+    /// au hasard donnerait un test qui échoue le jour où quelque chose écoute
+    /// dessus.
+    async fn port_ferme() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    #[tokio::test]
+    async fn un_appareil_qui_refuse_la_connexion_est_signale() {
+        // C'est le cas de Cyrille : deux Yamaha DLNA, rien à l'écoute sur le
+        // port OAAT, `Connection refused` sur les deux. Le groupe était
+        // pourtant créé et persisté (#1779).
+        let port = port_ferme().await;
+        let refuses = unreachable_endpoints(&[("127.0.0.1".to_string(), port)]).await;
+        assert_eq!(
+            refuses,
+            vec![format!("127.0.0.1:{port}")],
+            "un membre injoignable doit être nommé, pour que l'interface \
+             puisse dire LEQUEL pose problème"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_appareil_qui_accepte_la_connexion_passe() {
+        // Contre-épreuve indispensable : un contrôle qui refuse tout le monde
+        // « marche » aussi sur le test précédent, et casserait le multiroom
+        // pour les vrais points de diffusion.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+        let refuses = unreachable_endpoints(&[("127.0.0.1".to_string(), port)]).await;
+        assert!(
+            refuses.is_empty(),
+            "un point de diffusion qui accepte la connexion ne doit pas être \
+             refusé, sinon on casse le multiroom qui fonctionne : {refuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seuls_les_membres_fautifs_sont_nommes() {
+        // Le message affiché ne doit pas accuser tout le groupe quand un seul
+        // membre est en cause — c'est la différence entre « votre groupe ne
+        // marche pas » et « CET appareil ne peut pas en faire partie ».
+        let bon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_bon = bon.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if bon.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let port_mauvais = port_ferme().await;
+        let refuses = unreachable_endpoints(&[
+            ("127.0.0.1".to_string(), port_bon),
+            ("127.0.0.1".to_string(), port_mauvais),
+        ])
+        .await;
+        assert_eq!(refuses, vec![format!("127.0.0.1:{port_mauvais}")]);
+    }
+
+    #[test]
+    fn le_refus_de_calibrage_explique_la_mesure_manquante() {
+        let payload = audio_calibration_unavailable_payload(42);
+
+        assert_eq!(payload["error"], "audio_calibration_unavailable");
+        assert_eq!(payload["group_id"], 42);
+        assert!(payload["message"].as_str().unwrap().contains("RTT"));
+        assert!(payload["message"].as_str().unwrap().contains("audio"));
+    }
+
+    #[test]
+    fn aucune_route_ne_rebaptise_un_demi_rtt_en_latence_audio() {
+        let manager = include_str!("zone_manager.rs");
+        let zones = include_str!("zones.rs");
+
+        let demi_rtt = concat!("rtt_ms", " / 2");
+        let fausse_estimation = concat!("estimated_", "latency_ms");
+        assert!(!manager.contains(demi_rtt));
+        assert!(!zones.contains(demi_rtt));
+        assert!(!manager.contains(fausse_estimation));
+    }
 }

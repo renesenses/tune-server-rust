@@ -83,6 +83,7 @@ esac
 
 #[tokio::test]
 async fn appliance_endpoints_full_flow() {
+    let _environment = crate::lock_environment();
     let app = make_app();
 
     // 1) Not an appliance: everything is 404, config flag is false.

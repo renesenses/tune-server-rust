@@ -7,6 +7,13 @@ pub struct IcyMetadata {
     pub title: String,
     pub artist: Option<String>,
     pub station: Option<String>,
+    /// La pochette du titre en cours, quand la station la donne elle-même.
+    ///
+    /// Aucune recherche, aucune supposition : c'est l'URL que l'API de la
+    /// station publie avec son now-playing. Absente, l'écran garde le logo de
+    /// la radio — mieux vaut un logo juste qu'une pochette devinée.
+    #[serde(default)]
+    pub cover_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +159,22 @@ fn radiofrance_channel_id(station_name: &str, stream_url: &str) -> Option<u32> {
     }
 }
 
+/// Ne retenir qu'une **adresse** de pochette.
+///
+/// Le champ `visual` de Radio France est polymorphe, et un seul sondage suffit
+/// à s'y tromper : sur un pas de type *chanson* il porte une vraie URL
+/// (`https://www.radiofrance.fr/s3/…/400x400_….jpg`), sur un pas d'**émission**
+/// il ne porte qu'un UUID nu (`1059fabb-9a51-…`). Servir cet UUID à l'écran
+/// donnerait une image cassée là où le logo de la station faisait l'affaire.
+fn url_de_pochette(v: Option<&str>) -> Option<String> {
+    let v = v?.trim();
+    if v.starts_with("http://") || v.starts_with("https://") {
+        Some(v.to_string())
+    } else {
+        None
+    }
+}
+
 async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<IcyMetadata> {
     let url = format!("https://api.radiofrance.fr/livemeta/pull/{channel}");
     let client = crate::http::client::builder()
@@ -196,10 +219,16 @@ async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<
         })
         .map(|s| s.to_string());
 
+    // `visual` porte la pochette du titre sur un pas « chanson ». On la prend
+    // telle qu'elle vient — c'est la station qui la publie, il n'y a rien à
+    // deviner ni à chercher ailleurs.
+    let cover_url = url_de_pochette(now.get("visual").and_then(|v| v.as_str()));
+
     Some(IcyMetadata {
         title,
         artist,
         station: Some(station_name.to_string()),
+        cover_url,
     })
 }
 
@@ -247,10 +276,17 @@ async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<
         return None;
     }
 
+    // Radio Paradise publie trois tailles ; `cover` est la grande. Les deux
+    // autres restent disponibles si l'affichage venait à en vouloir de plus
+    // légères.
+    let cover_url = url_de_pochette(body.get("cover").and_then(|v| v.as_str()))
+        .or_else(|| url_de_pochette(body.get("cover_med").and_then(|v| v.as_str())));
+
     Some(IcyMetadata {
         title,
         artist,
         station: Some(station_name.to_string()),
+        cover_url,
     })
 }
 
@@ -337,6 +373,10 @@ fn parse_icy_string(raw: &str, station: Option<String>) -> Option<IcyMetadata> {
         title,
         artist,
         station,
+        // Un flux ICY brut ne transporte pas de pochette. Chercher celle du
+        // titre par artiste + titre serait un autre chantier, et faillible :
+        // le logo de la station reste préférable à une pochette fausse.
+        cover_url: None,
     })
 }
 
@@ -504,5 +544,61 @@ mod tests {
             radioparadise_channel("http://stream.radioparadise.com/world-320"),
             3
         );
+    }
+
+    // --- La pochette du titre, quand la station la donne ---
+
+    #[test]
+    fn seule_une_adresse_est_retenue_comme_pochette() {
+        assert_eq!(
+            url_de_pochette(Some("https://www.radiofrance.fr/s3/x/400x400_y.jpg")),
+            Some("https://www.radiofrance.fr/s3/x/400x400_y.jpg".into())
+        );
+        assert_eq!(
+            url_de_pochette(Some("http://img.radioparadise.com/covers/l/6940.jpg")),
+            Some("http://img.radioparadise.com/covers/l/6940.jpg".into())
+        );
+    }
+
+    /// Le piège qu'un seul sondage de l'API ne montre pas : le champ `visual`
+    /// de Radio France porte une vraie URL sur un pas « chanson », et un UUID
+    /// NU sur un pas d'émission. Servir l'UUID donnerait une image cassée là
+    /// où le logo de la station faisait l'affaire.
+    #[test]
+    fn un_uuid_nu_nest_pas_une_pochette() {
+        assert_eq!(
+            url_de_pochette(Some("1059fabb-9a51-4d4d-8abe-ecde69d0a3e6")),
+            None
+        );
+        assert_eq!(
+            url_de_pochette(Some("405a846f-bc82-41b9-89b1-135b2430fe5c")),
+            None
+        );
+    }
+
+    #[test]
+    fn labsence_et_le_vide_ne_donnent_rien() {
+        assert_eq!(url_de_pochette(None), None);
+        assert_eq!(url_de_pochette(Some("")), None);
+        assert_eq!(url_de_pochette(Some("   ")), None);
+        // Un chemin relatif n'est pas exploitable tel quel côté client.
+        assert_eq!(url_de_pochette(Some("/s3/x/400x400_y.jpg")), None);
+    }
+
+    #[test]
+    fn les_espaces_autour_de_l_adresse_sont_retires() {
+        assert_eq!(
+            url_de_pochette(Some("  https://x/y.jpg  ")),
+            Some("https://x/y.jpg".into())
+        );
+    }
+
+    /// Un flux ICY brut ne transporte aucune pochette : le champ doit rester
+    /// vide plutôt que d'aller en chercher une par ressemblance.
+    #[test]
+    fn licy_brut_ne_promet_aucune_pochette() {
+        let m = parse_icy_string("StreamTitle='Kings Of Leon - Pistol of fire';", None)
+            .expect("l'ICY se lit");
+        assert_eq!(m.cover_url, None);
     }
 }

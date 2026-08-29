@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tune_core::db::backend::DbBackend;
+use tune_core::discovery::renderer_identity::{
+    IdentityVerdict, RendererIdentity, compare_at_same_location,
+};
 use tune_core::outputs::OutputRegistry;
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
@@ -34,6 +37,77 @@ fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
         };
         format!("http://{host}:{port}{sep}{control_url}")
     }
+}
+
+/// Register a discovered output and notify controllers as one operation. Zone
+/// creation is deliberately independent: hidden devices and devices for which
+/// automatic zone creation is disabled must still appear in Settings > Network.
+fn register_discovered_output(
+    registry: &mut OutputRegistry,
+    output: Box<dyn tune_core::outputs::OutputTarget>,
+    event_bus: &EventBus,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    device_type: &str,
+) {
+    registry.register(output);
+    event_bus.emit_typed(
+        EventType::DeviceDiscovered,
+        serde_json::json!({
+            "device_id": &dev.id,
+            "name": &dev.name,
+            "device_type": device_type,
+            "host": &dev.host,
+        }),
+    );
+}
+
+/// Registre des serveurs multimédia, tel que le porte `AppState`.
+type RegistreServeursMultimedia = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>,
+    >,
+>;
+
+/// Retirer un serveur multimédia du registre et prévenir les clients.
+///
+/// C'est le SEUL retrait du registre `media_servers`, et il n'arrive que sur
+/// disparition **confirmée** : un `ssdp:byebye` vérifié par une sonde unicast,
+/// ou un `CACHE-CONTROL: max-age` écoulé suivi d'une sonde qui échoue. Jamais
+/// sur un simple silence — voir `media_server_verdict` dans `ssdp.rs`.
+///
+/// Rien d'autre n'est à défaire, et c'est vérifié :
+/// - **aucune zone** ne peut être adossée à un serveur multimédia — la branche
+///   `is_media_server()` de `ssdp.rs` rend la main avant toute création
+///   d'appareil, donc un serveur n'entre jamais dans `OutputRegistry` ;
+/// - **aucune lecture en cours** n'en dépend — `play_media_server_item`
+///   (`routes/network.rs`) répond `not_implemented` ; seuls `browse` et
+///   `search` lisent le registre, et à la demande ;
+/// - **aucune ligne en base** — le registre est une carte en mémoire,
+///   reconstruite au démarrage par la découverte. Pas de table, pas de
+///   migration.
+///
+/// Rend `true` si une entrée a effectivement été retirée.
+async fn retirer_serveur_multimedia(
+    media_servers: &RegistreServeursMultimedia,
+    event_bus: &EventBus,
+    id: &str,
+) -> bool {
+    if media_servers.lock().await.remove(id).is_none() {
+        return false;
+    }
+    // `device.*` est le seul préfixe sur lequel le client web recharge
+    // Réglages > Réseau (#2273) : sans cet événement, le retrait n'apparaîtrait
+    // qu'au rechargement de la page — exactement le symptôme signalé
+    // (« il reste affiché même si on fait actualiser »).
+    event_bus.emit_typed(
+        EventType::DeviceLost,
+        serde_json::json!({
+            "device_id": id,
+            "kind": "media_server",
+        }),
+    );
+    info!(id = %id, "media_server_unregistered");
+    true
 }
 
 /// Set a zone's online state and, if it actually changed, broadcast a
@@ -79,6 +153,28 @@ struct KnownRenderer {
     device_id: String,
     location: String,
     name: String,
+    // Clés de reconnaissance (#2639) — voir `DiscoveredDlnaDevice`, même
+    // raison, même `#[serde(default)]` : un magasin écrit avant #2639 doit
+    // continuer de se relire, sinon `from_str` échoue et TOUTES les zones
+    // disparaissent au démarrage suivant.
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    manufacturer: String,
+    #[serde(default)]
+    model: String,
+}
+
+impl KnownRenderer {
+    fn identity(&self) -> RendererIdentity<'_> {
+        RendererIdentity {
+            udn: &self.device_id,
+            mac: &self.mac,
+            friendly_name: &self.name,
+            manufacturer: &self.manufacturer,
+            model_name: &self.model,
+        }
+    }
 }
 
 fn load_known_renderers(db: &Arc<dyn DbBackend>) -> Vec<KnownRenderer> {
@@ -101,23 +197,59 @@ fn save_known_renderers(db: &Arc<dyn DbBackend>, renderers: &[KnownRenderer]) {
     }
 }
 
+/// Replie le magasin sur UNE entrée par `LOCATION`, en gardant la première.
+///
+/// UPnP garantit qu'une `LOCATION` renvoie une seule description racine, donc
+/// un seul appareil physique : deux entrées qui la partagent sont le même
+/// matériel vu par deux de ses UDN. Fonction pure, testable sans réseau
+/// (#1703).
+fn dedup_renderers_by_location(renderers: Vec<KnownRenderer>) -> Vec<KnownRenderer> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    renderers
+        .into_iter()
+        .filter(|r| seen.insert(r.location.clone()))
+        .collect()
+}
+
 /// Upsert a discovered renderer by device_id (replacing any prior entry).
 /// Best-effort: a persistence failure is logged, never panics, and never
 /// blocks discovery. Skips the settings write when the stored entry is already
 /// identical, so the periodic SSDP re-discovery doesn't churn the DB.
-fn persist_known_renderer(db: &Arc<dyn DbBackend>, device_id: &str, location: &str, name: &str) {
+fn persist_known_renderer(
+    db: &Arc<dyn DbBackend>,
+    device_id: &str,
+    location: &str,
+    name: &str,
+    mac: &str,
+    manufacturer: &str,
+    model: &str,
+) {
     let mut renderers = load_known_renderers(db);
-    if renderers
-        .iter()
-        .any(|r| r.device_id == device_id && r.location == location && r.name == name)
-    {
+    if renderers.iter().any(|r| {
+        r.device_id == device_id
+            && r.location == location
+            && r.name == name
+            // Les clés de reconnaissance font partie de l'entrée (#2639) :
+            // sans ça une MAC fraîchement relevée ne serait jamais écrite.
+            && r.mac == mac
+            && r.manufacturer == manufacturer
+            && r.model == model
+    }) {
         return;
     }
-    renderers.retain(|r| r.device_id != device_id);
+    // Une `LOCATION` = un appareil physique (UPnP) : un HEOS Denon/Marantz
+    // annonce racine et appareils embarqués sous des `uuid:` différents mais à
+    // la même URL de description. Sans le `r.location != location`, le magasin
+    // gagnait une entrée par UDN et le démarrage re-sondait cinq fois le même
+    // ND8006 (#1703).
+    renderers.retain(|r| r.device_id != device_id && r.location != location);
     renderers.push(KnownRenderer {
         device_id: device_id.to_string(),
         location: location.to_string(),
         name: name.to_string(),
+        mac: mac.to_string(),
+        manufacturer: manufacturer.to_string(),
+        model: model.to_string(),
     });
     save_known_renderers(db, &renderers);
 }
@@ -194,9 +326,148 @@ pub fn spawn_ssdp_handler(
                     media_servers.lock().await.insert(id.clone(), ms);
                     info!(id = %id, "media_server_registered");
                 }
+                SsdpEvent::MediaServerLost(id) => {
+                    retirer_serveur_multimedia(&media_servers, &event_bus, &id).await;
+                }
             }
         }
     });
+}
+
+/// Charge utile de `zone.created`, dans la forme que le client attend.
+///
+/// La route API emet `{ "id", "zone": <la zone entiere> }` et le client teste
+/// explicitement `data.zone` avant de fusionner la zone dans son magasin. Les
+/// trois emetteurs de la decouverte publiaient a plat — `zone_id`, `name`,
+/// `device_id`, `type` — donc sans cle `zone` : la condition etait fausse,
+/// l'evenement ignore en silence, et une zone decouverte n'apparaissait qu'au
+/// rechargement de la page (#2224). Une zone creee a la main, elle, apparaissait
+/// tout de suite : deux formes pour un meme evenement.
+///
+/// On AJOUTE `id` et `zone` sans retirer les champs plats. D'autres
+/// consommateurs lisent cet evenement — plugins abonnes, passerelle
+/// `developer_api` — et n'ont pas a etre migres pour que l'interface se repare.
+/// Un evenement qui satisfait les deux formes ne casse personne.
+fn charge_utile_zone_creee(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    zone_id: i64,
+    mut plat: serde_json::Value,
+) -> serde_json::Value {
+    // Lu avant l'emprunt mutable : sert de repli si la zone a disparu entre sa
+    // creation et cette relecture.
+    let nom = plat
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(obj) = plat.as_object_mut() {
+        obj.insert("id".into(), serde_json::json!(zone_id));
+        // Le CONTRAT client, pas la ligne de base : le volume y passe de 0..100
+        // a 0..1, et l'etat de lecture est pose plutot qu'omis. Un
+        // `to_value(&zone)` brut faisait repartir le volume a 50 la ou le
+        // client attend 0.5 (JP Robbe, revue de #2229).
+        //
+        // Si la relecture echoue, on emet la forme plate seule plutot que rien :
+        // l'ancien comportement, jamais pire.
+        if let Ok(Some(zone)) = zone_repo.get(zone_id) {
+            obj.insert(
+                "zone".into(),
+                tune_core::db::zone_repo::zone_creee_contrat_client(Some(&zone), zone_id, &nom),
+            );
+        }
+    }
+    plat
+}
+
+/// Reconnaître une annonce SSDP émise par CE serveur.
+///
+/// Tune publie chaque zone qui l'a demandé comme un MediaRenderer UPnP, sous
+/// le nom `« {zone} (Tune) »` (`routes/upnp_media_renderer.rs`). Ces
+/// annonces repartent sur le même multicast que celles des appareils du
+/// réseau — et rien ne les distinguait à la réception. Tune se découvrait
+/// donc lui-même : la zone « ND8006 » réapparaissait comme un appareil
+/// « ND8006 (Tune) », proposé comme sortie, enregistré, et persisté parmi les
+/// renderers connus.
+///
+/// Deux testeurs l'ont signalé sans qu'on fasse le lien — Jean Valjean
+/// (« j'ai une zone ND8006(Tune), est-ce normal ? ») et Marco Polo
+/// (« pourquoi les suffixes Tune, Tune… ? »). Et au démarrage suivant, le
+/// magasin ainsi pollué faisait sonder nos propres adresses : trois
+/// `known_renderer_probe_failed` sur `192.168.1.10:8888/upnp/renderer/…` dans
+/// ses journaux, pour des zones qui n'existaient plus.
+///
+/// Le test porte sur les **trois** à la fois — chemin de montage, port d'API,
+/// et adresse locale. Le chemin et le port seuls écarteraient aussi les zones
+/// d'un AUTRE serveur Tune du réseau, qui sont, elles, parfaitement
+/// pilotables : c'est nous qu'il faut exclure, pas nos semblables.
+fn est_notre_propre_renderer(
+    location: &str,
+    port_annonce: u16,
+    port_api: u16,
+    nos_adresses: &[String],
+) -> bool {
+    if port_annonce != port_api {
+        return false;
+    }
+    if !location.contains(tune_core::upnp_renderer::RENDERER_MOUNT) {
+        return false;
+    }
+    let hote = location
+        .split("://")
+        .nth(1)
+        .and_then(|reste| reste.split('/').next())
+        .map(|hp| hp.split(':').next().unwrap_or(hp))
+        .unwrap_or_default();
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// Les UDN de nos propres façades (`upnp_renderer_udn_<zone>`), tels que
+/// `renderer_udn` les persiste à la première annonce. Contrairement aux
+/// adresses, ils ne dépendent d'aucune énumération d'interfaces.
+fn nos_udn_de_facade(db: &Arc<dyn DbBackend>) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("upnp_renderer_udn_"))
+        .map(|(_, v)| v)
+        .collect()
+}
+
+fn est_un_de_nos_udn_de_facade(db: &Arc<dyn DbBackend>, device_id: &str) -> bool {
+    !device_id.is_empty() && nos_udn_de_facade(db).iter().any(|u| u == device_id)
+}
+
+/// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
+/// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
+/// nous renvoyer.
+fn nos_adresses() -> Vec<String> {
+    nos_adresses_depuis(
+        &tune_core::discovery::ssdp::local_ipv4_addresses(),
+        tune_core::discovery::ssdp::get_local_ip(),
+    )
+}
+
+/// L'assemblage seul, sans I/O — c'est lui que le test couvre.
+///
+/// `elue` est l'adresse que `get_local_ip()` retiendrait pour s'ANNONCER. Elle
+/// ne suffit pas à se RECONNAÎTRE : une annonce SSDP porte l'adresse de
+/// l'interface qui l'a émise, et sur une machine à plusieurs interfaces — Wi-Fi
+/// et Ethernet, pont Docker, tunnel VPN — ce n'est pas la même. On prend donc
+/// toutes les interfaces, et on garde l'élue en ceinture et bretelles pour le
+/// cas où l'énumération échoue (conteneur sans droits sur les interfaces).
+fn nos_adresses_depuis(
+    interfaces: &[std::net::Ipv4Addr],
+    elue: Option<std::net::Ipv4Addr>,
+) -> Vec<String> {
+    let mut v = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+    for ip in interfaces.iter().copied().chain(elue) {
+        let s = ip.to_string();
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
 }
 
 async fn handle_ssdp_discovered(
@@ -213,6 +484,35 @@ async fn handle_ssdp_discovered(
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
         || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
     if !is_renderer {
+        return;
+    }
+
+    // Nos propres zones publiées : on ne se découvre pas soi-même.
+    if let Some(loc) = dev.location.as_deref()
+        && est_notre_propre_renderer(loc, dev.port, config.port, &nos_adresses())
+    {
+        debug!(
+            id = %dev.id,
+            name = %dev.name,
+            location = %loc,
+            "ssdp_notre_propre_renderer_ignore"
+        );
+        return;
+    }
+
+    // Deuxième rideau : l'UDN. L'exclusion par adresse ci-dessus echoue des
+    // que l'annonce revient par un chemin que `nos_adresses()` n'enumere pas
+    // (interface manquante, nom d'hote dans LOCATION, vieux build) — c'est la
+    // greffe du 25/08 : .18 a enregistre sa propre facade de la zone 10 comme
+    // zone « Eversolo DMP-A8 (Tune) », UDN identique a `upnp_renderer_udn_10`.
+    // Un UDN de facade est tire au sort par NOUS et persiste : s'il revient
+    // par SSDP, c'est forcement notre reflet.
+    if est_un_de_nos_udn_de_facade(db, &dev.id) {
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            "ssdp_notre_facade_reconnue_par_udn_ignoree"
+        );
         return;
     }
 
@@ -246,7 +546,7 @@ async fn handle_ssdp_discovered(
             evt_urls,
         );
         let mut reg = outputs.lock().await;
-        reg.register(Box::new(oh));
+        register_discovered_output(&mut reg, Box::new(oh), event_bus, dev, "openhome");
         registered = true;
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
@@ -265,6 +565,21 @@ async fn handle_ssdp_discovered(
             .or_else(|| svc_urls.get("ConnectionManager"))
             .map(|p| resolve_control_url(&dev.host, dev.port, p));
         if let (Some(av), Some(rc)) = (av_url, rc_url) {
+            // Garde-fou : un appareil PHYSIQUE dont l'URL de contrôle pointe
+            // vers la façade UPnP d'un serveur Tune (`/upnp/renderer/`) est un
+            // enregistrement croisé — les commandes de transport partiraient
+            // dans un miroir qui acquitte tout sans rien faire (saga DMP-A8,
+            // 25/08 : Stop/SetURI/Play « acquittés » par personne). On
+            // journalise fort ; le comportement ne change pas encore, le
+            // mécanisme exact de la greffe restant à établir.
+            if av.contains("/upnp/renderer/") && !dev.id.contains("-tune-") {
+                warn!(
+                    name = %dev.name,
+                    id = %dev.id,
+                    ctrl = %av,
+                    "dlna_output_ctrl_vers_facade_tune — enregistrement suspect"
+                );
+            }
             let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
@@ -276,7 +591,7 @@ async fn handle_ssdp_discovered(
             )
             .with_play_delay(delay);
             let mut reg = outputs.lock().await;
-            reg.register(Box::new(dlna));
+            register_discovered_output(&mut reg, Box::new(dlna), event_bus, dev, "dlna");
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
@@ -285,7 +600,15 @@ async fn handle_ssdp_discovered(
             // until it next answers multicast (#1126).
             if let Some(ref loc) = dev.location {
                 crate::routes::devices::persist_discovered_dlna(
-                    db, &dev.id, loc, &dev.name, &dev.host, dev.port,
+                    db,
+                    &crate::routes::devices::DiscoveredDlnaDevice::new(
+                        &dev.id, loc, &dev.name, &dev.host, dev.port,
+                    )
+                    .with_identity(
+                        dev.mac_address.as_deref().unwrap_or_default(),
+                        dev.manufacturer.as_deref().unwrap_or_default(),
+                        dev.model.as_deref().unwrap_or_default(),
+                    ),
                 );
             }
         }
@@ -294,7 +617,15 @@ async fn handle_ssdp_discovered(
     // Persist this renderer so it can be re-probed directly at the next startup,
     // even if it never answers SSDP M-SEARCH again (#1126). Best-effort.
     if registered && let Some(location) = dev.location.as_deref() {
-        persist_known_renderer(db, &dev.id, location, &dev.name);
+        persist_known_renderer(
+            db,
+            &dev.id,
+            location,
+            &dev.name,
+            dev.mac_address.as_deref().unwrap_or_default(),
+            dev.manufacturer.as_deref().unwrap_or_default(),
+            dev.model.as_deref().unwrap_or_default(),
+        );
     }
 
     let skip_keywords = [
@@ -454,12 +785,16 @@ async fn handle_ssdp_discovered(
                 let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
-                    serde_json::json!({
-                        "zone_id": zid,
-                        "name": zone_name,
-                        "device_id": dev.id,
-                        "type": type_str,
-                    }),
+                    charge_utile_zone_creee(
+                        &zone_repo,
+                        zid,
+                        serde_json::json!({
+                            "zone_id": zid,
+                            "name": zone_name,
+                            "device_id": dev.id,
+                            "type": type_str,
+                        }),
+                    ),
                 );
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
             }
@@ -490,9 +825,44 @@ async fn handle_ssdp_discovered(
 /// device; failures are logged and never block boot. Mirrors
 /// `routes::devices::reregister_manual_devices`.
 pub async fn reregister_known_renderers(state: &AppState) {
-    let renderers = load_known_renderers(&state.backend);
-    if renderers.is_empty() {
+    let stored = load_known_renderers(&state.backend);
+    if stored.is_empty() {
         return;
+    }
+    // Les magasins écrits avant #1703 portent une entrée par UDN — cinq pour
+    // un seul Marantz ND8006, toutes à la même URL de description. On les
+    // replie avant de sonder, et on réécrit le magasin pour qu'il guérisse.
+    // Purge des entrées que nous nous étions ajoutées à nous-mêmes avant que
+    // l'auto-découverte ne soit filtrée : sans elle, un magasin déjà pollué
+    // continuerait à sonder nos propres adresses à chaque démarrage, pour des
+    // zones souvent supprimées depuis. Le magasin se soigne, comme il le fait
+    // déjà pour les doublons par UDN.
+    let a_nous = nos_adresses();
+    let port_api = state.config.port;
+    let stored_len = stored.len();
+    let stored: Vec<KnownRenderer> = stored
+        .into_iter()
+        .filter(|kr| !est_notre_propre_renderer(&kr.location, port_api, port_api, &a_nous))
+        .collect();
+    if stored.len() != stored_len {
+        info!(
+            retires = stored_len - stored.len(),
+            "known_renderers_purge_de_nos_propres_zones"
+        );
+    }
+    if stored.is_empty() {
+        save_known_renderers(&state.backend, &stored);
+        return;
+    }
+    let stored_len = stored.len();
+    let renderers = dedup_renderers_by_location(stored);
+    if renderers.len() != stored_len {
+        info!(
+            before = stored_len,
+            after = renderers.len(),
+            "known_renderers_collapsed_by_location"
+        );
+        save_known_renderers(&state.backend, &renderers);
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
 
@@ -510,34 +880,92 @@ pub async fn reregister_known_renderers(state: &AppState) {
     let mut recovered = 0usize;
     for kr in renderers {
         match tune_core::discovery::ssdp::probe_renderer(&kr.device_id, &kr.location).await {
-            Some(dev) if dev.id == kr.device_id => {
-                handle_ssdp_discovered(
-                    &dev,
-                    &state.outputs,
-                    &state.backend,
-                    &state.config,
-                    &state.event_bus,
-                    &oh_listener,
-                    &state.playback,
-                    &state.license,
-                    &mut seen_hosts,
-                )
-                .await;
-                recovered += 1;
-                info!(
-                    id = %kr.device_id,
-                    name = %kr.name,
-                    location = %kr.location,
-                    "known_renderer_reregistered"
-                );
-            }
             Some(dev) => {
-                warn!(
-                    stored_id = %kr.device_id,
-                    live_id = %dev.id,
-                    location = %kr.location,
-                    "known_renderer_uuid_changed_skipping"
-                );
+                // `dev.id` est l'identifiant qu'on VIENT de passer en argument :
+                // `build_renderer_device` le recopie tel quel. Le comparer à
+                // `kr.device_id` était donc une tautologie, et la branche
+                // « uuid changed » ci-dessous n'a jamais pu s'exécuter depuis
+                // #1126. C'est ce qui explique le journal de #2639 : 20 ms
+                // après que `reprobe_persisted_dlna_devices` a EFFACÉ le
+                // Marantz sur un désaccord d'UDN, ce chemin-ci le réécrivait
+                // sans rien vérifier. Deux magasins, deux verdicts opposés sur
+                // le même appareil.
+                //
+                // `stable_id` porte maintenant l'UDN réellement annoncé par le
+                // descripteur, et les deux chemins appliquent la MÊME règle.
+                let observed = RendererIdentity {
+                    udn: dev.stable_id.as_deref().unwrap_or_default(),
+                    mac: dev.mac_address.as_deref().unwrap_or_default(),
+                    friendly_name: &dev.name,
+                    manufacturer: dev.manufacturer.as_deref().unwrap_or_default(),
+                    model_name: dev.model.as_deref().unwrap_or_default(),
+                };
+                // Précondition : `probe_renderer` a lu `kr.location` mot pour mot.
+                let verdict = compare_at_same_location(kr.identity(), observed);
+                match verdict {
+                    IdentityVerdict::NoDisagreement | IdentityVerdict::SameHardware(_) => {
+                        if let IdentityVerdict::SameHardware(evidence) = verdict {
+                            info!(
+                                nom = %kr.name,
+                                location = %kr.location,
+                                udn_memorise = %kr.device_id,
+                                udn_annonce = %observed.udn,
+                                reconnu_par = evidence.label(),
+                                action = "l'appareil a changé d'identifiant UPnP (redémarrage, \
+                                          mise à jour ou réinitialisation). Il reste reconnu : \
+                                          sa zone est conservée, rien à faire.",
+                                "known_renderer_identifiant_change_appareil_reconnu"
+                            );
+                        }
+                        handle_ssdp_discovered(
+                            &dev,
+                            &state.outputs,
+                            &state.backend,
+                            &state.config,
+                            &state.event_bus,
+                            &oh_listener,
+                            &state.playback,
+                            &state.license,
+                            &mut seen_hosts,
+                        )
+                        .await;
+                        recovered += 1;
+                        info!(
+                            id = %kr.device_id,
+                            name = %kr.name,
+                            location = %kr.location,
+                            "known_renderer_reregistered"
+                        );
+                    }
+                    IdentityVerdict::OtherHardware(evidence) => {
+                        warn!(
+                            nom_attendu = %kr.name,
+                            nom_trouve = %dev.name,
+                            location = %kr.location,
+                            udn_memorise = %kr.device_id,
+                            udn_annonce = %observed.udn,
+                            distingue_par = evidence.label(),
+                            action = "un AUTRE appareil occupe désormais cette adresse : la zone \
+                                      mémorisée n'y est PAS rattachée, pour ne pas faire jouer la \
+                                      mauvaise pièce. Rallumez l'appareil attendu, puis relancez \
+                                      une recherche — il sera redécouvert.",
+                            "known_renderer_appareil_remplace_non_rattache"
+                        );
+                    }
+                    IdentityVerdict::Undecidable => {
+                        warn!(
+                            nom = %kr.name,
+                            location = %kr.location,
+                            udn_memorise = %kr.device_id,
+                            udn_annonce = %observed.udn,
+                            action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
+                                      « même appareil redémarré » de « autre appareil à la même \
+                                      adresse ». L'entrée est CONSERVÉE et sera re-sondée : aucune \
+                                      zone n'est perdue.",
+                            "known_renderer_identite_indecidable_entree_conservee"
+                        );
+                    }
+                }
             }
             None => {
                 warn!(
@@ -727,7 +1155,13 @@ pub fn spawn_mdns_handler(
 
                     if let Some(output) = output {
                         let mut reg = outputs.lock().await;
-                        reg.register(output);
+                        register_discovered_output(
+                            &mut reg,
+                            output,
+                            &event_bus,
+                            &dev,
+                            output_type_str,
+                        );
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
                         let zone_repo =
@@ -742,6 +1176,32 @@ pub fn spawn_mdns_handler(
                         // whole reconnect/create block for hidden devices.
                         if zone_repo.is_device_hidden(&dev.id) {
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
+                        } else if let Some((zid, was_hidden)) =
+                            legacy_zone_to_reanchor(&zone_repo, &dev)
+                        {
+                            // Zone creee AVANT #1528, donc enregistree sous
+                            // l'ancien identifiant derive de l'adresse. On la
+                            // re-ancre sur le nouvel identifiant durable — c'est
+                            // ce qui remplace la migration SQL, qui n'aurait pas
+                            // pu calculer ces identifiants (ils ne sont connus
+                            // qu'a la decouverte) et aurait fait perdre toutes
+                            // les zones d'un coup.
+                            //
+                            // Une zone supprimee reste supprimee : on deplace
+                            // son identifiant sans la remettre en ligne, sinon
+                            // la mise a jour ressusciterait ce que
+                            // l'utilisateur avait efface.
+                            let _ = zone_repo.update_output_device(zid, &dev.id);
+                            if !was_hidden {
+                                set_zone_online(&event_bus, &db, &dev.id, true);
+                            }
+                            info!(
+                                name = %dev.name,
+                                id = %dev.id,
+                                zone_id = zid,
+                                hidden = was_hidden,
+                                "mdns_zone_reanchored_from_legacy_id"
+                            );
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
@@ -828,6 +1288,25 @@ pub fn spawn_mdns_handler(
                                     let _ = zone_repo.update_output_type(zid, output_type_str);
                                     set_zone_online(&event_bus, &db, &dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+                                } else if let Some(zid) =
+                                    zone_repo.find_hidden_id_by_name(&dev.name)
+                                {
+                                    // Une zone SUPPRIMEE portant ce nom. Le
+                                    // garde-fou `is_device_hidden` en haut de
+                                    // ce bloc ne l'a pas vue : il teste le
+                                    // nouvel identifiant, la ligne masquee
+                                    // porte l'ancien. Et le rattrapage par nom
+                                    // juste au-dessus ne pouvait pas la voir non
+                                    // plus — `list()` filtre les masquees.
+                                    // Sans ce cas, la zone renaissait a neuf a
+                                    // chaque changement d'adresse (#1528).
+                                    //
+                                    // On la re-ancre sur le nouvel identifiant
+                                    // SANS la demasquer : la suppression reste
+                                    // une suppression, et le garde-fou redevient
+                                    // operant des le tour suivant.
+                                    let _ = zone_repo.update_output_device(zid, &dev.id);
+                                    info!(name = %dev.name, id = %dev.id, zone_id = zid, "mdns_hidden_zone_reanchored");
                                 } else {
                                     // Cross-protocol dedup (forum #1183): the
                                     // same physical device may already be a
@@ -899,12 +1378,16 @@ pub fn spawn_mdns_handler(
                                                         );
                                                         event_bus.emit_typed(
                                                             EventType::ZoneCreated,
-                                                            serde_json::json!({
-                                                                "zone_id": zid,
-                                                                "name": dev.name,
-                                                                "device_id": dev.id,
-                                                                "type": output_type_str,
-                                                            }),
+                                                            charge_utile_zone_creee(
+                                                                &zone_repo,
+                                                                zid,
+                                                                serde_json::json!({
+                                                                    "zone_id": zid,
+                                                                    "name": dev.name,
+                                                                    "device_id": dev.id,
+                                                                    "type": output_type_str,
+                                                                }),
+                                                            ),
                                                         );
                                                         info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                                     }
@@ -1125,6 +1608,133 @@ fn find_cross_protocol_zone_conflict<'a>(
 /// the same zone lifecycle as the mDNS handler: hidden zones stay deleted,
 /// known device_ids reconnect (online + restored volume), renamed device_ids
 /// re-attach by zone name, and new devices honour `zone_auto_create`.
+/// La zone a re-ancrer sur le nouvel identifiant durable, s'il y en a une.
+///
+/// Rend `(zone_id, etait_masquee)`.
+///
+/// Les zones creees avant #1528 sont enregistrees sous l'identifiant derive de
+/// l'adresse (`{type}-{host}-{port}`). Plutot qu'une migration SQL — impossible,
+/// puisque les nouveaux identifiants ne sont connus qu'a la decouverte — chaque
+/// appareil re-ancre sa zone a sa premiere reapparition. Les zones jamais
+/// revues gardent leur ancien identifiant sans dommage.
+///
+/// Trois garde-fous, et le troisieme a ete ajoute apres coup — il manquait :
+///
+/// 1. **Ne rien faire si une zone porte deja le nouvel identifiant.** Sans
+///    cela, une zone en double restee sur l'ancienne forme serait re-ancree
+///    par-dessus la bonne, et deux zones partageraient la meme cle.
+/// 2. Ne pas agir quand l'ancienne et la nouvelle forme coincident — cas d'un
+///    appareil qui n'annonce aucun identifiant : il n'y a rien a deplacer.
+/// 3. **Exiger que le nom corresponde.** L'ancien identifiant contient une
+///    adresse IP, donc il n'identifie rien — c'est la these de ce correctif, et
+///    l'oublier ici a coute une zone detournee (voir le commentaire sur le
+///    test de nom).
+fn legacy_zone_to_reanchor(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<(i64, bool)> {
+    let legacy = tune_core::discovery::mdns::legacy_device_id(dev.device_type, &dev.host, dev.port);
+    let new_id_taken = matches!(zone_repo.get_by_device_id(&dev.id), Ok(Some(_)));
+    let zone = zone_repo.get_by_device_id(&legacy).ok().flatten()?;
+    if !may_reanchor(&legacy, &dev.id, new_id_taken, &zone.name, &dev.name) {
+        return None;
+    }
+    let zid = zone.id?;
+    Some((zid, zone_repo.is_device_hidden(&legacy)))
+}
+
+/// La regle de re-ancrage, isolee pour etre testable — la fonction ci-dessus
+/// demande une base et un appareil decouvert.
+///
+/// Le troisieme terme merite son histoire. Sur .18 le 13/08, l'Apple TV etait en
+/// 192.168.1.37 ; le DHCP a donne cette adresse a une enceinte Sonos, qui
+/// annonce aussi de l'AirPlay sur le port 7000 ; la zone « AppleTV14,1 » s'est
+/// re-ancree sur le Sonos. Jouer sur l'Apple TV envoyait le son dans la chambre.
+///
+/// La cause : l'ancien identifiant contient une adresse IP, donc il n'identifie
+/// rien — c'est la these meme de ce correctif, et le mecanisme de transition
+/// l'avait oubliee. Le nom est le seul signal restant. Il est faillible, un
+/// utilisateur renomme ; mais l'asymetrie tranche : un faux negatif laisse la
+/// zone sur son ancien identifiant, c'est-a-dire l'etat d'avant le correctif,
+/// tandis qu'un faux positif detourne le son vers une autre enceinte, en
+/// silence.
+fn may_reanchor(
+    legacy_id: &str,
+    new_id: &str,
+    new_id_taken: bool,
+    zone_name: &str,
+    dev_name: &str,
+) -> bool {
+    legacy_id != new_id && !new_id_taken && zone_name == dev_name
+}
+
+/// Pourquoi chaque fournisseur de sortie hors-arbre est actif ou inerte.
+///
+/// #2392 : un module payant sans droit se retirait sans un mot. Vu de
+/// l'extérieur, « non licencié », « non compilé » et « aucun appareil trouvé »
+/// donnaient le même écran vide, et un bêta-testeur du module Diretta a
+/// réinstallé Fedora, changé de système de fichiers et recompilé trente
+/// minutes durant avant d'écrire « Je ne sais que faire ! ».
+///
+/// Cet instantané est lu par `/system/diagnostics`. Il tranche les trois cas :
+/// un fournisseur **absent de la liste** n'est pas compilé ; un fournisseur
+/// présent avec un `refusal` manque d'un droit, et le refus dit lequel et quoi
+/// faire ; un fournisseur présent sans refus et à `devices: 0` cherche
+/// vraiment et ne trouve rien.
+///
+/// Même motif que [`crate::boot_status`] : un état global minuscule, écrit par
+/// la boucle qui le connaît, lu par la route qui l'affiche.
+static STATUT_FOURNISSEURS: std::sync::LazyLock<std::sync::Mutex<serde_json::Value>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(serde_json::Value::Null));
+
+/// L'instantané courant, pour `/system/diagnostics`. `null` tant qu'aucune
+/// passe n'a eu lieu — y compris quand le binaire n'embarque aucun
+/// fournisseur hors-arbre, ce qui est déjà une réponse.
+pub fn provider_status_snapshot() -> serde_json::Value {
+    STATUT_FOURNISSEURS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// L'état d'UN fournisseur après une passe de découverte.
+///
+/// Isolé du monde (pas de base, pas de réseau) pour être testable : c'est ici
+/// que le silence de #2392 devient une raison nommée.
+fn statut_du_fournisseur(
+    nom: &str,
+    module_requis: Option<&str>,
+    appareils: usize,
+    modules_licencies: &[String],
+    compte_lie: bool,
+) -> serde_json::Value {
+    // Un fournisseur libre n'exige aucun droit : il ne peut donc pas être
+    // refusé, et le nombre d'appareils reste le seul fait à lire.
+    let refus = module_requis.and_then(|module| {
+        let possede = modules_licencies.iter().any(|m| m == module);
+        crate::premium_guard::ModuleRefusal::evaluate(possede, compte_lie)
+            .map(|raison| raison.to_json(module))
+    });
+
+    serde_json::json!({
+        "provider": nom,
+        "required_module": module_requis,
+        "devices": appareils,
+        "refusal": refus,
+    })
+}
+
+/// Un jeton de compte est-il stocké ? C'est la condition exacte sous laquelle
+/// `refresh_account_premium` (`background.rs:1177`) sort sans rien faire et
+/// sans rien dire, laissant `licensed_modules` vide à jamais.
+fn compte_mozaik_lie(db: &Arc<dyn DbBackend>) -> bool {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("mozaik_access_token")
+        .ok()
+        .flatten()
+        .is_some_and(|t| !t.is_empty())
+}
+
 pub fn spawn_output_providers(
     state: &AppState,
     providers: Vec<Arc<dyn tune_core::outputs::traits::OutputProvider>>,
@@ -1145,8 +1755,18 @@ pub fn spawn_output_providers(
             let ctx = tune_core::outputs::traits::ProviderContext {
                 licensed_modules: license.modules().await,
             };
+            let compte_lie = compte_mozaik_lie(&db);
+            let mut statuts = Vec::with_capacity(providers.len());
             for provider in &providers {
-                for output in provider.discover(&ctx).await {
+                let trouves = provider.discover(&ctx).await;
+                statuts.push(statut_du_fournisseur(
+                    provider.provider_name(),
+                    provider.required_module(),
+                    trouves.len(),
+                    &ctx.licensed_modules,
+                    compte_lie,
+                ));
+                for output in trouves {
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
                     let otype = output.output_type().to_string();
@@ -1212,10 +1832,14 @@ pub fn spawn_output_providers(
                                     Ok((zid, true)) => {
                                         event_bus.emit_typed(
                                             EventType::ZoneCreated,
-                                            serde_json::json!({
-                                                "zone_id": zid,
-                                                "name": name,
-                                            }),
+                                            charge_utile_zone_creee(
+                                                &zone_repo,
+                                                zid,
+                                                serde_json::json!({
+                                                    "zone_id": zid,
+                                                    "name": name,
+                                                }),
+                                            ),
                                         );
                                         set_zone_online(&event_bus, &db, &dev_id, true);
                                         info!(name = %name, id = %dev_id, zone_id = zid, "provider_zone_created");
@@ -1232,15 +1856,118 @@ pub fn spawn_output_providers(
                     }
                 }
             }
+            publier_statut_fournisseurs(statuts, &ctx.licensed_modules, compte_lie);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 }
 
+/// Publie l'instantané et **journalise ce qui a changé**, au-dessus de
+/// `debug`.
+///
+/// « Une fois » compte autant que « au-dessus de `debug` » : la boucle repasse
+/// toutes les soixante secondes, et un avertissement répété mille fois par
+/// nuit se fait filtrer comme du bruit — donc redevient invisible, ce qui est
+/// le défaut qu'on corrige. On ne réémet donc que sur changement réel
+/// (démarrage, compte lié, module acheté, remboursement).
+fn publier_statut_fournisseurs(
+    statuts: Vec<serde_json::Value>,
+    modules_licencies: &[String],
+    compte_lie: bool,
+) {
+    let instantane = serde_json::json!({
+        "account_linked": compte_lie,
+        "licensed_modules": modules_licencies,
+        "providers": statuts,
+    });
+
+    let change = {
+        let mut courant = STATUT_FOURNISSEURS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `null` = première passe : on parle toujours au démarrage.
+        let change = courant.is_null()
+            || refus_nommes(&courant) != refus_nommes(&instantane)
+            || courant["account_linked"] != instantane["account_linked"];
+        *courant = instantane;
+        change
+    };
+
+    if !change {
+        return;
+    }
+
+    // Le résumé de démarrage. Il vaut même quand AUCUN fournisseur ne déclare
+    // encore `required_module()` : un binaire qui embarque un fournisseur
+    // hors-arbre — donc, en pratique, un module payant — et qui tourne sans
+    // compte lié ne recevra jamais le moindre droit. C'est très exactement la
+    // configuration du bêta-testeur de #2392, et rien ne la disait.
+    let instantane = provider_status_snapshot();
+    let noms: Vec<&str> = instantane["providers"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|p| p["provider"].as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if compte_lie {
+        info!(
+            providers = ?noms,
+            licensed_modules = ?modules_licencies,
+            "output_providers_status"
+        );
+    } else {
+        warn!(
+            providers = ?noms,
+            "output_providers_no_linked_account: no Mozaiklabs account is linked, so no paid module entitlement can reach this server — a module you own stays idle until the account is connected (a license key alone never carries it)"
+        );
+    }
+
+    for (fournisseur, code, message) in refus_nommes(&instantane) {
+        warn!(
+            provider = %fournisseur,
+            code = %code,
+            account_linked = compte_lie,
+            "output_provider_module_refused: {message}"
+        );
+    }
+}
+
+/// Les refus nommés d'un instantané : `(fournisseur, code, message)`.
+fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)> {
+    instantane["providers"]
+        .as_array()
+        .map(|liste| {
+            liste
+                .iter()
+                .filter_map(|p| {
+                    let refus = p.get("refusal")?.as_object()?;
+                    Some((
+                        p["provider"].as_str().unwrap_or_default().to_string(),
+                        refus.get("code")?.as_str().unwrap_or_default().to_string(),
+                        refus
+                            .get("message")?
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{find_cross_protocol_zone_conflict, resolve_control_url};
+    use super::{
+        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, register_discovered_output,
+        resolve_control_url, statut_du_fournisseur,
+    };
     use tune_core::db::zone_repo::Zone;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+    use tune_core::event_bus::EventBus;
 
     fn zone(name: &str, output_type: &str, device_id: &str) -> Zone {
         Zone {
@@ -1262,6 +1989,45 @@ mod tests {
             fixed_volume: false,
             autoplay_enabled: false,
         }
+    }
+
+    /// #2273: the web client reloads Settings > Network only for `device.*`.
+    /// Automatic discovery must therefore publish the same canonical contract
+    /// as manual registration, independently of any later zone decision.
+    #[tokio::test]
+    async fn automatic_discovery_emits_canonical_device_event() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let dev = DiscoveredDevice::new(
+            "cast-living-room".into(),
+            "Salon".into(),
+            OutputType::Chromecast,
+            "192.0.2.42".into(),
+            8009,
+        );
+
+        let output = tune_core::outputs::chromecast::ChromecastOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            dev.port,
+        );
+        let mut registry = tune_core::outputs::OutputRegistry::new();
+
+        register_discovered_output(&mut registry, Box::new(output), &bus, &dev, "chromecast");
+
+        let event = events.recv().await.expect("device event");
+        assert!(registry.contains("cast-living-room"));
+        assert_eq!(event.event_type, "device.discovered");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "cast-living-room",
+                "name": "Salon",
+                "device_type": "chromecast",
+                "host": "192.0.2.42",
+            })
+        );
     }
 
     /// Forum #1183: a Samsung S95BA TV is already a DLNA zone — renamed by the
@@ -1378,5 +2144,691 @@ mod tests {
             resolve_control_url("192.168.68.55", 443, abs_https),
             abs_https
         );
+    }
+
+    #[test]
+    fn reanchor_refuses_a_zone_whose_name_no_longer_matches() {
+        // Vecu sur .18 le 13/08. L'Apple TV etait en 192.168.1.37 ; le DHCP a
+        // donne cette adresse a une enceinte Sonos qui annonce aussi de
+        // l'AirPlay sur le port 7000. Sans ce refus, la zone « AppleTV14,1 »
+        // se re-ancre sur le Sonos et le son part dans la chambre.
+        assert!(!may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-BA:C9:C4:56:04:E8",
+            false,
+            "AppleTV14,1",
+            "Chambre",
+        ));
+    }
+
+    #[test]
+    fn reanchor_accepts_the_same_device_under_a_new_identity() {
+        assert!(may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-AA:BB:CC:DD:EE:FF",
+            false,
+            "AppleTV14,1",
+            "AppleTV14,1",
+        ));
+    }
+
+    #[test]
+    fn reanchor_never_steals_an_identity_already_in_use() {
+        // Une zone en double restee sur l'ancienne forme ne doit pas etre
+        // re-ancree par-dessus la bonne : deux zones partageraient la cle.
+        assert!(!may_reanchor(
+            "airplay-192.168.1.37-7000",
+            "airplay-AA:BB:CC:DD:EE:FF",
+            true,
+            "AppleTV14,1",
+            "AppleTV14,1",
+        ));
+    }
+
+    #[test]
+    fn reanchor_does_nothing_when_both_forms_are_identical() {
+        // L'appareil n'annonce aucun identifiant : rien a deplacer.
+        assert!(!may_reanchor(
+            "dlna-192.168.1.9-8080",
+            "dlna-192.168.1.9-8080",
+            false,
+            "Salon",
+            "Salon",
+        ));
+    }
+
+    // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
+
+    // --- zone.created : une seule forme pour deux emetteurs ---
+
+    mod forme_de_zone_creee {
+        use super::super::charge_utile_zone_creee;
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::zone_repo::ZoneRepo;
+
+        fn base() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        /// La regression : le client teste `data.zone` avant de fusionner. Les
+        /// trois emetteurs de la decouverte publiaient a plat, sans cette cle —
+        /// la condition etait fausse et la zone n'apparaissait qu'au
+        /// rechargement de la page (#2224).
+        #[test]
+        fn la_decouverte_porte_la_zone_entiere_comme_la_route_api() {
+            let db = base();
+            let repo = ZoneRepo::with_backend(db.clone());
+            let (zid, cree) = repo
+                .get_or_create("Salon", Some("dlna"), "uuid:abcd")
+                .expect("creation de zone");
+            assert!(cree, "la zone doit etre neuve pour que le test ait un sens");
+
+            let charge = charge_utile_zone_creee(
+                &repo,
+                zid,
+                serde_json::json!({
+                    "zone_id": zid,
+                    "name": "Salon",
+                    "device_id": "uuid:abcd",
+                    "type": "dlna",
+                }),
+            );
+
+            // Ce que le client attend, et qui manquait.
+            let zone = charge
+                .get("zone")
+                .expect("sans la cle `zone`, le client ignore l'evenement");
+            assert_eq!(zone.get("id").and_then(|v| v.as_i64()), Some(zid));
+            assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(zid));
+
+            // La contre-epreuve de JP Robbe : la charge utile doit porter le
+            // CONTRAT client, pas la ligne de base. Le volume y passe de 0..100
+            // a 0..1 — un `to_value(&zone)` brut rendait 50.0 la ou le client
+            // attend 0.5, et le curseur se collait au maximum.
+            assert_eq!(
+                zone.get("volume").and_then(|v| v.as_f64()),
+                Some(0.5),
+                "volume en contrat client (0..1), pas la valeur de la base"
+            );
+            // Et l'etat de lecture est POSE, pas omis : le client fusionne sans
+            // refetch, un champ absent y laisserait la valeur d'une autre zone.
+            for champ in [
+                "state",
+                "current_track",
+                "position_ms",
+                "queue_length",
+                "shuffle",
+                "repeat",
+            ] {
+                assert!(
+                    zone.get(champ).is_some(),
+                    "{champ} absent : le client garderait la valeur precedente"
+                );
+            }
+
+            // Et ce que les autres consommateurs lisaient deja : rien n'est retire.
+            assert_eq!(
+                charge.get("zone_id").and_then(|v| v.as_i64()),
+                Some(zid),
+                "les champs plats restent : plugins et developer_api les lisent"
+            );
+            assert_eq!(
+                charge.get("device_id").and_then(|v| v.as_str()),
+                Some("uuid:abcd")
+            );
+        }
+
+        /// Si la relecture echoue, on emet la forme plate seule plutot que
+        /// rien : l'ancien comportement, jamais pire.
+        #[test]
+        fn une_zone_introuvable_ne_fait_pas_perdre_l_evenement() {
+            let db = base();
+            let repo = ZoneRepo::with_backend(db.clone());
+            let charge = charge_utile_zone_creee(
+                &repo,
+                4242,
+                serde_json::json!({ "zone_id": 4242, "name": "Fantome" }),
+            );
+            assert!(charge.get("zone").is_none());
+            assert_eq!(charge.get("zone_id").and_then(|v| v.as_i64()), Some(4242));
+            assert_eq!(charge.get("id").and_then(|v| v.as_i64()), Some(4242));
+        }
+    }
+
+    mod auto_exclusion_par_udn {
+        use super::super::est_un_de_nos_udn_de_facade;
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+
+        fn memory_backend() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        // La greffe du 25/08 sur .18 : la façade de la zone 10 revient par
+        // SSDP avec l'UDN que nous avons nous-mêmes persisté, et devient la
+        // zone fantôme « Eversolo DMP-A8 (Tune) ». L'annonce doit être
+        // reconnue comme notre reflet — et l'appareil physique, lui, passer.
+        #[test]
+        fn notre_udn_persiste_est_reconnu_l_appareil_physique_passe() {
+            let backend = memory_backend();
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            settings
+                .set(
+                    "upnp_renderer_udn_10",
+                    "uuid:558dcf82-5868-4126-951a-570149376da6",
+                )
+                .unwrap();
+
+            assert!(est_un_de_nos_udn_de_facade(
+                &backend,
+                "uuid:558dcf82-5868-4126-951a-570149376da6"
+            ));
+            assert!(!est_un_de_nos_udn_de_facade(
+                &backend,
+                "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE"
+            ));
+        }
+
+        // Un réglage voisin (`upnp_renderer_10`, opt-in booléen) ne doit pas
+        // faire écarter un appareil, et un device_id vide non plus.
+        #[test]
+        fn un_reglage_voisin_ou_un_id_vide_n_excluent_rien() {
+            let backend = memory_backend();
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            settings.set("upnp_renderer_10", "true").unwrap();
+            settings.set("upnp_renderer_udn_10", "").unwrap();
+
+            assert!(!est_un_de_nos_udn_de_facade(&backend, "true"));
+            assert!(!est_un_de_nos_udn_de_facade(&backend, ""));
+        }
+    }
+
+    mod known_renderers_par_location {
+        use super::super::{KnownRenderer, dedup_renderers_by_location, persist_known_renderer};
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+
+        const AIOS: &str = "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml";
+
+        fn memory_backend() -> Arc<dyn DbBackend> {
+            let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            // La table `settings` naît d'une migration : sans elle le magasin
+            // relit toujours vide et le test ne prouve rien.
+            tune_core::db::migrations::run_migrations(&db).unwrap();
+            Arc::new(db)
+        }
+
+        #[test]
+        fn les_udn_freres_d_un_heos_ne_font_qu_une_entree() {
+            // Le ND8006 de Jean Valjean : cinq `uuid:` annoncés, une seule
+            // description racine. Sans le correctif, cinq entrées persistées
+            // et cinq re-sondages au démarrage suivant.
+            let backend = memory_backend();
+            for i in 0..5 {
+                persist_known_renderer(
+                    &backend,
+                    &format!("uuid:aios-{i}"),
+                    AIOS,
+                    "Marantz ND8006",
+                    "",
+                    "",
+                    "",
+                );
+            }
+            let stored = super::super::load_known_renderers(&backend);
+            assert_eq!(
+                stored.len(),
+                1,
+                "un appareil physique = une entrée, pas {:?}",
+                stored.iter().map(|r| &r.device_id).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn deux_locations_restent_deux_appareils() {
+            // Garde-fou : un ampli multi-zone expose deux descriptions
+            // distinctes derrière la même adresse — on ne doit en perdre
+            // aucune.
+            let backend = memory_backend();
+            persist_known_renderer(
+                &backend,
+                "uuid:z1",
+                "http://192.168.1.11:8080/desc.xml",
+                "Zone 1",
+                "",
+                "",
+                "",
+            );
+            persist_known_renderer(
+                &backend,
+                "uuid:z2",
+                "http://192.168.1.11:8081/desc.xml",
+                "Zone 2",
+                "",
+                "",
+                "",
+            );
+            assert_eq!(super::super::load_known_renderers(&backend).len(), 2);
+        }
+
+        #[test]
+        fn un_magasin_deja_dedouble_se_replie() {
+            let stored: Vec<KnownRenderer> = (0..5)
+                .map(|i| KnownRenderer {
+                    device_id: format!("uuid:aios-{i}"),
+                    location: AIOS.to_string(),
+                    name: "Marantz ND8006".into(),
+                    mac: String::new(),
+                    manufacturer: String::new(),
+                    model: String::new(),
+                })
+                .collect();
+            let collapsed = dedup_renderers_by_location(stored);
+            assert_eq!(collapsed.len(), 1);
+            assert_eq!(collapsed[0].device_id, "uuid:aios-0");
+        }
+
+        /// Trois champs ajoutés à une structure déjà sérialisée en base : sans
+        /// `#[serde(default)]`, `from_str` échoue, `load_known_renderers` rend
+        /// un magasin VIDE, et toutes les zones disparaissent au démarrage.
+        #[test]
+        fn un_magasin_d_avant_2639_se_relit_sans_perdre_ses_entrees() {
+            let ancien = r#"[{"device_id":"uuid:56fcb4ae","location":"http://192.168.1.11:60006/d.xml","name":"Marantz ND8006"}]"#;
+            let relu: Vec<KnownRenderer> = serde_json::from_str(ancien)
+                .expect("un magasin ecrit avant #2639 doit continuer de se relire");
+            assert_eq!(relu.len(), 1);
+            assert_eq!(relu[0].name, "Marantz ND8006");
+            assert!(relu[0].mac.is_empty());
+        }
+
+        /// La garde de `reregister_known_renderers` n'est plus une tautologie.
+        ///
+        /// Elle comparait `dev.id` — l'identifiant que l'appelant venait de
+        /// passer à `probe_renderer` — à ce même identifiant. Elle ne pouvait
+        /// donc rien détecter, et ce chemin réécrivait le Marantz 20 ms après
+        /// que l'autre magasin l'avait effacé (#2639). Le verdict porte
+        /// désormais sur l'UDN réellement annoncé par le descripteur.
+        #[test]
+        fn la_garde_du_second_magasin_voit_enfin_un_udn_qui_change() {
+            use tune_core::discovery::renderer_identity::{
+                Evidence, IdentityVerdict, RendererIdentity, compare_at_same_location,
+            };
+
+            let memorise = KnownRenderer {
+                device_id: "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26".into(),
+                location: AIOS.to_string(),
+                name: "Marantz ND8006".into(),
+                mac: String::new(),
+                manufacturer: String::new(),
+                model: String::new(),
+            };
+
+            // Le Marantz, UDN régénéré : reconnu, sa zone se rattache.
+            let marantz = RendererIdentity {
+                udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+                mac: "",
+                friendly_name: "Marantz ND8006",
+                manufacturer: "Marantz",
+                model_name: "ND8006",
+            };
+            assert_eq!(
+                compare_at_same_location(memorise.identity(), marantz),
+                IdentityVerdict::SameHardware(Evidence::FriendlyName)
+            );
+
+            // Un autre appareil ayant hérité de l'adresse : PAS rattaché.
+            let intrus = RendererIdentity {
+                udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+                mac: "",
+                friendly_name: "Ampli chambre",
+                manufacturer: "Denon",
+                model_name: "AVR-X2700H",
+            };
+            assert_eq!(
+                compare_at_same_location(memorise.identity(), intrus),
+                IdentityVerdict::OtherHardware(Evidence::FriendlyName)
+            );
+        }
+    }
+
+    // --- Ne pas se découvrir soi-même ---
+
+    mod auto_decouverte {
+        use super::super::est_notre_propre_renderer;
+
+        const NOUS: &[&str] = &["192.168.1.10", "127.0.0.1", "localhost"];
+
+        fn nos() -> Vec<String> {
+            NOUS.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// Le cas exact des journaux de Jean Valjean : trois de ces adresses
+        /// étaient sondées à chaque démarrage, pour des zones supprimées.
+        #[test]
+        fn notre_propre_zone_est_reconnue() {
+            for zone in [3, 10, 13] {
+                let loc = format!("http://192.168.1.10:8888/upnp/renderer/{zone}/description.xml");
+                assert!(est_notre_propre_renderer(&loc, 8888, 8888, &nos()), "{loc}");
+            }
+        }
+
+        /// Le défaut que ce lot corrige, testé LÀ OÙ IL ÉTAIT : dans
+        /// l'assemblage de nos adresses, pas dans la comparaison.
+        ///
+        /// L'ancien code ne retenait que l'adresse élue. Une annonce arrivant
+        /// par une AUTRE de nos interfaces n'était donc pas reconnue comme
+        /// nôtre, et Tune adoptait son propre renderer comme un appareil du
+        /// réseau. Ce test échoue sur l'ancienne version : elle ne rendait que
+        /// la loopback et l'élue.
+        #[test]
+        fn toutes_nos_interfaces_comptent_pour_nous() {
+            use std::net::Ipv4Addr;
+            // Ethernet, Wi-Fi, pont Docker — une seule machine, trois adresses.
+            let interfaces = [
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 4, 22),
+                Ipv4Addr::new(172, 17, 0, 1),
+            ];
+            // L'élue est l'une d'elles : c'est le cas nominal.
+            let nous = super::super::nos_adresses_depuis(&interfaces, Some(interfaces[0]));
+
+            for ip in &interfaces {
+                let loc = format!("http://{ip}:8888/upnp/renderer/1/description.xml");
+                assert!(
+                    est_notre_propre_renderer(&loc, 8888, 8888, &nous),
+                    "annonce reçue par {ip} : c'est nous, et on ne se voyait pas"
+                );
+            }
+            // Les formes locales restent portées.
+            assert!(nous.iter().any(|a| a == "127.0.0.1"));
+            assert!(nous.iter().any(|a| a == "localhost"));
+            // Et aucune adresse en double.
+            let mut tri = nous.clone();
+            tri.sort();
+            tri.dedup();
+            assert_eq!(tri.len(), nous.len(), "doublons dans nos adresses");
+        }
+
+        /// Ceinture et bretelles : énumération vide (conteneur sans droits sur
+        /// les interfaces), l'élue reste une réponse valable.
+        #[test]
+        fn sans_enumeration_lelue_suffit_encore() {
+            use std::net::Ipv4Addr;
+            let nous = super::super::nos_adresses_depuis(&[], Some(Ipv4Addr::new(192, 168, 1, 10)));
+            let loc = "http://192.168.1.10:8888/upnp/renderer/1/description.xml";
+            assert!(est_notre_propre_renderer(loc, 8888, 8888, &nous));
+        }
+
+        /// Contre-épreuve : élargir la liste ne doit pas nous faire avaler les
+        /// voisins. Un autre serveur Tune du réseau reste pilotable.
+        #[test]
+        fn plusieurs_adresses_nexcluent_pas_un_autre_serveur() {
+            use std::net::Ipv4Addr;
+            let nous = super::super::nos_adresses_depuis(
+                &[Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(172, 17, 0, 1)],
+                None,
+            );
+            let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nous));
+        }
+
+        /// La règle décisive : un AUTRE serveur Tune du réseau publie ses zones
+        /// au même port et au même chemin. Les siennes sont pilotables — les
+        /// écarter serait perdre une fonction, pas corriger un défaut.
+        #[test]
+        fn un_autre_serveur_tune_reste_visible() {
+            let loc = "http://192.168.1.77:8888/upnp/renderer/2/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()));
+        }
+
+        #[test]
+        fn un_vrai_appareil_nest_jamais_confondu() {
+            // Le Marantz de Jean Valjean, et un Sonos : ni le chemin ni le
+            // port ne correspondent.
+            assert!(!est_notre_propre_renderer(
+                "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml",
+                60006,
+                8888,
+                &nos()
+            ));
+            assert!(!est_notre_propre_renderer(
+                "http://192.168.1.50:1400/xml/device_description.xml",
+                1400,
+                8888,
+                &nos()
+            ));
+        }
+
+        #[test]
+        fn le_chemin_seul_ne_suffit_pas() {
+            // Un appareil tiers qui servirait par hasard un chemin semblable
+            // sur un autre port n'est pas nous.
+            let loc = "http://192.168.1.10:9999/upnp/renderer/1/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 9999, 8888, &nos()));
+        }
+
+        #[test]
+        fn le_port_seul_ne_suffit_pas() {
+            // Notre propre MediaServer — même hôte, même port, autre chemin :
+            // il ne s'agit pas d'un renderer de zone.
+            let loc = "http://192.168.1.10:8888/upnp/server/description.xml";
+            assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()));
+        }
+
+        #[test]
+        fn les_formes_locales_comptent_pour_nous() {
+            // Un M-SEARCH émis depuis la machine elle-même peut nous revenir
+            // sous la boucle locale.
+            for hote in ["127.0.0.1", "localhost"] {
+                let loc = format!("http://{hote}:8888/upnp/renderer/1/description.xml");
+                assert!(est_notre_propre_renderer(&loc, 8888, 8888, &nos()), "{loc}");
+            }
+        }
+
+        #[test]
+        fn une_adresse_illisible_ne_nous_designe_pas() {
+            // Mieux vaut laisser passer un inconnu que de jeter un appareil
+            // réel sur une adresse qu'on n'a pas su lire.
+            for loc in [
+                "",
+                "pas-une-url",
+                "http://",
+                "http:///upnp/renderer/1/x.xml",
+            ] {
+                assert!(!est_notre_propre_renderer(loc, 8888, 8888, &nos()), "{loc}");
+            }
+        }
+    }
+
+    /// #2392, le cas du bêta-testeur Diretta : le fournisseur EST compilé et
+    /// enregistré, son droit est acheté, mais aucun compte n'est lié — donc
+    /// `licensed_modules` est vide et le fournisseur se retire sans un mot.
+    ///
+    /// Le diagnostic doit nommer la raison ET le geste qui la lève. Sans ça,
+    /// « pas de droit » est indiscernable de « rien sur le réseau », et c'est
+    /// une réinstallation complète de système d'exploitation qui se déclenche.
+    #[test]
+    fn un_fournisseur_paye_sans_compte_lie_dit_pourquoi_il_est_inerte() {
+        let statut = statut_du_fournisseur("diretta", Some("diretta"), 0, &[], false);
+
+        assert_eq!(statut["provider"], "diretta");
+        assert_eq!(statut["required_module"], "diretta");
+        assert_eq!(
+            statut["refusal"]["code"], "module_account_not_linked",
+            "le diagnostic doit nommer la raison, pas la taire : {statut}"
+        );
+        assert_eq!(statut["refusal"]["action"], "link_account");
+        assert_eq!(statut["refusal"]["module"], "diretta");
+    }
+
+    /// Compte bien lié, module non acheté : même écran vide, autre geste. Les
+    /// deux causes doivent rester distinctes côté client.
+    #[test]
+    fn un_fournisseur_paye_avec_compte_lie_mais_non_achete_dit_autre_chose() {
+        let statut = statut_du_fournisseur("diretta", Some("diretta"), 0, &[], true);
+        assert_eq!(statut["refusal"]["code"], "module_not_owned");
+        assert_eq!(statut["refusal"]["action"], "purchase_module");
+    }
+
+    /// Droit présent : aucun refus, et le compte d'appareils devient le seul
+    /// fait à lire — c'est ce qui sépare « pas de droit » de « rien trouvé ».
+    #[test]
+    fn un_fournisseur_licencie_ne_refuse_rien_et_rend_compte_de_sa_recherche() {
+        let licencies = vec!["diretta".to_string()];
+        let vide = statut_du_fournisseur("diretta", Some("diretta"), 0, &licencies, true);
+        assert!(
+            vide["refusal"].is_null(),
+            "un module possede ne doit pas etre presente comme refuse : {vide}"
+        );
+        assert_eq!(vide["devices"], 0);
+
+        let trouve = statut_du_fournisseur("diretta", Some("diretta"), 2, &licencies, true);
+        assert!(trouve["refusal"].is_null());
+        assert_eq!(trouve["devices"], 2);
+    }
+
+    /// Un fournisseur libre (le défaut du contrat : `required_module() == None`)
+    /// n'est jamais refusé, même sans compte lié — sinon le correctif
+    /// inventerait un refus là où il n'y en a pas.
+    #[test]
+    fn un_fournisseur_libre_nest_jamais_refuse() {
+        let statut = statut_du_fournisseur("snapcast", None, 0, &[], false);
+        assert!(statut["required_module"].is_null());
+        assert!(
+            statut["refusal"].is_null(),
+            "aucun droit exige, donc aucun refus : {statut}"
+        );
+    }
+
+    /// Le journal n'est réémis que lorsque l'ensemble des refus CHANGE — la
+    /// boucle repasse toutes les soixante secondes, et un avertissement répété
+    /// mille fois par nuit se fait filtrer comme du bruit, c'est-à-dire
+    /// redevient le silence qu'on corrige. C'est `refus_nommes` qui tranche.
+    #[test]
+    fn les_refus_se_comparent_pour_ne_pas_rejournaliser_a_chaque_passe() {
+        let passe = |compte_lie| {
+            serde_json::json!({
+                "providers": [
+                    statut_du_fournisseur("diretta", Some("diretta"), 0, &[], compte_lie),
+                    statut_du_fournisseur("snapcast", None, 1, &[], compte_lie),
+                ]
+            })
+        };
+
+        let refus = refus_nommes(&passe(false));
+        assert_eq!(
+            refus.len(),
+            1,
+            "seul le fournisseur paye est refuse : {refus:?}"
+        );
+        assert_eq!(refus[0].0, "diretta");
+        assert_eq!(refus[0].1, "module_account_not_linked");
+
+        // Deux passes identiques : rien de neuf à dire.
+        assert_eq!(refus_nommes(&passe(false)), refus);
+        // Le compte se lie : la raison change, donc on reparle.
+        assert_ne!(refus_nommes(&passe(true)), refus);
+        // Et un instantané vide (aucune passe encore) ne refuse rien.
+        assert!(refus_nommes(&serde_json::Value::Null).is_empty());
+    }
+}
+
+/// #2139 — le retrait d'un serveur multimédia du registre `media_servers`.
+///
+/// Le registre était en écriture seule : `insert` et rien d'autre, pour toute
+/// la vie du processus. Ces tests fixent le contrat du retrait et, surtout,
+/// celui de l'événement sans lequel « actualiser » ne changerait toujours rien.
+#[cfg(test)]
+mod retrait_serveur_multimedia {
+    use super::retirer_serveur_multimedia;
+    use tune_core::discovery::ssdp::MediaServerInfo;
+    use tune_core::event_bus::EventBus;
+
+    fn registre(ids: &[&str]) -> super::RegistreServeursMultimedia {
+        let mut map = std::collections::HashMap::new();
+        for id in ids {
+            map.insert(
+                (*id).to_string(),
+                MediaServerInfo {
+                    id: (*id).to_string(),
+                    name: format!("Serveur {id}"),
+                    manufacturer: "Minim".into(),
+                    model: "MinimServer".into(),
+                    location: "http://192.0.2.10:9790/desc.xml".into(),
+                    content_directory_url: "http://192.0.2.10:9790/cd".into(),
+                    host: "192.0.2.10".into(),
+                    port: 9790,
+                    last_seen: std::time::Instant::now(),
+                    max_age: std::time::Duration::from_secs(1800),
+                },
+            );
+        }
+        std::sync::Arc::new(tokio::sync::Mutex::new(map))
+    }
+
+    /// Le retrait sort bien l'entrée du registre ET publie `device.lost`.
+    ///
+    /// L'événement n'est pas cosmétique : le client web ne recharge
+    /// Réglages > Réseau que sur un événement `device.*` (#2273). Sans lui, le
+    /// serveur éteint resterait affiché jusqu'au rechargement de la page —
+    /// c'est-à-dire le symptôme signalé, à peine déplacé.
+    #[tokio::test]
+    async fn le_retrait_vide_le_registre_et_previent_les_clients() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registre = registre(&["uuid:minim-1", "uuid:twonky-2"]);
+
+        let retire = retirer_serveur_multimedia(&registre, &bus, "uuid:minim-1").await;
+
+        assert!(retire, "le retrait doit signaler qu'il a bien eu lieu");
+        let restant = registre.lock().await;
+        assert!(
+            !restant.contains_key("uuid:minim-1"),
+            "le serveur éteint doit avoir disparu du registre"
+        );
+        assert!(
+            restant.contains_key("uuid:twonky-2"),
+            "le serveur voisin ne doit pas être emporté"
+        );
+        drop(restant);
+
+        let event = events.recv().await.expect("device.lost attendu");
+        assert_eq!(event.event_type, "device.lost");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "uuid:minim-1",
+                "kind": "media_server",
+            })
+        );
+    }
+
+    /// Retirer un identifiant inconnu ne publie RIEN : un `byebye` de renderer
+    /// traverse le même chemin, et un `device.lost` en double ferait recharger
+    /// l'interface pour rien.
+    #[tokio::test]
+    async fn un_identifiant_inconnu_ne_publie_aucun_evenement() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registre = registre(&["uuid:minim-1"]);
+
+        let retire = retirer_serveur_multimedia(&registre, &bus, "uuid:un-renderer").await;
+
+        assert!(!retire);
+        assert!(
+            events.try_recv().is_err(),
+            "aucun événement ne doit être publié pour un identifiant inconnu"
+        );
+        assert_eq!(registre.lock().await.len(), 1);
     }
 }

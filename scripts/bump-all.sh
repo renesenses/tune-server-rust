@@ -14,9 +14,15 @@
 #   scripts/bump-all.sh 0.9.55              # server + web  (the release pair)
 #   scripts/bump-all.sh 0.9.55 --clients    # + Flutter and iPadOS/iOS/macOS
 #   scripts/bump-all.sh 0.9.55 --skip-web-drift-check   # escape hatch, see below
+#   scripts/bump-all.sh 0.9.55 --clients --skip-android-rebuild  # see below
 #
 # Does NOT commit, tag, or push — release decisions stay manual.
 # Review with `git diff` in each repo afterwards.
+#
+# EXCEPTION: with --clients this script DOES rebuild the three Android .so.
+# They are versioned inside tune-server-flutter, and bumping pubspec.yaml
+# without them produces a repo that cannot build a valid APK. See the Android
+# section below for why that is not an overreach but the only correct move.
 #
 # ⚠️ ORDER MATTERS, and this script does not enforce it. The web bump must be
 # committed AND pushed to tune-web-client `main` BEFORE the server tag is
@@ -29,17 +35,20 @@ set -euo pipefail
 VERSION=""
 WITH_CLIENTS=0
 SKIP_WEB_DRIFT=0
+SKIP_ANDROID=0
 for arg in "$@"; do
     case "$arg" in
         --clients) WITH_CLIENTS=1 ;;
         --skip-web-drift-check) SKIP_WEB_DRIFT=1 ;;
+        --skip-android-rebuild) SKIP_ANDROID=1 ;;
         -*) echo "Error: unknown flag $arg" >&2; exit 2 ;;
         *) VERSION="$arg" ;;
     esac
 done
 
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 <version> [--clients] [--skip-web-drift-check]   (e.g. $0 0.9.55)" >&2
+    echo "Usage: $0 <version> [--clients] [--skip-web-drift-check] [--skip-android-rebuild]" >&2
+    echo "       (e.g. $0 0.9.55)" >&2
     exit 2
 fi
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -51,14 +60,79 @@ DEV="${TUNE_DEV_DIR:-$HOME/DEV}"
 RUST_DIR="$DEV/tune-server-rust"
 CARGO="$RUST_DIR/Cargo.toml"
 WEB="$DEV/tune-web-client/package.json"
-FLUTTER="$DEV/tune-server-flutter/pubspec.yaml"
+FLUTTER_DIR="$DEV/tune-server-flutter"
+FLUTTER="$FLUTTER_DIR/pubspec.yaml"
 IPAD="$DEV/tune-server-ipados/Tune/project.yml"
+
+# The Android engine lives in the Flutter repo as three checked-in
+# `libtuneserver.so`, one per ABI. `check-native-libs.sh` is their guard;
+# `build-android.sh` rebuilds them and regenerates their fingerprint.
+NATIVE_GUARD="$FLUTTER_DIR/scripts/check-native-libs.sh"
+ANDROID_BUILD="$RUST_DIR/tune-ffi/build-android.sh"
+FLUTTER_JNI="$FLUTTER_DIR/android/app/src/main/jniLibs"
 
 REQUIRED=("$CARGO" "$WEB")
 [ "$WITH_CLIENTS" -eq 1 ] && REQUIRED+=("$FLUTTER" "$IPAD")
 for f in "${REQUIRED[@]}"; do
     [ -f "$f" ] || { echo "Error: missing $f" >&2; exit 1; }
 done
+
+# ------------------------------------------------------------------ Android
+#
+# The Flutter repo ships the Rust engine as three checked-in `.so`. Bumping
+# pubspec.yaml does not rebuild them, so every `--clients` bump used to produce
+# a commit whose native libraries belonged to the PREVIOUS version. Measured on
+# five consecutive releases — 0.9.81, 0.9.85, 0.9.89, 0.9.90, 0.9.91 — the bump
+# commit was red on CI's "Bibliothèques natives à jour" job and a separate
+# rebuild commit was needed to turn it green. That is an hour of hand-driven
+# cross-compilation per release, and once nobody noticed at all: testers ran
+# three and a half weeks on a 21 July engine (v0.8.354) under a 0.9.76 UI.
+#
+# The guard in the Flutter repo already refused — but only AFTER the commit
+# existed. So this script stops producing the broken state in the first place:
+# it rebuilds the three ABIs itself, and if it cannot, it does not move
+# pubspec.yaml at all. The bump and the rebuild are no longer separable.
+#
+# Nothing changes for a server+web bump: without --clients this whole section
+# is skipped, and the release pair keeps its current, fast path.
+if [ "$WITH_CLIENTS" -eq 1 ]; then
+    if [ ! -x "$NATIVE_GUARD" ]; then
+        echo "Error: $NATIVE_GUARD is missing or not executable." >&2
+        echo "       Without it there is no way to tell which version the" >&2
+        echo "       checked-in .so were built from. Refusing to bump Flutter." >&2
+        exit 1
+    fi
+    if [ ! -x "$ANDROID_BUILD" ] && [ "$SKIP_ANDROID" -eq 0 ]; then
+        echo "Error: $ANDROID_BUILD is missing or not executable." >&2
+        exit 1
+    fi
+
+    # Inherited drift: the CURRENT .so must match the CURRENT pubspec before we
+    # move anything. If they already disagree, a previous release was never
+    # rebuilt, and bumping on top would bury the evidence one version deeper.
+    if ! "$NATIVE_GUARD" >/dev/null 2>&1; then
+        echo >&2
+        echo "Error: tune-server-flutter's native libraries do not match its own" >&2
+        echo "       pubspec.yaml — a previous bump was never rebuilt." >&2
+        echo >&2
+        "$NATIVE_GUARD" >&2 || true
+        echo "       Fix that release first, then re-run this bump." >&2
+        echo >&2
+        exit 1
+    fi
+    echo "  Android natives: in sync with tune-server-flutter's current version"
+
+    # The pre-commit hook is what makes bump and rebuild inseparable for humans
+    # who do not go through this script. It only runs if core.hooksPath points
+    # at the repo's own hooks — a fresh clone does not, and that is precisely
+    # the machine on which the mistake gets repeated.
+    if [ -e "$FLUTTER_DIR/.git" ] && [ -d "$FLUTTER_DIR/.githooks" ]; then
+        if [ -z "$(git -C "$FLUTTER_DIR" config --get core.hooksPath || true)" ]; then
+            git -C "$FLUTTER_DIR" config core.hooksPath .githooks
+            echo "  Android natives: enabled tune-server-flutter's pre-commit hook"
+        fi
+    fi
+fi
 
 # Pre-flight: the web client must not be BEHIND its own development branch.
 #
@@ -155,6 +229,15 @@ echo "  - $WEB"
 # The same trap applies to tune-web-client's package.json.
 if [ "$WITH_CLIENTS" -eq 1 ]; then
     # pubspec.yaml — version: X.Y.Z+N, build number strictly monotonic.
+    #
+    # Snapshotted first, as a file rather than a variable: `$(cat …)` eats the
+    # trailing newline and would restore a subtly different pubspec.yaml. If
+    # the Android rebuild below fails, this file goes back byte for byte. A
+    # bumped pubspec.yaml carrying the previous version's .so is the broken
+    # state we are here to abolish — leaving it behind "just for now" is how
+    # the last five releases went red.
+    PUBSPEC_BACKUP="$(mktemp "${TMPDIR:-/tmp}/tune-pubspec.XXXXXX")"
+    cp "$FLUTTER" "$PUBSPEC_BACKUP"
     CUR_BUILD=$(grep -oE "^version: [0-9]+\.[0-9]+\.[0-9]+\+[0-9]+" "$FLUTTER" | head -1 | sed -E 's/.*\+//')
     if [ -n "$CUR_BUILD" ]; then
         NEXT_FLUTTER=$((CUR_BUILD + 1))
@@ -164,6 +247,55 @@ if [ "$WITH_CLIENTS" -eq 1 ]; then
         sed -i.bak -E "s/^version: [0-9]+\.[0-9]+\.[0-9]+.*/version: $VERSION+1/" "$FLUTTER"
     fi
     rm "$FLUTTER.bak"
+
+    # Rebuild the three ABIs against the version we have just written into
+    # Cargo.toml. build-android.sh refuses to copy a library that does not
+    # carry that version, and regenerates the fingerprint itself — so a green
+    # run here means the .so and pubspec.yaml genuinely agree.
+    #
+    # It is slow (three cross-compilations) and needs an NDK. That cost is the
+    # point: it is paid once, by the machine that decided to bump, instead of
+    # being rediscovered later by whoever reads a red CI.
+    restore_pubspec() {
+        cp "$PUBSPEC_BACKUP" "$FLUTTER"
+        rm -f "$PUBSPEC_BACKUP"
+    }
+
+    if [ "$SKIP_ANDROID" -eq 1 ]; then
+        rm -f "$PUBSPEC_BACKUP"
+        echo >&2
+        echo "  ⚠️  --skip-android-rebuild: pubspec.yaml now says $VERSION but the" >&2
+        echo "      embedded .so are still those of the previous version." >&2
+        echo "      tune-server-flutter's pre-commit hook WILL refuse this commit," >&2
+        echo "      and so will CI. Before committing, run there:" >&2
+        echo "        TUNE_FLUTTER_JNI=\"$FLUTTER_JNI\" $ANDROID_BUILD --release" >&2
+        echo >&2
+    else
+        echo
+        echo "Rebuilding the Android native libraries for $VERSION (3 ABIs)..."
+        if TUNE_FLUTTER_JNI="$FLUTTER_JNI" "$ANDROID_BUILD" --release; then
+            if ! "$NATIVE_GUARD"; then
+                restore_pubspec
+                echo >&2
+                echo "Error: the rebuild finished but the guard still refuses." >&2
+                echo "       pubspec.yaml has been restored — nothing half-done ships." >&2
+                exit 1
+            fi
+            rm -f "$PUBSPEC_BACKUP"
+            echo "  Android natives rebuilt and fingerprinted for $VERSION"
+            ANDROID_REBUILT=1
+        else
+            restore_pubspec
+            echo >&2
+            echo "Error: the Android rebuild failed — pubspec.yaml has been RESTORED." >&2
+            echo "       Flutter is untouched, so no bump can ship without its engine." >&2
+            echo "       Cargo.toml and package.json are already at $VERSION: fix the" >&2
+            echo "       toolchain (ANDROID_NDK_HOME, rustup targets) and re-run, or" >&2
+            echo "       re-run without --clients if this release is server-only." >&2
+            echo >&2
+            exit 1
+        fi
+    fi
 
     # project.yml — MARKETING_VERSION everywhere; CURRENT_PROJECT_VERSION += 1
     # everywhere. Every Swift target must move together or TestFlight rejects
@@ -175,6 +307,9 @@ if [ "$WITH_CLIENTS" -eq 1 ]; then
     rm "$IPAD.bak"
 
     echo "  - $FLUTTER (build $NEXT_FLUTTER)"
+    if [ "${ANDROID_REBUILT:-0}" -eq 1 ]; then
+        echo "  - $FLUTTER_JNI (3 ABIs rebuilt + fingerprint — commit them WITH the bump)"
+    fi
     echo "  - $IPAD (build $NEXT_BUILD for Apple targets)"
 else
     echo

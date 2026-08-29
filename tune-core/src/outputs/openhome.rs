@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use super::didl::DidlBuilder;
 use super::oh_events::{EventState, OpenHomeEventListener};
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const SOAP_MAX_RETRIES: usize = 2;
 
@@ -332,6 +332,19 @@ impl OutputTarget for OpenHomeOutput {
         "openhome"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        let transport = self.svc_url("transport").is_some() || self.svc_url("playlist").is_some();
+        let volume = self.svc_url("volume").is_some();
+        OutputCapabilities::v1(
+            transport,
+            transport,
+            transport,
+            volume,
+            volume,
+            self.svc_url("playlist").is_some(),
+        )
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host_addr)
     }
@@ -400,6 +413,8 @@ impl OutputTarget for OpenHomeOutput {
                 &[("Value", &seconds)],
             )
             .await?;
+        } else {
+            return Err("seek not supported by this OpenHome renderer".into());
         }
         Ok(())
     }
@@ -414,6 +429,9 @@ impl OutputTarget for OpenHomeOutput {
                 &[("Value", &level.to_string())],
             )
             .await?;
+            self.event_state.lock().await.volume = Some(level);
+        } else {
+            return Err("volume not supported by this OpenHome renderer".into());
         }
         Ok(())
     }
@@ -423,6 +441,9 @@ impl OutputTarget for OpenHomeOutput {
         if let Some(url) = self.svc_url("volume") {
             self.soap_call(url, SVC_VOLUME, "SetMute", &[("Value", val)])
                 .await?;
+            self.event_state.lock().await.muted = Some(muted);
+        } else {
+            return Err("mute not supported by this OpenHome renderer".into());
         }
         Ok(())
     }
@@ -465,13 +486,12 @@ impl OutputTarget for OpenHomeOutput {
         let volume = if let Some(v) = cached_volume.filter(|_| eventing) {
             v
         } else if let Some(url) = self.svc_url("volume") {
-            self.soap_call(url, SVC_VOLUME, "Volume", &[])
-                .await
-                .ok()
-                .and_then(|r| extract_tag(&r, "Value"))
-                .and_then(|v| v.parse::<f64>().ok())
+            let response = self.soap_call(url, SVC_VOLUME, "Volume", &[]).await?;
+            extract_tag(&response, "Value")
+                .ok_or("OpenHome Volume response has no Value")?
+                .parse::<f64>()
                 .map(|v| v / 100.0)
-                .unwrap_or(0.5)
+                .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
         } else {
             0.5
         };
@@ -479,12 +499,10 @@ impl OutputTarget for OpenHomeOutput {
         let muted = if let Some(m) = cached_muted.filter(|_| eventing) {
             m
         } else if let Some(url) = self.svc_url("volume") {
-            self.soap_call(url, SVC_VOLUME, "Mute", &[])
-                .await
-                .ok()
-                .and_then(|r| extract_tag(&r, "Value"))
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
+            let response = self.soap_call(url, SVC_VOLUME, "Mute", &[]).await?;
+            let value =
+                extract_tag(&response, "Value").ok_or("OpenHome Mute response has no Value")?;
+            value == "1" || value.eq_ignore_ascii_case("true")
         } else {
             false
         };
@@ -520,6 +538,9 @@ impl OutputTarget for OpenHomeOutput {
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 

@@ -11,6 +11,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/rooms", get(list_rooms))
+        .route("/speakers", get(list_speakers))
         .route("/rooms/{id}/play", post(play_room))
         .route("/rooms/{id}/pause", post(pause_room))
         .route("/rooms/{id}/volume", post(set_room_volume))
@@ -45,6 +46,44 @@ async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
     Json(json!(sonos))
 }
 
+/// GET /sonos/speakers
+///
+/// Les mêmes appareils que `/rooms`, sous la forme que la barre latérale
+/// attend : `uid`, `name`, `ip`.
+///
+/// L'interface appelait cette route depuis toujours ; elle n'a jamais existé,
+/// et la section multiroom restait donc vide sans rien dire (#2004). `/rooms`
+/// rend `id`/`host`, pas `uid`/`ip` : renommer la route n'aurait pas suffi,
+/// c'est la forme qui diffère.
+///
+/// `is_coordinator` et `group_uid`, déclarés par le type web, ne sont
+/// délibérément PAS rendus : ils viennent du service UPnP ZoneGroupTopology,
+/// que ce serveur n'interroge pas — il ne fait que de la découverte DLNA
+/// générique. Les inventer à `false`/`null` ferait passer une absence
+/// d'information pour un fait. Aucun composant ne les lit aujourd'hui.
+async fn list_speakers(State(state): State<AppState>) -> Json<Value> {
+    let devices = state.scanner.devices().await;
+
+    let speakers: Vec<Value> = devices
+        .iter()
+        .filter(|d| {
+            let mfr = d.manufacturer.as_deref().unwrap_or("").to_lowercase();
+            let model = d.model.as_deref().unwrap_or("").to_lowercase();
+            mfr.contains("sonos") || model.contains("sonos")
+        })
+        .map(|d| {
+            json!({
+                "uid": d.id,
+                "name": d.name,
+                "ip": d.host,
+                "available": d.available,
+            })
+        })
+        .collect();
+
+    Json(json!(speakers))
+}
+
 /// Send a Play (resume) command to the given Sonos device via its DLNA output.
 async fn play_room(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let outputs = state.outputs.lock().await;
@@ -56,7 +95,7 @@ async fn play_room(State(state): State<AppState>, Path(id): Path<String>) -> imp
             .into_response();
     };
     let output = output.lock().await;
-    match output.resume().await {
+    match output.checked_resume().await {
         Ok(()) => Json(json!({"status": "playing"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -73,7 +112,7 @@ async fn pause_room(State(state): State<AppState>, Path(id): Path<String>) -> im
             .into_response();
     };
     let output = output.lock().await;
-    match output.pause().await {
+    match output.checked_pause().await {
         Ok(()) => Json(json!({"status": "paused"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -100,7 +139,7 @@ async fn set_room_volume(
             .into_response();
     };
     let output = output.lock().await;
-    match output.set_volume(body.volume).await {
+    match output.checked_set_volume(body.volume).await {
         Ok(()) => Json(json!({"volume": body.volume})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }

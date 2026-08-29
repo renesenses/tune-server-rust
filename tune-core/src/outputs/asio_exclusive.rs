@@ -16,7 +16,7 @@
 //! On drop, the original sample rate is restored (if changed).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -24,7 +24,13 @@ use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
-use super::local::RingBuf;
+use super::local::{NativePcmRing, RingBuf};
+
+#[derive(Default)]
+struct RealtimeCounters {
+    underruns: AtomicU64,
+    callback_errors: AtomicU64,
+}
 
 /// Process-wide guard serializing access to the single ASIO device. ASIO
 /// forbids two concurrent streams on the same device — even within one
@@ -98,17 +104,72 @@ pub struct AsioExclusiveOutput {
     original_sample_rate: Option<u32>,
     current_sample_rate: u32,
     stream: Option<cpal::Stream>,
-    ring: Arc<RingBuf>,
+    #[allow(dead_code)]
+    float_ring: Arc<RingBuf>,
+    #[allow(dead_code)]
+    native_ring: Arc<NativePcmRing>,
+    transport: AsioTransport,
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     volume: Arc<AtomicU32>,
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
+    counters: Arc<RealtimeCounters>,
     /// Held for the whole session so no other ASIO stream can open on the
     /// device concurrently. Released (with a settle delay) in `Drop`.
     #[allow(dead_code)]
     device_guard: MutexGuard<'static, ()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsioTransport {
+    NativeI32,
+    NativeI24,
+    NativeI16,
+    ProcessedI32(&'static str),
+    ProcessedI24(&'static str),
+    ProcessedI16(&'static str),
+    ProcessedF32(&'static str),
+}
+
+impl AsioTransport {
+    fn for_format(native_format: SampleFormat, source_bit_depth: u32) -> Result<Self, String> {
+        match native_format {
+            SampleFormat::I32 if matches!(source_bit_depth, 16 | 24 | 32) => Ok(Self::NativeI32),
+            SampleFormat::I32 => Ok(Self::ProcessedI32(
+                "la profondeur source ne possède pas de représentation entière native prise en charge",
+            )),
+            SampleFormat::I24 if matches!(source_bit_depth, 16 | 24) => Ok(Self::NativeI24),
+            SampleFormat::I24 => Ok(Self::ProcessedI24(
+                "le callback 24 bits du pilote ASIO ne peut pas conserver tous les bits de la source",
+            )),
+            SampleFormat::I16 if source_bit_depth == 16 => Ok(Self::NativeI16),
+            SampleFormat::I16 => Ok(Self::ProcessedI16(
+                "le pilote ASIO n'accepte que des mots 16 bits pour cette configuration",
+            )),
+            SampleFormat::F32 => Ok(Self::ProcessedF32(
+                "le pilote ASIO expose uniquement un callback flottant pour cette configuration",
+            )),
+            other => Err(format!(
+                "Format natif ASIO non pris en charge sans conversion implicite : {other:?}"
+            )),
+        }
+    }
+
+    fn is_native(self) -> bool {
+        matches!(self, Self::NativeI32 | Self::NativeI24 | Self::NativeI16)
+    }
+
+    fn bit_perfect_unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::ProcessedI32(reason)
+            | Self::ProcessedI24(reason)
+            | Self::ProcessedI16(reason)
+            | Self::ProcessedF32(reason) => Some(reason),
+            Self::NativeI32 | Self::NativeI24 | Self::NativeI16 => None,
+        }
+    }
 }
 
 /// Information about the currently-configured exclusive format.
@@ -134,7 +195,8 @@ impl AsioExclusiveOutput {
         sample_rate: u32,
         bit_depth: u32,
         channels: u32,
-        ring: Arc<RingBuf>,
+        float_ring: Arc<RingBuf>,
+        native_ring: Arc<NativePcmRing>,
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
@@ -242,20 +304,32 @@ impl AsioExclusiveOutput {
             "asio_exclusive_config_found"
         );
 
+        let transport = AsioTransport::for_format(native_fmt, bit_depth)?;
+        if let Some(reason) = transport.bit_perfect_unavailable_reason() {
+            info!(
+                device = %resolved_name,
+                source_bit_depth = bit_depth,
+                native_format = ?native_fmt,
+                reason,
+                "asio_bit_perfect_transport_unavailable"
+            );
+        }
+
         // -- 5. Build output stream with render callback --------------------
         //
-        // The ring buffer always stores f32 samples internally.  When the
-        // ASIO driver's native format is *not* F32 we read f32 from the
-        // ring, apply volume, then convert to the driver's native type in
-        // the callback.  This keeps the entire pipeline in f32 while giving
-        // the driver the exact integer format it expects.
+        // Integer-compatible drivers consume the left-aligned native ring
+        // directly. Only incompatible configurations retain the processed
+        // f32 path, with an explicit reason logged above.
+        let counters = Arc::new(RealtimeCounters::default());
         let stream = Self::build_native_stream(
             &device,
             &stream_config,
-            native_fmt,
-            ring.clone(),
+            transport,
+            float_ring.clone(),
+            native_ring.clone(),
             volume.clone(),
             paused.clone(),
+            counters.clone(),
         )?;
 
         stream
@@ -275,9 +349,12 @@ impl AsioExclusiveOutput {
             original_sample_rate,
             current_sample_rate: sample_rate,
             stream: Some(stream),
-            ring,
+            float_ring,
+            native_ring,
+            transport,
             volume,
             paused,
+            counters,
             device_guard,
         })
     }
@@ -306,7 +383,12 @@ impl AsioExclusiveOutput {
             }
         }
 
-        info!(device = %self.device_name, "asio_exclusive_released");
+        info!(
+            device = %self.device_name,
+            underruns = self.underrun_count(),
+            callback_errors = self.callback_error_count(),
+            "asio_exclusive_released"
+        );
         Ok(())
     }
 
@@ -316,27 +398,45 @@ impl AsioExclusiveOutput {
         cpal::host_from_id(cpal::HostId::Asio).is_ok()
     }
 
-    /// Returns the ring buffer reference for external feeding.
-    pub fn ring(&self) -> &Arc<RingBuf> {
-        &self.ring
+    /// Whether the selected ASIO callback can consume left-aligned integer
+    /// words without a floating-point round trip.
+    pub fn uses_native_transport(&self) -> bool {
+        self.transport.is_native()
+    }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.counters.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn callback_error_count(&self) -> u64 {
+        self.counters.callback_errors.load(Ordering::Relaxed)
+    }
+
+    /// Human-readable reason exposed when this device/configuration cannot
+    /// honour a bit-perfect integer contract.
+    pub fn bit_perfect_unavailable_reason(&self) -> Option<&'static str> {
+        self.transport.bit_perfect_unavailable_reason()
     }
 
     /// Build the cpal output stream using the driver's native sample format.
     ///
-    /// The ring buffer always contains f32 samples.  For native I32 or I16
-    /// drivers (e.g. RME Babyface Pro FS) we read f32 from the ring, apply
-    /// volume, and convert to the target integer type in the callback.
+    /// Integer callbacks only move native words. The f32 callback is retained
+    /// for drivers whose advertised format cannot represent the source words
+    /// exactly; its reason is exposed by `bit_perfect_unavailable_reason`.
     fn build_native_stream(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        native_fmt: SampleFormat,
-        ring: Arc<RingBuf>,
+        transport: AsioTransport,
+        float_ring: Arc<RingBuf>,
+        native_ring: Arc<NativePcmRing>,
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
+        counters: Arc<RealtimeCounters>,
     ) -> Result<cpal::Stream, String> {
-        match native_fmt {
-            SampleFormat::I32 => {
+        match transport {
+            AsioTransport::NativeI32 => {
                 info!("asio_exclusive_building_i32_stream");
+                let errors = counters.clone();
                 device
                     .build_output_stream(
                         config,
@@ -345,28 +445,49 @@ impl AsioExclusiveOutput {
                                 data.fill(0);
                                 return;
                             }
-                            // Read f32 from ring into a temporary buffer
-                            let mut tmp = vec![0.0f32; data.len()];
-                            let read = ring.pop(&mut tmp);
-                            // Apply volume and convert f32 → i32
-                            let v = volume.load(Ordering::Relaxed) as f64 / 1000.0;
-                            let scale = i32::MAX as f64;
-                            for i in 0..read {
-                                let s = (tmp[i] as f64 * v).clamp(-1.0, 1.0);
-                                data[i] = (s * scale) as i32;
+                            let read = native_ring.pop(data);
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
-                            // Silence remaining
-                            for sample in &mut data[read..] {
-                                *sample = 0;
-                            }
+                            data[read..].fill(0);
                         },
-                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
                         None,
                     )
                     .map_err(|e| format!("Failed to build ASIO I32 stream: {e}"))
             }
-            SampleFormat::I16 => {
+            AsioTransport::NativeI24 => {
+                info!("asio_exclusive_building_native_i24_stream");
+                let errors = counters.clone();
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(cpal::I24::new(0).expect("zero tient sur 24 bits"));
+                                return;
+                            }
+                            let read = native_ring.pop_mapped(data, |sample| {
+                                cpal::I24::new(sample >> 8)
+                                    .expect("un mot natif décalé tient sur 24 bits")
+                            });
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
+                            data[read..].fill(cpal::I24::new(0).expect("zero tient sur 24 bits"));
+                        },
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build ASIO I24 stream: {e}"))
+            }
+            AsioTransport::NativeI16 => {
                 info!("asio_exclusive_building_i16_stream");
+                let errors = counters.clone();
                 device
                     .build_output_stream(
                         config,
@@ -375,31 +496,110 @@ impl AsioExclusiveOutput {
                                 data.fill(0);
                                 return;
                             }
-                            let mut tmp = vec![0.0f32; data.len()];
-                            let read = ring.pop(&mut tmp);
-                            let v = volume.load(Ordering::Relaxed) as f64 / 1000.0;
-                            let scale = i16::MAX as f64;
-                            for i in 0..read {
-                                let s = (tmp[i] as f64 * v).clamp(-1.0, 1.0);
-                                data[i] = (s * scale) as i16;
+                            let read = native_ring.pop_mapped(data, |sample| (sample >> 16) as i16);
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
-                            for sample in &mut data[read..] {
-                                *sample = 0;
-                            }
+                            data[read..].fill(0);
                         },
-                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
                         None,
                     )
                     .map_err(|e| format!("Failed to build ASIO I16 stream: {e}"))
             }
-            _ => {
-                // F32 (default) and any other format — use f32 callback
-                if native_fmt != SampleFormat::F32 {
-                    warn!(
-                        native_format = ?native_fmt,
-                        "asio_exclusive_unexpected_format_falling_back_to_f32"
-                    );
-                }
+            AsioTransport::ProcessedI32(_) => {
+                let errors = counters.clone();
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(0);
+                                return;
+                            }
+                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let read = float_ring.pop_mapped(data, |sample| {
+                                let scaled = (f64::from(sample) * volume * 2_147_483_648.0)
+                                    .round()
+                                    .clamp(i32::MIN as f64, i32::MAX as f64);
+                                scaled as i32
+                            });
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
+                            data[read..].fill(0);
+                        },
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build processed ASIO I32 stream: {e}"))
+            }
+            AsioTransport::ProcessedI24(_) => {
+                let errors = counters.clone();
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
+                            let zero = cpal::I24::new(0).expect("zero tient sur 24 bits");
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(zero);
+                                return;
+                            }
+                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let read = float_ring.pop_mapped(data, |sample| {
+                                let scaled = (f64::from(sample) * volume * 8_388_608.0)
+                                    .round()
+                                    .clamp(-8_388_608.0, 8_388_607.0)
+                                    as i32;
+                                cpal::I24::new(scaled).expect("la valeur bornée tient sur 24 bits")
+                            });
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
+                            data[read..].fill(zero);
+                        },
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build processed ASIO I24 stream: {e}"))
+            }
+            AsioTransport::ProcessedI16(_) => {
+                let errors = counters.clone();
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(0);
+                                return;
+                            }
+                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let read = float_ring.pop_mapped(data, |sample| {
+                                let scaled = (f64::from(sample) * volume * 32_768.0)
+                                    .round()
+                                    .clamp(i16::MIN as f64, i16::MAX as f64);
+                                scaled as i16
+                            });
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
+                            data[read..].fill(0);
+                        },
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build processed ASIO I16 stream: {e}"))
+            }
+            AsioTransport::ProcessedF32(_) => {
+                let errors = counters.clone();
                 device
                     .build_output_stream(
                         config,
@@ -408,7 +608,10 @@ impl AsioExclusiveOutput {
                                 data.fill(0.0);
                                 return;
                             }
-                            let read = ring.pop(data);
+                            let read = float_ring.pop(data);
+                            if read < data.len() {
+                                counters.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
                             let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
                             for sample in &mut data[..read] {
                                 *sample *= v;
@@ -417,7 +620,9 @@ impl AsioExclusiveOutput {
                                 *sample = 0.0;
                             }
                         },
-                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        move |_| {
+                            errors.callback_errors.fetch_add(1, Ordering::Relaxed);
+                        },
                         None,
                     )
                     .map_err(|e| format!("Failed to build ASIO F32 stream: {e}"))
@@ -555,5 +760,33 @@ mod tests {
     fn test_asio_exclusive_output_is_available() {
         // Same as above — just verify it doesn't panic
         let _ = AsioExclusiveOutput::is_available();
+    }
+
+    #[test]
+    fn native_asio_transport_is_selected_only_when_every_source_bit_fits() {
+        assert_eq!(
+            AsioTransport::for_format(SampleFormat::I32, 32).unwrap(),
+            AsioTransport::NativeI32
+        );
+        assert_eq!(
+            AsioTransport::for_format(SampleFormat::I24, 24).unwrap(),
+            AsioTransport::NativeI24
+        );
+        assert_eq!(
+            AsioTransport::for_format(SampleFormat::I16, 16).unwrap(),
+            AsioTransport::NativeI16
+        );
+        assert!(
+            AsioTransport::for_format(SampleFormat::I16, 24)
+                .unwrap()
+                .bit_perfect_unavailable_reason()
+                .is_some()
+        );
+        assert!(
+            AsioTransport::for_format(SampleFormat::F32, 24)
+                .unwrap()
+                .bit_perfect_unavailable_reason()
+                .is_some()
+        );
     }
 }

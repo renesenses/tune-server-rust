@@ -67,15 +67,57 @@ jobs:
             || { echo "::error::asset linux-x86_64.tar.gz absent de la release v$VERSION"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # Le tarball est récupéré ICI, sur le runner, avec le jeton — et pas dans
+      # le conteneur par une URL publique.
+      #
+      # Depuis #1588 la release naît en BROUILLON : ses assets ne sont plus
+      # servis par `releases/download/...`, qui répond une page 404. Le `curl`
+      # du script recevait donc du HTML, l'écrivait dans tune.tar.gz — non vide,
+      # donc son test `-s` passait — et le `tar` mourait cinquante lignes plus
+      # loin sur « gzip: stdin: not in gzip format ». v0.9.76 : deux cycles de
+      # CI perdus, et une release bloquée en brouillon par sa propre garde.
+      #
+      # `gh release download` passe par l'API et voit les brouillons.
+      - name: Télécharger le tarball serveur (brouillon compris)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          OUT="$PWD/image/tune-server-v$V-linux-x86_64.tar.gz"
+          gh release download "v$V" --repo "${{ github.repository }}" \
+            --pattern "tune-server-v$V-linux-x86_64.tar.gz" --output "$OUT" --clobber
+          # Vérifier que c'est bien une archive, pas une page d'erreur.
+          gzip -t "$OUT" || { echo "::error::$OUT n'est pas une archive gzip"; exit 1; }
+          echo "TUNE_TARBALL_PATH=/repo/image/tune-server-v$V-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+
       # Build dans un conteneur bookworm : le debootstrap d'ubuntu-22.04
       # échoue à configurer les paquets de base de bookworm (polkitd).
       # --privileged : losetup/chroot ; le noyau est partagé avec le runner.
       - name: Build image (debian bookworm container)
         run: |
           docker run --rm --privileged -v "$PWD":/repo -w /repo -v /dev:/dev \
+            -e TUNE_TARBALL_PATH="$TUNE_TARBALL_PATH" \
             debian:bookworm bash -ec '
-              apt-get update -qq
-              apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null
+              # PAS de `sudo` ici : on est root dans un `debian:bookworm` nu,
+              # qui ne contient pas sudo. Chaque ligne `sudo ...` echouerait en
+              # « command not found » et casserait la construction de l image a
+              # TOUS les coups — pas seulement quand apt est en panne.
+              #
+              # Et pas d `apt-get update -qq` non borne avant la boucle : il
+              # annulerait le garde-fou en pendant avant tout `timeout`.
+              for essai in 1 2 3; do
+                if timeout 100 apt-get update -qq && timeout 200 apt-get install -y -qq debootstrap parted dosfstools grub-efi-amd64-bin e2fsprogs curl ca-certificates >/dev/null; then
+                  break
+                fi
+                if [ "$essai" = "3" ]; then
+                  echo "::error::apt injoignable apres 3 essais"
+                  exit 1
+                fi
+                echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+                rm -rf /var/lib/apt/lists/*
+                sleep 20
+              done
               ./image/build-nuc-image.sh --version "${{ steps.ver.outputs.version }}" || {
                 echo "=== debootstrap.log (fin) ==="
                 tail -n 150 /tmp/tune-os-build/rootfs/debootstrap/debootstrap.log 2>/dev/null || true

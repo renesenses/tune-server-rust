@@ -51,19 +51,29 @@ pub(super) async fn list_duplicates(
         .unwrap_or_default();
     let hash_dups: Vec<Value> = hash_rows
         .iter()
-        .map(|row| {
-            json!({
+        .filter_map(|row| {
+            let file_path = row.get(3).and_then(|v| v.as_string())?;
+            let duplicate_path = row.get(7).and_then(|v| v.as_string())?;
+            if !tune_core::scanner::hasher::files_are_byte_identical(
+                std::path::Path::new(&file_path),
+                std::path::Path::new(&duplicate_path),
+            )
+            .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(json!({
                 "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": row.get(2).and_then(|v| v.as_string()),
-                "file_path": row.get(3).and_then(|v| v.as_string()),
+                "file_path": file_path,
                 "audio_hash": row.get(4).and_then(|v| v.as_string()),
                 "duration_ms": row.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
                 "dup_id": row.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
-                "dup_path": row.get(7).and_then(|v| v.as_string()),
+                "dup_path": duplicate_path,
                 "dup_artist_name": row.get(8).and_then(|v| v.as_string()),
                 "match_type": "audio_hash",
-            })
+            }))
         })
         .collect();
 
@@ -309,5 +319,54 @@ pub(super) async fn smart_duplicates(
     Ok(Json(json!({
         "duplicates": items,
         "count": items.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ScanParams {
+    /// Plafond de pistes examinées. 0 (défaut) = toute la bibliothèque.
+    limit: Option<usize>,
+}
+
+/// POST /library/duplicates/scan
+///
+/// Recalcule les empreintes audio manquantes et rend le compte des doublons.
+///
+/// `list_duplicates` ne rapproche que des pistes dont `audio_hash` est déjà
+/// renseigné. Le scanner le calcule à l'indexation
+/// (`scanner/walker.rs`), mais rien ne rattrapait les pistes entrées avant
+/// que le hachage existe, ni celles dont il avait échoué : elles restaient
+/// invisibles aux doublons pour toujours, sans que rien ne le signale.
+///
+/// Le moteur `duplicate_detector::scan_duplicates` fait exactement ce
+/// rattrapage — il calcule l'empreinte absente, la PERSISTE, puis regroupe.
+/// Il était complet dans `tune-core` et **n'avait aucun appelant** : une
+/// porte HTTP manquait, et l'interface appelait `/metadata/duplicates/scan`,
+/// qui n'a jamais existé (#1893).
+///
+/// Les deux champs rendus sont ceux que lit l'écran Métadonnées ; `groups`
+/// n'est pas renvoyé, la liste détaillée étant le travail de
+/// `GET /library/duplicates` qui la pagine.
+pub(super) async fn scan_duplicates(
+    State(state): State<AppState>,
+    Query(p): Query<ScanParams>,
+) -> Result<Json<Value>, AppError> {
+    let limit = p.limit.unwrap_or(0);
+
+    // Le scan lit et réécrit chaque fichier sans empreinte : sur une grande
+    // bibliothèque il tient la durée d'un calcul de hachage par piste. Le
+    // sortir du fil de la requête évite de bloquer l'exécuteur asynchrone.
+    let backend = state.backend.clone();
+    let resultat = tokio::task::spawn_blocking(move || {
+        tune_core::library::duplicate_detector::scan_duplicates(&backend, limit)
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("scan de doublons interrompu : {e}")))?;
+
+    Ok(Json(json!({
+        "total_scanned": resultat.total_scanned,
+        "duplicates_found": resultat.duplicates_found,
+        "groups": resultat.groups.len(),
+        "errors": resultat.errors,
     })))
 }

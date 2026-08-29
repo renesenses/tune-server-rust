@@ -182,6 +182,18 @@ pub fn build_track_from_metadata_opts(
     });
     let album_id = album.as_ref().and_then(|a| a.id);
 
+    // Garder la décision qui vient d'être prise (#1957) : c'est elle qui a
+    // envoyé l'album sous « Various Artists » plus haut. Cette voie est celle
+    // du surveillant de fichiers, où `compilation_override` reconstruit la vue
+    // du dossier depuis la base — donc le drapeau enregistré ici est bien le
+    // même que celui du scan par lots. `mark_compilation` ne fait que lever le
+    // drapeau, jamais le baisser (voir sa documentation).
+    if let Some(aid) = album_id
+        && is_compilation
+    {
+        album_repo.mark_compilation(aid).ok();
+    }
+
     // Propagate date metadata from track tags to the album (COALESCE — only
     // fills in values not already set, so the first track with dates wins).
     if let Some(aid) = album_id {
@@ -216,6 +228,21 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
     let scan_done_clone = scan_done.clone();
     tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
+
+        // Registre des executions automatisees (#2080). Ouvert AVANT toute
+        // sortie anticipee : « aucun dossier configure » et « un scan tenait
+        // deja le verrou » sont deux reponses valables a « le scan n'a rien
+        // fait », et un registre qui ne les consignait pas laisserait ces deux
+        // cas indistinguables d'un scan jamais lance.
+        //
+        // Le temoin ferme la ligne sur TOUS les chemins de sortie : `terminer`
+        // en fin de scan, et son `Drop` en `interrompu` partout ailleurs — y
+        // compris le deroulement d'une panique. Il ne couvre pas l'extinction
+        // du processus ; c'est la cloture des orphelines au demarrage suivant
+        // qui s'en charge (`startup::ouvrir_le_registre_des_executions`).
+        let suivi = tune_core::db::task_run_repo::TaskRunRepo::with_backend(db.clone())
+            .ouvrir(tune_core::db::task_run_repo::TACHE_SCAN_DEMARRAGE);
+
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let raw_dirs: Vec<String> = settings
             .get("music_dirs")
@@ -232,11 +259,31 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            suivi.rien_a_faire(Some("aucun dossier de musique configure"));
             // Mark the scan "done" even on this early exit: the file watcher
             // waits on this flag before it starts watching.
             scan_done_clone.store(true, Ordering::Release);
             return;
         }
+
+        // Le scan de démarrage partage exactement la même porte que les scans
+        // manuels et planifiés. L'acquisition précède même l'énumération : deux
+        // walkers ne peuvent donc jamais converger ensuite vers des écritures
+        // et purges concurrentes.
+        let Some(scan_lease) = crate::routes::system::scan::try_begin_scan() else {
+            info!("auto_scan_skipped_already_scanning");
+            suivi.rien_a_faire(Some("un autre scan tenait deja le verrou"));
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        };
+        let _scan_lease = scan_lease;
+
+        // Make the startup scan first-class, exactly like the manual one:
+        // advertise it via `scan_status` and honour cooperative cancellation.
+        // The guards reset the persisted status before releasing the unique
+        // owner on every exit path, including panic unwind.
+        let _ = settings.set("scan_status", "scanning");
+        let _scan_status_guard = ScanStatusGuard(db.clone());
 
         let exclude_patterns = scan_exclude_patterns(&db);
         if !exclude_patterns.is_empty() {
@@ -249,20 +296,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
+        let mut skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_reasons = list_result.skipped_reasons;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
-
-        // Make the startup scan first-class, exactly like the manual one:
-        // advertise it via `scan_status` and honour the shared cancel flag.
-        // Previously the boot-time scan set neither, so on the desktop app it ran
-        // with no progress banner and no working "Arrêter le scan" button — the
-        // client's on-mount getScanStatus() saw "idle" and the cancel endpoint
-        // had nothing to stop (#1197 Benjithom / #1196). The guard resets to idle
-        // on every exit path (incl. panic unwind).
-        crate::routes::system::scan::reset_scan_cancel();
-        let _ = settings.set("scan_status", "scanning");
-        let _scan_status_guard = ScanStatusGuard(db.clone());
 
         // NFC-normalized set of every path found on disk this scan. Used after
         // the scan to prune tracks whose files were deleted while the server was
@@ -287,12 +325,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                // Le message d'erreur du moteur peut porter un chemin de base :
+                // on n'inscrit que le motif, pas `e`.
+                suivi.echec("lecture des pistes existantes impossible");
                 scan_done_clone.store(true, Ordering::Release);
                 return;
             }
         };
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Keep only files that are new or whose mtime/size changed since the
@@ -308,7 +349,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let is_changed = |path: &std::path::Path| {
             crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
         };
-        let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
+        // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
+        // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
+        // moitié de la charge — et personne ne comprenait pourquoi (#1948).
+        let stat_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(tune_core::scanner::walker::scan_io_concurrency())
+            .build()
+            .ok();
         let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
             Some(pool) => {
                 pool.install(|| files.into_par_iter().filter(|p| is_changed(p)).collect())
@@ -360,6 +407,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_unchanged = pre_skipped as u64;
         let mut skipped_duplicate = 0u64;
         let mut skipped_no_metadata = 0u64;
+        let mut skipped_unsupported = 0u64;
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -383,13 +431,29 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    db.execute("BEGIN IMMEDIATE", &[]).ok();
+                let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
+                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                    // Se nommer : tout `write_tx` concurrent echouera tant
+                    // que ce lot tient la connexion, et sans cette
+                    // etiquette son message n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:auto");
                 }
 
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    if let Some(unsupported) = &sf.unsupported {
+                        tracing::info!(
+                            path = %sf.path,
+                            format = %unsupported.report_key,
+                            reason = unsupported.reason,
+                            "scan_track_skipped_unsupported"
+                        );
+                        skipped += 1;
+                        skipped_unsupported += 1;
+                        continue;
+                    }
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         // Counted in the aggregate too, so `processed` can
@@ -427,22 +491,37 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Deduplicate by audio_hash + album_id: if the same content
-                    // already exists in this album (via a different path), skip it.
+                    // `audio_hash` only selects cheap candidates. Never hide a
+                    // track until an existing path is byte-for-byte identical.
                     if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                         let key = (hash.clone(), aid);
-                        if known_hashes.contains(&key) {
+                        let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                        if let Some(existing_path) =
+                            tune_core::scanner::hasher::find_byte_identical_path(
+                                std::path::Path::new(&sf.path),
+                                &candidates,
+                            )
+                        {
                             tracing::debug!(
                                 audio_hash = %hash,
                                 album_id = aid,
                                 path = %sf.path,
+                                existing_path = %existing_path,
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
                             skipped_duplicate += 1;
                             continue;
                         }
-                        known_hashes.insert(key);
+                        if !candidates.is_empty() {
+                            tracing::warn!(
+                                audio_hash = %hash,
+                                album_id = aid,
+                                path = %sf.path,
+                                candidates = candidates.len(),
+                                "audio_hash_candidate_not_byte_identical"
+                            );
+                        }
                     }
 
                     to_insert.push(track);
@@ -453,6 +532,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                if batch_inserted == to_insert.len() as u64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as u64 - batch_inserted;
                 db_update_failed += to_update.len() as u64 - batch_updated;
                 inserted += batch_inserted;
@@ -484,9 +575,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     }
                 }
 
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                if is_sqlite {
                     db.execute("COMMIT", &[]).ok();
+                    // Liberer meme si le COMMIT a echoue : une etiquette
+                    // perimee accuserait un innocent au prochain incident.
+                    tune_core::db::tx_holder::liberer();
                 }
+                drop(sqlite_write_guard);
 
                 // Emit scan progress after each batch (throttled every other
                 // batch or 2s), mirroring the manual scan's payload/phase.
@@ -523,6 +618,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         );
 
+        for (format, count) in &stats.unsupported_by_ext {
+            *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
+        }
+        skipped_reasons.extend(stats.unsupported_reasons.clone());
+
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted();
 
@@ -537,36 +637,139 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // Stop must never be destructive. Same subtree protection as the manual
         // scan for `error_dirs` (walk errors mid-scan: files exist but never
         // made it into the discovered set).
+        // Hissé hors du bloc pour la réconciliation des favoris (#1943).
+        let mut racines_videes: Vec<String> = Vec::new();
+        // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
+        // émet lui aussi `library.scan.completed`. Son rapport ne portait
+        // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
+        // sur ce chemin-là également. Hissé pour que le rapport puisse le
+        // publier (#2146).
+        let mut pistes_supprimees = 0i64;
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
+            // C'est CE scan-ci qui frappait Dominique : il tourne au démarrage
+            // du service, précisément au moment où un montage SMB peut ne pas
+            // encore être là. Le point de montage existe, il est lisible, il
+            // est vide — et la bibliothèque partait avec (#1652).
+            let existing_refs: Vec<&str> = existing_tracks.keys().map(|s| s.as_str()).collect();
+            racines_videes = crate::routes::system::scan::roots_gone_empty(
+                &music_dirs,
+                &existing_refs,
+                &discovered_paths,
+            );
+            let emptied_roots = &racines_videes;
+            // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
+            // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
+            // et tout le sous-arbre partait sans un mot (#1943).
+            let sous_arbres =
+                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            if !sous_arbres.is_empty() {
+                tracing::error!(
+                    dossiers = ?sous_arbres,
+                    seuil = SEUIL_SOUS_ARBRE_VIDE,
+                    "auto_scan_sous_arbre_vide — ces dossiers ont perdu leurs pistes d'un coup \
+                     alors que leur racine répond. Montage imbriqué absent ? CONSERVÉES."
+                );
+            }
+            if !emptied_roots.is_empty() {
+                tracing::error!(
+                    roots = ?emptied_roots,
+                    "auto_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
+                );
+            }
+            // Même règle que le scan manuel, et au même endroit : ces deux
+            // boucles étaient des copies portant les mêmes trous (#1943).
+            // Celle-ci est la plus dangereuse des deux — elle tourne au
+            // démarrage, donc AVANT qu'un montage USB ou SMB soit prêt.
+            use crate::routes::system::scan::{
+                PART_MAX_PURGE, SEUIL_SOUS_ARBRE_VIDE, VerdictPurge, purge_trop_massive,
+                verdict_purge,
+            };
             let mut pruned = 0i64;
             let mut protected = 0i64;
+            let mut hors_perimetre = 0i64;
+            let mut a_supprimer: Vec<i64> = Vec::new();
+            let examinees = existing_tracks.len();
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
-                    let in_unreadable_scope = missing_dirs
-                        .iter()
-                        .chain(error_dirs.iter())
-                        .any(|d| db_path.starts_with(d));
-                    if in_unreadable_scope {
-                        protected += 1;
-                        continue;
-                    }
-                    if track_repo.delete(track_id).is_ok() {
-                        pruned += 1;
+                    match verdict_purge(
+                        db_path,
+                        &music_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        &sous_arbres,
+                    ) {
+                        VerdictPurge::ProtegeIllisible => protected += 1,
+                        VerdictPurge::HorsPerimetre => hors_perimetre += 1,
+                        VerdictPurge::Supprimer => a_supprimer.push(track_id),
                     }
                 }
+            }
+            if purge_trop_massive(a_supprimer.len(), examinees) {
+                tracing::error!(
+                    candidats = a_supprimer.len(),
+                    examinees,
+                    plafond = PART_MAX_PURGE,
+                    // Pas de `confirm_purge` ici, et c'est VOLONTAIRE : un
+                    // scan automatique n'a aucune intention d'utilisateur
+                    // derrière lui. Il ne doit jamais pouvoir supprimer en
+                    // masse, quel que soit le réglage. La sortie passe par un
+                    // scan explicite — on le dit, plutôt que de laisser le
+                    // refus se rejouer sans issue.
+                    "auto_scan_purge_refusee_trop_massive — disparition massive au démarrage : \
+                     bien plus souvent un montage pas encore prêt qu'une suppression réelle. \
+                     Les pistes sont CONSERVÉES. Un scan automatique ne peut JAMAIS purger \
+                     au-delà du plafond : si ces pistes ont vraiment été supprimées, lancer un \
+                     scan explicite avec `?confirm_purge={}`.",
+                    a_supprimer.len()
+                );
+                protected += a_supprimer.len() as i64;
+                a_supprimer.clear();
+            }
+            for track_id in a_supprimer {
+                if track_repo.delete(track_id).is_ok() {
+                    pruned += 1;
+                }
+            }
+            if hors_perimetre > 0 {
+                tracing::warn!(
+                    hors_perimetre,
+                    racines = ?music_dirs,
+                    "auto_scan_tracks_hors_perimetre — hors de toute racine configurée, donc \
+                     CONSERVÉES (#1943)."
+                );
             }
             if protected > 0 {
                 tracing::warn!(
                     protected,
                     missing = ?missing_dirs,
                     walk_errors = ?error_dirs,
+                    emptied = ?emptied_roots,
                     "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
+            pistes_supprimees = pruned;
             if pruned > 0 {
                 info!(pruned, "auto_scan_stale_tracks_removed");
+            }
+        }
+
+        // Comme la réconciliation des favoris, une réattribution d'album exige
+        // un scan complet et sain. Le démarrage avec montage absent, erreur de
+        // parcours ou annulation reste strictement en lecture seule ici.
+        let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
+            && missing_dirs.is_empty()
+            && error_dirs.is_empty()
+            && racines_videes.is_empty();
+        if full_scan_ok {
+            match album_repo.repair_empty_mbid_artist_collapses() {
+                Ok(repaired) if repaired > 0 => {
+                    tracing::warn!(repaired, "auto_scan_album_artists_repaired")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto_scan_album_artist_repair_failed"),
             }
         }
 
@@ -591,9 +794,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // supprime un favori vraiment introuvable qu'après un scan complet
         // sain (aucune racine manquante/illisible, non annulé).
         {
-            let full_scan_ok = !crate::routes::system::scan::scan_cancel_requested()
-                && missing_dirs.is_empty()
-                && error_dirs.is_empty();
+            // `emptied_roots` inclus depuis #1943 : sans lui, une racine vidée
+            // par un montage absent laissait passer la réconciliation, qui
+            // supprimait définitivement les favoris. Irréversible.
             match tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(db.clone())
                 .run(full_scan_ok)
             {
@@ -624,6 +827,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            skipped_unsupported,
             db_insert_failed,
             db_update_failed,
             artwork = artwork_extracted,
@@ -653,6 +857,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            // Ce que la purge a effectivement retiré. Le client lit cette clé
+            // pour le bandeau de fin de scan (#2146).
+            "removed": pistes_supprimees,
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
@@ -662,10 +869,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unchanged": skipped_unchanged,
             "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
+            "skipped_unsupported": skipped_unsupported,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
+            "skipped_unsupported_by_ext": skipped_by_ext,
+            "skipped_unsupported_reasons": skipped_reasons,
         });
 
         let report_path = std::env::var("TUNE_DB_PATH")
@@ -676,6 +886,26 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         }
 
         event_bus.emit("library.scan.completed", report);
+
+        // Le compteur du registre est ce qui a CHANGE, pas ce qui a ete vu :
+        // un scan qui relit 40 000 fichiers inchanges n'a rien fait, et
+        // inscrire 40 000 le ferait passer pour un gros travail.
+        let modifies = inserted as i64 + updated as i64 + pistes_supprimees;
+        let verdict = if modifies == 0 {
+            tune_core::db::task_run_repo::Verdict::RienAFaire
+        } else {
+            tune_core::db::task_run_repo::Verdict::Succes
+        };
+        // Que des compteurs : ni chemin, ni nom de dossier. `missing_dirs` et
+        // `failed_paths` sont des chemins de l'utilisateur — ils restent dans
+        // le rapport de scan, jamais dans le registre.
+        let detail = format!(
+            "{total_discovered} vus, {inserted} ajoutees, {updated} mises a jour, \
+             {pistes_supprimees} retirees, {} dossiers absents",
+            missing_dirs.len()
+        );
+        suivi.terminer(verdict, Some(modifies), Some(&detail));
+
         scan_done_clone.store(true, Ordering::Release);
     });
     scan_done
@@ -765,6 +995,73 @@ fn settle_partition(
 }
 
 #[cfg(test)]
+mod registre_du_scan_tests {
+    /// Le scan de demarrage inscrit son execution au registre (#2080) sur
+    /// TOUTES ses sorties. Les deux sorties anticipees comptent autant que la
+    /// normale : « aucun dossier configure » et « un scan tenait deja le
+    /// verrou » sont precisement les deux reponses a « le scan n'a rien fait »,
+    /// et sans elles ce cas se lirait comme un scan jamais lance.
+    #[test]
+    fn le_scan_de_demarrage_ferme_sa_ligne_sur_toutes_ses_sorties() {
+        let source = include_str!("auto_scan.rs");
+        let corps = source
+            .split("pub fn spawn_auto_scan")
+            .nth(1)
+            .expect("spawn_auto_scan introuvable")
+            .split("\n    scan_done\n}")
+            .next()
+            .expect("fin de spawn_auto_scan introuvable");
+
+        assert_eq!(
+            corps.matches("TACHE_SCAN_DEMARRAGE").count(),
+            1,
+            "une seule ouverture de ligne pour un scan"
+        );
+        assert_eq!(
+            corps.matches("suivi.rien_a_faire").count(),
+            2,
+            "les deux sorties anticipees (aucun dossier, verrou deja tenu) \
+             doivent chacune fermer la ligne"
+        );
+        assert_eq!(corps.matches("suivi.echec").count(), 1);
+        assert_eq!(corps.matches("suivi.terminer").count(), 1);
+    }
+
+    /// Le rapport de scan contient les chemins de l'utilisateur
+    /// (`missing_dirs`, `failed_paths`). Le registre, lui, ne doit porter que
+    /// des compteurs — il est fait pour etre colle dans un ticket.
+    #[test]
+    fn le_registre_du_scan_ne_recopie_aucun_chemin() {
+        let source = include_str!("auto_scan.rs");
+        let detail = source
+            .split("let detail = format!(")
+            .nth(1)
+            .expect("le detail du registre a change de forme")
+            .split(");")
+            .next()
+            .unwrap();
+
+        for interdit in [
+            "missing_dirs.clone",
+            "failed_paths",
+            "error_dirs",
+            "music_dirs",
+            "file_path",
+            "report_path",
+        ] {
+            assert!(
+                !detail.contains(interdit),
+                "le detail inscrit au registre ne doit pas porter `{interdit}`"
+            );
+        }
+        assert!(
+            detail.contains("missing_dirs.len()"),
+            "seul le NOMBRE de dossiers absents est inscrit, jamais leur nom"
+        );
+    }
+}
+
+#[cfg(test)]
 mod settle_tests {
     use super::settle_partition;
     use std::io::Write;
@@ -828,7 +1125,13 @@ mod settle_tests {
     }
 }
 
-pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
+/// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
+/// a personne. Voir l'emission de `library.updated` en fin de lot.
+pub fn spawn_file_watcher(
+    db: Arc<dyn DbBackend>,
+    wait_for_scan: Option<Arc<AtomicBool>>,
+    event_bus: Arc<tune_core::event_bus::EventBus>,
+) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
@@ -1053,19 +1356,36 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                     continue;
                                 };
 
-                                // Skip duplicate: same audio content already in this album
+                                // The hash is only a candidate selector. The
+                                // watcher is allowed to skip solely after a
+                                // full byte-for-byte comparison.
                                 if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                    if track_repo
-                                        .exists_by_audio_hash_and_album(hash, aid)
-                                        .unwrap_or(false)
+                                    let candidates = track_repo
+                                        .paths_by_audio_hash_and_album(hash, aid)
+                                        .unwrap_or_default();
+                                    if let Some(existing_path) =
+                                        tune_core::scanner::hasher::find_byte_identical_path(
+                                            std::path::Path::new(&sf.path),
+                                            &candidates,
+                                        )
                                     {
                                         tracing::debug!(
                                             audio_hash = %hash,
                                             album_id = aid,
                                             path = %sf.path,
+                                            existing_path = %existing_path,
                                             "watcher_skip_duplicate_audio_hash"
                                         );
                                         continue;
+                                    }
+                                    if !candidates.is_empty() {
+                                        tracing::warn!(
+                                            audio_hash = %hash,
+                                            album_id = aid,
+                                            path = %sf.path,
+                                            candidates = candidates.len(),
+                                            "watcher_audio_hash_candidate_not_byte_identical"
+                                        );
                                     }
                                 }
 
@@ -1128,6 +1448,25 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
+
+                    // DIRE que la bibliotheque a change.
+                    //
+                    // Le surveillant importait en silence : il ne recevait meme
+                    // pas le bus d'evenements, il ne POUVAIT donc rien annoncer.
+                    // Les listes du client restaient telles quelles, et il
+                    // fallait changer d'onglet puis revenir pour voir arriver
+                    // les albums qu'on venait de deposer — c'est mot pour mot
+                    // le contournement que Patatorz decrit (fil forum #1517).
+                    //
+                    // Un evenement PROPRE, et non `library.scan.completed` :
+                    // celui-la fait afficher au client une banniere « prete »,
+                    // qui n'aurait aucun sens a chaque fichier depose. Ici on
+                    // veut seulement que les listes se rechargent.
+                    event_bus.emit(
+                        tune_core::event_types::EventType::LibraryUpdated.as_str(),
+                        serde_json::json!({ "source": "watcher" }),
+                    );
+                    info!("watcher_library_updated_emis");
                 }
             }
         }

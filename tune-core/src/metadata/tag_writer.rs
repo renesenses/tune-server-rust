@@ -25,6 +25,50 @@ pub struct TagUpdate {
     pub lyrics: Option<String>,
 }
 
+impl TagUpdate {
+    fn sanitized(&self) -> (Self, Vec<super::TextCorrection>) {
+        fn clean(
+            field: &str,
+            value: &mut Option<String>,
+            corrections: &mut Vec<super::TextCorrection>,
+        ) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (sanitized, mut found) = super::sanitize_untrusted_single_line_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+
+        let mut update = self.clone();
+        let mut corrections = Vec::new();
+        clean("title", &mut update.title, &mut corrections);
+        clean("artist_name", &mut update.artist_name, &mut corrections);
+        clean("album_title", &mut update.album_title, &mut corrections);
+        clean("genre", &mut update.genre, &mut corrections);
+        clean("composer", &mut update.composer, &mut corrections);
+        clean("isrc", &mut update.isrc, &mut corrections);
+        clean("label", &mut update.label, &mut corrections);
+        for (field, value) in [
+            ("comment", &mut update.comment),
+            ("lyrics", &mut update.lyrics),
+        ] {
+            let Some(raw) = value.as_deref() else {
+                continue;
+            };
+            let (sanitized, mut found) = super::sanitize_untrusted_text(raw, field);
+            if !found.is_empty() {
+                *value = (!sanitized.is_empty()).then_some(sanitized);
+                corrections.append(&mut found);
+            }
+        }
+        (update, corrections)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagFormat {
     Id3,
@@ -57,7 +101,14 @@ pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResu
         return Err("file not found".into());
     }
     let path = file_path.to_string();
-    let update = update.clone();
+    let (update, corrections) = update.sanitized();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = file_path,
+            corrections = ?corrections,
+            "tag_writer_unsafe_text_sanitized"
+        );
+    }
     tokio::task::spawn_blocking(move || write_tags_lofty(&path, &update))
         .await
         .map_err(|e| format!("join: {e}"))?
@@ -290,7 +341,7 @@ fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
 }
 
 /// Returns true if the file extension is not supported for tag writing.
-fn is_unsupported_format(file_path: &str) -> bool {
+pub(crate) fn is_unsupported_format(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -324,7 +375,7 @@ pub async fn write_metadata_to_file(
         .map_err(|e| format!("join: {e}"))?
 }
 
-fn write_metadata_to_file_sync(
+pub(crate) fn write_metadata_to_file_sync(
     file_path: &str,
     fields: &HashMap<String, String>,
 ) -> Result<WriteResult, String> {
@@ -405,6 +456,21 @@ mod tests {
     }
 
     #[test]
+    fn tag_writer_sanitizes_every_text_field_before_the_file_boundary() {
+        let dirty = TagUpdate {
+            title: Some("A\0B".into()),
+            artist_name: Some("Lisa\u{feff}Strings".into()),
+            lyrics: Some("line one\nline two".into()),
+            ..Default::default()
+        };
+        let (clean, corrections) = dirty.sanitized();
+        assert_eq!(clean.title.as_deref(), Some("A B"));
+        assert_eq!(clean.artist_name.as_deref(), Some("Lisa Strings"));
+        assert_eq!(clean.lyrics.as_deref(), Some("line one\nline two"));
+        assert_eq!(corrections.len(), 2);
+    }
+
+    #[test]
     fn tune_key_mapping_covers_all_extended_fields() {
         // Verify all keys from read_extended_metadata have a mapping
         let keys = [
@@ -445,6 +511,9 @@ mod tests {
             "mb_work_id",
             // Note: `source_media` (Vorbis SOURCE) is intentionally read-only —
             // it has no lofty ItemKey and is read via raw_vorbis_field.
+            // Same for `dr_album` / `dr_track` (Vorbis DYNAMIC RANGE): a measured
+            // value produced by an external analyser, not something Tune should
+            // let a user overwrite from the tag editor.
             "rg_track_gain",
             "rg_track_peak",
             "rg_album_gain",

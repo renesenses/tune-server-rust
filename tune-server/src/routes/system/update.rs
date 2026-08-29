@@ -130,6 +130,102 @@ fn running_in_docker() -> bool {
     false
 }
 
+const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade tune-server";
+const HOMEBREW_UPDATE_HINT: &str = "This Tune installation is managed by Homebrew. Update it with `brew update && brew upgrade tune-server`. If the renesenses tap stays stale, run `brew untap renesenses/tap && brew tap renesenses/tap` first.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewInstallation {
+    executable: std::path::PathBuf,
+    cellar_version: String,
+}
+
+/// Extract the formula version only from Tune's own Homebrew Cellar layout.
+/// Merely seeing a `Cellar` component is not enough: another formula could
+/// contain or invoke a binary named `tune-server` without owning this install.
+fn homebrew_cellar_version(executable: &std::path::Path) -> Option<String> {
+    let components: Vec<_> = executable.components().map(|c| c.as_os_str()).collect();
+    components.windows(3).find_map(|parts| {
+        if parts[0] != std::ffi::OsStr::new("Cellar")
+            || parts[1] != std::ffi::OsStr::new("tune-server")
+        {
+            return None;
+        }
+        parts[2]
+            .to_str()
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Homebrew appends `_N` for formula revisions without changing the upstream
+/// binary version. Treat `0.9.113_1` and binary `v0.9.113` as coherent.
+fn homebrew_version_matches(cellar_version: &str, binary_version: &str) -> bool {
+    fn normalize_binary(version: &str) -> &str {
+        version.trim().trim_start_matches('v')
+    }
+
+    let cellar = normalize_binary(cellar_version);
+    let cellar_upstream = cellar
+        .split_once('_')
+        .map_or(cellar, |(upstream, _)| upstream);
+    cellar_upstream == normalize_binary(binary_version)
+}
+
+fn homebrew_installation(executable: &std::path::Path) -> Option<HomebrewInstallation> {
+    // `current_exe` is usually already resolved, but Homebrew launches through
+    // `opt/tune-server`. Canonicalising here makes the guard independent of the
+    // platform's current_exe symlink semantics. A missing/unresolvable path is
+    // still parsed as given so diagnostics never turn an I/O hiccup into a
+    // silent permission to self-update.
+    let resolved = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let cellar_version = homebrew_cellar_version(&resolved)?;
+    Some(HomebrewInstallation {
+        executable: resolved,
+        cellar_version,
+    })
+}
+
+fn current_homebrew_installation() -> Option<HomebrewInstallation> {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(homebrew_installation)
+}
+
+fn homebrew_update_refusal(installation: &HomebrewInstallation, current: &str) -> Value {
+    json!({
+        "status": "managed_installation",
+        "reason": "homebrew_managed_installation",
+        "manager": "homebrew",
+        "message": HOMEBREW_UPDATE_HINT,
+        "detail": HOMEBREW_UPDATE_HINT,
+        "command": HOMEBREW_UPDATE_COMMAND,
+        "installation_version": installation.cellar_version,
+        "current_version": current,
+        "installation_version_mismatch": !homebrew_version_matches(
+            &installation.cellar_version,
+            current,
+        ),
+    })
+}
+
+fn homebrew_mismatch_result(installation: &HomebrewInstallation, current: &str) -> Option<Value> {
+    if homebrew_version_matches(&installation.cellar_version, current) {
+        return None;
+    }
+    Some(json!({
+        "status": "warning",
+        "reason": "homebrew_version_mismatch",
+        "detail": format!(
+            "Tune binary {current} is running from Homebrew Cellar {}, so the binary and web assets may come from different releases. {HOMEBREW_UPDATE_HINT}",
+            installation.cellar_version
+        ),
+        "command": HOMEBREW_UPDATE_COMMAND,
+        "current_version": current,
+        "installation_version": installation.cellar_version,
+    }))
+}
+
 /// Find the extractable archive asset (tar.gz or zip) for the current platform.
 /// Excludes .dmg and .exe installers — we want the raw archive containing the binary + web/.
 fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
@@ -164,6 +260,120 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
     })
 }
 
+/// Build the public update contract only after resolving an archive that this
+/// exact OS/architecture can install. GitHub can expose a release before every
+/// platform asset has finished uploading; such a release is newer, but it is
+/// not an available update for this server yet (#1575).
+fn update_release_payload(
+    current: &str,
+    release: &ReleaseInfo,
+    homebrew: Option<&HomebrewInstallation>,
+) -> Value {
+    let asset = find_archive_asset(release);
+    let installation_version_mismatch =
+        homebrew.is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
+    json!({
+        "current": current,
+        "latest": &release.version,
+        "update_available": asset.is_some(),
+        "download_url": asset.map(|a| &a.browser_download_url),
+        "asset_name": asset.map(|a| &a.name),
+        "release_notes": &release.body,
+        "size_bytes": asset.map(|a| a.size).unwrap_or(0),
+        "html_url": &release.html_url,
+        "published_at": &release.published_at,
+        "unavailable_reason": asset.is_none().then_some("no_compatible_asset"),
+        "installable": homebrew.is_none(),
+        "install_hint": homebrew.map(|_| HOMEBREW_UPDATE_HINT),
+        "installation_manager": homebrew.map(|_| "homebrew"),
+        "installation_version": homebrew.map(|install| &install.cellar_version),
+        "installation_version_mismatch": installation_version_mismatch,
+    })
+}
+
+#[cfg(test)]
+mod update_availability_tests {
+    use super::{HomebrewInstallation, update_release_payload};
+    use std::path::PathBuf;
+    use tune_core::updater::{ReleaseAsset, ReleaseInfo};
+
+    fn release_with(asset_name: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: "v9.9.9".into(),
+            version: "9.9.9".into(),
+            name: "fixture".into(),
+            body: "notes".into(),
+            published_at: "2026-08-26T00:00:00Z".into(),
+            html_url: "https://example.invalid/release".into(),
+            assets: vec![ReleaseAsset {
+                name: asset_name.into(),
+                browser_download_url: "https://example.invalid/archive".into(),
+                size: 42,
+                content_type: "application/octet-stream".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn une_release_sans_archive_compatible_n_est_pas_proposee() {
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            None,
+        );
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["download_url"], serde_json::Value::Null);
+        assert_eq!(payload["asset_name"], serde_json::Value::Null);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+    }
+
+    #[test]
+    fn une_release_avec_l_archive_de_la_plateforme_est_proposee() {
+        let extension = if std::env::consts::OS == "windows" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let name = format!(
+            "tune-server-{}-{}.{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            extension
+        );
+        let payload = update_release_payload("0.9.113", &release_with(&name), None);
+
+        assert_eq!(payload["update_available"], true);
+        assert_eq!(payload["asset_name"], name);
+        assert_eq!(payload["unavailable_reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn le_filtre_d_asset_conserve_le_contrat_homebrew() {
+        let installation = HomebrewInstallation {
+            executable: PathBuf::from("/opt/homebrew/Cellar/tune-server/0.9.112/bin/tune-server"),
+            cellar_version: "0.9.112".into(),
+        };
+        let payload = update_release_payload(
+            "0.9.113",
+            &release_with("tune-server-plan9-mips64.tar.gz"),
+            Some(&installation),
+        );
+
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
+        assert_eq!(payload["installable"], false);
+        assert_eq!(payload["installation_manager"], "homebrew");
+        assert_eq!(payload["installation_version"], "0.9.112");
+        assert_eq!(payload["installation_version_mismatch"], true);
+        assert!(
+            payload["install_hint"]
+                .as_str()
+                .is_some_and(|hint| { hint.contains("brew update && brew upgrade tune-server") })
+        );
+    }
+}
+
 /// Trusted **minisign** public key for release signatures (audit item 8). The
 /// matching secret key lives only in the release CI (a GitHub Actions secret);
 /// this is the verify-only half, safe to embed.
@@ -173,6 +383,98 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
 /// with the real public key (the base64 line of `minisign -G`'s `.pub` file)
 /// once the CI signing step is live; verification then becomes mandatory.
 const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB7T9aBRwUM";
+
+/// À qui la faute quand une mise à jour ne peut pas être vérifiée.
+///
+/// La question n'est pas cosmétique. En v0.9.71 la release est restée douze
+/// heures visible mais incomplète ; le client a échoué, et la première réponse
+/// au fil forum a envoyé Jean Valjean vérifier SON réseau. Il n'y était pour
+/// rien. Un message qui ne nomme pas la cause fait chercher au mauvais endroit
+/// — et le seul qui puisse trancher, c'est le code qui a vu la réponse HTTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateBlame {
+    /// Rien n'a répondu : réseau, DNS, proxy, coupure. Chez l'utilisateur.
+    Unreachable,
+    /// Le serveur a répondu, mais le fichier n'est pas là. Chez nous.
+    ReleaseIncomplete,
+    /// Le serveur a répondu qu'il allait mal (5xx, quota). Ni l'un ni l'autre.
+    ServerError,
+    /// Signature ou empreinte qui ne concorde pas. On refuse d'installer.
+    Untrusted,
+}
+
+impl UpdateBlame {
+    /// Marqueur de journal — un par cause, pour qu'un `grep` les sépare.
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::Unreachable => "update_server_unreachable",
+            Self::ReleaseIncomplete => "update_release_incomplete",
+            Self::ServerError => "update_server_error",
+            Self::Untrusted => "update_untrusted_archive",
+        }
+    }
+
+    /// Ce que lit l'utilisateur : la cause, puis la conduite à tenir.
+    pub(crate) fn user_message(self) -> &'static str {
+        match self {
+            Self::Unreachable => {
+                "Impossible de joindre le serveur de mises à jour. Vérifiez votre connexion, \
+                 puis réessayez."
+            }
+            Self::ReleaseIncomplete => {
+                "Le serveur a répondu, mais cette version n'est pas complètement publiée. \
+                 Ce n'est pas un problème de votre côté : réessayez plus tard."
+            }
+            Self::ServerError => {
+                "Le serveur de mises à jour est momentanément indisponible. \
+                 Ce n'est pas un problème de votre côté : réessayez plus tard."
+            }
+            Self::Untrusted => {
+                "L'archive téléchargée ne correspond pas à sa signature. Installation refusée."
+            }
+        }
+    }
+}
+
+/// Une cause typée, plus le détail technique destiné aux journaux.
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateError {
+    pub(crate) blame: UpdateBlame,
+    pub(crate) detail: String,
+}
+
+impl UpdateError {
+    fn new(blame: UpdateBlame, detail: impl Into<String>) -> Self {
+        Self {
+            blame,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)
+    }
+}
+
+/// Un statut HTTP dit-il « ce fichier n'existe pas » ou « le serveur va mal » ?
+///
+/// Dans les deux cas il y a EU une réponse : quel que soit le statut, on ne
+/// renvoie jamais l'utilisateur vérifier son propre réseau. C'est toute la
+/// différence avec l'échec de `send()`.
+pub(crate) fn blame_for_status(status: u16) -> UpdateBlame {
+    match status {
+        // L'artefact n'est pas là — la release est incomplète (cas v0.9.71).
+        404 | 410 => UpdateBlame::ReleaseIncomplete,
+        // Le serveur dit qu'il va mal, ou nous limite. Rien à conclure sur la
+        // complétude de la release.
+        429 | 500..=599 => UpdateBlame::ServerError,
+        // 401/403 : dépôt privé, jeton, quota anonyme épuisé. Là encore une
+        // réponse, donc pas le réseau de l'utilisateur.
+        _ => UpdateBlame::ServerError,
+    }
+}
 
 /// Verify a downloaded update archive against a minisign-signed `SHA256SUMS`
 /// before it is extracted/installed. The signature authenticates `SHA256SUMS`
@@ -185,40 +487,71 @@ async fn verify_update_signature(
     archive_bytes: &[u8],
     sums_url: Option<&str>,
     sig_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), UpdateError> {
     if UPDATE_PUBLIC_KEY.is_empty() {
         warn!("update_signature_check_skipped_no_key");
         return Ok(());
     }
 
-    let sums_url = sums_url.ok_or("release has no SHA256SUMS — refusing unsigned update")?;
-    let sig_url =
-        sig_url.ok_or("release has no SHA256SUMS.minisig signature — refusing unsigned update")?;
+    // Le fichier n'est même pas annoncé par la release : elle est incomplète,
+    // exactement l'état dans lequel la v0.9.71 est restée douze heures.
+    let sums_url = sums_url.ok_or_else(|| {
+        UpdateError::new(
+            UpdateBlame::ReleaseIncomplete,
+            "release has no SHA256SUMS — refusing unsigned update",
+        )
+    })?;
+    let sig_url = sig_url.ok_or_else(|| {
+        UpdateError::new(
+            UpdateBlame::ReleaseIncomplete,
+            "release has no SHA256SUMS.minisig signature — refusing unsigned update",
+        )
+    })?;
 
     let fetch = |url: String| async move {
+        // `send()` qui échoue = rien n'a répondu. C'est la SEULE branche qui
+        // autorise à parler du réseau de l'utilisateur.
         let resp = client
             .get(&url)
             .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
-            .map_err(|e| format!("fetch {url} failed: {e}"))?;
+            .map_err(|e| {
+                UpdateError::new(UpdateBlame::Unreachable, format!("fetch {url} failed: {e}"))
+            })?;
         if !resp.status().is_success() {
-            return Err(format!("fetch {url}: HTTP {}", resp.status()));
+            let status = resp.status();
+            return Err(UpdateError::new(
+                blame_for_status(status.as_u16()),
+                format!("fetch {url}: HTTP {status}"),
+            ));
         }
-        resp.text()
-            .await
-            .map_err(|e| format!("read {url} failed: {e}"))
+        resp.text().await.map_err(|e| {
+            UpdateError::new(UpdateBlame::Unreachable, format!("read {url} failed: {e}"))
+        })
     };
     let sums = fetch(sums_url.to_string()).await?;
     let sig_str = fetch(sig_url.to_string()).await?;
 
     // 1. Signature over SHA256SUMS with the embedded trusted key.
-    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY)
-        .map_err(|e| format!("invalid embedded update public key: {e}"))?;
-    let sig = minisign_verify::Signature::decode(&sig_str)
-        .map_err(|e| format!("invalid update signature: {e}"))?;
-    pk.verify(sums.as_bytes(), &sig, false)
-        .map_err(|_| "update signature does not match — refusing to install".to_string())?;
+    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY).map_err(|e| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("invalid embedded update public key: {e}"),
+        )
+    })?;
+    let sig = minisign_verify::Signature::decode(&sig_str).map_err(|e| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("invalid update signature: {e}"),
+        )
+    })?;
+    pk.verify(sums.as_bytes(), &sig, false).map_err(|_| {
+        UpdateError::new(
+            UpdateBlame::Untrusted,
+            "update signature does not match — refusing to install",
+        )
+    })?;
 
     // 2. The now-authenticated SHA256SUMS must list our archive with a hash
     //    matching the bytes we downloaded.
@@ -238,13 +571,89 @@ async fn verify_update_signature(
                 None
             }
         })
-        .ok_or_else(|| format!("{archive_name} not listed in signed SHA256SUMS"))?;
+        // Absent de la liste SIGNÉE : la release est incomplète, pas
+        // frauduleuse. C'est exactement l'état de la v0.9.71 — SHA256SUMS
+        // publié en ne couvrant que 5 fichiers sur 13. Accuser la signature
+        // ici ferait croire à une attaque là où il n'y a qu'une publication
+        // inachevée.
+        .ok_or_else(|| {
+            UpdateError::new(
+                UpdateBlame::ReleaseIncomplete,
+                format!("{archive_name} not listed in signed SHA256SUMS"),
+            )
+        })?;
     if want != got {
-        return Err(format!(
-            "archive hash mismatch — signed {want}, downloaded {got}"
+        // Là en revanche, le fichier est listé et son empreinte ne correspond
+        // pas : on refuse d'installer.
+        return Err(UpdateError::new(
+            UpdateBlame::Untrusted,
+            format!("archive hash mismatch — signed {want}, downloaded {got}"),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod update_blame_tests {
+    use super::{UpdateBlame, blame_for_status};
+
+    #[test]
+    fn une_reponse_recue_n_accuse_jamais_le_reseau_de_l_utilisateur() {
+        // Le coeur de #1588 : dès qu'un statut HTTP existe, c'est qu'on a
+        // joint le serveur. Renvoyer l'utilisateur vers sa connexion serait
+        // le faire chercher chez lui un défaut qui est chez nous.
+        for status in [400, 401, 403, 404, 410, 429, 500, 502, 503] {
+            assert_ne!(
+                blame_for_status(status),
+                UpdateBlame::Unreachable,
+                "HTTP {status} ne doit pas accuser le reseau"
+            );
+        }
+    }
+
+    #[test]
+    fn artefact_absent_est_une_release_incomplete() {
+        // Le cas vécu : l'asset macOS n'existait pas sur la v0.9.71.
+        assert_eq!(blame_for_status(404), UpdateBlame::ReleaseIncomplete);
+        assert_eq!(blame_for_status(410), UpdateBlame::ReleaseIncomplete);
+    }
+
+    #[test]
+    fn serveur_en_peine_n_est_pas_une_release_incomplete() {
+        // Un 503 ne dit RIEN sur la complétude de la release : l'annoncer
+        // comme telle serait inventer une cause.
+        for status in [429, 500, 502, 503] {
+            assert_eq!(blame_for_status(status), UpdateBlame::ServerError);
+        }
+    }
+
+    #[test]
+    fn chaque_cause_a_son_marqueur_et_son_message() {
+        let toutes = [
+            UpdateBlame::Unreachable,
+            UpdateBlame::ReleaseIncomplete,
+            UpdateBlame::ServerError,
+            UpdateBlame::Untrusted,
+        ];
+        let mut marqueurs: Vec<&str> = toutes.iter().map(|b| b.marker()).collect();
+        marqueurs.sort_unstable();
+        let avant = marqueurs.len();
+        marqueurs.dedup();
+        assert_eq!(marqueurs.len(), avant, "deux causes partagent un marqueur");
+
+        // Seule la cause « injoignable » a le droit de parler de la connexion
+        // de l'utilisateur. C'est la règle que la v0.9.71 a enfreinte.
+        for b in toutes {
+            let msg = b.user_message();
+            assert!(!msg.is_empty());
+            if b != UpdateBlame::Unreachable {
+                assert!(
+                    !msg.contains("votre connexion"),
+                    "{b:?} ne doit pas renvoyer l'utilisateur a son reseau : {msg}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -283,22 +692,13 @@ kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV
 pub(super) async fn update_check() -> Json<Value> {
     let checker = UpdateChecker::new();
     let current = tune_core::version();
+    let homebrew = current_homebrew_installation();
+    let installation_version_mismatch = homebrew
+        .as_ref()
+        .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => {
-            let asset = find_archive_asset(&release);
-            Json(json!({
-                "current": current,
-                "latest": release.version,
-                "update_available": true,
-                "download_url": asset.map(|a| &a.browser_download_url),
-                "asset_name": asset.map(|a| &a.name),
-                "release_notes": release.body,
-                "size_bytes": asset.map(|a| a.size).unwrap_or(0),
-                "html_url": release.html_url,
-                "published_at": release.published_at,
-            }))
-        }
+        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
@@ -306,6 +706,11 @@ pub(super) async fn update_check() -> Json<Value> {
             "download_url": null,
             "release_notes": null,
             "size_bytes": 0,
+            "installable": homebrew.is_none(),
+            "install_hint": homebrew.as_ref().map(|_| HOMEBREW_UPDATE_HINT),
+            "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
+            "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
+            "installation_version_mismatch": installation_version_mismatch,
         })),
         Err(e) => {
             warn!(error = %e, "update_check_failed");
@@ -369,10 +774,29 @@ pub(super) async fn update_install(
             .into_response();
     }
 
+    let current_exe = std::env::current_exe().ok();
+
+    // A Cellar is one Homebrew-owned unit: binary, receipt and web assets.
+    // Replacing only Tune's executable leaves Homebrew believing the old
+    // formula is installed and can pair a new server with an old web client
+    // (#2448). Never mutate any part of that unit behind the package manager's
+    // back; tell both current and older clients how to take the supported path.
+    if let Some(installation) = current_exe.as_deref().and_then(homebrew_installation) {
+        let refusal = homebrew_update_refusal(&installation, tune_core::version());
+        info!(
+            executable = %installation.executable.display(),
+            cellar_version = %installation.cellar_version,
+            binary_version = tune_core::version(),
+            mismatch = refusal["installation_version_mismatch"].as_bool().unwrap_or(false),
+            "update_skipped_homebrew"
+        );
+        let _ = SettingsRepo::with_backend(state.backend.clone())
+            .set("last_update_result", &refusal.to_string());
+        return (StatusCode::OK, Json(refusal)).into_response();
+    }
+
     // Guard: refuse update if .no-auto-update flag file exists
-    let working_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let working_dir = current_exe.and_then(|p| p.parent().map(|d| d.to_path_buf()));
     if let Some(ref dir) = working_dir {
         if dir.join(".no-auto-update").exists() {
             warn!("update_blocked_no_auto_update_flag");
@@ -574,8 +998,13 @@ pub(super) async fn update_install(
         )
         .await
         {
-            error!(error = %e, "update_signature_verification_failed");
-            set_phase(&format!("failed: {e}"));
+            // Le journal garde le détail technique ET un marqueur par cause,
+            // pour qu'on puisse compter les échecs de publication séparément
+            // des coupures réseau. L'utilisateur, lui, lit une phrase qui
+            // nomme le responsable : c'est ce qui manquait quand on a envoyé
+            // Jean Valjean vérifier son réseau pour un défaut de chez nous.
+            error!(error = %e.detail, blame = ?e.blame, "{}", e.blame.marker());
+            set_phase(&format!("failed: {}", e.blame.user_message()));
             return;
         }
 
@@ -929,48 +1358,20 @@ fn install_unix(
 }
 
 /// Windows install: write a bat script that replaces the binary after exit.
-fn install_windows(
-    current_exe: &std::path::Path,
-    new_binary: &std::path::Path,
-    tmp_dir: &std::path::Path,
-) -> Result<(), String> {
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Cannot determine binary directory".to_string())?;
-
-    let new_staging = current_exe.with_extension("new.exe");
-    std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
-    info!(staging = %new_staging.display(), "update_win_binary_staged");
-
-    update_web_dir(exe_dir, tmp_dir)?;
-    info!("update_win_web_swapped");
-
-    // Wait for OUR specific PID to exit, not any process named tune-server.exe.
-    // Matching by image name hangs forever whenever a second tune-server.exe is
-    // alive (a lingering child, a double launch): the wait_loop never completes,
-    // the binary is never swapped, and the OLD version comes back — an
-    // intermittent "update did nothing" that reproduces only sometimes
-    // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
-    // the backstop so the swap is never blocked indefinitely.
-    let pid = std::process::id();
-    let err_file = exe_dir.join("tune-update-failed.txt");
-
-    // Le batch se termine par `(goto) 2>nul & del "%~f0"` et non par
-    // `del "%~f0"` suivi de `goto :eof`.
-    //
-    // cmd.exe lit un fichier batch ligne par ligne DEPUIS LE DISQUE, en gardant
-    // une position de lecture. Supprimer le fichier puis continuer le fait donc
-    // échouer sur la lecture suivante : « Le fichier de commandes est
-    // introuvable », et la fenêtre reste ouverte sur le prompt au lieu de se
-    // fermer — alors que la mise à jour, elle, s'est bien déroulée (capture de
-    // Bilou, Windows 11 25H2).
-    //
-    // L'idiome `(goto) 2>nul` provoque une sortie du contexte batch (l'erreur
-    // de syntaxe est avalée par 2>nul) AVANT que `del` ne s'exécute : plus
-    // aucune lecture n'a lieu ensuite, le fichier est supprimé et la fenêtre se
-    // ferme proprement.
-    let bat_path = exe_dir.join("tune-update.bat");
-    let bat_content = format!(
+/// Le script de bascule écrit à côté du binaire, isolé pour être testable.
+///
+/// Les deux invariants que verrouillent les tests : le chemin nominal se
+/// termine par `exit /b 0` avant `:swap_failed`, et le script ne se supprime
+/// jamais lui-même.
+fn windows_update_bat(
+    pid: u32,
+    exe: &str,
+    new: &str,
+    err_file: &str,
+    exe_name: &str,
+    exe_name_new: &str,
+) -> String {
+    format!(
         "@echo off\r\n\
          setlocal enabledelayedexpansion\r\n\
          echo Waiting for Tune server (PID {pid}) to stop...\r\n\
@@ -999,7 +1400,7 @@ fn install_windows(
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          start \"\" \"{exe}\"\r\n\
-         (goto) 2>nul & del \"%~f0\"\r\n\
+         exit /b 0\r\n\
          :swap_failed\r\n\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
          echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
@@ -1007,15 +1408,78 @@ fn install_windows(
          echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
          echo Update failed - old binary locked. Details written to {err_file}\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
-         start \"\" \"{exe}\"\r\n",
-        exe = current_exe.display(),
-        new = new_staging.display(),
-        err_file = err_file.display(),
-        exe_name = current_exe
+         start \"\" \"{exe}\"\r\n"
+    )
+}
+
+fn install_windows(
+    current_exe: &std::path::Path,
+    new_binary: &std::path::Path,
+    tmp_dir: &std::path::Path,
+) -> Result<(), String> {
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "Cannot determine binary directory".to_string())?;
+
+    let new_staging = current_exe.with_extension("new.exe");
+    std::fs::copy(new_binary, &new_staging).map_err(|e| format!("copy new binary: {e}"))?;
+    info!(staging = %new_staging.display(), "update_win_binary_staged");
+
+    update_web_dir(exe_dir, tmp_dir)?;
+    info!("update_win_web_swapped");
+
+    // Wait for OUR specific PID to exit, not any process named tune-server.exe.
+    // Matching by image name hangs forever whenever a second tune-server.exe is
+    // alive (a lingering child, a double launch): the wait_loop never completes,
+    // the binary is never swapped, and the OLD version comes back — an
+    // intermittent "update did nothing" that reproduces only sometimes
+    // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
+    // the backstop so the swap is never blocked indefinitely.
+    let pid = std::process::id();
+    let err_file = exe_dir.join("tune-update-failed.txt");
+
+    let bat_path = exe_dir.join("tune-update.bat");
+    // Le script ne se supprime plus lui-même, et c'est délibéré.
+    //
+    // HISTORIQUE — cette décision ANNULE celle qui la précédait, il faut donc
+    // savoir pourquoi avant de la re-inverser.
+    //
+    // cmd.exe relit un fichier batch DEPUIS LE DISQUE après chaque commande, en
+    // gardant une position de lecture. L'effacer pendant son interprétation fait
+    // donc échouer la lecture suivante : « Le fichier de commande est
+    // introuvable » juste après « Starting updated server... » (capture de
+    // Bilou, Windows 11 25H2).
+    //
+    // Le correctif précédent (#1377) a conservé la suppression mais l'a fait
+    // précéder de `(goto) 2>nul`, censé quitter le contexte batch AVANT que
+    // `del` ne s'exécute. Le raisonnement se tient — mais **le terrain l'a
+    // démenti** : Bilou a confirmé le 13/08/2026 que le message persiste en
+    // v0.9.71, version qui contient pourtant ce correctif (vérifié par
+    // ascendance). L'astuce n'est pas fiable ici, vraisemblablement à cause du
+    // `setlocal enabledelayedexpansion` actif dès la première ligne.
+    //
+    // Plutôt que de parier une troisième fois sur une subtilité de cmd.exe
+    // qu'on ne peut pas tester depuis un Mac, on supprime la cause : le script
+    // ne s'efface plus. Il reste un fichier d'environ 2 Ko dans le répertoire
+    // d'installation, réécrit à chaque mise à jour — un bien meilleur marché
+    // qu'un message d'erreur à chaque fois. Et contrairement à un `cmd /c del`
+    // détaché, aucune subtilité de guillemets ne peut casser la mise à jour
+    // elle-même.
+    //
+    // `exit /b 0` est ce qui rend l'ensemble sûr : sans lui, le chemin nominal
+    // tombe droit dans `:swap_failed`, écrit un rapport d'échec pour une mise à
+    // jour réussie et relance l'exécutable une seconde fois. Seule l'astuce
+    // `(goto)` l'empêchait — un second défaut latent que ceci supprime.
+    let bat_content = windows_update_bat(
+        pid,
+        &current_exe.display().to_string(),
+        &new_staging.display().to_string(),
+        &err_file.display().to_string(),
+        &current_exe
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
-        exe_name_new = new_staging
+        &new_staging
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
@@ -1311,6 +1775,37 @@ pub fn record_post_update_result(state: &AppState) {
         }
         let _ = std::fs::remove_file(&expected_marker);
     }
+
+    match homebrew_installation(&exe)
+        .as_ref()
+        .and_then(|installation| homebrew_mismatch_result(installation, current))
+    {
+        Some(result) => {
+            warn!(
+                executable = %exe.display(),
+                cellar_version = result["installation_version"].as_str().unwrap_or("unknown"),
+                binary_version = current,
+                "homebrew_installation_version_mismatch"
+            );
+            let _ = settings.set("last_update_result", &result.to_string());
+        }
+        _ => {
+            // Do not leave the warning behind after `brew upgrade` has made
+            // the Cellar coherent again (or after moving to a standalone
+            // install). Preserve unrelated update results.
+            let stale_homebrew_warning = settings
+                .get("last_update_result")
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .and_then(|value| value["reason"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("homebrew_version_mismatch");
+            if stale_homebrew_warning {
+                let _ = settings.delete("last_update_result");
+            }
+        }
+    }
 }
 
 /// POST /system/update/apply — kept for backward compatibility.
@@ -1349,6 +1844,17 @@ pub(super) async fn changelog() -> Json<Value> {
         Err(_) => guard.1.clone(),
     };
     drop(guard);
+
+    // Le cache démarre à `json!([])`. Sur un serveur fraîchement lancé et sans
+    // réseau, les deux branches ci-dessus rendent donc un tableau VIDE, et le
+    // panneau « Quoi de neuf » s'affiche désert — ce qui se lit non pas comme
+    // « je n'ai pas pu joindre la source » mais comme « cette version
+    // n'apporte rien ». Le repli en dur existait depuis toujours pour ce cas ;
+    // il n'était simplement jamais appelé.
+    if entries.as_array().is_none_or(|a| a.is_empty()) {
+        return changelog_hardcoded();
+    }
+
     Json(json!({ "version": tune_core::version(), "entries": entries }))
 }
 
@@ -1553,10 +2059,25 @@ async fn fetch_github_changelog() -> Result<Value, String> {
     Ok(json!(entries))
 }
 
-#[allow(dead_code)]
+/// Dernier recours quand la source distante est injoignable ET que le cache
+/// est vide (serveur qui vient de démarrer, machine hors ligne, panne de
+/// GitHub — vécu le 17/08/2026). Le client sait lire cette forme `sections`
+/// aussi bien que la forme `features/fixes/improvements` du chemin réseau :
+/// `WhatsNew.svelte` convertit l'une vers l'autre.
+///
+/// Ces notes sont figées et ne suivent pas les releases : elles valent mieux
+/// qu'un panneau vide, pas mieux que les vraies notes. Chaque entrée porte sa
+/// version et sa date, donc rien n'est présenté comme récent à tort.
 fn changelog_hardcoded() -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
+        // Dit au client que ces notes sont un secours, pas l'actualité du
+        // produit. Sans ce drapeau, le panneau badge sa première entrée
+        // « Récent » — soit « v0.8.15 » annoncée comme la version en cours sur
+        // un serveur bien plus récent. Un panneau vide n'affirmait rien ; un
+        // panneau mal étiqueté affirme quelque chose de faux, ce qui est pire.
+        // Lu par `WhatsNew.svelte` (tune-web-client#501).
+        "offline": true,
         "entries": [
             {
                 "version": "0.8.15",
@@ -1968,5 +2489,240 @@ mod swap_result_tests {
         // No pending update (empty marker) → nothing to compare.
         assert_eq!(swap_took("", "0.9.48"), None);
         assert_eq!(swap_took("   ", "0.9.48"), None);
+    }
+}
+
+#[cfg(test)]
+mod homebrew_guard_tests {
+    use std::path::Path;
+
+    use super::{
+        HOMEBREW_UPDATE_COMMAND, HomebrewInstallation, homebrew_cellar_version,
+        homebrew_installation, homebrew_mismatch_result, homebrew_update_refusal,
+        homebrew_version_matches,
+    };
+
+    #[test]
+    fn reconnait_les_cellars_apple_silicon_intel_et_linuxbrew() {
+        for (path, version) in [
+            (
+                "/opt/homebrew/Cellar/tune-server/0.9.110/bin/tune-server",
+                "0.9.110",
+            ),
+            (
+                "/usr/local/Cellar/tune-server/0.9.71/bin/tune-server",
+                "0.9.71",
+            ),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/tune-server/0.9.113_1/bin/tune-server",
+                "0.9.113_1",
+            ),
+        ] {
+            assert_eq!(
+                homebrew_cellar_version(Path::new(path)).as_deref(),
+                Some(version),
+                "installation Homebrew non reconnue : {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ne_confond_pas_une_installation_autonome_ou_une_autre_formule() {
+        assert_eq!(
+            homebrew_cellar_version(Path::new("/Applications/Tune/tune-server")),
+            None
+        );
+        assert_eq!(
+            homebrew_cellar_version(Path::new("/opt/homebrew/Cellar/ffmpeg/8.0/bin/tune-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_la_version_du_cellar_au_binaire() {
+        assert!(homebrew_version_matches("0.9.113", "0.9.113"));
+        assert!(homebrew_version_matches("0.9.113_1", "v0.9.113"));
+        assert!(!homebrew_version_matches("0.9.71", "0.9.110"));
+    }
+
+    #[test]
+    fn le_refus_est_actionnable_et_nomme_la_divergence() {
+        let installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+        let response = homebrew_update_refusal(&installation, "0.9.110");
+
+        assert_eq!(response["status"], "managed_installation");
+        assert_eq!(response["reason"], "homebrew_managed_installation");
+        assert_eq!(response["command"], HOMEBREW_UPDATE_COMMAND);
+        assert_eq!(response["installation_version"], "0.9.71");
+        assert_eq!(response["current_version"], "0.9.110");
+        assert_eq!(response["installation_version_mismatch"], true);
+    }
+
+    #[test]
+    fn le_demarrage_ne_signale_que_les_cellars_incoherents() {
+        let mut installation = HomebrewInstallation {
+            executable: "/opt/homebrew/Cellar/tune-server/0.9.71/bin/tune-server".into(),
+            cellar_version: "0.9.71".into(),
+        };
+
+        let warning = homebrew_mismatch_result(&installation, "0.9.110").unwrap();
+        assert_eq!(warning["status"], "warning");
+        assert_eq!(warning["reason"], "homebrew_version_mismatch");
+        assert_eq!(warning["command"], HOMEBREW_UPDATE_COMMAND);
+
+        installation.cellar_version = "0.9.110_1".into();
+        assert!(homebrew_mismatch_result(&installation, "v0.9.110").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resout_le_lien_opt_vers_le_vrai_cellar() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp
+            .path()
+            .join("Cellar/tune-server/0.9.113/bin/tune-server");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"fixture").unwrap();
+
+        let linked = tmp.path().join("opt/tune-server/bin/tune-server");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&real, &linked).unwrap();
+
+        let installation = homebrew_installation(&linked).expect("lien Homebrew non resolu");
+        assert_eq!(
+            installation.executable,
+            std::fs::canonicalize(real).unwrap()
+        );
+        assert_eq!(installation.cellar_version, "0.9.113");
+    }
+}
+
+#[cfg(test)]
+mod windows_update_bat_tests {
+    use super::windows_update_bat;
+
+    fn script() -> String {
+        windows_update_bat(
+            4242,
+            r"C:\Program Files\Tune\tune-server.exe",
+            r"C:\Program Files\Tune\tune-server.new.exe",
+            r"C:\Program Files\Tune\tune-update-failed.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+        )
+    }
+
+    /// Le script ne doit JAMAIS s'effacer lui-même.
+    ///
+    /// cmd.exe relit le fichier depuis le disque après chaque commande : le
+    /// supprimer en cours d'interprétation affiche « Le fichier de commande est
+    /// introuvable » à chaque mise à jour (Bilou, fil #1306). Le correctif
+    /// précédent gardait la suppression derrière `(goto) 2>nul` ; le terrain a
+    /// démenti cette parade en v0.9.71. Réintroduire l'une ou l'autre forme
+    /// ramènerait le bug.
+    #[test]
+    fn never_deletes_itself() {
+        let s = script();
+        assert!(!s.contains("%~f0"), "le script se supprime lui-même");
+        assert!(!s.contains("(goto)"), "l'astuce (goto) est de retour");
+    }
+
+    /// Le chemin nominal doit sortir avant l'étiquette d'échec.
+    ///
+    /// Sans `exit /b 0`, une mise à jour RÉUSSIE tombe dans `:swap_failed` :
+    /// elle écrit un rapport d'échec mensonger et relance l'exécutable une
+    /// seconde fois, `start` étant présent dans les deux branches.
+    #[test]
+    fn success_path_exits_before_the_failure_branch() {
+        let s = script();
+        let exit = s.find("exit /b 0").expect("pas de sortie explicite");
+        let failed = s.find(":swap_failed").expect("pas d'étiquette d'échec");
+        assert!(
+            exit < failed,
+            "le chemin nominal traverse :swap_failed au lieu de sortir"
+        );
+    }
+
+    /// Garde-fou sur les points déjà corrigés ailleurs : l'attente porte sur
+    /// NOTRE pid (et non sur le nom d'image, qui pendait indéfiniment quand un
+    /// second tune-server.exe tournait), et le binaire de remplacement est bien
+    /// celui préparé à côté.
+    #[test]
+    fn keeps_the_pid_wait_and_the_staged_binary() {
+        let s = script();
+        assert!(
+            s.contains("PID eq 4242"),
+            "l'attente ne filtre plus par PID"
+        );
+        assert!(s.contains("tune-server.new.exe"));
+        assert!(s.contains("tune-update-failed.txt"));
+    }
+}
+
+#[cfg(test)]
+mod changelog_fallback_tests {
+    use super::changelog_hardcoded;
+
+    /// Le repli doit satisfaire le contrat que `changelog_has_entries` vérifie
+    /// quand des données arrivent : au moins 5 versions, la plus récente
+    /// nommée. Contrairement à ce test d'intégration, celui-ci ne touche PAS
+    /// au réseau — il vaut donc aussi pendant une panne de GitHub, qui est
+    /// précisément le moment où le repli sert.
+    #[test]
+    fn le_repli_satisfait_le_contrat_du_panneau() {
+        let body = changelog_hardcoded().0;
+        let entries = body["entries"]
+            .as_array()
+            .expect("le repli doit exposer un tableau `entries`");
+
+        assert!(
+            entries.len() >= 5,
+            "le repli doit porter au moins 5 versions, il en a {}",
+            entries.len()
+        );
+        assert!(
+            body["version"].is_string(),
+            "le repli doit annoncer la version du serveur"
+        );
+    }
+
+    /// Le client distingue un secours d'une vraie réponse par ce seul drapeau.
+    /// S'il disparaît, le panneau rebadge « Récent » sur une entrée de juin.
+    #[test]
+    fn le_repli_sannonce_comme_tel() {
+        let body = changelog_hardcoded().0;
+        assert_eq!(
+            body["offline"],
+            serde_json::json!(true),
+            "sans ce drapeau, WhatsNew.svelte presente le secours comme l'actualite"
+        );
+    }
+
+    /// Chaque entrée doit être exploitable par `WhatsNew.svelte` : une version
+    /// non vide, une date, et des rubriques. Une entrée creuse produirait une
+    /// ligne muette dans le panneau — le défaut même qu'on corrige.
+    #[test]
+    fn chaque_entree_du_repli_est_affichable() {
+        let body = changelog_hardcoded().0;
+        for e in body["entries"].as_array().unwrap() {
+            let v = e["version"].as_str().unwrap_or("");
+            assert!(!v.is_empty(), "entrée sans version : {e}");
+            assert!(
+                e["date"].as_str().is_some_and(|d| !d.is_empty()),
+                "version {v} sans date"
+            );
+            let sections = e["sections"]
+                .as_array()
+                .unwrap_or_else(|| panic!("version {v} sans rubriques"));
+            assert!(
+                !sections.is_empty(),
+                "version {v} : rubriques vides, la ligne serait muette"
+            );
+        }
     }
 }

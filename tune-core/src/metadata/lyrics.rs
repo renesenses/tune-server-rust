@@ -84,13 +84,24 @@ pub fn has_lrc_timestamps(content: &str) -> bool {
 /// lowercase `.lrc` extension first, then uppercase `.LRC`. Read-only:
 /// never writes anything into the user's music folders.
 pub fn find_sidecar_lrc(audio_path: &str) -> Option<String> {
+    let candidate = sidecar_lrc_path(audio_path)?;
+    std::fs::read_to_string(&candidate).ok()
+}
+
+/// Chemin du `.lrc` voisin s'il existe (même souche, `.lrc` puis `.LRC`) —
+/// sans en lire le contenu.
+///
+/// Séparé de [`find_sidecar_lrc`] pour que la passe de fond « paroles » puisse
+/// **enregistrer le chemin trouvé** dans `track_metadata` : l'indicateur de
+/// couverture doit pouvoir dire « cette piste a des paroles, et les voici »,
+/// pas seulement « oui ». Lecture seule : n'écrit jamais dans les dossiers de
+/// musique de l'utilisateur.
+pub fn sidecar_lrc_path(audio_path: &str) -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(audio_path);
     for ext in ["lrc", "LRC"] {
         let candidate = path.with_extension(ext);
         if candidate.exists() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                return Some(content);
-            }
+            return Some(candidate);
         }
     }
     None
@@ -123,6 +134,115 @@ pub fn read_embedded_lyrics(audio_path: &str) -> Option<String> {
     tag.get_string(ItemKey::Lyrics)
         .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Écriture — la seconde moitié de l'issue #2172
+// ---------------------------------------------------------------------------
+//
+// Tout ce qui précède lit. Ce qui suit écrit, et écrit dans les dossiers de
+// musique de l'utilisateur : c'est le seul endroit du module où une erreur
+// abîme quelque chose. D'où trois règles, tenues ici et pas seulement chez
+// l'appelant :
+//
+// 1. **Rien n'est jamais écrasé.** Un `.lrc` déjà posé — fût-il en `.LRC` —
+//    arrête l'écriture net.
+// 2. **Un `.lrc` sans horodatage n'est pas un `.lrc`.** Écrire des paroles
+//    plates sous cette extension produirait un fichier que la cascade
+//    d'affichage lirait comme synchronisé et n'afficherait jamais.
+// 3. **Pas de fichier audio, pas de voisin.** On ne sème pas des `.lrc`
+//    orphelins dans une bibliothèque dont une piste a disparu.
+
+/// Pourquoi un `.lrc` voisin n'a pas été écrit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarWriteError {
+    /// Le chemin audio n'a pas de souche exploitable.
+    BadPath,
+    /// Le fichier audio n'existe pas (plus) : son voisin n'aurait aucun sens.
+    MissingAudioFile,
+    /// Corps vide ou sans le moindre horodatage LRC.
+    NotLrc,
+    /// Un fichier existe déjà à cet emplacement. **Jamais écrasé.**
+    AlreadyExists(std::path::PathBuf),
+    /// Échec d'entrée/sortie.
+    Io(String),
+}
+
+impl std::fmt::Display for SidecarWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadPath => write!(f, "chemin audio inexploitable"),
+            Self::MissingAudioFile => write!(f, "fichier audio absent"),
+            Self::NotLrc => write!(f, "paroles sans horodatage LRC"),
+            Self::AlreadyExists(p) => write!(f, "déjà présent : {}", p.display()),
+            Self::Io(e) => write!(f, "écriture : {e}"),
+        }
+    }
+}
+
+/// Chemin du `.lrc` voisin **à écrire** : même souche, extension `.lrc` en
+/// minuscules.
+///
+/// Distinct de [`sidecar_lrc_path`], qui ne rend un chemin que s'il existe
+/// déjà. Ici le fichier n'existe précisément pas encore.
+pub fn sidecar_lrc_write_path(audio_path: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(audio_path);
+    // Une souche est indispensable : `/musique/` ou `..` n'en ont pas, et
+    // `with_extension` y produirait n'importe quoi.
+    path.file_stem()?;
+    Some(path.with_extension("lrc"))
+}
+
+/// Écrit les paroles synchronisées dans un `.lrc` posé à côté du fichier
+/// audio, et rend le chemin écrit.
+///
+/// La seule écriture de Tune dans les dossiers de musique côté paroles. Elle
+/// est **additive** : elle crée un fichier neuf, ne touche jamais au fichier
+/// audio, et refuse plutôt que d'écraser.
+///
+/// L'appelant doit avoir vérifié le consentement — voir
+/// `crate::library::lyrics_pass::write_consent_given`.
+pub fn write_sidecar_lrc(
+    audio_path: &str,
+    lrc: &str,
+) -> Result<std::path::PathBuf, SidecarWriteError> {
+    use std::io::Write;
+
+    if !has_lrc_timestamps(lrc) {
+        return Err(SidecarWriteError::NotLrc);
+    }
+    if !std::path::Path::new(audio_path).is_file() {
+        return Err(SidecarWriteError::MissingAudioFile);
+    }
+    // Un `.LRC` majuscule compte aussi comme « déjà là » : la lecture le
+    // trouverait, et poser un `.lrc` à côté sèmerait deux vérités.
+    if let Some(existing) = sidecar_lrc_path(audio_path) {
+        return Err(SidecarWriteError::AlreadyExists(existing));
+    }
+    let target = sidecar_lrc_write_path(audio_path).ok_or(SidecarWriteError::BadPath)?;
+
+    // `create_new` : c'est le noyau qui refuse si le fichier apparaît
+    // entre-temps. Un `exists()` peut mentir une milliseconde plus tard ;
+    // cette garantie-là, non.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => SidecarWriteError::AlreadyExists(target.clone()),
+            _ => SidecarWriteError::Io(e.to_string()),
+        })?;
+
+    let body = if lrc.ends_with('\n') {
+        lrc.to_string()
+    } else {
+        format!("{lrc}\n")
+    };
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| SidecarWriteError::Io(e.to_string()))?;
+
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -221,12 +341,110 @@ mod tests {
 
     #[test]
     fn sidecar_uppercase_extension() {
-        let dir = std::env::temp_dir().join("tune_lrc_test_upper");
-        std::fs::create_dir_all(&dir).unwrap();
-        let audio = dir.join("Song.flac");
-        std::fs::write(dir.join("Song.LRC"), "[00:01.00] up").unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = dir.path().join("Song.flac");
+        std::fs::write(dir.path().join("Song.LRC"), "[00:01.00] up").unwrap();
         let content = find_sidecar_lrc(audio.to_str().unwrap());
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(content.as_deref(), Some("[00:01.00] up"));
+    }
+
+    // -- Écriture (#2172) --------------------------------------------------
+
+    /// Un dossier avec un « fichier audio » réel : `write_sidecar_lrc` refuse
+    /// d'écrire à côté d'un fichier absent, donc il faut vraiment en poser un.
+    fn faux_morceau(dir: &tempfile::TempDir, nom: &str) -> String {
+        let audio = dir.path().join(nom);
+        std::fs::write(&audio, b"pas vraiment du son").unwrap();
+        audio.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn ecrit_un_lrc_voisin_que_la_lecture_retrouve() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = faux_morceau(&dir, "Song.flac");
+
+        let ecrit = write_sidecar_lrc(&audio, "[00:01.00] une ligne").unwrap();
+        assert_eq!(ecrit, dir.path().join("Song.lrc"));
+        // La boucle se referme : ce que l'écriture pose, la lecture le trouve.
+        assert_eq!(
+            find_sidecar_lrc(&audio).as_deref(),
+            Some("[00:01.00] une ligne\n"),
+            "le corps est terminé par un saut de ligne"
+        );
+    }
+
+    #[test]
+    fn n_ecrase_jamais_un_lrc_deja_pose() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = faux_morceau(&dir, "Song.flac");
+        std::fs::write(
+            dir.path().join("Song.lrc"),
+            "[00:09.00] celui de l'utilisateur",
+        )
+        .unwrap();
+
+        let err = write_sidecar_lrc(&audio, "[00:01.00] le notre").unwrap_err();
+        assert!(matches!(err, SidecarWriteError::AlreadyExists(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Song.lrc")).unwrap(),
+            "[00:09.00] celui de l'utilisateur",
+            "le fichier de l'utilisateur est intact"
+        );
+    }
+
+    #[test]
+    fn n_ecrase_pas_davantage_un_lrc_en_majuscules() {
+        // La lecture accepte `.LRC` ; l'écriture doit donc le voir aussi,
+        // sinon on poserait un second fichier de paroles contradictoire.
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = faux_morceau(&dir, "Song.flac");
+        std::fs::write(dir.path().join("Song.LRC"), "[00:09.00] majuscules").unwrap();
+
+        let err = write_sidecar_lrc(&audio, "[00:01.00] le notre").unwrap_err();
+        assert!(matches!(err, SidecarWriteError::AlreadyExists(_)));
+        assert!(
+            !dir.path().join("Song.lrc").exists(),
+            "aucun `.lrc` minuscule ne doit apparaitre a cote du `.LRC`"
+        );
+    }
+
+    #[test]
+    fn refuse_des_paroles_sans_horodatage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = faux_morceau(&dir, "Song.flac");
+
+        assert_eq!(
+            write_sidecar_lrc(&audio, "Des paroles plates\nsans horodatage"),
+            Err(SidecarWriteError::NotLrc)
+        );
+        assert_eq!(
+            write_sidecar_lrc(&audio, ""),
+            Err(SidecarWriteError::NotLrc)
+        );
+        assert!(
+            !dir.path().join("Song.lrc").exists(),
+            "un refus ne doit laisser aucun fichier derriere lui"
+        );
+    }
+
+    #[test]
+    fn refuse_d_ecrire_a_cote_d_un_fichier_audio_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fantome = dir.path().join("Disparu.flac");
+        assert_eq!(
+            write_sidecar_lrc(fantome.to_str().unwrap(), "[00:01.00] x"),
+            Err(SidecarWriteError::MissingAudioFile)
+        );
+        assert!(!dir.path().join("Disparu.lrc").exists());
+    }
+
+    #[test]
+    fn chemin_d_ecriture_toujours_en_minuscules_et_sans_souche_pas_de_chemin() {
+        assert_eq!(
+            sidecar_lrc_write_path("/musique/Song.FLAC"),
+            Some(std::path::PathBuf::from("/musique/Song.lrc"))
+        );
+        assert_eq!(sidecar_lrc_write_path("/"), None);
+        assert_eq!(sidecar_lrc_write_path(""), None);
     }
 }

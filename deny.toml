@@ -26,6 +26,19 @@ ignore = [
     # la 0.9.58, sans que personne puisse le savoir : le rapport n'affichait que
     # les avertissements de doublons, jamais l'erreur. À revisiter si audiopus
     # migre, ou si un jour un CVE tombe dessus — auquel cas cette ligne saute.
+    #
+    # Précision d'inventaire (#2251) : la dépendance n'est PAS que mobile.
+    # `audiopus` est une dépendance dure, non optionnelle et non conditionnée à
+    # la cible, de `tune-core` — donc de TOUTES les cibles livrées, du .so
+    # Android au binaire Windows. Le seul défaut concret que l'avis reproche
+    # (un `cmake_minimum_required` antérieur à 3.5, que CMake 4.x refuse) est
+    # déjà neutralisé ici : `.cargo/config.toml` pose
+    # `CMAKE_POLICY_VERSION_MINIMUM=3.5` pour tous les builds, `Cross.toml` le
+    # repasse dans le conteneur musl. Le remplacement lui-même reste un
+    # arbitrage ouvert — options et coûts dans #2251.
+    #
+    # Cette liste doit rester identique à celle de `.cargo/audit.toml` et à
+    # l'entrée `ignore:` du job `audit` de `.github/workflows/ci.yml`.
     "RUSTSEC-2026-0150",
     # NOTE: the wasmtime advisories RUSTSEC-2026-0222/0223 were resolved by the
     # bump to wasmtime 47.0.3 and are no longer ignored.

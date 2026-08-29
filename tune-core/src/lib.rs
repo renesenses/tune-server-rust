@@ -7,6 +7,7 @@ pub mod ai;
 pub mod alarms;
 pub mod api_analytics;
 pub mod audio;
+pub mod bandcamp_veille;
 pub mod bug_report;
 pub mod cloud;
 pub mod collaborative;
@@ -30,8 +31,6 @@ pub mod library;
 pub mod license;
 pub mod lyrics;
 pub mod metadata;
-pub mod mount_manager;
-pub mod network;
 pub mod notifications;
 pub mod orchestrator;
 pub mod outputs;
@@ -43,11 +42,6 @@ pub mod playlist_sync;
 pub mod playlist_transfer;
 pub mod plugin_sdk;
 pub mod plugins;
-/// P0 of the plugin ABI (RFC §3): embedded wasmtime runtime that loads,
-/// instantiates and calls wasm plugins with JSON-over-linear-memory
-/// marshalling under resource limits. Gated behind `plugins-wasm`.
-#[cfg(feature = "plugins-wasm")]
-pub mod plugins_runtime;
 pub mod poller;
 pub mod prefetch;
 pub mod queue_persistence;
@@ -69,6 +63,7 @@ pub mod stream_cache;
 pub mod streaming;
 pub mod transcode_cache;
 pub mod updater;
+pub mod upnp_renderer;
 pub mod upnp_server;
 pub mod user_profiles;
 pub mod ytdlp;

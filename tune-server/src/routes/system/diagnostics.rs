@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -14,6 +15,123 @@ use crate::state::AppState;
 /// Number of recent log lines embedded in a bug report (kept modest so the
 /// forum thread stays readable; the "Export logs" button has the full tail).
 const BUG_REPORT_LOG_LINES: usize = 200;
+
+/// Fenêtre LUE avant filtrage, pour que les 200 lignes retenues soient 200
+/// lignes utiles.
+///
+/// Mesuré sur un rapport réel (#1884, Bertrand, analyse acoustique figée) :
+/// **160 des 200 lignes étaient la même sonde `ssdp_unicast_probe_ok` en
+/// DEBUG**, et le rapport ne contenait pas une seule ligne acoustique — la
+/// fenêtre couvrait moins de trois minutes. Un rapport arrivé vide de ce qui
+/// concerne le défaut oblige à redemander un journal complet, et un
+/// signalement sur deux s'éteint en route.
+const BUG_REPORT_LOG_SCAN_LINES: usize = 3000;
+
+/// Ne garder d'un journal que ce qui documente un défaut.
+///
+/// Le DEBUG des modules de découverte est une sonde de bon fonctionnement :
+/// sa place est dans le fichier et dans l'export complet, pas dans un rapport
+/// de bogue où il chasse tout le reste. On ne garde donc que INFO et au-dessus.
+///
+/// Une ligne de continuation — celle d'une trace d'erreur, qui ne porte ni
+/// horodatage ni niveau — hérite de la décision prise pour la ligne qui la
+/// précède : découper une trace en deux vaudrait moins que de la jeter
+/// entière.
+fn lignes_utiles_pour_un_rapport(journal: &str, garder: usize) -> String {
+    let mut retenu: Vec<&str> = Vec::new();
+    // Une ligne sans niveau reconnu ouvre le journal : on la garde, faute de
+    // quoi un format inattendu viderait le rapport au lieu de l'alléger.
+    let mut on_garde = true;
+    for ligne in journal.lines() {
+        match niveau_de_ligne(ligne) {
+            Some(niveau) => {
+                on_garde = !matches!(niveau, "DEBUG" | "TRACE");
+                if on_garde {
+                    retenu.push(ligne);
+                }
+            }
+            None => {
+                if on_garde {
+                    retenu.push(ligne);
+                }
+            }
+        }
+    }
+    // Le rapport passe désormais par la MÊME sélection que l'export (#1974) :
+    // un module ne peut occuper plus d'un quart de la fenêtre. Il ne l'avait
+    // pas, et il tronquait bêtement.
+    //
+    // Trois journaux de testeurs la même semaine l'exigeaient, et jamais avec
+    // le même coupable : chez Bilou, `tune_server::scan_import` et
+    // `tune_core::metadata` prenaient les deux tiers de 1 003 lignes — zéro
+    // ligne d'enrichissement ne survivait, alors que c'était le sujet de son
+    // signalement ; chez Jean Valjean, la boucle de sondage UPnP en prenait
+    // 807 sur 1 003. Plafonner le module tient quel que soit le bavard du
+    // jour, là où nommer les coupables un à un ne tient jamais longtemps.
+    //
+    // Écrire ici un SECOND mécanisme aurait été le vrai piège : deux réponses
+    // à la même question dérivent, et c'est exactement ce que la doctrine du
+    // dépôt interdit.
+    let candidates: Vec<String> = retenu.into_iter().map(str::to_owned).collect();
+    let (gardees, ecartees) = selectionner_lignes(candidates, garder);
+    let mut sortie = gardees.join("\n");
+    // Un rapport qui tait ce qu'il a laissé tomber se lit comme s'il avait
+    // tout montré — même règle que pour l'export.
+    for (module, combien) in ecartees {
+        sortie.push_str(&format!(
+            "\n… {combien} lignes de « {module} » écartées du rapport (elles sont dans l'export complet)"
+        ));
+    }
+    sortie
+}
+
+/// Le niveau d'une ligne de journal, quand elle en porte un.
+///
+/// Format écrit par `tracing` : `2026-08-17T15:22:15.003+02:00  DEBUG
+/// tune_core::discovery::ssdp: …`. On ne cherche le niveau que dans les
+/// premiers champs — un `DEBUG` au milieu d'un message ne doit pas faire
+/// passer la ligne pour du DEBUG.
+fn niveau_de_ligne(ligne: &str) -> Option<&'static str> {
+    for mot in ligne.split_whitespace().take(3) {
+        match mot {
+            "TRACE" => return Some("TRACE"),
+            "DEBUG" => return Some("DEBUG"),
+            "INFO" => return Some("INFO"),
+            "WARN" => return Some("WARN"),
+            "ERROR" => return Some("ERROR"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// L'horodatage en tête d'une ligne de journal, sous la forme brute écrite par
+/// `tracing` (`2026-08-20T09:03:15.059+02:00`), tronqué à la minute.
+fn horodatage_de_ligne(ligne: &str) -> Option<&str> {
+    let premier = ligne.split_whitespace().next()?;
+    // `2026-08-20T09:03` — dix caractères de date, un `T`, cinq d'heure.
+    if premier.len() >= 16 && premier.as_bytes()[10] == b'T' && premier.starts_with("20") {
+        Some(&premier[..16])
+    } else {
+        None
+    }
+}
+
+/// La période réellement couverte par un extrait de journal, `du … au …`.
+///
+/// Trois mille lignes couvrent des heures sur un serveur au repos et **dix
+/// minutes** sur un serveur qui scanne (#2028). L'utilisateur qui décrit un
+/// blocage vieux de plusieurs heures nous envoie alors un journal qui ne peut
+/// rien en contenir — et rien, ni pour lui ni pour nous, ne distingue ce
+/// rapport-là d'un rapport qui couvre la journée. On l'annonce donc.
+fn periode_couverte(extrait: &str) -> Option<String> {
+    let mut lignes = extrait.lines().filter_map(horodatage_de_ligne);
+    let debut = lignes.next()?;
+    match lignes.last() {
+        Some(fin) if fin != debut => Some(format!("du {debut} au {fin}")),
+        _ => Some(format!("à {debut}")),
+    }
+}
 
 /// Public bug-intake endpoint on the community site. It creates a *moderated*
 /// (pending) forum thread server-side with the site's own credentials — the
@@ -117,15 +235,34 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "rust_version": tune_core::rustc_version(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // #2117 : `uptime_seconds` mesure BIEN ce processus — il naît d'un
+        // `Instant` posé au démarrage — mais un compteur relatif ne permet pas
+        // de VÉRIFIER que le processus interrogé est le même qu'à l'appel
+        // précédent : il faut le déduire, et la déduction a déjà fait écarter
+        // à tort l'hypothèse d'un redémarrage pendant un diagnostic. L'ancrage
+        // absolu ci-dessous répond sans déduction : il change au redémarrage.
         "uptime_seconds": uptime_secs,
+        "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // #2154 — une base incomplète ne doit plus pouvoir ignorer des
+        // réglages pendant des mois sans laisser de trace dans le rapport.
+        "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
         "discovered_devices": devices_by_type,
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
         "asio_available": asio_avail,
+        // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
+        // une ligne WARN que l'utilisateur ne verra jamais.
+        "asio_warm_scan": crate::startup::asio_warm_status(),
+        // #2392 : pourquoi un fournisseur de sortie hors-arbre est inerte.
+        // Absent de la liste = non compilé ; présent avec un `refusal` = droit
+        // manquant, et le refus dit lequel et quoi faire ; présent sans refus
+        // et `devices: 0` = il cherche et ne trouve rien. Ces trois cas
+        // donnaient jusqu'ici le même écran vide.
+        "output_providers": crate::discovery_setup::provider_status_snapshot(),
         "scan_status": {
             "status": scan_status,
             "tracks": tracks,
@@ -186,6 +323,51 @@ fn get_rss_mb() -> Option<u64> {
     {
         None::<u64>
     }
+}
+
+/// La section « fournisseurs de sortie » d'un rapport de bogue.
+///
+/// Vide quand le binaire n'embarque aucun fournisseur hors-arbre : il n'y a
+/// alors rien à dire, et une section vide dans chaque rapport serait du bruit.
+fn section_fournisseurs_de_sortie(instantane: &Value) -> String {
+    let Some(fournisseurs) = instantane["providers"].as_array().filter(|l| !l.is_empty()) else {
+        return String::new();
+    };
+
+    let mut md = String::from("## Output Providers\n");
+    if !instantane["account_linked"].as_bool().unwrap_or(true) {
+        md.push_str(
+            "- ⚠ **No linked Mozaiklabs account** — paid module entitlements travel with the \
+             account, never with the license key, so no paid output module can be active.\n",
+        );
+    }
+    let modules = instantane["licensed_modules"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    md.push_str(&format!(
+        "- Licensed modules: {}\n",
+        if modules.is_empty() { "none" } else { &modules }
+    ));
+
+    for f in fournisseurs {
+        let nom = f["provider"].as_str().unwrap_or("?");
+        let appareils = f["devices"].as_u64().unwrap_or(0);
+        match f["refusal"]["code"].as_str() {
+            Some(code) => md.push_str(&format!(
+                "- {nom}: **idle — {code}** ({})\n",
+                f["refusal"]["message"].as_str().unwrap_or("")
+            )),
+            None => md.push_str(&format!("- {nom}: active, {appareils} device(s)\n")),
+        }
+    }
+    md.push('\n');
+    md
 }
 
 pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {
@@ -258,11 +440,16 @@ pub(super) struct LogsQuery {
     lines: Option<usize>,
 }
 
-/// Bounded tail window for `/system/logs`. 2 MiB comfortably covers the
-/// default 1000 lines while keeping the read bounded regardless of how large
-/// the append-only log has grown (rotation only runs at startup, so a
+/// Bounded tail window for `/system/logs`, kept bounded regardless of how
+/// large the append-only log has grown (rotation only runs at startup, so a
 /// long-running server's file can reach hundreds of MB).
-const LOG_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+///
+/// 8 MiB et non 2 : depuis #1974 on lit `CANDIDATE_FACTOR` fois plus de lignes
+/// que demandé pour pouvoir SÉLECTIONNER au lieu de tronquer. 8 000 lignes de
+/// journal pèsent environ 1,6 Mo — 2 Mo passait tout juste, et « tout juste »
+/// se transforme en fenêtre amputée le jour où les messages s'allongent, sans
+/// que rien ne le dise.
+const LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 enum LogTailError {
@@ -304,8 +491,220 @@ fn read_log_tail(
     Ok(lines.into_iter().rev().map(str::to_string).collect())
 }
 
+/// Combien de lignes brutes lire avant d'en selectionner `max_lines`.
+///
+/// Rebalancer suppose d'avoir le choix : prendre exactement les 1000
+/// dernieres lignes, c'est deja avoir subi la troncature qu'on veut corriger.
+/// On lit donc large, puis on selectionne.
+const CANDIDATE_FACTOR: usize = 8;
+
+/// Part maximale d'une fenetre d'export qu'un seul sous-systeme peut occuper.
+///
+/// Les sous-systemes n'ecrivent pas au meme rythme : `discovery::ssdp` ecrit
+/// toutes les quelques secondes (annonces reseau, re-enregistrements),
+/// `audio::embedding` une ligne par lot — une toutes les quinze minutes. Sur
+/// une fenetre a plafond simple, le premier chasse mecaniquement le second.
+///
+/// Autrement dit : **plus un traitement est lent, donc plus il est suspect,
+/// moins il a de chances d'apparaitre dans l'export.** L'outil de diagnostic
+/// est aveugle exactement la ou on en a besoin.
+///
+/// Mesure sur deux exports de Bilou (#1974) : 529 et 562 lignes de SSDP sur
+/// 1003. Le second ne contenait AUCUNE ligne d'embedding, alors que l'analyse
+/// acoustique etait l'objet du signalement. Il avait fourni le bon fichier, au
+/// bon moment, et il etait inexploitable.
+const QUOTA_PAR_MODULE: f64 = 0.25;
+
+/// Le module (`target` de tracing) d'une ligne de log, si elle en porte un.
+///
+/// Format du writer (`fmt::layer()` par defaut, `bootstrap.rs`) :
+/// `<horodatage>  INFO tune_core::discovery::ssdp: message`.
+///
+/// Rend `None` pour tout ce qui ne suit pas cette forme — continuation d'un
+/// message multiligne, trace de panique, sortie d'un tiers. Ces lignes-la ne
+/// sont JAMAIS ecartees : une ligne qu'on ne sait pas classer est une ligne
+/// dont on ne sait pas si elle compte.
+fn module_de_la_ligne(ligne: &str) -> Option<&str> {
+    const NIVEAUX: [&str; 5] = [" ERROR ", " WARN ", " INFO ", " DEBUG ", " TRACE "];
+    let (_, apres) = NIVEAUX
+        .iter()
+        .find_map(|n| ligne.split_once(n).map(|p| (n, p)))?;
+    let cible = apres.1.split_whitespace().next()?;
+    let cible = cible.strip_suffix(':')?;
+    // `tune_core::discovery::ssdp` — un module, pas un mot isole comme le
+    // debut d'une phrase. Sans cette exigence, un message qui commence par
+    // « erreur: » se ferait compter comme un module a lui tout seul.
+    if cible.is_empty() || !cible.contains("::") {
+        return None;
+    }
+    Some(cible)
+}
+
+/// Choisit `max_lines` lignes parmi `candidates`, en empechant un seul module
+/// d'occuper plus de [`QUOTA_PAR_MODULE`] de la fenetre.
+///
+/// Deux passes, et la seconde est ce qui rend la premiere sans risque :
+///
+/// 1. du plus recent au plus ancien, on garde chaque ligne dont le module n'a
+///    pas epuise son quota ;
+/// 2. si la fenetre n'est pas pleine — parce que les quotas ont beaucoup
+///    ecarte — on la complete avec les lignes mises de cote, toujours du plus
+///    recent au plus ancien.
+///
+/// La seconde passe garantit qu'on ne rend JAMAIS moins de lignes que la
+/// troncature simple : a taille egale, l'export dit strictement plus. Sur une
+/// machine ou seul SSDP parle, il reste donc integralement.
+///
+/// Rend les lignes dans l'ordre chronologique, et le decompte par module de ce
+/// qui a ete ecarte — un export qui tait ce qu'il a laisse tomber se lit comme
+/// s'il avait tout montre.
+fn selectionner_lignes(
+    candidates: Vec<String>,
+    max_lines: usize,
+) -> (Vec<String>, std::collections::BTreeMap<String, usize>) {
+    use std::collections::BTreeMap;
+
+    if max_lines == 0 {
+        return (Vec::new(), BTreeMap::new());
+    }
+    if candidates.len() <= max_lines {
+        return (candidates, BTreeMap::new());
+    }
+
+    let quota = ((max_lines as f64 * QUOTA_PAR_MODULE).floor() as usize).max(1);
+    let mut comptes: BTreeMap<String, usize> = BTreeMap::new();
+    // `Option<String>` et non l'indice : on garde la ligne retenue et, pour
+    // celles mises de cote, de quoi les reprendre en seconde passe.
+    let mut retenues: Vec<usize> = Vec::with_capacity(max_lines);
+    let mut ecartees: Vec<usize> = Vec::new();
+
+    for (i, ligne) in candidates.iter().enumerate().rev() {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        match module_de_la_ligne(ligne) {
+            Some(m) => {
+                let n = comptes.entry(m.to_string()).or_insert(0);
+                if *n < quota {
+                    *n += 1;
+                    retenues.push(i);
+                } else {
+                    ecartees.push(i);
+                }
+            }
+            // Non classable : jamais ecartee.
+            None => retenues.push(i),
+        }
+    }
+
+    // Seconde passe : completer avec ce qu'on avait mis de cote.
+    for i in ecartees.iter().copied() {
+        if retenues.len() >= max_lines {
+            break;
+        }
+        retenues.push(i);
+    }
+
+    retenues.sort_unstable();
+
+    // Ce qu'on RAPPORTE comme mis de cote, et le calcul n'est pas celui qu'on
+    // ecrit d'abord.
+    //
+    // Compter toutes les lignes non retenues serait faux, et faussement
+    // alarmant : sur 3000 lignes lues pour une fenetre de 1000, la troncature
+    // simple en jetait deja 2000 sans jamais le dire. Les annoncer ici ferait
+    // passer pour une perte ce qui est le fonctionnement normal d'une fenetre.
+    //
+    // Le seul chiffre honnete est le DEPLACEMENT : les lignes qui auraient
+    // figure dans la fenetre d'avant — les `max_lines` dernieres — et qu'on a
+    // ecartees au profit d'autres. C'est exactement ce que le quota a coute, ni
+    // plus ni moins. Un module bavard seul en scene n'y apparait donc pas : il
+    // n'a rien cede a personne.
+    //
+    // Ce calcul est le second : le premier comptait tout, et le test de
+    // non-regression `un_seul_module_bavard_reste_entier` l'a refuse.
+    let seuil_ancienne_fenetre = candidates.len().saturating_sub(max_lines);
+    let retenu: std::collections::BTreeSet<usize> = retenues.iter().copied().collect();
+    let mut vraiment_ecartees: BTreeMap<String, usize> = BTreeMap::new();
+    for i in seuil_ancienne_fenetre..candidates.len() {
+        if retenu.contains(&i) {
+            continue;
+        }
+        if let Some(m) = module_de_la_ligne(&candidates[i]) {
+            *vraiment_ecartees.entry(m.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let lignes = retenues
+        .into_iter()
+        .map(|i| candidates[i].clone())
+        .collect::<Vec<_>>();
+    (lignes, vraiment_ecartees)
+}
+
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     collect_recent_logs(q.lines.unwrap_or(1000)).await
+}
+
+#[derive(Deserialize)]
+pub(super) struct RegistreQuery {
+    /// Filtrer sur une passe. Sans ce parametre, tout le registre.
+    task: Option<String>,
+    /// Nombre maximum de lignes rendues. Borne a 500 par le registre.
+    limit: Option<i64>,
+}
+
+/// `GET /system/task-runs` — le registre des executions automatisees (#2080).
+///
+/// Ce que cette route repond, et que rien ne repondait avant : « la passe
+/// a-t-elle tourne, quand, combien de temps, et avec quel resultat ». Le
+/// journal defile et se perd ; `/system/background-tasks` ne connait que le
+/// PRESENT (les taches en cours, en memoire, perdues au redemarrage). Ici,
+/// c'est le PASSE, et il survit au redemarrage.
+///
+/// `boot_id` distingue les incarnations du processus : deux executions de boots
+/// differents ne se confondent pas, et c'est ce qui rend lisible « la passe a
+/// ete interrompue par un redemarrage ».
+///
+/// La reponse ne contient ni chemin, ni cle, ni jeton — des compteurs et des
+/// verdicts. Elle peut donc etre collee telle quelle dans un ticket.
+pub(super) async fn task_runs(
+    State(state): State<AppState>,
+    Query(q): Query<RegistreQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(state.backend.clone());
+    let limite = q.limit.unwrap_or(100);
+
+    let runs = registre.lister(q.task.as_deref(), limite).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    let dernieres = registre.resume().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+
+    Ok(Json(json!({
+        // L'incarnation COURANTE. Une ligne qui ne porte pas ce boot_id vient
+        // d'un demarrage anterieur — c'est la lecture qui evite de prendre une
+        // vieille execution pour l'actuelle.
+        "boot_id": tune_core::db::task_run_repo::boot_id(),
+        // Les passes que le registre sait ecrire aujourd'hui. Une passe de
+        // cette liste ABSENTE de `latest` n'a jamais tourne sur cette
+        // installation ; sans la liste, on ne saurait pas la distinguer d'une
+        // passe qu'on aurait oublie de cabler.
+        "wired_tasks": tune_core::db::task_run_repo::TACHES_CABLEES,
+        "retention": {
+            "runs_per_task": tune_core::db::task_run_repo::RETENTION_EXECUTIONS_PAR_PASSE,
+            "days": tune_core::db::task_run_repo::RETENTION_JOURS,
+        },
+        "latest": dernieres,
+        "runs": runs,
+    })))
 }
 
 /// Collect the most recent server logs (tail): log file first, then
@@ -330,16 +729,36 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // 1 GB RAM).
     {
         let path = log_path.clone();
+        // On lit CANDIDATE_FACTOR fois plus de lignes que demandé, puis on
+        // sélectionne : rebalancer suppose d'avoir le choix, et prendre
+        // exactement les N dernières lignes c'est déjà avoir subi la troncature
+        // qu'on veut corriger (#1974).
+        let a_lire = max_lines.saturating_mul(CANDIDATE_FACTOR).max(max_lines);
         let tail =
-            tokio::task::spawn_blocking(move || read_log_tail(&path, max_lines, LOG_TAIL_BYTES))
-                .await;
+            tokio::task::spawn_blocking(move || read_log_tail(&path, a_lire, LOG_TAIL_BYTES)).await;
         match tail {
-            Ok(Ok(lines)) => {
+            Ok(Ok(brutes)) => {
+                let lues = brutes.len();
+                let (lines, ecartees) = selectionner_lignes(brutes, max_lines);
+                if !ecartees.is_empty() {
+                    tracing::info!(
+                        lues,
+                        rendues = lines.len(),
+                        ecartees = ?ecartees,
+                        "log_export_rebalanced"
+                    );
+                }
                 return Json(json!({
                     "logs": lines.join("\n"),
                     "lines": lines.len(),
                     "source": "file",
                     "path": log_path,
+                    // Ce qui a été mis de côté, par module. Un export qui tait
+                    // ce qu'il a laissé tomber se lit comme s'il avait tout
+                    // montré — et c'est exactement ce qui a coûté deux
+                    // allers-retours à Bilou.
+                    "scanned_lines": lues,
+                    "set_aside": ecartees,
                 }));
             }
             Ok(Err(LogTailError::Unreadable(e))) => {
@@ -358,7 +777,16 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     // Try journalctl on Linux (multiple service names)
     #[cfg(target_os = "linux")]
     {
-        for service in &["tune-server", "tune-rust"] {
+        // `tune` D'ABORD : c'est le nom de l'unité sur Tune OS
+        // (`/etc/systemd/system/tune.service`, posé par l'image), et il
+        // manquait à cette liste. Conséquence : sur l'appliance que nous
+        // distribuons, l'export de journaux ne trouvait JAMAIS rien — ni
+        // fichier (le serveur y écrit sur la sortie standard, captée par
+        // systemd), ni journalctl (mauvais nom d'unité), ni syslog. Le
+        // testeur recevait « No log file found. Launch Tune from a terminal »,
+        // conseil absurde sur un boîtier sans écran, et nous joignait un
+        // fichier de quatre lignes (Stéphane Villerio, 19/08).
+        for service in &["tune", "tune-server", "tune-rust"] {
             if let Ok(output) = std::process::Command::new("journalctl")
                 .args([
                     "-u",
@@ -497,8 +925,25 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
         }
     }
 
+    // Dire ce qui a été tenté, pas seulement ce qui a échoué.
+    //
+    // « No log file found » avec un seul chemin laissait croire à un problème
+    // de fichier, alors que trois mécanismes distincts ont été essayés. Sans
+    // cette liste, ni le testeur ni nous ne pouvons dire lequel a manqué — et
+    // c'est nous qui redemandons un journal que sa machine ne sait pas
+    // produire.
+    #[cfg(target_os = "linux")]
+    let tentatives = format!(
+        "Chemins et sources essayés :\n  - fichier : {log_path}\n           - journalctl -u tune / tune-server / tune-rust\n  - /var/log/syslog"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let tentatives = format!("Chemins et sources essayés :\n  - fichier : {log_path}");
+
     Json(json!({
-        "logs": "No log file found. Launch Tune from a terminal to see logs in real-time.\nChecked: ".to_owned() + &log_path,
+        "logs": format!(
+            "Aucun journal accessible. Si Tune tourne en service, la commande \
+             ci-dessous le donne en direct :\n  journalctl -u tune -n 2000 --no-pager\n\n{tentatives}"
+        ),
         "lines": 0,
         "source": "none",
     }))
@@ -585,6 +1030,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Zones
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
+    let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
+    let asio_warm_scan = crate::startup::asio_warm_status();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
@@ -670,10 +1117,21 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         std::env::consts::ARCH
     ));
     md.push_str(&format!("**Uptime**: {uptime_str}\n"));
+    // #2117 : un rapport de bogue est lu bien après avoir été produit, souvent
+    // à côté d'un journal horodaté. « 1h19 » ne se recoupe avec rien ; une date
+    // de démarrage se recoupe avec tout.
+    md.push_str(&format!(
+        "**Process started**: {}\n",
+        state.process_started_at_rfc3339()
+    ));
     md.push_str(&format!("**PID**: {}\n", std::process::id()));
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
+    md.push_str(&format!(
+        "**ASIO warm scan**: {} — {}\n",
+        asio_warm_scan.state, asio_warm_scan.message
+    ));
     md.push('\n');
 
     md.push_str("## Library\n");
@@ -691,6 +1149,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&format!(
+        "- Zone settings not persisted: {zone_settings_ignored}\n"
+    ));
     md.push('\n');
 
     md.push_str("## Streaming Services\n");
@@ -719,6 +1180,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     md.push('\n');
 
+    // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
+    // Diretta une réinstallation complète de Fedora. Un rapport de bogue qui
+    // dit « fournisseur diretta, 0 appareil, aucun compte lié » se lit en dix
+    // secondes ; un rapport muet oblige à tout redemander.
+    md.push_str(&section_fournisseurs_de_sortie(
+        &crate::discovery_setup::provider_status_snapshot(),
+    ));
+
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
         for ep in &oaat_endpoints {
@@ -744,11 +1213,18 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Recent logs (tail) — the single most useful part of a bug report. Reuses
     // the same collector as the /logs endpoint so the report matches what the
     // "Export logs" button shows.
-    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_LINES).await;
-    let log_text = logs_json["logs"].as_str().unwrap_or("").trim();
+    // On lit large et on filtre, plutôt que de lire 200 lignes et d'espérer
+    // qu'elles parlent du défaut (#1884). L'export complet, lui, reste verbatim.
+    let Json(logs_json) = collect_recent_logs(BUG_REPORT_LOG_SCAN_LINES).await;
+    let brut = logs_json["logs"].as_str().unwrap_or("");
+    let filtre = lignes_utiles_pour_un_rapport(brut, BUG_REPORT_LOG_LINES);
+    let log_text = filtre.trim();
     let log_source = logs_json["source"].as_str().unwrap_or("none");
+    let periode = periode_couverte(log_text)
+        .map(|p| format!(", {p}"))
+        .unwrap_or_default();
     md.push_str(&format!(
-        "\n## Recent Logs (last {BUG_REPORT_LOG_LINES} lines, source: {log_source})\n"
+        "\n## Recent Logs ({BUG_REPORT_LOG_LINES} dernières lignes INFO et au-dessus{periode}, source: {log_source} — le DEBUG est dans l'export complet)\n"
     ));
     if log_text.is_empty() {
         md.push_str("_No logs available._\n");
@@ -765,6 +1241,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "arch": std::env::consts::ARCH,
         "uptime_seconds": uptime_secs,
         "uptime": uptime_str,
+        "process_started_at": state.process_started_at_rfc3339(),
         "pid": std::process::id(),
         "rss_mb": rss_mb,
         "library": {
@@ -778,6 +1255,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "count": zone_count,
             "items": zones,
         },
+        "zone_settings_ignored": zone_settings_ignored,
+        "asio_warm_scan": asio_warm_scan,
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
@@ -952,6 +1431,68 @@ pub(super) async fn audio_check() -> Json<Value> {
     }))
 }
 
+pub(super) async fn asio_warm_scan_status() -> Json<Value> {
+    Json(json!(crate::startup::asio_warm_status()))
+}
+
+/// Retire uniquement le témoin qui interdit le prochain préchauffage.
+///
+/// La tentative attend le redémarrage : énumérer les pilotes ASIO à chaud peut
+/// faire planter le processus ou heurter une sortie qui possède déjà le DAC.
+pub(super) async fn rearm_asio_warm_scan(
+    _admin: crate::auth::RequireAdmin,
+) -> (StatusCode, Json<Value>) {
+    use crate::startup::AsioWarmRearm;
+
+    match crate::startup::rearm_asio_warm_scan() {
+        Ok(AsioWarmRearm::Rearmed) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "rearmed",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::AlreadyReady) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "already_ready",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::DisabledByEnv) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "asio_warm_scan_disabled_by_env",
+                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "asio_not_supported",
+                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "asio_warm_scan_rearm_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "asio_warm_scan_rearm_failed",
+                    "message": error,
+                    "asio_warm_scan": crate::startup::asio_warm_status(),
+                })),
+            )
+        }
+    }
+}
+
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1052,6 +1593,24 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "message": format!("Zone {} max latency {}ms", zone_id, m.max_latency_ms),
             }));
         }
+        // #2493 : l'appareil annonce toujours jouer alors que la position a
+        // atteint — ou depasse — la duree de la piste depuis une minute. Le
+        // sondeur ne coupe rien (une duree fausse produit la meme forme qu'une
+        // lecture bloquee), mais il refuse de laisser le diagnostic annoncer
+        // une lecture saine.
+        if m.lecture_au_dela_de_la_duree {
+            issues.push(json!({
+                "severity": "warning",
+                "type": "zone_playback_beyond_duration",
+                "zone_id": zone_id,
+                "message": format!(
+                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
+                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
+                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
+                     dans le journal."
+                ),
+            }));
+        }
     }
     drop(metrics);
 
@@ -1092,6 +1651,16 @@ pub(super) async fn api_docs() -> Json<Value> {
             "GET",
             "/system/api-docs",
             "This endpoint — API documentation",
+        ),
+        (
+            "GET",
+            "/system/audio/asio-warm-scan",
+            "ASIO startup scan fail-safe status",
+        ),
+        (
+            "POST",
+            "/system/audio/asio-warm-scan/rearm",
+            "Allow one ASIO startup scan on the next restart (admin)",
         ),
         ("GET", "/system/telemetry", "Telemetry snapshot (opt-in)"),
         ("POST", "/system/scan", "Trigger library scan"),
@@ -1302,5 +1871,441 @@ mod log_tail_tests {
         std::fs::write(&path, "a\nb\n").unwrap();
         let lines = read_log_tail(path.to_str().unwrap(), 1000, 1024).unwrap();
         assert_eq!(lines, ["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod tests_journal_rapport {
+    use super::{
+        horodatage_de_ligne, lignes_utiles_pour_un_rapport, niveau_de_ligne, periode_couverte,
+    };
+
+    /// Le cas mesuré : 160 sondes SSDP en DEBUG chassaient tout le reste.
+    #[test]
+    fn le_debug_bavard_ne_chasse_plus_ce_qui_compte() {
+        let mut journal = String::new();
+        for i in 0..160 {
+            journal.push_str(&format!(
+                "2026-08-17T15:22:15.003+02:00 DEBUG tune_core::discovery::ssdp: ssdp_unicast_probe_ok id=uuid:{i}\n"
+            ));
+        }
+        journal.push_str(
+            "2026-08-17T15:25:00.000+02:00  INFO tune_core::audio::embedding: audio_embedding_batch embedded=10\n",
+        );
+        journal.push_str(
+            "2026-08-17T15:25:01.000+02:00  WARN tune_core::audio::embedding: audio_embed_decode_failed track_id=42\n",
+        );
+
+        let garde = lignes_utiles_pour_un_rapport(&journal, 200);
+
+        assert!(
+            !garde.contains("ssdp_unicast_probe_ok"),
+            "le DEBUG bavard sort"
+        );
+        assert!(garde.contains("audio_embedding_batch"), "l'INFO reste");
+        assert!(garde.contains("audio_embed_decode_failed"), "le WARN reste");
+        assert_eq!(garde.lines().count(), 2);
+    }
+
+    /// La coupe se fait APRÈS le filtrage : on garde N lignes utiles, pas les
+    /// N dernières lignes du fichier.
+    #[test]
+    fn on_garde_les_dernieres_lignes_utiles() {
+        let mut journal = String::new();
+        for i in 0..10 {
+            journal.push_str(&format!("2026-08-17T10:00:0{i}Z  INFO m: utile-{i}\n"));
+            journal.push_str(&format!("2026-08-17T10:00:0{i}Z DEBUG m: bruit-{i}\n"));
+        }
+        let garde = lignes_utiles_pour_un_rapport(&journal, 3);
+        assert_eq!(garde.lines().count(), 3);
+        assert!(garde.contains("utile-9") && garde.contains("utile-7"));
+        assert!(!garde.contains("utile-6"), "seules les trois dernières");
+        assert!(!garde.contains("bruit"));
+    }
+
+    /// Une trace d'erreur suit sa ligne d'en-tête : la découper en deux
+    /// vaudrait moins que de la jeter entière.
+    #[test]
+    fn une_trace_suit_la_ligne_qui_la_porte() {
+        let journal = "2026-08-17T10:00:00Z ERROR m: panic\n    at src/lib.rs:12\n    at src/main.rs:3\n\
+                       2026-08-17T10:00:01Z DEBUG m: sonde\n    detail de la sonde\n";
+        let garde = lignes_utiles_pour_un_rapport(journal, 200);
+        assert!(
+            garde.contains("at src/lib.rs:12"),
+            "la trace de l'ERROR reste"
+        );
+        assert!(garde.contains("at src/main.rs:3"));
+        assert!(!garde.contains("detail de la sonde"), "celle du DEBUG part");
+    }
+
+    /// Un format inattendu ne doit pas vider le rapport : sans niveau
+    /// reconnu, on garde.
+    #[test]
+    fn un_journal_sans_niveau_reconnu_est_conserve() {
+        let journal = "ligne sans niveau\nune autre\n";
+        let garde = lignes_utiles_pour_un_rapport(journal, 200);
+        assert_eq!(garde.lines().count(), 2);
+    }
+
+    /// Le niveau se lit dans les premiers champs — pas au milieu du message,
+    /// sans quoi une ligne parlant de « DEBUG » serait jetée.
+    #[test]
+    fn le_mot_debug_dans_un_message_ne_compte_pas() {
+        assert_eq!(
+            niveau_de_ligne("2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique"),
+            Some("INFO")
+        );
+        assert_eq!(
+            niveau_de_ligne("2026-08-17T10:00:00Z DEBUG m: coucou"),
+            Some("DEBUG")
+        );
+        assert_eq!(niveau_de_ligne("    at src/lib.rs:12"), None);
+
+        let journal = "2026-08-17T10:00:00Z  INFO m: log_level=DEBUG applique\n";
+        assert!(lignes_utiles_pour_un_rapport(journal, 10).contains("log_level=DEBUG"));
+    }
+
+    #[test]
+    fn la_periode_couverte_est_annoncee() {
+        let j = "2026-08-20T09:03:15.059+02:00  INFO a: debut\n\
+                 2026-08-20T09:08:00.000+02:00  WARN a: milieu\n\
+                 2026-08-20T09:13:13.491+02:00  INFO a: fin\n";
+        assert_eq!(
+            periode_couverte(j).unwrap(),
+            "du 2026-08-20T09:03 au 2026-08-20T09:13"
+        );
+    }
+
+    #[test]
+    fn une_seule_minute_ne_sannonce_pas_comme_un_intervalle() {
+        let j = "2026-08-20T09:03:15.059+02:00  INFO a: seule\n";
+        assert_eq!(periode_couverte(j).unwrap(), "à 2026-08-20T09:03");
+        let deux = "2026-08-20T09:03:15.059+02:00  INFO a: une\n\
+                    2026-08-20T09:03:59.000+02:00  INFO a: deux\n";
+        assert_eq!(periode_couverte(deux).unwrap(), "à 2026-08-20T09:03");
+    }
+
+    #[test]
+    fn un_journal_sans_horodatage_ne_promet_aucune_periode() {
+        // Un format inattendu ne doit pas produire une période inventée : mieux
+        // vaut ne rien annoncer que d'annoncer faux.
+        assert!(periode_couverte("Tune Server 0.9.90 | windows\n=====\n").is_none());
+        assert!(periode_couverte("").is_none());
+        assert!(horodatage_de_ligne("    at src/lib.rs:12").is_none());
+        assert!(horodatage_de_ligne("2026-08-20 09:03:15 INFO a: espace au lieu de T").is_none());
+    }
+
+    /// Le cas qui a motivé #2028 : trois mille lignes qui ne couvrent que dix
+    /// minutes. Rien ne le disait, et l'en-tête laissait croire à un journal
+    /// représentatif.
+    #[test]
+    fn dix_minutes_de_scan_sannoncent_comme_dix_minutes() {
+        let mut j = String::new();
+        for i in 0..600 {
+            j.push_str(&format!(
+                "2026-08-20T09:{:02}:{:02}.000+02:00  INFO tune_server::scan_import: DIAG\n",
+                3 + i / 60,
+                i % 60
+            ));
+        }
+        assert_eq!(
+            periode_couverte(&j).unwrap(),
+            "du 2026-08-20T09:03 au 2026-08-20T09:12"
+        );
+    }
+}
+
+/// #1974 — l'export de journaux était noyé par la découverte SSDP.
+///
+/// Deux exports successifs de Bilou (fil forum 1479, 0.9.88 · Windows) :
+/// 529 puis **562 lignes de SSDP sur 1003**. Le second ne contenait AUCUNE
+/// ligne d'embedding, alors que l'analyse acoustique était l'objet même du
+/// signalement. Il avait fourni le bon fichier, au bon moment, et il était
+/// inexploitable.
+#[cfg(test)]
+mod selection_de_lignes {
+    use super::*;
+
+    fn ligne(module: &str, n: usize) -> String {
+        format!("2026-08-20T10:00:00.000+02:00  INFO {module}: message {n}")
+    }
+
+    /// Reproduit la proportion mesurée : 562 lignes de SSDP, une poignée du
+    /// sujet, et le reste réparti. Avant, la fenêtre de 1000 les avalait.
+    fn journal_de_bilou() -> Vec<String> {
+        let mut v = Vec::new();
+        // L'embedding écrit une ligne par lot — une toutes les quinze minutes.
+        // Elles sont donc ANCIENNES, et c'est précisément ce qui les
+        // condamnait : la troncature garde la fin.
+        for i in 0..4 {
+            v.push(ligne("tune_core::audio::embedding", i));
+        }
+        for i in 0..151 {
+            v.push(ligne("tune_core::metadata::matcher", i));
+        }
+        for i in 0..1400 {
+            v.push(ligne("tune_core::discovery::ssdp", i));
+        }
+        v
+    }
+
+    #[test]
+    fn le_module_est_lu_dans_la_ligne() {
+        assert_eq!(
+            module_de_la_ligne(&ligne("tune_core::discovery::ssdp", 1)),
+            Some("tune_core::discovery::ssdp")
+        );
+        // Une continuation de message multiligne, une trace de panique : pas de
+        // module, donc jamais écartée.
+        assert_eq!(module_de_la_ligne("    at src/main.rs:42"), None);
+        assert_eq!(module_de_la_ligne(""), None);
+        // Un mot isolé suivi de « : » n'est pas un module — sans l'exigence du
+        // `::`, un message commençant par « erreur: » compterait pour un module
+        // à lui tout seul et se ferait rationner.
+        assert_eq!(
+            module_de_la_ligne("2026-08-20T10:00:00.000+02:00  WARN erreur: ceci"),
+            None
+        );
+    }
+
+    #[test]
+    fn le_signalement_de_bilou_ne_disparait_plus() {
+        let (retenues, ecartees) = selectionner_lignes(journal_de_bilou(), 1000);
+
+        assert_eq!(retenues.len(), 1000, "la fenêtre doit rester pleine");
+
+        let compte = |m: &str| retenues.iter().filter(|l| l.contains(m)).count();
+        // LE point du ticket : les quatre lignes d'embedding survivent.
+        assert_eq!(
+            compte("audio::embedding"),
+            4,
+            "les lignes du sujet signalé ont de nouveau disparu"
+        );
+        // Et SSDP ne peut plus prendre plus du quart... en première passe.
+        // Il en reprend ensuite, faute d'autre chose à montrer — c'est voulu.
+        assert!(
+            compte("discovery::ssdp") < 1400,
+            "SSDP occupe encore toute la fenêtre"
+        );
+        assert!(!ecartees.is_empty(), "rien n'a été mis de côté ?");
+    }
+
+    /// La troncature simple est le point de comparaison : avec la même fenêtre,
+    /// elle perdait tout du sujet. Ce test échouerait sur l'ancien code.
+    #[test]
+    fn la_troncature_simple_perdait_tout() {
+        let journal = journal_de_bilou();
+        let ancienne: Vec<&String> = journal.iter().rev().take(1000).collect();
+        assert_eq!(
+            ancienne
+                .iter()
+                .filter(|l| l.contains("audio::embedding"))
+                .count(),
+            0,
+            "le journal d'essai ne reproduit pas le défaut : revoir les proportions"
+        );
+    }
+
+    /// Garde-fou de non-régression, et le plus important des trois : on ne rend
+    /// JAMAIS moins de lignes qu'avant. Sur une machine où seul SSDP parle, le
+    /// quota ne doit rien retirer — il n'y a rien d'autre à montrer.
+    #[test]
+    fn un_seul_module_bavard_reste_entier() {
+        let journal: Vec<String> = (0..3000)
+            .map(|i| ligne("tune_core::discovery::ssdp", i))
+            .collect();
+        let (retenues, ecartees) = selectionner_lignes(journal, 1000);
+        assert_eq!(retenues.len(), 1000);
+        assert!(
+            ecartees.is_empty(),
+            "des lignes ont été perdues alors qu'il n'y avait rien à leur préférer"
+        );
+    }
+
+    #[test]
+    fn l_ordre_chronologique_est_conserve() {
+        let mut journal = Vec::new();
+        for i in 0..50 {
+            journal.push(ligne("a::b", i));
+            journal.push(ligne("c::d", i));
+        }
+        let (retenues, _) = selectionner_lignes(journal.clone(), 40);
+        // Les retenues doivent apparaître dans le même ordre relatif que dans
+        // le journal : un export dont les lignes sont mélangées ne se lit pas.
+        let positions: Vec<usize> = retenues
+            .iter()
+            .map(|l| journal.iter().position(|j| j == l).unwrap())
+            .collect();
+        let mut triees = positions.clone();
+        triees.sort_unstable();
+        assert_eq!(positions, triees);
+    }
+
+    #[test]
+    fn moins_de_candidats_que_demande_rend_tout() {
+        let journal: Vec<String> = (0..10).map(|i| ligne("a::b", i)).collect();
+        let (retenues, ecartees) = selectionner_lignes(journal.clone(), 1000);
+        assert_eq!(retenues, journal);
+        assert!(ecartees.is_empty());
+    }
+
+    #[test]
+    fn une_fenetre_nulle_ne_panique_pas() {
+        let (retenues, _) = selectionner_lignes(journal_de_bilou(), 0);
+        assert!(retenues.is_empty());
+    }
+
+    // --- #2028, dernier volet : le rapport hérite du quota par module ---
+
+    fn ligne_de(module: &str, n: usize) -> String {
+        format!(
+            "2026-08-20T09:03:{:02}.000+02:00  INFO {module}: evenement n={n}",
+            n % 60
+        )
+    }
+
+    /// Le cœur du défaut : chez Bilou, 311 lignes de `scan_import` et 322 de
+    /// `metadata` ne laissaient AUCUNE ligne d'enrichissement dans le rapport
+    /// — alors que l'enrichissement était l'objet de son signalement.
+    #[test]
+    fn le_bavard_ne_chasse_plus_la_ligne_qui_compte_du_rapport() {
+        let mut journal = String::new();
+        for i in 0..311 {
+            journal.push_str(&ligne_de("tune_server::scan_import", i));
+            journal.push('\n');
+        }
+        for i in 0..322 {
+            journal.push_str(&ligne_de("tune_core::metadata", i));
+            journal.push('\n');
+        }
+        journal.push_str(
+            "2026-08-20T09:13:00.000+02:00  INFO tune_core::enrichment: batch_artist_mbid_match_started count=7837\n",
+        );
+
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert!(
+            rapport.contains("batch_artist_mbid_match_started"),
+            "la ligne rare doit survivre au vacarme"
+        );
+    }
+
+    /// Le décompte ne rapporte QUE le déplacement — ce que le quota a coûté à
+    /// d'autres — et pas le débordement de fenêtre, qui est son fonctionnement
+    /// normal. Il faut donc un vrai cas de sauvetage : un module ancien que le
+    /// bavard aurait entièrement chassé, et que le quota ramène.
+    #[test]
+    fn le_rapport_dit_ce_que_le_quota_a_deplace() {
+        let mut journal = String::new();
+        // Anciennes, et hors de la fenêtre simple : elles n'y seraient jamais.
+        for i in 0..50 {
+            journal.push_str(&ligne_de("tune_core::orchestrator", i));
+            journal.push('\n');
+        }
+        // Récentes, assez nombreuses pour remplir la fenêtre à elles seules.
+        for i in 0..300 {
+            journal.push_str(&ligne_de("tune_server::scan_import", i));
+            journal.push('\n');
+        }
+
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert!(
+            rapport.contains("tune_core::orchestrator"),
+            "le module ancien doit être sauvé par son quota"
+        );
+        assert!(rapport.contains("écartées du rapport"), "{rapport}");
+        assert!(
+            rapport.contains("tune_server::scan_import"),
+            "et c'est le bavard qui a cédé la place : {rapport}"
+        );
+        assert!(rapport.contains("export complet"), "{rapport}");
+    }
+
+    #[test]
+    fn un_journal_calme_traverse_le_rapport_sans_rien_perdre() {
+        // Le quota ne doit pas s'inviter là où personne ne monopolise rien :
+        // à taille égale, le rapport ne dit jamais moins qu'avant.
+        let mut journal = String::new();
+        for i in 0..20 {
+            journal.push_str(&ligne_de("tune_core::orchestrator", i));
+            journal.push('\n');
+        }
+        let rapport = lignes_utiles_pour_un_rapport(&journal, 200);
+        assert_eq!(rapport.lines().count(), 20);
+        assert!(!rapport.contains("écartées"), "rien à annoncer : {rapport}");
+    }
+
+    #[test]
+    fn le_niveau_filtre_toujours_avant_le_quota() {
+        // L'ordre compte : plafonner d'abord laisserait du DEBUG occuper un
+        // quota au détriment d'un WARN.
+        let journal = "2026-08-20T09:03:00.000+02:00 DEBUG tune_core::discovery::ssdp: sonde a=1\n\
+                       2026-08-20T09:03:01.000+02:00  WARN tune_core::outputs::bluos: add_rejected b=2\n";
+        let rapport = lignes_utiles_pour_un_rapport(journal, 200);
+        assert!(rapport.contains("add_rejected"));
+        assert!(!rapport.contains("sonde a=1"));
+    }
+}
+
+/// #2392 — la section « fournisseurs de sortie » du rapport de bogue.
+#[cfg(test)]
+mod fournisseurs_de_sortie {
+    use super::*;
+
+    /// #2392 : le rapport de bogue doit dire pourquoi un fournisseur payant est
+    /// inerte. C'est le canal qui aurait épargné au bêta-testeur du module
+    /// Diretta une réinstallation complète de son système d'exploitation.
+    #[test]
+    fn le_rapport_dit_quand_un_module_paye_est_inerte_faute_de_compte_lie() {
+        let instantane = serde_json::json!({
+            "account_linked": false,
+            "licensed_modules": [],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": {
+                    "code": "module_account_not_linked",
+                    "message": "link your Mozaiklabs account",
+                },
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: none"), "{md}");
+        assert!(
+            md.contains("diretta: **idle — module_account_not_linked**"),
+            "{md}"
+        );
+    }
+
+    /// Droit présent mais rien sur le réseau : l'autre cas, et il doit se lire
+    /// différemment — sinon on n'a fait que déplacer l'ambiguïté.
+    #[test]
+    fn le_rapport_distingue_un_module_actif_qui_ne_trouve_rien() {
+        let instantane = serde_json::json!({
+            "account_linked": true,
+            "licensed_modules": ["diretta"],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": null,
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(!md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: diretta"), "{md}");
+        assert!(md.contains("diretta: active, 0 device(s)"), "{md}");
+    }
+
+    /// Aucun fournisseur hors-arbre (le cas du binaire public, et l'état avant
+    /// la première passe) : pas de section du tout, pas de bruit.
+    #[test]
+    fn aucun_fournisseur_hors_arbre_najoute_aucune_section() {
+        assert_eq!(section_fournisseurs_de_sortie(&Value::Null), "");
+        assert_eq!(
+            section_fournisseurs_de_sortie(&serde_json::json!({ "providers": [] })),
+            ""
+        );
     }
 }
