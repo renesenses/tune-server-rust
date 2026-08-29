@@ -207,10 +207,11 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ("/system/scan/status", "/api/v1/system/scan/status"),
     ("/system/stats", "/api/v1/system/stats"),
     ("/system/youtube/status", "/api/v1/system/youtube/status"),
+    ("/zones", "/api/v1/zones"),
 ];
 
 #[tokio::test]
-async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
+async fn trente_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
@@ -220,6 +221,10 @@ async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     pistes
         .create(&piste_douteuse)
         .expect("piste temoin sans artiste ni album");
+    let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(etat.backend.clone());
+    zones
+        .create("Zone du contrat", Some("browser"), Some("browser-contract"))
+        .expect("zone temoin pour prouver le contrat de liste");
     let app = tune_server::routes::router(etat);
 
     for (route_contrat, chemin_reel) in VAGUE_INITIALE {

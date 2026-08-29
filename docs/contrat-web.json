@@ -530,6 +530,35 @@
       ]
     },
     {
+      "route": "/library/albums/{}/reidentify",
+      "methode": "POST",
+      "type": "ReidentifyResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "verdict",
+        "tracks_total"
+      ],
+      "champs_optionnels": [
+        "tracks_matched",
+        "tracks_unmatched",
+        "was_identified_before",
+        "previous_release_id",
+        "release_id",
+        "release_group_id",
+        "release_title",
+        "release_artist",
+        "release_date",
+        "release_country",
+        "release_disambiguation",
+        "match_score",
+        "fields_left_as_is",
+        "previous_identification_restored",
+        "searched_title",
+        "searched_artist"
+      ]
+    },
+    {
       "route": "/library/albums/{}/similar",
       "methode": "GET",
       "type": "Album",
@@ -1217,12 +1246,9 @@
       "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
-        "status",
-        "music_dirs"
+        "better"
       ],
-      "champs_optionnels": [
-        "full"
-      ]
+      "champs_optionnels": []
     },
     {
       "route": "/library/tracks/{}/credits",
@@ -1374,6 +1400,16 @@
       "liste": false,
       "champs_obligatoires": [
         "url"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/shares/{}",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "shares"
       ],
       "champs_optionnels": []
     },
@@ -1819,7 +1855,8 @@
         "title",
         "artist",
         "album",
-        "cover_url"
+        "cover_url",
+        "created_at"
       ]
     },
     {
@@ -2937,6 +2974,20 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/health",
+      "methode": "GET",
+      "type": "SystemHealth",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "components",
+        "version",
+        "server_name"
+      ]
+    },
+    {
       "route": "/system/health/alerts",
       "methode": "GET",
       "type": "HealthAlert",
@@ -3216,6 +3267,59 @@
     },
     {
       "route": "/zones",
+      "methode": "GET",
+      "type": "Zone",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "queue_position",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "aac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "dop_active",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones",
       "methode": "POST",
       "type": "Zone",
       "liste": false,
@@ -3442,22 +3546,28 @@
     {
       "route": "/zones/{}/audiophile",
       "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "enabled"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/zones/{}/audiophile",
-      "methode": "POST",
-      "type": "(en ligne)",
+      "type": "AudiophileModeState",
       "liste": false,
       "champs_obligatoires": [
         "enabled"
       ],
       "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
+        "applied_live"
+      ]
+    },
+    {
+      "route": "/zones/{}/audiophile",
+      "methode": "POST",
+      "type": "AudiophileModeState",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled"
+      ],
+      "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
         "applied_live"
       ]
     },
@@ -4045,11 +4155,6 @@
   ],
   "non_resolus": [
     {
-      "route": "/zones",
-      "type": "T>(url: string, options?: RequestInit): Promise<T> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n      ...entetesRelais(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    if (response.status === 402) {\n      // Ni le message du serveur ni le repli ne parlaient la langue de\n      // l'interface : `premium_guard.rs` compose le sien avec\n      // `feature.display_name()` — « Parametric EQ requires Tune Premium »,\n      // en anglais — et le repli etait du francais code en dur, montre tel\n      // quel a un anglophone. Les deux sont le meme defaut (#2419).\n      notifications.error(get(t)('premium.required'));\n      throw new Error('premium_required');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    } else {\n      // Surface actionable playback failures that callers would otherwise\n      // swallow (they fire play/next/resume without awaiting): a missing local\n      // file or a zone with no output device. Localised so it matches the UI.\n      const key = err.code ? PLAY_ERROR_KEYS[err.code] : undefined;\n      if (key) notifications.error(get(t)(key as any));\n    }\n    throw err;\n  }\n  const text = await response.text();\n  if (text.trimStart().startsWith('<!') || text.trimStart().toLowerCase().startsWith('<html')) {\n    throw new Error('Expected JSON but received HTML — check the endpoint URL');\n  }\n  // A 204, or any 2xx with an empty body, is a success with nothing to parse.\n  // Many mutating endpoints answer that way; treating it as a parse failure\n  // made successful writes surface as errors in the UI (the rating that saved\n  // fine but showed \"Erreur notation\").\n  if (response.status === 204 || text.trim() === '') {\n    return undefined as T;\n  }\n  try {\n    return JSON.parse(text) as T;\n  } catch {\n    throw new Error('Invalid JSON response');\n  }\n}\n\n/** Wrap a promise with a timeout — rejects with an Error after `ms` milliseconds. */\nexport function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);\n    promise.then(\n      (v) => { clearTimeout(timer); resolve(v); },\n      (e) => { clearTimeout(timer); reject(e); },\n    );\n  });\n}\n\nasync function fetchVoid(url: string, options?: RequestInit): Promise<void> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n      ...entetesRelais(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    }\n    throw err;\n  }\n}\n\n// --- Zones ---\n\nexport function getZones() {\n  return fetchJSON<Zone[]",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/devices/audio",
       "type": "any",
       "raison": "type non structurel"
@@ -4265,11 +4370,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/system/health",
-      "type": "FederatedSearchResult>(url).then(result => {\n    if (result.local) result.local.tracks = mapStreamingTracks(result.local.tracks);\n    if (result.services) {\n      for (const key of Object.keys(result.services)) {\n        result.services[key].tracks = mapStreamingTracks(result.services[key].tracks);\n        result.services[key].albums = mapStreamingAlbums(result.services[key].albums);\n        // The server's StreamTrack/StreamAlbum carry no `source` field, so a\n        // track played from global search had no source and did nothing\n        // (DEvir). Stamp the service key as the source so play/queue actions\n        // can route these streaming results.\n        for (const t of result.services[key].tracks ?? []) if (t && !t.source) t.source = key;\n        for (const a of result.services[key].albums ?? []) if (a && !a.source) a.source = key;\n      }\n    }\n    return result;\n  });\n}\n\n// --- System ---\n\nexport function getHealth() {\n  return fetchJSON<SystemHealth",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/system/config",
       "type": "any",
       "raison": "type non structurel"
@@ -4351,8 +4451,8 @@
     },
     {
       "route": "/playlist-manager/backups/{}",
-      "type": "PlaylistSnapshot[]>(url);\n}\n\nexport function getPlaylistSnapshot(id: number) {\n  return fetchJSON<SnapshotDetail",
-      "raison": "type non structurel"
+      "type": "SnapshotDetail",
+      "raison": "type introuvable dans les sources"
     },
     {
       "route": "/playlist-manager/links",
@@ -4406,7 +4506,7 @@
     },
     {
       "route": "/profiles/{}/favorites{}",
-      "type": "Array<{ item_type: string; item_id: number }>",
+      "type": "Array<{ item_type: string; item_id: number; created_at?: string | null }>",
       "raison": "type non structurel"
     },
     {
@@ -4427,11 +4527,6 @@
     {
       "route": "/network/shares",
       "type": "any[]",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/network/shares/{}",
-      "type": "any>(url);\n}\n\nexport function listHostShares(hostId: string) {\n  return fetchJSON<{ shares: string[] }",
       "raison": "type non structurel"
     },
     {
@@ -4751,7 +4846,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 232,
-    "appels_non_resolus": 141
+    "routes_cartographiees": 236,
+    "appels_non_resolus": 138
   }
 }
