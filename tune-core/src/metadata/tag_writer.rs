@@ -341,7 +341,7 @@ fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
 }
 
 /// Returns true if the file extension is not supported for tag writing.
-fn is_unsupported_format(file_path: &str) -> bool {
+pub(crate) fn is_unsupported_format(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -375,7 +375,7 @@ pub async fn write_metadata_to_file(
         .map_err(|e| format!("join: {e}"))?
 }
 
-fn write_metadata_to_file_sync(
+pub(crate) fn write_metadata_to_file_sync(
     file_path: &str,
     fields: &HashMap<String, String>,
 ) -> Result<WriteResult, String> {

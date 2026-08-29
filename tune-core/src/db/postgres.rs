@@ -95,6 +95,28 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             track_number BIGINT,\
             disc_number BIGINT\
         )",
+    // Registre des executions automatisees (#2080). La migration numerotee
+    // 039 le monte sur les bases qui suivent la piste numerotee — mais une
+    // base creee par l'assistant SQLite -> PostgreSQL porte
+    // `schema_version = 99` et ne rejoue JAMAIS les scripts numerotes. Sans
+    // cette entree, ces bases-la n'auraient pas la table, la route
+    // `/system/task-runs` rendrait une erreur SQL et chaque passe cablee
+    // ecrirait dans le vide. C'est exactement la derive documentee sur
+    // `lyrics_cache` dans `PG_FULL_SCHEMA`.
+    "CREATE TABLE IF NOT EXISTS task_runs (\
+            boot_id TEXT NOT NULL,\
+            task TEXT NOT NULL,\
+            seq BIGINT NOT NULL,\
+            started_at TEXT NOT NULL,\
+            finished_at TEXT,\
+            duration_ms BIGINT,\
+            outcome TEXT NOT NULL,\
+            items BIGINT,\
+            detail TEXT,\
+            PRIMARY KEY (boot_id, task, seq)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the

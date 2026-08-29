@@ -9473,6 +9473,13 @@ impl PlaybackOrchestrator {
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
     }
+    /// Consigne le constat « aucun onglet ne reçoit le son de cette zone »
+    /// (voir [`crate::playback::PlaybackManager::note_browser_unattended`]).
+    pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
+        self.playback
+            .note_browser_unattended(zone_id, unattended)
+            .await;
+    }
 
     /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
     pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
