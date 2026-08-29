@@ -11,26 +11,12 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Score de qualité comparable entre formats : `(sans_perte, débit)`.
-///
-/// Un sans-perte bat toujours un avec-perte ; à famille égale,
-/// `sample_rate × bit_depth` départage. Le DSD porte `bit_depth = 1` :
-/// DSD64 (2,8 M) bat le CD (0,7 M) et le 96/24 (2,3 M), mais s'incline
-/// devant le 192/24 (4,6 M) — arbitrage assumé, documenté, et testé.
-pub(crate) fn score_qualite(
-    format: Option<&str>,
-    sample_rate: Option<i64>,
-    bit_depth: Option<i64>,
-) -> (bool, i64) {
-    // La même liste que le filtre « Lossy » de la bibliothèque.
-    const AVEC_PERTE: [&str; 5] = ["mp3", "aac", "ogg", "opus", "wma"];
-    let sans_perte = format
-        .map(|f| !AVEC_PERTE.contains(&f.to_lowercase().as_str()))
-        .unwrap_or(false);
-    let sr = sample_rate.unwrap_or(44100).max(1);
-    let bd = bit_depth.unwrap_or(16).max(1);
-    (sans_perte, sr.saturating_mul(bd))
-}
+/// Le barème vit dans `tune-core` : le repli d'album — affichage ET file de
+/// lecture — s'en sert pour choisir laquelle de deux copies d'un morceau
+/// survit (#1362). Deux implémentations du même arbitrage finiraient par
+/// diverger, et l'écran proposerait une variante que la lecture n'irait pas
+/// chercher.
+pub(crate) use tune_core::library::quality::score_qualite;
 
 /// `GET /library/tracks/{id}/better-quality` — la meilleure variante d'une
 /// piste (même titre, même artiste, autre piste), ou `null`.
@@ -145,38 +131,19 @@ pub(super) async fn album_better_quality(
 mod tests {
     use super::score_qualite;
 
-    /// Un sans-perte bat toujours un avec-perte, même « hi-res lossy ».
+    /// L'arbitrage lui-même (sans-perte, résolution, DSD, égalité) est testé
+    /// là où il vit désormais — `tune_core::library::quality`. Ce qui se
+    /// vérifie ICI est que la route parle bien à ce barème-là, et pas à une
+    /// copie locale qui aurait recommencé à dériver.
     #[test]
-    fn le_sans_perte_bat_l_avec_perte() {
-        assert!(
-            score_qualite(Some("flac"), Some(44100), Some(16))
-                > score_qualite(Some("mp3"), Some(48000), Some(24))
+    fn la_route_utilise_le_bareme_de_tune_core() {
+        assert_eq!(
+            score_qualite(Some("flac"), Some(44100), Some(16)),
+            tune_core::library::quality::score_qualite(Some("flac"), Some(44100), Some(16))
         );
-    }
-
-    /// À famille égale, la résolution départage : 96/24 > 44.1/16.
-    #[test]
-    fn la_resolution_departage_les_sans_perte() {
         assert!(
-            score_qualite(Some("flac"), Some(96000), Some(24))
-                > score_qualite(Some("flac"), Some(44100), Some(16))
+            score_qualite(Some("aiff"), Some(44100), Some(16))
+                > score_qualite(Some("aac"), Some(48000), Some(24))
         );
-    }
-
-    /// DSD64 (2,8 M × 1 bit) bat le CD et le 96/24, s'incline devant 192/24 —
-    /// l'arbitrage documenté.
-    #[test]
-    fn le_dsd_est_arbitre_comme_documente() {
-        let dsd64 = score_qualite(Some("dsf"), Some(2_822_400), Some(1));
-        assert!(dsd64 > score_qualite(Some("flac"), Some(44100), Some(16)));
-        assert!(dsd64 > score_qualite(Some("flac"), Some(96000), Some(24)));
-        assert!(score_qualite(Some("flac"), Some(192_000), Some(24)) > dsd64);
-    }
-
-    /// Deux fichiers identiques : aucun n'est « meilleur ».
-    #[test]
-    fn a_egalite_rien_n_est_meilleur() {
-        let a = score_qualite(Some("flac"), Some(44100), Some(16));
-        assert!(!(a > a));
     }
 }
