@@ -11,6 +11,7 @@ use tune_core::db::favorite_facets_repo::FavoriteFacetsRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo;
+use tune_core::favorites_sort::TriFavoris;
 use tune_core::license::Feature;
 
 use crate::state::AppState;
@@ -37,9 +38,17 @@ struct FavoriteAction {
     item_id: i64,
 }
 
+/// `item_type` filtre, `sort`/`order` rangent (#2001).
+///
+/// Les deux derniers sont **facultatifs** : absents, la liste est rendue
+/// exactement comme avant (`ORDER BY created_at DESC`), et le code emprunte le
+/// même chemin qu'auparavant. `sort` accepte `added`, `title`, `artist`,
+/// `album` (et leurs équivalents français) ; `order` vaut `asc` par défaut.
 #[derive(Deserialize)]
 struct FavoritesQuery {
     item_type: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
 }
 
 /// Favori de FACETTE (#2442) : un label n'a pas d'identifiant entier, il est
@@ -297,9 +306,11 @@ async fn list_favorites(
     Query(q): Query<FavoritesQuery>,
 ) -> Json<Value> {
     let repo = ProfileRepo::with_backend(state.backend.clone());
-    let items = repo
-        .list_favorites(id, q.item_type.as_deref())
-        .unwrap_or_default();
+    let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        Some(tri) => repo.list_favorites_sorted(id, q.item_type.as_deref(), tri),
+        None => repo.list_favorites(id, q.item_type.as_deref()),
+    }
+    .unwrap_or_default();
     Json(json!(items))
 }
 
@@ -338,7 +349,11 @@ async fn list_streaming_favorites(
     Query(q): Query<FavoritesQuery>,
 ) -> Json<Value> {
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
-    let items = repo.list(id, q.item_type.as_deref()).unwrap_or_default();
+    let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        Some(tri) => repo.list_sorted(id, q.item_type.as_deref(), tri),
+        None => repo.list(id, q.item_type.as_deref()),
+    }
+    .unwrap_or_default();
     Json(json!(items))
 }
 
