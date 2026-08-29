@@ -140,10 +140,16 @@ pub(super) async fn upload_album_artwork(
     };
 
     let cache_dir = artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("album-upload-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444). Sous
+    // `artwork_hash("album-upload-{id}")`, remplacer la pochette gardait la
+    // même URL alors que la route sert `immutable, max-age=31536000` : les
+    // clients affichaient l'ancienne image pendant un an — et si l'extension
+    // changeait (`.png` après un `.jpg`), les deux fichiers coexistaient et
+    // `find_cached` servait l'ancien `.jpg` pour toujours. Une image
+    // différente obtient désormais forcément une adresse différente, et
+    // l'écriture passe par `save_to_cache` (extension canonique, #2567).
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),
@@ -879,6 +885,19 @@ mod tests_service_pochette {
             cas.len(),
             echecs
         );
+    }
+
+    /// Une entrée adressée par le CONTENU (#1444) — SHA-256, 64 hexdigits —
+    /// est servie exactement comme une entrée héritée en 32 : la route ne
+    /// distingue pas les deux formes.
+    #[tokio::test]
+    async fn une_entree_adressee_par_le_contenu_est_servie() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = tune_core::library::artwork::content_hash(b"NOUVELLE-POCHETTE");
+        assert_eq!(hash.len(), 64);
+        ecrire(cache.path(), &format!("{hash}.jpg"), b"NOUVELLE-POCHETTE");
+        let reponse = serve_artwork_from(cache.path(), &hash).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
     }
 
     /// Garde-fou : un condensat sans fichier reste un 404. Servir un octet de

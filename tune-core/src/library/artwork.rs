@@ -244,6 +244,33 @@ pub fn artwork_hash(file_path: &str) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Condensat de CONTENU d'une image : SHA-256 des octets, en hexadécimal.
+///
+/// Adressage par le contenu (#1444) : deux fichiers aux mêmes octets partagent
+/// une seule entrée de cache, quel que soit leur chemin. Les compilations
+/// éclatées façon Qobuz (#1440) — une jaquette identique recopiée dans N
+/// dossiers d'artiste — cessent ainsi de peupler le cache de N copies.
+///
+/// **Octets bruts, pas pixels décodés.** Mesuré le 29/08/2026 sur les deux
+/// bibliothèques de référence : décoder gagne 4 groupes sur 6 285 (.18) et
+/// 84 sur 7 600 (.15), normaliser en 256×256 en gagne zéro, et 11 fichiers de
+/// .15 sont illisibles par un décodeur — sous un schéma adressé par les pixels
+/// ils n'auraient plus d'adresse du tout. Le signal *perceptuel* (« même image
+/// malgré un ré-encodage ») existe séparément et reste où il est :
+/// [`crate::scanner::compilation::CoverFingerprint`], consommé par le
+/// regroupement des compilations.
+///
+/// 64 hexdigits : accepté tel quel par toutes les routes de lecture
+/// (`is_hex_hash` reconnaît 32 **et** 64 caractères, route HTTP comme
+/// `upnp_server::artwork_url`), donc aucune URL existante ne change de forme.
+pub fn content_hash(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     let client = crate::http::client::builder()
@@ -1456,17 +1483,25 @@ pub fn save_embedded_cover(
     cache_dir: &Path,
     cover: &(Vec<u8>, String),
 ) -> Option<String> {
-    let hash = artwork_hash(&audio_path.to_string_lossy());
-
-    // Already cached (from a previous scan or from get_or_extract): reuse it.
-    // La sonde interroge la MÊME liste que la route. Tant qu'elle ne regardait
-    // que `jpg`/`png`, une entrée héritée (`.jpeg`, `.JPG`, `.bmp`) passait pour
+    // Entrée héritée, adressée par le CHEMIN de la piste : la sonder d'abord
+    // garde les URL déjà distribuées valables (la route sert `immutable,
+    // max-age=31536000`) et évite tout travail sur un rescan. La sonde
+    // interroge la MÊME liste que la route. Tant qu'elle ne regardait que
+    // `jpg`/`png`, une entrée héritée (`.jpeg`, `.JPG`, `.bmp`) passait pour
     // absente et était réécrite à chaque passe (#2567).
-    if find_cached(cache_dir, &hash).is_some() {
-        return Some(hash);
+    let legacy = artwork_hash(&audio_path.to_string_lossy());
+    if find_cached(cache_dir, &legacy).is_some() {
+        return Some(legacy);
     }
 
     let (data, mime) = cover;
+    // Nouvelle écriture : adressée par le CONTENU (#1444). Mêmes octets dans
+    // N fichiers = une seule entrée, et un rescan retombe sur elle sans rien
+    // réécrire.
+    let hash = content_hash(data);
+    if find_cached(cache_dir, &hash).is_some() {
+        return Some(hash);
+    }
     let ext = if mime.contains("png") {
         "png"
     } else if mime.contains("bmp") {
@@ -1495,14 +1530,21 @@ pub fn save_embedded_cover(
 /// gagnait et se retrouvait attribuée à tout le répertoire (testeur, forum).
 pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let folder_cover = find_folder_cover(audio_path)?;
-    // Le hachage porte sur le CHEMIN DE LA POCHETTE, pas sur celui de la piste :
-    // toutes les pistes du dossier partagent ainsi la même entrée de cache au
-    // lieu d'en dupliquer une par fichier.
-    let hash = artwork_hash(&folder_cover.to_string_lossy());
+    // Entrée héritée, adressée par le CHEMIN de la pochette : la sonder
+    // d'abord garde les URL déjà distribuées valables et épargne la lecture du
+    // fichier sur un rescan.
+    let legacy = artwork_hash(&folder_cover.to_string_lossy());
+    if find_cached(cache_dir, &legacy).is_some() {
+        return Some(legacy);
+    }
+    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
+    // Nouvelle écriture : adressée par le CONTENU (#1444). La même `cover.jpg`
+    // recopiée dans N dossiers d'artiste (compilation éclatée façon Qobuz,
+    // #1440) ne peuple plus le cache que d'UNE entrée.
+    let hash = content_hash(&data);
     if find_cached(cache_dir, &hash).is_some() {
         return Some(hash);
     }
-    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
     let ext = folder_cover
         .extension()
         .and_then(|e| e.to_str())
@@ -1511,15 +1553,22 @@ pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> 
 }
 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
-    let hash = artwork_hash(&audio_path.to_string_lossy());
-
-    // Check if already cached — même liste que la route (#2567).
-    if find_cached(cache_dir, &hash).is_some() {
-        return Some(hash);
+    // Entrée héritée, adressée par le CHEMIN de la piste — même liste que la
+    // route (#2567). La sonder d'abord garde les URL déjà distribuées valables
+    // et évite de rouvrir le fichier audio sur un rescan.
+    let legacy = artwork_hash(&audio_path.to_string_lossy());
+    if find_cached(cache_dir, &legacy).is_some() {
+        return Some(legacy);
     }
 
-    // Try embedded cover art from the audio file tags
+    // Try embedded cover art from the audio file tags.
+    // Nouvelle écriture : adressée par le CONTENU (#1444) — la même jaquette
+    // intégrée à N pistes ne peuple le cache que d'UNE entrée.
     if let Some((data, mime)) = extract_cover_art(audio_path) {
+        let hash = content_hash(&data);
+        if find_cached(cache_dir, &hash).is_some() {
+            return Some(hash);
+        }
         let ext = if mime.contains("png") { "png" } else { "jpg" };
         if save_to_cache(&data, cache_dir, &hash, ext).is_some() {
             return Some(hash);
@@ -1531,10 +1580,17 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
         );
     }
 
-    // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.)
+    // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.).
+    // Ici l'ancien schéma hachait le chemin de la PISTE : chaque piste du
+    // dossier dupliquait la même pochette dans le cache. Le condensat de
+    // contenu les fait toutes converger vers une seule entrée.
     if let Some(folder_cover) = find_folder_cover(audio_path) {
         match std::fs::read(&*extended_path(&folder_cover)) {
             Ok(data) => {
+                let hash = content_hash(&data);
+                if find_cached(cache_dir, &hash).is_some() {
+                    return Some(hash);
+                }
                 let ext = folder_cover
                     .extension()
                     .and_then(|e| e.to_str())
@@ -1834,6 +1890,146 @@ mod tests {
             std::fs::read(cache.join(format!("{h1}.jpg"))).unwrap(),
             b"POCHETTE-DU-DOSSIER"
         );
+    }
+
+    fn nb_fichiers(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
+    }
+
+    /// Vecteur connu : SHA-256 de la chaîne vide. Le condensat de contenu doit
+    /// être exactement cela — 64 hexdigits, la forme que `is_hex_hash` accepte
+    /// déjà partout (routes HTTP et `upnp_server::artwork_url`).
+    #[test]
+    fn content_hash_est_un_sha256_hexadecimal() {
+        assert_eq!(
+            content_hash(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let h = content_hash(b"POCHETTE");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Le cas #1440/#1444 : une compilation éclatée façon Qobuz — la MÊME
+    /// jaquette recopiée dans N dossiers d'artiste. Adressée par le chemin,
+    /// chaque dossier fabriquait sa propre entrée de cache ; adressée par le
+    /// contenu, ils convergent tous vers UNE entrée.
+    #[test]
+    fn meme_octets_dans_deux_dossiers_une_seule_entree_de_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let jaquette = b"JAQUETTE-COMMUNE-DE-LA-COMPILATION";
+        let mut hashes = Vec::new();
+        for artiste in ["Corte Real", "Autre Artiste"] {
+            let dossier = dir.path().join(artiste).join("OUF L'anthologie");
+            std::fs::create_dir_all(&dossier).unwrap();
+            std::fs::write(dossier.join("cover.jpg"), jaquette).unwrap();
+            let piste = dossier.join("01 - Opium.flac");
+            std::fs::write(&piste, b"").unwrap();
+            hashes.push(folder_cover_hash(&piste, &dir.path().join("cache")).unwrap());
+        }
+        assert_eq!(hashes[0], hashes[1], "mêmes octets = même adresse");
+        assert_eq!(
+            nb_fichiers(&dir.path().join("cache")),
+            1,
+            "une seule entrée de cache pour N dossiers"
+        );
+    }
+
+    /// Deux jaquettes différentes ne partagent rien : adresses distinctes,
+    /// deux entrées.
+    #[test]
+    fn octets_differents_deux_entrees_distinctes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hashes = Vec::new();
+        for (nom, octets) in [("A", b"JAQUETTE-A".as_slice()), ("B", b"JAQUETTE-B")] {
+            let dossier = dir.path().join(nom);
+            std::fs::create_dir_all(&dossier).unwrap();
+            std::fs::write(dossier.join("cover.jpg"), octets).unwrap();
+            let piste = dossier.join("01.flac");
+            std::fs::write(&piste, b"").unwrap();
+            hashes.push(folder_cover_hash(&piste, &dir.path().join("cache")).unwrap());
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!(nb_fichiers(&dir.path().join("cache")), 2);
+    }
+
+    /// Un rescan ne duplique rien et rend la même adresse : le deuxième
+    /// passage retombe sur l'entrée de contenu écrite au premier.
+    #[test]
+    fn rescan_stable_meme_adresse_sans_duplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        std::fs::write(dossier.join("cover.jpg"), b"JAQUETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let h1 = folder_cover_hash(&piste, &cache).unwrap();
+        let h2 = folder_cover_hash(&piste, &cache).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(nb_fichiers(&cache), 1);
+    }
+
+    /// Un cache déjà constitué sous l'ancien schéma (condensat du CHEMIN de la
+    /// pochette) reste servi tel quel : la route sert `immutable,
+    /// max-age=31536000`, une URL distribuée doit rester valable. Le rescan ne
+    /// doit ni l'invalider ni écrire une entrée de contenu en doublon.
+    #[test]
+    fn entree_heritee_par_chemin_reste_servie_sans_doublon() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let pochette = dossier.join("cover.jpg");
+        std::fs::write(&pochette, b"JAQUETTE-HERITEE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        // Cache constitué par une version antérieure : entrée au condensat du
+        // chemin.
+        let legacy = artwork_hash(&pochette.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"JAQUETTE-HERITEE").unwrap();
+
+        let h = folder_cover_hash(&piste, &cache).unwrap();
+        assert_eq!(h, legacy, "l'adresse déjà distribuée est conservée");
+        assert_eq!(
+            nb_fichiers(&cache),
+            1,
+            "aucune entrée de contenu en doublon"
+        );
+    }
+
+    /// `save_embedded_cover` : la même jaquette intégrée à deux pistes
+    /// différentes ne peuple le cache que d'une entrée.
+    #[test]
+    fn pochette_integree_identique_partagee_entre_pistes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let cover = (b"JAQUETTE-INTEGREE".to_vec(), "image/jpeg".to_string());
+        let h1 = save_embedded_cover(Path::new("/musique/a/01.flac"), &cache, &cover).unwrap();
+        let h2 = save_embedded_cover(Path::new("/musique/b/02.flac"), &cache, &cover).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(nb_fichiers(&cache), 1);
+    }
+
+    /// `get_or_extract` sur des pistes sans tags : la pochette de dossier
+    /// n'est plus dupliquée par piste — l'ancien schéma hachait le chemin de
+    /// la PISTE et écrivait N copies des mêmes octets.
+    #[test]
+    fn get_or_extract_pochette_de_dossier_une_entree_pour_n_pistes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        std::fs::write(dossier.join("cover.jpg"), b"JAQUETTE-DOSSIER").unwrap();
+        let cache = dir.path().join("cache");
+        let mut hashes = Vec::new();
+        for nom in ["01.flac", "02.flac"] {
+            let piste = dossier.join(nom);
+            std::fs::write(&piste, b"").unwrap();
+            hashes.push(get_or_extract(&piste, &cache).unwrap());
+        }
+        assert_eq!(hashes[0], hashes[1]);
+        assert_eq!(nb_fichiers(&cache), 1);
     }
 
     /// Sans pochette dans le dossier, rien n'est inventé — l'appelant retombe

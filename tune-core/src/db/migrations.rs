@@ -1423,6 +1423,51 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started
 CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
 ",
     },
+    Migration {
+        version: 89,
+        name: "hidden_items",
+        // Masquer un album sans toucher aux fichiers (#1391, Jean-Luc Cassé).
+        //
+        // Pourquoi une TABLE et pas une colonne `albums.is_hidden` (ce que
+        // l'issue proposait, sur le modèle de `zones.is_hidden`) : une ligne
+        // `zones` n'est JAMAIS supprimée (son delete est un UPDATE), une ligne
+        // `albums` l'est en routine — purge post-scan, `delete_orphans`,
+        // fusion de doublons, « vider la bibliothèque ». Racine music déplacée
+        // → pistes purgées → album réinséré sous un nouveau rowid → drapeau
+        // perdu. C'est mot pour mot le défaut déjà payé par `favorites`
+        // (cœurs éteints, bug .18 v0.9.50, cf. `favorites_reconcile.rs`).
+        //
+        // On reprend donc la solution qui a réparé les favoris : une table de
+        // marqueurs SANS clé étrangère, portant un instantané d'identité
+        // (`item_name`/`item_artist`) figé au masquage, réconciliée au
+        // démarrage et après chaque scan (`hidden_repo::reconcile`). Le
+        // marqueur survit ainsi au rescan, au déplacement de bibliothèque et
+        // à la bascule SQLite → PostgreSQL.
+        //
+        // PAS DE COLONNE `id` : la clé naturelle (profil, type, item) EST la
+        // clé primaire — même choix que `favorite_facets` (85) et `task_runs`
+        // (88), pour éviter la divergence AUTOINCREMENT / BIGSERIAL que la
+        // bascule SQLite → PostgreSQL impose à toute colonne `id` (#1706).
+        //
+        // `item_type` est libre (`album` seul aujourd'hui) et `profile_id` est
+        // ÉCRIT (toujours 1) mais jamais LU par les filtres : le masquage est
+        // global maintenant, et passera par profil sans migration le jour où
+        // les vues bibliothèque connaîtront le profil.
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2904,6 +2949,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         40,
         "task_runs",
         include_str!("../../migrations/postgres/040_task_runs.sql"),
+    ),
+    // Albums masqués (#1391). Jumelle de la migration SQLite 89 — les deux
+    // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à
+    // tout le parc PostgreSQL et chaque vue bibliothèque y rendrait une
+    // erreur SQL (le filtre « pas masqué » la nomme).
+    (
+        41,
+        "hidden_items",
+        include_str!("../../migrations/postgres/041_hidden_items.sql"),
     ),
 ];
 

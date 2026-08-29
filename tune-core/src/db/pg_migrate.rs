@@ -154,6 +154,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
     "favorite_facets",
+    // Albums masqués (#1391). Sans cette ligne, les albums masqués
+    // réapparaîtraient tous à la bascule SQLite → PostgreSQL.
+    "hidden_items",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -511,6 +514,19 @@ CREATE TABLE IF NOT EXISTS favorites (
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
+
+-- Albums masqués (#1391). Tout en TEXT comme le reste de ce schéma (la copie
+-- lie chaque valeur en texte) ; la migration 041 ramène `profile_id` et
+-- `item_id` en BIGINT après coup, comme 038 pour `favorite_facets`.
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    item_type TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
 CREATE TABLE IF NOT EXISTS streaming_favorites (

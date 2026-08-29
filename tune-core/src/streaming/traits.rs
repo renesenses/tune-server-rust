@@ -23,6 +23,12 @@ pub struct StreamTrack {
     /// `#[serde(default)]` so older serialized results without the field still load.
     #[serde(default)]
     pub isrc: Option<String>,
+    /// Compositeur de la piste, quand le service l'expose (Qobuz : `composer.name`).
+    /// Champ propre : il ne sert JAMAIS de valeur d'« artist » — en classique,
+    /// compositeur ≠ interprète (#1407). `#[serde(default)]` comme `isrc`, pour
+    /// que les résultats sérialisés antérieurs se chargent encore.
+    #[serde(default)]
+    pub composer: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -395,6 +401,7 @@ mod tests {
             disc_number: Some(1),
             explicit: false,
             isrc: Some("USSM19900001".into()),
+            composer: None,
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: 96000,

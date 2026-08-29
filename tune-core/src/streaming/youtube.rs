@@ -1194,6 +1194,7 @@ impl YouTubeService {
             disc_number: None,
             explicit: false,
             isrc: None,
+            composer: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1328,6 +1329,7 @@ impl YouTubeService {
             disc_number: None,
             explicit: item["isExplicit"].as_bool().unwrap_or(false),
             isrc: None,
+            composer: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1521,6 +1523,7 @@ impl YouTubeService {
                         disc_number: None,
                         explicit: false,
                         isrc: None,
+                        composer: None,
                         quality: None,
                     });
                 }
@@ -1549,6 +1552,7 @@ impl YouTubeService {
                                 disc_number: None,
                                 explicit: false,
                                 isrc: None,
+                                composer: None,
                                 quality: None,
                             });
                         }
@@ -1642,6 +1646,7 @@ impl YouTubeService {
                             disc_number: None,
                             explicit: false,
                             isrc: None,
+                            composer: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -1846,6 +1851,7 @@ impl YouTubeService {
                 disc_number: None,
                 explicit: false,
                 isrc: None,
+                composer: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -1960,6 +1966,7 @@ impl YouTubeService {
                             disc_number: Some(1),
                             explicit: false,
                             isrc: None,
+                            composer: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -2266,6 +2273,7 @@ impl YouTubeService {
                 disc_number: None,
                 explicit: false,
                 isrc: None,
+                composer: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -2638,6 +2646,7 @@ impl StreamingService for YouTubeService {
             disc_number: None,
             explicit: false,
             isrc: None,
+            composer: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,

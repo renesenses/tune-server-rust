@@ -931,10 +931,12 @@ async fn set_radio_artwork(
     };
 
     let cache_dir = crate::routes::library::artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("radio-upload-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444) : sous
+    // `artwork_hash("radio-upload-{id}")`, remplacer le logo gardait la même
+    // URL servie `immutable` — l'ancienne image restait affichée. Voir le
+    // commentaire complet dans `library/artwork.rs::upload_album_artwork`.
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),

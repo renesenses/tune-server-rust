@@ -1151,6 +1151,11 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),
             "asio_available": tune_core::outputs::local::asio_available(),
+            // #1268 — la liste des backends que le sélecteur peut proposer,
+            // filtrée par la plateforme du SERVEUR. Le client l'écrivait en
+            // dur (Auto/WASAPI/ASIO), et des machines Debian/Fedora se
+            // voyaient offrir deux technologies Windows.
+            "supported_backends": tune_core::outputs::local::supported_backends(),
         }))
     }
     #[cfg(not(feature = "local-audio"))]
@@ -1160,6 +1165,7 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
             "devices": [],
             "backend": "none",
             "asio_available": false,
+            "supported_backends": [],
         }))
     }
 }

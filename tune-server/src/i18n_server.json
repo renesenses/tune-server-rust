@@ -1686,5 +1686,17 @@
     "ko": "스트림 주소에 공백이 들어 있습니다. 스트림 주소에는 공백이 없습니다. 붙여넣을 때 잘리지 않았는지 확인하세요.",
     "ro": "Adresa fluxului conține un spațiu, ceea ce nu se întâmplă niciodată la o adresă de flux. Verificați dacă nu a fost tăiată la lipire.",
     "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen."
+  },
+  "podcasts.radiofrance.cleAbsente": {
+    "fr": "La source Radio France nécessite une clé API. Renseignez le réglage « radiofrance_api_key » pour l'activer.",
+    "en": "The Radio France source requires an API key. Set the “radiofrance_api_key” setting to enable it.",
+    "de": "Die Radio-France-Quelle benötigt einen API-Schlüssel. Hinterlegen Sie die Einstellung „radiofrance_api_key“, um sie zu aktivieren.",
+    "es": "La fuente Radio France requiere una clave API. Configure el ajuste «radiofrance_api_key» para activarla.",
+    "it": "La sorgente Radio France richiede una chiave API. Impostare «radiofrance_api_key» per attivarla.",
+    "zh": "Radio France 源需要 API 密钥。请填写“radiofrance_api_key”设置以启用。",
+    "ja": "Radio France ソースには API キーが必要です。設定「radiofrance_api_key」を入力すると有効になります。",
+    "ko": "Radio France 소스를 사용하려면 API 키가 필요합니다. \"radiofrance_api_key\" 설정을 입력하면 활성화됩니다.",
+    "ro": "Sursa Radio France necesită o cheie API. Completați setarea „radiofrance_api_key” pentru a o activa.",
+    "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den."
   }
 }

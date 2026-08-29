@@ -365,10 +365,12 @@ pub(super) async fn artist_image_upload(
             .into_response();
     };
     let cache_dir = artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("artist-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444) : sous
+    // `artwork_hash("artist-{id}")`, remplacer l'image gardait la même URL
+    // servie `immutable` — l'ancienne image restait affichée. Voir le
+    // commentaire complet dans `artwork.rs::upload_album_artwork`.
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),
