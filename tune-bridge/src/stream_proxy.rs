@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::state::{PendingResponse, RelayState};
+use crate::state::{CorpsRelaye, PendingResponse, RelayState};
 
 pub async fn proxy_stream(
     State(state): State<Arc<RelayState>>,
@@ -67,21 +67,7 @@ pub async fn proxy_stream(
 
     // Wait for the relay.stream_start response with headers/status
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) => {
-            let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut response = Response::builder().status(status);
-
-            for (key, value) in &resp.headers {
-                if let Some(v) = value.as_str() {
-                    response = response.header(key.as_str(), v);
-                }
-            }
-
-            let body = resp.body.unwrap_or_default();
-            response
-                .body(Body::from(body))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
+        Ok(Ok(resp)) => reponse_relayee(resp),
         Ok(Err(_)) => {
             warn!(request_id = %request_id, "stream response channel dropped");
             StatusCode::BAD_GATEWAY.into_response()
@@ -94,4 +80,36 @@ pub async fn proxy_stream(
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
+}
+
+/// Batit la reponse HTTP a partir de ce que le serveur a renvoye.
+///
+/// Un flux audio ne peut pas etre mis en memoire avant d'etre rendu : le
+/// corps est cable directement sur le canal de morceaux, pour que le lecteur
+/// entende le debut du morceau pendant que la fin voyage encore.
+pub fn reponse_relayee(resp: PendingResponse) -> Response {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = Response::builder().status(status);
+
+    for (key, value) in &resp.headers {
+        if let Some(v) = value.as_str() {
+            response = response.header(key.as_str(), v);
+        }
+    }
+
+    let corps = match resp.body {
+        CorpsRelaye::Entier(body) => Body::from(body.unwrap_or_default()),
+        CorpsRelaye::Morceaux(reception) => {
+            let morceaux = futures_util::stream::unfold(reception, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|morceau| (Ok::<Vec<u8>, std::io::Error>(morceau), rx))
+            });
+            Body::from_stream(morceaux)
+        }
+    };
+
+    response
+        .body(corps)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

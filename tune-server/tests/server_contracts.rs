@@ -7,10 +7,14 @@
 mod annonce_forum_bornes;
 #[path = "auth_security.rs"]
 mod auth_security;
+#[path = "bios_langue_album.rs"]
+mod bios_langue_album;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "etiquettes_types_et_playlists.rs"]
+mod etiquettes_types_et_playlists;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_facettes_routes.rs"]
