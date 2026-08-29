@@ -770,37 +770,43 @@ fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
 /// Le chemin vit-il sur un montage RÉSEAU ?
 ///
 /// Décision par le type de système de fichiers du point de montage, lu dans
-/// `/proc/mounts` (Linux) ou via `statfs` (macOS). En cas de doute — type
+/// `/proc/mounts` (Linux/Android) ou via `statfs` (plateformes Apple). En cas de doute — type
 /// inconnu, lecture impossible — on répond `false` : ne pas copier est le
 /// choix le moins coûteux, le décodeur lira sur place.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
-            return false;
-        };
-        montage_reseau_depuis_mounts(&mounts, &chemin.to_string_lossy())
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    montage_reseau_depuis_mounts(&mounts, &chemin.to_string_lossy())
+}
+
+#[cfg(target_vendor = "apple")]
+fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
+    // Darwin : statfs donne le nom du système de fichiers.
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let Ok(c) = CString::new(chemin.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut st = MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // macOS : statfs donne le nom du système de fichiers.
-        use std::ffi::CString;
-        use std::mem::MaybeUninit;
-        let Ok(c) = CString::new(chemin.as_os_str().as_encoded_bytes()) else {
-            return false;
-        };
-        let mut st = MaybeUninit::<libc::statfs>::uninit();
-        if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
-            return false;
-        }
-        let st = unsafe { st.assume_init() };
-        let genre = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }
-            .to_string_lossy()
-            .to_lowercase();
-        const TYPES_RESEAU_MAC: &[&str] = &["nfs", "smbfs", "webdav", "afpfs", "cifs", "ftp", "9p"];
-        TYPES_RESEAU_MAC.iter().any(|t| genre == *t)
-    }
+    let st = unsafe { st.assume_init() };
+    let genre = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .to_lowercase();
+    const TYPES_RESEAU_MAC: &[&str] = &["nfs", "smbfs", "webdav", "afpfs", "cifs", "ftp", "9p"];
+    TYPES_RESEAU_MAC.iter().any(|t| genre == *t)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn chemin_sur_montage_reseau(_chemin: &Path) -> bool {
+    false
 }
 
 #[cfg(unix)]
