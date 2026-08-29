@@ -2739,6 +2739,37 @@ async fn create_zone(
                     .into_response();
             }
         }
+
+        // #1281 — même appareil physique, seconde identité SSDP (DLNA +
+        // OpenHome, ou deux UUID : buchardt A700). La découverte regroupe déjà
+        // par hôte (`zone_id_by_host`), mais CE chemin manuel ne dédoublonnait
+        // que par `output_device_id` exact : créer une zone depuis l'entrée
+        // jumelle du sélecteur produisait une deuxième zone pour le même
+        // renderer — « I tried creating a zone and it duplicates ». L'hôte
+        // vient du registre des sorties (rempli à la découverte) ; s'il porte
+        // déjà une zone visible, on la rend au lieu d'en créer une autre.
+        if is_dlna {
+            let host = { state.outputs.lock().await.host_of(device_id) };
+            if let Some(host) = host {
+                let repo = ZoneRepo::with_backend(state.backend.clone());
+                if let Some(existing_id) = repo.zone_id_by_host(&host) {
+                    let _ = repo.update_online(existing_id, true);
+                    // Même contrat client que les deux autres retours
+                    // anticipés (#2284) : l'état RÉEL de la zone.
+                    let v = crate::routes::playback::build_zone_json(&state, existing_id).await;
+                    state
+                        .event_bus
+                        .emit("zone.updated", json!({ "zone_id": existing_id }));
+                    info!(
+                        zone_id = existing_id,
+                        device_id,
+                        host = %host,
+                        "zone_same_host_already_exists_returning"
+                    );
+                    return (StatusCode::OK, Json(v)).into_response();
+                }
+            }
+        }
     }
 
     // Duplicate device assignment already handled above (early return)
@@ -5174,9 +5205,10 @@ mod contrat_des_retours_anticipes {
 
         assert_eq!(
             corps.matches("build_zone_json(").count(),
-            2,
-            "les DEUX retours anticipés doivent passer par le contrat client : \
-             zone déjà associée au device, et rattrapage après collision UNIQUE"
+            3,
+            "les TROIS retours anticipés doivent passer par le contrat client : \
+             zone déjà associée au device, zone du même hôte sous une autre \
+             identité SSDP (#1281), et rattrapage après collision UNIQUE"
         );
         assert!(
             !corps.contains("serde_json::to_value(z)"),
@@ -5221,5 +5253,61 @@ mod contrat_des_retours_anticipes {
                 "{champ} absent : le client garderait la valeur d'une autre zone"
             );
         }
+    }
+
+    /// #1281 — buchardt A700 : un appareil annoncé sous DEUX identités SSDP
+    /// (deux UUID, même hôte) apparaît deux fois dans le sélecteur. « I tried
+    /// creating a zone and it duplicates the zone output » : POST /zones avec
+    /// l'identité jumelle ne dédoublonnait que par `output_device_id` exact et
+    /// créait une deuxième zone pour le même renderer physique. Le regroupement
+    /// par hôte de la découverte doit s'appliquer ici aussi : la zone existante
+    /// est rendue (200), rien n'est créé.
+    #[tokio::test]
+    async fn poster_la_seconde_identite_ssdp_rend_la_zone_existante() {
+        use axum::response::IntoResponse;
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zid = repo
+            .create("buchardt A700", Some("dlna"), Some("uuid:a700-dlna"))
+            .unwrap();
+        // L'identité physique que la découverte persiste (#942/#1239).
+        repo.set_host(zid, "192.168.1.50").unwrap();
+
+        // La jumelle du même appareil, déjà enregistrée comme sortie par la
+        // découverte : même hôte, autre UUID.
+        {
+            let mut reg = state.outputs.lock().await;
+            reg.register(Box::new(tune_core::outputs::dlna::DlnaOutput::new(
+                "buchardt A700".into(),
+                "uuid:a700-oh".into(),
+                "192.168.1.50".into(),
+                "http://192.168.1.50:49152/av".into(),
+                "http://192.168.1.50:49152/rc".into(),
+                None,
+            )));
+        }
+
+        let resp = super::create_zone(
+            axum::extract::State(state.clone()),
+            axum::Json(super::CreateZone {
+                name: "buchardt A700".into(),
+                output_type: Some("dlna".into()),
+                output_device_id: Some("uuid:a700-oh".into()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "la zone existante du même hôte est rendue, pas créée (201)"
+        );
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "toujours une seule zone pour l'appareil physique"
+        );
     }
 }
