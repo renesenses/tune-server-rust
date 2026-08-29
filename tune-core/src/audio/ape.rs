@@ -832,10 +832,10 @@ mod tests {
     #[test]
     fn parse_ape_header_stereo_16bit_44100() {
         let data = build_ape_header(2000, 2, 44100, 16, 10, 73728, 12345);
-        let tmp = std::env::temp_dir().join("test_ape_header.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.version, 3990);
         assert_eq!(info.compression_level, 2000);
         assert_eq!(info.channels, 2);
@@ -847,36 +847,30 @@ mod tests {
 
         let expected_total = 9u64 * 73728 + 12345;
         assert_eq!(info.total_samples, expected_total);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn parse_ape_header_mono_24bit_96000() {
         let data = build_ape_header(1000, 1, 96000, 24, 5, 73728, 5000);
-        let tmp = std::env::temp_dir().join("test_ape_mono_24.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.channels, 1);
         assert_eq!(info.sample_rate, 96000);
         assert_eq!(info.bits_per_sample, 24);
         assert_eq!(info.compression_level, 1000);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn parse_ape_header_compression_levels() {
         for &comp in &[1000u16, 2000, 3000, 4000] {
             let data = build_ape_header(comp, 2, 44100, 16, 1, 73728, 1000);
-            let tmp = std::env::temp_dir().join(format!("test_ape_comp_{comp}.ape"));
-            std::fs::write(&tmp, &data).unwrap();
+            let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+            std::fs::write(tmp.path(), &data).unwrap();
 
-            let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+            let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
             assert_eq!(info.compression_level, comp);
-
-            std::fs::remove_file(&tmp).ok();
         }
     }
 
@@ -885,27 +879,23 @@ mod tests {
         let mut data = build_ape_header(2000, 2, 44100, 16, 1, 73728, 1000);
         // Overwrite version at offset 4 to 3970
         data[4..6].copy_from_slice(&3970u16.to_le_bytes());
-        let tmp = std::env::temp_dir().join("test_ape_old.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let result = parse_ape(tmp.to_str().unwrap());
+        let result = parse_ape(tmp.path().to_str().unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("3970"));
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn parse_ape_rejects_bad_magic() {
         let data = vec![0x00u8; 100];
-        let tmp = std::env::temp_dir().join("test_ape_bad_magic.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let result = parse_ape(tmp.to_str().unwrap());
+        let result = parse_ape(tmp.path().to_str().unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not an APE file"));
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
@@ -913,14 +903,12 @@ mod tests {
         let mut data = build_ape_header(2000, 2, 44100, 16, 1, 73728, 1000);
         // Overwrite channels at offset 52 + 18 = 70 to 5
         data[70..72].copy_from_slice(&5u16.to_le_bytes());
-        let tmp = std::env::temp_dir().join("test_ape_bad_channels.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let result = parse_ape(tmp.to_str().unwrap());
+        let result = parse_ape(tmp.path().to_str().unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("channel"));
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
@@ -928,56 +916,48 @@ mod tests {
         let mut data = build_ape_header(2000, 2, 44100, 16, 1, 73728, 1000);
         // Overwrite bits_per_sample at offset 52 + 16 = 68 to 32
         data[68..70].copy_from_slice(&32u16.to_le_bytes());
-        let tmp = std::env::temp_dir().join("test_ape_bad_bits.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let result = parse_ape(tmp.to_str().unwrap());
+        let result = parse_ape(tmp.path().to_str().unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("bit depth"));
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn total_samples_single_frame() {
         let data = build_ape_header(2000, 2, 44100, 16, 1, 73728, 5000);
-        let tmp = std::env::temp_dir().join("test_ape_single_frame.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         // Single frame: total_samples = final_frame_blocks only
         assert_eq!(info.total_samples, 5000);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn total_samples_zero_frames() {
         let data = build_ape_header(2000, 2, 44100, 16, 0, 73728, 0);
-        let tmp = std::env::temp_dir().join("test_ape_zero_frames.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.total_samples, 0);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
     fn duration_calculation() {
         let data = build_ape_header(2000, 2, 44100, 16, 10, 73728, 12345);
-        let tmp = std::env::temp_dir().join("test_ape_duration.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         let duration_s = info.total_samples as f64 / info.sample_rate as f64;
         // (9 * 73728 + 12345) / 44100 = 675897 / 44100 ≈ 15.32s
         assert!(
             duration_s > 15.0 && duration_s < 16.0,
             "expected ~15.3s, got {duration_s}"
         );
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
@@ -1023,14 +1003,12 @@ mod tests {
     #[test]
     fn seek_table_offset_calculation() {
         let data = build_ape_header(2000, 2, 44100, 16, 3, 73728, 1000);
-        let tmp = std::env::temp_dir().join("test_ape_seek_offset.ape");
-        std::fs::write(&tmp, &data).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".ape").tempfile().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
 
-        let info = parse_ape(tmp.to_str().unwrap()).unwrap();
+        let info = parse_ape(tmp.path().to_str().unwrap()).unwrap();
         // seek_table_offset = descriptor_bytes (52) + header_bytes (24) = 76
         assert_eq!(info.seek_table_offset, 76);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

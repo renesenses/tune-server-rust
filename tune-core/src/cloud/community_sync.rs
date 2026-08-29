@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::settings_repo::SettingsRepo;
 
 const COMMUNITY_API: &str = "https://mozaiklabs.fr/api/v1/community/library";
 
@@ -39,6 +41,39 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn request_deferred(backend: &Arc<dyn DbBackend>, scope: CloudScope) -> bool {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let Some(backoff) = rate_limit::active(&settings, scope) else {
+        return false;
+    };
+    warn!(
+        scope = backoff.scope,
+        until_epoch = backoff.until_epoch,
+        retry_after_seconds = backoff.retry_after_seconds,
+        "community_sync_deferred_rate_limit"
+    );
+    true
+}
+
+fn persist_rate_limit(
+    backend: &Arc<dyn DbBackend>,
+    scope: CloudScope,
+    response: &reqwest::Response,
+) {
+    if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return;
+    }
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Some(backoff) = rate_limit::defer_from_headers(&settings, scope, response.headers()) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "community_sync_rate_limit_persisted"
+        );
+    }
+}
+
 /// Push enriched tracks (those with a MusicBrainz recording ID) to
 /// mozaiklabs.fr so other Tune instances can benefit from the metadata.
 /// Returns the number of tracks stored server-side.
@@ -47,6 +82,9 @@ pub async fn sync_enriched_tracks(
     http_client: &reqwest::Client,
     instance_id: &str,
 ) -> Result<usize, String> {
+    if request_deferred(backend, CloudScope::CommunityTracks) {
+        return Ok(0);
+    }
     // Query tracks with musicbrainz_recording_id set
     let rows = backend
         .query_many(
@@ -100,6 +138,7 @@ pub async fn sync_enriched_tracks(
         .await
         .map_err(|e| format!("community sync: {e}"))?;
 
+    persist_rate_limit(backend, CloudScope::CommunityTracks, &resp);
     if !resp.status().is_success() {
         return Err(format!("community sync: HTTP {}", resp.status()));
     }
@@ -117,6 +156,9 @@ pub async fn pull_community_enrichments(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
 ) -> Result<usize, String> {
+    if request_deferred(backend, CloudScope::CommunityEnriched) {
+        return Ok(0);
+    }
     let resp = http_client
         .get(format!("{COMMUNITY_API}/enriched"))
         .timeout(std::time::Duration::from_secs(30))
@@ -124,6 +166,7 @@ pub async fn pull_community_enrichments(
         .await
         .map_err(|e| format!("community pull: {e}"))?;
 
+    persist_rate_limit(backend, CloudScope::CommunityEnriched, &resp);
     if !resp.status().is_success() {
         return Err(format!("community pull: HTTP {}", resp.status()));
     }
@@ -151,7 +194,8 @@ pub async fn pull_community_enrichments(
                  composer = COALESCE(composer, ?), \
                  label = COALESCE(label, ?), \
                  isrc = COALESCE(isrc, ?) \
-                 WHERE musicbrainz_recording_id = ? AND (genre IS NULL OR year IS NULL)",
+                 WHERE musicbrainz_recording_id = ? \
+                 AND (genre IS NULL OR year IS NULL OR composer IS NULL)",
                 &[
                     &genre as &dyn ToSqlValue,
                     &year as &dyn ToSqlValue,
@@ -186,6 +230,9 @@ pub async fn resolve_missing_mbids(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
 ) -> Result<usize, String> {
+    if request_deferred(backend, CloudScope::CommunityResolve) {
+        return Ok(0);
+    }
     // Local tracks lacking an MBID but with an artist + title to match on, that
     // we haven't attempted recently. The `mb_resolve_tried` sentinel (stamped
     // below for every attempted track) slides the window forward each cycle, so a
@@ -249,6 +296,7 @@ pub async fn resolve_missing_mbids(
         .await
         .map_err(|e| format!("community resolve: {e}"))?;
 
+    persist_rate_limit(backend, CloudScope::CommunityResolve, &resp);
     if !resp.status().is_success() {
         return Err(format!("community resolve: HTTP {}", resp.status()));
     }
@@ -315,6 +363,9 @@ pub async fn pull_community_extra(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
 ) -> Result<usize, String> {
+    if request_deferred(backend, CloudScope::CommunityExtraRead) {
+        return Ok(0);
+    }
     // Tracks with an MBID whose extra hasn't been synced recently. The sentinel
     // stores a fixed-width epoch string, so a lexical `>=` compare is chronological.
     let cutoff = now_epoch_secs()
@@ -362,6 +413,7 @@ pub async fn pull_community_extra(
         .await
         .map_err(|e| format!("community extra: {e}"))?;
 
+    persist_rate_limit(backend, CloudScope::CommunityExtraRead, &resp);
     if !resp.status().is_success() {
         return Err(format!("community extra: HTTP {}", resp.status()));
     }
@@ -431,6 +483,9 @@ pub async fn push_local_extra(
     http_client: &reqwest::Client,
     instance_id: &str,
 ) -> Result<usize, String> {
+    if request_deferred(backend, CloudScope::CommunityExtraWrite) {
+        return Ok(0);
+    }
     // Pristine candidates: MBID set, has at least one extra key, never pushed,
     // never pulled (so its extra is 100% the user's own tags).
     let key_list = EXTRA_KEYS
@@ -517,6 +572,7 @@ pub async fn push_local_extra(
         .await
         .map_err(|e| format!("community push extra: {e}"))?;
 
+    persist_rate_limit(backend, CloudScope::CommunityExtraWrite, &resp);
     if !resp.status().is_success() {
         return Err(format!("community push extra: HTTP {}", resp.status()));
     }

@@ -47,6 +47,7 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_DB_PATH` | tune.db | SQLite database path |
 | `TUNE_MUSIC_DIRS` | [] | Music directories (JSON array or comma-separated) |
 | `TUNE_AUTO_SCAN` | false | Scan library on startup |
+| `TUNE_SCAN_IO_CONCURRENCY` | *auto* | Parallel tag reads during a scan. Auto-detected from the storage: **4** on a spinning disk, **32** otherwise. Set it only to override that guess — a slow NAS may want less, a high-latency share more. Clamped to 1..=256. |
 | `TUNE_WEB_DIR` | web | Web client directory |
 | `TUNE_ARTWORK_DIR` | artwork_cache | Cover art cache |
 | `TUNE_INGEST_STAGING` | *(next to artwork cache)* | Where drag-and-dropped files are staged before import |

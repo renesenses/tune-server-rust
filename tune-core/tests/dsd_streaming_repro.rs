@@ -8,7 +8,7 @@
 //!
 //! CI-safe: only runs when TUNE_DSD_REAL_FILE points at an existing file.
 //!   TUNE_DSD_REAL_FILE="/path/to/file.dsf" cargo test -p tune-core \
-//!     --test dsd_streaming_repro -- --nocapture
+//!     --test integration_contracts dsd_streaming_repro:: -- --nocapture
 
 /// Drive the streaming decode exactly as playback does, at `out_bd` bits, and
 /// return (nonzero_samples, total_samples, peak_dbfs). `out_bd` is 32 for LOCAL

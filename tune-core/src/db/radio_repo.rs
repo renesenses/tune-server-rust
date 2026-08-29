@@ -24,6 +24,18 @@ pub mod sql {
         )
     }
 
+    /// Retrouver une station par l'URL exacte de son flux.
+    ///
+    /// `(name, url)` porte la contrainte d'unicité, pas `url` seule : deux
+    /// lignes peuvent partager un flux sous deux noms. `ORDER BY id` rend donc
+    /// le résultat déterministe plutôt que dépendant du plan de requête.
+    pub fn get_by_url<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM radio_stations WHERE url = {} ORDER BY id LIMIT 1",
+            d.placeholder(1)
+        )
+    }
+
     pub fn list_all() -> String {
         format!("SELECT {COLS} FROM radio_stations ORDER BY is_favorite DESC, LOWER(name)")
     }
@@ -159,6 +171,14 @@ impl RadioRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
     }
 
+    /// Retrouver une station par l'URL exacte de son flux — c'est ce que le
+    /// now-playing d'une radio porte dans `source_id` (#2421).
+    pub fn get_by_url(&self, url: &str) -> Result<Option<RadioStation>, String> {
+        let sql = self.dialect_sql(sql::get_by_url, sql::get_by_url);
+        let params: [&dyn ToSqlValue; 1] = [&url];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
+    }
+
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
         let rows = self.db.query_many(&sql::list_all(), &[])?;
         Ok(rows.iter().map(row_to_radio).collect())
@@ -200,10 +220,26 @@ impl RadioRepo {
         self.db.execute(&sql, &params)?;
         Ok(())
     }
+}
 
+/// L'instant present en ISO-8601 UTC, **marqueur de fuseau compris**.
+///
+/// La forme compte autant que la valeur : sans le `Z` final, un client
+/// JavaScript interprete la chaine comme une heure LOCALE et n'applique aucune
+/// conversion. C'est ce qui faisait afficher les favoris radio deux heures en
+/// avance l'ete (Reivax66, fil forum #1515).
+///
+/// Publique parce que `tune-server` en a besoin et n'a pas `chrono` : une
+/// dependance de plus pour une ligne serait payer cher un format qui doit de
+/// toute facon rester le MEME des deux cotes.
+pub fn maintenant_iso8601() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+impl RadioRepo {
     pub fn record_play(&self, id: i64) -> Result<(), String> {
         let sql = self.dialect_sql(sql::record_play, sql::record_play);
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let now = maintenant_iso8601();
         let params: [&dyn ToSqlValue; 2] = [&now, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -462,6 +498,22 @@ mod tests {
     }
 
     #[test]
+    /// La FORME de l'horodatage est ce qui compte : sans le `Z`, un client
+    /// JavaScript lit la chaine comme une heure locale et n'applique aucune
+    /// conversion — l'ecran affichait deux heures d'avance l'ete (#1515).
+    #[test]
+    fn l_horodatage_porte_toujours_son_fuseau() {
+        let h = maintenant_iso8601();
+        assert!(h.ends_with('Z'), "le marqueur UTC manque : {h}");
+        assert_eq!(h.len(), 20, "forme attendue AAAA-MM-JJTHH:MM:SSZ : {h}");
+        assert_eq!(h.as_bytes()[10], b'T', "un T, pas une espace : {h}");
+        // Et c'est bien une date que `chrono` sait relire.
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&h).is_ok(),
+            "pas un RFC 3339 valide : {h}"
+        );
+    }
+
     fn radio_favorites_empty() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();

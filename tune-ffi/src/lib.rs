@@ -24,6 +24,28 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 // never replace the sender and restart would be broken.
 static SHUTDOWN_TX: Mutex<Option<tokio::sync::watch::Sender<bool>>> = Mutex::new(None);
 
+/// Barriere d'ABI : une panique ne doit JAMAIS franchir un `extern "C"`.
+///
+/// Tant que le profil release portait `panic = "abort"`, la question ne se
+/// posait pas — toute panique tuait le processus, ici comme ailleurs. En
+/// repassant a `panic = "unwind"` (#2305), une panique qui traverse une
+/// frontiere `extern "C"` fait avorter le processus : c'est la regle de Rust,
+/// et c'est le pire des deux mondes pour l'hote Flutter ou Swift, qui perd
+/// l'application entiere sans diagnostic.
+///
+/// Chaque entree convertit donc la panique en sa valeur d'echec documentee.
+/// Le hook global de `bootstrap.rs` a deja ecrit `tune-crash.log` au moment de
+/// la panique : on ne rejournalise pas la pile, seulement l'entree franchie.
+fn barriere_abi<T>(entree: &'static str, valeur_si_panique: T, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(valeur) => valeur,
+        Err(_) => {
+            tracing::error!(entree, "tune_ffi_panique_interceptee");
+            valeur_si_panique
+        }
+    }
+}
+
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -46,6 +68,17 @@ fn get_runtime() -> &'static Runtime {
 /// Returns 0 on success, -1 if already running, -2 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn tune_server_start(
+    port: u16,
+    db_path: *const c_char,
+    music_dirs_json: *const c_char,
+    web_dir: *const c_char,
+) -> i32 {
+    barriere_abi("tune_server_start", -2, || {
+        demarrer(port, db_path, music_dirs_json, web_dir)
+    })
+}
+
+fn demarrer(
     port: u16,
     db_path: *const c_char,
     music_dirs_json: *const c_char,
@@ -132,48 +165,65 @@ pub extern "C" fn tune_server_start(
 /// Returns 0 on success, -1 if not running.
 #[unsafe(no_mangle)]
 pub extern "C" fn tune_server_stop() -> i32 {
-    if !RUNNING.load(Ordering::SeqCst) {
-        return -1;
-    }
-    // Take the sender so it is cleared for the next start/stop cycle.
-    if let Ok(mut guard) = SHUTDOWN_TX.lock() {
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(true);
+    barriere_abi("tune_server_stop", -2, || {
+        if !RUNNING.load(Ordering::SeqCst) {
+            return -1;
         }
-    }
-    0
+        // Take the sender so it is cleared for the next start/stop cycle.
+        if let Ok(mut guard) = SHUTDOWN_TX.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(true);
+            }
+        }
+        0
+    })
 }
 
 /// Returns a JSON string with the server status.
 /// Caller must free the returned string with `tune_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn tune_server_status() -> *mut c_char {
-    let running = RUNNING.load(Ordering::SeqCst);
-    let json = serde_json::json!({
-        "running": running,
-        "version": tune_core::version(),
-        "engine": "rust",
-    });
-    let s = CString::new(json.to_string()).unwrap_or_default();
-    s.into_raw()
+    barriere_abi("tune_server_status", std::ptr::null_mut(), || {
+        let running = RUNNING.load(Ordering::SeqCst);
+        let json = serde_json::json!({
+            "running": running,
+            "version": tune_core::version(),
+            "engine": "rust",
+        });
+        let s = CString::new(json.to_string()).unwrap_or_default();
+        s.into_raw()
+    })
 }
 
 /// Returns the Tune server version string.
 /// Caller must free the returned string with `tune_free_string`.
 #[unsafe(no_mangle)]
 pub extern "C" fn tune_server_version() -> *mut c_char {
-    let s = CString::new(tune_core::version()).unwrap_or_default();
-    s.into_raw()
+    barriere_abi("tune_server_version", std::ptr::null_mut(), || {
+        let s = CString::new(tune_core::version()).unwrap_or_default();
+        s.into_raw()
+    })
 }
 
 /// Free a string previously returned by this library.
+///
+/// # Contrat
+/// `ptr` doit provenir de `tune_server_status` ou `tune_server_version`, et
+/// n'etre libere qu'une fois. C'est un contrat d'API C : `unsafe` n'a aucune
+/// signification pour l'appelant Swift ou Dart, et marquer la fonction
+/// `unsafe extern "C"` changerait la signature vue des liaisons existantes sans
+/// rien apporter cote hote. Le lint est donc leve ICI, avec sa raison, plutot
+/// que globalement.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn tune_free_string(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        unsafe {
-            let _ = CString::from_raw(ptr);
+    barriere_abi("tune_free_string", (), || {
+        if !ptr.is_null() {
+            unsafe {
+                let _ = CString::from_raw(ptr);
+            }
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

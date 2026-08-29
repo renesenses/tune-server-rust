@@ -19,6 +19,12 @@ mod tags;
 pub(crate) mod update;
 mod youtube;
 
+/// Nom convivial de cette machine (#2110). Réexporté ici parce que trois
+/// endroits doivent répondre la même chose à « quel serveur est-ce ? » :
+/// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
+/// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
+pub(crate) use config::resolve_server_name;
+
 use axum::Router;
 use axum::routing::{get, post};
 
@@ -56,7 +62,11 @@ pub fn router() -> Router<AppState> {
         .route("/scan/report", get(scan::scan_report))
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
+        // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit
+        // que leur present (#2080). Survit au redemarrage, borne en taille.
+        .route("/task-runs", get(diagnostics::task_runs))
         .route("/restart", post(config::restart))
+        .route("/stop", post(config::stop))
         .route("/database/status", get(database::database_status))
         .route("/database/optimize", post(database::database_optimize))
         .route("/database/rebuild-fts", post(database::rebuild_fts))
@@ -66,6 +76,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
+        .route("/music-dirs/orphans", get(config::orphan_tracks))
+        .route(
+            "/music-dirs/purge-orphans",
+            post(config::purge_orphan_tracks),
+        )
         .route("/browse-dirs", get(config::browse_dirs))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
@@ -152,6 +167,14 @@ pub fn router() -> Router<AppState> {
         .route("/bug-report", get(diagnostics::generate_bug_report))
         .route("/audio-check", get(diagnostics::audio_check))
         .route("/audio/asio-devices", get(diagnostics::asio_devices))
+        .route(
+            "/audio/asio-warm-scan",
+            get(diagnostics::asio_warm_scan_status),
+        )
+        .route(
+            "/audio/asio-warm-scan/rearm",
+            post(diagnostics::rearm_asio_warm_scan),
+        )
         .route(
             "/telemetry",
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),
@@ -296,7 +319,9 @@ async fn recommendations_generate_handler(
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.
-fn get_music_dirs_list(db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<String> {
+pub(crate) fn get_music_dirs_list(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<String> {
     SettingsRepo::with_backend(db.clone())
         .get("music_dirs")
         .ok()

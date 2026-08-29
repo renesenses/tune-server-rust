@@ -1,15 +1,28 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use super::traits::StreamingService;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
+/// `RwLock` et non `Mutex` : les lectures peuvent se faire en parallele.
+///
+/// Le `Mutex` donnait une exclusivite que les lectures ne peuvent PAS utiliser
+/// — toutes les methodes de lecture du trait sont en `&self`, elles n'ont aucun
+/// moyen de muter quoi que ce soit, meme seules. Elles se serialisaient donc
+/// mutuellement sans contrepartie : la page decouverte tire sept requetes
+/// editoriales, qui faisaient la queue une par une derriere ce verrou (#1969,
+/// lot 6 de #1621).
+///
+/// Les huit methodes en `&mut self` — `refresh_if_needed`, `logout`,
+/// `set_enabled`, les favoris… — prennent `.write()`. Le compilateur le fait
+/// respecter : une methode `&mut self` NE COMPILE PAS sous un garde de lecture.
+/// Il n'y a donc pas de cas silencieusement faux.
 pub struct ServiceRegistry {
-    services: HashMap<String, Arc<Mutex<Box<dyn StreamingService>>>>,
+    services: HashMap<String, Arc<RwLock<Box<dyn StreamingService>>>>,
 }
 
 impl Default for ServiceRegistry {
@@ -27,10 +40,10 @@ impl ServiceRegistry {
 
     pub fn register(&mut self, service: Box<dyn StreamingService>) {
         let name = service.name().to_string();
-        self.services.insert(name, Arc::new(Mutex::new(service)));
+        self.services.insert(name, Arc::new(RwLock::new(service)));
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<Mutex<Box<dyn StreamingService>>>> {
+    pub fn get(&self, name: &str) -> Option<Arc<RwLock<Box<dyn StreamingService>>>> {
         self.services.get(name).cloned()
     }
 
@@ -41,7 +54,7 @@ impl ServiceRegistry {
     pub async fn status_all(&self) -> Vec<serde_json::Value> {
         let mut results = Vec::new();
         for (name, svc) in &self.services {
-            let svc = svc.lock().await;
+            let svc = svc.read().await;
             let status = svc.auth_status().await;
             results.push(serde_json::json!({
                 "name": name,
@@ -57,7 +70,7 @@ impl ServiceRegistry {
     pub async fn save_all_tokens(&self, db: &Arc<dyn DbBackend>) {
         let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
-            let svc = svc.lock().await;
+            let svc = svc.read().await;
             if let Some(tokens) = svc.save_tokens() {
                 let key = format!("auth_tokens_{name}");
                 settings.set(&key, &tokens.to_string()).ok();
@@ -76,7 +89,7 @@ impl ServiceRegistry {
             .services
             .get(service_name)
             .ok_or_else(|| format!("service not found: {service_name}"))?;
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let stream_url = svc.get_track_url(track_id, quality).await?;
         Ok(stream_url.url)
     }
@@ -90,7 +103,7 @@ impl ServiceRegistry {
             .services
             .get(service_name)
             .ok_or_else(|| format!("service not found: {service_name}"))?;
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = svc.get_album_tracks(album_id).await?;
         Ok(tracks
             .iter()
@@ -114,7 +127,7 @@ impl ServiceRegistry {
             .services
             .get(service_name)
             .ok_or_else(|| format!("service not found: {service_name}"))?;
-        let svc = svc.lock().await;
+        let svc = svc.read().await;
         let tracks = svc.get_playlist_tracks(playlist_id).await?;
         Ok(tracks
             .iter()
@@ -135,7 +148,7 @@ impl ServiceRegistry {
             // Restore enabled/disabled state
             let enabled_key = format!("streaming_{name}_enabled");
             if let Some(val) = settings.get(&enabled_key).ok().flatten() {
-                let mut svc_locked = svc.lock().await;
+                let mut svc_locked = svc.write().await;
                 match val.as_str() {
                     "true" => svc_locked.set_enabled(true),
                     "false" => svc_locked.set_enabled(false),
@@ -149,7 +162,7 @@ impl ServiceRegistry {
             if let Some(json_str) = settings.get(&key).ok().flatten()
                 && let Ok(tokens) = serde_json::from_str(&json_str)
             {
-                let mut svc = svc.lock().await;
+                let mut svc = svc.write().await;
                 if svc.restore_tokens(&tokens) {
                     info!(service = %name, "tokens_restored");
                     // A row in a superseded shape (today: the Qobuz plaintext

@@ -186,8 +186,48 @@ pub trait StreamingService: Send + Sync {
         let _ = artist_id;
         Ok(vec![])
     }
+    /// Une PAGE de la discographie, pour un « voir plus ».
+    ///
+    /// Ajoutée à côté de [`Self::get_artist_albums`] plutôt qu'en remplacement :
+    /// six services l'implémentent, et tous ne savent pas paginer. Le repli par
+    /// défaut rend la liste unique à `offset = 0` et **rien** au-delà — ce qui
+    /// arrête proprement le « voir plus » au lieu de renvoyer indéfiniment la
+    /// même première page.
+    ///
+    /// Un service qui sait paginer surcharge cette méthode ; les autres n'ont
+    /// rien à changer et ne régressent pas.
+    async fn get_artist_albums_page(
+        &self,
+        artist_id: &str,
+        offset: u32,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        if offset == 0 {
+            self.get_artist_albums(artist_id).await
+        } else {
+            Ok(vec![])
+        }
+    }
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let _ = artist_id;
+        Ok(vec![])
+    }
+    /// Artistes similaires SELON LE SERVICE, pour la radio d'autoplay (#1553).
+    ///
+    /// Jusqu'ici « qui ressemble à qui » n'avait qu'une seule reponse possible :
+    /// l'API d'enrichissement mozaiklabs, interrogeable par MBID seulement.
+    /// Or ~10 % des artistes en ont un, et une piste Qobuz n'en transporte
+    /// aucun : la radio streaming n'avait donc jamais de candidats, et la file
+    /// s'arretait en silence (Sandro, 0.9.75).
+    ///
+    /// Le service qui diffuse la piste connait, lui, son propre catalogue.
+    /// Defaut vide : un service sans notion de similarite ne bloque rien, le
+    /// couple appelant/repli reste responsable de la suite.
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let _ = (artist_id, limit);
         Ok(vec![])
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;

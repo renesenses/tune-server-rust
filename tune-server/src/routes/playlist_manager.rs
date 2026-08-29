@@ -115,7 +115,7 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let write = if let Some(svc) = registry.get(name) {
-            svc.lock().await.supports_write()
+            svc.read().await.supports_write()
         } else {
             false
         };
@@ -206,7 +206,7 @@ async fn transfer_playlist(
         };
         drop(registry);
 
-        let svc = svc_arc.lock().await;
+        let svc = svc_arc.read().await;
         let playlist_tracks = match svc.get_playlist_tracks(&body.source_playlist_id).await {
             Ok(tracks) => tracks,
             Err(e) => {
@@ -304,7 +304,7 @@ async fn transfer_playlist(
             };
             drop(registry);
 
-            let svc = svc_arc.lock().await;
+            let svc = svc_arc.read().await;
             let query = if artist.is_empty() {
                 title.to_string()
             } else {
@@ -371,7 +371,7 @@ async fn transfer_playlist(
                 let registry = state.services.lock().await;
                 if let Some(svc_arc) = registry.get(&body.target_service) {
                     drop(registry);
-                    let svc = svc_arc.lock().await;
+                    let svc = svc_arc.read().await;
                     match svc
                         .create_playlist(&target_name, Some("Created by Tune"))
                         .await
@@ -477,7 +477,7 @@ async fn batch_transfer(
     };
     drop(registry);
 
-    let svc = svc_arc.lock().await;
+    let svc = svc_arc.read().await;
     let all_playlists = svc.get_user_playlists().await.unwrap_or_default();
     drop(svc);
 
@@ -687,7 +687,7 @@ async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl I
     };
     drop(registry);
 
-    let svc = svc_arc.lock().await;
+    let svc = svc_arc.read().await;
     let remote_tracks = svc
         .get_playlist_tracks(&service_playlist_id)
         .await
@@ -837,7 +837,7 @@ async fn backup_playlists(
             };
             drop(registry);
 
-            let svc = svc_arc.lock().await;
+            let svc = svc_arc.read().await;
             let playlists = svc.get_user_playlists().await.unwrap_or_default();
             for pl in &playlists {
                 let pl_name = &pl.name;
@@ -1194,7 +1194,7 @@ async fn export_playlists(
         };
         drop(registry);
 
-        let svc = svc_arc.lock().await;
+        let svc = svc_arc.read().await;
         let name = svc
             .get_user_playlists()
             .await

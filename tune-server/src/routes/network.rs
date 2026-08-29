@@ -7,8 +7,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
+use tracing::{info, warn};
 
 use crate::error::AppError;
+use crate::smb;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -51,6 +53,7 @@ pub fn router() -> Router<AppState> {
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
+        .route("/media-servers/{id}/search", get(search_media_server))
         .route(
             "/media-servers/{id}/item/{item_id}/stream-url",
             get(media_server_stream_url),
@@ -84,12 +87,53 @@ async fn list_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppEr
     Ok(Json(json!(items)))
 }
 
+/// L'identite d'un montage : le quadruplet que l'index unique protege
+/// (migration 83). Rend l'id de la ligne existante, s'il y en a une.
+///
+/// GgB (fil 1562, #2453) : sans ce controle, une seconde validation du meme
+/// formulaire ajoutait une ligne jumelle que l'ecran Emplacements affichait
+/// indefiniment. Depuis l'index unique, elle echouerait a la place — une 500
+/// pour un geste anodin. On rend donc la ligne deja la.
+fn montage_existant(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    mount_type: &str,
+    server: &str,
+    share: &str,
+    mount_path: &str,
+) -> Option<i64> {
+    use tune_core::db::backend::ToSqlValue;
+    backend
+        .query_one(
+            "SELECT id FROM network_mounts \
+             WHERE mount_type = ? AND server = ? AND share = ? AND mount_path = ?",
+            &[
+                &mount_type as &dyn ToSqlValue,
+                &server as &dyn ToSqlValue,
+                &share as &dyn ToSqlValue,
+                &mount_path as &dyn ToSqlValue,
+            ],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+}
+
 async fn create_mount(
     State(state): State<AppState>,
     Json(body): Json<CreateMount>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
     let mount_type = body.mount_type.unwrap_or_else(|| "smb".into());
+    if let Some(id) = montage_existant(
+        &state.backend,
+        &mount_type,
+        &body.server,
+        &body.share,
+        &body.mount_path,
+    ) {
+        tracing::info!(id, server = %body.server, share = %body.share, "montage_reseau_deja_enregistre");
+        return (StatusCode::OK, Json(json!({ "id": id, "existant": true }))).into_response();
+    }
     match state.backend.execute_returning_id(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
         &[&mount_type as &dyn ToSqlValue, &body.server as &dyn ToSqlValue, &body.share as &dyn ToSqlValue, &body.mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
@@ -129,7 +173,14 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 "manufacturer": ms.manufacturer,
                 "model": ms.model,
                 "host": ms.host,
+                "port": ms.port,
                 "location": ms.location,
+                // Le marquage demandé par Bertrand dans le fil forum 1425 :
+                // l'interface grise un serveur qui ne répond plus au lieu de
+                // le faire clignoter en le retirant puis le remettant. Champs
+                // AJOUTÉS — aucun client existant ne casse (#2139).
+                "reachable": ms.is_reachable(),
+                "last_seen_secs": ms.age().as_secs(),
             })
         })
         .collect();
@@ -486,11 +537,24 @@ async fn trigger_smb_scan() -> impl IntoResponse {
 }
 
 /// List all stored SMB mounts from the network_mounts table.
+///
+/// La liste ne rendait que `active` — l'INTENTION de l'utilisateur. Un partage
+/// dont le remontage au demarrage avait echoue s'affichait donc exactement
+/// comme un partage monte, et l'echec ne se voyait qu'a la lecture, sous la
+/// forme d'une erreur reseau generique qui ne le nommait pas (#1916, Eric
+/// `ricouxxx`). Trois champs portent desormais le CONSTAT :
+///
+/// - `mounted` : verifie a l'instant, sur le systeme de fichiers ;
+/// - `mount_state` / `last_mount_error` : ce qu'a donne le dernier essai ;
+/// - `smb_version` : le dialecte retenu, que l'interface doit afficher quand
+///   il vaut `1.0` — retomber sur un protocole obsolete et non chiffre n'est
+///   pas neutre, et se fait aujourd'hui en silence (#1834).
 async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state
         .backend
         .query_many(
-            "SELECT id, server, share, mount_path, username, active \
+            "SELECT id, server, share, mount_path, username, active, \
+             smb_version, mount_state, last_mount_error \
              FROM network_mounts WHERE mount_type = 'smb' ORDER BY id",
             &[],
         )
@@ -498,13 +562,24 @@ async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, A
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
+            let mount_path = r.get(3).and_then(|v| v.as_string());
+            // Le constat de l'instant prime sur celui du dernier essai : un NAS
+            // rallume et remonte a la main doit apparaitre monte, meme si le
+            // demarrage s'etait solde par un echec.
+            let monte = mount_path
+                .as_deref()
+                .is_some_and(|p| smb::est_un_point_de_montage(std::path::Path::new(p)));
             json!({
                 "id": r.get(0).and_then(|v| v.as_i64()),
                 "server": r.get(1).and_then(|v| v.as_string()),
                 "share": r.get(2).and_then(|v| v.as_string()),
-                "mount_path": r.get(3).and_then(|v| v.as_string()),
+                "mount_path": mount_path,
                 "username": r.get(4).and_then(|v| v.as_string()),
                 "active": r.get(5).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+                "smb_version": r.get(6).and_then(|v| v.as_string()),
+                "mount_state": r.get(7).and_then(|v| v.as_string()),
+                "last_mount_error": r.get(8).and_then(|v| v.as_string()),
+                "mounted": monte,
             })
         })
         .collect();
@@ -512,6 +587,46 @@ async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, A
 }
 
 /// Mount an SMB share: execute the OS mount command, then persist in the database.
+
+/// Traduire l'échec de création du point de montage en un obstacle NOMMÉ.
+///
+/// Le message rendu était `failed to create mount dir: Permission denied
+/// (os error 13)`. Exact, et inutile : il ne dit pas ce qui manque, et surtout
+/// pas que **le montage lui-même** demandera le même privilège juste après —
+/// de sorte que créer le dossier à la main ne débloquerait rien.
+///
+/// Vécu le 2026-08-21 par Dominique Comet, dont le serveur tourne depuis son
+/// répertoire personnel et non sous `root` : trois échecs identiques dans ses
+/// journaux, un 500 à l'écran, et la conclusion naturelle — mais fausse — que
+/// son partage SMB ou son NAS étaient en cause. La découverte avait pourtant
+/// réussi juste avant (`shares=1`).
+///
+/// On sépare donc le refus de privilège du reste : c'est le seul cas où
+/// l'utilisateur peut agir, et l'action n'est pas celle qu'il croit.
+fn obstacle_de_montage(e: &std::io::Error, chemin: &str) -> (&'static str, String) {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => (
+            "privileges_insuffisants",
+            format!(
+                "Le serveur n'a pas les droits de créer le point de montage {chemin}. \
+                 Monter un partage SMB demande des privilèges système (root, ou la \
+                 capacité CAP_SYS_ADMIN) : créer ce dossier à la main ne suffira pas, \
+                 car le montage lui-même les redemandera. Deux issues : donner ces \
+                 privilèges au service, ou monter le partage par le système \
+                 (/etc/fstab) et déclarer le dossier obtenu dans les dossiers de musique."
+            ),
+        ),
+        std::io::ErrorKind::NotFound => (
+            "chemin_parent_absent",
+            format!("Le dossier parent de {chemin} n'existe pas."),
+        ),
+        _ => (
+            "creation_impossible",
+            format!("Impossible de créer le point de montage {chemin} : {e}"),
+        ),
+    }
+}
+
 async fn mount_smb_share(
     State(state): State<AppState>,
     Json(body): Json<MountRequest>,
@@ -526,23 +641,51 @@ async fn mount_smb_share(
         let reachable = tokio::net::TcpStream::connect(format!("{}:445", body.host))
             .await
             .is_ok();
+        // Le message disait « Host reachable on SMB port 445 », que l'interface
+        // affichait en vert comme une validation. Il ne teste QUE l'ouverture du
+        // port : ni les identifiants, ni l'existence du partage, ni la
+        // possibilite de monter. Chez Philippe Landes il etait au vert et
+        // l'etape suivante rendait 500 — un voyant vert juste avant l'etape qui
+        // echoue est pire qu'aucun voyant, il envoie chercher la panne du cote
+        // du reseau, precisement la seule chose qui ait ete verifiee (#1847).
         return Json(json!({
             "ok": reachable,
             "host": body.host,
             "share_name": body.share_name,
-            "message": if reachable { "Host reachable on SMB port 445" } else { "Cannot reach host on port 445" },
+            "message": if reachable {
+                "Serveur joignable (port 445) — identifiants et partage non vérifiés"
+            } else {
+                "Serveur injoignable sur le port 445"
+            },
         }))
         .into_response();
     }
 
     // Create mount directory
     if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+        // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
+        // web n'affichait que le statut, donc la cause n'existait nulle part
+        // (#1847).
+        warn!(host = %body.host, path = %mount_path, error = %e, "smb_mount_dir_failed");
+        let (motif, message) = obstacle_de_montage(&e, &mount_path);
+        // `message` porte le TEXTE, `error` porte le CODE — et cet ordre n'est
+        // pas decoratif : `apiError()` du client lit `detail` ou `message` pour
+        // ce qu'il affiche, et range `error` dans un code machine. La reponse
+        // d'avant mettait sa phrase dans `error` : elle n'etait donc affichee
+        // NULLE PART, et l'utilisateur ne voyait que « 500 Internal Server
+        // Error ». C'est ce qui a laisse Dominique Comet sans autre indice que
+        // ses journaux.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("failed to create mount dir: {e}") })),
+            Json(json!({ "message": message, "error": motif })),
         )
             .into_response();
     }
+
+    // Dialecte qui a effectivement monte le partage, a persister pour que le
+    // remontage au demarrage reparte du bon (#1834). Reste NUL sur macOS :
+    // `mount_smbfs` negocie seul, des deux cotes, il n'y a rien a retenir.
+    let mut dialecte_retenu: Option<String> = None;
 
     // Build the mount command depending on the platform
     let mount_result = if cfg!(target_os = "macos") {
@@ -560,18 +703,106 @@ async fn mount_smb_share(
         )
         .await
     } else {
-        // Linux: mount.cifs
+        // Linux: mount.cifs, en NEGOCIANT le dialecte au lieu de l'imposer.
+        //
+        // `vers=3.0` etait code en dur, sans repli ni choix. Or le module CIFS
+        // du noyau ne negocie de lui-meme qu'entre 2.1, 3.0 et 3.1.1 : il ne
+        // descend jamais plus bas et refuse par `mount error(22): Invalid
+        // argument`, un message qui ne dit rien de la cause.
+        //
+        // Philippe Landes l'a paye cher : `smbclient -L` listait parfaitement
+        // le partage ROSEDISK de son NAS Rose, avec les memes identifiants,
+        // pendant que le montage echouait. L'asymetrie tient a ce que
+        // `smbclient` est du Samba en espace utilisateur — il descend plus bas
+        // que le noyau. Le materiel audio embarque souvent un Samba ancien ;
+        // tout ce parc etait donc inaccessible, sans que rien ne l'explique.
+        //
+        // On essaie donc, dans l'ordre : negociation libre (le noyau prend le
+        // meilleur dialecte moderne), puis 2.0, puis 1.0. Le premier qui monte
+        // gagne.
+        //
+        // L'echelle vit desormais dans `crate::smb` : le remontage au demarrage
+        // doit imperativement essayer les MEMES dialectes, dans le MEME ordre.
+        // Il ne le faisait pas — il imposait toujours `vers=3.0` — et le partage
+        // que cette route venait de monter en SMB 1.0 se perdait au premier
+        // redemarrage (#1834).
         let user = body.username.as_deref().unwrap_or("guest");
         let pass = body.password.as_deref().unwrap_or("");
         let unc = format!("//{}/{}", body.host, body.share_name);
-        let opts = format!("username={user},password={pass},vers=3.0");
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            Command::new("mount.cifs")
-                .args([&unc, &mount_path, "-o", &opts])
-                .output(),
-        )
-        .await
+
+        let mut dernier = None;
+        for dialecte in smb::DIALECTES {
+            let mut opts = format!("username={user},password={pass}");
+            if let Some(v) = dialecte {
+                opts.push_str(&format!(",vers={v}"));
+            }
+            // JAMAIS `opts` dans une trace : il porte le mot de passe.
+            info!(
+                host = %body.host,
+                share = %body.share_name,
+                dialect = smb::etiquette(dialecte),
+                "smb_mount_attempt"
+            );
+            let res = tokio::time::timeout(
+                smb::ESSAI_TIMEOUT,
+                Command::new("mount.cifs")
+                    .args([&unc, &mount_path, "-o", &opts])
+                    .output(),
+            )
+            .await;
+
+            let arreter = match &res {
+                Ok(Ok(out)) if out.status.success() => {
+                    info!(
+                        host = %body.host,
+                        share = %body.share_name,
+                        dialect = smb::etiquette(dialecte),
+                        "smb_mount_ok"
+                    );
+                    // Le dialecte qui a gagne doit survivre a la reponse HTTP :
+                    // c'est lui que le remontage au demarrage rejouera.
+                    dialecte_retenu = Some(smb::etiquette(dialecte).to_string());
+                    true
+                }
+                Ok(Ok(out)) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    // Sans cette trace, un echec de montage ne laissait AUCUNE
+                    // marque nulle part : ni a l'ecran (le client jetait le
+                    // corps de la reponse), ni au journal. Le diagnostic
+                    // existait deux fois et disparaissait deux fois.
+                    warn!(
+                        host = %body.host,
+                        share = %body.share_name,
+                        dialect = smb::etiquette(dialecte),
+                        error = %stderr,
+                        "smb_mount_failed"
+                    );
+                    // Un refus d'authentification ne se repare pas en changeant
+                    // de dialecte : inutile de faire patienter l'utilisateur
+                    // vingt secondes de plus pour la meme reponse.
+                    smb::est_refus_d_authentification(&stderr)
+                }
+                Ok(Err(e)) => {
+                    // mount.cifs absent ou non executable : reessayer avec un
+                    // autre dialecte ne changera rien.
+                    warn!(host = %body.host, error = %e, "smb_mount_command_failed");
+                    true
+                }
+                Err(_) => {
+                    warn!(
+                        host = %body.host,
+                        dialect = smb::etiquette(dialecte),
+                        "smb_mount_timeout"
+                    );
+                    false
+                }
+            };
+            dernier = Some(res);
+            if arreter {
+                break;
+            }
+        }
+        dernier.expect("DIALECTES n'est jamais vide")
     };
 
     let mount_ok = match mount_result {
@@ -602,9 +833,66 @@ async fn mount_smb_share(
 
     // Persist to database
     use tune_core::db::backend::ToSqlValue;
+    // Remonter un partage deja enregistre passe souvent par cet ecran plutot
+    // que par le bouton de remontage : sans ce controle on ajoutait une ligne
+    // jumelle (#2453), et depuis l'index unique on echouerait. On rafraichit
+    // la ligne existante — le dialecte retenu et le constat de montage sont
+    // justement ce qui vient d'etre etabli.
+    if let Some(id) = montage_existant(
+        &state.backend,
+        "smb",
+        &body.host,
+        &body.share_name,
+        &mount_path,
+    ) {
+        let _ = state.backend.execute(
+            "UPDATE network_mounts SET username = ?, password = ?, smb_version = ?, \
+             mount_state = ?, active = 1 WHERE id = ?",
+            &[
+                &body.username as &dyn ToSqlValue,
+                &body.password as &dyn ToSqlValue,
+                &dialecte_retenu as &dyn ToSqlValue,
+                &"mounted" as &dyn ToSqlValue,
+                &id as &dyn ToSqlValue,
+            ],
+        );
+        tracing::info!(id, host = %body.host, share = %body.share_name, "montage_reseau_rafraichi");
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "id": id,
+                "mounted": mount_ok,
+                "mount_path": mount_path,
+                "smb_version": dialecte_retenu,
+                "existant": true,
+            })),
+        )
+            .into_response();
+    }
     match state.backend.execute_returning_id(
-        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username) VALUES (?, ?, ?, ?, ?)",
-        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue],
+        // Le mot de passe est persiste AVEC le reste. Sans lui, le partage
+        // enregistre est inexploitable au redemarrage : Tune connait l'adresse
+        // et l'identifiant, pas le secret, donc il ne peut pas remonter — et
+        // l'utilisateur doit re-saisir son partage ET ses identifiants a chaque
+        // fois (Dominique Comet, #1692 : « il faut que je relance Ajouter un
+        // partage reseau SMB, que je rechoisisse le disque avec les identifiants
+        // adequats »).
+        //
+        // Ce n'est pas une nouvelle exposition : la route de montage generique
+        // (`create_mount`) enregistre deja le mot de passe dans cette meme
+        // colonne, et la meme base porte les jetons de streaming. Le chiffrer
+        // ici seul donnerait l'illusion d'une protection sans en apporter —
+        // `secret_envelope` exige une passphrase utilisateur, incompatible avec
+        // un remontage sans personne devant la machine.
+        //
+        // `smb_version` retient le dialecte qui a gagne. Sans lui, le remontage
+        // au demarrage repartait de `vers=3.0` en dur : le partage SMB 1.0 de
+        // Philippe Landes montait ici, puis disparaissait au premier
+        // redemarrage (#1834). `mount_state` porte le CONSTAT, la ou `active`
+        // n'exprime qu'une intention (#1916) — on n'arrive ici qu'apres un
+        // montage reussi, d'ou 'mounted'.
+        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password, smb_version, mount_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue, &dialecte_retenu as &dyn ToSqlValue, &"mounted" as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (
@@ -613,6 +901,7 @@ async fn mount_smb_share(
                     "id": id,
                     "mounted": mount_ok,
                     "mount_path": mount_path,
+                    "smb_version": dialecte_retenu,
                 })),
             )
                 .into_response()
@@ -659,7 +948,11 @@ async fn browse_media_server(
     // StartingIndex>=TotalMatches, with a safety bound.
     const PAGE_SIZE: u32 = 200;
     const MAX_PAGES: u32 = 500; // up to 100k children
-    let client = reqwest::Client::new();
+    // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
+    // 30 s compte ici : la boucle ci-dessous peut enchaîner jusqu'à 500 pages,
+    // et un client reqwest nu n'impose aucune limite — un serveur DLNA qui
+    // accepte la connexion sans jamais répondre bloquait la requête sans fin.
+    let client = tune_core::http::client::shared();
     let mut containers: Vec<Value> = Vec::new();
     let mut items: Vec<Value> = Vec::new();
     let mut starting_index: u32 = 0;
@@ -744,6 +1037,258 @@ async fn browse_media_server(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    /// Le texte cherché.
+    q: String,
+    /// Le conteneur où chercher. Absent = tout le serveur (`0`).
+    container: Option<String>,
+}
+
+/// Cherche DANS un serveur de médias, par son action ContentDirectory `Search`.
+///
+/// Pourquoi ce n'est pas un simple `Browse` filtré : parcourir une
+/// arborescence de plusieurs milliers d'entrées côté client pour y chercher un
+/// titre est intenable, et c'est précisément ce que `Search` évite — le
+/// serveur cherche dans SON index.
+///
+/// La règle du chantier, symétrique de celle qu'on s'applique à nous-mêmes
+/// (#2312) : **ne demander que ce que le serveur distant annonce**. On lit donc
+/// d'abord ses `SearchCapabilities`. S'il n'annonce pas `dc:title`, on ne lui
+/// envoie pas de critère qu'il ne sait pas évaluer — beaucoup répondent alors
+/// par toute la bibliothèque, ce qui ressemble à un résultat et n'en est pas.
+/// La réponse porte `supported: false` et le client se rabat sur un filtrage
+/// du dossier courant, en le disant à l'écran.
+async fn search_media_server(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> Json<Value> {
+    let container = q.container.as_deref().unwrap_or("0");
+    let vide = |supported: bool, raison: &str| {
+        Json(json!({
+            "container": container,
+            "query": q.q,
+            "supported": supported,
+            "reason": raison,
+            "containers": [],
+            "items": [],
+            "total_matches": 0,
+            "number_returned": 0,
+        }))
+    };
+
+    let servers = state.media_servers.lock().await;
+    let ms = match servers.get(&id) {
+        Some(ms) => ms.clone(),
+        None => return vide(false, "serveur inconnu"),
+    };
+    drop(servers);
+
+    if q.q.trim().is_empty() {
+        return vide(true, "");
+    }
+
+    let caps = capacites_de_recherche(&ms.content_directory_url).await;
+    let criteria = match critere_de_recherche(&caps, &q.q) {
+        Some(c) => c,
+        None => return vide(false, "ce serveur n'annonce pas la recherche par titre"),
+    };
+
+    const PAGE_SIZE: u32 = 200;
+    const MAX_PAGES: u32 = 50;
+    let client = tune_core::http::client::shared();
+    let mut containers: Vec<Value> = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+    let mut starting_index: u32 = 0;
+    let mut total_matches: u32 = 0;
+
+    for _page in 0..MAX_PAGES {
+        let soap_body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ContainerID>{container}</ContainerID>
+<SearchCriteria>{criteria}</SearchCriteria>
+<Filter>*</Filter>
+<StartingIndex>{starting_index}</StartingIndex>
+<RequestedCount>{PAGE_SIZE}</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Search>
+</s:Body>
+</s:Envelope>"#,
+            criteria = xml_escape(&criteria),
+        );
+
+        let resp = match client
+            .post(&ms.content_directory_url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header(
+                "SOAPAction",
+                "\"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"",
+            )
+            .body(soap_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "search_media_server soap_error server={} start={starting_index} err={e}",
+                    ms.name
+                );
+                break;
+            }
+        };
+
+        let body = resp.text().await.unwrap_or_default();
+        // Un 708 (« critère non supporté ») n'est pas une panne : c'est un
+        // serveur qui annonce plus qu'il n'évalue. On le dit, plutôt que de
+        // rendre une liste vide qui se lirait « aucun résultat ».
+        if body.contains("<errorCode>") {
+            let code = extract_xml_tag(&body, "errorCode").unwrap_or_default();
+            tracing::info!(
+                "search_media_server refus server={} code={code} criteria={criteria}",
+                ms.name
+            );
+            return vide(false, "ce serveur a refusé le critère de recherche");
+        }
+
+        let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
+        let parsed = (page_containers.len() + page_items.len()) as u32;
+        let number_returned: u32 = extract_xml_tag(&body, "NumberReturned")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(parsed);
+        if let Some(tm) = extract_xml_tag(&body, "TotalMatches").and_then(|s| s.trim().parse().ok())
+        {
+            total_matches = tm;
+        }
+
+        containers.append(&mut page_containers);
+        items.append(&mut page_items);
+
+        if number_returned == 0 || parsed == 0 {
+            break;
+        }
+        starting_index += number_returned.max(parsed);
+        if total_matches != 0 && starting_index >= total_matches {
+            break;
+        }
+    }
+
+    let fetched = containers.len() + items.len();
+    Json(json!({
+        "container": container,
+        "query": q.q,
+        "supported": true,
+        "reason": "",
+        "containers": containers,
+        "items": items,
+        "total_matches": (total_matches as usize).max(fetched),
+        "number_returned": fetched,
+    }))
+}
+
+/// Ce que le serveur distant DIT savoir chercher.
+///
+/// Mis en cache dix minutes : une zone de recherche interroge à chaque frappe,
+/// et cette capacité ne change pas d'une seconde à l'autre. Une panne réseau
+/// n'est pas mise en cache — on réessaiera.
+async fn capacites_de_recherche(content_directory_url: &str) -> String {
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+    type Cache = std::sync::Mutex<std::collections::HashMap<String, (Instant, String)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(600);
+
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some((pose, caps)) = map.get(content_directory_url) {
+            if pose.elapsed() < TTL {
+                return caps.clone();
+            }
+        }
+    }
+
+    let soap = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body><u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/></s:Body>
+</s:Envelope>"#;
+    let caps = match tune_core::http::client::shared()
+        .post(content_directory_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "SOAPAction",
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#GetSearchCapabilities\"",
+        )
+        .body(soap)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            extract_xml_tag(&r.text().await.unwrap_or_default(), "SearchCaps").unwrap_or_default()
+        }
+        Err(e) => {
+            tracing::debug!("get_search_capabilities err={e}");
+            return String::new();
+        }
+    };
+
+    if let Ok(mut map) = cache.lock() {
+        map.insert(
+            content_directory_url.to_string(),
+            (Instant::now(), caps.clone()),
+        );
+    }
+    caps
+}
+
+/// Le critère à envoyer, construit UNIQUEMENT avec les champs annoncés.
+///
+/// `*` est la façon dont beaucoup de serveurs disent « tout m'est
+/// interrogeable ». Sans `dc:title` — ni `*` —, on rend `None` : mieux vaut
+/// dire au client qu'on ne sait pas chercher que lui rendre la bibliothèque
+/// entière sous le nom de « résultats ».
+///
+/// La restriction de classe n'est ajoutée que si `upnp:class` est annoncé :
+/// c'est un champ de plus à évaluer, et un serveur qui ne le connaît pas
+/// refuserait tout le critère.
+fn critere_de_recherche(caps: &str, texte: &str) -> Option<String> {
+    let annonce = |champ: &str| {
+        caps.split(',')
+            .any(|c| c.trim() == "*" || c.trim().eq_ignore_ascii_case(champ))
+    };
+    if !annonce("dc:title") {
+        return None;
+    }
+    let valeur = echapper_valeur_critere(texte);
+    let titre = format!("dc:title contains \"{valeur}\"");
+    Some(if annonce("upnp:class") {
+        format!("upnp:class derivedfrom \"object.item.audioItem\" and {titre}")
+    } else {
+        titre
+    })
+}
+
+/// Dans un `SearchCriteria`, une valeur est entre guillemets : la barre
+/// oblique inverse et le guillemet doivent y être échappés, sinon un titre
+/// contenant `"` casse le critère — ou, pire, en injecte un autre.
+fn echapper_valeur_critere(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Le critère voyage dans du XML : `&`, `<` et les guillemets doivent y être
+/// écrits en entités, sinon le SOAP est invalide.
+fn xml_escape(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
     let result_start = xml.find("<Result>").or_else(|| xml.find("<Result "));
     let result_end = xml.find("</Result>");
@@ -788,6 +1333,12 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "id": id,
                         "parent_id": parent_id,
                         "title": title,
+                        // Le serveur envoie dc:creator sur les conteneurs album
+                        // depuis toujours — c'est ICI qu'il se perdait : extrait
+                        // quatre lignes plus haut, jamais posé dans le JSON.
+                        // Une grille d'albums sans artiste n'est pas une
+                        // bibliothèque (jeu des sept erreurs, 25/08).
+                        "artist": artist,
                         "child_count": child_count,
                         "album_art_uri": album_art_uri,
                     }));
@@ -1109,7 +1660,46 @@ async fn get_share_detail(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_didl_browse_response, parse_res_elements, select_best_res};
+
+    /// La regle du chantier : ne demander QUE ce que le serveur annonce.
+    ///
+    /// Un serveur qui n'annonce pas `dc:title` ne doit pas recevoir de critere
+    /// de titre. Beaucoup repondent alors par toute la bibliotheque, ce qui
+    /// ressemble a un resultat et n'en est pas.
+    #[test]
+    fn on_ne_demande_que_ce_que_le_serveur_annonce() {
+        assert_eq!(critere_de_recherche("upnp:class", "blue"), None);
+        assert_eq!(critere_de_recherche("", "blue"), None);
+        assert_eq!(
+            critere_de_recherche("upnp:class,dc:title", "blue").as_deref(),
+            Some("upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"blue\"")
+        );
+        // Sans `upnp:class` annonce, la restriction de classe est retiree :
+        // l'ajouter ferait refuser tout le critere.
+        assert_eq!(
+            critere_de_recherche("dc:title", "blue").as_deref(),
+            Some("dc:title contains \"blue\"")
+        );
+        // `*` est la facon dont beaucoup de serveurs disent « tout ».
+        assert!(critere_de_recherche("*", "blue").is_some());
+        // La casse annoncee varie d'un serveur a l'autre.
+        assert!(critere_de_recherche("DC:TITLE", "blue").is_some());
+    }
+
+    /// Un titre contenant un guillemet ne doit pas pouvoir fermer la valeur du
+    /// critere — ni casser le SOAP, ni y injecter un predicat.
+    #[test]
+    fn un_guillemet_dans_le_texte_cherche_est_echappe() {
+        let c = critere_de_recherche("dc:title", r#"say "hello""#).unwrap();
+        assert!(c.contains(r#"\"hello\""#), "{c}");
+        assert_eq!(echapper_valeur_critere(r#"a\b"c"#), r#"a\\b\"c"#);
+        assert_eq!(xml_escape(r#"a&b<c>"d""#), "a&amp;b&lt;c&gt;&quot;d&quot;");
+    }
+
+    use super::{
+        critere_de_recherche, echapper_valeur_critere, obstacle_de_montage,
+        parse_didl_browse_response, parse_res_elements, select_best_res, xml_escape,
+    };
 
     /// Build a SOAP Browse response whose escaped DIDL contains one item with
     /// the given raw `<res>` elements (LMS-style).
@@ -1152,6 +1742,29 @@ mod tests {
         assert_eq!(
             best.protocol_info.as_deref(),
             Some("http-get:*:audio/x-flac:*")
+        );
+    }
+
+    /// Jeu des sept erreurs (25/08) : le serveur envoie dc:creator sur les
+    /// conteneurs album depuis toujours — extrait par le parseur, jamais posé
+    /// dans le JSON. Une grille d'albums sans artiste n'est pas une
+    /// bibliothèque. Contre-épreuve faite : fix neutralisé → FAILED.
+    #[test]
+    fn le_createur_d_un_conteneur_atterrit_dans_le_json() {
+        let soap = format!(
+            "<Envelope><Body><BrowseResponse><Result>{}</Result></BrowseResponse></Body></Envelope>",
+            xml_escape(
+                r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><container id="album/18" parentID="albums" restricted="1" childCount="10"><dc:title>18</dc:title><dc:creator>Moby</dc:creator><upnp:class>object.container.album.musicAlbum</upnp:class></container></DIDL-Lite>"#
+            )
+        );
+        let (containers, items) = parse_didl_browse_response(&soap);
+        assert!(items.is_empty());
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0]["title"].as_str(), Some("18"));
+        assert_eq!(
+            containers[0]["artist"].as_str(),
+            Some("Moby"),
+            "dc:creator doit survivre jusqu'au JSON du conteneur"
         );
     }
 
@@ -1236,5 +1849,79 @@ mod tests {
         let resources = parse_res_elements(element);
         let best = select_best_res(&resources).unwrap();
         assert!(best.url.ends_with("track.mp3"));
+    }
+
+    // --- Nommer l'obstacle, au lieu de rendre un errno (#1515 voisin) ---
+
+    fn err(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::new(kind, "essai")
+    }
+
+    /// Le cas de Dominique Comet : serveur lance depuis son repertoire
+    /// personnel, /mnt appartient a root. Le message rendu etait « failed to
+    /// create mount dir: Permission denied (os error 13) » — exact, et
+    /// inutile : il ne dit pas ce qui manque, et surtout pas que le MONTAGE
+    /// redemandera le meme privilege juste apres.
+    #[test]
+    fn un_refus_de_privilege_est_nomme_comme_tel() {
+        let (motif, msg) = obstacle_de_montage(
+            &err(std::io::ErrorKind::PermissionDenied),
+            "/mnt/192.168.1.146_Music",
+        );
+        assert_eq!(motif, "privileges_insuffisants");
+        assert!(msg.contains("/mnt/192.168.1.146_Music"), "{msg}");
+        // Le point qui a coute une soiree a Dominique : creer le dossier a la
+        // main ne suffit pas. Le message doit le dire, sinon il essaiera.
+        assert!(
+            msg.contains("ne suffira pas"),
+            "le message doit prevenir que creer le dossier ne debloque rien : {msg}"
+        );
+        assert!(
+            msg.contains("CAP_SYS_ADMIN") || msg.contains("root"),
+            "{msg}"
+        );
+        // Et il doit offrir la sortie, pas seulement le constat.
+        assert!(
+            msg.contains("fstab"),
+            "la solution non privilegiee manque : {msg}"
+        );
+    }
+
+    #[test]
+    fn les_autres_echecs_gardent_leur_cause_exacte() {
+        // On ne noie pas tout dans « privileges » : un parent absent est un
+        // probleme different, avec une reparation differente.
+        let (motif, msg) = obstacle_de_montage(&err(std::io::ErrorKind::NotFound), "/x/y");
+        assert_eq!(motif, "chemin_parent_absent");
+        assert!(msg.contains("/x/y"), "{msg}");
+        assert!(
+            !msg.contains("CAP_SYS_ADMIN"),
+            "pas de conseil hors sujet : {msg}"
+        );
+
+        let (motif, msg) = obstacle_de_montage(&err(std::io::ErrorKind::AlreadyExists), "/x/y");
+        assert_eq!(motif, "creation_impossible");
+        // Le cas inconnu garde l'erreur systeme : mieux vaut un message brut
+        // qu'un message faux.
+        assert!(
+            msg.contains("essai"),
+            "l'erreur d'origine doit survivre : {msg}"
+        );
+    }
+
+    #[test]
+    fn chaque_motif_est_distinct() {
+        // Trois motifs, trois codes : le client peut les traduire, et un
+        // journal les distingue. Les confondre ramenerait au message unique.
+        let m: Vec<&str> = [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ]
+        .iter()
+        .map(|k| obstacle_de_montage(&err(*k), "/x").0)
+        .collect();
+        let uniques: std::collections::HashSet<&&str> = m.iter().collect();
+        assert_eq!(uniques.len(), 3, "{m:?}");
     }
 }

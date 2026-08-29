@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::backend::DbBackend;
@@ -92,9 +93,16 @@ struct AlbumBioResponse {
     lang: Option<String>,
 }
 
+/// Le cloud repond `{"bios": [...]}` sur `GET /community/bios/artists`
+/// (`CommunityBioController::artists`, `return response()->json(['bios' => …])`),
+/// et l'a fait depuis la creation du point d'entree le 17/06/2026. Le client
+/// n'a jamais lu que `artists`, avec `serde(default)` : la cle ne tombait
+/// jamais, le vecteur restait vide, et **aucune bio d'artiste n'a jamais ete
+/// appliquee** — meme sur un HTTP 200. L'alias accepte les deux formes, pour
+/// ne pas re-casser si le cloud s'aligne un jour sur `artists`.
 #[derive(Debug, Deserialize)]
 struct ArtistBiosWrapper {
-    #[serde(default)]
+    #[serde(default, alias = "bios")]
     artists: Vec<ArtistBioResponse>,
 }
 
@@ -119,6 +127,27 @@ struct AlbumByTitleBioResponse {
     lang: Option<String>,
 }
 
+/// Ce qu'on fait d'un lot que le cloud vient de refuser.
+///
+/// Un 429 ou un 5xx ne se rattrape pas en envoyant le lot suivant tout de
+/// suite : il s'aggrave. La phase albums s'arretait deja (Fabien : « des
+/// dizaines de requetes refusees par seconde »), mais chacune des trois
+/// boucles portait sa propre copie de la regle — ou ne la portait pas du tout.
+/// Une seule fonction, appelee partout.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ApresRefus {
+    LotSuivant,
+    ArreterLeCycle,
+}
+
+fn apres_refus(status: reqwest::StatusCode) -> ApresRefus {
+    if status.as_u16() == 429 || status.is_server_error() {
+        ApresRefus::ArreterLeCycle
+    } else {
+        ApresRefus::LotSuivant
+    }
+}
+
 /// Source label for a downloaded community bio — defaults to "community"
 /// when the payload carries no explicit source.
 fn bio_source(source: &Option<String>) -> &str {
@@ -137,14 +166,44 @@ struct AlbumByTitleBiosWrapper {
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Upload local bios to mozaiklabs.fr in batches of 100.
-/// Controlled by `TUNE_TELEMETRY` — returns early if telemetry is off.
+///
+/// **Consentement explicite requis.** Ces bios sont des donnees de la
+/// bibliotheque de l'utilisateur : elles ne partent que si
+/// `community_contribution_enabled` est pose a vrai. Le defaut est NON, et
+/// `TUNE_TELEMETRY=false` reste un coupe-circuit qui prime (voir
+/// `cloud::consent`). Le controle est en tete de fonction, avant meme la
+/// creation du `server_id` : au defaut, cette fonction ne touche a rien.
+///
 /// Fails silently: errors are logged as warnings.
 pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
-    if !crate::cloud::telemetry::TelemetryReporter::is_enabled() {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if !crate::cloud::consent::contribution_autorisee(&settings) {
         return;
     }
+    upload_bios_to(db, UPLOAD_URL).await;
+}
 
+/// Corps du televersement, l'URL en parametre.
+///
+/// Le verrou de consentement — et avec lui la lecture de `TUNE_TELEMETRY` —
+/// reste dans `upload_bios` : ce corps-ci ne consulte ni reglage d'autorisation
+/// ni variable d'environnement, ce qui le rend exercable par un test sans
+/// dependre de l'ambiance du processus.
+///
+/// Corollaire a ne pas perdre de vue : **ce corps envoie sans rien demander**.
+/// Tout nouvel appelant doit donc passer par `upload_bios`, ou refaire le
+/// controle `cloud::consent::contribution_autorisee` lui-meme.
+async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosWrite) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
 
     let artist_repo = ArtistRepo::with_backend(db.clone());
@@ -241,7 +300,7 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
             albums: album_batch,
         };
 
-        match client.post(UPLOAD_URL).json(&payload).send().await {
+        match client.post(upload_url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 info!(
                     batch = i,
@@ -253,6 +312,28 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
             Ok(resp) => {
                 let status = resp.status();
                 warn!(batch = i, status = %status, "bio_sync_upload_rejected");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if let Some(backoff) = rate_limit::defer_from_headers(
+                        &settings,
+                        CloudScope::BiosWrite,
+                        resp.headers(),
+                    ) {
+                        warn!(
+                            scope = backoff.scope,
+                            until_epoch = backoff.until_epoch,
+                            retry_after_seconds = backoff.retry_after_seconds,
+                            "bio_sync_rate_limit_persisted"
+                        );
+                    }
+                }
+                // `POST /community/bios` est plafonne a 5 requetes par heure
+                // (routes/api.php:705, `throttle:5,60`). Sans ce garde-fou, le
+                // lot 0 refuse en 429 etait suivi de tous les autres, refuses
+                // aussi, dans la foulee — le journal de Sandro (#2257).
+                if apres_refus(status) == ApresRefus::ArreterLeCycle {
+                    warn!("bio_sync_upload_backoff — cloud rate-limited, stopping run");
+                    break;
+                }
             }
             Err(e) => {
                 warn!(batch = i, error = %e, "bio_sync_upload_failed");
@@ -281,11 +362,21 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
         }
     };
 
-    download_artist_bios(db, &client).await;
+    download_artist_bios(db, &client, DOWNLOAD_ARTIST_URL).await;
     download_album_bios(db, &client).await;
 }
 
-async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
+async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, artist_url: &str) {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosArtistsRead) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let artist_repo = ArtistRepo::with_backend(db.clone());
 
     let candidates = match artist_repo.artists_without_bio_with_mbid() {
@@ -301,11 +392,14 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client)
     }
 
     for chunk in candidates.chunks(BATCH_SIZE) {
+        // Meme cadence que les deux phases albums : `GET /community/bios/artists`
+        // est plafonne a 30 requetes par minute (routes/api.php:708).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let ids: Vec<&str> = chunk.iter().map(|(_, mbid)| mbid.as_str()).collect();
         let query = ids.join(",");
 
         let url = format!(
-            "{DOWNLOAD_ARTIST_URL}?musicbrainz_ids={}",
+            "{artist_url}?musicbrainz_ids={}",
             urlencoding::encode(&query)
         );
 
@@ -320,6 +414,20 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client)
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_artists_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosArtistsRead,
+                    resp.headers(),
+                );
+            }
+            // Le marqueur reste inexplique de #2258 (`status=500`). La cause
+            // est cote cloud ; ce qui est corrige ici est la REACTION du
+            // client, qui reemettait le lot suivant sans pause ni limite.
+            if apres_refus(status) == ApresRefus::ArreterLeCycle {
+                warn!("bio_download_artists_backoff — cloud rate-limited, stopping run");
+                break;
+            }
             continue;
         }
 
@@ -362,6 +470,16 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client)
 }
 
 async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
+    let settings = SettingsRepo::with_backend(db.clone());
+    if let Some(backoff) = rate_limit::active(&settings, CloudScope::BiosAlbumsRead) {
+        warn!(
+            scope = backoff.scope,
+            until_epoch = backoff.until_epoch,
+            retry_after_seconds = backoff.retry_after_seconds,
+            "bio_sync_deferred_rate_limit"
+        );
+        return;
+    }
     let album_repo = AlbumRepo::with_backend(db.clone());
 
     // Phase 1: download by MBID (existing path, for albums that have one)
@@ -395,13 +513,20 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosAlbumsRead,
+                    resp.headers(),
+                );
+            }
             // Stop hammering the cloud when it rate-limits (429) or errors (5xx):
             // the old `continue` fired every batch back-to-back with no delay,
             // producing dozens of rejected requests/sec (Fabien). Retry happens
             // on the next scan-completed event / daily cycle.
-            if status.as_u16() == 429 || status.is_server_error() {
+            if apres_refus(status) == ApresRefus::ArreterLeCycle {
                 warn!("bio_download_backoff — cloud rate-limited, stopping run");
-                break;
+                return;
             }
             continue;
         }
@@ -486,9 +611,16 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_by_title_rejected");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit::defer_from_headers(
+                    &settings,
+                    CloudScope::BiosAlbumsRead,
+                    resp.headers(),
+                );
+            }
             // Stop hammering the cloud on 429 / 5xx instead of firing the next
             // batch immediately (Fabien: dozens of by-title 429s per second).
-            if status.as_u16() == 429 || status.is_server_error() {
+            if apres_refus(status) == ApresRefus::ArreterLeCycle {
                 warn!("bio_download_albums_by_title_backoff — cloud rate-limited, stopping run");
                 break;
             }
@@ -578,6 +710,46 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         Arc::new(db)
+    }
+
+    /// Contre-epreuve du consentement : au reglage par defaut, AUCUN envoi.
+    ///
+    /// Le temoin est `server_id`. `upload_bios` le cree en base — via
+    /// `get_or_create_server_id` — avant d'avoir seulement construit son client
+    /// HTTP, parce qu'il l'expedie dans la charge utile. Sa presence en base
+    /// prouve donc que le chemin d'envoi s'est deroule ; son absence prouve que
+    /// la fonction a rendu la main avant de rien entreprendre.
+    ///
+    /// La base porte un artiste avec bio ET MBID : sans le verrou de
+    /// consentement, cette bio partirait vers le cloud communautaire.
+    #[tokio::test]
+    async fn aucun_envoi_de_bios_sans_consentement_explicite() {
+        use crate::db::models::Artist;
+
+        let db = fresh_db();
+        let repo = ArtistRepo::with_backend(db.clone());
+        let mut artiste = Artist::new("Contre-epreuve".into());
+        artiste.musicbrainz_id = Some("mbid-contre-epreuve".into());
+        artiste.bio = Some("Cette bio ne doit jamais quitter la machine.".into());
+        repo.create(&artiste).unwrap();
+
+        let settings = SettingsRepo::with_backend(db.clone());
+        // Rien n'est pose : on est exactement au defaut d'une installation neuve.
+        assert_eq!(
+            settings.get("community_contribution_enabled").unwrap(),
+            None,
+            "le reglage doit etre absent pour que ce test mesure bien le DEFAUT"
+        );
+
+        upload_bios(&db).await;
+
+        assert_eq!(
+            settings.get("server_id").unwrap(),
+            None,
+            "au reglage par defaut, upload_bios ne doit RIEN entreprendre : \
+             un server_id en base prouve que le chemin d'envoi vers le cloud \
+             communautaire s'est deroule"
+        );
     }
 
     #[test]
@@ -710,5 +882,181 @@ mod tests {
         assert_eq!(result[1].0, "No MBID Album");
         assert_eq!(result[1].2, None);
         assert_eq!(result[1].3, "Bio without MBID");
+    }
+
+    // ── Refus du cloud : on rend la main, on ne martele pas ───────────────
+    //
+    // La phase albums s'arrete deja au premier 429/5xx (Fabien : « des dizaines
+    // de requetes refusees par seconde »). Les phases artistes — televersement
+    // ET telechargement — n'ont jamais recu ce garde-fou : elles enchainent le
+    // lot suivant sans pause. C'est la forme du marqueur reste inexplique dans
+    // #2258 (`bio_download_artists_rejected status=500`) et de celui de Sandro
+    // dans #2257 (`bio_sync_upload_rejected batch=0 status=429`).
+    //
+    // Ces deux tests exercent le CABLAGE, pas une fonction en vase clos : ils
+    // comptent les requetes reellement recues par un serveur qui refuse tout.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serveur de test qui refuse tout avec `status`, et compte les requetes.
+    ///
+    /// axum lit la requete en entier avant de repondre : pas de RST qui
+    /// detruirait la reponse en vol (cause de l'instabilite de #1358).
+    async fn mock_refusant(status: u16) -> (String, Arc<AtomicUsize>) {
+        use axum::Router;
+        use axum::routing::{get, post};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let etat = hits.clone();
+        let app = Router::new()
+            .route(
+                "/artists",
+                get(
+                    move |axum::extract::State(h): axum::extract::State<Arc<AtomicUsize>>| async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("Retry-After", "3600")],
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/upload",
+                post(
+                    move |axum::extract::State(h): axum::extract::State<Arc<AtomicUsize>>,
+                          _corps: String| async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("Retry-After", "3600")],
+                        )
+                    },
+                ),
+            )
+            .with_state(etat);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    fn client_de_test() -> reqwest::Client {
+        crate::http::client::builder()
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap()
+    }
+
+    /// Assez d'artistes a MBID sans bio pour former `lots` lots pleins.
+    fn semer_artistes_sans_bio(db: &Arc<dyn DbBackend>, lots: usize) {
+        use crate::db::models::Artist;
+        let repo = ArtistRepo::with_backend(db.clone());
+        for i in 0..(BATCH_SIZE * lots) {
+            let mut a = Artist::new(format!("Artiste {i}"));
+            a.musicbrainz_id = Some(format!("mbid-{i:05}"));
+            repo.create(&a).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn telechargement_artistes_un_500_arrete_le_cycle() {
+        let db = fresh_db();
+        semer_artistes_sans_bio(&db, 3); // 3 lots de BATCH_SIZE
+        let (base, hits) = mock_refusant(500).await;
+
+        download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "un 500 doit arreter le cycle apres le premier lot, pas enchainer les suivants"
+        );
+    }
+
+    /// Le cloud repond `{"bios": [...]}` sur `GET /community/bios/artists`
+    /// (`CommunityBioController::artists`, `response()->json(['bios' => …])`),
+    /// et l'a TOUJOURS fait depuis la creation du point d'entree le 17/06/2026.
+    /// Le client, lui, deserialise `{"artists": [...]}` avec `serde(default)` :
+    /// la cle ne tombe jamais, le vecteur est vide, et aucune bio d'artiste
+    /// n'a jamais ete appliquee — meme sur un HTTP 200.
+    #[tokio::test]
+    async fn telechargement_artistes_accepte_la_cle_bios_du_cloud() {
+        use crate::db::models::Artist;
+        use axum::Router;
+        use axum::routing::get;
+
+        let db = fresh_db();
+        let repo = ArtistRepo::with_backend(db.clone());
+        let mut a = Artist::new("Sans Bio".into());
+        a.musicbrainz_id = Some("mbid-00042".into());
+        let id = repo.create(&a).unwrap();
+
+        let app = Router::new().route(
+            "/artists",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "bios": [{
+                        "musicbrainz_id": "mbid-00042",
+                        "name": "Sans Bio",
+                        "bio": "Une biographie communautaire.",
+                        "source": "wikipedia",
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        download_artist_bios(
+            &db,
+            &client_de_test(),
+            &format!("http://127.0.0.1:{port}/artists"),
+        )
+        .await;
+
+        let apres = repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            apres.bio.as_deref(),
+            Some("Une biographie communautaire."),
+            "la bio renvoyee par le cloud sous la cle `bios` doit etre appliquee"
+        );
+    }
+
+    #[tokio::test]
+    async fn televersement_un_429_persiste_le_delai_et_survit_au_redemarrage() {
+        use crate::db::models::Artist;
+
+        let db = fresh_db();
+        let repo = ArtistRepo::with_backend(db.clone());
+        for i in 0..(BATCH_SIZE * 3) {
+            let mut a = Artist::new(format!("Artiste {i}"));
+            a.musicbrainz_id = Some(format!("mbid-{i:05}"));
+            a.bio = Some(format!("bio {i}"));
+            repo.create(&a).unwrap();
+        }
+        let (base, hits) = mock_refusant(429).await;
+
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+
+        // Un nouvel appel reconstruit son `SettingsRepo`, comme apres un
+        // redemarrage. Il doit relire l'echeance avant toute requete.
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "un 429 doit arreter le cycle et le suivant avant toute requete"
+        );
+        let settings = SettingsRepo::with_backend(db);
+        assert!(rate_limit::active(&settings, CloudScope::BiosWrite).is_some());
     }
 }

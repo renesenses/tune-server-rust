@@ -141,7 +141,11 @@ pub async fn ensure_runtime(cache_root: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("mkdir {}: {e}", cache_root.display()))?;
 
     tracing::info!(url = dist.url, dest = %dir.display(), "audio_runtime_downloading");
-    let bytes = reqwest::get(dist.url)
+    // Voir `crate::http::client` : jamais `reqwest::get`, dont le client par
+    // défaut dépend d'un vérificateur TLS que l'Android FFI n'initialise pas.
+    let bytes = crate::http::client::long_timeout()
+        .get(dist.url)
+        .send()
         .await
         .map_err(|e| format!("download: {e}"))?
         .error_for_status()

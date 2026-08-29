@@ -25,7 +25,9 @@ static POLLER_FSM_SHADOW: LazyLock<bool> = LazyLock::new(|| {
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
-use crate::outputs::traits::{OutputStatus, OutputTarget, TransportState};
+use crate::outputs::traits::{
+    OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget, TransportState,
+};
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
 /// Upper bound on a single `get_status` poll (device lock + transport call).
@@ -48,13 +50,25 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 /// stalling every zone behind one dead device. The bound covers the lock
 /// acquisition too: an orchestrator call hung inside the same output must not
 /// stall the poller either.
-async fn get_status_bounded(
+/// Bounded status lock with the synchronous runtime
+/// signal observation captured before releasing the output. Taking both under
+/// one lock prevents the UI from combining a status from one track with the
+/// signal contract of the next one.
+async fn get_status_with_signal_path_bounded(
     output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
     timeout: Option<Duration>,
-) -> Result<OutputStatus, String> {
+) -> Result<
+    (
+        OutputStatus,
+        Option<OutputSignalPathStatus>,
+        Option<OutputDspMetrics>,
+    ),
+    String,
+> {
     let poll = async {
         let output = output_arc.lock().await;
-        output.get_status().await
+        let status = output.get_status().await?;
+        Ok((status, output.signal_path_status(), output.dsp_metrics()))
     };
     match timeout {
         Some(t) => tokio::time::timeout(t, poll)
@@ -73,6 +87,16 @@ pub struct ZonePollerMetrics {
     pub consecutive_errors: u8,
     pub last_latency_ms: u32,
     pub max_latency_ms: u32,
+    /// L'appareil annonce toujours jouer alors que la position est arrivee a la
+    /// fin de la piste — ou l'a depassee — depuis [`DEPASSEMENT_DUREE_TICKS`]
+    /// ticks consecutifs (#2493).
+    ///
+    /// Champ de CONSTAT, jamais de commande : rien dans le sondeur ne s'appuie
+    /// dessus pour avancer ou arreter une piste. Il existe pour qu'un
+    /// diagnostic de zone cesse d'affirmer une lecture normale quand Tune sait
+    /// deja qu'elle ne l'est pas — soit la lecture est bloquee, soit la duree
+    /// connue est fausse, et le sondeur ne peut pas trancher entre les deux.
+    pub lecture_au_dela_de_la_duree: bool,
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
@@ -80,6 +104,44 @@ const POLL_INTERVAL_MS: u64 = 1000;
 /// deux tentatives quand l'appareil ne répond plus. Assez pour cesser de le
 /// noyer, assez court pour repérer une lecture démarrée depuis sa façade.
 const IDLE_BACKOFF_MAX_SHIFT: u8 = 5;
+/// Cadence de sondage d'une zone **arrêtée dont le renderer répond**, en
+/// secondes d'horloge murale.
+///
+/// Une zone qui ne joue rien n'est sondée que pour une seule raison : repérer
+/// une lecture démarrée hors de Tune (façade de l'appareil, autre
+/// application). Tout ce que la branche « repos » sait faire est verrouillé
+/// derrière un transport ACTIF — l'adoption du volume réglé sur l'appareil
+/// comme la reprise d'état exigent l'une et l'autre
+/// `status.state == TransportState::Playing`. Face à un renderer qui répond
+/// `Stopped`, les trois actions SOAP d'un tick ne produisent donc rien, et
+/// elles partaient chaque seconde, indéfiniment : sur une installation qui se
+/// repose 20 h par jour pour 4 h de lecture, c'est le premier poste de
+/// dépense UPnP, loin devant la lecture elle-même (#2263).
+///
+/// Ce qui est échangé : le délai de détection d'une lecture lancée depuis la
+/// façade de l'appareil passe de 1 s à 5 s au pire. Dès que le renderer
+/// annonce autre chose que `Stopped`, la cadence repart à plein régime au
+/// tick suivant — reprise d'état, synchronisation du volume et détection de
+/// conflit gardent exactement le rythme qu'elles ont aujourd'hui.
+///
+/// Écrit en secondes, converti en ticks à la compilation. `POLL_INTERVAL_MS`
+/// est le facteur de conversion implicite entre les garde-fous du sondeur
+/// comptés en ticks et ceux comptés en horloge murale ; poser « 5 ticks » ici
+/// aurait ajouté un garde-fou de plus à la première famille, celle qui se
+/// désaccorde en silence le jour où la cadence devient réglable.
+const IDLE_REPOS_POLL_SECS: u64 = 5;
+/// [`IDLE_REPOS_POLL_SECS`] exprimé en ticks de sondeur. Jamais zéro : une
+/// cadence de repos plus courte qu'un tick vaut « à chaque tick ».
+const IDLE_REPOS_POLL_TICKS: u8 = {
+    let ticks = (IDLE_REPOS_POLL_SECS * 1000).div_ceil(POLL_INTERVAL_MS);
+    if ticks == 0 {
+        1
+    } else if ticks > u8::MAX as u64 {
+        u8::MAX
+    } else {
+        ticks as u8
+    }
+};
 const GAPLESS_WINDOW_MS: u64 = 30_000;
 
 /// Au-dela de ce delai, une piste mise en attente n'est plus fiable et doit
@@ -97,6 +159,12 @@ const GAPLESS_WINDOW_MS: u64 = 30_000;
 /// Confortablement sous les 300 s : repreparer coute un transcodage, se
 /// tromper coute un blanc et une zone arretee.
 const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
+
+/// Fenêtre minimale entre deux relances automatiques « démarrage mort »
+/// (#2394) sur une même zone. Assez longue pour qu'un second échec dans la
+/// foulée signifie « l'appareil est vraiment planté, on coupe » ; assez
+/// courte pour redonner sa chance à l'album suivant.
+const DEAD_START_RETRY_COOLDOWN_SECS: u64 = 180;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -110,6 +178,12 @@ const MIN_SERVED_PERCENT_FOR_NATURAL_END: u64 = 90;
 /// de reprendre sa lecture. Passé ce délai, la lecture a réellement échoué : on
 /// arrête la zone bruyamment au lieu d'avancer en silence.
 const STALL_DECLINE_MAX_TICKS: u8 = 10;
+/// Consecutive ~1 s polls for which a DLNA renderer claims `Playing` while
+/// neither its position nor Tune's served-byte counter moves.  The detector is
+/// armed only after the normal load grace and after position has demonstrably
+/// advanced once, so slow starts and renderers with no position support remain
+/// outside its scope.
+const PLAYING_STALL_THRESHOLD: u8 = 30;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -133,6 +207,12 @@ const STOPPED_FAILURE_THRESHOLD: u8 = 30;
 /// take 5-15 seconds before the renderer receives any audio data.
 const TRACK_LOAD_GRACE_SECS: u64 = 45;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
+/// How many consecutive unplayable queue items the auto-advance will skip
+/// before giving up and stopping the zone. One or two dead tracks in an album
+/// is ordinary (a title pulled from the catalogue); a long run means something
+/// systemic — expired credentials, no network — where retrying once per queued
+/// item would just hammer the service.
+const MAX_CONSECUTIVE_SKIPS: u32 = 25;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
@@ -175,6 +255,17 @@ const POSITION_PAST_END_TICKS: u8 = 3;
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
 const POLL_FAIL_END_MIN_ERRORS: u8 = 2;
+/// Ticks de scrutation (~1 s) pendant lesquels la position doit rester collee a
+/// la fin — ou au-dela — avant que Tune ose DIRE que l'etat annonce ne veut plus
+/// rien dire (#2493).
+///
+/// Vingt fois [`POSITION_PAST_END_TICKS`] : tous les detecteurs de fin de piste
+/// agissent en trois ticks. Ce compteur ne commence donc a compter que la ou ils
+/// ont TOUS deja renonce, et n'atteint son seuil qu'une minute plus tard. Une
+/// transition sans blanc, une reprise apres pause, une fin de piste normale sont
+/// toutes reglees bien avant — le compteur repart de zero a chaque changement de
+/// piste et des que la position quitte la zone de fin.
+const DEPASSEMENT_DUREE_TICKS: u8 = 60;
 /// After a gapless metadata advance (the poller called advance_queue_metadata
 /// expecting the renderer to auto-transition), if the renderer stays Stopped
 /// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
@@ -185,6 +276,20 @@ const GAPLESS_STUCK_THRESHOLD: u8 = 2;
 /// does not overwrite the volume with the renderer-reported value. Prevents
 /// the slider from bouncing back on DLNA renderers with latent GetVolume.
 const VOLUME_GRACE_SECS: u64 = 5;
+
+/// Délai au-delà duquel une lecture dont pas un octet n'a été tiré n'est plus
+/// un démarrage lent mais un silence établi.
+///
+/// C'est le seuil que `output_reach` utilisait déjà pour dire
+/// `browser_unattended` au client (`tune-server/src/routes/zones.rs`) : le
+/// client web branche son `<audio>` sur `stream_url` dès qu'il a l'état de la
+/// zone, et les premiers octets partent en une seconde ou deux. Douze secondes
+/// laissent de la marge à un poste lent sans laisser l'utilisateur dans le noir.
+///
+/// Il vit ici, dans `tune-core`, parce que le poller et la vue des zones
+/// doivent trancher au MÊME instant : deux seuils, et le serveur dirait à la
+/// fois « personne ne reçoit ce son » et « en lecture ».
+pub const DELAI_SILENCE_ETABLI: Duration = Duration::from_secs(12);
 
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
@@ -197,16 +302,136 @@ const VOLUME_GRACE_SECS: u64 = 5;
 /// faithful and seeds the future poller state machine (Axe 2): the FSM
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
+    /// Qui tient réellement le renderer, d'après l'URI qu'il rapporte.
+    ///
+    /// Le terrain (24/08, DMP-A8 de Bertrand) : DEUX serveurs Tune avaient
+    /// chacun une zone sur le même appareil, et le lecteur interne de
+    /// l'Eversolo s'y ajoutait après un redémarrage. Chaque perdant échouait
+    /// EN SILENCE — l'interface relançait la lecture toutes les quinze
+    /// secondes, et un conflit d'appareil s'est déguisé en « bug DSD ».
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TenueDuRenderer {
+        /// Il joue notre flux — ou ne rapporte rien d'exploitable.
+        LeNotre,
+        /// Il joue le flux d'un AUTRE serveur Tune (l'hôte extrait de l'URI).
+        AutreServeurTune(String),
+        /// Il joue autre chose (BubbleUPnP, une autre application…).
+        AutreApplication,
+        /// URI vide mais transport actif : son propre lecteur interne
+        /// (l'Eversolo restaure sa lecture locale après un redémarrage).
+        LecteurInterne,
+    }
+
+    /// Décide qui tient le renderer.
+    ///
+    /// - `current_uri = None` → [`TenueDuRenderer::LeNotre`] : beaucoup de
+    ///   renderers ne rapportent pas `TrackURI` — l'absence de signal n'est
+    ///   pas une preuve, on ne crie pas sans preuve ;
+    /// - URI vide → lecteur interne (ne se juge que transport actif, c'est à
+    ///   l'appelant de ne demander qu'alors) ;
+    /// - URI portant NOTRE `stream_id` → à nous ;
+    /// - URI au motif `/stream/…` d'un flux Tune, sans notre id → un autre
+    ///   serveur Tune, dont on extrait l'hôte pour le NOMMER à l'écran ;
+    /// - toute autre URI → une autre application.
+    pub fn qui_tient_le_renderer(
+        current_uri: Option<&str>,
+        notre_stream_id: Option<&str>,
+    ) -> TenueDuRenderer {
+        let Some(uri) = current_uri else {
+            return TenueDuRenderer::LeNotre;
+        };
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return TenueDuRenderer::LecteurInterne;
+        }
+        if let Some(sid) = notre_stream_id
+            && !sid.is_empty()
+            && uri.contains(sid)
+        {
+            return TenueDuRenderer::LeNotre;
+        }
+        if uri.contains("/stream/") {
+            let hote = uri
+                .strip_prefix("http://")
+                .or_else(|| uri.strip_prefix("https://"))
+                .and_then(|r| r.split('/').next())
+                .unwrap_or("?")
+                .to_string();
+            return TenueDuRenderer::AutreServeurTune(hote);
+        }
+        TenueDuRenderer::AutreApplication
+    }
+
     use super::{
-        GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS,
-        MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS, MIN_WALL_FRACTION_FOR_NATURAL_END,
-        POLL_FAIL_END_MIN_ERRORS,
+        DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
+        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
+        POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD,
     };
 
     /// Margin (ms) added to the track duration before position-based
     /// end-of-track is accepted, to avoid clipping the last fraction of a
     /// second on renderers that report position slightly ahead of playback.
     pub const END_MARGIN_MS: u64 = 3000;
+
+    /// Motif — stable, journalisé — de la branche qui a conclu « la piste est
+    /// finie ». Un seul mot par branche, écrit tel quel dans `track_end_gap`.
+    ///
+    /// Ce ne sont PAS des étiquettes décoratives : chaque branche porte un
+    /// plancher de silence différent (voir [`plancher_de_detection_ms`]), et
+    /// c'est ce plancher qui décide si un blanc de 3-4 s est explicable par la
+    /// détection ou s'il vient d'ailleurs (#2488).
+    pub mod motif_fin {
+        /// La sortie locale a signalé l'EOF elle-même (`ended_naturally`).
+        pub const FIN_NATURELLE_LOCALE: &str = "local_ended_naturally";
+        /// DSD sur DLNA : le pic de position a atteint la fin (#402).
+        pub const DSD_DLNA_PIC_ATTEINT: &str = "dlna_dsd_reached_end";
+        /// Le renderer annonce `Stopped` et le compteur a atteint son seuil.
+        pub const FIN_NATURELLE_APRES_STOPPED: &str = "natural_end_after_stopped";
+        /// Le renderer avait accepté `SetNext` mais n'a jamais transitionné.
+        pub const AVANCE_GAPLESS_BLOQUEE: &str = "gapless_advance_stuck";
+        /// La position a dépassé la fin sans que le renderer s'arrête.
+        pub const POSITION_AU_DELA_DE_LA_FIN: &str = "position_past_end";
+    }
+
+    /// Plancher de silence, en millisecondes, imposé par la BRANCHE de
+    /// détection qui a conclu — avant même que la résolution de la piste
+    /// suivante ne commence.
+    ///
+    /// Pourquoi ce chiffre existe (#2488) : `playback_timing` démarre à
+    /// `play_inner`, c'est-à-dire APRÈS que le sondeur a décidé d'avancer.
+    /// Tout ce qui précède cette décision est aujourd'hui invisible dans le
+    /// journal, alors que c'est structurellement le plus gros terme du blanc
+    /// entre deux pistes. Cette fonction rend ce terme lisible sans avoir à
+    /// relire la source : elle ne dérive que des constantes du sondeur.
+    ///
+    /// C'est un PLANCHER, pas une mesure : le temps réel s'y ajoute (un tick
+    /// n'est pas aligné sur la fin du morceau, et le réseau a son mot à dire).
+    ///
+    /// Un motif inconnu rend `0` — on ne devine pas.
+    pub fn plancher_de_detection_ms(motif: &str) -> u64 {
+        let tick = POLL_INTERVAL_MS;
+        match motif {
+            // La sortie locale réveille le sondeur par `TRACK_END_NOTIFY`
+            // au lieu d'attendre le tick : aucun plancher de sondage.
+            motif_fin::FIN_NATURELLE_LOCALE => 0,
+            // Il faut UN sondage pour observer que le pic a atteint la fin.
+            motif_fin::DSD_DLNA_PIC_ATTEINT => tick,
+            // Le compteur `stopped_ticks` doit atteindre son seuil.
+            motif_fin::FIN_NATURELLE_APRES_STOPPED => STOPPED_TICKS_THRESHOLD as u64 * tick,
+            // Compté depuis la fin de la temporisation gapless, qui s'ajoute
+            // encore devant : le renderer a accepté `SetNext` puis n'a rien
+            // fait, et on attend `GAPLESS_STUCK_THRESHOLD` sondages.
+            motif_fin::AVANCE_GAPLESS_BLOQUEE => GAPLESS_STUCK_THRESHOLD as u64 * tick,
+            // La position doit d'abord dépasser la fin de `END_MARGIN_MS`
+            // — autant de silence déjà écoulé — puis tenir
+            // `POSITION_PAST_END_TICKS` sondages.
+            motif_fin::POSITION_AU_DELA_DE_LA_FIN => {
+                END_MARGIN_MS + POSITION_PAST_END_TICKS as u64 * tick
+            }
+            _ => 0,
+        }
+    }
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -286,6 +511,78 @@ pub(crate) mod decisions {
         }
     }
 
+    /// « Démarrage mort » (#2394) : l'échec de lecture DLNA où la piste n'a
+    /// JAMAIS été tirée (0 octet servi). C'est le profil du pipeline Eversolo
+    /// coincé — SOAP et HTTP vivants, lecture morte — que la relance guérit.
+    /// Un décrochage en cours de lecture (octets déjà servis) n'en est pas un.
+    pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
+        output_type == "dlna" && bytes_sent == 0
+    }
+
+    /// Is a `Playing`-but-dead watchdog meaningful for this sample?
+    ///
+    /// Every gate removes a known false positive: this is DLNA-only, Tune must
+    /// own an actual realtime stream, startup and seek recovery must be over,
+    /// the renderer must already have proven that it reports position, and a
+    /// known track end is left to the normal end-of-track machinery.
+    pub fn dlna_playing_stall_eligible(
+        output_type: &str,
+        tune_is_playing: bool,
+        renderer_is_playing: bool,
+        realtime: bool,
+        has_stream_id: bool,
+        in_seek_grace: bool,
+        load_elapsed_secs: u64,
+        peak_position_ms: u64,
+        position_ms: u64,
+        track_duration_ms: u64,
+    ) -> bool {
+        let near_known_end =
+            track_duration_ms > 0 && position_ms.saturating_add(END_MARGIN_MS) >= track_duration_ms;
+        output_type == "dlna"
+            && tune_is_playing
+            && renderer_is_playing
+            && realtime
+            && has_stream_id
+            && !in_seek_grace
+            && load_elapsed_secs >= super::TRACK_LOAD_GRACE_SECS
+            && peak_position_ms >= 5_000
+            && !near_known_end
+    }
+
+    /// Advance the consecutive-stall counter only when both independent signs
+    /// of life are frozen. Any movement resets the full observation window.
+    pub fn next_dlna_playing_stall_ticks(
+        previous_ticks: u8,
+        eligible: bool,
+        previous_position_ms: u64,
+        position_ms: u64,
+        previous_bytes_sent: u64,
+        bytes_sent: u64,
+    ) -> u8 {
+        if !eligible || position_ms > previous_position_ms || bytes_sent > previous_bytes_sent {
+            0
+        } else {
+            previous_ticks.saturating_add(1)
+        }
+    }
+
+    /// Une relance automatique après démarrage mort est-elle permise ?
+    /// Au plus une par fenêtre : si la précédente date de moins de
+    /// DEAD_START_RETRY_COOLDOWN_SECS, l'échec suivant coupe la zone comme
+    /// avant — on ne martèle pas un appareil réellement planté ou éteint.
+    pub fn relance_demarrage_mort_autorisee(derniere_il_y_a_secs: Option<u64>) -> bool {
+        derniere_il_y_a_secs.is_none_or(|s| s > DEAD_START_RETRY_COOLDOWN_SECS)
+    }
+
+    /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
+    /// tient que pour LA position de file constatée : si la file bouge (ajout,
+    /// saut, avance), la position suivante change et on re-résout — au pire on
+    /// perd UNE occasion d'armer le gapless (petit blanc), jamais une lecture.
+    pub fn dsd_skip_latched(latch: Option<i64>, next_pos: Option<i64>) -> bool {
+        latch.is_some() && latch == next_pos
+    }
+
     /// Position dropped from `>30s` to `<5s` while a gapless transition was
     /// armed — a strong signal the renderer auto-advanced to the next track.
     pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
@@ -301,8 +598,15 @@ pub(crate) mod decisions {
     /// and steals the event from the natural-end path (Stopped branch →
     /// play_from_queue = real load), causing the endless 1-2s-then-zero loop
     /// (Rhorn, #1072). So the fallback only fires for internal-gapless outputs.
-    pub fn position_reset_fires(raw_position_reset: bool, can_internal_gapless: bool) -> bool {
-        raw_position_reset && can_internal_gapless
+    /// It is also forbidden during the seek grace period: recreating the current
+    /// stream can produce the same position-drop shape, but it never means the
+    /// renderer moved to the next queue item (#2170).
+    pub fn position_reset_fires(
+        raw_position_reset: bool,
+        can_internal_gapless: bool,
+        in_seek_grace: bool,
+    ) -> bool {
+        raw_position_reset && can_internal_gapless && !in_seek_grace
     }
 
     /// A renderer can report the PREVIOUS session's position for the first
@@ -520,6 +824,45 @@ pub(crate) mod decisions {
             && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// UN tick ou l'etat annonce se contredit lui-meme : la piste a une duree
+    /// connue, et la position rapportee est arrivee a la fin — ou l'a depassee —
+    /// alors que l'appareil dit toujours jouer (#2493, Tades : 1'46 « en
+    /// lecture » depuis dix minutes sur une Serenade/upmpdcli).
+    ///
+    /// Ce predicat ne DECIDE rien : l'appelant s'en sert uniquement pour
+    /// compter, puis pour le DIRE. Aucune piste n'est avancee ni arretee par ce
+    /// chemin, et c'est delibere — la meme forme est produite par deux causes
+    /// qu'aucune horloge ne sait distinguer :
+    ///
+    /// - la lecture est reellement bloquee (le renderer ment sur son etat) ;
+    /// - la duree que Tune connait est FAUSSE (etiquette erronee, piste plus
+    ///   longue que ce que le scan a mesure) et la lecture est parfaitement
+    ///   valide.
+    ///
+    /// Couper dans le second cas amputerait une ecoute legitime. On se contente
+    /// donc de cesser d'affirmer ce qu'on ne sait pas.
+    ///
+    /// Ce que le predicat refuse de qualifier :
+    /// - `source_radio` : un flux de radio n'a pas de fin, sa position n'a rien
+    ///   a depasser ;
+    /// - `duree_connue_ms` nulle ou derisoire : sans duree il n'y a pas de
+    ///   depassement possible — le seuil reprend celui de [`past_end_reached`]
+    ///   ([`END_MARGIN_MS`]) pour que les deux parlent de la meme « fin ».
+    ///
+    /// La duree passee par l'appelant est la duree EFFECTIVE
+    /// (`max(file d'attente, sane_current_duration)`) : une duree de base trop
+    /// courte face a un renderer credible est deja elargie la, donc le cas « le
+    /// scan a sous-estime la piste » ne remonte meme pas jusqu'ici.
+    pub fn position_au_dela_de_la_duree(
+        source_radio: bool,
+        duree_connue_ms: u64,
+        position_ms: u64,
+    ) -> bool {
+        !source_radio
+            && duree_connue_ms > END_MARGIN_MS
+            && position_ms.saturating_add(END_MARGIN_MS) >= duree_connue_ms
+    }
+
     /// Position to persist for auto-resume. A position within `END_MARGIN_MS`
     /// of the track end means the track is effectively complete; persist 0 so a
     /// later auto-resume plays it from the start instead of seeking into the
@@ -572,6 +915,87 @@ pub(crate) mod decisions {
 
     /// Should the poller dispatch a scrobble this tick?
     ///
+    /// L'echeance de sondage d'une radio est-elle atteinte ?
+    ///
+    /// Ne prend PAS l'etat du transport en parametre, et c'est tout l'objet du
+    /// correctif : le titre diffuse se lit sur une API externe ou dans le flux
+    /// ICY, independamment de ce que fait le renderer. Seul le TEMPS ecoule
+    /// commande — le tick du poller est a la seconde, l'API de la station non.
+    pub fn radio_poll_due(since_last: std::time::Duration, interval_secs: u64) -> bool {
+        since_last >= std::time::Duration::from_secs(interval_secs)
+    }
+
+    /// Faut-il rafraichir les metadonnees radio d'une zone qui n'a AUCUN
+    /// peripherique de sortie ?
+    ///
+    /// Trois conditions, et la troisieme est celle qu'on oublie : la zone joue,
+    /// la source est une radio, et l'etranglement est echu. Sans le dernier
+    /// point on interrogerait l'API de la station a chaque tick du poller,
+    /// c'est-a-dire toutes les secondes.
+    ///
+    /// Le cas `source != "radio"` n'est pas theorique : une zone navigateur qui
+    /// joue un fichier local passe ici a chaque tick et ne doit declencher
+    /// aucun appel reseau.
+    pub fn deviceless_radio_refresh_due(
+        is_playing: bool,
+        source: Option<&str>,
+        since_last_poll: std::time::Duration,
+        interval_secs: u64,
+    ) -> bool {
+        is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
+    }
+
+    /// Une lecture sans destination doit-elle cesser d'être annoncée ?
+    ///
+    /// Une zone sans périphérique de sortie prépare son flux, renonce à
+    /// l'envoyer (`no_output_device_id_skipping_send_to_output`) et passe
+    /// quand même en lecture : `orchestrator_play … output_sent=false`. Rien
+    /// ne revenait ensuite sur cet état — la branche « pas de périphérique »
+    /// du poller se termine par un `continue` — et la zone restait annoncée
+    /// « en cours » indéfiniment, barre de progression comprise (#2630,
+    /// journal de Pierre M).
+    ///
+    /// **Ce que ce prédicat ne regarde surtout pas : la présence d'un
+    /// périphérique.** Une zone navigateur n'en a JAMAIS — sa sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. Une garde « pas de
+    /// périphérique ⇒ pas de lecture » les rendrait toutes muettes ; c'est la
+    /// régression exacte de `70401f2d`, réparée par #2657. Le seul fait
+    /// observable est la CONSOMMATION du flux, et c'est la même preuve que
+    /// `output_reach` utilise déjà pour dire `browser_unattended`.
+    ///
+    /// On n'abandonne donc que sur des faits POSITIFS :
+    /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
+    ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
+    ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
+    /// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+    ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
+    ///   de silence : on laisse la lecture tranquille.
+    ///
+    /// Le sens du doute est celui de #2657 : on préfère taire un silence réel
+    /// que d'en inventer un.
+    pub fn lecture_sans_destination_abandonnee(
+        depuis_le_demarrage: Option<std::time::Duration>,
+        octets_servis: Option<u64>,
+    ) -> bool {
+        depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
+            && octets_servis == Some(0)
+    }
+
+    /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?
+    ///
+    /// Vrai des que l'ecoute vient d'un service de streaming. Le repli
+    /// streaming existait deja (#1443) mais restait conditionne a « rien
+    /// trouve en local » : chez qui possede une bibliotheque locale ET un
+    /// abonnement, le generateur local repondait presque toujours quelque
+    /// chose, et l'autoplay renvoyait donc des titres locaux au milieu d'une
+    /// ecoute Qobuz (Sandro, 0.9.70).
+    ///
+    /// La source de la piste en cours est la meilleure expression de ce que
+    /// l'auditeur ecoute : on la suit, et le local reste le filet.
+    pub fn autoplay_prefers_streaming(source: Option<&str>) -> bool {
+        matches!(source, Some(s) if !s.is_empty() && s != "local")
+    }
+
     /// True when the playing track differs from the one already latched
     /// (`latched_key`) AND it has genuinely been listened past the Last.fm
     /// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
@@ -669,6 +1093,33 @@ pub(crate) mod decisions {
                 >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 
+    /// Fin de piste à l'horloge murale pour un renderer DLNA au poll SAIN qui
+    /// gèle sa position dans la zone de fin sans jamais la dépasser ni passer
+    /// STOPPED (Villerio, Eversolo DMP-A6, 25/08 : SetNext acquitté jamais
+    /// honoré, PLAYING éternel, position figée exactement à la durée).
+    /// `past_end_reached` exige la position AU-DELÀ de durée+marge,
+    /// `wall_clock_past_end` exige une durée rapportée nulle, et
+    /// `duration_changed` attend un changement qui ne vient pas : aucun ne
+    /// couvre ce gel. Garde-fous : pic ≥ 80 % (le trajet jusqu'à la fin fut
+    /// honnête), position ÉPINGLÉE en zone de fin (une vraie transition
+    /// gapless la ramène près de zéro — pas de double-play), et l'horloge de
+    /// Tune ayant réellement dépassé durée + marge à 1x. L'appelant exige
+    /// toujours `POSITION_PAST_END_TICKS` coups consécutifs.
+    pub fn dlna_frozen_at_end_wall_clock(
+        is_dlna: bool,
+        played_enough: bool,
+        track_duration_ms: u64,
+        position_ms: u64,
+        wall_elapsed_secs: u64,
+    ) -> bool {
+        is_dlna
+            && played_enough
+            && track_duration_ms > END_MARGIN_MS
+            && position_ms.saturating_add(2000) >= track_duration_ms
+            && wall_elapsed_secs.saturating_mul(1000)
+                >= track_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+
     /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
     /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
     /// `get_status` returns `Err` and Tune gets NO transport state, position, or
@@ -708,6 +1159,103 @@ pub(crate) mod decisions {
             && queue_duration_ms > END_MARGIN_MS
             && wall_elapsed_secs.saturating_mul(1000)
                 >= queue_duration_ms.saturating_add(END_MARGIN_MS)
+    }
+}
+
+/// #2493 — Tades : « un morceau de Turapin (1'46) tourne depuis 10 minutes »
+/// (HIFIMAN Serenade, pile UPnP `upmpdcli`, 26/08).
+///
+/// Ce que ces tests tiennent, et ce qu'ils refusent de tenir.
+#[cfg(test)]
+mod depassement_duree_tests {
+    use super::decisions::{END_MARGIN_MS, position_au_dela_de_la_duree};
+
+    /// Duree reelle du morceau du signalement : 1 min 46 s.
+    const TURAPIN_MS: u64 = 106_000;
+    /// Dix minutes : ce que le testeur a vu defiler.
+    const DIX_MINUTES_MS: u64 = 600_000;
+
+    /// La forme du signalement : duree connue, position tres au-dela.
+    #[test]
+    fn position_tres_au_dela_de_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "une position de dix minutes sur une piste de 1'46 doit etre constatee"
+        );
+    }
+
+    /// La forme que l'ecran MONTRE reellement : la position rendue au client est
+    /// plafonnee a la duree (voir le `min(dur)` du sondeur), donc le testeur lit
+    /// « 1:46 / 1:46, en lecture » indefiniment. Le constat doit tenir sur cette
+    /// forme-la aussi, sinon il ne couvre pas le cas observe.
+    #[test]
+    fn position_collee_a_la_duree_est_constatee() {
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS),
+            "position figee EXACTEMENT a la duree : c'est ce que le testeur voit"
+        );
+    }
+
+    /// Une radio n'a pas de fin : sa position ne depasse rien, quelle qu'elle
+    /// soit et quelle que soit la duree que quelqu'un aurait cru y lire.
+    #[test]
+    fn une_radio_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(true, 0, DIX_MINUTES_MS),
+            "radio sans duree : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(true, TURAPIN_MS, DIX_MINUTES_MS),
+            "meme si une duree traine dans les metadonnees, une radio reste hors sujet"
+        );
+        // Contre-epreuve de la garde `source_radio` : memes chiffres, source
+        // ordinaire — la, et la seulement, le constat tombe.
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, DIX_MINUTES_MS),
+            "la garde ne doit tenir QUE sur la radio, sinon elle ne prouve rien"
+        );
+    }
+
+    /// Duree nulle ou derisoire : il n'y a rien a depasser. Le seuil est le meme
+    /// que celui de `past_end_reached` — les deux doivent parler de la meme
+    /// « fin », sans quoi Tune constaterait un depassement la ou son propre
+    /// detecteur de fin de piste ne voit meme pas de piste.
+    #[test]
+    fn une_duree_nulle_ou_absente_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, 0, DIX_MINUTES_MS),
+            "duree inconnue (0) : aucun depassement possible"
+        );
+        assert!(
+            !position_au_dela_de_la_duree(false, END_MARGIN_MS, DIX_MINUTES_MS),
+            "duree egale a la marge de fin : sous le seuil de `past_end_reached`"
+        );
+        // Contre-epreuve : une milliseconde de plus que la marge, et la duree
+        // devient exploitable.
+        assert!(
+            position_au_dela_de_la_duree(false, END_MARGIN_MS + 1, DIX_MINUTES_MS),
+            "juste au-dessus de la marge, la duree redevient une duree"
+        );
+    }
+
+    /// Une lecture ordinaire en plein milieu de piste n'est jamais constatee —
+    /// c'est la garde qui empeche ce chemin de parler a tort une fois par
+    /// seconde sur toutes les zones du parc.
+    #[test]
+    fn une_lecture_en_cours_de_piste_ne_declenche_rien() {
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS / 2),
+            "a mi-piste, rien a signaler"
+        );
+        // Bord exact : la zone de fin commence a duree - END_MARGIN_MS.
+        assert!(
+            !position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS - 1),
+            "une milliseconde AVANT la zone de fin : encore une lecture ordinaire"
+        );
+        assert!(
+            position_au_dela_de_la_duree(false, TURAPIN_MS, TURAPIN_MS - END_MARGIN_MS),
+            "au bord exact de la zone de fin, le constat est possible"
+        );
     }
 }
 
@@ -965,6 +1513,13 @@ pub mod fsm {
                     i.is_dlna,
                     i.reported_duration_ms,
                     i.track_duration_ms,
+                    i.wall_elapsed_secs,
+                )
+                || decisions::dlna_frozen_at_end_wall_clock(
+                    i.is_dlna,
+                    i.played_enough,
+                    i.track_duration_ms,
+                    i.position_ms,
                     i.wall_elapsed_secs,
                 );
         let past_end_track_ended =
@@ -1455,6 +2010,58 @@ pub mod fsm {
         }
 
         #[test]
+        fn un_dmp_fige_a_la_duree_avance_par_horloge_murale() {
+            // Villerio, DMP-A6, 25/08 22:24 : SetNext acquitté mais jamais
+            // honoré ; le renderer reste PLAYING, position figée EXACTEMENT à
+            // la durée (373000 — les stale_start_position du journal), durée
+            // rapportée inchangée. past_end_reached exige position > durée+3s,
+            // wall_clock_past_end exige durée rapportée nulle : aucun ne tire,
+            // la piste ne finit jamais. L'horloge murale de Tune, elle, sait.
+            let i = PlayingInput {
+                track_duration_ms: 373_000,
+                reported_duration_ms: 373_000,
+                played_enough: true,
+                position_ms: 373_000,
+                past_end_ticks: 2,
+                gapless_sent: true,
+                is_dlna: true,
+                wall_elapsed_secs: 380,
+                ..pbase()
+            };
+            assert!(classify_playing(&i).past_end_track_ended);
+
+            // Une VRAIE transition gapless à durées voisines remet la position
+            // près de zéro : la position n'est plus épinglée en zone de fin,
+            // le filet ne doit pas tirer (sinon double-play).
+            assert!(
+                !classify_playing(&PlayingInput {
+                    position_ms: 3_000,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+            // Gel en PLEIN MILIEU de piste (vrai blocage réseau) : pic < 80 %,
+            // on ne conclut pas une fin.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    played_enough: false,
+                    position_ms: 180_000,
+                    wall_elapsed_secs: 380,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+            // L'horloge n'a pas encore dépassé durée + marge : on attend.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    wall_elapsed_secs: 370,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+        }
+
+        #[test]
         fn playing_transition_resets_past_end_counter() {
             // Past-end IS reached, but a detected transition resets the counter
             // to 0 before (D), so no past-end advance this tick.
@@ -1580,10 +2187,21 @@ impl IdlePollBackoff {
         }
     }
 
-    /// Sondage réussi : on repart à plein rythme.
-    fn record_success(&mut self) {
+    /// Sondage réussi. La suite dépend de ce que l'appareil a répondu.
+    ///
+    /// Un transport actif — `Playing`, `Paused`, `Transitioning` — veut dire
+    /// qu'il se passe quelque chose sur l'appareil : plein rythme, comme
+    /// avant. Un transport `Stopped` ne peut rien produire de plus au tick
+    /// suivant qu'à celui-ci (toute la branche « repos » est verrouillée
+    /// derrière un transport actif) : la zone retombe à la cadence de repos
+    /// [`IDLE_REPOS_POLL_TICKS`] jusqu'à ce que l'appareil bouge (#2263).
+    fn record_success(&mut self, etat: TransportState) {
         self.consecutive_errors = 0;
-        self.remaining = 0;
+        self.remaining = if etat == TransportState::Stopped {
+            IDLE_REPOS_POLL_TICKS - 1
+        } else {
+            0
+        };
     }
 
     /// Sondage en échec : recul exponentiel, plafonné.
@@ -1596,6 +2214,13 @@ impl IdlePollBackoff {
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
+    /// Ticks consecutifs ou le renderer rapporte une URI qui n'est pas la
+    /// notre. Trois d'affilee avant de parler : une transition de piste peut
+    /// montrer un instant l'URI precedente.
+    tenue_etrangere_ticks: u8,
+    /// Le conflit a deja ete signale pour cette generation de piste : on ne
+    /// harcele pas l'utilisateur a chaque tick.
+    tenue_signalee: bool,
     /// Ticks to ignore Stopped state after a gapless advance, so the
     /// poller doesn't re-send play_from_queue to a renderer that already
     /// transitioned via SetNextAVTransportURI.
@@ -1668,6 +2293,23 @@ struct ZonePollState {
     /// transition and forces play_from_queue.
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
+    /// Consecutive `Playing` polls with neither renderer position nor served
+    /// bytes progressing. See `decisions::dlna_playing_stall_eligible`.
+    playing_stall_ticks: u8,
+    /// Ticks CONSECUTIFS ou la position rapportee est a la fin de la piste — ou
+    /// au-dela — alors que l'appareil annonce toujours jouer. Voir
+    /// [`decisions::position_au_dela_de_la_duree`] et [`DEPASSEMENT_DUREE_TICKS`].
+    ///
+    /// Compte dans le bras `Playing` uniquement : une zone en pause n'y passe
+    /// pas, donc une pause de vingt minutes ne gonfle pas ce compteur — c'est
+    /// precisement ce que l'horloge murale (`track_started_at`, jamais repliee
+    /// a la reprise) ne sait pas faire. Remis a zero des que la position quitte
+    /// la zone de fin, et a chaque changement de piste.
+    depassement_duree_ticks: u8,
+    /// Latch par piste : l'incoherence a deja ete DITE une fois (journal +
+    /// metrique de zone). Sans lui la boucle ecrirait la meme ligne chaque
+    /// seconde pendant tout le temps que dure le blocage.
+    depassement_duree_signale: bool,
     /// Ticks pendant lesquels on a refusé de conclure à une fin naturelle parce
     /// que le flux servi était manifestement incomplet (voir
     /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
@@ -1694,6 +2336,122 @@ struct ZonePollState {
     /// `None` on a fresh track forces one line per track — so it never spams at
     /// the ~1 s tick rate. Read-only diagnostic; drives no playback decision.
     gapless_arm_logged: Option<bool>,
+    /// Verrou par piste (#2394) : la position de file pour laquelle
+    /// `prepare_gapless` a constaté « suivant DSD sur DLNA, gapless refusé ».
+    /// Sans lui, la fenêtre d'armement re-résout la piste suivante À CHAQUE
+    /// tick — création puis destruction d'une session fichier par seconde
+    /// pendant toute la fin d'une piste DSD (constaté sur DMP-A8, 96
+    /// occurrences en 2 h). On ne peut PAS poser `gapless_sent = true` comme
+    /// pour la sortie exclusive : sur DLNA, ce drapeau active les détecteurs
+    /// de transition (durée/position) et le DMP-A8 rapporte des durées
+    /// inexactes — fausse transition garantie. Cleared au changement de
+    /// génération et à chaque transition, comme `gapless_arm_logged`.
+    gapless_dsd_skip_pos: Option<i64>,
+}
+
+impl ZonePollState {
+    /// Etat de sondage neuf pour une zone qui vient d'entrer en lecture.
+    ///
+    /// Etait construit en ligne, champ par champ, a un seul endroit. Il en
+    /// faut desormais deux — la zone avec peripherique et celle sans — et
+    /// recopier vingt-neuf champs est le genre de chose qui diverge en
+    /// silence.
+    fn new(track_generation: u64) -> Self {
+        Self {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
+            peak_position_ms: 0,
+            scrobbled_key: None,
+            ticks_since_db_save: 0,
+            track_started_at: None,
+            last_seek_seen: None,
+            track_generation: track_generation,
+            track_loaded_at: Instant::now(),
+            past_end_ticks: 0,
+            gapless_advance_pending: false,
+            gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
+            stall_declines: 0,
+            radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
+            last_device_volume: None,
+            wall_clock_end_fired: false,
+            gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
+        }
+    }
+}
+
+/// Issue de `prepare_gapless` : distinguer « rien à armer / échec (re-tenter
+/// au prochain tick) » de « suivant DSD sur DLNA (inutile de re-tenter pour
+/// cette position — verrou `gapless_dsd_skip_pos`, #2394) ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaplessPrep {
+    Armed,
+    DsdNextSkipped,
+    NotArmed,
+}
+
+/// Retrouver en base la station qui joue, a partir du `source_id` du
+/// now-playing.
+///
+/// Le `source_id` d'une radio n'a pas UNE forme mais deux, et c'est tout le
+/// probleme : l'identifiant numerique de la ligne, ou l'URL du flux.
+pub(crate) fn station_du_now_playing(
+    repo: &crate::db::radio_repo::RadioRepo,
+    source_id: &str,
+) -> Option<crate::db::radio_repo::RadioStation> {
+    if let Ok(id) = source_id.parse::<i64>() {
+        if let Ok(Some(station)) = repo.get(id) {
+            return Some(station);
+        }
+    }
+    // Et par URL de flux, qui est ce que le chemin de lecture normal écrit :
+    // `POST /radios/{id}/play/{zone_id}` pose `source_id: Some(radio.url)`.
+    // Ne chercher que par identifiant numérique revenait à ne jamais chercher.
+    repo.get_by_url(source_id).ok().flatten()
+}
+
+/// Choisir la vignette d'un pas de radio.
+///
+/// « Un pas » et non « un morceau » : entre deux chansons il y a des
+/// chroniques, des jingles, des flashs — des pas qui n'ont pas de pochette.
+///
+/// Deux pas, et deux seulement : la pochette du morceau quand la station la
+/// donne (Bertrand : « mettre la pochette de l'album et non le logo de la
+/// radio »), le logo de la station sinon. **Et rien après.** Se rabattre sur
+/// la pochette COURANTE serait recycler celle du pas précédent : dès qu'un
+/// titre en a posé une, `cover_path` la porte, et la chronique qui suit
+/// l'hériterait puis la garderait. On n'illustre pas le journal de 13 h avec
+/// la chanson d'avant : mieux vaut le micro générique qu'une pochette fausse.
+///
+/// Une chaîne vide ne compte pas pour une valeur — `Option::or` ne le voit
+/// pas, `Some("")` gagne contre `None` et l'on publie une URL vide.
+pub(crate) fn vignette_du_pas_radio(
+    pochette_titre: Option<&str>,
+    logo_station: Option<&str>,
+) -> Option<String> {
+    let renseigne = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    renseigne(pochette_titre).or_else(|| renseigne(logo_station))
 }
 
 pub struct PositionPoller {
@@ -1703,6 +2461,12 @@ pub struct PositionPoller {
     db: Arc<dyn crate::db::backend::DbBackend>,
     shared_metrics: PollerMetricsMap,
     event_bus: Option<Arc<crate::event_bus::EventBus>>,
+    /// Horodatage de la dernière relance automatique après « démarrage mort »
+    /// par zone (#2394). Vit HORS de ZonePollState : la relance recrée l'état
+    /// de sondage, un drapeau dedans repartirait à zéro et bouclerait. Une
+    /// relance au plus par fenêtre de DEAD_START_RETRY_COOLDOWN_SECS ; si la
+    /// relance échoue à son tour, la zone est coupée comme avant.
+    relances_demarrage_mort: Mutex<std::collections::HashMap<i64, Instant>>,
 }
 
 impl PositionPoller {
@@ -1720,6 +2484,7 @@ impl PositionPoller {
             db,
             shared_metrics,
             event_bus: None,
+            relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1736,6 +2501,8 @@ impl PositionPoller {
             let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
             let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
+            // Derniere valeur annoncee de `levels_available`, par zone.
+            let mut niveaux_annonces: HashMap<i64, bool> = HashMap::new();
 
             loop {
                 // Wake on either the regular 1-second tick OR an immediate
@@ -1746,8 +2513,244 @@ impl PositionPoller {
                 }
                 self.tick(&mut poll_states, &mut idle_backoff, &startup_at)
                     .await;
+                self.annoncer_bascule_des_niveaux(&mut niveaux_annonces)
+                    .await;
             }
         })
+    }
+
+    /// Rafraichit le titre/interprete d'une zone qui joue une radio.
+    ///
+    /// Extrait de la boucle de sondage pour pouvoir servir DEUX appelants : la
+    /// zone qui a un peripherique de sortie, et celle qui n'en a pas. La
+    /// seconde n'etait servie par personne — voir l'appel dans `tick`.
+    ///
+    /// Le choix de la vignette et la recherche de la station vivent dans
+    /// [`vignette_du_pas_radio`] et [`station_du_now_playing`] : les deux se
+    /// prouvent hors reseau, ce que cette fonction-ci ne permet pas.
+    async fn refresh_radio_metadata(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
+        // Radio metadata polling (title/artist from ICY or external)
+        if let Some(ref np) = zone_state.now_playing {
+            if np.source == "radio" {
+                if let Some(ref source_id) = np.source_id {
+                    // source_id is either a numeric radio DB id or the stream URL itself
+                    // Le logo de la station sert de REPLI quand le titre en
+                    // cours n'a pas de pochette. Il faut le relire ici et non
+                    // reprendre `np.cover_path` : dès qu'un titre a posé sa
+                    // pochette, `cover_path` la porte, et le titre suivant —
+                    // une chronique, un jingle — hériterait de la pochette du
+                    // précédent au lieu de revenir au logo.
+                    let radio_repo =
+                        crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
+                    let mut logo_station: Option<String> = None;
+                    let (station_name, stream_url) =
+                        if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
+                            logo_station = station.logo_url.clone();
+                            (station.name.clone(), station.url.clone())
+                        } else {
+                            // Station introuvable en base : on retombe sur
+                            // `album_title`, qui porte le nom de la station et
+                            // survit aux mises a jour (`np.title`, lui, prend
+                            // le titre du morceau des le premier
+                            // rafraichissement).
+                            let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                            (name, source_id.clone())
+                        };
+
+                    if let Some(meta) =
+                        crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
+                            .await
+                    {
+                        // La pochette du titre quand la station la donne, le
+                        // logo sinon. Bertrand : « mettre la pochette de
+                        // l'album et non le logo de la radio ».
+                        let pochette = vignette_du_pas_radio(
+                            meta.cover_url.as_deref(),
+                            logo_station.as_deref(),
+                        );
+                        let title_changed = np.title != meta.title
+                            || np.artist_name != meta.artist
+                            || np.cover_path != pochette;
+                        if title_changed {
+                            let title_for_icy = meta.title.clone();
+                            let artist_for_icy = meta.artist.clone();
+                            let new_np = crate::playback::NowPlaying {
+                                track_id: None,
+                                title: meta.title,
+                                artist_name: meta.artist,
+                                album_title: Some(station_name.clone()),
+                                cover_path: pochette,
+                                duration_ms: 0,
+                                source: "radio".into(),
+                                source_id: np.source_id.clone(),
+                                stream_id: np.stream_id.clone(),
+                                ..Default::default()
+                            };
+                            self.playback.update_now_playing(zone_id, new_np).await;
+                            // Le renderer, lui, ne lit pas le
+                            // now-playing : il reçoit des blocs ICY
+                            // dans le flux. On publie donc aussi le
+                            // titre là où le gestionnaire de flux
+                            // saura le relire, sinon l'appareil
+                            // reste figé sur le morceau qui passait
+                            // à sa connexion.
+                            if let Some(sid) = np.stream_id.as_deref() {
+                                crate::http::streamer::publish_radio_now(
+                                    sid,
+                                    artist_for_icy,
+                                    title_for_icy,
+                                );
+                            }
+                            debug!(zone_id, station = %station_name, "radio_metadata_updated");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Annoncer quand une zone se met — ou cesse — de mesurer ses niveaux.
+    ///
+    /// `levels_available` est calcule a la demande sur les trois surfaces de
+    /// zone, mais le drapeau qui le determine bascule TARD : la tache OAAT ne
+    /// passe en DSD natif qu'apres l'arret, deux secondes d'attente, la
+    /// connexion et la detection du `.dsf`. La reponse HTTP du play est deja
+    /// partie, avec `levels_available: true` — le bon champ restait donc
+    /// invisible pendant exactement la lecture concernee (JP Robbe, revue de
+    /// #2220).
+    ///
+    /// On emet un `zone.updated` SANS donnees inline : le client refetch alors
+    /// toutes ses zones (`App.svelte`, branche de repli des evenements
+    /// `zone.*`). Pas de nouveau type d'evenement, pas de changement cote web.
+    ///
+    /// Le cout est nul pour les zones non-OAAT : `output_produces_levels`
+    /// teste le prefixe `oaat:` avant de prendre le moindre verrou.
+    pub(crate) async fn annoncer_bascule_des_niveaux(&self, dernier: &mut HashMap<i64, bool>) {
+        let Some(ref bus) = self.event_bus else {
+            return;
+        };
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let vus: std::collections::HashSet<i64> = zones.iter().filter_map(|z| z.id).collect();
+        dernier.retain(|zone_id, _| vus.contains(zone_id));
+
+        for zone in &zones {
+            let Some(zone_id) = zone.id else { continue };
+            let dispo = self
+                .orchestrator
+                .output_produces_levels(zone.output_device_id.as_deref())
+                .await;
+            match dernier.get(&zone_id) {
+                Some(&precedent) if precedent == dispo => {}
+                _ => {
+                    // Premier passage compris : une zone deja en DSD natif au
+                    // demarrage du serveur doit s'annoncer elle aussi.
+                    if dernier.insert(zone_id, dispo) != Some(dispo) {
+                        info!(
+                            zone_id,
+                            levels_available = dispo,
+                            "levels_availability_changed"
+                        );
+                        bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Une lecture que personne ne reçoit cesse d'être annoncée « en cours ».
+    ///
+    /// Rend `true` si la zone a été arrêtée. Appelée par le tick UNIQUEMENT
+    /// dans la branche « zone sans périphérique de sortie » : c'est là, et
+    /// seulement là, que l'état « en lecture » ne repose sur rien. Une zone
+    /// avec périphérique a déjà ses propres chiens de garde
+    /// (`output_reported_failure_stopping_zone`,
+    /// `dlna_playing_without_progress_stopping_zone`, `demarrage_mort`).
+    ///
+    /// Le verdict lui-même est dans
+    /// [`decisions::lecture_sans_destination_abandonnee`] — et il ne regarde
+    /// PAS la présence d'un périphérique, seulement la consommation du flux.
+    /// Une zone navigateur dont l'onglet joue sert des octets et n'est jamais
+    /// touchée ici.
+    async fn abandonner_lecture_sans_destination(
+        &self,
+        zone_state: &crate::playback::ZoneState,
+    ) -> bool {
+        let zone_id = zone_state.zone_id;
+        let octets_servis = match zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+        {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        if !decisions::lecture_sans_destination_abandonnee(
+            zone_state.last_play_started_at.map(|t| t.elapsed()),
+            octets_servis,
+        ) {
+            return false;
+        }
+
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten();
+        let navigateur = zone.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+        // La zone navigateur et la zone orpheline produisent le même silence,
+        // mais pas le même geste : ouvrir un onglet, ou attribuer une sortie.
+        // Le message dit lequel. Le second reprend mot pour mot la sentinelle
+        // que le client sait déjà traduire (`zone_no_output_device`).
+        let message = if navigateur {
+            "zone_browser_unattended:No browser tab is playing this zone — open Tune in a browser \
+             on the computer that should play, or give this zone an output device."
+                .to_string()
+        } else {
+            format!(
+                "zone_no_output_device:Zone '{}' has no output device assigned — assign an output \
+                 device to this zone or delete it and re-create it from a device.",
+                zone.as_ref().map(|z| z.name.as_str()).unwrap_or("?")
+            )
+        };
+        warn!(
+            zone_id,
+            navigateur,
+            title = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.title.as_str())
+                .unwrap_or(""),
+            "lecture_sans_destination_abandonnee"
+        );
+        if let Some(ref bus) = self.event_bus {
+            // `fatal` : rien ne se rétablira tout seul, et la zone s'arrête
+            // juste après — sans ce drapeau la fenêtre de grâce d'après-lecture
+            // du client avalerait le message, et l'utilisateur n'aurait, une
+            // fois de plus, que le silence.
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": true,
+                }),
+            );
+        }
+        // Horodater le constat AVANT l'arrêt : c'est l'arrêt lui-même qui
+        // faisait retomber `output_reach` à `"ok"` et effaçait le bandeau
+        // « aucun onglet ne reçoit le son » à l'instant où il devenait vrai
+        // (#2588). La marque survit à l'arrêt ; la lecture suivante l'efface.
+        if navigateur {
+            self.orchestrator
+                .note_browser_unattended(zone_id, true)
+                .await;
+        }
+        // Sans identifiant d'appareil, `stop` prend son repli — celui que
+        // #2658 vient de borner au périmètre de la zone. Avant elle, arrêter
+        // une zone navigateur coupait la musique de TOUTES les autres.
+        self.orchestrator.stop(zone_id, None).await;
+        true
     }
 
     async fn tick(
@@ -1803,9 +2806,21 @@ impl PositionPoller {
                         None => continue,
                     }
                 };
-                match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok(s) => {
-                        idle_backoff.entry(zone_id).or_default().record_success();
+                match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
+                    Ok((s, signal_path, dsp_metrics)) => {
+                        idle_backoff
+                            .entry(zone_id)
+                            .or_default()
+                            .record_success(s.state);
+                        // Le curseur de volume est inerte tant que dure le DoP :
+                        // l'état de zone doit le dire au client (#1735).
+                        self.playback.set_dop_active(zone_id, s.dop_active).await;
+                        self.playback
+                            .set_output_signal_path(zone_id, signal_path)
+                            .await;
+                        self.playback
+                            .set_output_dsp_metrics(zone_id, dsp_metrics)
+                            .await;
                         s
                     }
                     Err(e) => {
@@ -1879,6 +2894,76 @@ impl PositionPoller {
             let already_playing = fresh_states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+
+            // ── Le renderer nous appartient-il encore ? ──
+            //
+            // Deux serveurs Tune sur le même appareil, ou son lecteur interne
+            // qui reprend la main après un redémarrage : chaque perdant
+            // échouait EN SILENCE, l'interface relançait toutes les quinze
+            // secondes, et un conflit d'appareil s'est déguisé en « bug DSD »
+            // (DMP-A8, 24/08). On regarde l'URI que le renderer rapporte, et
+            // on DIT à l'utilisateur qui tient l'appareil — une fois par
+            // piste, après trois ticks concordants (une transition peut
+            // montrer un instant l'URI précédente).
+            if already_playing {
+                let notre_stream_id = fresh_states
+                    .iter()
+                    .find(|s| s.zone_id == zone_id)
+                    .and_then(|s| s.now_playing.as_ref())
+                    .and_then(|np| np.stream_id.clone());
+                if let Some(ps) = poll_states.get_mut(&zone_id) {
+                    use decisions::TenueDuRenderer;
+                    let verdict = decisions::qui_tient_le_renderer(
+                        status.current_uri.as_deref(),
+                        notre_stream_id.as_deref(),
+                    );
+                    // L'URI vide ne dit « lecteur interne » que si le
+                    // transport est actif : un renderer arrêté a le droit de
+                    // n'avoir rien chargé.
+                    let etrangere = match &verdict {
+                        TenueDuRenderer::LeNotre => false,
+                        TenueDuRenderer::LecteurInterne => status.state == TransportState::Playing,
+                        _ => true,
+                    };
+                    if etrangere {
+                        ps.tenue_etrangere_ticks = ps.tenue_etrangere_ticks.saturating_add(1);
+                        if ps.tenue_etrangere_ticks >= 3 && !ps.tenue_signalee {
+                            ps.tenue_signalee = true;
+                            let message = match &verdict {
+                                TenueDuRenderer::AutreServeurTune(hote) => format!(
+                                    "Cet appareil est tenu par un autre serveur Tune ({hote}).                                      Arrêtez la lecture sur ce serveur-là, ou choisissez un autre appareil."
+                                ),
+                                TenueDuRenderer::LecteurInterne => "L'appareil joue depuis sa propre                                      interface. Arrêtez la lecture sur l'appareil lui-même, puis relancez."
+                                    .to_string(),
+                                _ => "Cet appareil est tenu par une autre application.                                      Arrêtez-y la lecture, puis relancez."
+                                    .to_string(),
+                            };
+                            warn!(
+                                zone_id,
+                                device = %device_id,
+                                verdict = ?verdict,
+                                uri = ?status.current_uri,
+                                "renderer_tenu_par_un_tiers — la lecture demandée ne sortira pas"
+                            );
+                            if let Some(ref bus) = self.event_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": message,
+                                        // `fatal` : rien ne se rétablira tout
+                                        // seul, l'utilisateur doit agir — le
+                                        // message le lui dit.
+                                        "fatal": true,
+                                    }),
+                                );
+                            }
+                        }
+                    } else {
+                        ps.tenue_etrangere_ticks = 0;
+                    }
+                }
+            }
             if status.state == TransportState::Playing && !already_playing && !in_startup_grace {
                 let last_state =
                     ZoneRepo::with_backend(self.db.clone()).get_last_play_state(zone_id);
@@ -1961,40 +3046,79 @@ impl PositionPoller {
             let zone_id = zone_state.zone_id;
             let device_id = match self.get_zone_device_id(zone_id) {
                 Some(id) => id,
-                None => continue,
+                // Pas de peripherique de sortie : une zone navigateur, par
+                // conception (le client web tire `stream_url` lui-meme).
+                //
+                // Cette porte renvoyait tout le monde, et le rafraichissement
+                // des metadonnees radio vit 400 lignes plus bas, dans le bloc
+                // qui suit l'interrogation du peripherique. Consequence : sur
+                // « Cet ordinateur », `fetch_radio_metadata` n'etait JAMAIS
+                // appele. Pas d'echec, pas de trace — l'appel n'existait pas.
+                //
+                // Ce n'etait pas une regression : ca n'a jamais marche. D'ou
+                // deux testeurs sur la meme station et la meme version avec
+                // des resultats opposes (Jean Valjean sur une vraie sortie :
+                // titre, interprete et paroles ; Bilou sur « Cet ordinateur » :
+                // rien). Fil forum « Metadonnees radio disparues ? ».
+                //
+                // Le reste de la boucle (transport, gapless, fin de piste) n'a
+                // effectivement rien a faire ici : on garde le `continue`.
+                None => {
+                    let ps = poll_states
+                        .entry(zone_id)
+                        .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
+                    // Meme etranglement que la zone avec peripherique : le tick
+                    // est a la seconde, l'API de la station non.
+                    if decisions::deviceless_radio_refresh_due(
+                        zone_state.state == PlayState::Playing,
+                        zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                        ps.last_radio_poll.elapsed(),
+                        RADIO_POLL_INTERVAL_SECS,
+                    ) {
+                        ps.last_radio_poll = Instant::now();
+                        self.refresh_radio_metadata(zone_id, zone_state).await;
+                    }
+
+                    // Zone navigateur : l'annonce « en écoute » que le
+                    // démarrage a mise en attente part d'ICI, une fois
+                    // constaté que l'onglet tire réellement le flux (#1998).
+                    //
+                    // Le démarrage ne peut pas trancher : sans périphérique de
+                    // sortie, `output_sent` y vaut toujours faux, qu'on écoute
+                    // ou non. Le seul fait observable est la consommation du
+                    // flux, et elle n'apparaît qu'après coup — c'est
+                    // exactement ce qu'une boucle de scrutation est là pour
+                    // voir. L'orchestrateur ne fait rien tant qu'il n'a rien
+                    // en attente pour ce flux, donc ce tick ne coûte qu'une
+                    // comparaison sur toutes les autres zones.
+                    if let Some(stream_id) = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref())
+                    {
+                        self.orchestrator
+                            .confirmer_lecture_navigateur(zone_id, stream_id)
+                            .await;
+                    }
+
+                    // … et le versant symétrique : l'ABSENCE de preuve.
+                    //
+                    // #2657 a appris à cette branche à LIBÉRER l'annonce quand
+                    // l'onglet tire le flux. Rien ne lui apprenait à RENONCER
+                    // quand personne ne le tire : la zone restait « en
+                    // lecture » pour toujours, barre de progression comprise,
+                    // alors que le démarrage avait déjà renoncé à envoyer quoi
+                    // que ce soit (`output_sent=false`, #2630).
+                    if self.abandonner_lecture_sans_destination(zone_state).await {
+                        poll_states.remove(&zone_id);
+                    }
+                    continue;
+                }
             };
 
-            let ps = poll_states.entry(zone_id).or_insert_with(|| ZonePollState {
-                gapless_sent: false,
-                stopped_ticks: 0,
-                gapless_cooldown: 0,
-                consecutive_errors: 0,
-                backoff_remaining: 0,
-                total_polls: 0,
-                total_errors: 0,
-                last_latency_ms: 0,
-                max_latency_ms: 0,
-                last_radio_poll: Instant::now(),
-                gapless_sent_at: None,
-                last_position_ms: 0,
-                peak_position_ms: 0,
-                scrobbled_key: None,
-                ticks_since_db_save: 0,
-                track_started_at: None,
-                last_seek_seen: None,
-                track_generation: zone_state.track_generation,
-                track_loaded_at: Instant::now(),
-                past_end_ticks: 0,
-                gapless_advance_pending: false,
-                gapless_stuck_ticks: 0,
-                last_bytes_sent: 0,
-                stall_declines: 0,
-                radio_stopped_ticks: 0,
-                last_radio_position_ms: 0,
-                last_device_volume: None,
-                wall_clock_end_fired: false,
-                gapless_arm_logged: None,
-            });
+            let ps = poll_states
+                .entry(zone_id)
+                .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
 
             // Detect track change: if the generation changed, the orchestrator
             // started a new track (via play() / play_from_queue / next / previous).
@@ -2031,6 +3155,7 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.scrobbled_key = None;
                     ps.last_bytes_sent = 0;
+                    ps.playing_stall_ticks = 0;
                     ps.stall_declines = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
@@ -2040,14 +3165,20 @@ impl PositionPoller {
                 ps.gapless_cooldown = 0;
                 ps.stopped_ticks = 0;
                 ps.track_generation = zone_state.track_generation;
+                ps.tenue_etrangere_ticks = 0;
+                ps.tenue_signalee = false;
                 ps.track_loaded_at = Instant::now();
                 ps.past_end_ticks = 0;
                 ps.gapless_advance_pending = false;
                 ps.gapless_stuck_ticks = 0;
                 // Re-arm the DLNA poll-fail wall-clock fallback for the new track.
                 ps.wall_clock_end_fired = false;
+                // Le constat de depassement vaut pour UNE piste (#2493).
+                ps.depassement_duree_ticks = 0;
+                ps.depassement_duree_signale = false;
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
+                ps.gapless_dsd_skip_pos = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -2102,11 +3233,13 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.source == "radio")
                 .unwrap_or(false);
-            if is_radio {
-                let since_last = ps.last_radio_poll.elapsed();
-                if since_last < std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS) {
-                    continue;
-                }
+            if is_radio
+                && !decisions::radio_poll_due(
+                    ps.last_radio_poll.elapsed(),
+                    RADIO_POLL_INTERVAL_SECS,
+                )
+            {
+                continue;
             }
 
             ps.total_polls += 1;
@@ -2172,14 +3305,24 @@ impl PositionPoller {
                         None => continue,
                     }
                 };
-                match get_status_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok(s) => {
+                match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
+                    Ok((s, signal_path, dsp_metrics)) => {
                         ps.consecutive_errors = 0;
                         let latency = poll_start.elapsed().as_millis() as u32;
                         ps.last_latency_ms = latency;
                         if latency > ps.max_latency_ms {
                             ps.max_latency_ms = latency;
                         }
+                        // Même report que sur le chemin « zone au repos » : un
+                        // flux peut entrer ou sortir du DoP d'une piste à
+                        // l'autre sans changement d'état de zone (#1735).
+                        self.playback.set_dop_active(zone_id, s.dop_active).await;
+                        self.playback
+                            .set_output_signal_path(zone_id, signal_path)
+                            .await;
+                        self.playback
+                            .set_output_dsp_metrics(zone_id, dsp_metrics)
+                            .await;
                         s
                     }
                     Err(e) => {
@@ -2301,83 +3444,25 @@ impl PositionPoller {
                             .ok();
                     }
                     ps.last_device_volume = Some(status.volume);
-
-                    // Radio metadata polling (title/artist from ICY or external)
-                    if let Some(ref np) = zone_state.now_playing {
-                        if np.source == "radio" {
-                            if let Some(ref source_id) = np.source_id {
-                                // source_id is either a numeric radio DB id or the stream URL itself
-                                let (station_name, stream_url) = if let Ok(sid) =
-                                    source_id.parse::<i64>()
-                                {
-                                    let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(
-                                        self.db.clone(),
-                                    );
-                                    if let Ok(Some(station)) = radio_repo.get(sid) {
-                                        (station.name.clone(), station.url.clone())
-                                    } else {
-                                        // Fallback: use album_title (holds station name)
-                                        // instead of np.title (holds song title after first update)
-                                        let name = np
-                                            .album_title
-                                            .clone()
-                                            .unwrap_or_else(|| np.title.clone());
-                                        (name, source_id.clone())
-                                    }
-                                } else {
-                                    // source_id is a URL — use album_title which preserves
-                                    // the station name across metadata updates (np.title
-                                    // gets overwritten with the current song title)
-                                    let name =
-                                        np.album_title.clone().unwrap_or_else(|| np.title.clone());
-                                    (name, source_id.clone())
-                                };
-
-                                if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
-                                    &station_name,
-                                    &stream_url,
-                                )
-                                .await
-                                {
-                                    let title_changed =
-                                        np.title != meta.title || np.artist_name != meta.artist;
-                                    if title_changed {
-                                        let title_for_icy = meta.title.clone();
-                                        let artist_for_icy = meta.artist.clone();
-                                        let new_np = crate::playback::NowPlaying {
-                                            track_id: None,
-                                            title: meta.title,
-                                            artist_name: meta.artist,
-                                            album_title: Some(station_name.clone()),
-                                            cover_path: np.cover_path.clone(),
-                                            duration_ms: 0,
-                                            source: "radio".into(),
-                                            source_id: np.source_id.clone(),
-                                            stream_id: np.stream_id.clone(),
-                                            ..Default::default()
-                                        };
-                                        self.playback.update_now_playing(zone_id, new_np).await;
-                                        // Le renderer, lui, ne lit pas le
-                                        // now-playing : il reçoit des blocs ICY
-                                        // dans le flux. On publie donc aussi le
-                                        // titre là où le gestionnaire de flux
-                                        // saura le relire, sinon l'appareil
-                                        // reste figé sur le morceau qui passait
-                                        // à sa connexion.
-                                        if let Some(sid) = np.stream_id.as_deref() {
-                                            crate::http::streamer::publish_radio_now(
-                                                sid,
-                                                artist_for_icy,
-                                                title_for_icy,
-                                            );
-                                        }
-                                        debug!(zone_id, station = %station_name, "radio_metadata_updated");
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
+
+                // Le titre diffuse par une webradio NE DEPEND PAS de l'etat du
+                // renderer : il se lit sur une API externe (Radio Paradise,
+                // Radio France) ou dans le flux ICY, tous deux independants de
+                // ce que fait l'appareil. Rien ne justifiait de conditionner
+                // cette lecture a la bonne sante du transport.
+                //
+                // C'etait pourtant le cas : l'appel vivait dans le
+                // `if !radio_stopped` ci-dessus, aux cotes de la synchro de
+                // volume — qui, elle, a bien besoin d'un renderer en lecture.
+                // Consequence : un renderer qui ne demarre pas figeait
+                // l'affichage sur le nom de la station, et un bug de LECTURE se
+                // deguisait en bug de METADONNEES. Bilou a ouvert deux fils
+                // distincts pour un seul probleme (#1522, #1492).
+                //
+                // La garde sur le peripherique de sortie, elle, est tombee
+                // avec #1536.
+                self.refresh_radio_metadata(zone_id, zone_state).await;
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
                 self.shared_metrics.lock().await.insert(
@@ -2388,6 +3473,10 @@ impl PositionPoller {
                         consecutive_errors: ps.consecutive_errors,
                         last_latency_ms: ps.last_latency_ms,
                         max_latency_ms: ps.max_latency_ms,
+                        // Chemin RADIO : un flux sans fin ne depasse aucune
+                        // duree, et ce bras n'evalue meme pas le predicat
+                        // (#2493). Constat toujours faux, par construction.
+                        lecture_au_dela_de_la_duree: false,
                     },
                 );
 
@@ -2419,6 +3508,8 @@ impl PositionPoller {
                                             sample_rate: None,
                                             bit_depth: None,
                                             media_format: None,
+                                            track_number: None,
+                                            disc_number: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
@@ -2682,10 +3773,17 @@ impl PositionPoller {
                         None => false,
                     }
                 };
-                position_reset =
-                    decisions::position_reset_fires(position_reset, can_internal_gapless);
+                position_reset = decisions::position_reset_fires(
+                    position_reset,
+                    can_internal_gapless,
+                    in_seek_grace,
+                );
                 if !position_reset {
-                    info!(zone_id, "position_reset_deferred_to_natural_end");
+                    if in_seek_grace {
+                        info!(zone_id, "gapless_advance_suppressed_after_seek");
+                    } else {
+                        info!(zone_id, "position_reset_deferred_to_natural_end");
+                    }
                 }
             }
             ps.last_position_ms = status.position_ms;
@@ -2720,6 +3818,7 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.last_position_ms = 0;
                     ps.last_bytes_sent = 0;
+                    ps.playing_stall_ticks = 0;
                     ps.stall_declines = 0;
                     ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
@@ -2773,7 +3872,13 @@ impl PositionPoller {
             let in_gapless_guard = ps.gapless_sent_at.is_some();
 
             let mut track_ended = false;
+            // Quelle branche a conclu « la piste est finie ». Journalisé tel
+            // quel par `track_end_gap` au moment d'enchaîner (#2488) : sans
+            // lui, le journal ne dit pas laquelle des cinq portes de sortie a
+            // servi, et donc pas quel plancher de silence a été payé.
+            let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
+            let mut force_stop_demarrage_mort = false;
 
             // Guard: if Tune's own playback state for this zone is Stopped
             // (or has no now_playing), ignore device state changes entirely.
@@ -2789,8 +3894,10 @@ impl PositionPoller {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
                     // Tune is not playing on this zone — ignore device Stopped.
                     ps.stopped_ticks = 0;
+                    ps.playing_stall_ticks = 0;
                 }
                 TransportState::Stopped => {
+                    ps.playing_stall_ticks = 0;
                     // During the seek grace period, the renderer may report
                     // Stopped while it buffers the new stream (especially for
                     // streaming seeks that recreate the session).  Suppress
@@ -2929,6 +4036,7 @@ impl PositionPoller {
                             ps.gapless_stuck_ticks = 0;
                             ps.stopped_ticks = 0;
                             track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE;
                         } else {
                             fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
@@ -2956,6 +4064,7 @@ impl PositionPoller {
                             "local_output_ended_naturally_advancing"
                         );
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::FIN_NATURELLE_LOCALE;
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
@@ -2973,6 +4082,7 @@ impl PositionPoller {
                         );
                         ps.stopped_ticks = 0;
                         track_ended = true;
+                        motif_fin_de_piste = decisions::motif_fin::DSD_DLNA_PIC_ATTEINT;
                     } else {
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
@@ -3080,6 +4190,8 @@ impl PositionPoller {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         track_ended = true;
+                                        motif_fin_de_piste =
+                                            decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
                                     } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
                                         // On laisse au renderer le temps de
                                         // reprendre : s'il repart, il repassera
@@ -3156,6 +4268,24 @@ impl PositionPoller {
                                     );
                                     track_ended = false;
                                     force_stop = true;
+                                    // « Démarrage mort » (#2394) : la piste n'a
+                                    // JAMAIS été tirée (0 octet servi) sur un
+                                    // renderer DLNA — le profil du pipeline
+                                    // Eversolo coincé, qui acquitte le Play et
+                                    // ouvre ses connexions sans rien lire. Une
+                                    // relance (précédée de Pause→Stop, son
+                                    // libérateur connu) passe alors presque
+                                    // toujours à la main. Distinct d'un
+                                    // décrochage EN COURS de lecture
+                                    // (bytes_sent > 0), qu'on ne rejoue pas.
+                                    force_stop_demarrage_mort = decisions::demarrage_mort(
+                                        all_zones
+                                            .iter()
+                                            .find(|z| z.id == Some(zone_id))
+                                            .and_then(|z| z.output_type.as_deref())
+                                            .unwrap_or(""),
+                                        current_bytes,
+                                    );
                                 }
                             } else {
                                 debug!(
@@ -3197,6 +4327,12 @@ impl PositionPoller {
                         .and_then(|z| z.output_type.as_deref())
                         .unwrap_or("");
                     let is_dlna = output_type_str == "dlna";
+                    // Un flux de radio n'a pas de fin : sa position ne peut rien
+                    // depasser (#2493).
+                    let source_est_radio = zone_state
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.source == "radio");
                     let mut fsm_pin = fsm::PlayingInput {
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
@@ -3326,6 +4462,7 @@ impl PositionPoller {
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
+                        ps.playing_stall_ticks = 0;
                         ps.stall_declines = 0;
                         ps.track_started_at = Some(Instant::now());
                         ps.stopped_ticks = 0;
@@ -3335,6 +4472,7 @@ impl PositionPoller {
                         // New track after a gapless advance (no generation bump):
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
+                        ps.gapless_dsd_skip_pos = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -3410,12 +4548,25 @@ impl PositionPoller {
                             if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                            } else if decisions::dsd_skip_latched(
+                                ps.gapless_dsd_skip_pos,
+                                Self::next_position(zone_state),
+                            ) {
+                                // Suivant DSD sur DLNA, déjà constaté pour cette
+                                // position : ne pas re-résoudre (donc re-créer puis
+                                // détruire une session fichier) à chaque tick
+                                // (spin 1 Hz, #2394). handle_track_end jouera la
+                                // piste explicitement en fin de morceau.
                             } else {
-                                let ok =
-                                    self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                                if ok {
-                                    ps.gapless_sent_at = Some(Instant::now());
-                                    ps.gapless_sent = true;
+                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                    GaplessPrep::Armed => {
+                                        ps.gapless_sent_at = Some(Instant::now());
+                                        ps.gapless_sent = true;
+                                    }
+                                    GaplessPrep::DsdNextSkipped => {
+                                        ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
+                                    }
+                                    GaplessPrep::NotArmed => {}
                                 }
                             }
                         } else {
@@ -3512,10 +4663,22 @@ impl PositionPoller {
                             track_duration_ms,
                             wall_elapsed,
                         );
+                    // DMP-A6/A8 : PLAYING éternel, position gelée À la durée,
+                    // poll sain — seul filet possible : l'horloge de Tune
+                    // (même !in_seek_grace que ses deux voisins).
+                    let dlna_frozen_end = !in_seek_grace
+                        && decisions::dlna_frozen_at_end_wall_clock(
+                            is_dlna,
+                            played_enough,
+                            track_duration_ms,
+                            status.position_ms,
+                            wall_elapsed,
+                        );
                     if past_end
                         || reached_end_exclusive
                         || wall_clock_past_end
                         || chromecast_wall_clock_past_end
+                        || dlna_frozen_end
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
@@ -3528,13 +4691,134 @@ impl PositionPoller {
                                 exclusive_end = reached_end_exclusive,
                                 wall_clock_end = wall_clock_past_end,
                                 cast_wall_clock_end = chromecast_wall_clock_past_end,
+                                dlna_frozen_end,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
                             fsm_pact.past_end_track_ended = true;
+                            motif_fin_de_piste = decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN;
                         }
                     } else {
                         ps.past_end_ticks = 0;
+                    }
+
+                    // #2493 — Tades : « un morceau de 1'46 tourne depuis dix
+                    // minutes » (Serenade/upmpdcli). Aucun des cinq detecteurs
+                    // ci-dessus n'a agi, et la position montree a l'ecran est
+                    // plafonnee a la duree : le testeur voit « 1:46 / 1:46, en
+                    // lecture » indefiniment. Tune n'a alors plus le droit de
+                    // presenter cet etat comme une lecture ordinaire.
+                    //
+                    // Ce bloc ne touche NI `track_ended` NI `force_stop`. La
+                    // meme forme est produite par une lecture bloquee et par une
+                    // duree fausse (etiquette erronee, piste reellement plus
+                    // longue) : couper reviendrait a amputer une ecoute valide
+                    // une fois sur deux. On DIT, on n'agit pas — voir
+                    // `decisions::position_au_dela_de_la_duree`.
+                    //
+                    // Complementaire de #2116 juste en dessous, qui exclut
+                    // explicitement la zone de fin (`near_known_end`) : celui-la
+                    // couvre la position gelee AVANT la fin, celui-ci la
+                    // position collee A la fin.
+                    if decisions::position_au_dela_de_la_duree(
+                        source_est_radio,
+                        effective_end_duration_ms,
+                        status.position_ms,
+                    ) {
+                        ps.depassement_duree_ticks = ps.depassement_duree_ticks.saturating_add(1);
+                    } else {
+                        ps.depassement_duree_ticks = 0;
+                        ps.depassement_duree_signale = false;
+                    }
+                    if !track_ended
+                        && ps.depassement_duree_ticks >= DEPASSEMENT_DUREE_TICKS
+                        && !ps.depassement_duree_signale
+                    {
+                        ps.depassement_duree_signale = true;
+                        // Les trois inconnues que le ticket reclamait faute de
+                        // journal : la position est-elle figee, reboucle-t-elle,
+                        // et des octets sont-ils encore servis ?
+                        let octets_servis = match zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.stream_id.as_deref())
+                        {
+                            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                            None => None,
+                        };
+                        warn!(
+                            zone_id,
+                            output_type = output_type_str,
+                            position_ms = status.position_ms,
+                            peak_position_ms = ps.peak_position_ms,
+                            duree_file_ms = track_duration_ms,
+                            duree_rapportee_ms = status.duration_ms,
+                            duree_effective_ms = effective_end_duration_ms,
+                            wall_secs = wall_elapsed,
+                            ticks = ps.depassement_duree_ticks,
+                            ?octets_servis,
+                            "lecture_annoncee_au_dela_de_la_duree"
+                        );
+                    }
+
+                    // #2116: a renderer can acknowledge Play forever while
+                    // producing no more sound. Only stop after two independent
+                    // progress signals (renderer position and bytes served by
+                    // Tune) have both remained frozen for the full observation
+                    // window. The pure eligibility predicate deliberately
+                    // excludes startup, seeks, unknown-position devices and a
+                    // normal frozen-at-end transition.
+                    let stream_id = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref());
+                    let playing_stall_eligible = !track_ended
+                        && decisions::dlna_playing_stall_eligible(
+                            output_type_str,
+                            zone_state.state == PlayState::Playing,
+                            status.state == TransportState::Playing,
+                            status.realtime,
+                            stream_id.is_some(),
+                            in_seek_grace,
+                            ps.track_loaded_at.elapsed().as_secs(),
+                            ps.peak_position_ms,
+                            status.position_ms,
+                            track_duration_ms,
+                        );
+                    if playing_stall_eligible {
+                        if let Some(current_bytes) = match stream_id {
+                            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                            None => None,
+                        } {
+                            let previous_bytes = ps.last_bytes_sent;
+                            ps.playing_stall_ticks = decisions::next_dlna_playing_stall_ticks(
+                                ps.playing_stall_ticks,
+                                true,
+                                prev_position_ms,
+                                status.position_ms,
+                                previous_bytes,
+                                current_bytes,
+                            );
+                            ps.last_bytes_sent = current_bytes;
+                            if ps.playing_stall_ticks >= PLAYING_STALL_THRESHOLD {
+                                warn!(
+                                    zone_id,
+                                    position_ms = status.position_ms,
+                                    peak_position_ms = ps.peak_position_ms,
+                                    bytes_sent = current_bytes,
+                                    stall_ticks = ps.playing_stall_ticks,
+                                    wall_secs = wall_elapsed,
+                                    "dlna_playing_without_progress_stopping_zone"
+                                );
+                                force_stop = true;
+                            }
+                        } else {
+                            // No byte evidence means no conviction: a transient
+                            // metrics lookup failure restarts the whole window.
+                            ps.playing_stall_ticks = 0;
+                        }
+                    } else {
+                        ps.playing_stall_ticks = 0;
                     }
                     // v0.9 rc.2 — FSM shadow-compare for the Playing arm.
                     if *POLLER_FSM_SHADOW {
@@ -3551,6 +4835,7 @@ impl PositionPoller {
                 }
                 TransportState::Paused => {
                     ps.stopped_ticks = 0;
+                    ps.playing_stall_ticks = 0;
                 }
             }
 
@@ -3563,16 +4848,83 @@ impl PositionPoller {
                     consecutive_errors: ps.consecutive_errors,
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
+                    lecture_au_dela_de_la_duree: ps.depassement_duree_signale,
                 },
             );
 
             if force_stop {
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
-                self.orchestrator
-                    .stop(zone_id, device_id_ref.as_deref())
-                    .await;
+                let relance = force_stop_demarrage_mort && {
+                    let mut relances = self.relances_demarrage_mort.lock().await;
+                    let autorisee = decisions::relance_demarrage_mort_autorisee(
+                        relances.get(&zone_id).map(|t| t.elapsed().as_secs()),
+                    );
+                    if autorisee {
+                        relances.insert(zone_id, Instant::now());
+                    }
+                    autorisee
+                };
+                if relance {
+                    // Pause→Stop d'abord : le pipeline Eversolo coincé ACQUITTE
+                    // les Stop sans les exécuter, seul Pause→Stop le libère
+                    // (constaté par SOAP direct sur le DMP-A8). Best-effort :
+                    // un appareil sain n'en souffre pas.
+                    if let Err(error) = self
+                        .orchestrator
+                        .pause(zone_id, device_id_ref.as_deref())
+                        .await
+                    {
+                        warn!(zone_id, error = %error, "demarrage_mort_pause_echouee");
+                    }
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    let position = zone_state.queue_position;
+                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                        Ok(_) => {
+                            warn!(zone_id, position, "demarrage_mort_relance_automatique");
+                        }
+                        Err(e) => {
+                            warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
+                            self.orchestrator
+                                .stop(zone_id, device_id_ref.as_deref())
+                                .await;
+                        }
+                    }
+                } else {
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                }
             } else if track_ended {
+                // #2488 — la moitié invisible du blanc entre deux pistes.
+                //
+                // `playback_timing` (orchestrator) démarre à `play_inner`,
+                // donc APRÈS cette décision : tout ce que le sondeur a attendu
+                // pour conclure « c'est fini » n'apparaît nulle part. Sur un
+                // renderer réseau ce terme domine — de 0 ms (la sortie locale
+                // réveille le sondeur) à plusieurs secondes selon la branche.
+                // Une seule ligne, ici, au seul entonnoir d'avance côté
+                // serveur, avec le nom de la branche et son plancher.
+                let etat = poll_states.get(&zone_id);
+                info!(
+                    zone_id,
+                    motif = motif_fin_de_piste,
+                    plancher_ms = decisions::plancher_de_detection_ms(motif_fin_de_piste),
+                    stopped_ticks = etat.map(|p| p.stopped_ticks).unwrap_or(0),
+                    past_end_ticks = etat.map(|p| p.past_end_ticks).unwrap_or(0),
+                    gapless_sent = etat.map(|p| p.gapless_sent).unwrap_or(false),
+                    peak_pos = etat.map(|p| p.peak_position_ms).unwrap_or(0),
+                    track_dur = track_duration_ms,
+                    wall_secs = wall_elapsed,
+                    output = all_zones
+                        .iter()
+                        .find(|z| z.id == Some(zone_id))
+                        .and_then(|z| z.output_type.as_deref())
+                        .unwrap_or(""),
+                    "track_end_gap"
+                );
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
@@ -3592,6 +4944,32 @@ impl PositionPoller {
     /// governs automatic end-of-track advance, never the next button (#1110).
     pub fn next_position_manual(zone_state: &crate::playback::ZoneState) -> Option<i64> {
         Self::next_position_inner(zone_state, true)
+    }
+
+    /// Next-track decision *after* the track at `failed_pos` turned out to be
+    /// unplayable. Same rules as `next_position` (repeat, shuffle order), but
+    /// evaluated as if `failed_pos` had just finished playing — so skipping a
+    /// dead item keeps following the shuffle permutation instead of falling
+    /// back to raw queue order.
+    pub fn next_position_after(
+        zone_state: &crate::playback::ZoneState,
+        failed_pos: i64,
+    ) -> Option<i64> {
+        let mut as_if = zone_state.clone();
+        as_if.queue_position = failed_pos;
+        if as_if.shuffle && !as_if.shuffle_order.is_empty() {
+            // Follow the permutation from the slot we just failed on, so the
+            // walk cannot revisit it or lose its place in the cycle.
+            match as_if
+                .shuffle_order
+                .iter()
+                .position(|&i| i as i64 == failed_pos)
+            {
+                Some(idx) => as_if.shuffle_index = idx as i64,
+                None => as_if.shuffle_index += 1,
+            }
+        }
+        Self::next_position_inner(&as_if, false)
     }
 
     fn next_position_inner(zone_state: &crate::playback::ZoneState, manual: bool) -> Option<i64> {
@@ -3671,17 +5049,121 @@ impl PositionPoller {
                 .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
-                let seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
-                let seed_artist = zone_state
+                let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
+                let mut seed_artist = zone_state
                     .now_playing
                     .as_ref()
                     .and_then(|np| np.artist_name.clone());
+
+                // File vide DÈS LE DÉPART : rien n'a joué, donc rien à
+                // prolonger. C'était le cas d'un serveur qu'on rallume ou
+                // d'une file qu'on vient d'effacer — le réglage « lecture
+                // automatique » était activé et il ne se passait rien, la
+                // seule trace étant un `autoplay_skipped_no_seed` en DEBUG.
+                // On repart de la dernière écoute de LA ZONE, à défaut de la
+                // maison : c'est la graine la plus proche de ce que
+                // l'auditeur attend d'entendre.
+                if seed_artist.is_none() && seed_track_id.is_none() {
+                    // La radio par défaut se construit sur les DERNIERS TITRES
+                    // écoutés, et non sur le seul dernier artiste : c'est la
+                    // différence entre prolonger un morceau et proposer une
+                    // radio. On demande leurs semblables à plusieurs artistes
+                    // récents, et on choisit dans tout ce pool.
+                    let radio =
+                        crate::playback::auto_dj::radio_depuis_l_historique(&self.db, zone_id, 10)
+                            .await;
+                    let ids: Vec<i64> = radio
+                        .iter()
+                        .filter_map(|t| t["track_id"].as_i64())
+                        .collect();
+                    if !ids.is_empty() {
+                        info!(
+                            zone_id,
+                            count = ids.len(),
+                            "autoplay_radio_depuis_l_historique"
+                        );
+                        let queue_repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                            self.db.clone(),
+                        );
+                        if queue_repo.append_tracks(zone_id, &ids).is_ok() {
+                            let new_pos = zone_state.queue_position + 1;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, new_pos).await
+                            {
+                                warn!(zone_id, error = %e, "autoplay_play_failed");
+                                self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            }
+                            return;
+                        }
+                    }
+
+                    // La bibliothèque n'a rien rendu : on garde une graine pour
+                    // les autres cartes de la chaîne — radio du service,
+                    // genre/BPM — plutôt que de s'arrêter là.
+                    if let Some(g) = crate::playback::auto_dj::graine_recente(&self.db, zone_id) {
+                        info!(
+                            zone_id,
+                            artist = %g.artist_name.as_deref().unwrap_or(""),
+                            "autoplay_graine_depuis_l_historique"
+                        );
+                        seed_track_id = g.track_id;
+                        seed_artist = g.artist_name;
+                    }
+                }
 
                 // « Radio artistes similaires » : la graine est le NOM d'artiste,
                 // donc une écoute streaming (pas de track_id local) alimente
                 // aussi l'autoplay. Repli sur le générateur genre/BPM local si
                 // l'API d'enrichissement est injoignable ou ne matche rien dans
                 // la bibliothèque (Tune doit marcher sans mozaiklabs.fr).
+                // La source de l'ecoute en cours passe AVANT le generateur
+                // local. Le repli streaming plus bas ne se declenchait que si
+                // le local n'avait rien rendu — donc jamais, chez qui a une
+                // bibliotheque locale garnie. L'autoplay enchainait alors des
+                // titres locaux au milieu d'une ecoute Qobuz.
+                // Le repli streaming plus bas est le MEME appel : sans ce
+                // temoin il refaisait a l'identique le travail que la branche
+                // preferee venait d'echouer — deux fois les memes appels
+                // reseau, deux fois les memes lignes de log.
+                let mut streaming_already_tried = false;
+                let seed_source = zone_state.now_playing.as_ref().map(|np| np.source.clone());
+                let seed_source_id = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.source_id.clone());
+                if decisions::autoplay_prefers_streaming(seed_source.as_deref())
+                    && let Some(ref artist) = seed_artist
+                    && let Some(ref source) = seed_source
+                {
+                    let added = self
+                        .autoplay_streaming_radio(
+                            zone_id,
+                            artist,
+                            source,
+                            seed_source_id.as_deref(),
+                        )
+                        .await;
+                    if added > 0 {
+                        let new_pos = zone_state.queue_position + 1;
+                        info!(
+                            zone_id,
+                            added,
+                            source = %source,
+                            "autoplay_streaming_radio_started_preferred"
+                        );
+                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                            warn!(zone_id, error = %e, "autoplay_play_failed");
+                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        }
+                        return;
+                    }
+                    // Le service n'a rien rendu (hors catalogue, API muette) :
+                    // on retombe sur le generateur local plutot que de laisser
+                    // la file s'arreter en silence.
+                    info!(zone_id, "autoplay_streaming_empty_falling_back_local");
+                    streaming_already_tried = true;
+                }
+
                 let mut generated = Vec::new();
                 if let Some(ref artist) = seed_artist {
                     info!(zone_id, artist = %artist, "autoplay_similar_artists_radio");
@@ -3714,6 +5196,7 @@ impl PositionPoller {
                 // résultats ne pouvaient être que locaux. On va donc chercher
                 // les artistes similaires dans le service de la piste en cours.
                 if track_ids.is_empty()
+                    && !streaming_already_tried
                     && let Some(ref artist) = seed_artist
                     && let Some(source) = zone_state
                         .now_playing
@@ -3722,7 +5205,12 @@ impl PositionPoller {
                         .filter(|s| s != "local" && !s.is_empty())
                 {
                     let added = self
-                        .autoplay_streaming_radio(zone_id, artist, &source)
+                        .autoplay_streaming_radio(
+                            zone_id,
+                            artist,
+                            &source,
+                            seed_source_id.as_deref(),
+                        )
                         .await;
                     if added > 0 {
                         let new_pos = zone_state.queue_position + 1;
@@ -3810,10 +5298,62 @@ impl PositionPoller {
             queue_pos = zone_state.queue_position,
             "auto_next"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
-            warn!(zone_id, error = %e, "auto_next_failed");
-            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+        // Skip tracks that cannot be played instead of ending the session. A
+        // single unplayable streaming track — rights withdrawn, region block,
+        // the service returning no URL at any format — used to stop the whole
+        // queue: playing 11 albums to a zone died on one blocked track with
+        // 108 items still queued, leaving nothing but a WARN behind. Walk
+        // forward over the dead items, announce each one, and stop only when
+        // the queue really is exhausted (or the failures look systemic).
+        let mut attempt_pos = next_pos;
+        let mut skipped = 0u32;
+        loop {
+            match self
+                .orchestrator
+                .play_from_queue(zone_id, attempt_pos)
+                .await
+            {
+                Ok(_) => {
+                    if skipped > 0 {
+                        info!(
+                            zone_id,
+                            skipped,
+                            next_pos = attempt_pos,
+                            "auto_next_resumed_after_skips"
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": attempt_pos,
+                                "reason": e.to_string(),
+                            }),
+                        );
+                    }
+                    skipped += 1;
+                    // A run this long is not "one bad track" any more — an
+                    // expired token or a dead network would otherwise have us
+                    // hammer the service once per queued item.
+                    if skipped >= MAX_CONSECUTIVE_SKIPS {
+                        warn!(zone_id, skipped, "auto_next_skip_limit_reached");
+                        break;
+                    }
+                    match Self::next_position_after(zone_state, attempt_pos) {
+                        // Same slot again means repeat-one on a dead track:
+                        // skipping would spin forever.
+                        Some(p) if p != attempt_pos => attempt_pos = p,
+                        _ => break,
+                    }
+                }
+            }
         }
+        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
     }
 
     /// Resolve the next queue item's stream URL for gapless, with one bounded
@@ -3846,9 +5386,9 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
-    ) -> bool {
+    ) -> GaplessPrep {
         let Some(next_pos) = Self::next_position(zone_state) else {
-            return false;
+            return GaplessPrep::NotArmed;
         };
 
         // Local-file gapless (OAAT native DSD): the output reads the next
@@ -3877,7 +5417,7 @@ impl PositionPoller {
                         outputs.get(device_id).map(|a| a.clone())
                     };
                     let Some(output_arc) = output_arc else {
-                        return false;
+                        return GaplessPrep::NotArmed;
                     };
                     let output = output_arc.lock().await;
                     let media = crate::outputs::PlayMedia {
@@ -3894,7 +5434,12 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        byte_seekable: true,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     return match output.set_next_media(&media).await {
                         Ok(()) => {
@@ -3904,21 +5449,21 @@ impl PositionPoller {
                                 resolve_ms = t0.elapsed().as_millis() as u64,
                                 "gapless_next_set_local_file"
                             );
-                            true
+                            GaplessPrep::Armed
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
-                            false
+                            GaplessPrep::NotArmed
                         }
                     };
                 }
                 Ok(_) => {
                     info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
                 Err(e) => {
                     warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                    return false;
+                    return GaplessPrep::NotArmed;
                 }
             }
         }
@@ -3964,7 +5509,7 @@ impl PositionPoller {
                     // fallback advances the queue (a small gap, never a stall).
                     if !output.supports_internal_gapless() {
                         info!(zone_id, "gapless_skipped_exclusive_output");
-                        return false;
+                        return GaplessPrep::NotArmed;
                     }
                     // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
                     // Benjithom). They accept SetNextAVTransportURI for a DSD
@@ -3987,7 +5532,7 @@ impl PositionPoller {
                                 mime = %resolved.mime_type,
                                 "gapless_skipped_dsd_next_dlna"
                             );
-                            return false;
+                            return GaplessPrep::DsdNextSkipped;
                         }
                     }
                     let media = crate::outputs::PlayMedia {
@@ -4004,11 +5549,16 @@ impl PositionPoller {
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
                         live_stream: false,
+                        byte_seekable: true,
                         origin_url: None,
+                        source: resolved.source.as_deref(),
+                        source_id: resolved.source_id.as_deref(),
+                        track_number: resolved.track_number,
+                        disc_number: resolved.disc_number,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
-                        false
+                        GaplessPrep::NotArmed
                     } else {
                         info!(
                             zone_id,
@@ -4017,10 +5567,10 @@ impl PositionPoller {
                             streaming = is_streaming,
                             "gapless_next_set"
                         );
-                        true
+                        GaplessPrep::Armed
                     }
                 } else {
-                    false
+                    GaplessPrep::NotArmed
                 }
             }
             Err(e) => {
@@ -4030,7 +5580,7 @@ impl PositionPoller {
                     resolve_ms = t0.elapsed().as_millis() as u64,
                     "gapless_resolve_failed"
                 );
-                false
+                GaplessPrep::NotArmed
             }
         }
     }
@@ -4047,25 +5597,138 @@ impl PositionPoller {
         zone_id: i64,
         seed_artist: &str,
         source: &str,
+        seed_source_id: Option<&str>,
     ) -> usize {
-        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
-        if names.is_empty() {
-            debug!(zone_id, seed_artist, "autoplay_streaming_no_similar_names");
-            return 0;
-        }
         let Some(service) = self.orchestrator.services.lock().await.get(source) else {
-            debug!(zone_id, source, "autoplay_streaming_service_absent");
+            warn!(zone_id, source, "autoplay_streaming_service_absent");
             return 0;
         };
+
+        // Source 1 : l'API d'enrichissement. Elle ne repond que par MBID, et
+        // une piste de streaming n'en transporte aucun — en pratique elle rend
+        // toujours zero candidat sur une ecoute Qobuz (#1553).
+        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
+        let from_enrichment = !names.is_empty();
+
+        // Source 2 : le service lui-meme. Deux appels reseau, pas un de plus.
+        // On garde les IDENTIFIANTS de catalogue, pas seulement les noms : ils
+        // permettent ensuite de demander « des titres DE cet artiste » plutot
+        // que « des titres qui contiennent son nom ».
+        let mut service_artists: Vec<crate::streaming::traits::StreamArtist> = Vec::new();
+        if names.is_empty() {
+            info!(
+                zone_id,
+                seed_artist, source, "autoplay_streaming_enrichment_empty_trying_service"
+            );
+            service_artists = crate::playback::auto_dj::service_similar_artists(
+                seed_artist,
+                20,
+                |query| {
+                    let service = service.clone();
+                    async move {
+                        let svc = service.read().await;
+                        match svc.search(&query, 10).await {
+                            Ok(res) => res.artists,
+                            Err(e) => {
+                                warn!(artist = %query, error = %e, "autoplay_streaming_artist_search_failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                },
+                |artist_id| {
+                    let service = service.clone();
+                    async move {
+                        let svc = service.read().await;
+                        match svc.get_similar_artists(&artist_id, 20).await {
+                            Ok(artists) => artists,
+                            Err(e) => {
+                                warn!(artist_id = %artist_id, error = %e, "autoplay_streaming_similar_failed");
+                                Vec::new()
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+        }
+
+        if names.is_empty() && service_artists.is_empty() {
+            // Les DEUX sources sont muettes : c'est ici que la file s'arrete,
+            // et c'est la ligne que doit trouver quiconque diagnostique un
+            // « autoplay qui ne fait rien ».
+            warn!(
+                zone_id,
+                seed_artist, source, "autoplay_streaming_no_similar_names_from_any_source"
+            );
+            return 0;
+        }
+        let candidates = if from_enrichment {
+            names.len()
+        } else {
+            service_artists.len()
+        };
+        info!(
+            zone_id,
+            source, seed_artist, candidates, from_enrichment, "autoplay_streaming_candidates"
+        );
+
+        // Ne jamais reproposer ce qu'on vient d'entendre, ni ce qui est deja
+        // dans la file : une radio qui rejoue la piste qui se termine n'est pas
+        // une radio.
+        let mut exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(id) = seed_source_id {
+            exclude.insert(id.to_string());
+        }
+        if let Ok(rows) = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+            .get_ordered(zone_id)
+        {
+            exclude.extend(rows.into_iter().filter_map(|r| r.source_id));
+        }
+
+        // Deux facons de transformer un voisin en piste jouable :
+        //  - via l'API d'enrichissement on n'a qu'un NOM, donc une recherche ;
+        //  - via le service on a son identifiant de catalogue, donc ses titres
+        //    a lui. La recherche par nom reste le repli quand l'artiste n'a pas
+        //    de titres exposes.
+        let names_by_id: std::collections::HashMap<String, String> = service_artists
+            .iter()
+            .map(|a| (a.id.clone(), a.name.clone()))
+            .collect();
+        let keys: Vec<String> = if from_enrichment {
+            names.clone()
+        } else {
+            service_artists.iter().map(|a| a.id.clone()).collect()
+        };
+
         let found =
-            crate::playback::auto_dj::streaming_tracks_for_artist_names(&names, 10, |name| {
+            crate::playback::auto_dj::streaming_tracks_for_artist_names(&keys, 10, &exclude, |key| {
                 let service = service.clone();
+                let artist_name = names_by_id.get(&key).cloned();
                 async move {
-                    let svc = service.lock().await;
-                    match svc.search(&name, 5).await {
+                    let svc = service.read().await;
+                    // Chemin identifiant : les titres DE l'artiste, sans
+                    // ambiguite de titre homonyme.
+                    if let Some(ref name) = artist_name {
+                        match svc.get_artist_top_tracks(&key).await {
+                            Ok(tracks) if !tracks.is_empty() => return tracks,
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(artist_id = %key, error = %e, "autoplay_streaming_top_tracks_failed");
+                            }
+                        }
+                        return match svc.search(name, 5).await {
+                            Ok(res) => res.tracks,
+                            Err(e) => {
+                                warn!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                                Vec::new()
+                            }
+                        };
+                    }
+                    match svc.search(&key, 5).await {
                         Ok(res) => res.tracks,
                         Err(e) => {
-                            debug!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                            warn!(artist = %key, error = %e, "autoplay_streaming_search_failed");
                             Vec::new()
                         }
                     }
@@ -4073,6 +5736,10 @@ impl PositionPoller {
             })
             .await;
         if found.is_empty() {
+            warn!(
+                zone_id,
+                source, candidates, "autoplay_streaming_no_playable_track"
+            );
             return 0;
         }
         let items: Vec<crate::db::play_queue_repo::StreamingQueueItem> = found
@@ -4121,6 +5788,131 @@ impl PositionPoller {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2488 — le plancher de silence de chaque branche de fin de piste.
+    ///
+    /// Ces assertions ne décorent pas le code : elles VERROUILLENT le chiffre
+    /// qu'un journal de testeur permettra d'imputer. Si quelqu'un touche
+    /// `STOPPED_TICKS_THRESHOLD`, `POSITION_PAST_END_TICKS`, `END_MARGIN_MS`
+    /// ou l'intervalle de sondage, le plancher annoncé dans `track_end_gap`
+    /// change — et ces tests l'annoncent au lieu de laisser une ligne de
+    /// journal mentir en silence.
+    mod plancher_de_detection {
+        use crate::poller::decisions::{motif_fin, plancher_de_detection_ms};
+
+        /// La sortie locale réveille le sondeur par `TRACK_END_NOTIFY` au lieu
+        /// d'attendre son tick : elle ne paie AUCUN plancher de sondage. C'est
+        /// la borne basse de toute la table, et ce qui distingue le chemin
+        /// local des chemins réseau.
+        #[test]
+        fn la_fin_naturelle_locale_ne_coute_aucun_sondage() {
+            assert_eq!(plancher_de_detection_ms(motif_fin::FIN_NATURELLE_LOCALE), 0);
+        }
+
+        /// Les quatre branches réseau, du moins cher au plus cher. Le blanc
+        /// rapporté par Stéphane Villerio vaut 3 à 4 s : seule la branche DSD
+        /// sur DLNA (1 s) laisse la place aux étapes suivantes dans cette
+        /// enveloppe — les deux dernières (5 s et 6 s) la dépassent à elles
+        /// seules, donc ce n'est pas elles qu'il subit.
+        #[test]
+        fn les_branches_reseau_portent_chacune_leur_plancher() {
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::DSD_DLNA_PIC_ATTEINT),
+                1_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::AVANCE_GAPLESS_BLOQUEE),
+                2_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::FIN_NATURELLE_APRES_STOPPED),
+                5_000
+            );
+            assert_eq!(
+                plancher_de_detection_ms(motif_fin::POSITION_AU_DELA_DE_LA_FIN),
+                6_000
+            );
+        }
+
+        /// Un motif que la table ne connaît pas rend `0` : le journal n'annonce
+        /// jamais un chiffre inventé. C'est aussi le cas de la valeur initiale
+        /// (chaîne vide) si une future branche oubliait de se nommer.
+        #[test]
+        fn un_motif_inconnu_ne_promet_rien() {
+            assert_eq!(plancher_de_detection_ms(""), 0);
+            assert_eq!(plancher_de_detection_ms("branche_inventee"), 0);
+        }
+    }
+
+    mod tenue_du_renderer {
+        use crate::poller::decisions::{TenueDuRenderer, qui_tient_le_renderer};
+
+        /// Le cas du 24/08 : le DMP-A8 rapportait l'URI d'un flux du .18
+        /// pendant que le .42 croyait jouer. L'hôte est extrait pour être
+        /// NOMMÉ à l'écran.
+        #[test]
+        fn le_flux_dun_autre_serveur_tune_est_reconnu_et_nomme() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.18:8888/stream/fe226f5d-abcd.flac"),
+                Some("20dd4336-813d"),
+            );
+            assert_eq!(
+                v,
+                TenueDuRenderer::AutreServeurTune("192.168.1.18:8888".into())
+            );
+        }
+
+        /// Notre propre flux ne déclenche RIEN — c'est le cas nominal.
+        #[test]
+        fn notre_propre_flux_est_le_notre() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.42:8888/stream/20dd4336-813d.wav"),
+                Some("20dd4336-813d"),
+            );
+            assert_eq!(v, TenueDuRenderer::LeNotre);
+        }
+
+        /// L'Eversolo après redémarrage : transport actif, URI VIDE — c'est
+        /// son lecteur interne qui a restauré sa lecture locale.
+        #[test]
+        fn une_uri_vide_designe_le_lecteur_interne() {
+            assert_eq!(
+                qui_tient_le_renderer(Some(""), Some("x")),
+                TenueDuRenderer::LecteurInterne
+            );
+        }
+
+        /// Pas de TrackURI du tout : beaucoup de renderers n'en rapportent
+        /// pas. L'absence de signal n'est pas une preuve — on ne crie pas.
+        #[test]
+        fn labsence_de_signal_ne_declenche_rien() {
+            assert_eq!(
+                qui_tient_le_renderer(None, Some("x")),
+                TenueDuRenderer::LeNotre
+            );
+        }
+
+        #[test]
+        fn une_autre_application_est_reconnue() {
+            let v = qui_tient_le_renderer(
+                Some("http://192.168.1.30:57645/song/42.mp3"),
+                Some("20dd4336"),
+            );
+            assert_eq!(v, TenueDuRenderer::AutreApplication);
+        }
+
+        /// Sans stream_id à nous (rien en lecture de notre côté), un flux au
+        /// motif Tune reste celui d'un autre serveur.
+        #[test]
+        fn sans_notre_id_un_flux_tune_reste_etranger() {
+            let v = qui_tient_le_renderer(Some("https://tune.local:8888/stream/abc.wav"), None);
+            assert_eq!(
+                v,
+                TenueDuRenderer::AutreServeurTune("tune.local:8888".into())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -4298,6 +6090,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 4,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -4319,12 +6113,16 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -4351,6 +6149,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: true,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 3,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -4372,12 +6172,16 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulates entering Playing state
@@ -4471,6 +6275,96 @@ mod tests {
     }
 
     #[test]
+    fn next_position_after_walks_forward() {
+        // An unplayable track at position 2 must hand back position 3, not
+        // stop the queue (the poller loops on this).
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 10,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(3));
+    }
+
+    #[test]
+    fn next_position_after_end_of_queue_stops() {
+        // Last item unplayable under repeat-off: nothing left to skip to.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), None);
+    }
+
+    #[test]
+    fn next_position_after_repeat_one_returns_same_slot() {
+        // Repeat-one on a dead track: the caller must recognise the unchanged
+        // position and stop instead of spinning forever.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), Some(2));
+    }
+
+    #[test]
+    fn next_position_after_repeat_all_wraps() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::All,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_keeps_its_place_in_the_order() {
+        // Order 3,1,4,0,2 — the item at queue position 4 (order index 2) is
+        // unplayable, so the next candidate is the order's next entry, 0.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 4), Some(0));
+    }
+
+    #[test]
+    fn next_position_after_shuffle_last_of_cycle_stops() {
+        // Dead item is the final entry of the shuffle cycle under repeat-off.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 0,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 3,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_after(&state, 2), None);
+    }
+
+    #[test]
     fn next_position_empty_queue() {
         let state = crate::playback::ZoneState {
             state: PlayState::Playing,
@@ -4559,6 +6453,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -4580,12 +6476,16 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -4779,12 +6679,28 @@ mod tests {
         assert!(raw, "the drop shape matches on both output kinds");
 
         // Chromecast (can_internal_gapless == false) → suppressed.
-        assert!(!decisions::position_reset_fires(raw, false));
+        assert!(!decisions::position_reset_fires(raw, false, false));
         // DLNA (can_internal_gapless == true) → fires as before.
-        assert!(decisions::position_reset_fires(raw, true));
+        assert!(decisions::position_reset_fires(raw, true, false));
         // No raw reset → never, regardless of output kind.
-        assert!(!decisions::position_reset_fires(false, true));
-        assert!(!decisions::position_reset_fires(false, false));
+        assert!(!decisions::position_reset_fires(false, true, false));
+        assert!(!decisions::position_reset_fires(false, false, false));
+    }
+
+    #[test]
+    fn position_reset_during_seek_never_advances_gapless_metadata() {
+        // #2170: a seek near the arming window recreates the OAAT stream. The
+        // old direct-file path restarted at zero, so the drop shape looked
+        // exactly like a real internal transition. A current-track seek must
+        // never advance queue metadata, even when gapless is armed and the
+        // output otherwise supports internal chaining.
+        let raw = decisions::position_reset(258_760, 174, true);
+        assert!(raw);
+        assert!(!decisions::position_reset_fires(raw, true, true));
+
+        // Once the seek grace is over, an honest internal transition keeps the
+        // existing behavior.
+        assert!(decisions::position_reset_fires(raw, true, false));
     }
 
     #[test]
@@ -5071,6 +6987,136 @@ mod tests {
     }
 
     #[test]
+    fn dlna_playing_stall_ne_sarme_quavec_des_preuves_exploitables() {
+        let eligible = |output,
+                        tune_playing,
+                        renderer_playing,
+                        realtime,
+                        has_stream,
+                        seek,
+                        load,
+                        peak,
+                        pos,
+                        dur| {
+            decisions::dlna_playing_stall_eligible(
+                output,
+                tune_playing,
+                renderer_playing,
+                realtime,
+                has_stream,
+                seek,
+                load,
+                peak,
+                pos,
+                dur,
+            )
+        };
+
+        assert!(eligible(
+            "dlna", true, true, true, true, false, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "chromecast",
+            true,
+            true,
+            true,
+            true,
+            false,
+            45,
+            6_000,
+            6_000,
+            300_000
+        ));
+        assert!(!eligible(
+            "dlna", false, true, true, true, false, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, false, true, true, false, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, true, false, true, false, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, true, true, false, false, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, true, true, true, true, 45, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, true, true, true, false, 44, 6_000, 6_000, 300_000
+        ));
+        assert!(!eligible(
+            "dlna", true, true, true, true, false, 45, 4_999, 4_999, 300_000
+        ));
+        // A frozen sample at the known end belongs to the existing natural-end
+        // paths; it is not a mid-track playback failure.
+        assert!(!eligible(
+            "dlna", true, true, true, true, false, 45, 299_000, 299_000, 300_000
+        ));
+    }
+
+    #[test]
+    fn dlna_playing_stall_exige_position_et_octets_figes() {
+        let next = decisions::next_dlna_playing_stall_ticks;
+        assert_eq!(next(7, true, 6_000, 6_000, 42_000, 42_000), 8);
+        assert_eq!(next(7, true, 6_000, 7_000, 42_000, 42_000), 0);
+        assert_eq!(next(7, true, 6_000, 6_000, 42_000, 43_000), 0);
+        assert_eq!(next(7, false, 6_000, 6_000, 42_000, 42_000), 0);
+    }
+
+    #[test]
+    fn dlna_playing_stall_declenche_a_la_frontiere_exacte() {
+        let mut ticks = 0;
+        for _ in 0..PLAYING_STALL_THRESHOLD - 1 {
+            ticks =
+                decisions::next_dlna_playing_stall_ticks(ticks, true, 6_000, 6_000, 42_000, 42_000);
+        }
+        assert_eq!(ticks, PLAYING_STALL_THRESHOLD - 1);
+        assert!(ticks < PLAYING_STALL_THRESHOLD);
+
+        ticks = decisions::next_dlna_playing_stall_ticks(ticks, true, 6_000, 6_000, 42_000, 42_000);
+        assert_eq!(ticks, PLAYING_STALL_THRESHOLD);
+    }
+
+    #[test]
+    fn un_demarrage_mort_est_un_echec_dlna_sans_aucun_octet_servi() {
+        // Le profil du pipeline Eversolo coincé : DLNA, zéro octet tiré.
+        assert!(super::decisions::demarrage_mort("dlna", 0));
+        // Un décrochage EN COURS de lecture n'en est pas un.
+        assert!(!super::decisions::demarrage_mort("dlna", 1_234_567));
+        // Et seul le DLNA est concerné (le zombie est un renderer réseau).
+        assert!(!super::decisions::demarrage_mort("chromecast", 0));
+        assert!(!super::decisions::demarrage_mort("local", 0));
+    }
+
+    #[test]
+    fn une_seule_relance_demarrage_mort_par_fenetre() {
+        // Jamais relancé : autorisé.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(None));
+        // Relancé il y a longtemps : autorisé de nouveau.
+        assert!(super::decisions::relance_demarrage_mort_autorisee(Some(
+            181
+        )));
+        // Relancé dans la fenêtre : on coupe, on ne martèle pas.
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(
+            180
+        )));
+        assert!(!super::decisions::relance_demarrage_mort_autorisee(Some(0)));
+    }
+
+    #[test]
+    fn dsd_skip_latch_holds_only_for_the_same_queue_position() {
+        // Verrou posé pour la position 3 : tient tant que le « suivant » est 3…
+        assert!(super::decisions::dsd_skip_latched(Some(3), Some(3)));
+        // …et lâche dès que la file bouge (autre position, ou plus de suivant).
+        assert!(!super::decisions::dsd_skip_latched(Some(3), Some(4)));
+        assert!(!super::decisions::dsd_skip_latched(Some(3), None));
+        // Jamais verrouillé sans constat préalable.
+        assert!(!super::decisions::dsd_skip_latched(None, Some(3)));
+        assert!(!super::decisions::dsd_skip_latched(None, None));
+    }
+
+    #[test]
     fn should_arm_gapless_in_final_window() {
         // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
         assert!(decisions::should_arm_gapless(
@@ -5206,6 +7252,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -5227,12 +7275,16 @@ mod tests {
             gapless_advance_pending: true, // metadata was advanced
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -5295,12 +7347,112 @@ mod tests {
         b.record_failure();
         b.record_failure();
         assert!(b.remaining > 0);
-        b.record_success();
+        b.record_success(TransportState::Playing);
         assert_eq!(b.consecutive_errors, 0);
         assert!(
             !b.should_skip(),
             "un appareil qui répond doit être sondé à plein rythme"
         );
+    }
+
+    /// La cadence de repos est une DURÉE, pas un nombre de ticks : elle doit
+    /// rester la même durée si la cadence du sondeur change un jour. C'est le
+    /// désaccord silencieux décrit en #2263 (les garde-fous comptés en ticks
+    /// changent de sens quand `POLL_INTERVAL_MS` bouge, ceux comptés en
+    /// horloge murale non).
+    #[test]
+    fn la_cadence_de_repos_est_une_duree_murale() {
+        let duree_ms = super::IDLE_REPOS_POLL_TICKS as u64 * super::POLL_INTERVAL_MS;
+        assert_eq!(
+            duree_ms,
+            super::IDLE_REPOS_POLL_SECS * 1000,
+            "{} ticks de {} ms ne font pas {} s",
+            super::IDLE_REPOS_POLL_TICKS,
+            super::POLL_INTERVAL_MS,
+            super::IDLE_REPOS_POLL_SECS
+        );
+        assert!(
+            super::IDLE_REPOS_POLL_TICKS >= 1,
+            "une cadence de repos nulle sonderait en boucle"
+        );
+    }
+
+    /// Un renderer qui répond `Stopped` est sondé à la cadence de repos, pas
+    /// à chaque seconde : c'est le premier poste de dépense SOAP d'une
+    /// installation au repos (#2263).
+    #[test]
+    fn une_zone_arretee_retombe_a_la_cadence_de_repos() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_success(TransportState::Stopped);
+        for i in 1..super::IDLE_REPOS_POLL_TICKS {
+            assert!(
+                b.should_skip(),
+                "tick {i} : la zone au repos ne doit pas être re-sondée"
+            );
+        }
+        assert!(
+            !b.should_skip(),
+            "après {} ticks, il faut bien re-sonder",
+            super::IDLE_REPOS_POLL_TICKS
+        );
+    }
+
+    /// Le frein ne s'applique QU'AU repos : tout transport actif — y compris
+    /// une pause ou une transition — garde le plein rythme, sans quoi la
+    /// reprise d'état et l'adoption du volume ralentiraient elles aussi.
+    #[test]
+    fn un_transport_actif_garde_le_plein_rythme() {
+        for etat in [
+            TransportState::Playing,
+            TransportState::Paused,
+            TransportState::Transitioning,
+        ] {
+            let mut b = super::IdlePollBackoff::default();
+            b.record_success(etat);
+            assert!(
+                !b.should_skip(),
+                "{etat:?} : un appareil qui bouge doit rester sondé à chaque tick"
+            );
+        }
+    }
+
+    /// Quantifie le gain, comme le fait déjà le test de l'appareil mort : sur
+    /// une minute face à une zone arrêtée dont le renderer répond poliment,
+    /// l'ancien chemin envoyait 60 sondages — soit 180 actions SOAP pour
+    /// n'apprendre rien.
+    #[test]
+    fn une_zone_arretee_ne_coute_plus_un_sondage_par_seconde() {
+        let mut b = super::IdlePollBackoff::default();
+        let mut sondages = 0;
+        for _ in 0..60 {
+            if b.should_skip() {
+                continue;
+            }
+            sondages += 1;
+            b.record_success(TransportState::Stopped);
+        }
+        assert_eq!(
+            sondages,
+            60 / super::IDLE_REPOS_POLL_TICKS as u32,
+            "60 ticks à la cadence de repos"
+        );
+        assert!(
+            sondages <= 12,
+            "60 sondages par minute étaient le défaut corrigé, or {sondages}"
+        );
+    }
+
+    /// Une zone qui se remet à jouer depuis la façade de l'appareil doit
+    /// retrouver le plein rythme au tick suivant : le frein ne doit jamais
+    /// survivre au réveil.
+    #[test]
+    fn le_frein_de_repos_saute_des_que_l_appareil_repart() {
+        let mut b = super::IdlePollBackoff::default();
+        b.record_success(TransportState::Stopped);
+        while b.should_skip() {}
+        b.record_success(TransportState::Playing);
+        assert!(!b.should_skip());
+        assert!(!b.should_skip());
     }
 
     /// Quantifie le gain : sur une minute face à un appareil qui ne répond
@@ -5408,6 +7560,8 @@ mod tests {
         let mut ps = ZonePollState {
             gapless_sent: false,
             stopped_ticks: 0,
+            tenue_etrangere_ticks: 0,
+            tenue_signalee: false,
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
@@ -5429,12 +7583,16 @@ mod tests {
             gapless_advance_pending: true,
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
+            playing_stall_ticks: 0,
+            depassement_duree_ticks: 0,
+            depassement_duree_signale: false,
             stall_declines: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
+            gapless_dsd_skip_pos: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
@@ -5531,6 +7689,21 @@ mod status_timeout_tests {
                 ..Default::default()
             })
         }
+        fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+            Some(OutputSignalPathStatus {
+                bit_perfect: true,
+                sample_transport: crate::outputs::traits::OutputSampleTransport::NativeInteger,
+                dsp: crate::outputs::traits::OutputDspState::Inactive,
+                volume: crate::outputs::traits::OutputVolumeState::Unity,
+                reasons: Vec::new(),
+            })
+        }
+        fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+            Some(OutputDspMetrics {
+                eq_overs: 3,
+                eq_non_finite_samples: 1,
+            })
+        }
         async fn is_available(&self) -> bool {
             true
         }
@@ -5543,7 +7716,7 @@ mod status_timeout_tests {
     #[tokio::test]
     async fn hung_transport_times_out_instead_of_stalling_the_poller() {
         let out = arc(Box::new(HungOutput));
-        let res = get_status_bounded(&out, Some(Duration::from_millis(50))).await;
+        let res = get_status_with_signal_path_bounded(&out, Some(Duration::from_millis(50))).await;
         let err = res.expect_err("a hung get_status must yield an error, not block");
         assert!(err.contains("timed out"), "unexpected error: {err}");
     }
@@ -5554,26 +7727,161 @@ mod status_timeout_tests {
         // poller must not wait behind it forever.
         let out = arc(Box::new(FastOutput));
         let _held = out.lock().await;
-        let res = get_status_bounded(&out, Some(Duration::from_millis(50))).await;
+        let res = get_status_with_signal_path_bounded(&out, Some(Duration::from_millis(50))).await;
         assert!(res.is_err(), "a held output lock must not stall the poller");
     }
 
     #[tokio::test]
     async fn healthy_transport_passes_through() {
         let out = arc(Box::new(FastOutput));
-        let res = get_status_bounded(&out, Some(Duration::from_secs(5))).await;
-        assert_eq!(res.unwrap().state, TransportState::Playing);
+        let (status, signal_path, dsp_metrics) =
+            get_status_with_signal_path_bounded(&out, Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+        assert_eq!(status.state, TransportState::Playing);
+        assert_eq!(signal_path.unwrap().bit_perfect, true);
+        assert_eq!(dsp_metrics.unwrap().eq_overs, 3);
     }
 
     #[tokio::test]
     async fn timeout_disabled_preserves_unbounded_behavior() {
         // TUNE_POLLER_STATUS_TIMEOUT_SECS=0 → rollback to the pre-fix path.
         let out = arc(Box::new(FastOutput));
-        let res = get_status_bounded(&out, None).await;
-        assert_eq!(res.unwrap().state, TransportState::Playing);
+        let (status, signal_path, dsp_metrics) = get_status_with_signal_path_bounded(&out, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, TransportState::Playing);
+        assert!(signal_path.is_some());
+        assert_eq!(dsp_metrics.unwrap().eq_non_finite_samples, 1);
     }
 }
 
+#[cfg(test)]
+mod cadence_de_repos_tests {
+    use super::*;
+    use crate::db::zone_repo::ZoneRepo;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Renderer poli : il répond toujours, et il répond ce qu'on lui dit de
+    /// répondre. Il compte les `get_status` reçus — c'est exactement le
+    /// trafic SOAP que #2263 mesure.
+    struct Compteur {
+        etat: TransportState,
+        appels: Arc<AtomicU32>,
+    }
+    #[async_trait::async_trait]
+    impl OutputTarget for Compteur {
+        fn name(&self) -> &str {
+            "compteur"
+        }
+        fn device_id(&self) -> &str {
+            "test:compteur"
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_status(&self) -> Result<OutputStatus, String> {
+            self.appels.fetch_add(1, Ordering::Relaxed);
+            Ok(OutputStatus {
+                state: self.etat,
+                ..Default::default()
+            })
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Joue `ticks` tours de la vraie boucle `tick()` sur une zone arrêtée
+    /// câblée à un renderer qui répond `etat`, et rend le nombre de sondages
+    /// qu'il a réellement subis.
+    async fn sondages_sur(etat: TransportState, ticks: u32) -> u32 {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+        let device_id = "test:compteur";
+        ZoneRepo::with_backend(db.clone())
+            .create("Salon", Some("test"), Some(device_id))
+            .unwrap();
+
+        let appels = Arc::new(AtomicU32::new(0));
+        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+        outputs.lock().await.register(Box::new(Compteur {
+            etat,
+            appels: appels.clone(),
+        }));
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        let orchestrator = Arc::new(PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(Mutex::new(crate::streaming::ServiceRegistry::new())),
+            outputs.clone(),
+            None,
+        ));
+        let poller = PositionPoller::new(
+            orchestrator,
+            playback,
+            outputs.clone(),
+            db.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
+        let mut idle_backoff: HashMap<i64, IdlePollBackoff> = HashMap::new();
+        let startup_at = Instant::now();
+        for _ in 0..ticks {
+            poller
+                .tick(&mut poll_states, &mut idle_backoff, &startup_at)
+                .await;
+        }
+        appels.load(Ordering::Relaxed)
+    }
+
+    /// Le défaut de #2263, mesuré sur la vraie boucle : une zone arrêtée dont
+    /// le renderer répond poliment était sondée à CHAQUE tick, indéfiniment.
+    ///
+    /// Ce test couvre le site d'appel, pas seulement `IdlePollBackoff` :
+    /// neutraliser l'état passé à `record_success` laissait les tests
+    /// unitaires du recul entièrement verts.
+    #[tokio::test]
+    async fn une_zone_arretee_est_sondee_a_la_cadence_de_repos() {
+        let sondages = sondages_sur(TransportState::Stopped, 10).await;
+        assert_eq!(
+            sondages,
+            10u32.div_ceil(IDLE_REPOS_POLL_TICKS as u32),
+            "10 ticks sur une zone arrêtée doivent tenir en {} sondages, pas {sondages}",
+            10u32.div_ceil(IDLE_REPOS_POLL_TICKS as u32)
+        );
+    }
+
+    /// Le frein ne doit jamais toucher un appareil qui joue : la reprise
+    /// d'état après une lecture lancée depuis la façade, la synchronisation du
+    /// volume et la détection de conflit gardent leur cadence d'aujourd'hui.
+    #[tokio::test]
+    async fn un_renderer_qui_joue_reste_sonde_a_chaque_tick() {
+        assert_eq!(sondages_sur(TransportState::Playing, 10).await, 10);
+    }
+}
 #[cfg(test)]
 mod gapless_stage_expiry_tests {
     use super::decisions::gapless_stage_expired;
@@ -5617,5 +7925,865 @@ mod gapless_stage_expiry_tests {
     fn the_threshold_stays_below_the_decoder_timeout() {
         assert!(super::GAPLESS_STAGE_MAX_AGE_SECS < 300);
         assert!(super::GAPLESS_STAGE_MAX_AGE_SECS > 60);
+    }
+}
+
+/// Metadonnees radio sur une zone SANS peripherique de sortie.
+///
+/// Le poller quittait toute zone sans peripherique avant d'arriver au
+/// rafraichissement des metadonnees : sur « Cet ordinateur », l'appel n'a
+/// jamais existe. Ce n'etait donc pas une regression, et c'est pourquoi deux
+/// testeurs sur la meme station et la meme version obtenaient des resultats
+/// opposes — l'un sur une vraie sortie, l'autre sur le navigateur.
+#[cfg(test)]
+mod radio_metadata_deviceless_tests {
+    // ── Garde n°2 : l'etat du transport ne commande pas les metadonnees ────
+    //
+    // Le rafraichissement vivait dans le `if !radio_stopped`, aux cotes de la
+    // synchro de volume — qui, elle, a bien besoin d'un renderer en lecture.
+    // Un renderer qui ne demarrait pas figeait donc l'affichage sur le nom de
+    // la station, et un bug de LECTURE se deguisait en bug de METADONNEES.
+
+    #[test]
+    fn seul_le_temps_ecoule_commande_le_sondage_radio() {
+        use super::decisions::radio_poll_due;
+        use std::time::Duration;
+        assert!(!radio_poll_due(Duration::from_secs(3), 15));
+        assert!(radio_poll_due(Duration::from_secs(15), 15));
+        assert!(radio_poll_due(Duration::from_secs(600), 15));
+    }
+
+    #[test]
+    fn les_deux_chemins_partagent_la_meme_cadence() {
+        // La zone SANS peripherique (#1536) et la zone AVEC doivent sonder au
+        // meme rythme : une seule regle de temps, pas deux qui derivent.
+        use super::decisions::{deviceless_radio_refresh_due, radio_poll_due};
+        use std::time::Duration;
+        for secs in [0_u64, 5, 14, 15, 60] {
+            let d = Duration::from_secs(secs);
+            assert_eq!(
+                deviceless_radio_refresh_due(true, Some("radio"), d, 15),
+                radio_poll_due(d, 15),
+                "cadence divergente a {secs}s"
+            );
+        }
+    }
+
+    // ── Metadonnees radio sur une zone SANS peripherique (fil « Metadonnees
+    //    radio disparues ? ») ──────────────────────────────────────────────
+    //
+    // Le poller quittait toute zone sans peripherique avant d'arriver au
+    // rafraichissement des metadonnees : sur « Cet ordinateur », l'appel
+    // n'existait pas. Deux testeurs, meme station, meme version, resultats
+    // opposes — l'un sur une vraie sortie, l'autre sur le navigateur.
+
+    use super::decisions::deviceless_radio_refresh_due as due;
+    use std::time::Duration;
+
+    #[test]
+    fn zone_navigateur_qui_joue_une_radio_est_rafraichie() {
+        assert!(due(true, Some("radio"), Duration::from_secs(20), 15));
+    }
+
+    #[test]
+    fn letranglement_est_respecte() {
+        // Le tick est a la seconde, l'API de la station ne doit pas l'etre.
+        assert!(!due(true, Some("radio"), Duration::from_secs(3), 15));
+        // Pile a l'echeance : on y va.
+        assert!(due(true, Some("radio"), Duration::from_secs(15), 15));
+    }
+
+    #[test]
+    fn un_fichier_local_ne_declenche_aucun_appel_reseau() {
+        // Une zone navigateur qui joue un fichier passe ici a chaque tick.
+        assert!(!due(true, Some("local"), Duration::from_secs(600), 15));
+        assert!(!due(true, None, Duration::from_secs(600), 15));
+    }
+
+    #[test]
+    fn zone_a_larret_nest_pas_sondee() {
+        assert!(!due(false, Some("radio"), Duration::from_secs(600), 15));
+    }
+}
+
+/// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
+///
+/// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
+/// ou rien du tout. Le repli streaming existait (#1443) mais restait
+/// conditionne a « rien trouve en local » — donc jamais chez qui possede une
+/// bibliotheque garnie.
+#[cfg(test)]
+mod autoplay_source_tests {
+    use super::decisions::autoplay_prefers_streaming as prefers;
+
+    #[test]
+    fn une_ecoute_qobuz_cherche_dans_qobuz() {
+        assert!(prefers(Some("qobuz")));
+        assert!(prefers(Some("tidal")));
+        assert!(prefers(Some("deezer")));
+    }
+
+    #[test]
+    fn une_ecoute_locale_reste_locale() {
+        // Le generateur local garde la main quand c'est du local qui joue :
+        // ce lot ne doit rien changer pour qui n'a pas d'abonnement.
+        assert!(!prefers(Some("local")));
+    }
+
+    #[test]
+    fn une_source_absente_ou_vide_ne_bascule_rien() {
+        // Sens de defaut : sans source identifiee, on ne va pas interroger un
+        // service au hasard.
+        assert!(!prefers(None));
+        assert!(!prefers(Some("")));
+    }
+}
+
+#[cfg(all(test, feature = "oaat"))]
+mod bascule_des_niveaux_tests {
+    use super::PositionPoller;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::outputs::OutputRegistry;
+    use crate::outputs::oaat::OaatOutput;
+    use crate::playback::PlaybackManager;
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// La dette de test relevee par JP Robbe sur #2280 : rien ne couvrait
+    /// `annoncer_bascule_des_niveaux`, ni son emission de `zone.updated`.
+    ///
+    /// Supprimer l'appel du poller ou le `bus.emit(...)` laissait les tests de
+    /// #2280 VERTS, alors que le client ne refetch plus et que
+    /// `levels_available` reste fige pendant exactement la lecture DSD.
+    ///
+    /// Le scenario est celui de son ticket, dans l'ordre : valeur initiale,
+    /// bascule en DSD natif, re-poll sans changement, retour en PCM.
+    #[tokio::test]
+    async fn la_bascule_est_annoncee_une_fois_et_une_seule() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+
+        let device_id = "oaat:zicmu-test";
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo.create("Zicmu", Some("oaat"), Some(device_id)).unwrap();
+
+        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+        outputs.lock().await.register(Box::new(OaatOutput::new(
+            "Zicmu".into(),
+            "192.168.1.99".into(),
+            9000,
+            device_id.into(),
+        )));
+
+        let playback = Arc::new(PlaybackManager::new());
+        let orchestrator = Arc::new(crate::orchestrator::PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            outputs.clone(),
+            None,
+        ));
+
+        let bus = Arc::new(EventBus::new());
+        let mut recu = bus.subscribe();
+        let poller = PositionPoller::new(
+            orchestrator,
+            playback,
+            outputs.clone(),
+            db.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_event_bus(bus.clone());
+
+        let compter = |recu: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>| {
+            let mut n = 0;
+            while let Ok(ev) = recu.try_recv() {
+                if ev.event_type == "zone.updated"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id)
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        let mut dernier: HashMap<i64, bool> = HashMap::new();
+
+        // 1. Valeur initiale : une zone jamais annoncee doit l'etre, sinon une
+        //    zone deja en DSD au demarrage resterait muette.
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "la valeur initiale doit s'annoncer");
+        assert_eq!(dernier.get(&zone_id), Some(&true), "en PCM, on mesure");
+
+        // 2. Bascule en DSD natif : exactement un evenement.
+        {
+            let registre = outputs.lock().await;
+            let arc = registre.get(device_id).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<OaatOutput>()
+                .unwrap()
+                .set_native_dsd_active_for_test(true);
+        }
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "la bascule doit s'annoncer");
+        assert_eq!(
+            dernier.get(&zone_id),
+            Some(&false),
+            "en DSD natif, rien ne mesure"
+        );
+
+        // 3. Re-poll sans changement : aucun doublon.
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 0, "pas d'evenement sans changement");
+
+        // 4. Retour en PCM : un second evenement.
+        {
+            let registre = outputs.lock().await;
+            let arc = registre.get(device_id).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<OaatOutput>()
+                .unwrap()
+                .set_native_dsd_active_for_test(false);
+        }
+        poller.annoncer_bascule_des_niveaux(&mut dernier).await;
+        assert_eq!(compter(&mut recu), 1, "le retour en PCM doit s'annoncer");
+    }
+}
+
+/// Le repli sur le logo de la station — #2421, fil forum 1508.
+///
+/// Belkadi Yacine : « pas de jaquettes lors de l'écoute des radios ». La
+/// pochette du MORCEAU a été câblée depuis (74677e35, v0.9.97) ; ce qui
+/// n'avait jamais marché, c'est le repli sur le logo de la station quand la
+/// station ne donne rien — une chronique, un jingle, un flash info, ou une
+/// station qui n'expose aucune API de now-playing.
+#[cfg(test)]
+mod repli_logo_station_tests {
+    use super::{station_du_now_playing, vignette_du_pas_radio};
+    use crate::db::migrations;
+    use crate::db::radio_repo::RadioRepo;
+    use crate::db::sqlite::SqliteDb;
+
+    const FIP: &str = "https://icecast.radiofrance.fr/fip-hifi.aac";
+
+    fn repo_avec_fip(logo: Option<&str>) -> RadioRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = RadioRepo::new(db);
+        // Les 24 stations semées le sont par la migration 33 : on ne récrit
+        // pas FIP, on lui pose le logo que le rattrapage mozaiklabs lui aurait
+        // donné.
+        let mut fip = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.url == FIP)
+            .expect("FIP est semée par la migration 33");
+        fip.logo_url = logo.map(str::to_string);
+        repo.update(&fip).unwrap();
+        repo
+    }
+
+    /// LE défaut. `POST /radios/{id}/play/{zone}` écrit dans `source_id`
+    /// **l'URL du flux**, jamais l'identifiant numérique de la ligne
+    /// (`tune-server/src/routes/radios.rs`, `play_radio` :
+    /// `source_id: Some(radio.url.clone())`). Le sondeur, lui, ne cherchait la
+    /// station que par `source_id.parse::<i64>()`. La branche qui lit
+    /// `station.logo_url` était donc MORTE sur le chemin de lecture normal :
+    /// `logo_station` restait `None` pour les 24 stations livrées — y compris
+    /// les 20 auxquelles le rattrapage mozaiklabs avait bel et bien posé un
+    /// logo. Le repli n'avait rien à replier parce qu'il ne lisait rien.
+    #[test]
+    fn la_station_se_retrouve_par_l_url_du_flux_que_pose_le_play() {
+        let repo = repo_avec_fip(Some("https://mozaiklabs.fr/storage/radios/fip.png"));
+        let station = station_du_now_playing(&repo, FIP)
+            .expect("le play pose l'URL du flux dans source_id : il faut savoir la relire");
+        assert_eq!(station.name, "FIP");
+        assert_eq!(
+            station.logo_url.as_deref(),
+            Some("https://mozaiklabs.fr/storage/radios/fip.png")
+        );
+    }
+
+    /// L'identifiant numérique reste servi : d'autres appelants peuvent
+    /// l'écrire, et une station supprimée ne doit pas ressusciter.
+    #[test]
+    fn l_identifiant_numerique_continue_de_marcher() {
+        let repo = repo_avec_fip(Some("https://mozaiklabs.fr/storage/radios/fip.png"));
+        let id = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.url == FIP)
+            .and_then(|s| s.id)
+            .unwrap();
+        let station = station_du_now_playing(&repo, &id.to_string()).unwrap();
+        assert_eq!(station.name, "FIP");
+        assert!(station_du_now_playing(&repo, "999999").is_none());
+    }
+
+    /// Une station absente de la base — flux collé à la main, import M3U —
+    /// ne trouve rien, et ce n'est pas une erreur.
+    #[test]
+    fn une_station_inconnue_ne_trouve_rien() {
+        let repo = repo_avec_fip(None);
+        assert!(station_du_now_playing(&repo, "https://stream.inconnu.example/x.mp3").is_none());
+    }
+
+    /// Le second défaut, et il est écrit noir sur blanc dans le commentaire
+    /// que le code se donnait à lui-même : « dès qu'un titre a posé sa
+    /// pochette, `cover_path` la porte, et le titre suivant — une chronique,
+    /// un jingle — hériterait de la pochette du précédent au lieu de revenir
+    /// au logo ». C'est exactement ce que faisait le troisième repli
+    /// `.or_else(|| np.cover_path.clone())`. Mieux vaut le micro générique
+    /// qu'une pochette fausse : on n'illustre pas le journal de 13 h avec la
+    /// pochette de la chanson d'avant.
+    ///
+    /// La pochette courante n'est plus un argument du tout : le pas suivant ne
+    /// peut donc PLUS hériter de celle du précédent, et c'est le compilateur
+    /// qui le tient, pas ce test. Ce test-ci garde le résultat.
+    #[test]
+    fn un_pas_sans_pochette_ne_recycle_pas_celle_du_titre_precedent() {
+        assert_eq!(
+            vignette_du_pas_radio(None, None),
+            None,
+            "sans pochette de titre ni logo de station, il ne faut RIEN afficher"
+        );
+    }
+
+    /// Un `logo_url` vide ou blanc en base — import, saisie à la main — n'est
+    /// pas un logo. `Option::or` ne le voit pas : `Some("")` gagne contre
+    /// `None` et l'on publie une URL vide.
+    #[test]
+    fn un_logo_vide_en_base_ne_compte_pas_pour_un_logo() {
+        assert_eq!(vignette_du_pas_radio(None, Some("")), None);
+        assert_eq!(vignette_du_pas_radio(None, Some("   ")), None);
+        assert_eq!(
+            vignette_du_pas_radio(Some(""), Some("https://x/logo.png")),
+            Some("https://x/logo.png".to_string()),
+            "une pochette de titre vide doit laisser la main au logo"
+        );
+    }
+
+    /// Le sens de l'ordre, demandé par Bertrand : « mettre la pochette de
+    /// l'album et non le logo de la radio ». Garde anti-régression sur
+    /// 74677e35 / #2109.
+    #[test]
+    fn la_pochette_du_titre_passe_avant_le_logo() {
+        assert_eq!(
+            vignette_du_pas_radio(
+                Some("https://api.radiofrance/visual.jpg"),
+                Some("https://mozaiklabs.fr/storage/radios/fip.png"),
+            ),
+            Some("https://api.radiofrance/visual.jpg".to_string())
+        );
+        assert_eq!(
+            vignette_du_pas_radio(None, Some("https://mozaiklabs.fr/storage/radios/fip.png")),
+            Some("https://mozaiklabs.fr/storage/radios/fip.png".to_string())
+        );
+    }
+}
+
+/// Garde-fou #1998 : c'est le poller qui LIBÈRE l'annonce d'une zone
+/// navigateur.
+///
+/// Le démarrage ne peut pas trancher pour une telle zone : sans périphérique de
+/// sortie, `output_sent` y vaut toujours faux, qu'on écoute ou non. La preuve
+/// — l'onglet tire réellement le flux — n'apparaît qu'après coup, donc dans la
+/// boucle de scrutation. Si cet appel disparaît de la branche « zone sans
+/// périphérique », plus aucune zone navigateur ne scrobble : c'est exactement
+/// la régression pour laquelle ce ticket a été rouvert, et elle est silencieuse.
+///
+/// Relecture de source parce que la propriété tenue est un EMPLACEMENT dans une
+/// boucle de plusieurs milliers de lignes. Même procédé, même raison que
+/// `annonce_apres_sortie_guard` dans `orchestrator.rs`.
+#[cfg(test)]
+mod annonce_navigateur_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe à ce module pour que
+    /// les motifs cherchés ne puissent pas se trouver eux-mêmes dans les
+    /// messages d'assertion ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod annonce_navigateur_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #1998."
+            )
+        })
+    }
+
+    /// L'appel doit vivre DANS la branche « pas de périphérique de sortie » :
+    /// après le rafraîchissement radio qui lui est propre, et avant le code
+    /// qui ne concerne que les zones AVEC périphérique.
+    #[test]
+    fn la_zone_sans_peripherique_libere_son_annonce_en_attente() {
+        let branche_sans_peripherique = position("decisions::deviceless_radio_refresh_due(");
+        let liberation = position(".confirmer_lecture_navigateur(zone_id, stream_id)");
+        let apres_le_match = position("// Detect track change: if the generation changed");
+        assert!(
+            branche_sans_peripherique < liberation && liberation < apres_le_match,
+            "l'annonce des zones navigateur n'est plus libérée dans la branche \
+             « zone sans périphérique » : plus aucune zone navigateur ne \
+             scrobblerait, sans le moindre message (#1998)."
+        );
+    }
+
+    /// Garde-fou #2630, versant symétrique du précédent.
+    ///
+    /// L'abandon d'une lecture que personne ne reçoit doit vivre dans la MÊME
+    /// branche : c'est la seule où l'état « en lecture » ne repose sur rien.
+    /// Retiré de la boucle, la méthode reste compilée, testée et verte — et
+    /// plus personne ne l'appelle. La zone 987 se remettrait à jouer dans le
+    /// vide, sans le moindre message.
+    #[test]
+    fn la_zone_sans_peripherique_renonce_a_ce_quelle_nenvoie_pas() {
+        let branche_sans_peripherique = position("decisions::deviceless_radio_refresh_due(");
+        let abandon = position(".abandonner_lecture_sans_destination(zone_state)");
+        let apres_le_match = position("// Detect track change: if the generation changed");
+        assert!(
+            branche_sans_peripherique < abandon && abandon < apres_le_match,
+            "l'abandon d'une lecture sans destination n'est plus appelé dans la \
+             branche « zone sans périphérique » : une zone qui n'envoie rien \
+             resterait annoncée « en lecture » indéfiniment (#2630)."
+        );
+    }
+}
+
+/// #2630 — une lecture que personne ne reçoit cesse d'être annoncée.
+///
+/// Le journal de Pierre M, zone 987 : `no_output_device_id_skipping_send_to_output`
+/// puis `orchestrator_play … output_sent=false`. Le serveur constate qu'il n'a
+/// envoyé le titre nulle part, et l'annonce quand même. Rien ne revenait
+/// ensuite sur cet état : la branche « pas de périphérique » du poller se
+/// terminait par un `continue`.
+///
+/// La ligne de crête est ici : une zone navigateur n'a JAMAIS de périphérique
+/// et joue pourtant pour de vrai. Le verdict ne porte donc pas sur l'appareil
+/// mais sur la CONSOMMATION du flux — la preuve que #2657 a déjà introduite.
+#[cfg(test)]
+mod lecture_sans_destination_tests {
+    use super::{DELAI_SILENCE_ETABLI, PositionPoller, decisions};
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::{NowPlaying, PlayState, PlaybackManager, ZoneState};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        orchestrator: Arc<PlaybackOrchestrator>,
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        tmp: tempfile::TempDir,
+    }
+
+    impl Banc {
+        async fn monter() -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let playback = Arc::new(PlaybackManager::new());
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            let poller = PositionPoller::new(
+                orchestrator.clone(),
+                playback.clone(),
+                outputs,
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(bus);
+            Self {
+                poller,
+                playback,
+                orchestrator,
+                db,
+                recu,
+                tmp: tempfile::TempDir::new().unwrap(),
+            }
+        }
+
+        /// Une zone en lecture, sans AUCUN périphérique de sortie, dont le flux
+        /// a servi `octets`. C'est la scène du ticket.
+        async fn zone_en_lecture(&self, nom: &str, output_type: &str, octets: u64) -> i64 {
+            let zone_id = ZoneRepo::with_backend(self.db.clone())
+                .create(nom, Some(output_type), None)
+                .unwrap();
+            let fichier = self.tmp.path().join(format!("{zone_id}.flac"));
+            std::fs::write(&fichier, b"fake audio").unwrap();
+            let sid = self
+                .orchestrator
+                .streamer
+                .create_file_session(
+                    crate::http::streamer::StreamInfo {
+                        format: "flac".into(),
+                        mime_type: "audio/flac".into(),
+                        ..Default::default()
+                    },
+                    fichier.to_string_lossy().into_owned(),
+                    false,
+                )
+                .await;
+            if octets > 0 {
+                let sessions = self.orchestrator.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                sessions
+                    .get(&sid)
+                    .expect("la session vient d'être créée")
+                    .bytes_sent
+                    .store(octets, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        title: "Never Make It on Time".into(),
+                        stream_id: Some(sid),
+                        source: "local".into(),
+                        duration_ms: 240_000,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            zone_id
+        }
+
+        /// L'instantané que le poller reçoit, vieilli de `age`. Vieillir l'état
+        /// plutôt que dormir : le seuil est de douze secondes.
+        async fn instantane(&self, zone_id: i64, age: Duration) -> ZoneState {
+            let mut zs = self.playback.get_state(zone_id).await;
+            zs.last_play_started_at = Some(
+                Instant::now()
+                    .checked_sub(age)
+                    .expect("machine démarrée depuis moins que l'âge simulé"),
+            );
+            zs
+        }
+
+        /// L'erreur remontée au client pour cette zone, s'il y en a une.
+        fn erreur(&mut self, zone_id: i64) -> Option<(String, bool)> {
+            let mut trouvee = None;
+            while let Ok(ev) = self.recu.try_recv() {
+                if ev.event_type == "zone.playback_error"
+                    && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id)
+                {
+                    trouvee = Some((
+                        ev.data
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        ev.data.get("fatal").and_then(|v| v.as_bool()) == Some(true),
+                    ));
+                }
+            }
+            trouvee
+        }
+    }
+
+    /// ⛔ LA RÉGRESSION À NE PAS COMMETTRE.
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie et joue pourtant
+    /// vraiment : son onglet tire le flux. Une garde « pas de périphérique donc
+    /// pas de lecture » la couperait — c'est exactement ce que `70401f2d` a
+    /// fait à l'annonce Last.fm, et qu'il a fallu réparer par #2657. Ici la
+    /// zone joue depuis cinq minutes : rien ne doit lui arriver.
+    #[tokio::test]
+    async fn la_zone_navigateur_qui_joue_vraiment_nest_jamais_touchee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc
+            .zone_en_lecture("Cet ordinateur", "browser", 64 * 1024)
+            .await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(300)).await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "l'onglet tire le flux : cette zone JOUE, on n'y touche pas"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "la zone navigateur doit rester en lecture"
+        );
+        assert_eq!(
+            banc.erreur(zone_id),
+            None,
+            "aucune erreur ne doit être montrée à qui écoute réellement"
+        );
+    }
+
+    /// Le démarrage d'une zone navigateur n'est pas un silence : l'onglet met
+    /// une seconde ou deux à tirer ses premiers octets. Pendant la grâce, on ne
+    /// conclut rien.
+    #[tokio::test]
+    async fn le_demarrage_dun_onglet_lent_est_laisse_tranquille() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc
+            .instantane(zone_id, DELAI_SILENCE_ETABLI - Duration::from_secs(1))
+            .await;
+
+        assert!(
+            !banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "avant l'échéance, un onglet peut encore démarrer"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Playing
+        );
+        assert_eq!(banc.erreur(zone_id), None);
+    }
+
+    /// Zone navigateur, personne au bout du fil, l'échéance est passée : Tune
+    /// arrête de prétendre. Le message dit le geste utile — ouvrir un onglet.
+    #[tokio::test]
+    async fn la_zone_navigateur_sans_onglet_cesse_detre_annoncee() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(
+            banc.poller.abandonner_lecture_sans_destination(&zs).await,
+            "douze secondes sans un octet : ce n'est plus un démarrage"
+        );
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "la zone ne doit plus être annoncée « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_browser_unattended:"),
+            "le message doit désigner l'onglet manquant, pas un périphérique : {message}"
+        );
+        assert!(fatal, "rien ne se rétablira tout seul");
+    }
+
+    /// #2588 — l'abandon ne doit pas emporter l'explication du silence.
+    ///
+    /// L'arrêt fait retomber `output_reach` à `"ok"`, et le bandeau « aucun
+    /// onglet ne reçoit le son » disparaissait donc à l'instant même où le
+    /// poller le rendait vrai. Sans marque laissée derrière, l'utilisateur
+    /// voit la lecture cesser et n'apprend jamais pourquoi.
+    #[tokio::test]
+    async fn labandon_laisse_derriere_lui_de_quoi_expliquer_le_silence() {
+        let banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Cet ordinateur", "browser", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        let etat = banc.playback.get_state(zone_id).await;
+        assert_eq!(etat.state, PlayState::Stopped);
+        assert!(
+            etat.browser_unattended_at.is_some(),
+            "la raison du silence doit survivre à l'arrêt qui la produit"
+        );
+    }
+    /// Le constat est celui d'un ONGLET absent : une zone DLNA sans
+    /// périphérique produit le même silence pour une autre raison, et ne doit
+    /// pas hériter d'un message qui parle d'onglets (#2588).
+    #[tokio::test]
+    async fn labandon_dune_zone_sans_peripherique_naccuse_aucun_onglet() {
+        let banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Salon", "dlna", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        assert!(
+            banc.playback
+                .get_state(zone_id)
+                .await
+                .browser_unattended_at
+                .is_none(),
+            "aucun onglet n'est en cause ici"
+        );
+    }
+    /// La scène du ticket : zone 987, aucun périphérique, aucun onglet. Le
+    /// message reprend la sentinelle que le client sait déjà traduire.
+    #[tokio::test]
+    async fn la_zone_sans_peripherique_ni_onglet_ne_ment_plus() {
+        let mut banc = Banc::monter().await;
+        let zone_id = banc.zone_en_lecture("Salon", "dlna", 0).await;
+        let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+
+        assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+        assert_eq!(
+            banc.playback.get_state(zone_id).await.state,
+            PlayState::Stopped,
+            "`output_sent=false` ne doit plus produire un état « en lecture »"
+        );
+        let (message, fatal) = banc
+            .erreur(zone_id)
+            .expect("l'utilisateur doit être prévenu");
+        assert!(
+            message.starts_with("zone_no_output_device:") && message.contains("Salon"),
+            "le message doit nommer la zone et le geste : {message}"
+        );
+        assert!(fatal);
+    }
+
+    /// Le verdict, sans I/O. `None` n'est jamais une preuve : ni une date de
+    /// démarrage absente (`last_play_started_at` est `#[serde(skip)]`, il vaut
+    /// `None` après une restauration d'état), ni un flux inconnu du streamer.
+    #[test]
+    fn le_doute_profite_toujours_a_la_lecture() {
+        use decisions::lecture_sans_destination_abandonnee as abandon;
+        let vieux = DELAI_SILENCE_ETABLI + Duration::from_secs(1);
+
+        assert!(
+            abandon(Some(vieux), Some(0)),
+            "vieux et muet : on abandonne"
+        );
+        assert!(
+            abandon(Some(DELAI_SILENCE_ETABLI), Some(0)),
+            "pile à l'échéance : on abandonne"
+        );
+        assert!(
+            !abandon(
+                Some(DELAI_SILENCE_ETABLI - Duration::from_millis(1)),
+                Some(0)
+            ),
+            "une milliseconde avant l'échéance : on attend"
+        );
+        assert!(
+            !abandon(None, Some(0)),
+            "démarrage non daté : on ne conclut rien"
+        );
+        assert!(
+            !abandon(Some(vieux), None),
+            "flux inconnu du streamer : ce n'est pas une preuve de silence"
+        );
+        assert!(
+            !abandon(Some(vieux), Some(1)),
+            "un seul octet servi suffit à prouver que quelqu'un écoute"
+        );
+    }
+}
+
+/// #2493 — garde-fou d'EMPLACEMENT : le constat de depassement DIT, il n'agit
+/// pas.
+///
+/// La propriete tenue n'est pas une valeur, c'est une absence dans un bloc
+/// precis d'une boucle de plusieurs milliers de lignes : entre l'appel a
+/// `position_au_dela_de_la_duree` et la ligne de journal qu'il declenche, il ne
+/// doit y avoir NI `track_ended = true` NI `force_stop = true`.
+///
+/// C'est tout l'arbitrage du ticket. La meme forme — position a la fin,
+/// appareil qui dit jouer — est produite par une lecture bloquee ET par une
+/// duree fausse (etiquette erronee, piste reellement plus longue). Aucune
+/// horloge ne sait les distinguer, donc agir couperait une ecoute legitime une
+/// fois sur deux. Le jour ou quelqu'un « complete » ce bloc par un saut de
+/// piste, ce test doit l'arreter.
+///
+/// Meme procede, meme raison que `annonce_navigateur_guard` : relecture de
+/// source parce que la propriete est un emplacement.
+#[cfg(test)]
+mod depassement_duree_nagit_pas_guard {
+    /// ⚠️ `include_str!` rend le fichier ENTIER. On coupe a ce module pour que
+    /// les motifs cherches ne puissent pas se trouver eux-memes dans les
+    /// assertions ci-dessous (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("poller.rs");
+        const BORNE: &str = "mod depassement_duree_nagit_pas_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a ete renomme : la decoupe ne protege plus rien"));
+        &TOUT[..fin]
+    }
+
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans poller.rs : « {motif} ».\n\
+                 Le code a ete remanie ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #2493."
+            )
+        })
+    }
+
+    #[test]
+    fn le_bloc_de_constat_ne_touche_ni_la_piste_ni_la_zone() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        assert!(
+            debut < fin,
+            "le journal du constat doit suivre l'appel au predicat"
+        );
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            !bloc.contains("track_ended = true"),
+            "le constat de depassement avance maintenant la piste. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+        assert!(
+            !bloc.contains("force_stop = true"),
+            "le constat de depassement arrete maintenant la zone. C'est \
+             exactement ce que #2493 interdit : une duree FAUSSE produit la \
+             meme forme qu'une lecture bloquee, et couper amputerait une \
+             ecoute valide."
+        );
+    }
+
+    /// Le constat n'a le droit de parler qu'APRES que tous les detecteurs de
+    /// fin de piste ont renonce : il compte jusqu'a `DEPASSEMENT_DUREE_TICKS`,
+    /// pas jusqu'a `POSITION_PAST_END_TICKS`. Confondre les deux seuils ferait
+    /// crier le journal a chaque fin de piste normale.
+    #[test]
+    fn le_constat_attend_son_propre_seuil() {
+        let debut = position("decisions::position_au_dela_de_la_duree(");
+        let fin = position("\"lecture_annoncee_au_dela_de_la_duree\"");
+        let bloc = &code_de_production()[debut..fin];
+        assert!(
+            bloc.contains("DEPASSEMENT_DUREE_TICKS"),
+            "le constat ne s'appuie plus sur son propre seuil : il parlerait \
+             avant que les detecteurs de fin de piste aient eu leur chance."
+        );
+        assert!(
+            super::DEPASSEMENT_DUREE_TICKS > super::POSITION_PAST_END_TICKS,
+            "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
+             detecteurs de fin de piste, sinon il double-signale une fin de \
+             piste parfaitement normale."
+        );
     }
 }

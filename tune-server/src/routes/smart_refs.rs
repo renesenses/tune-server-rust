@@ -261,6 +261,27 @@ fn favorites_sub(profile_id: i64, item_type: &str) -> String {
     )
 }
 
+/// Sous-requête des PISTES favorites d'un profil : favoris locaux (table
+/// `favorites`) + pistes locales correspondant à un favori STREAMING du même
+/// profil (titre + artiste normalisés). Un favori Qobuz/Tidal dont on possède
+/// la copie locale compte ainsi comme favori dans les règles — avant, seule
+/// la table locale était vue (point 6, revue 2026-08-15). Le rapprochement
+/// est volontairement exact-normalisé (lower/trim) : en SQL portable
+/// SQLite/PG, pas de fuzzy — un titre orthographié différemment ne matche
+/// pas, c'est assumé.
+fn track_favorites_sub(profile_id: i64) -> String {
+    format!(
+        "{local} UNION SELECT t9.id FROM tracks t9 \
+         LEFT JOIN artists ar9 ON t9.artist_id = ar9.id \
+         JOIN streaming_favorites sf9 ON sf9.profile_id = {profile_id} \
+         AND sf9.item_type = 'track' \
+         AND sf9.title IS NOT NULL \
+         AND lower(trim(t9.title)) = lower(trim(sf9.title)) \
+         AND lower(trim(coalesce(ar9.name, ''))) = lower(trim(coalesce(sf9.artist, '')))",
+        local = favorites_sub(profile_id, "track")
+    )
+}
+
 /// Condition SQL pour une règle référence au niveau ALBUM (smart collections).
 /// Requêtes basées sur les alias `al` (albums), `ar` (artists), `t` (tracks)
 /// de `build_album_query`.
@@ -274,9 +295,10 @@ pub(crate) fn album_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
                 return "1=0".into();
             };
             match value {
-                // L'album contient au moins une piste favorite.
+                // L'album contient au moins une piste favorite (locale ou
+                // correspondant à un favori streaming).
                 "track" => {
-                    let fav = favorites_sub(pid, "track");
+                    let fav = track_favorites_sub(pid);
                     let sub = format!(
                         "SELECT DISTINCT t2.album_id FROM tracks t2 \
                          WHERE t2.album_id IS NOT NULL AND t2.id IN ({fav})"
@@ -356,7 +378,7 @@ pub(crate) fn track_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
                 return "1=0".into();
             };
             match value {
-                "track" => membership("t.id", &favorites_sub(pid, "track"), neg, false),
+                "track" => membership("t.id", &track_favorites_sub(pid), neg, false),
                 "album" => membership("t.album_id", &favorites_sub(pid, "album"), neg, true),
                 "artist" => membership("t.artist_id", &favorites_sub(pid, "artist"), neg, true),
                 _ => "1=0".into(),
@@ -620,9 +642,31 @@ mod tests {
         let r = EmptyResolver;
         let ctx = RefCtx::root(&r, Some(3));
         let cond = track_ref_condition("favorite", "is", "track", &ctx);
-        assert_eq!(
-            cond,
-            "t.id IN (SELECT item_id FROM favorites WHERE profile_id = 3 AND item_type = 'track')"
+        // Favoris locaux…
+        assert!(
+            cond.contains(
+                "SELECT item_id FROM favorites WHERE profile_id = 3 AND item_type = 'track'"
+            ),
+            "{cond}"
+        );
+        // …UNION les pistes locales correspondant à un favori streaming du
+        // même profil (titre+artiste normalisés).
+        assert!(cond.contains("UNION"), "{cond}");
+        assert!(
+            cond.contains("streaming_favorites sf9 ON sf9.profile_id = 3"),
+            "{cond}"
+        );
+        assert!(cond.starts_with("t.id IN ("), "{cond}");
+    }
+
+    #[test]
+    fn album_favorite_track_includes_streaming_matches() {
+        let r = EmptyResolver;
+        let ctx = RefCtx::root(&r, Some(7));
+        let cond = album_ref_condition("favorite", "is", "track", &ctx);
+        assert!(
+            cond.contains("streaming_favorites sf9 ON sf9.profile_id = 7"),
+            "{cond}"
         );
     }
 

@@ -10,16 +10,19 @@
 //!   `strm`, `audg`, `setd`, `serv`
 
 pub mod cli_server;
+pub mod discovery;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::outputs::TransportState;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,7 +48,8 @@ pub enum ClientMessage {
         device_type: u8,
         firmware_version: u8,
         mac: [u8; 6],
-        /// Remaining bytes may contain device name (UTF-8, variable length).
+        /// Display label derived from the modern HELO capabilities, or from
+        /// the legacy trailing UTF-8 field for old short payloads.
         name: String,
     },
     /// `STAT` — status report.
@@ -145,6 +149,41 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<ClientMessage, Strin
     parse_client_message(tag, payload)
 }
 
+const MODERN_HELO_BASE_LEN: usize = 36;
+const LEGACY_HELO_NAME_OFFSET: usize = 10;
+
+fn helo_display_name(payload: &[u8], device_type: u8) -> String {
+    if payload.len() >= MODERN_HELO_BASE_LEN {
+        // Modern HELO layout (payload offsets): device/revision/MAC [0..8],
+        // UUID [8..24], WLAN channels [24..26], bytes received [26..34],
+        // language [34..36], then comma-separated ASCII capabilities.
+        let capabilities = String::from_utf8_lossy(&payload[MODERN_HELO_BASE_LEN..]);
+        let capabilities = capabilities.trim_matches('\0').trim();
+        let capability = |key: &str| {
+            capabilities
+                .split(',')
+                .find_map(|item| item.trim().strip_prefix(key))
+                .filter(|value| !value.is_empty())
+        };
+        return capability("ModelName=")
+            .or_else(|| capability("Model="))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Squeezebox {device_type}"));
+    }
+
+    // Preserve the old parser for short legacy frames whose optional trailing
+    // field starts after device/revision/MAC/WLAN. Their layout predates the
+    // 36-byte UUID/counters/language contract above.
+    payload
+        .get(LEGACY_HELO_NAME_OFFSET..)
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse raw tag + payload into a typed `ClientMessage`.
 fn parse_client_message(tag: [u8; 4], payload: Vec<u8>) -> Result<ClientMessage, String> {
     match &tag {
@@ -155,15 +194,7 @@ fn parse_client_message(tag: [u8; 4], payload: Vec<u8>) -> Result<ClientMessage,
             if payload.len() >= 8 {
                 mac.copy_from_slice(&payload[2..8]);
             }
-            // Bytes 8..9 are typically the number of wlan channels, bytes 10+
-            // may contain the device name as UTF-8.
-            let name = if payload.len() > 10 {
-                String::from_utf8_lossy(&payload[10..])
-                    .trim_end_matches('\0')
-                    .to_string()
-            } else {
-                String::new()
-            };
+            let name = helo_display_name(&payload, device_type);
 
             Ok(ClientMessage::Helo {
                 device_type,
@@ -390,6 +421,161 @@ pub fn strm_control(command: u8) -> ServerMessage {
 // Player registry
 // ---------------------------------------------------------------------------
 
+/// Why the last native SlimProto playback stopped or degraded.  This is kept
+/// separate from `ended_naturally`: an underrun or a broken stream must never
+/// advance the queue as if the renderer had drained a complete track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlimProtoPlaybackFailure {
+    Underrun,
+    OutputUnderrun,
+    UnsupportedFormat,
+    StreamDisconnected(u8),
+    ControlDisconnected,
+}
+
+impl SlimProtoPlaybackFailure {
+    pub(crate) fn diagnostic(self) -> String {
+        match self {
+            Self::Underrun => "underrun".into(),
+            Self::OutputUnderrun => "output_underrun".into(),
+            Self::UnsupportedFormat => "unsupported_format".into(),
+            Self::StreamDisconnected(reason) => format!("stream_disconnected:{reason}"),
+            Self::ControlDisconnected => "control_disconnected".into(),
+        }
+    }
+}
+
+/// Functional playback state shared by the TCP reader and the registered
+/// output.  Commands provide an immediate pending state; STAT then becomes the
+/// source of truth for start, pause, decoder completion and final drain.
+#[derive(Debug)]
+pub(crate) struct SlimProtoPlaybackState {
+    pub(crate) transport: TransportState,
+    pub(crate) decoder_finished: bool,
+    pub(crate) ended_naturally: bool,
+    pub(crate) failure: Option<SlimProtoPlaybackFailure>,
+}
+
+impl Default for SlimProtoPlaybackState {
+    fn default() -> Self {
+        Self {
+            transport: TransportState::Stopped,
+            decoder_finished: false,
+            ended_naturally: false,
+            failure: None,
+        }
+    }
+}
+
+impl SlimProtoPlaybackState {
+    pub(crate) fn begin_playback(&mut self) {
+        self.transport = TransportState::Transitioning;
+        self.decoder_finished = false;
+        self.ended_naturally = false;
+        self.failure = None;
+    }
+
+    pub(crate) fn pause(&mut self) {
+        self.transport = TransportState::Paused;
+    }
+
+    pub(crate) fn resume(&mut self) {
+        self.transport = TransportState::Playing;
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.transport = TransportState::Stopped;
+        self.decoder_finished = false;
+        self.ended_naturally = false;
+        self.failure = None;
+    }
+
+    /// Apply a player STAT event.
+    ///
+    /// Squeezelite emits `STMd` when the decoder has no more input, while PCM
+    /// may still remain in its output buffer.  The later terminal `STMu` is a
+    /// natural end only when that decoder-complete marker was observed first;
+    /// an isolated `STMu` is a real underrun and stays fail-closed.
+    pub(crate) fn apply_stat(&mut self, event: [u8; 4]) {
+        match &event {
+            b"STMc" | b"STMe" | b"STMh" | b"STMl" | b"STMa" => {
+                if self.transport != TransportState::Stopped {
+                    self.transport = TransportState::Transitioning;
+                }
+            }
+            b"STMs" => {
+                self.transport = TransportState::Playing;
+                self.decoder_finished = false;
+                self.ended_naturally = false;
+                self.failure = None;
+            }
+            b"STMp" => self.transport = TransportState::Paused,
+            b"STMr" => self.transport = TransportState::Playing,
+            b"STMd" => self.decoder_finished = true,
+            b"STMu" => {
+                self.transport = TransportState::Stopped;
+                self.ended_naturally = self.decoder_finished;
+                if !self.decoder_finished {
+                    self.failure = Some(SlimProtoPlaybackFailure::Underrun);
+                }
+            }
+            b"STMo" => {
+                self.failure = Some(SlimProtoPlaybackFailure::OutputUnderrun);
+            }
+            b"STMn" => {
+                self.transport = TransportState::Stopped;
+                self.ended_naturally = false;
+                self.failure = Some(SlimProtoPlaybackFailure::UnsupportedFormat);
+            }
+            // A start command itself begins with a decoder/output flush.  Keep
+            // its pending state, but preserve an explicit local Stop.
+            b"STMf" => {
+                if self.transport != TransportState::Stopped {
+                    self.transport = TransportState::Transitioning;
+                }
+                self.decoder_finished = false;
+                self.ended_naturally = false;
+            }
+            // `STMt` is a heartbeat/position sample and must not manufacture a
+            // transport transition.
+            _ => {}
+        }
+    }
+
+    pub(crate) fn stream_disconnected(&mut self, reason: u8) {
+        // reason=0 is Squeezelite's normal source EOF.  Its decoded PCM can
+        // still be draining, so only the later STMu may stop it naturally.
+        if reason == 0 {
+            return;
+        }
+        self.transport = TransportState::Stopped;
+        self.decoder_finished = false;
+        self.ended_naturally = false;
+        self.failure = Some(SlimProtoPlaybackFailure::StreamDisconnected(reason));
+    }
+
+    pub(crate) fn control_disconnected(&mut self) {
+        self.transport = TransportState::Stopped;
+        self.decoder_finished = false;
+        self.ended_naturally = false;
+        self.failure = Some(SlimProtoPlaybackFailure::ControlDisconnected);
+    }
+}
+
+pub(crate) type SlimProtoPlayback = Arc<StdMutex<SlimProtoPlaybackState>>;
+
+pub(crate) fn new_playback_state() -> SlimProtoPlayback {
+    Arc::new(StdMutex::new(SlimProtoPlaybackState::default()))
+}
+
+pub(crate) fn lock_playback(
+    playback: &SlimProtoPlayback,
+) -> StdMutexGuard<'_, SlimProtoPlaybackState> {
+    playback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Format a MAC address as colon-separated hex string.
 fn format_mac(mac: &[u8; 6]) -> String {
     format!(
@@ -422,6 +608,8 @@ pub struct SlimProtoPlayer {
     /// Last STAT event code (e.g. `STMt` timer, `STMd` decoder-ready/track-end,
     /// `STMu` underrun). Kept for diagnostics and end-of-track heuristics.
     pub last_event: [u8; 4],
+    /// State shared with the native output registered for this player.
+    pub(crate) playback: SlimProtoPlayback,
 }
 
 /// Thread-safe registry of connected players, keyed by MAC string.
@@ -624,6 +812,7 @@ impl SlimProtoServer {
 
                 // Register the player.
                 {
+                    let playback = new_playback_state();
                     let mut players = self.players.lock().await;
                     players.insert(
                         mac_str.clone(),
@@ -638,6 +827,7 @@ impl SlimProtoServer {
                             elapsed_ms: 0,
                             bytes_received: 0,
                             last_event: [0u8; 4],
+                            playback,
                         },
                     );
                 }
@@ -741,16 +931,23 @@ impl SlimProtoServer {
                             player.elapsed_ms = elapsed_ms;
                             player.bytes_received = bytes_received;
                             player.last_event = event;
+                            lock_playback(&player.playback).apply_stat(event);
                         }
                     }
                     Ok(ClientMessage::Bye) => {
                         info!(mac = %mac_for_reader, "slimproto_bye_received");
+                        if let Some(player) = players.lock().await.get(&mac_for_reader) {
+                            lock_playback(&player.playback).control_disconnected();
+                        }
                         break Ok(());
                     }
                     Ok(ClientMessage::Dsco { reason }) => {
                         info!(mac = %mac_for_reader, reason, "slimproto_dsco_received");
                         // Player disconnected from the audio stream — not from us.
                         // Stay connected and keep heartbeating.
+                        if let Some(player) = players.lock().await.get(&mac_for_reader) {
+                            lock_playback(&player.playback).stream_disconnected(reason);
+                        }
                     }
                     Ok(ClientMessage::Resp { data }) => {
                         debug!(
@@ -780,6 +977,9 @@ impl SlimProtoServer {
                     Err(e) => {
                         // Connection closed or read error.
                         debug!(mac = %mac_for_reader, error = %e, "slimproto_read_error");
+                        if let Some(player) = players.lock().await.get(&mac_for_reader) {
+                            lock_playback(&player.playback).control_disconnected();
+                        }
                         break Err(e);
                     }
                 }
@@ -817,10 +1017,10 @@ impl SlimProtoServer {
             return;
         };
         let device_id = format!("slimproto-{mac_str}");
-        let player_name = {
+        let (player_name, playback) = {
             let reg = self.players.lock().await;
             match reg.get(mac_str) {
-                Some(p) => p.name.clone(),
+                Some(p) => (p.name.clone(), Arc::clone(&p.playback)),
                 None => return,
             }
         };
@@ -835,15 +1035,33 @@ impl SlimProtoServer {
         match zone_repo.get_or_create(&player_name, Some("slimproto"), &device_id) {
             Ok((zone_id, created)) => {
                 if created {
-                    state.event_bus.emit_typed(
-                        crate::event_types::EventType::ZoneCreated,
-                        serde_json::json!({
-                            "zone_id": zone_id,
-                            "name": player_name.clone(),
-                            "device_id": device_id.clone(),
-                            "type": "slimproto",
-                        }),
-                    );
+                    state
+                        .event_bus
+                        .emit_typed(crate::event_types::EventType::ZoneCreated, {
+                            // Meme contrat que la route API et la decouverte :
+                            // le client teste `data.zone` avant de fusionner, et
+                            // attend le volume en 0..1 (#2224).
+                            let mut charge = serde_json::json!({
+                                "zone_id": zone_id,
+                                "name": player_name.clone(),
+                                "device_id": device_id.clone(),
+                                "type": "slimproto",
+                                "id": zone_id,
+                            });
+                            if let Some(obj) = charge.as_object_mut()
+                                && let Ok(Some(z)) = zone_repo.get(zone_id)
+                            {
+                                obj.insert(
+                                    "zone".into(),
+                                    crate::db::zone_repo::zone_creee_contrat_client(
+                                        Some(&z),
+                                        zone_id,
+                                        &player_name,
+                                    ),
+                                );
+                            }
+                            charge
+                        });
                 } else {
                     let _ = zone_repo.set_online_by_device(&device_id, true);
                     state.event_bus.emit_typed(
@@ -857,12 +1075,13 @@ impl SlimProtoServer {
         }
 
         // Register the native output so the orchestrator can route to it.
-        let output = crate::outputs::slimproto::SlimProtoOutput::new(
+        let output = crate::outputs::slimproto::SlimProtoOutput::new_with_playback(
             player_name,
             device_id,
             mac_str.to_string(),
             Arc::clone(&self.players),
             Arc::clone(&state.command_channels),
+            playback,
         );
         state.outputs.lock().await.register(Box::new(output));
     }
@@ -895,22 +1114,24 @@ async fn read_message_from_reader(
 ) -> Result<ClientMessage, String> {
     use tokio::io::AsyncReadExt;
 
-    let len = reader
-        .read_u16()
-        .await
-        .map_err(|e| format!("read length: {e}"))? as usize;
-
-    if len < 4 {
-        return Err(format!("message too short: len={len}"));
-    }
-
+    // Client -> server keeps the same framing after `into_split()` as the
+    // initial HELO: tag first, then a 32-bit payload length.  The old helper
+    // accidentally used the opposite server -> client 16-bit framing, making
+    // every post-HELO STAT unreadable.
     let mut tag = [0u8; 4];
     reader
         .read_exact(&mut tag)
         .await
         .map_err(|e| format!("read tag: {e}"))?;
 
-    let payload_len = len - 4;
+    let payload_len = reader
+        .read_u32()
+        .await
+        .map_err(|e| format!("read length: {e}"))? as usize;
+    if payload_len > MAX_MESSAGE_LEN {
+        return Err(format!("payload too large: {payload_len} bytes"));
+    }
+
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
         reader
@@ -1052,6 +1273,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_modern_helo_reads_model_name_after_binary_fields() {
+        let mut payload = vec![
+            12, // device_type
+            0,  // firmware_version
+            0x00, 0x04, 0x20, 0x2a, 0xe4, 0xfe, // MAC
+        ];
+        // UUID, WLAN channel bitmap, byte counter and language are deliberately
+        // non-UTF-8/binary: none of them may leak into the display name.
+        payload.extend_from_slice(&[
+            0xff, 0x81, 0x00, 0x7f, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0,
+            0xb0, 0xc0,
+        ]);
+        payload.extend_from_slice(&0x07ff_u16.to_be_bytes());
+        payload.extend_from_slice(&21_700_000_u64.to_be_bytes());
+        payload.extend_from_slice(b"FR");
+        payload.extend_from_slice(
+            b"Model=baby,ModelName=Squeezebox Radio,Firmware=8.0.1-r16924,alc,aac,ogg,flc",
+        );
+
+        let msg = parse_client_message(*b"HELO", payload).unwrap();
+        match msg {
+            ClientMessage::Helo { name, mac, .. } => {
+                assert_eq!(name, "Squeezebox Radio");
+                assert_eq!(mac, [0x00, 0x04, 0x20, 0x2a, 0xe4, 0xfe]);
+                assert!(!name.contains('\u{fffd}'));
+            }
+            _ => panic!("expected Helo"),
+        }
+    }
+
+    #[test]
+    fn parse_modern_helo_falls_back_to_model_then_device_type() {
+        let mut with_model = vec![0_u8; MODERN_HELO_BASE_LEN];
+        with_model[0] = 12;
+        with_model.extend_from_slice(b"Model=squeezelite,flc,pcm");
+        let ClientMessage::Helo { name, .. } = parse_client_message(*b"HELO", with_model).unwrap()
+        else {
+            panic!("expected Helo");
+        };
+        assert_eq!(name, "squeezelite");
+
+        let mut without_model = vec![0_u8; MODERN_HELO_BASE_LEN];
+        without_model[0] = 10;
+        without_model.extend_from_slice(b"flc,pcm");
+        let ClientMessage::Helo { name, .. } =
+            parse_client_message(*b"HELO", without_model).unwrap()
+        else {
+            panic!("expected Helo");
+        };
+        assert_eq!(name, "Squeezebox 10");
+    }
+
+    #[test]
     fn parse_bye() {
         let msg = parse_client_message(*b"BYE!", vec![]).unwrap();
         assert!(matches!(msg, ClientMessage::Bye));
@@ -1124,6 +1398,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn le_lecteur_post_helo_conserve_le_cadrage_client_stat() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut payload = vec![0; 53];
+            payload[..4].copy_from_slice(b"STMt");
+            payload[35..39].copy_from_slice(&12_345u32.to_be_bytes());
+            stream.write_all(b"STAT").await.unwrap();
+            stream.write_u32(payload.len() as u32).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut reader, _) = stream.into_split();
+        let message = read_message_from_reader(&mut reader).await.unwrap();
+        writer.await.unwrap();
+
+        match message {
+            ClientMessage::Stat {
+                event, elapsed_ms, ..
+            } => {
+                assert_eq!(&event, b"STMt");
+                assert_eq!(elapsed_ms, 12_345);
+            }
+            other => panic!("STAT attendu, reçu {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_ne_termine_naturellement_qu_apres_decodage_puis_drainage() {
+        let mut playback = SlimProtoPlaybackState::default();
+        playback.begin_playback();
+        assert_eq!(playback.transport, TransportState::Transitioning);
+
+        playback.apply_stat(*b"STMs");
+        assert_eq!(playback.transport, TransportState::Playing);
+        playback.apply_stat(*b"STMt");
+        assert_eq!(playback.transport, TransportState::Playing);
+
+        playback.apply_stat(*b"STMp");
+        assert_eq!(playback.transport, TransportState::Paused);
+        playback.apply_stat(*b"STMr");
+        assert_eq!(playback.transport, TransportState::Playing);
+
+        playback.apply_stat(*b"STMd");
+        assert!(playback.decoder_finished);
+        assert_eq!(playback.transport, TransportState::Playing);
+        assert!(!playback.ended_naturally);
+
+        // DSCO(0) est l'EOF de la source HTTP, pas la fin du tampon audio.
+        playback.stream_disconnected(0);
+        assert_eq!(playback.transport, TransportState::Playing);
+        assert!(!playback.ended_naturally);
+
+        playback.apply_stat(*b"STMu");
+        assert_eq!(playback.transport, TransportState::Stopped);
+        assert!(playback.ended_naturally);
+        assert_eq!(playback.failure, None);
+
+        // Squeezelite protège déjà STMu avec `sentSTMu`; notre latch reste
+        // idempotent si un lecteur tiers répète néanmoins le paquet.
+        playback.apply_stat(*b"STMu");
+        assert!(playback.ended_naturally);
+    }
+
+    #[test]
+    fn underrun_et_deconnexion_restent_fail_closed() {
+        let mut playback = SlimProtoPlaybackState::default();
+        playback.begin_playback();
+        playback.apply_stat(*b"STMs");
+        playback.apply_stat(*b"STMu");
+        assert_eq!(playback.transport, TransportState::Stopped);
+        assert!(!playback.ended_naturally);
+        assert_eq!(playback.failure, Some(SlimProtoPlaybackFailure::Underrun));
+
+        playback.begin_playback();
+        playback.apply_stat(*b"STMs");
+        playback.stream_disconnected(2);
+        assert_eq!(playback.transport, TransportState::Stopped);
+        assert!(!playback.ended_naturally);
+        assert_eq!(
+            playback.failure,
+            Some(SlimProtoPlaybackFailure::StreamDisconnected(2))
+        );
+    }
+
+    #[tokio::test]
     async fn player_registry_insert_remove() {
         let registry = new_player_registry();
         let mac_str = "aa:bb:cc:dd:ee:ff".to_string();
@@ -1143,6 +1507,7 @@ mod tests {
                     elapsed_ms: 0,
                     bytes_received: 0,
                     last_event: [0u8; 4],
+                    playback: new_playback_state(),
                 },
             );
             assert_eq!(reg.len(), 1);

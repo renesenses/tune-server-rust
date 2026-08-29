@@ -5,6 +5,13 @@ name: Widget Release
 # own cadence, NOT with every server `v*` tag — trigger with a `widget-v*`
 # tag or run manually. Reuses the same Apple signing/notarization secrets as
 # release.yml.
+#
+# Trois cibles : macOS arm64, macOS Intel (DMG signés + notarisés) et Windows
+# x64 (installeur NSIS). La cible Windows a ete ajoutee le 14 aout 2026 : la
+# release widget-v0.1.2 ne contenait que des DMG, et les testeurs Windows —
+# Sandro, qui fait tourner son serveur sur GentooPlayer — n'avaient rien a
+# installer. Le widget est un CLIENT : il ne transporte aucun serveur en
+# sidecar, il se connecte a celui que l'utilisateur fait deja tourner.
 on:
   workflow_dispatch:
   push:
@@ -17,6 +24,25 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Sans limite explicite, GitHub laisse tourner 6 HEURES. Le 12 aout 2026, une
+    # signature bloquee a consomme 95 min de silence avant une annulation
+    # manuelle — elle en aurait consomme 360 sans intervention. Reference : la
+    # compilation prend ~5 min, la notarisation ~45 s dans release.yml. 30 min
+    # laissent une marge confortable tout en transformant un blocage en echec
+    # rapide et lisible.
+    #
+    # Windows a besoin de plus : pas de signature a bloquer, mais un runner
+    # nettement plus lent (E/S disque), une compilation a froid de toute
+    # l'arborescence Tauri et le telechargement de NSIS par le bundler. 45 min
+    # gardent la meme propriete — un blocage devient un echec lisible — sans
+    # transformer un premier build sans cache en faux negatif.
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      # Au niveau du job, parce qu'un `if:` d'etape ne voit pas le contexte
+      # `secrets` — seulement `env`. Meme montage que release.yml. Le secret
+      # n'existe pas encore : la valeur est vide et l'etape de signature
+      # Windows reste inerte.
+      WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
     defaults:
       run:
         working-directory: tune-widget/src-tauri
@@ -26,10 +52,31 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            timeout: 30
           - target: x86_64-apple-darwin
             os: macos-15-intel
+            timeout: 30
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            timeout: 45
     steps:
       - uses: actions/checkout@v4
+
+      # Garde-fou : les fichiers produits portent la version de tauri.conf.json.
+      # Sans ce contrôle, un tag widget-v0.1.3 pouvait publier des fichiers
+      # nommés 0.1.0 (vécu sur widget-v0.1.2 et v0.1.3) — deux releases
+      # devenaient indistinguables par leur nom.
+      - name: Verify widget version matches tag
+        if: startsWith(github.ref, 'refs/tags/widget-v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#widget-v}"
+          CONF_VERSION=$(grep -m1 '"version"' tune-widget/src-tauri/tauri.conf.json | sed 's/.*"version": "\(.*\)".*/\1/')
+          echo "tag=$TAG_VERSION conf=$CONF_VERSION"
+          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
+            echo "::error::Le tag $GITHUB_REF_NAME ne correspond pas a la version $CONF_VERSION de tauri.conf.json — les fichiers publies porteraient un mauvais numero."
+            exit 1
+          fi
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,9 +90,18 @@ jobs:
       - name: Install Tauri CLI
         uses: taiki-e/install-action@v2
         with:
-          tool: tauri-cli@^2
+          # Version EXACTE, sans opérateur semver : install-action rejette `^2`
+          # (« semver operators are not supported in 'tool' input option »).
+          # Le workflow n'ayant jamais tourné avant widget-v0.1.0, l'erreur est
+          # restée invisible jusqu'au premier tag.
+          tool: tauri-cli@2.11.4
 
+      # Tout le bloc Apple (trousseau, cle API, build notarise) ne concerne QUE
+      # les runners macOS. Sans ce garde-fou, `security` et la syntaxe bash de
+      # ces etapes s'executeraient sous pwsh sur windows-latest et feraient
+      # echouer le job avant meme la compilation.
       - name: Import signing certificate
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -54,30 +110,143 @@ jobs:
           echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
+          # Le trousseau doit aussi etre dans la LISTE DE RECHERCHE : codesign
+          # parcourt celle-ci, pas seulement le trousseau par defaut.
+          security list-keychains -d user -s build.keychain login.keychain
           security unlock-keychain -p actions build.keychain
+          # SANS CECI, LA SIGNATURE PEND INDEFINIMENT. Un trousseau se
+          # reverrouille tout seul apres quelques minutes d'inactivite ; codesign
+          # attend alors un mot de passe que personne ne saisira jamais, et le job
+          # reste muet jusqu'au timeout. release.yml y echappe par chance : il
+          # signe 5 secondes apres l'import. Ici `cargo tauri build` compile
+          # d'abord ~5 min, et le trousseau a le temps de se refermer — c'est
+          # exactement ce qui est arrive au tag widget-v0.1.0 le 12 aout 2026
+          # (95 min de silence apres « Signing ... », annule a la main).
+          security set-keychain-settings -lut 21600 build.keychain
           security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
           rm /tmp/certificate.p12
 
-      - name: Build signed + notarized bundle
+      # release.yml notarise via une CLE API App Store Connect et ne retombe sur
+      # le mot de passe applicatif qu'a defaut. Le widget ne connaissait que la
+      # seconde porte — celle qui repond 401. On ecrit donc le .p8 sur disque,
+      # comme le fait release.yml, pour que Tauri emprunte la meme.
+      - name: Write App Store Connect API key
+        if: runner.os == 'macOS'
         env:
-          # Tauri v2 signs with this identity and — because the notarization
-          # trio below is set — notarizes and staples the DMG automatically.
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          # Test en shell, pas dans un `if:` d'etape : le contexte `secrets`
+          # n'y est pas disponible. Meme motif que release.yml.
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            printf '%s' "$ASC_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+            echo "cle API App Store Connect ecrite"
+          else
+            echo "::error::ASC_API_KEY_P8 absent — la notarisation echouera (pas de repli : voir la priorite de notarize_auth ci-dessous)"
+            exit 1
+          fi
+
+      - name: Build signed + notarized bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          # Tauri v2 signe avec cette identite et, parce que de quoi notariser
+          # est fourni ci-dessous, notarise et tamponne le DMG automatiquement.
           APPLE_SIGNING_IDENTITY: "Developer ID Application: Bertrand Clech (${{ secrets.APPLE_TEAM_ID }})"
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Cle API App Store Connect. ATTENTION, priorite INVERSE de ce que
+          # croyait #1644 : notarize_auth() de tauri-bundler teste APPLE_ID +
+          # APPLE_PASSWORD + APPLE_TEAM_ID EN PREMIER et ne regarde la cle API
+          # qu'a defaut (crates/tauri-bundler/src/bundle/macos/sign.rs). Poser
+          # APPLE_ID/APPLE_PASSWORD ici court-circuitait donc la cle API et
+          # renvoyait 401 (mot de passe applicatif invalide) — echec du run du
+          # 13 aout 2026 sur widget-v0.1.0. On ne pose QUE la cle API.
+          # (APPLE_TEAM_ID seul ne declenche pas le chemin AppleId.)
+          APPLE_API_KEY: ${{ secrets.ASC_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
         run: cargo tauri build --target ${{ matrix.target }}
 
+      # `--bundles nsis` prime sur `bundle.targets` de tauri.conf.json, qui vaut
+      # ["dmg", "app"] — deux formats qui n'existent pas sous Windows. On evite
+      # ainsi d'ajouter un tauri.windows.conf.json juste pour ca.
+      #
+      # AUCUN sidecar ici, volontairement. La branche abandonnee
+      # `feat/windows-launcher-sidecar` (depot autonome tune-widget) embarquait
+      # `tune-server.exe` dans l'installeur pour faire un lanceur « tout-en-un ».
+      # Ce n'est PAS ce qu'il faut : les testeurs Windows visés font deja tourner
+      # un serveur ailleurs (Sandro : GentooPlayer). Le widget est un client, il
+      # se connecte a l'URL configuree.
+      - name: Build Windows installer (NSIS)
+        if: runner.os == 'Windows'
+        run: cargo tauri build --target ${{ matrix.target }} --bundles nsis
+
+      # Rien a signer aujourd'hui : le certificat Authenticode n'existe pas
+      # encore, `WIN_SIGN_CERT_BASE64` est vide et cette etape est donc IGNOREE.
+      # Elle est posee maintenant, sur le meme modele que release.yml (etapes
+      # « Sign Windows binaries/installer »), pour que le jour ou le certificat
+      # arrive il n'y ait qu'un secret a poser — aucun changement de workflow.
+      #
+      # L'installeur est ce que l'utilisateur double-clique, donc ce que
+      # SmartScreen juge en premier ; c'est lui qu'on signe ici. Le
+      # `tune-widget.exe` qu'il contient est fige avant cette etape : pour le
+      # signer aussi il faudra passer par `bundle.windows.signCommand` de Tauri,
+      # a faire en meme temps que l'arrivee du certificat.
+      - name: Sign Windows installer (si le certificat est présent)
+        if: runner.os == 'Windows' && env.WIN_SIGN_CERT_BASE64 != ''
+        env:
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+          # signtool vit dans le SDK Windows, à une version près : prendre la
+          # plus récente plutôt que figer un chemin qui cassera à la prochaine
+          # image de runner.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+          $installers = Get-ChildItem "target\${{ matrix.target }}\release\bundle\nsis\*.exe"
+          if (-not $installers) { throw "aucun installeur NSIS à signer" }
+          foreach ($i in $installers) {
+            # /tr = horodatage : c'est lui qui fait qu'une signature reste
+            # valide APRÈS l'expiration du certificat.
+            & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+              /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v $i.FullName
+            if ($LASTEXITCODE -ne 0) { throw "échec de signature : $($i.Name)" }
+            & $signtool.FullName verify /pa /v $i.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signature invalide : $($i.Name)" }
+          }
+          Remove-Item $pfx -Force
+
       - name: Collect DMG
+        if: runner.os == 'macOS'
         run: |
           mkdir -p ../../dist
           cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg ../../dist/
 
+      # `--bundles nsis` ne produit pas de MSI, mais on le ramasse s'il existe
+      # (bundle par defaut d'une future config) plutot que de le perdre en
+      # silence. `Copy-Item` sans correspondance n'echoue pas, d'ou le
+      # decompte explicite : un dossier dist vide ferait passer le job au vert
+      # et publierait une release sans installeur Windows.
+      - name: Collect Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\..\dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\bundle\nsis\*.exe" ..\..\dist\ -ErrorAction SilentlyContinue
+          Copy-Item "target\${{ matrix.target }}\release\bundle\msi\*.msi" ..\..\dist\ -ErrorAction SilentlyContinue
+          $found = Get-ChildItem ..\..\dist
+          if (-not $found) { throw "aucun installeur Windows produit par le bundler" }
+          $found | ForEach-Object { "{0}  {1:N0} octets" -f $_.Name, $_.Length }
+
       - uses: actions/upload-artifact@v4
         with:
           name: tune-widget-${{ matrix.target }}
-          path: dist/*.dmg
+          # `dist/*` et non `dist/*.dmg` : la cible Windows y depose un .exe
+          # NSIS (et un .msi le cas echeant), qu'un filtre .dmg jetterait.
+          path: dist/*
           retention-days: 3
 
   release:
@@ -90,15 +259,22 @@ jobs:
         with:
           path: artifacts
 
+      # Les sommes doivent couvrir TOUT ce qui est publie, sinon un utilisateur
+      # Windows n'a rien a verifier. Le `-o` s'applique aux trois motifs grace
+      # aux parentheses : sans elles, `-exec` ne s'accrocherait qu'au dernier.
       - name: Checksums
         run: |
           cd artifacts
-          find . -name '*.dmg' -exec sha256sum {} \; > ../SHA256SUMS-widget
+          find . \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) \
+            -exec sha256sum {} \; > ../SHA256SUMS-widget
           cd ..
+          cat SHA256SUMS-widget
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/**/*.dmg
+            artifacts/**/*.exe
+            artifacts/**/*.msi
             SHA256SUMS-widget
           generate_release_notes: true

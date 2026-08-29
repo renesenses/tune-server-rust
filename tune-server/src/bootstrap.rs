@@ -29,15 +29,73 @@ use crate::plugins::PluginBuilder;
 use crate::routes;
 use crate::state::AppState;
 
+/// Ce dont un binaire composeur a besoin pour demarrer le serveur.
+///
+/// Cette couture existe pour les caisses de sortie hors-arbre, qui ne peuvent
+/// pas apparaitre dans le graphe de dependances public — le premier
+/// consommateur est `tune-diretta`, prive.
+///
+/// ⚠️ Elle a deja ete supprimee une fois (#1510, entre 0.9.69 et 0.9.70) parce
+/// que rien, DANS CE DEPOT, ne l'appelait ni ne la testait. Le raisonnement
+/// etait juste et la conclusion fausse : un consommateur externe etait casse
+/// pendant deux versions. Le test `run_options_carry_output_providers` existe
+/// pour que le prochain audit trouve un appelant.
+///
+/// `..Default::default()` est deliberement supportable : c'est la forme
+/// d'appel qu'utilisent les binaires composeurs.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Appele une fois, apres construction de [`AppState`] et enregistrement
+    /// des sorties locales, pour produire des greffons a enregistrer aux cotes
+    /// de ceux compiles dans le binaire.
+    pub build_plugins: Option<PluginBuilder>,
+    /// Fournisseurs de sorties hors-arbre. Interroges au demarrage puis
+    /// toutes les 60 s — c'est ce polling, et non un enregistrement statique,
+    /// que reclame une decouverte reseau dynamique doublee d'une
+    /// reverification periodique d'habilitation.
+    pub output_providers: Vec<std::sync::Arc<dyn tune_core::outputs::traits::OutputProvider>>,
+}
+
 /// Start the server and serve until a shutdown signal arrives.
 ///
 /// `build_plugins` is called once, after [`AppState`] is built and local
 /// outputs are registered, to produce plugins to register alongside the
 /// compiled-in ones. Pass `None` for the plain server.
+///
+/// Conserve pour les appelants existants : delegue a [`run_with`].
 pub async fn run(build_plugins: Option<PluginBuilder>) {
+    run_with(RunOptions {
+        build_plugins,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Comme [`run`], mais pour un binaire composeur qui apporte ses propres
+/// fournisseurs de sorties.
+pub async fn run_with(opts: RunOptions) {
+    let build_plugins = opts.build_plugins;
     // Probe-child dispatch FIRST: when spawned as a wasm-load probe, do the
     // one dangerous thing and exit before any server state exists (#1249).
     crate::plugins::maybe_run_wasm_probe();
+
+    // `--version` / `-V` : répondre et sortir avant tout effet de bord.
+    //
+    // Ici et non dans `main.rs` : ce dernier est délibérément vide pour qu'un
+    // binaire composeur (`tune-server-diretta`) partage ce démarrage, et il
+    // doit hériter du drapeau. Et après la sonde wasm ci-dessus, dont le
+    // commentaire impose qu'elle reste le premier geste.
+    //
+    // Pourquoi ce drapeau existe : l'écran d'une appliance Tune OS affichait
+    // la version gravée à l'installation, définitivement. Philippe Landes a lu
+    // 0.9.85 dans l'interface web et 0.9.83 en console — sur la MÊME machine,
+    // après une mise à jour qui avait parfaitement fonctionné. Faute de pouvoir
+    // demander sa version au binaire, l'écran ne pouvait que répéter une valeur
+    // figée. Cf tune-os#27.
+    if version_requested(std::env::args().skip(1)) {
+        println!("tune-server {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
 
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
@@ -167,19 +225,24 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // .app. The path is shared with the reader via config::default_log_file_path()
     // so both always agree. Previously Linux wrote no file, so any launch where
     // journalctl didn't apply exported an empty log.
+    // Plafond du journal : 10 Mio pour le fichier courant, plus une sauvegarde
+    // `.1` — soit ~2× sur le disque.
+    //
+    // Il est tenu à DEUX moments, et il faut les deux. `rotate_log_file` range
+    // au démarrage ce que la session précédente a laissé ; `JournalBorne` tient
+    // le plafond *pendant* que le serveur tourne. Jusqu'ici seul le premier
+    // existait, et #539 l'assumait — mais un serveur qui tourne longtemps est
+    // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
+    // et #2156).
+    const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
     let log_file = {
         let path = config::default_log_file_path();
-        // Cap the log at 10 MiB (keeping one .1 backup) so it doesn't grow
-        // without bound on a long-running server.
-        config::rotate_log_file(&path, 10 * 1024 * 1024);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        config::rotate_log_file(&path, PLAFOND_JOURNAL);
+        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
             .ok()
-            .map(|f| {
+            .map(|j| {
                 eprintln!("Logging to {}", path.display());
-                f
+                j
             })
     };
 
@@ -217,7 +280,7 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // sur une socket IPv4 seule (#1321). Le repli couvre les machines où IPv6
     // est désactivé, et la reprise de port ci-dessous reste inchangée.
     let v4_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = {
+    let (listener, boot_socket) = {
         let (mut socket, mut addr) = crate::config::dual_stack_listen_socket(config.port)
             .unwrap_or_else(|| (crate::config::ipv4_listen_socket(), v4_addr));
         let mut ipv6_attempted = addr.is_ipv6();
@@ -280,18 +343,36 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
         socket
             .set_nonblocking(true)
             .expect("failed to set nonblocking");
-        tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
+        // Descripteur dupliqué de la MÊME socket, pour le répondeur de
+        // démarrage (#1701) : il accepte les connexions pendant que la base se
+        // met à niveau, puis rend la place à axum. Dupliquer plutôt que
+        // réécouter garde la protection ci-dessus (un seul serveur tient le
+        // port) et le backlog déjà constitué.
+        let boot_socket = socket.try_clone().ok().map(std::net::TcpListener::from);
+        (
+            tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener"),
+            boot_socket,
+        )
     };
     // Adresse réellement obtenue : `[::]` en double pile, `0.0.0.0` en repli.
     let addr = listener.local_addr().unwrap_or(v4_addr);
 
+    // À partir d'ici et jusqu'à ce qu'axum serve, quelqu'un répond. Sans ça,
+    // une migration longue laissait le navigateur tourner dans le vide : le
+    // testeur « eric » a signalé « l'installation de la 9.70 plante » alors que
+    // la base se mettait à niveau, en silence (#1701, fil forum 1386).
+    let boot_responder = boot_socket.map(crate::boot_status::spawn);
+
     // Appliance : ne jamais démarrer sur une base vide si le disque de
     // données externe est absent (docs/DATA-RELOCATION.md).
+    crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
 
+    crate::boot_status::set_phase("base de données");
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
 
+    crate::boot_status::set_phase("configuration");
     state.restore_tokens().await;
 
     // Restore zone volumes, persist music_dirs/discogs_token to DB
@@ -320,9 +401,16 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
 
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
-    crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done);
+    crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done, state.event_bus.clone());
+
+    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
+    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
+    // « 0 fichier » (#1692).
+    crate::boot_status::set_phase("partages réseau");
+    crate::startup::remount_network_shares(&state).await;
 
     // Register local audio outputs (USB DAC, headphones, speakers)
+    crate::boot_status::set_phase("sorties audio");
     #[cfg(feature = "local-audio")]
     crate::startup::register_local_outputs(&state).await;
 
@@ -333,6 +421,7 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // `build_plugins` is where an out-of-tree binary injects its own. It runs
     // here, and not earlier, because a plugin's host services (`services`,
     // `backend`, `http_client`) only exist once `state` does.
+    crate::boot_status::set_phase("greffons");
     let extra_plugins = build_plugins.map(|build| build(&state)).unwrap_or_default();
     let plugin_routers = crate::plugins::init(
         &state,
@@ -358,6 +447,7 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // with local_audio_http_fetch_failed and left playback silently dead.
 
     // Create shared OpenHome event listener
+    crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
 
     // SSDP discovery (DLNA / OpenHome)
@@ -365,6 +455,12 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
 
     // mDNS discovery (Chromecast, AirPlay, BluOS, OAAT, Squeezebox)
     let _mdns_handle = crate::discovery_setup::spawn_mdns_handler(&state);
+
+    // Sorties hors-arbre apportees par un binaire composeur (tune-diretta).
+    // Sans effet pour le binaire standard : `RunOptions::default()` n'a aucun
+    // fournisseur. C'est l'appel dont la disparition a casse l'integration
+    // partenaire pendant deux versions (#1510).
+    crate::discovery_setup::spawn_output_providers(&state, opts.output_providers);
 
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
@@ -403,6 +499,13 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
     // besoin pour replier le WAL.
     let shutdown_state = state.clone();
     let app = routes::router_with_plugins(state, plugin_routers);
+
+    // Le routeur est prêt : le répondeur de démarrage rend la socket. `stop()`
+    // attend la sortie du fil, donc il n'y a jamais deux accepteurs à la fois
+    // et aucune connexion ne peut recevoir un « je démarre » après coup.
+    if let Some(responder) = boot_responder {
+        responder.stop();
+    }
 
     // Listener was bound before the DB was opened (see above) — the socket's
     // backlog has been queueing connections since then.
@@ -698,4 +801,57 @@ fn same_executable(a: &str, b: &str) -> bool {
     }
     // One side may be truncated by ps (TASK_COMM_LEN / MAXCOMLEN).
     (a.len() >= 15 && b.starts_with(a)) || (b.len() >= 15 && a.starts_with(b))
+}
+
+/// Les arguments demandent-ils la version ?
+///
+/// Extrait de [`run_with`] pour être testable : la branche appelante quitte le
+/// processus, ce qu'un test ne peut pas observer. L'appelant a déjà écarté
+/// `argv[0]`.
+///
+/// Comparaison stricte, jamais un préfixe : `--verbose` ne doit pas faire
+/// sortir un serveur au démarrage.
+fn version_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_requested;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn les_deux_formes_demandent_la_version() {
+        assert!(version_requested(args(&["--version"])));
+        assert!(version_requested(args(&["-V"])));
+    }
+
+    #[test]
+    fn un_demarrage_ordinaire_ne_demande_rien() {
+        assert!(!version_requested(args(&[])));
+        assert!(!version_requested(args(&[
+            "--config",
+            "/opt/tune/tune.toml"
+        ])));
+    }
+
+    /// Le vrai risque de ce drapeau : un serveur qui sort au lieu de démarrer.
+    /// Un préfixe ne doit JAMAIS suffire.
+    #[test]
+    fn un_argument_qui_commence_pareil_ne_fait_pas_sortir_le_serveur() {
+        assert!(!version_requested(args(&["--verbose"])));
+        assert!(!version_requested(args(&["--version-check"])));
+        assert!(!version_requested(args(&["-Version"])));
+        assert!(!version_requested(args(&["-Vv"])));
+    }
+
+    /// La sonde wasm est dispatchée avant, mais si l'ordre changeait un jour,
+    /// ce test rappelle que ses arguments ne doivent pas déclencher la sortie.
+    #[test]
+    fn les_arguments_de_la_sonde_wasm_ne_declenchent_rien() {
+        assert!(!version_requested(args(&["--wasm-probe", "/tmp/x.wasm"])));
+    }
 }

@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -275,19 +275,56 @@ async fn apply_profile_handler(
         )
         .map_err(AppError::internal)?;
 
+    // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a
+    // la piste SUIVANTE sur une zone locale, alors que la reponse annonce deja
+    // `applied: true` (#1725). Une correction de piece se juge a l'oreille,
+    // musique en cours — c'est le geste meme qu'on attend de l'utilisateur.
+    // `zone_id` est textuel sur cette route ; l'orchestrateur indexe par i64.
+    let applique_a_chaud = match zone_id.parse::<i64>() {
+        Ok(id) => state.orchestrator.apply_eq_change(id).await,
+        Err(_) => false,
+    };
+
     Ok(Json(json!({
         "applied": true,
         "zone_id": zone_id,
         "profile_name": profile.name,
         "filter_count": profile.filters.len(),
+        // `applied` dit « persiste » ; celui-ci dit « entendu maintenant ».
+        // Faux ne signale pas un echec : rien ne joue, zone non locale, PURE.
+        "applied_live": applique_a_chaud,
     }))
     .into_response())
 }
 
+/// Le canal vise par un televersement de filtre.
+#[derive(Deserialize, Default)]
+struct CanalDuFiltre {
+    /// `left` ou `right` pour deposer UN canal ; absent = le fichier porte deja
+    /// la correction complete (mono duplique, ou stereo tel quel).
+    channel: Option<String>,
+}
+
 /// `POST /room-correction/ir/upload/{zone_id}` — upload a WAV impulse response
+///
+/// `?channel=left` / `?channel=right` depose UN canal a la fois. Les outils de
+/// correction de piece — REW, Acourate, Audiolense — exportent deux fichiers
+/// mono, `filter_L.wav` et `filter_R.wav`, jamais un stereo : sans ce chemin,
+/// l'utilisateur devait les fusionner lui-meme dans un editeur audio (Daniel,
+/// 24/08/2026).
+///
+/// Les deux canaux deposes sont combines en un WAV stereo ecrit au chemin que
+/// les consommateurs lisent DEJA — sortie locale, transcodage vers les
+/// renderers reseau, visualisation `/convolver/response`. Aucun d'eux n'a a
+/// connaitre ce nouveau mode.
+///
+/// Tant qu'il manque un canal, la correction n'est PAS activee : n'appliquer
+/// qu'une oreille serait pire que ne rien appliquer. La reponse dit lequel
+/// manque.
 async fn upload_ir_handler(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    Query(canal): Query<CanalDuFiltre>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -311,7 +348,58 @@ async fn upload_ir_handler(
             .join("ir");
     std::fs::create_dir_all(&ir_dir).ok();
     let ir_path = ir_dir.join(format!("zone_{zone_id}.wav"));
-    if let Err(e) = std::fs::write(&ir_path, &body) {
+    let cote = match canal.channel.as_deref() {
+        None | Some("") => None,
+        Some("left") | Some("l") | Some("gauche") => Some("L"),
+        Some("right") | Some("r") | Some("droite") => Some("R"),
+        Some(autre) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("canal inconnu « {autre} » — attendu left ou right")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Depot d'un seul canal : on garde le fichier brut de son cote, et on ne
+    // combine que lorsque les DEUX sont la.
+    if let Some(cote) = cote {
+        let chemin_cote = ir_dir.join(format!("zone_{zone_id}_{cote}.wav"));
+        if let Err(e) = std::fs::write(&chemin_cote, &body) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("write IR: {e}")})),
+            )
+                .into_response();
+        }
+        let gauche = ir_dir.join(format!("zone_{zone_id}_L.wav"));
+        let droite = ir_dir.join(format!("zone_{zone_id}_R.wav"));
+        if !gauche.exists() || !droite.exists() {
+            let manquant = if gauche.exists() { "right" } else { "left" };
+            return Json(json!({
+                "ok": true,
+                "zone_id": zone_id,
+                "channel": if cote == "L" { "left" } else { "right" },
+                "awaiting_channel": manquant,
+                "active": false,
+                "size_bytes": body.len(),
+                "message": format!(
+                    "filtre {} enregistre — la correction s'activera au depot du canal {manquant}",
+                    if cote == "L" { "gauche" } else { "droit" }
+                ),
+            }))
+            .into_response();
+        }
+        if let Err(e) = tune_core::audio::convolver::Convolver::combiner_en_stereo(
+            gauche.to_str().unwrap_or(""),
+            droite.to_str().unwrap_or(""),
+            ir_path.to_str().unwrap_or(""),
+        ) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    } else if let Err(e) = std::fs::write(&ir_path, &body) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write IR: {e}")})),
@@ -353,6 +441,8 @@ async fn upload_ir_handler(
         "zone_id": zone_id,
         "ir_path": ir_path_str,
         "size_bytes": body.len(),
+        "active": true,
+        "per_channel": cote.is_some(),
         "applies_to": if is_local { "local" } else { "network (transcode)" },
     }))
     .into_response()
@@ -386,6 +476,13 @@ async fn clear_ir_handler(
             .join("ir")
             .join(format!("zone_{zone_id}.wav"));
     std::fs::remove_file(&ir_path).ok();
+    // Et les deux depots par canal, sinon un « effacer » suivi d'un depot d'un
+    // seul cote ressusciterait l'ancien filtre de l'autre.
+    for cote in ["L", "R"] {
+        let mut p = ir_path.clone();
+        p.set_file_name(format!("zone_{zone_id}_{cote}.wav"));
+        std::fs::remove_file(&p).ok();
+    }
 
     // A local output also drops its live convolver.
     #[cfg(feature = "local-audio")]

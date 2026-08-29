@@ -101,8 +101,10 @@
       "name": "Bluesound",
       "models": [
         { "name": "Node", "quirks": {} },
+        { "name": "Node N130", "quirks": {} },
         { "name": "Node Icon", "quirks": {} },
         { "name": "Powernode", "quirks": {} },
+        { "name": "Vault", "quirks": {} },
         { "name": "Pulse Flex", "quirks": { "max_sample_rate": 48000 } }
       ]
     },
@@ -197,6 +199,23 @@
         { "name": "R-N1000A", "quirks": {} },
         { "name": "WXC-50", "quirks": {} },
         { "name": "WXA-50", "quirks": {} }
+      ]
+    },
+    {
+      "name": "NAD",
+      "models": [
+        { "name": "C 700", "quirks": {} },
+        { "name": "M10", "quirks": {} },
+        { "name": "M10 V2", "quirks": {} },
+        { "name": "M10 V3", "quirks": {} },
+        { "name": "M33", "quirks": {} },
+        { "name": "M66", "quirks": {} }
+      ]
+    },
+    {
+      "name": "Samsung",
+      "models": [
+        { "name": "S95B", "quirks": {} }
       ]
     }
   ]

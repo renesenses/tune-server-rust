@@ -114,6 +114,8 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             audio_backend,
             wire.as_ref(),
         );
+        let output_capabilities =
+            crate::routes::zones::output_capabilities(state, z.output_device_id.as_deref()).await;
         zone_snaps.push(serde_json::json!({
             "zone_id": zid,
             "name": z.name,
@@ -134,6 +136,8 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             "queue_length": ps.queue_length,
             "now_playing": ps.now_playing,
             "signal_path": signal_path,
+            "output_capabilities": output_capabilities,
+            "resolving": ps.resolving,
         }));
     }
 

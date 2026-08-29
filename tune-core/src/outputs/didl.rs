@@ -6,6 +6,33 @@
 
 use quick_xml::escape::{escape, partial_escape};
 
+/// XML 1.0 interdit les caractères de contrôle hors tabulation et fins de
+/// ligne — et `escape` n'y touche pas : un séparateur NUL d'ID3v2.4/Picard
+/// traversait tel quel et rendait l'enveloppe SOAP entière illégale. npupnp
+/// (upmpdcli — HiFiMAN Serenade de Tades) répond alors 401 « Invalid
+/// Action » : son parseur échoue sur le corps, pas sur l'action. On remplace
+/// par une espace : les multi-valeurs restent lisibles (« Lisa The String
+/// Soloists »), rien n'est perdu.
+fn texte_xml_sain(s: &str) -> std::borrow::Cow<'_, str> {
+    let illegal = |c: char| !matches!(c, '\t' | '\n' | '\r') && c < '\u{20}';
+    if s.chars().any(illegal) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| if illegal(c) { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Échappement XML précédé de l'assainissement ci-dessus — l'unique porte
+/// par laquelle du texte libre (tags) entre dans un document DIDL.
+fn escape_sain(s: &str) -> String {
+    let sain = texte_xml_sain(s);
+    escape(sain.as_ref()).into_owned()
+}
+
 /// DLNA flags string for a given MIME type.
 ///
 /// Returns `protocolInfo` 4th-field with DLNA profile name, operation flags,
@@ -170,6 +197,7 @@ pub struct DidlBuilder {
     /// True for infinite live streams (internet radio): emit live/senderPaced
     /// protocolInfo flags and never emit `size=`/`duration=` in `<res>`.
     live_stream: bool,
+    byte_seekable: bool,
 }
 
 impl DidlBuilder {
@@ -194,6 +222,7 @@ impl DidlBuilder {
             item_id: "0".to_string(),
             parent_id: "0".to_string(),
             live_stream: false,
+            byte_seekable: true,
         }
     }
 
@@ -204,6 +233,16 @@ impl DidlBuilder {
     /// `size=`/`duration=` attributes regardless of any values set.
     pub fn live_stream(mut self, yes: bool) -> Self {
         self.live_stream = yes;
+        self
+    }
+
+    /// Une source FINIE mais non-seekable : la conversion à la volée
+    /// (DSD→WAV). La durée et la taille restent annoncées, mais le
+    /// protocolInfo passe à `DLNA.ORG_OP=00` — sans quoi le renderer
+    /// seeke par tranches un tuyau qui ne sait pas rejouer un octet passé
+    /// (Eversolo DMP-A8 : gel à 0:00 en boucle, .42, 24/08).
+    pub fn byte_seekable(mut self, yes: bool) -> Self {
+        self.byte_seekable = yes;
         self
     }
 
@@ -334,14 +373,14 @@ impl DidlBuilder {
     /// Use this when multiple items are combined inside a single `<DIDL-Lite>`
     /// wrapper (e.g. UPnP ContentDirectory Browse responses).
     pub fn build_item(&self) -> String {
-        let title = escape(&self.title);
-        let escaped_url = escape(&self.resource_url);
-        let escaped_id = escape(&self.item_id);
-        let escaped_pid = escape(&self.parent_id);
+        let title = escape_sain(&self.title);
+        let escaped_url = escape_sain(&self.resource_url);
+        let escaped_id = escape_sain(&self.item_id);
+        let escaped_pid = escape_sain(&self.parent_id);
 
         // Artist tags
         let artist_tags = if is_valid_meta(self.artist.as_deref()) {
-            let a = escape(self.artist.as_deref().unwrap());
+            let a = escape_sain(self.artist.as_deref().unwrap());
             if self.include_upnp_artist {
                 format!("<dc:creator>{a}</dc:creator><upnp:artist>{a}</upnp:artist>")
             } else {
@@ -356,7 +395,7 @@ impl DidlBuilder {
             .album
             .as_deref()
             .filter(|a| is_valid_meta(Some(a)))
-            .map(|a| format!("<upnp:album>{}</upnp:album>", escape(a)))
+            .map(|a| format!("<upnp:album>{}</upnp:album>", escape_sain(a)))
             .unwrap_or_default();
 
         // Album art URI
@@ -365,7 +404,7 @@ impl DidlBuilder {
             .as_deref()
             .filter(|c| is_valid_meta(Some(c)))
             .map(|c| {
-                let c = escape(c);
+                let c = escape_sain(c);
                 if self.dlna_art_profile {
                     format!("<upnp:albumArtURI dlna:profileID=\"JPEG_TN\">{c}</upnp:albumArtURI>")
                 } else {
@@ -385,9 +424,20 @@ impl DidlBuilder {
         let protocol_info = match self.protocol_style {
             ProtocolStyle::Dlna => {
                 let flags = if self.live_stream {
-                    dlna_flags_for_mime_live(&self.mime_type)
+                    dlna_flags_for_mime_live(&self.mime_type).to_string()
                 } else {
-                    dlna_flags_for_mime_bd_sr(&self.mime_type, self.bit_depth, self.sample_rate)
+                    let f = dlna_flags_for_mime_bd_sr(
+                        &self.mime_type,
+                        self.bit_depth,
+                        self.sample_rate,
+                    );
+                    if self.byte_seekable {
+                        f.to_string()
+                    } else {
+                        // Conversion à la volée : mêmes profils, mais on dit la
+                        // vérité sur la seekabilité.
+                        f.replace("DLNA.ORG_OP=01", "DLNA.ORG_OP=00")
+                    }
                 };
                 format!("http-get:*:{}:{}", self.mime_type, flags)
             }
@@ -737,6 +787,37 @@ mod tests {
         assert!(!xml.contains("duration="), "no duration on live stream");
     }
 
+    /// Une conversion à la volée (DSD→WAV) est FINIE mais non-seekable : le
+    /// protocolInfo doit dire OP=00 (sinon l'Eversolo seeke le tuyau et gèle
+    /// à 0:00), mais la durée et la taille restent annoncées — le renderer
+    /// affiche une piste normale, il ne doit juste pas chercher dedans.
+    #[test]
+    fn conversion_didl_dit_op00_mais_garde_la_duree() {
+        let xml = DidlBuilder::new("Abacab", "http://s/stream/x.wav", "audio/wav")
+            .protocol_style(ProtocolStyle::Dlna)
+            .byte_seekable(false)
+            .duration_ms(390_000)
+            .file_size(1_300_000_000)
+            .bit_depth(24)
+            .sample_rate(176_400)
+            .build();
+        assert!(
+            xml.contains("DLNA.ORG_OP=00"),
+            "conversion non-seekable, got: {xml}"
+        );
+        assert!(
+            !xml.contains("DLNA.ORG_OP=01"),
+            "plus aucune annonce de seek, got: {xml}"
+        );
+        assert!(xml.contains("duration="), "la durée reste annoncée");
+        assert!(xml.contains("size="), "la taille reste annoncée");
+        // Pas les drapeaux senderPaced d'un direct : c'est une piste finie.
+        assert!(
+            xml.contains("DLNA.ORG_FLAGS=01700000"),
+            "drapeaux interactifs d'une piste finie, got: {xml}"
+        );
+    }
+
     #[test]
     fn non_live_stream_keeps_file_semantics() {
         let xml = DidlBuilder::new("Track", "http://x/s.flac", "audio/flac")
@@ -762,5 +843,48 @@ mod tests {
         assert_eq!(format_duration_hms(0), "0:00:00");
         assert_eq!(format_duration_hms(225_000), "0:03:45");
         assert_eq!(format_duration_hms(3_600_000), "1:00:00");
+    }
+
+    // Tades, 25/08/2026 : l'artiste multi-valeurs d'un rip Picard/ID3v2.4
+    // arrive avec son séparateur NUL (« Jacobs, Lisa\0The String Soloists »).
+    // `escape` n'échappe que &<>"' : l'octet 0x00 traversait tel quel, toute
+    // l'enveloppe SOAP devenait du XML illégal, et npupnp (upmpdcli — la
+    // HiFiMAN Serenade) répondait 401 « Invalid Action » — son code renvoie
+    // ce fault dès que le corps ne parse pas.
+    #[test]
+    fn un_separateur_nul_id3_ne_rend_pas_l_enveloppe_illegale() {
+        let didl = DidlBuilder::new(
+            "1. Andante: Locatelli Violin Concerto No. 2 in C Minor, Op. 3, No. 2",
+            "http://192.168.0.10:8888/stream/x.wav",
+            "audio/wav",
+        )
+        .artist("Jacobs, Lisa\u{0}The String Soloists")
+        .album("L'Arte del Violino\u{1}")
+        .build_escaped();
+        let interdit = didl
+            .chars()
+            .find(|c| !matches!(c, '\t' | '\n' | '\r') && *c < '\u{20}');
+        assert!(
+            interdit.is_none(),
+            "caractère XML-illégal {:?} dans le DIDL échappé",
+            interdit
+        );
+        // Le séparateur devient un espace lisible, pas une fusion des noms.
+        assert!(
+            didl.contains("Jacobs, Lisa The String Soloists"),
+            "artiste attendu avec séparateur remplacé, didl: {didl}"
+        );
+    }
+
+    // Les caractères légaux, eux, ne bougent pas : échappement intact, BOM
+    // conservé (il est licite en XML 1.0 — dossier DMP-A8).
+    #[test]
+    fn l_assainissement_ne_touche_pas_aux_caracteres_legaux() {
+        let didl = DidlBuilder::new("Rock & Roll", "http://x/s?a=1&b=2", "audio/flac")
+            .artist("\u{feff}Jacobs, Lisa")
+            .build();
+        assert!(didl.contains("Rock &amp; Roll"));
+        assert!(didl.contains("a=1&amp;b=2"));
+        assert!(didl.contains("\u{feff}Jacobs, Lisa"));
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use reqwest::Client;
 use tokio::io::AsyncWriteExt;
@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 use crate::http::error as http_error;
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -26,6 +26,20 @@ const SOAP_MAX_RETRIES: usize = 2;
 /// Toute modification de cette chaîne doit suivre dans
 /// `orchestrator::command_may_have_landed`.
 pub const SOAP_TIMEOUT_PREFIX: &str = "soap timeout:";
+
+/// Préfixe des erreurs « statut HTTP d'échec SANS corps SOAP ».
+///
+/// Un défaut SOAP légitime voyage DANS un 500 avec un corps `UPnPError` — le
+/// spec UPnP l'impose — et nos appelants le lisent (la reprise 714 en dépend).
+/// Mais un 500 au corps VIDE n'est pas un défaut SOAP : c'est un serveur qui
+/// n'a pas su LIRE la requête. Platinum/1.0.5.13 (Eversolo DMP-A8) répond
+/// `500 Bad Request: Error Parsing XML Body`, corps vide, quand le corps
+/// dépasse un segment TCP : il parse sa première lecture et jette le reste —
+/// les octets suivants restent dans la Send-Q (constaté sur .18, 25/08).
+/// L'ancien code ne regardait que le corps : ce 500 vide passait pour un
+/// acquittement, et la zone « jouait » une piste que le renderer n'avait
+/// jamais reçue.
+pub(crate) const SOAP_HTTP_SANS_CORPS_PREFIX: &str = "soap http sans corps:";
 /// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
 /// Kept short (2s) because we don't need the response — SetAVTransportURI
 /// implicitly stops the current track on compliant renderers.
@@ -51,6 +65,32 @@ pub struct DlnaOutput {
     /// next track causes the renderer to display stale metadata (wrong
     /// duration, format) on every other track.
     next_item_id_flip: AtomicBool,
+    /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
+    /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
+    /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
+    /// minimal passe — mais l'échelle re-payait l'aller-retour raté À CHAQUE
+    /// piste (un warn + ~200 ms par SetURI/SetNext, constaté sur DMP-A8,
+    /// #2394). Une fois le niveau qui passe constaté, on démarre là. Jamais
+    /// remonté en cours de vie du process : la pile du renderer ne change pas ;
+    /// un redémarrage de Tune repart du complet.
+    didl_niveau_appris: AtomicU8,
+    /// Dernier état « coupé » que **Tune** a posé sur cet appareil, via
+    /// `set_mute`.
+    ///
+    /// `get_status` le rend tel quel au lieu d'aller le redemander au
+    /// renderer : le poller interroge chaque zone DLNA à 1 Hz pendant toute la
+    /// lecture, et l'action SOAP `GetMute` y valait une requête sur quatre —
+    /// pour une valeur que **personne ne lisait**. L'état coupé qu'affichent
+    /// l'interface, la base (`zones.muted`) et les évènements est écrit
+    /// uniquement par `Orchestrator::set_mute` ; `OutputStatus.muted` ne le
+    /// nourrit nulle part (#2263).
+    ///
+    /// Même convention que les autres sorties sans évènements — AirPlay,
+    /// SlimProto, Squeezebox tiennent déjà leur mute en local. Conséquence
+    /// assumée : une coupure faite **sur l'appareil lui-même** (télécommande
+    /// physique) n'est plus reflétée dans `GET /api/devices/{id}/status`,
+    /// seule route qui expose ce champ.
+    muted: AtomicBool,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
     /// URL for the ConnectionManager service (used to query GetProtocolInfo).
@@ -102,6 +142,8 @@ impl DlnaOutput {
                 .unwrap_or_default(),
             play_delay_ms: AtomicU64::new(0),
             next_item_id_flip: AtomicBool::new(false),
+            didl_niveau_appris: AtomicU8::new(0),
+            muted: AtomicBool::new(false),
             micromega_ip,
             connection_manager_url,
         }
@@ -199,11 +241,40 @@ impl DlnaOutput {
                 .send()
                 .await
             {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => return Ok(text),
-                    Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
-                },
-                Err(e) if e.is_connect() || e.is_timeout() => {
+                Ok(resp) => {
+                    let statut = resp.status();
+                    match resp.text().await {
+                        Ok(text) => {
+                            // Statut d'échec + corps vide : le renderer n'a pas
+                            // lu la requête (voir SOAP_HTTP_SANS_CORPS_PREFIX).
+                            // Un échec AVEC corps reste rendu tel quel — c'est
+                            // un défaut SOAP que l'appelant sait interpréter.
+                            if !statut.is_success() && text.trim().is_empty() {
+                                return Err(format!(
+                                    "{SOAP_HTTP_SANS_CORPS_PREFIX} {statut} sur {action}"
+                                ));
+                            }
+                            return Ok(text);
+                        }
+                        Err(e) => last_err = format!("soap read: {}", http_error::chain(&e)),
+                    }
+                }
+                // `is_connection_closed_early` : le renderer a raccroché avant
+                // d'avoir fini sa réponse. Sans ce troisième prédicat, la panne
+                // ressortait par le bras « erreur définitive » ci-dessous et
+                // n'était JAMAIS réessayée — le Marantz ND8006 de Jean Valjean
+                // échouait dès la première tentative (#1984), y compris sur le
+                // GetProtocolInfo qui arme le bouton « 24 bits ».
+                //
+                // La deuxième tentative repart sur une connexion neuve : celle
+                // qui vient d'échouer a été évacuée du pool par l'échec même.
+                // C'est ce qui rend le simple réessai suffisant, sans avoir à
+                // désactiver la mutualisation vers tous les renderers.
+                Err(e)
+                    if e.is_connect()
+                        || e.is_timeout()
+                        || http_error::is_connection_closed_early(&e) =>
+                {
                     last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
@@ -237,6 +308,32 @@ impl DlnaOutput {
         .await
     }
 
+    /// Réenvoie `SetAVTransportURI` au niveau de DIDL qui a fini par passer
+    /// pour cet appareil : rejouer le complet referait échouer la lecture chez
+    /// Platinum. Deux appelants — le réarmement d'un 701 sans média (#2581) et
+    /// la relance d'un Play acquitté mais jamais appliqué.
+    async fn reposer_uri(
+        &self,
+        media: &PlayMedia<'_>,
+        item_id: &'static str,
+        mime: &str,
+        niveau_didl: u8,
+    ) -> Result<String, String> {
+        let metadata = match niveau_didl {
+            0 => Self::didl_metadata_mime(media, item_id, mime),
+            1 => Self::didl_metadata_minimale(media, item_id, mime),
+            _ => String::new(),
+        };
+        self.av_action(
+            "SetAVTransportURI",
+            &format!(
+                "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+                media.url
+            ),
+        )
+        .await
+    }
+
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         Self::didl_metadata_mime(media, item_id, media.mime_type)
     }
@@ -250,6 +347,7 @@ impl DlnaOutput {
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
+            .byte_seekable(media.byte_seekable)
             .dlna_art_profile(true)
             .include_upnp_artist(true)
             .item_id(item_id)
@@ -262,6 +360,44 @@ impl DlnaOutput {
             .bit_depth_opt(if is_dsd { None } else { media.bit_depth })
             .channels_opt(if is_dsd { None } else { media.channels })
             .build_escaped()
+    }
+
+    /// DIDL réduit au strict jouable : titre, ressource, protocolInfo, durée.
+    ///
+    /// Ni artiste, ni album, ni pochette : la pile Platinum/1.0.5.13 de
+    /// l'Eversolo ne lit qu'un segment TCP de requête — un DIDL complet
+    /// (~1,9 Ko d'enveloppe) déborde et finit en `500 Error Parsing XML Body`,
+    /// quand les mêmes octets passent en une seule trame. Ce DIDL-ci tient
+    /// l'enveloppe sous un segment. Le protocolInfo reste : sans lui, le
+    /// DMP-A8 accepte l'URI d'un `.dsf` mais ne vient jamais le chercher.
+    fn didl_metadata_minimale(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
+        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
+            .protocol_style(ProtocolStyle::Dlna)
+            .live_stream(media.live_stream)
+            .byte_seekable(media.byte_seekable)
+            .item_id(item_id)
+            .duration_ms_opt(media.duration_ms)
+            .build_escaped()
+    }
+
+    /// Accès de test aux deux niveaux de DIDL (budget de taille mesuré dans
+    /// `dlna_test.rs` — l'échelle ne vaut que si le minimal tient un segment).
+    #[cfg(test)]
+    pub(crate) fn didl_metadata_pour_test(
+        media: &PlayMedia<'_>,
+        item_id: &str,
+        mime: &str,
+    ) -> String {
+        Self::didl_metadata_mime(media, item_id, mime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn didl_metadata_minimale_pour_test(
+        media: &PlayMedia<'_>,
+        item_id: &str,
+        mime: &str,
+    ) -> String {
+        Self::didl_metadata_minimale(media, item_id, mime)
     }
 
     /// Return the next item id ("1" or "2") and flip the toggle.
@@ -321,6 +457,10 @@ impl OutputTarget for DlnaOutput {
         "dlna"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, true)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -353,6 +493,46 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
+        // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
+        // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
+        // tard est acquitté… et ignoré — il continue son flux précédent (la
+        // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
+        // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
+        // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
+        // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
+        for attente in 0..8u32 {
+            match self
+                .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                .await
+            {
+                Ok(resp) if arret_effectif(&resp) => {
+                    if attente > 0 {
+                        debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+                    }
+                    break;
+                }
+                // Un renderer sans GetTransportInfo ne doit rien bloquer.
+                Err(_) => break,
+                Ok(_) if attente == 7 => {
+                    warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
+                }
+                Ok(_) => {
+                    // À mi-parcours, escalader : l'Eversolo coincé en
+                    // TRANSITIONING (flux mort qu'il ressasse) ACQUITTE les
+                    // Stop sans les exécuter — seul Pause→Stop le libère
+                    // (constaté par SOAP direct sur le DMP-A8, 25/08 : Stop →
+                    // toujours PLAYING ; Pause → PAUSED_PLAYBACK ; Stop →
+                    // STOPPED).
+                    if attente == 3 {
+                        debug!(device = %self.name, "dlna_pre_stop_escalade_pause_puis_stop");
+                        let _ = self.av_action("Pause", "<InstanceID>0</InstanceID>").await;
+                        let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+
         let item_id = self.next_item_id();
 
         // First attempt: announce `media.mime_type` UNCHANGED — exactly the
@@ -365,14 +545,55 @@ impl OutputTarget for DlnaOutput {
         let mut sink: Vec<String> = Vec::new();
         let mut tried_exact = false;
         let mut tried_fallback = false;
+        // Échelle de métadonnées : DIDL complet → minimal → vide. On ne
+        // descend que sur un échec de LECTURE de la requête (500 sans corps,
+        // Platinum) — jamais sur un défaut SOAP, qui a sa propre reprise 714.
+        // On démarre au niveau APPRIS pour cet appareil : re-payer l'échec du
+        // complet à chaque piste coûtait un aller-retour et un warn par SetURI
+        // (DMP-A8, #2394) pour finir au même DIDL minimal de toute façon.
+        let mut niveau_didl: u8 = self.didl_niveau_appris.load(Ordering::Relaxed);
+        let debut_set_uri = std::time::Instant::now();
         loop {
-            let metadata = Self::didl_metadata_mime(media, item_id, &attempt_mime);
-            let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
+            let metadata = match niveau_didl {
+                0 => Self::didl_metadata_mime(media, item_id, &attempt_mime),
+                1 => Self::didl_metadata_minimale(media, item_id, &attempt_mime),
+                _ => String::new(),
+            };
+            let set_uri_resp = match self.av_action("SetAVTransportURI", &format!(
                 "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
                 media.url
-            )).await?;
+            )).await {
+                Ok(r) => r,
+                Err(e) if e.starts_with(SOAP_HTTP_SANS_CORPS_PREFIX) && niveau_didl < 2 => {
+                    niveau_didl += 1;
+                    warn!(
+                        device = %self.name,
+                        ctrl = %self.av_transport_url,
+                        niveau = niveau_didl,
+                        error = %e,
+                        "dlna_set_uri_corps_illisible_didl_reduit"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
+                self.didl_niveau_appris
+                    .store(niveau_didl, Ordering::Relaxed);
+                // Le SUCCÈS se journalise, pas seulement l'échec. Sans cette
+                // ligne, un SetAVTransportURI lent laisse un trou muet et
+                // l'incident n'est plus instruisable : dans le journal de
+                // FabienM (#2581), 23,5 s s'écoulent entre « flux prêt » et le
+                // premier refus de Play sans une seule trace de la sortie.
+                info!(
+                    device = %self.name,
+                    url = media.url,
+                    niveau_didl,
+                    advertised_mime = %attempt_mime,
+                    duree_ms = debut_set_uri.elapsed().as_millis() as u64,
+                    "dlna_set_uri_ok"
+                );
                 break;
             }
 
@@ -463,7 +684,20 @@ impl OutputTarget for DlnaOutput {
         // reject Play immediately after SetAVTransportURI while still loading the URI.
         // On first 501, send another Stop then retry — the Revox needs an explicit
         // Stop after SetAVTransportURI when it was already playing.
+        //
+        // Le 701 « Transition not available » ne dit pas « je suis en panne » :
+        // il dit « pas CETTE transition, MAINTENANT » — et le renderer sait
+        // dans quel état il est. Le barème aveugle répondait à côté (#2581,
+        // journal FabienM du 27/08) : cinq refus 701 en 11,4 s, zone arrêtée
+        // après 36 s… et la MÊME piste vers le MÊME appareil part du premier
+        // coup 1,8 s plus tard, dès qu'un SetAVTransportURI est rejoué. On lit
+        // donc le transport avant de réessayer : il charge encore → le laisser
+        // finir, sans le Stop du barème qui le ferait retomber ; il ne tient
+        // plus de média → lui réarmer l'URI, sans quoi chaque Play suivant est
+        // un 701 de plus. Le renderer qui ne dit rien d'exploitable garde le
+        // barème historique, au mot près.
         let mut last_err = String::new();
+        let mut reprise = RepriseApresRefus::StopPuisPlay;
         for attempt in 0..5u32 {
             if attempt > 0 {
                 let delay = match attempt {
@@ -472,13 +706,24 @@ impl OutputTarget for DlnaOutput {
                     3 => 3000,
                     _ => 4000,
                 };
-                if attempt == 1 {
-                    debug!(device = %self.name, "dlna_play_retry_sending_stop");
-                    let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    let _ = self
-                        .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-                        .await;
+                match reprise {
+                    RepriseApresRefus::StopPuisPlay if attempt == 1 => {
+                        debug!(device = %self.name, "dlna_play_retry_sending_stop");
+                        let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        let _ = self
+                            .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                            .await;
+                    }
+                    RepriseApresRefus::ReArmerUri => {
+                        info!(device = %self.name, attempt, "dlna_play_701_rearmement_uri");
+                        let _ = self
+                            .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
+                            .await;
+                    }
+                    // Chargement en cours, ou barème historique hors du premier
+                    // essai : ne rien envoyer de plus.
+                    _ => {}
                 }
                 info!(device = %self.name, attempt, delay_ms = delay, "dlna_play_retry");
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -496,12 +741,113 @@ impl OutputTarget for DlnaOutput {
             }
             warn!(device = %self.name, attempt, response = %play_resp, "dlna_play_error");
             last_err = format!("Play rejected: {play_resp}");
+            // Un 701 nomme un état : on va le LIRE plutôt que le deviner. Un
+            // renderer sans GetTransportInfo ne change rien au barème.
+            reprise = if est_701(&play_resp) {
+                let etat = self
+                    .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                    .ok()
+                    .and_then(|xml| extract_tag(&xml, "CurrentTransportState"));
+                let choix = reprise_apres_refus_play(&play_resp, etat.as_deref());
+                info!(
+                    device = %self.name,
+                    attempt,
+                    etat = etat.as_deref().unwrap_or("-"),
+                    reprise = ?choix,
+                    "dlna_play_701_transport_lu"
+                );
+                choix
+            } else {
+                RepriseApresRefus::StopPuisPlay
+            };
         }
         if !last_err.is_empty() {
             return Err(last_err);
         }
 
-        info!(device = %self.name, url = media.url, delay_ms = play_delay, "dlna_play");
+        // Le Play est acquitté — est-il APPLIQUÉ ? Dans la course des 5 ms,
+        // l'Eversolo répond OK à toute la séquence et garde l'URI précédente :
+        // la zone affichait « playing » sur la position de l'ancienne piste,
+        // et l'utilisateur relançait à la main. On relit l'URI courante ; en
+        // cas d'écart, UNE relance complète, puis un échec VISIBLE plutôt
+        // qu'un état menteur. Une URI qu'on ne sait pas interpréter (renderer
+        // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
+        let mut applique = UriVerdict::Indeterminee;
+        let mut uri_tenue: Option<String> = None;
+        'verif: for relance in 0..2u32 {
+            for essai in 0..3u32 {
+                let resp = self
+                    .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+                    .await;
+                let uri = match &resp {
+                    Ok(xml) => extract_tag(xml, "CurrentURI"),
+                    // Un renderer sans GetMediaInfo ne doit rien bloquer.
+                    Err(_) => break 'verif,
+                };
+                uri_tenue = uri.clone();
+                applique = verdict_uri_appliquee(uri.as_deref(), media.url);
+                match applique {
+                    UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'verif,
+                    UriVerdict::PasAppliquee if essai < 2 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
+                    UriVerdict::PasAppliquee => {}
+                }
+            }
+            if relance == 0 {
+                warn!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
+                let _ = self
+                    .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
+                    .await;
+                let _ = self
+                    .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                    .await;
+            }
+        }
+        if applique == UriVerdict::PasAppliquee {
+            warn!(
+                device = %self.name,
+                url = media.url,
+                ctrl = %self.av_transport_url,
+                tenue = uri_tenue.as_deref().unwrap_or("-"),
+                "dlna_play_jamais_applique"
+            );
+            // Si le renderer tient un flux de NOTRE serveur, ce flux va mourir
+            // avec la session que l'appelant s'apprête à démonter — et le
+            // DMP-A8 ressasse une URI morte en zombie (PLAYING/TRANSITIONING,
+            // sourd aux Stop) jusqu'à bloquer toute prise de contrôle
+            // ultérieure. On vide son média, au mieux. Un flux ÉTRANGER, lui,
+            // est peut-être une lecture légitime d'un autre serveur : on n'y
+            // touche pas.
+            let notre_origine: String = media
+                .url
+                .splitn(4, '/')
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("/");
+            if uri_tenue
+                .as_deref()
+                .is_some_and(|u| !notre_origine.is_empty() && u.starts_with(&notre_origine))
+            {
+                debug!(device = %self.name, "dlna_echec_vidage_du_media_mort");
+                let _ = self
+                    .av_action(
+                        "SetAVTransportURI",
+                        "<InstanceID>0</InstanceID><CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+                    )
+                    .await;
+            }
+            let detail = match uri_tenue.as_deref() {
+                Some(u) if !u.trim().is_empty() => format!("il tient encore : {u}"),
+                _ => "URI non appliquée après relance".to_string(),
+            };
+            return Err(format!(
+                "Le renderer a acquitté Play mais joue toujours une autre source ({detail})"
+            ));
+        }
+
+        info!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, delay_ms = play_delay, "dlna_play");
         Ok(())
     }
 
@@ -606,6 +952,11 @@ impl OutputTarget for DlnaOutput {
         self.rc_action("SetMute", &format!(
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{val}</DesiredMute>"
         )).await?;
+        // Mémorisé seulement après un SetMute accepté : `get_status` ne
+        // redemande plus rien au renderer (#2263), donc ce champ est la seule
+        // source du `muted` rendu — il ne doit jamais annoncer une coupure que
+        // l'appareil a refusée.
+        self.muted.store(muted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -635,13 +986,10 @@ impl OutputTarget for DlnaOutput {
             )
             .await?
         };
-        let mute_resp = self
-            .rc_action(
-                "GetMute",
-                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
-            )
-            .await;
-
+        // Pas de `GetMute` ici. Le poller passe par cette fonction une fois
+        // par seconde et par zone pendant TOUTE la lecture : l'action valait
+        // un quart du trafic SOAP envoyé au renderer, pour une valeur que
+        // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
         let state = if transport_resp.contains("PLAYING") {
             TransportState::Playing
         } else if transport_resp.contains("PAUSED") {
@@ -662,11 +1010,7 @@ impl OutputTarget for DlnaOutput {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v / 100.0)
             .unwrap_or(0.5);
-        let muted = mute_resp
-            .ok()
-            .and_then(|r| extract_tag(&r, "CurrentMute"))
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let muted = self.muted.load(Ordering::Relaxed);
         let current_uri = extract_tag(&position_resp, "TrackURI");
 
         Ok(OutputStatus {
@@ -681,6 +1025,9 @@ impl OutputTarget for DlnaOutput {
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 
@@ -695,11 +1042,36 @@ impl OutputTarget for DlnaOutput {
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         let item_id = self.next_item_id();
-        let metadata = Self::didl_metadata(media, item_id);
-        let resp = self.av_action("SetNextAVTransportURI", &format!(
-            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
-            media.url
-        )).await?;
+        // Même échelle que le SetAVTransportURI du play : le DIDL complet du
+        // gapless a la même taille, donc le même échec de lecture chez
+        // Platinum — et un gapless silencieusement perdu, c'est une file qui
+        // s'arrête entre deux pistes.
+        let mut resp = None;
+        // Même départ au niveau appris que le play : l'échec du DIDL complet
+        // est une propriété de l'appareil, pas de la piste (#2394).
+        for niveau in self.didl_niveau_appris.load(Ordering::Relaxed)..=2 {
+            let metadata = match niveau {
+                0 => Self::didl_metadata(media, item_id),
+                1 => Self::didl_metadata_minimale(media, item_id, media.mime_type),
+                _ => String::new(),
+            };
+            match self.av_action("SetNextAVTransportURI", &format!(
+                "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
+                media.url
+            )).await {
+                Ok(r) => {
+                    self.didl_niveau_appris.store(niveau, Ordering::Relaxed);
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) if e.starts_with(SOAP_HTTP_SANS_CORPS_PREFIX) && niveau < 2 => {
+                    warn!(device = %self.name, niveau = niveau + 1, error = %e, "dlna_set_next_corps_illisible_didl_reduit");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let resp =
+            resp.ok_or_else(|| "SetNextAVTransportURI: aucune tentative aboutie".to_string())?;
         if resp.contains("UPnPError") || resp.contains("<errorCode>") {
             warn!(device = %self.name, response = %resp, "dlna_set_next_rejected");
             return Err(format!("SetNextAVTransportURI rejected: {resp}"));
@@ -843,7 +1215,19 @@ impl DlnaOutput {
     pub async fn probe_capabilities(&self) -> RendererCapabilities {
         match self.get_protocol_info().await {
             Ok(sink) if !sink.is_empty() => renderer_caps_from_sink(sink),
-            _ => RendererCapabilities::default(),
+            // Le `_ =>` d'origine avalait l'erreur : l'utilisateur voyait
+            // « impossible de lire les capacités » et le journal ne portait
+            // AUCUNE trace de la sonde (#1984). Dire lequel des deux cas s'est
+            // produit — l'appel a échoué, ou le Sink est vide — coûte une ligne
+            // et distingue « injoignable » de « joignable mais muet ».
+            Ok(_) => {
+                warn!(device = %self.name, "renderer_caps_probe_empty_sink");
+                RendererCapabilities::inconclusive("empty_sink")
+            }
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "renderer_caps_probe_failed");
+                RendererCapabilities::inconclusive("soap_failed")
+            }
         }
     }
 }
@@ -854,6 +1238,10 @@ impl DlnaOutput {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RendererCapabilities {
     pub probed: bool,
+    /// Stable machine-readable cause when `probed` is false. The API, not the
+    /// translated UI, knows whether SOAP failed or returned an empty Sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
     pub flac: bool,
     /// Plain `audio/wav` / `audio/x-wav`.
     pub wav: bool,
@@ -867,6 +1255,15 @@ pub struct RendererCapabilities {
     pub dsd: bool,
     /// Raw Sink entries, for an advanced/debug view.
     pub sink: Vec<String>,
+}
+
+impl RendererCapabilities {
+    fn inconclusive(reason: &'static str) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
@@ -903,6 +1300,7 @@ fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
     });
     RendererCapabilities {
         probed: true,
+        reason: None,
         flac: has("audio/flac"),
         wav: has("audio/wav"),
         lpcm16: has("audio/l16"),
@@ -1016,9 +1414,201 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].to_string())
 }
 
+/// Le renderer a-t-il réellement cessé de jouer, d'après sa réponse
+/// `GetTransportInfo` ? Un Stop acquitté n'est pas un Stop appliqué :
+/// l'Eversolo répond OK puis met ~1-2 s à s'arrêter, et un
+/// SetAVTransportURI envoyé dans cette fenêtre est acquitté… et ignoré
+/// (la course des 5 ms, .42, 24/08).
+fn arret_effectif(transport_resp: &str) -> bool {
+    !transport_resp.contains("PLAYING") && !transport_resp.contains("TRANSITIONING")
+}
+
+/// Verdict sur l'URI que le renderer dit tenir après notre Play.
+#[derive(Debug, PartialEq, Eq)]
+enum UriVerdict {
+    /// C'est bien la nôtre : le Play est appliqué.
+    Appliquee,
+    /// Vide, ou un flux Tune qui n'est pas le nôtre : le renderer a acquitté
+    /// toute la séquence et joue toujours autre chose.
+    PasAppliquee,
+    /// Une URI étrangère qu'on ne sait pas interpréter (un renderer qui
+    /// réécrit, un GetMediaInfo exotique) : on ne conclut rien.
+    Indeterminee,
+}
+
+/// La partie discriminante de l'URL d'un flux : son chemin (`/stream/…`).
+/// L'hôte peut différer entre ce qu'on envoie et ce que le renderer
+/// rapporte (résolution DNS, réécriture d'IP) — le chemin, lui, est unique.
+fn chemin_du_flux(url: &str) -> &str {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|reste| reste.find('/').map(|i| &reste[i..]))
+        .unwrap_or(url)
+}
+
+fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVerdict {
+    let Some(uri) = current_uri else {
+        return UriVerdict::Indeterminee;
+    };
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return UriVerdict::PasAppliquee;
+    }
+    if uri.contains(chemin_du_flux(url_attendue)) {
+        return UriVerdict::Appliquee;
+    }
+    if uri.contains("/stream/") {
+        // Un flux Tune — le périmé d'avant notre Play, ou celui d'un autre
+        // serveur : dans les deux cas, PAS ce qu'on vient d'envoyer.
+        return UriVerdict::PasAppliquee;
+    }
+    UriVerdict::Indeterminee
+}
+
+/// Un refus SOAP portant le code UPnP **701 « Transition not available »**.
+/// Ce n'est pas une panne : le renderer refuse LA TRANSITION à cet instant.
+fn est_701(reponse_play: &str) -> bool {
+    reponse_play.contains(">701<")
+        || reponse_play
+            .to_ascii_lowercase()
+            .contains("transition not available")
+}
+
+/// Ce qu'il faut envoyer — ou ne pas envoyer — avant de redemander `Play`
+/// après un refus.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RepriseApresRefus {
+    /// Barème historique : au PREMIER essai, un Stop puis un Play (écrit pour
+    /// le Revox S100 et son 501). Conduite par défaut, inchangée.
+    StopPuisPlay,
+    /// 701 alors que le transport charge encore l'URI : le laisser finir. Un
+    /// Stop ici le ferait retomber et rendrait le 701 suivant certain.
+    Attendre,
+    /// 701 alors que le transport ne tient plus de média : sans réarmement de
+    /// l'URI, chaque `Play` suivant est un 701 de plus. C'est ce que montre le
+    /// journal de FabienM (#2581) — cinq refus, puis un succès immédiat dès
+    /// qu'un `SetAVTransportURI` est rejoué.
+    ReArmerUri,
+}
+
+/// Décide de la reprise à partir du refus reçu et de l'état que le transport
+/// déclare (`CurrentTransportState`). On ne dévie du barème historique que sur
+/// une information POSITIVE : un renderer muet, ou qui n'a pas
+/// `GetTransportInfo`, garde exactement l'ancienne conduite.
+fn reprise_apres_refus_play(reponse_play: &str, etat_transport: Option<&str>) -> RepriseApresRefus {
+    if !est_701(reponse_play) {
+        return RepriseApresRefus::StopPuisPlay;
+    }
+    match etat_transport.map(|e| e.trim().to_ascii_uppercase()) {
+        Some(e) if e.contains("TRANSITIONING") => RepriseApresRefus::Attendre,
+        Some(e) if e.contains("NO_MEDIA_PRESENT") || e.contains("STOPPED") => {
+            RepriseApresRefus::ReArmerUri
+        }
+        _ => RepriseApresRefus::StopPuisPlay,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La faute SOAP EXACTE relevée dans le journal de FabienM (#2581).
+    const FAUTE_701: &str = concat!(
+        "<s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>",
+        "<detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">",
+        "<errorCode>701</errorCode>",
+        "<errorDescription>Transition not available</errorDescription>",
+        "</UPnPError></detail></s:Fault>"
+    );
+
+    /// 501 Action Failed — le refus pour lequel le barème Stop+Play a été écrit
+    /// (Revox S100). Il ne doit RIEN changer de son comportement.
+    const FAUTE_501: &str = "<UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError>";
+
+    #[test]
+    fn le_701_se_reconnait_au_code_comme_au_libelle() {
+        assert!(est_701(FAUTE_701));
+        assert!(est_701(
+            "<errorDescription>Transition not available</errorDescription>"
+        ));
+        // Un 7010 n'est pas un 701, et les autres codes du fichier non plus.
+        assert!(!est_701("<errorCode>7010</errorCode>"));
+        assert!(!est_701(FAUTE_501));
+        assert!(!est_701("<errorCode>714</errorCode>"));
+    }
+
+    /// #2581 — le renderer charge encore l'URI : lui envoyer le Stop du barème
+    /// le ferait retomber. On attend.
+    #[test]
+    fn un_701_pendant_le_chargement_fait_attendre_sans_stop() {
+        assert_eq!(
+            reprise_apres_refus_play(FAUTE_701, Some("TRANSITIONING")),
+            RepriseApresRefus::Attendre
+        );
+    }
+
+    /// #2581 — le transport ne tient plus de média : sans réarmement de l'URI,
+    /// les cinq tentatives sont cinq 701 d'avance.
+    #[test]
+    fn un_701_sans_media_rearme_l_uri() {
+        for etat in ["NO_MEDIA_PRESENT", "STOPPED", " no_media_present "] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_701, Some(etat)),
+                RepriseApresRefus::ReArmerUri,
+                "état {etat}"
+            );
+        }
+    }
+
+    /// Zéro régression : un renderer qui ne dit rien d'exploitable garde le
+    /// barème historique, au mot près.
+    #[test]
+    fn un_701_muet_ne_devie_pas_du_bareme_historique() {
+        for etat in [None, Some(""), Some("PLAYING"), Some("RECORDING")] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_701, etat),
+                RepriseApresRefus::StopPuisPlay,
+                "état {etat:?}"
+            );
+        }
+    }
+
+    /// Zéro régression : le 501 du Revox garde son Stop+Play, QUEL QUE SOIT
+    /// l'état déclaré par le transport.
+    #[test]
+    fn un_refus_qui_n_est_pas_un_701_garde_le_stop_du_revox() {
+        for etat in [
+            None,
+            Some("TRANSITIONING"),
+            Some("NO_MEDIA_PRESENT"),
+            Some("STOPPED"),
+        ] {
+            assert_eq!(
+                reprise_apres_refus_play(FAUTE_501, etat),
+                RepriseApresRefus::StopPuisPlay,
+                "état {etat:?}"
+            );
+        }
+    }
+
+    /// L'état lu dans la boucle vient d'un `GetTransportInfo` complet : le
+    /// chaînage extraction → décision doit tenir sur la réponse RÉELLE.
+    #[test]
+    fn l_etat_se_lit_dans_la_reponse_get_transport_info() {
+        let reponse = concat!(
+            "<u:GetTransportInfoResponse>",
+            "<CurrentTransportState>NO_MEDIA_PRESENT</CurrentTransportState>",
+            "<CurrentTransportStatus>OK</CurrentTransportStatus>",
+            "<CurrentSpeed>1</CurrentSpeed>",
+            "</u:GetTransportInfoResponse>"
+        );
+        let etat = extract_tag(reponse, "CurrentTransportState");
+        assert_eq!(etat.as_deref(), Some("NO_MEDIA_PRESENT"));
+        assert_eq!(
+            reprise_apres_refus_play(FAUTE_701, etat.as_deref()),
+            RepriseApresRefus::ReArmerUri
+        );
+    }
 
     #[test]
     fn caps_from_sink_maps_advertised_formats() {
@@ -1037,6 +1627,16 @@ mod tests {
         assert!(c.lpcm16, "audio/L16 present");
         assert!(!c.lpcm24, "no audio/L24 advertised");
         assert!(c.mp3 && c.aac && c.dsd);
+        assert_eq!(c.reason, None, "une sonde concluante ne porte aucun refus");
+    }
+
+    #[test]
+    fn une_sonde_inconclusive_expose_une_raison_stable() {
+        let c = RendererCapabilities::inconclusive("empty_sink");
+        let json = serde_json::to_value(c).unwrap();
+
+        assert_eq!(json["probed"], false);
+        assert_eq!(json["reason"], "empty_sink");
     }
 
     #[test]
@@ -1185,6 +1785,69 @@ mod tests {
     fn format_time_works() {
         assert_eq!(DlnaOutput::format_time(225_000), "0:03:45");
         assert_eq!(DlnaOutput::format_time(3_600_000), "1:00:00");
+    }
+
+    /// La course des 5 ms (.42, 24/08) : un Stop acquitté n'est pas appliqué.
+    #[test]
+    fn arret_effectif_lit_l_etat_du_transport() {
+        assert!(!arret_effectif(
+            "<CurrentTransportState>PLAYING</CurrentTransportState>"
+        ));
+        assert!(!arret_effectif(
+            "<CurrentTransportState>TRANSITIONING</CurrentTransportState>"
+        ));
+        assert!(arret_effectif(
+            "<CurrentTransportState>STOPPED</CurrentTransportState>"
+        ));
+        assert!(arret_effectif(
+            "<CurrentTransportState>NO_MEDIA_PRESENT</CurrentTransportState>"
+        ));
+        // PAUSED_PLAYBACK : le transport n'avance plus, l'URI peut changer.
+        assert!(arret_effectif(
+            "<CurrentTransportState>PAUSED_PLAYBACK</CurrentTransportState>"
+        ));
+    }
+
+    #[test]
+    fn verdict_uri_notre_flux_est_applique() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        assert_eq!(verdict_uri_appliquee(Some(url), url), UriVerdict::Appliquee);
+        // L'hôte peut différer (IP réécrite) — le chemin suffit.
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://tune.local:8888/stream/abc-123.wav"), url),
+            UriVerdict::Appliquee
+        );
+    }
+
+    #[test]
+    fn verdict_uri_vide_ou_flux_perime_n_est_pas_applique() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        // L'Eversolo qui garde l'URI d'avant : vide, ou un autre flux Tune.
+        assert_eq!(
+            verdict_uri_appliquee(Some(""), url),
+            UriVerdict::PasAppliquee
+        );
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://192.168.1.42:8888/stream/vieux-flux.flac"), url),
+            UriVerdict::PasAppliquee
+        );
+        // Le flux d'un AUTRE serveur Tune : pas le nôtre non plus.
+        assert_eq!(
+            verdict_uri_appliquee(Some("http://192.168.1.18:8888/stream/xyz.wav"), url),
+            UriVerdict::PasAppliquee
+        );
+    }
+
+    #[test]
+    fn verdict_uri_etrangere_ou_absente_ne_conclut_rien() {
+        let url = "http://192.168.1.42:8888/stream/abc-123.wav";
+        // Un renderer qui réécrit (Sonos et ses URI propriétaires) ne doit
+        // JAMAIS être déclaré en échec sur cette seule base.
+        assert_eq!(
+            verdict_uri_appliquee(Some("x-rincon-queue:RINCON_123#0"), url),
+            UriVerdict::Indeterminee
+        );
+        assert_eq!(verdict_uri_appliquee(None, url), UriVerdict::Indeterminee);
     }
 
     #[test]

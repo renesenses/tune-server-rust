@@ -24,7 +24,7 @@ async fn spotify_token(state: &AppState) -> Option<String> {
     let registry = state.services.lock().await;
     let svc = registry.get("spotify")?;
     drop(registry);
-    let svc = svc.lock().await;
+    let svc = svc.read().await;
     let tokens = svc.save_tokens()?;
     tokens.get("access_token")?.as_str().map(Into::into)
 }
@@ -50,7 +50,11 @@ async fn enable_connect(
     }
 
     if let Err(e) = state.spotify_connect.enable(zone_id).await {
-        return Json(json!({"enabled": false, "error": e}));
+        let mut status = state.spotify_connect.status().await;
+        if let Some(object) = status.as_object_mut() {
+            object.insert("error".into(), Value::String(e));
+        }
+        return Json(status);
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -59,7 +63,7 @@ async fn enable_connect(
         .set("spotify_connect_zone_id", &zone_id.to_string())
         .ok();
 
-    Json(json!({"enabled": true, "zone_id": zone_id}))
+    Json(state.spotify_connect.status().await)
 }
 
 async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
@@ -68,7 +72,7 @@ async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("spotify_connect_enabled", "false").ok();
 
-    Json(json!({"enabled": false}))
+    Json(state.spotify_connect.status().await)
 }
 
 async fn list_connect_devices(State(state): State<AppState>) -> impl IntoResponse {

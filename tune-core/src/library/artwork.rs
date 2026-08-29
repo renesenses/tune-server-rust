@@ -138,6 +138,69 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Extensions sous lesquelles une entrée de cache de pochette peut exister,
+/// dans l'ordre où on la cherche.
+///
+/// C'est le **contrat unique** entre celui qui écrit dans le cache
+/// ([`save_to_cache`]) et celui qui le sert
+/// (`tune-server/src/routes/library/artwork.rs::serve_artwork`). Tant que les
+/// deux listes vivaient séparément, un fichier pouvait être écrit sous un nom
+/// que la route ne regardait jamais : la base annonçait alors un condensat dont
+/// la route rendait 404, et l'écran affichait l'image de remplacement (#2567).
+///
+/// Les quatre premières sont les seules que [`save_to_cache`] produit
+/// désormais. Les suivantes sont les orthographes **héritées** : l'extension du
+/// fichier source était jusqu'ici recopiée telle quelle, et
+/// `FOLDER_COVER_NAMES` accepte `cover.jpeg`, `FOLDER.JPG`, `Front.png`… Les
+/// caches déjà constitués en sont pleins. Les garder ici les guérit **sans rien
+/// réécrire et sans changer un seul condensat** : aucune URL de pochette ne
+/// bouge, donc aucun cache de navigateur n'est invalidé.
+pub const CACHE_EXTENSIONS: &[&str] = &[
+    // Écrites aujourd'hui, dans l'ordre de fréquence.
+    "jpg", "png", "webp", "bmp", // Héritées : orthographes recopiées d'un fichier source.
+    "jpeg", "JPG", "JPEG", "PNG", "Jpg", "Jpeg", "Png",
+];
+
+/// Orthographe canonique sous laquelle une entrée de cache doit être écrite.
+///
+/// Écrire `{hash}.jpeg` ou `{hash}.JPG` revenait à annoncer un condensat que la
+/// route ne trouvait pas. On ne touche ni au condensat ni au contenu : seule
+/// l'orthographe de l'extension est ramenée à celle que la lecture cherche en
+/// premier. Une extension inconnue devient `jpg`, ce qui est déjà ce que
+/// `extract_cover_art` suppose pour un type d'image qu'il ne reconnaît pas.
+pub fn canonical_cache_ext(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "png",
+        "webp" => "webp",
+        "bmp" => "bmp",
+        _ => "jpg",
+    }
+}
+
+/// Type MIME d'une entrée de cache, d'après son extension.
+pub fn cache_mime(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/jpeg",
+    }
+}
+
+/// Retrouve le fichier de cache d'un condensat, s'il existe.
+///
+/// Rend le chemin **et** le type MIME à servir. `None` signifie que le
+/// condensat n'a aucun fichier : l'annoncer en base est alors un mensonge.
+pub fn find_cached(cache_dir: &Path, hash: &str) -> Option<(PathBuf, &'static str)> {
+    for ext in CACHE_EXTENSIONS {
+        let path = cache_dir.join(format!("{hash}.{ext}"));
+        if path.exists() {
+            return Some((path, cache_mime(ext)));
+        }
+    }
+    None
+}
+
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         warn!(
@@ -147,6 +210,11 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
         );
         return None;
     }
+    // L'extension vient souvent d'un fichier source (`cover.jpeg`,
+    // `FOLDER.JPG`) ou d'un type MIME (`image/bmp`). La ramener à l'orthographe
+    // que la lecture cherche est la seule façon de garantir que le condensat
+    // qu'on va annoncer sera servi (#2567).
+    let ext = canonical_cache_ext(ext);
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
     if let Err(e) = std::fs::write(&path, data) {
@@ -602,13 +670,12 @@ async fn fetch_artist_image_mozaiklabs_by_name(
     }
     let data: serde_json::Value = resp.json().await.ok()?;
     let results = data.get("data")?.as_array()?;
-    let want = q.to_lowercase();
     let image_url = results
         .iter()
         .filter(|a| {
             a.get("name")
                 .and_then(|v| v.as_str())
-                .is_some_and(|n| n.trim().to_lowercase() == want)
+                .is_some_and(|n| artist_name_matches_exactly(n, q))
         })
         .find_map(|a| {
             a.get("image_url")
@@ -715,6 +782,98 @@ async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Optio
     download_image(client, &direct_url).await
 }
 
+/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse et aux
+/// espaces de bord près, rien d'autre.
+///
+/// C'est le pendant serveur de `trouverArtisteExact` (client web,
+/// `libraryNavigation.ts`), et il obéit à la même règle : on ne replie NI les
+/// accents NI la ponctuation. « Motorhead » et « Motörhead » sont deux entrées
+/// distinctes ; les confondre poserait la mauvaise image.
+fn artist_name_matches_exactly(candidate: &str, wanted: &str) -> bool {
+    let candidate = candidate.trim();
+    let wanted = wanted.trim();
+    // Un nom vide se « retrouve » partout : il ne départage rien.
+    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
+}
+
+/// Retire le désambiguïsateur numérique que Discogs accole aux homonymes :
+/// « Marquis De Sade (2) » → « Marquis De Sade ».
+///
+/// Il sert UNIQUEMENT à repérer que Discogs déclare plusieurs entités du même
+/// nom — pas à les rendre équivalentes.
+fn strip_discogs_disambiguator(title: &str) -> &str {
+    let t = title.trim_end();
+    let Some(rest) = t.strip_suffix(')') else {
+        return title.trim();
+    };
+    let Some(open) = rest.rfind(" (") else {
+        return title.trim();
+    };
+    let inside = &rest[open + 2..];
+    if !inside.is_empty() && inside.bytes().all(|b| b.is_ascii_digit()) {
+        rest[..open].trim()
+    } else {
+        title.trim()
+    }
+}
+
+/// Choisit l'image de couverture d'une réponse `database/search?type=artist`.
+///
+/// Deux refus, et dans les deux cas on ne pose AUCUNE image (#2221) :
+///
+/// 1. **Aucun résultat ne porte le nom cherché.** Prendre le premier venu — ce
+///    que faisait `per_page=1` + `results[0]` — donne l'entrée la plus
+///    populaire chez Discogs, pas l'artiste de la bibliothèque.
+/// 2. **Discogs déclare lui-même un homonyme** en numérotant une seconde
+///    entrée du même nom (« Marquis De Sade » / « Marquis De Sade (2) » : le
+///    personnage historique et le groupe rennais). Rien ne permet alors de
+///    trancher, et une image fausse s'installe durablement — l'utilisateur
+///    peut la signaler, mais la passe d'enrichissement suivante la reposerait.
+fn discogs_pick_cover_image<'a>(data: &'a serde_json::Value, artist_name: &str) -> Option<&'a str> {
+    let results = data.get("results")?.as_array()?;
+    let mut exact = results.iter().filter(|r| {
+        r.get("title")
+            .or_else(|| r.get("name"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| {
+                artist_name_matches_exactly(strip_discogs_disambiguator(t), artist_name)
+            })
+    });
+    let chosen = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    chosen
+        .get("cover_image")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && !s.contains("spacer.gif"))
+}
+
+/// Choisit l'URL d'image d'une réponse `artist.getinfo` de Last.fm.
+///
+/// `artist.getinfo` répond sur un simple nom et peut rediriger vers un autre
+/// artiste. On exige donc que le nom RENDU soit celui demandé (#2221) : sans
+/// ce recoupement, rien ne départage et on ne pose aucune image.
+fn lastfm_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> Option<&'a str> {
+    let returned = data.pointer("/artist/name").and_then(|v| v.as_str())?;
+    if !artist_name_matches_exactly(returned, artist_name) {
+        return None;
+    }
+    let images = data.pointer("/artist/image").and_then(|v| v.as_array())?;
+    ["mega", "extralarge", "large"].iter().find_map(|&size| {
+        images.iter().find_map(|img| {
+            if img.get("size").and_then(|v| v.as_str())? != size {
+                return None;
+            }
+            img.get("#text").and_then(|v| v.as_str()).filter(|url| {
+                !url.is_empty()
+                    && !url.contains("/noimage/")
+                    && !url.contains("2a96cbd8b46e442fc41c2b86b821562f")
+            })
+        })
+    })
+}
+
 /// Fetch artist image from Discogs by searching the artist name.
 async fn fetch_artist_image_discogs(
     client: &reqwest::Client,
@@ -735,7 +894,9 @@ async fn fetch_artist_image_discogs(
     }
     let resp = client
         .get("https://api.discogs.com/database/search")
-        .query(&[("type", "artist"), ("per_page", "1"), ("q", artist_name)])
+        // Dix résultats, pas un seul : avec `per_page=1` on ne PEUT pas voir
+        // qu'un homonyme existe, et on repart avec l'entrée la plus populaire.
+        .query(&[("type", "artist"), ("per_page", "10"), ("q", artist_name)])
         .header("Authorization", format!("Discogs token={token}"))
         .header("User-Agent", "TuneServer/1.0")
         .send()
@@ -745,12 +906,13 @@ async fn fetch_artist_image_discogs(
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let cover_url = data["results"]
-        .as_array()?
-        .first()?
-        .get("cover_image")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.contains("spacer.gif"))?;
+    let Some(cover_url) = discogs_pick_cover_image(&data, artist_name) else {
+        debug!(
+            artist = artist_name,
+            "artist_image_discogs_no_unambiguous_match"
+        );
+        return None;
+    };
     download_image(client, cover_url).await
 }
 
@@ -782,27 +944,11 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let images = data.pointer("/artist/image").and_then(|v| v.as_array())?;
-
-    // Pick best available size: mega > extralarge > large
-    let image_url = ["mega", "extralarge", "large"].iter().find_map(|&size| {
-        images.iter().find_map(|img| {
-            let s = img.get("size").and_then(|v| v.as_str())?;
-            if s == size {
-                let url = img.get("#text").and_then(|v| v.as_str())?;
-                if !url.is_empty()
-                    && !url.contains("/noimage/")
-                    && !url.contains("2a96cbd8b46e442fc41c2b86b821562f")
-                {
-                    Some(url.to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-    })?;
+    let Some(image_url) = lastfm_pick_image_url(&data, artist_name) else {
+        debug!(artist = artist_name, "artist_image_lastfm_no_exact_match");
+        return None;
+    };
+    let image_url = image_url.to_string();
 
     download_image(client, &image_url).await
 }
@@ -1052,6 +1198,13 @@ async fn batch_enrich_artist_artwork_inner(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Consentement explicite avant de rien remonter au cloud communautaire.
+    // Le seul garde-fou etait « avoir un instance_id » — or il est genere tout
+    // seul au demarrage, donc l'envoi des images d'artistes etait en pratique
+    // inconditionnel. Lu ICI, une fois, et non a chaque artiste : la boucle
+    // dure des heures et le choix de l'utilisateur au moment ou il lance
+    // l'enrichissement est celui qui fait foi pour cette passe.
+    let contribution_consentie = crate::cloud::consent::contribution_autorisee(&settings);
     // Discogs token as configured in the app UI (stored in settings), so the
     // by-name Discogs image lookup actually works (Progman: no artist images).
     let discogs_token = settings
@@ -1121,9 +1274,10 @@ async fn batch_enrich_artist_artwork_inner(
                     );
 
                     // Fire-and-forget: submit to community for sharing.
-                    // Only when we have an MBID — the community store is keyed by
-                    // MBID, so submitting with an empty one is meaningless.
-                    if !instance_id.is_empty() && !mbid.is_empty() {
+                    // Seulement si l'utilisateur l'a explicitement autorise, et
+                    // seulement quand on a un MBID — le depot communautaire est
+                    // indexe par MBID, y poster avec un MBID vide n'a aucun sens.
+                    if contribution_consentie && !instance_id.is_empty() && !mbid.is_empty() {
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
@@ -1305,9 +1459,10 @@ pub fn save_embedded_cover(
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
     // Already cached (from a previous scan or from get_or_extract): reuse it.
-    if cache_dir.join(format!("{hash}.jpg")).exists()
-        || cache_dir.join(format!("{hash}.png")).exists()
-    {
+    // La sonde interroge la MÊME liste que la route. Tant qu'elle ne regardait
+    // que `jpg`/`png`, une entrée héritée (`.jpeg`, `.JPG`, `.bmp`) passait pour
+    // absente et était réécrite à chaque passe (#2567).
+    if find_cached(cache_dir, &hash).is_some() {
         return Some(hash);
     }
 
@@ -1330,16 +1485,36 @@ pub fn save_embedded_cover(
     None
 }
 
+/// Pochette du DOSSIER d'un fichier, mise en cache — sans jamais regarder les
+/// tags du fichier lui-même.
+///
+/// Sert à choisir la pochette d'un ALBUM, où l'ordre de priorité n'est pas le
+/// même que pour une piste. Une `cover.jpg` posée dans le dossier est un choix
+/// délibéré de l'utilisateur ; une pochette intégrée à UNE piste est un
+/// accident de tag. Sur une compilation « maison », c'est la seconde qui
+/// gagnait et se retrouvait attribuée à tout le répertoire (testeur, forum).
+pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
+    let folder_cover = find_folder_cover(audio_path)?;
+    // Le hachage porte sur le CHEMIN DE LA POCHETTE, pas sur celui de la piste :
+    // toutes les pistes du dossier partagent ainsi la même entrée de cache au
+    // lieu d'en dupliquer une par fichier.
+    let hash = artwork_hash(&folder_cover.to_string_lossy());
+    if find_cached(cache_dir, &hash).is_some() {
+        return Some(hash);
+    }
+    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
+    let ext = folder_cover
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    save_to_cache(&data, cache_dir, &hash, ext).map(|_| hash)
+}
+
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
-    // Check if already cached
-    let cached_jpg = cache_dir.join(format!("{hash}.jpg"));
-    let cached_png = cache_dir.join(format!("{hash}.png"));
-    if cached_jpg.exists() {
-        return Some(hash);
-    }
-    if cached_png.exists() {
+    // Check if already cached — même liste que la route (#2567).
+    if find_cached(cache_dir, &hash).is_some() {
         return Some(hash);
     }
 
@@ -1414,6 +1589,23 @@ pub fn backfill_embedded_covers(
     let mut filled = 0usize;
     for (album_id, _title, _artist, _mbid) in &coverless {
         let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+
+        // La pochette du DOSSIER d'abord : elle décrit l'album, là où une
+        // pochette intégrée ne décrit qu'une piste. Sur une compilation
+        // « maison », la première piste taguée imposait sa jaquette à tout le
+        // répertoire — un disque de Brel illustré par la pochette du seul titre
+        // dont le fichier portait une image.
+        if let Some(hash) = tracks
+            .iter()
+            .filter_map(|t| t.file_path.as_ref())
+            .find_map(|p| folder_cover_hash(Path::new(p), cache_dir))
+        {
+            if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
+                filled += 1;
+            }
+            continue;
+        }
+
         for track in &tracks {
             let Some(ref file_path) = track.file_path else {
                 continue;
@@ -1435,6 +1627,226 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // #2221 — la recherche d'image d'artiste PAR NOM doit départager.
+    //
+    // La phase 3 de l'enrichissement ne traite que les artistes SANS MBID —
+    // exactement ceux dont on ne peut vérifier l'identité autrement que par le
+    // nom. Une image fausse posée là s'installe durablement : mieux vaut ne
+    // rien poser.
+    // ---------------------------------------------------------------------
+
+    /// La casse et les espaces de bord ne comptent pas. Le reste, si.
+    #[test]
+    fn nom_exact_a_la_casse_et_aux_espaces_pres() {
+        assert!(artist_name_matches_exactly("  Pink Floyd ", "pink floyd"));
+        assert!(artist_name_matches_exactly(
+            "MARQUIS DE SADE",
+            "Marquis de Sade"
+        ));
+
+        // Un approchant n'est PAS une correspondance : chercher « Air »
+        // ramènerait « Airbourne ».
+        assert!(!artist_name_matches_exactly("Airbourne", "Air"));
+        assert!(!artist_name_matches_exactly("Air", "Airbourne"));
+
+        // Pas de repli des accents : deux entrées distinctes de la
+        // bibliothèque, comme côté web (`trouverArtisteExact`).
+        assert!(!artist_name_matches_exactly("Motörhead", "Motorhead"));
+
+        // Un nom vide se « retrouve » partout — c'est le piège qui fabrique une
+        // fausse preuve. Il ne départage rien, donc il ne correspond à rien.
+        assert!(!artist_name_matches_exactly("", ""));
+        assert!(!artist_name_matches_exactly("   ", "Pink Floyd"));
+        assert!(!artist_name_matches_exactly("Pink Floyd", ""));
+    }
+
+    /// Le désambiguïsateur numérique de Discogs, et rien d'autre.
+    #[test]
+    fn desambiguisateur_discogs_retire_les_parentheses_numeriques() {
+        assert_eq!(
+            strip_discogs_disambiguator("Marquis De Sade (2)"),
+            "Marquis De Sade"
+        );
+        assert_eq!(strip_discogs_disambiguator("Nirvana (5)"), "Nirvana");
+        // Ce qui n'est pas un nombre entre parenthèses reste intact.
+        assert_eq!(
+            strip_discogs_disambiguator("Nine Inch Nails (US)"),
+            "Nine Inch Nails (US)"
+        );
+        assert_eq!(strip_discogs_disambiguator("Sunn O)))"), "Sunn O)))");
+        assert_eq!(strip_discogs_disambiguator("Front 242"), "Front 242");
+        assert_eq!(strip_discogs_disambiguator("Aphex Twin"), "Aphex Twin");
+    }
+
+    /// LE cas signalé au forum : le marquis (personnage historique) et le
+    /// groupe rennais partagent le nom. Discogs le dit lui-même en numérotant
+    /// la seconde entrée. Rien ne départage ⇒ on ne pose AUCUNE image.
+    #[test]
+    fn discogs_homonyme_declare_refuse_toute_image() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "Marquis De Sade", "cover_image": "https://img.discogs.com/marquis-personnage.jpg" },
+                { "title": "Marquis De Sade (2)", "cover_image": "https://img.discogs.com/groupe-rennais.jpg" }
+            ]
+        });
+        assert_eq!(discogs_pick_cover_image(&data, "Marquis de Sade"), None);
+    }
+
+    /// Aucun résultat ne porte le nom cherché : le premier venu n'est pas une
+    /// réponse. C'est ce que faisait `per_page=1` + `results[0]`.
+    #[test]
+    fn discogs_sans_correspondance_exacte_refuse_le_premier_venu() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "Airbourne", "cover_image": "https://img.discogs.com/airbourne.jpg" },
+                { "title": "Air France", "cover_image": "https://img.discogs.com/airfrance.jpg" }
+            ]
+        });
+        assert_eq!(discogs_pick_cover_image(&data, "Air"), None);
+    }
+
+    /// Une seule entrée porte le nom : elle départage, on la prend.
+    #[test]
+    fn discogs_correspondance_unique_est_acceptee() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "Pink Floyd", "cover_image": "https://img.discogs.com/pink-floyd.jpg" },
+                { "title": "Pink Floyd Tribute Band", "cover_image": "https://img.discogs.com/tribute.jpg" }
+            ]
+        });
+        assert_eq!(
+            discogs_pick_cover_image(&data, "pink floyd"),
+            Some("https://img.discogs.com/pink-floyd.jpg")
+        );
+    }
+
+    /// Seule l'entrée numérotée existe : Discogs ne déclare alors aucun
+    /// homonyme, la correspondance est unique.
+    #[test]
+    fn discogs_entree_numerotee_seule_est_acceptee() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "Marquis De Sade (2)", "cover_image": "https://img.discogs.com/groupe-rennais.jpg" }
+            ]
+        });
+        assert_eq!(
+            discogs_pick_cover_image(&data, "Marquis de Sade"),
+            Some("https://img.discogs.com/groupe-rennais.jpg")
+        );
+    }
+
+    /// Le gabarit vide de Discogs n'est pas une image (garde existante).
+    #[test]
+    fn discogs_spacer_gif_n_est_pas_une_image() {
+        let data = serde_json::json!({
+            "results": [
+                { "title": "Untel", "cover_image": "https://img.discogs.com/spacer.gif" }
+            ]
+        });
+        assert_eq!(discogs_pick_cover_image(&data, "Untel"), None);
+    }
+
+    /// Last.fm redirige silencieusement vers un autre artiste (« Sade » →
+    /// « Marquis de Sade »). Le nom rendu ne correspond pas ⇒ on refuse.
+    #[test]
+    fn lastfm_nom_rendu_different_refuse_l_image() {
+        let data = serde_json::json!({
+            "artist": {
+                "name": "Marquis de Sade",
+                "image": [ { "size": "mega", "#text": "https://lastfm.freetls.fastly.net/mega.jpg" } ]
+            }
+        });
+        assert_eq!(lastfm_pick_image_url(&data, "Sade"), None);
+    }
+
+    /// Nom rendu identique : on prend la plus grande taille disponible.
+    #[test]
+    fn lastfm_nom_rendu_identique_prend_la_plus_grande_taille() {
+        let data = serde_json::json!({
+            "artist": {
+                "name": "Pink Floyd",
+                "image": [
+                    { "size": "large", "#text": "https://lastfm.freetls.fastly.net/large.jpg" },
+                    { "size": "mega", "#text": "https://lastfm.freetls.fastly.net/mega.jpg" }
+                ]
+            }
+        });
+        assert_eq!(
+            lastfm_pick_image_url(&data, "  pink floyd "),
+            Some("https://lastfm.freetls.fastly.net/mega.jpg")
+        );
+    }
+
+    /// Le gabarit « étoile grise » de Last.fm n'est pas une image : on retombe
+    /// sur la taille inférieure (garde existante).
+    #[test]
+    fn lastfm_placeholder_est_ignore() {
+        let data = serde_json::json!({
+            "artist": {
+                "name": "Pink Floyd",
+                "image": [
+                    { "size": "large", "#text": "https://lastfm.freetls.fastly.net/large.jpg" },
+                    { "size": "mega", "#text": "https://lastfm.freetls.fastly.net/2a96cbd8b46e442fc41c2b86b821562f.png" }
+                ]
+            }
+        });
+        assert_eq!(
+            lastfm_pick_image_url(&data, "Pink Floyd"),
+            Some("https://lastfm.freetls.fastly.net/large.jpg")
+        );
+    }
+
+    /// Une réponse Last.fm sans nom d'artiste ne départage rien.
+    #[test]
+    fn lastfm_sans_nom_rendu_refuse_l_image() {
+        let data = serde_json::json!({
+            "artist": {
+                "image": [ { "size": "mega", "#text": "https://lastfm.freetls.fastly.net/mega.jpg" } ]
+            }
+        });
+        assert_eq!(lastfm_pick_image_url(&data, "Pink Floyd"), None);
+    }
+
+    /// Le cas du testeur : une compilation « maison » où UNE seule piste porte
+    /// une pochette intégrée. C'est la pochette du DOSSIER qui doit décrire
+    /// l'album, pas celle d'un fichier isolé.
+    #[test]
+    fn folder_cover_wins_and_is_shared_by_every_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Compilation maison");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpg"), b"POCHETTE-DU-DOSSIER").unwrap();
+        let t1 = music.join("01 - Brel.flac");
+        let t2 = music.join("02 - Barbara.flac");
+        std::fs::write(&t1, b"").unwrap();
+        std::fs::write(&t2, b"").unwrap();
+
+        let cache = dir.path().join("cache");
+        let h1 = folder_cover_hash(&t1, &cache).expect("pochette de dossier trouvée");
+        let h2 = folder_cover_hash(&t2, &cache).expect("pochette de dossier trouvée");
+
+        // Deux pistes du même dossier partagent LA MÊME entrée de cache : le
+        // hachage porte sur la pochette, pas sur le fichier audio.
+        assert_eq!(h1, h2);
+        assert_eq!(
+            std::fs::read(cache.join(format!("{h1}.jpg"))).unwrap(),
+            b"POCHETTE-DU-DOSSIER"
+        );
+    }
+
+    /// Sans pochette dans le dossier, rien n'est inventé — l'appelant retombe
+    /// alors sur l'extraction des tags, comme avant.
+    #[test]
+    fn no_folder_cover_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("Album nu");
+        std::fs::create_dir_all(&music).unwrap();
+        let t = music.join("01.flac");
+        std::fs::write(&t, b"").unwrap();
+        assert!(folder_cover_hash(&t, &dir.path().join("cache")).is_none());
+    }
 
     #[test]
     fn extended_path_windows_and_noop() {
@@ -1609,8 +2021,8 @@ mod tests {
 
     #[test]
     fn save_to_cache_and_read() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_cache");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("cache");
 
         let data = b"fake image data";
         let result = save_to_cache(data, &dir, "test_hash_123", "jpg");
@@ -1619,25 +2031,22 @@ mod tests {
         let path = result.unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), data);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_to_cache_creates_dir() {
-        let dir = std::env::temp_dir().join("tune_test_artwork_new_dir");
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("nouveau");
         assert!(!dir.exists());
 
         save_to_cache(b"test", &dir, "hash", "png");
         assert!(dir.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_or_extract_nonexistent() {
-        let cache_dir = std::env::temp_dir().join("tune_test_extract_ne");
+        let base = tempfile::TempDir::new().unwrap();
+        let cache_dir = base.path().join("cache");
         let result = get_or_extract(Path::new("/tmp/nonexistent_audio_file.flac"), &cache_dir);
         assert!(result.is_none());
     }
@@ -1657,5 +2066,229 @@ mod tests {
         let h = artwork_hash("/music/artist/album/track.flac");
         assert_eq!(h.len(), 32);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ------------------------------------------------------------------
+    // #2567 — un condensat annoncé DOIT avoir un fichier que la route sait
+    // servir.
+    //
+    // La base ne stocke pas un chemin : elle stocke la CLÉ DE CACHE que le
+    // client demandera à `/api/v1/library/artwork/{clé}`. Écrire cette clé
+    // alors que le fichier porte une extension que la route ne regarde pas
+    // revient à annoncer une pochette qu'on ne sert pas — 404, image de
+    // remplacement à l'écran, et rien dans le journal.
+    //
+    // L'invariant tient en une ligne : ce que l'écriture rend, la lecture doit
+    // le retrouver. `find_cached` EST la lecture ; les tests ci-dessous ne
+    // demandent rien d'autre.
+    // ------------------------------------------------------------------
+
+    /// Un album dont la pochette de dossier s'appelle `cover.jpeg` — quatre
+    /// lettres, pas trois. `find_folder_cover` l'accepte (elle est dans
+    /// `FOLDER_COVER_NAMES`), l'écriture recopiait son extension telle quelle.
+    #[test]
+    fn pochette_de_dossier_en_jpeg_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Existence");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpeg"), b"POCHETTE").unwrap();
+        let track = music.join("01 - Pizza Boy.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let hash = get_or_extract(&track, &cache).expect("une pochette de dossier a été trouvée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route : \
+             la pochette a été écrite sous une extension que serve_artwork ne \
+             regarde pas — 404 et image de remplacement (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Même chose avec une extension en majuscules : `FOLDER.JPG` est dans la
+    /// liste des noms acceptés, et sur un système de fichiers sensible à la
+    /// casse (Linux, la plupart des NAS) `FOLDER.JPG` n'est pas `folder.jpg`.
+    #[test]
+    fn pochette_de_dossier_en_majuscules_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Album crié");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("FOLDER.JPG"), b"POCHETTE").unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let hash = get_or_extract(&track, &cache).expect("une pochette de dossier a été trouvée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Une pochette intégrée au format BMP : `extract_cover_art` rend
+    /// `image/bmp`, `save_embedded_cover` écrivait `.bmp`, la route ne
+    /// connaissait pas cette extension.
+    #[test]
+    fn pochette_integree_en_bmp_annoncee_donc_servable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+        let track = dir.path().join("Album/01.flac");
+        std::fs::create_dir_all(track.parent().unwrap()).unwrap();
+
+        let cover = (b"BM-POCHETTE".to_vec(), "image/bmp".to_string());
+        let hash = save_embedded_cover(&track, &cache, &cover).expect("écriture acquittée");
+
+        assert!(
+            find_cached(&cache, &hash).is_some(),
+            "condensat {hash} annoncé mais introuvable par la route (#2567). \
+             Présents dans le cache : {:?}",
+            listing(&cache)
+        );
+    }
+
+    /// Le même contrat, au ras de l'écriture : quelle que soit l'orthographe de
+    /// l'extension qu'on lui passe, `save_to_cache` doit produire un fichier que
+    /// la lecture retrouve.
+    #[test]
+    fn save_to_cache_ecrit_sous_une_extension_que_la_lecture_retrouve() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manquantes = Vec::new();
+        let orthographes = ["jpg", "jpeg", "JPG", "JPEG", "png", "PNG", "webp", "bmp"];
+        for (i, ext) in orthographes.iter().enumerate() {
+            let cache = dir.path().join(format!("cache{i}"));
+            let hash = format!("{i:032x}");
+            save_to_cache(b"IMAGE", &cache, &hash, ext).expect("écriture acquittée");
+            if find_cached(&cache, &hash).is_none() {
+                manquantes.push((*ext, listing(&cache)));
+            }
+        }
+        assert!(
+            manquantes.is_empty(),
+            "{} orthographe(s) sur {} écrivent un fichier que la route ne sert pas (#2567) : {:?}",
+            manquantes.len(),
+            orthographes.len(),
+            manquantes
+        );
+    }
+
+    /// L'autre moitié du contrat : l'écriture ne doit plus **produire**
+    /// d'orthographe héritée. Sans cela, la liste que la lecture doit connaître
+    /// s'allongerait à chaque source d'image nouvelle, et un cache neuf
+    /// continuerait de se remplir de noms que seule la clémence de la lecture
+    /// rattrape.
+    #[test]
+    fn l_ecriture_ne_produit_que_des_orthographes_canoniques() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let attendus = [
+            ("jpg", "jpg"),
+            ("jpeg", "jpg"),
+            ("JPG", "jpg"),
+            ("JPEG", "jpg"),
+            ("Jpeg", "jpg"),
+            ("png", "png"),
+            ("PNG", "png"),
+            ("webp", "webp"),
+            ("WEBP", "webp"),
+            ("bmp", "bmp"),
+            ("gif", "jpg"), // inconnue : jpg, comme le suppose extract_cover_art
+        ];
+        let mut ecarts = Vec::new();
+        for (i, (donnee, canonique)) in attendus.iter().enumerate() {
+            let cache = dir.path().join(format!("c{i}"));
+            let hash = format!("{i:032x}");
+            save_to_cache(b"IMAGE", &cache, &hash, donnee).expect("écriture acquittée");
+            let obtenu = listing(&cache);
+            if obtenu != vec![format!("{hash}.{canonique}")] {
+                ecarts.push((*donnee, obtenu));
+            }
+        }
+        assert!(
+            ecarts.is_empty(),
+            "{} orthographe(s) sur {} écrites hors de la forme canonique (#2567) : {:?}",
+            ecarts.len(),
+            attendus.len(),
+            ecarts
+        );
+    }
+
+    /// Garde-fou contre l'excès inverse : sans pochette nulle part, rien n'est
+    /// annoncé. Un condensat inventé vaut pire qu'une absence — il pose un
+    /// `src` qui échoue au lieu de laisser l'image de remplacement.
+    #[test]
+    fn sans_pochette_aucun_condensat_n_est_invente() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Album nu");
+        std::fs::create_dir_all(&music).unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        assert!(get_or_extract(&track, &cache).is_none());
+        assert!(listing(&cache).is_empty(), "rien ne doit être écrit");
+    }
+
+    /// Le condensat est une clé de cache : il ne bouge pas d'un appel à
+    /// l'autre. S'il bougeait, chaque client retéléchargerait la bibliothèque
+    /// entière à chaque passe.
+    #[test]
+    fn condensat_stable_entre_deux_appels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let music = dir.path().join("Existence");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpeg"), b"POCHETTE").unwrap();
+        let track = music.join("01.flac");
+        std::fs::write(&track, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let a = get_or_extract(&track, &cache).expect("premier appel");
+        let b = get_or_extract(&track, &cache).expect("second appel");
+        assert_eq!(a, b, "la clé de cache d'une même pochette doit être stable");
+        assert!(find_cached(&cache, &a).is_some());
+    }
+
+    /// Deux pochettes différentes ne partagent pas une entrée de cache : sinon
+    /// la seconde écraserait la première et un album porterait la jaquette
+    /// d'un autre.
+    #[test]
+    fn deux_pochettes_differentes_donnent_deux_condensats() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+        let mut hashes = Vec::new();
+        for (nom, octets) in [
+            ("Album A", &b"POCHETTE-A"[..]),
+            ("Album B", &b"POCHETTE-B"[..]),
+        ] {
+            let music = dir.path().join(nom);
+            std::fs::create_dir_all(&music).unwrap();
+            std::fs::write(music.join("cover.jpeg"), octets).unwrap();
+            let track = music.join("01.flac");
+            std::fs::write(&track, b"").unwrap();
+            hashes.push(get_or_extract(&track, &cache).expect("pochette trouvée"));
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        let (chemin, _) = find_cached(&cache, &hashes[0]).expect("A servable");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"POCHETTE-A");
+        let (chemin, _) = find_cached(&cache, &hashes[1]).expect("B servable");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"POCHETTE-B");
+    }
+
+    /// Noms de fichiers présents dans un répertoire de cache, triés. Sert à
+    /// faire dire aux échecs ce qui a réellement été écrit, plutôt que « rien
+    /// trouvé ».
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
     }
 }

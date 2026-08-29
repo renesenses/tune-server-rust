@@ -179,6 +179,11 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
 
     let repo = PlayQueueRepo::with_backend(db.clone());
     let mut restored = 0usize;
+    // Zones whose snapshot exists but could not be written back to the DB.
+    // Counted so the boot log states the damage in one line instead of leaving
+    // it to be reconstructed from N scattered warnings (#1706: 9 zones came up
+    // empty on .15 and nothing said so out loud).
+    let mut failed = 0usize;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -278,7 +283,13 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
             continue;
         }
         if let Err(e) = repo.append(zone_id, &inputs) {
-            warn!(zone_id, error = %e, "queue_restore_append_failed");
+            warn!(
+                zone_id,
+                items = inputs.len(),
+                error = %e,
+                "queue_restore_append_failed"
+            );
+            failed += 1;
             continue;
         }
         if snapshot.current_position > 0 {
@@ -298,6 +309,13 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
 
     if restored > 0 {
         info!(count = restored, "queues_restore_complete");
+    }
+    if failed > 0 {
+        // Loud on purpose: the user sees empty zones and has no other clue.
+        warn!(
+            count = failed,
+            restored, "queues_restore_incomplete_zones_will_appear_empty"
+        );
     }
 }
 

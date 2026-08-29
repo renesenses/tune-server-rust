@@ -25,9 +25,17 @@ pub async fn decode_pcm(
             debug!(
                 file = file_path,
                 samples = decoded.samples_i32.len(),
-                "decoded_native"
+                sample_rate = decoded.sample_rate,
+                channels = decoded.channels,
+                source_bit_depth = decoded.bit_depth,
+                output_bit_depth = 16,
+                "decoded_analyzer_contract"
             );
-            let bytes: Vec<u8> = decoded.pcm_bytes();
+            // Analyzer consumers parse two bytes per sample. Returning native
+            // 24/32-bit bytes under an i16 contract shifted frame boundaries
+            // and corrupted BPM/waveform measurements (#2230).
+            let bytes =
+                super::decode::convert_pcm_bit_depth(&decoded.samples_i32, decoded.bit_depth, 16);
             Ok(bytes)
         }
         Err(e) => {
@@ -414,13 +422,22 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
             break;
         }
         sample_rate = sr as f64;
+        // Le contrat #2230 rend normalement du mono. On compte néanmoins des
+        // trames à partir des métadonnées réellement rendues : une régression
+        // de l'adaptation ne doit jamais redoubler silencieusement la durée.
+        let canaux = decoded.channels.max(1) as usize;
         let scale = pcm_scale(decoded.bit_depth);
-        for (i, &s) in decoded.samples_i32.iter().enumerate() {
-            if (s as f64 / scale).abs() > threshold_linear {
-                last_loud = Some(total + i);
+        for (trame, bloc) in decoded.samples_i32.chunks(canaux).enumerate() {
+            // Une trame est sonore dès qu'UN de ses canaux l'est : un silence
+            // sur le seul canal gauche n'est pas un silence.
+            if bloc
+                .iter()
+                .any(|&s| (s as f64 / scale).abs() > threshold_linear)
+            {
+                last_loud = Some(total + trame);
             }
         }
-        let frames = decoded.samples_i32.len(); // mono: 1 sample per frame
+        let frames = decoded.samples_i32.len() / canaux;
         total += frames;
         if (frames as f64) < SEG_SECONDS * sr as f64 {
             break;
@@ -968,6 +985,43 @@ mod tests {
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(samples, vec![16384, -16384]);
+    }
+
+    #[tokio::test]
+    async fn decode_pcm_rend_toujours_des_trames_i16() {
+        let wav_file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = wav_file.path().to_path_buf();
+        let source = [0x7f_ffffi32, -0x80_0000i32, 0x12_3456i32, -0x12_3456i32];
+        let mut data = Vec::new();
+        for sample in source {
+            data.extend_from_slice(&sample.to_le_bytes()[..3]);
+        }
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&22_050u32.to_le_bytes());
+        wav.extend_from_slice(&(22_050u32 * 3).to_le_bytes());
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        std::fs::write(&path, wav).unwrap();
+
+        let pcm = decode_pcm(path.to_str().unwrap(), 22_050, 1, 0.0, 0.0)
+            .await
+            .unwrap();
+        let samples: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+
+        assert_eq!(pcm.len(), 8, "quatre trames mono i16 = huit octets");
+        assert_eq!(samples, vec![32_767, -32_768, 0x1234, -0x1235]);
     }
 
     #[test]

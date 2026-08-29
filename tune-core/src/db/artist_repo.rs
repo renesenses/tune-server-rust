@@ -146,11 +146,30 @@ pub mod sql {
         "SELECT id, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    /// ⚠ L'ordre DÉCLARÉ doit suivre l'ordre LIÉ.
+    ///
+    /// `SqliteDialect::placeholder` **ignore l'indice** et rend `?`
+    /// (`db/engine.rs`) : sur SQLite seule la position compte. Cette requête
+    /// déclarait `SET musicbrainz_id = {2} WHERE id = {1}` alors que
+    /// `ArtistRepo::update_mbid` liait `[id, mbid]` — ce qui donnait, une fois
+    /// les `?` numérotés par leur ordre d'apparition,
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>`. Un identifiant
+    /// MusicBrainz n'étant jamais un entier, la clause `WHERE` ne trouvait
+    /// **jamais** de ligne : l'écriture était un no-op silencieux, et l'est
+    /// restée sur toute la ligne 0.9. Postgres, qui numérote ses `$n`,
+    /// n'était pas touché — le défaut ne se voyait donc que sur le moteur par
+    /// défaut, celui de la quasi-totalité des installations.
+    ///
+    /// Conséquence directe sur #2184 : la « phase 1 » de l'enrichissement des
+    /// images d'artistes (`batch_match_artist_mbids`) résolvait des MBID et
+    /// n'en gardait aucun. D'une passe à l'autre, `artists_without_mbid` ne
+    /// bougeait pas et les artistes n'atteignaient jamais les sources d'images
+    /// indexées par MBID (Fanart, TheAudioDB, MusicBrainz/Wikidata).
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
-            d.placeholder(2),
-            d.placeholder(1)
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -174,6 +193,17 @@ pub mod sql {
 
 pub struct ArtistRepo {
     db: Arc<dyn DbBackend>,
+}
+
+/// Un identifiant externe vide n'est pas une identité.
+///
+/// Le chemin instruit dans #2458 peut transmettre une clé MusicBrainz présente
+/// mais vide — sa présence dans la base du testeur reste à vérifier. La garder
+/// sous `Some("")` suffit néanmoins, code en main, à rechercher puis partager
+/// la même ligne artiste pour des noms distincts. Les espaces seuls sont
+/// équivalents à l'absence ; un identifiant réel est normalisé avant comparaison.
+fn usable_musicbrainz_id(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 impl ArtistRepo {
@@ -217,6 +247,9 @@ impl ArtistRepo {
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, TuneError> {
+        let Some(mbid) = usable_musicbrainz_id(Some(mbid)) else {
+            return Ok(None);
+        };
         let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
         let params: [&dyn ToSqlValue; 1] = [&mbid];
         Ok(self
@@ -228,10 +261,11 @@ impl ArtistRepo {
 
     pub fn create(&self, artist: &Artist) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
+        let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
         let params: [&dyn ToSqlValue; 7] = [
             &artist.name,
             &artist.sort_name,
-            &artist.musicbrainz_id,
+            &musicbrainz_id,
             &artist.discogs_id,
             &artist.bio,
             &artist.image_path,
@@ -255,6 +289,7 @@ impl ArtistRepo {
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, TuneError> {
+        let musicbrainz_id = usable_musicbrainz_id(musicbrainz_id);
         if let Some(mbid) = musicbrainz_id {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
@@ -287,10 +322,11 @@ impl ArtistRepo {
     pub fn update(&self, artist: &Artist) -> Result<(), TuneError> {
         let id = artist.id.ok_or("artist has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
+        let musicbrainz_id = usable_musicbrainz_id(artist.musicbrainz_id.as_deref());
         let params: [&dyn ToSqlValue; 8] = [
             &artist.name,
             &artist.sort_name,
-            &artist.musicbrainz_id,
+            &musicbrainz_id,
             &artist.discogs_id,
             &artist.bio,
             &artist.image_path,
@@ -598,7 +634,9 @@ impl ArtistRepo {
 
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
-        self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
+        let mbid = usable_musicbrainz_id(Some(mbid));
+        // Ordre lié = ordre déclaré : la valeur d'abord, l'identifiant ensuite.
+        self.db.execute(&sql, &[&mbid as &dyn ToSqlValue, &id])?;
         Ok(())
     }
 
@@ -818,6 +856,37 @@ mod tests {
         assert_eq!(repo.count().unwrap(), 1);
     }
 
+    /// Reproduit la convergence proposée dans #2458 : une clé MBID présente
+    /// mais vide ne doit ni être recherchée ni relier deux noms distincts.
+    #[test]
+    fn un_mbid_vide_ne_colle_jamais_deux_artistes() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+
+        let saint_saens = repo
+            .get_or_create("Classique - Saint-Saëns", Some(""), None)
+            .unwrap();
+        let anouar = repo.get_or_create("Anouar Brahem", Some(""), None).unwrap();
+
+        assert_ne!(saint_saens.id, anouar.id);
+        assert_eq!(
+            repo.get(saint_saens.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .musicbrainz_id,
+            None
+        );
+        assert_eq!(
+            repo.get(anouar.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .musicbrainz_id,
+            None
+        );
+        assert!(repo.get_by_musicbrainz_id("").unwrap().is_none());
+        assert!(repo.get_by_musicbrainz_id("  ").unwrap().is_none());
+    }
+
     #[test]
     fn artist_with_sort_name() {
         let db = test_db();
@@ -906,6 +975,51 @@ mod tests {
 
         let results = repo.search("Jazz", 10).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// `update_mbid` doit ÉCRIRE — sur SQLite aussi.
+    ///
+    /// `SqliteDialect::placeholder` rend `?` quel que soit l'indice, donc
+    /// l'ordre déclaré dans le `format!` ne vaut rien : seul l'ordre des
+    /// paramètres liés compte. La requête déclarait la valeur en `{2}` et
+    /// l'identifiant en `{1}` tout en liant `[id, mbid]`, ce qui produisait
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>` : zéro ligne touchée.
+    ///
+    /// Sans cette écriture, la phase 1 de l'enrichissement des images
+    /// d'artistes résout des MBID et n'en garde aucun (#2184).
+    #[test]
+    fn update_mbid_ecrit_reellement_le_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Magma".into())).unwrap();
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
+
+        const MBID: &str = "0e1a0b0f-1111-2222-3333-444444444444";
+        repo.update_mbid(id, MBID).unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().musicbrainz_id.as_deref(),
+            Some(MBID),
+            "le MBID doit être persisté, sinon chaque passe repart de zéro"
+        );
+        assert!(
+            repo.list_without_mbid().unwrap().is_empty(),
+            "l'artiste doit sortir de la liste « sans MBID »"
+        );
+    }
+
+    /// Contre-épreuve du témoin : un identifiant vide reste une absence, il ne
+    /// doit pas se transformer en chaîne vide qui passerait les filtres
+    /// `musicbrainz_id != ''`.
+    #[test]
+    fn update_mbid_vide_laisse_l_artiste_sans_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Gong".into())).unwrap();
+
+        repo.update_mbid(id, "   ").unwrap();
+
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
     }
 
     #[test]

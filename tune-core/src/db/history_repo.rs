@@ -14,11 +14,11 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id";
+    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id";
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -29,7 +29,9 @@ pub mod sql {
             d.placeholder(8),
             d.placeholder(9),
             d.placeholder(10),
-            d.placeholder(11)
+            d.placeholder(11),
+            d.placeholder(12),
+            d.placeholder(13)
         )
     }
 
@@ -159,6 +161,17 @@ pub struct ListenRecord {
     pub zone_id: Option<i64>,
     pub cover_url: Option<String>,
     pub profile_id: Option<i64>,
+    /// Nature de l'objet que l'auditeur a demande au moment ou il a clique
+    /// « Lire » : `track`, `album`, `playlist`, `artist`, `label`. `None`
+    /// quand l'appelant ne l'a pas dit — une absence, jamais une deduction.
+    ///
+    /// C'est l'INTENTION, pas ce qui a fini par jouer : la premiere piste
+    /// d'une playlist porte `playlist`, pas `track`.
+    pub context_type: Option<String>,
+    /// Identifiant de cet objet, dans le referentiel de sa source. TEXT et
+    /// non INTEGER : une playlist locale a un id numerique, un album Qobuz
+    /// une chaine. La colonne doit accueillir les deux.
+    pub context_id: Option<String>,
 }
 
 pub struct HistoryRepo {
@@ -187,7 +200,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 11] = [
+        let params: [&dyn ToSqlValue; 13] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -199,6 +212,8 @@ impl HistoryRepo {
             &rec.zone_id,
             &rec.cover_url,
             &rec.profile_id,
+            &rec.context_type,
+            &rec.context_id,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -1197,6 +1212,8 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         zone_id: cols.get(10).and_then(|v| v.as_i64()),
         cover_url: None,
         profile_id: None,
+        context_type: cols.get(11).and_then(|v| v.as_string()),
+        context_id: cols.get(12).and_then(|v| v.as_string()),
     }
 }
 
@@ -1210,6 +1227,90 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         HistoryRepo::new(db)
+    }
+
+    /// #2441 — l'ecoute doit garder la trace de CE QUE l'auditeur a demande.
+    ///
+    /// FabienM (fil 1557) : « si je choisis d'ecouter un titre alors je
+    /// m'attends a voir ce titre » ; « si je choisis de jouer une playlist
+    /// complete, je m'attends a voir cette playlist ». Aucune de ces deux
+    /// attentes n'est satisfiable tant que `listen_history` ne conserve rien
+    /// de l'intention : la ligne d'historique d'une piste jouee depuis une
+    /// playlist est aujourd'hui indiscernable de la meme piste jouee seule.
+    ///
+    /// Ce test ne juge d'AUCUNE regle d'affichage — le cahier des charges du
+    /// testeur n'est pas arbitre. Il tient uniquement le socle : ce que
+    /// l'appelant declare est ecrit, et se relit tel quel.
+    #[test]
+    fn le_contexte_de_lecture_est_ecrit_et_se_relit() {
+        let repo = fresh_repo();
+
+        let depuis_une_playlist = ListenRecord {
+            id: None,
+            track_id: None,
+            title: "So What".into(),
+            artist_name: Some("Miles Davis".into()),
+            album_title: Some("Kind of Blue".into()),
+            source: "local".into(),
+            source_id: None,
+            album_id: None,
+            duration_ms: 562_000,
+            listened_at: None,
+            zone_id: None,
+            cover_url: None,
+            profile_id: None,
+            context_type: Some("playlist".into()),
+            context_id: Some("42".into()),
+        };
+        repo.record(&depuis_une_playlist).unwrap();
+
+        let relu = repo.recent(10).unwrap();
+        assert_eq!(relu.len(), 1);
+        assert_eq!(
+            relu[0].context_type.as_deref(),
+            Some("playlist"),
+            "le type de l'objet demande n'a pas survecu a l'ecriture : \
+             l'historique ne peut donc pas distinguer une piste jouee seule \
+             d'une piste jouee depuis une playlist (#2441)"
+        );
+        assert_eq!(
+            relu[0].context_id.as_deref(),
+            Some("42"),
+            "le type est la mais pas l'identifiant : on saurait que c'etait \
+             une playlist sans jamais savoir LAQUELLE"
+        );
+
+        // Une piste jouee seule dit « track », pas « playlist » : les deux
+        // gestes doivent rester discernables ligne a ligne.
+        let piste_seule = ListenRecord {
+            title: "Blue in Green".into(),
+            context_type: Some("track".into()),
+            context_id: Some("7".into()),
+            ..depuis_une_playlist.clone()
+        };
+        repo.record(&piste_seule).unwrap();
+        let relu = repo.recent(10).unwrap();
+        let types: Vec<Option<&str>> = relu.iter().map(|r| r.context_type.as_deref()).collect();
+        assert!(
+            types.contains(&Some("track")) && types.contains(&Some("playlist")),
+            "les deux intentions se confondent en base : {types:?}"
+        );
+
+        // L'absence reste possible : un appelant qui ne sait pas d'ou vient le
+        // geste ecrit NULL. On ne devine pas a sa place.
+        let sans_contexte = ListenRecord {
+            title: "All Blues".into(),
+            context_type: None,
+            context_id: None,
+            ..depuis_une_playlist.clone()
+        };
+        repo.record(&sans_contexte).unwrap();
+        let relu = repo.recent(10).unwrap();
+        assert!(
+            relu.iter()
+                .any(|r| r.title == "All Blues" && r.context_type.is_none()),
+            "une ecoute sans contexte declare doit rester sans contexte"
+        );
     }
 
     #[test]
@@ -1229,6 +1330,8 @@ mod tests {
             zone_id: None,
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         };
 
         repo.record(&rec).unwrap();
@@ -1264,6 +1367,8 @@ mod tests {
                 zone_id: None,
                 cover_url: None,
                 profile_id: None,
+                context_type: None,
+                context_id: None,
             })
             .unwrap();
         }
@@ -1282,6 +1387,8 @@ mod tests {
                 zone_id: None,
                 cover_url: None,
                 profile_id: None,
+                context_type: None,
+                context_id: None,
             })
             .unwrap();
         }
@@ -1312,6 +1419,8 @@ mod tests {
                 zone_id: None,
                 cover_url: None,
                 profile_id: None,
+                context_type: None,
+                context_id: None,
             })
             .unwrap();
         }
@@ -1341,6 +1450,8 @@ mod tests {
             zone_id: None,
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -1363,6 +1474,8 @@ mod tests {
             zone_id: None,
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -1379,6 +1492,8 @@ mod tests {
             zone_id: None,
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         })
         .unwrap();
 
@@ -1406,6 +1521,8 @@ mod tests {
                 zone_id: None,
                 cover_url: None,
                 profile_id: None,
+                context_type: None,
+                context_id: None,
             })
             .unwrap();
         }
@@ -1419,8 +1536,13 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
-        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        // 13 colonnes depuis #2441 : `context_type` et `context_id` se sont
+        // ajoutees aux onze precedentes.
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(
+            sql::record(&p)
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
+        );
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
@@ -1449,6 +1571,8 @@ mod tests {
             zone_id: Some(1),
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         })
         .unwrap();
 
@@ -1480,6 +1604,8 @@ mod tests {
             zone_id: None,
             cover_url: None,
             profile_id: None,
+            context_type: None,
+            context_id: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);

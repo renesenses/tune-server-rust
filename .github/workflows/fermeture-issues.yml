@@ -1,0 +1,108 @@
+name: Fermetures justifiées
+
+# Le geste le plus destructeur du circuit — refermer le ticket d'un testeur —
+# etait le seul sans aucun controle.
+#
+# Le 2026-08-21 a 10:07, six issues ont ete fermees en TREIZE SECONDES, cinq
+# avec une « preuve par contenu » qui pointait un fichier sans rapport (deux
+# fois de la documentation). Deux d'entre elles citaient un commit dont le
+# corps dit « Ne ferme aucune des deux issues ». Les six ont du etre rouvertes
+# par une autre session, qui l'a decouvert par hasard (#2086). Le 2026-08-25,
+# #2230 et #2156 ont ete fermees contre le refus ecrit de leur propre commit,
+# et #2296 malgre son etiquette `keep-open`.
+#
+# La consigne de l'agent a ete corrigee depuis. Ce controle existe parce qu'une
+# consigne se contourne : c'est la lecon repetee de ce depot, et la raison
+# d'etre de xcodegen-check, preflight-port-audit et verifier-refs-issues.
+#
+# ⚠️ IL NE ROUVRE RIEN, ET NE FERME RIEN. Il commente. Refermer le ticket d'un
+# testeur est une decision ; y ajouter une automatisation qui decide a la place
+# d'un humain remplacerait un probleme par un autre. Le but est qu'une
+# fermetute douteuse cesse d'etre SILENCIEUSE, pas qu'une machine arbitre.
+#
+# La logique et ses cas de preuve vivent dans scripts/verifier-fermeture.sh,
+# qui porte son propre --autotest. Il est joue A CHAQUE FOIS, avant l'analyse :
+# un garde-fou dont la contre-epreuve ne tourne pas finit par repondre vert sur
+# le defaut qu'il devait attraper (deux fois cette semaine dans ce depot).
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verifier:
+    name: La justification tient-elle ?
+    runs-on: ubuntu-latest
+    # Sans plafond, un blocage tourne SIX HEURES avant que GitHub ne le tue.
+    # Trois releases l'ont paye (0.9.86, 0.9.87, 0.9.88).
+    timeout-minutes: 5
+
+    steps:
+      # `fetch-depth: 0` : le controle « commit refusant » lit le corps d'un
+      # commit quelconque de l'historique. Un clone superficiel ne l'a pas, et
+      # le controle repondrait vert sans rien avoir verifie.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: release/v0.9
+
+      - name: Contre-épreuve du garde-fou
+        run: bash scripts/verifier-fermeture.sh --autotest
+
+      - name: Relever le commentaire de fermeture
+        id: relever
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMERO: ${{ github.event.issue.number }}
+          DEPOT_NOM: ${{ github.repository }}
+        run: |
+          # Le dernier commentaire porte la justification. On le passe par un
+          # FICHIER, jamais par une variable de sortie : un corps de
+          # commentaire est du texte fourni par l'exterieur, et l'interpoler
+          # dans le shell permettrait d'y injecter des commandes.
+          gh api "repos/$DEPOT_NOM/issues/$NUMERO/comments" \
+            --jq '.[-1].body // ""' > /tmp/fermeture.txt || echo "" > /tmp/fermeture.txt
+          printf 'commentaire relevé : %s octets\n' "$(wc -c < /tmp/fermeture.txt)"
+
+      - name: Analyser la justification
+        id: analyse
+        env:
+          NUMERO_ISSUE: ${{ github.event.issue.number }}
+          KEEP_OPEN: ${{ contains(github.event.issue.labels.*.name, 'keep-open') }}
+        run: |
+          set +e
+          DEPOT=. bash scripts/verifier-fermeture.sh "$(cat /tmp/fermeture.txt)" > /tmp/verdict.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat /tmp/verdict.txt
+
+      # On ne commente QUE si quelque chose cloche : un garde-fou qui parle a
+      # chaque fermeture devient du bruit, et le bruit ne se lit plus.
+      - name: Le dire, si la justification ne tient pas
+        if: steps.analyse.outputs.code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMERO: ${{ github.event.issue.number }}
+          DEPOT_NOM: ${{ github.repository }}
+          QUI: ${{ github.event.sender.login }}
+        run: |
+          {
+            printf '## ⚠️ La justification de cette fermeture ne tient pas\n\n'
+            printf 'Fermée par **%s**. Contrôle automatique du commentaire de fermeture :\n\n' "$QUI"
+            printf '```\n'
+            cat /tmp/verdict.txt
+            printf '```\n\n'
+            printf 'Ce contrôle **ne rouvre rien** — refermer le ticket d'"'"'un testeur est une décision, '
+            printf 'et une machine n'"'"'a pas à la prendre à votre place. Il signale, pour que le doute '
+            printf 'cesse d'"'"'être silencieux.\n\n'
+            printf 'Si la fermeture est justifiée, elle l'"'"'est : commentez pourquoi, et laissez-la fermée. '
+            printf 'Sinon, rouvrez.\n\n'
+            printf 'Le 2026-08-21, six issues ont été fermées en treize secondes sur des preuves qui '
+            printf 'pointaient de la documentation, dont deux contre l'"'"'avis explicite du commit cité. '
+            printf 'Voir #2086.\n'
+          } > /tmp/message.md
+          gh api "repos/$DEPOT_NOM/issues/$NUMERO/comments" -f "body=$(cat /tmp/message.md)" --silent
+          printf 'Signalé sur #%s\n' "$NUMERO"

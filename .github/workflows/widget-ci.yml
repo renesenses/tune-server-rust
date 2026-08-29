@@ -1,0 +1,38 @@
+name: Widget CI
+
+# Le widget est un workspace autonome : aucun crate ni lockfile du serveur ne
+# peut le casser. Le compiler sur chaque PR serveur monopolisait un runner
+# macOS rare sans tester une ligne modifiee. Sa couverture reste obligatoire
+# des qu'un fichier du widget ou ce workflow change.
+on:
+  push:
+    branches: [main, release/v0.9]
+    paths:
+      - "tune-widget/**"
+      - ".github/workflows/widget-ci.yml"
+  pull_request:
+    paths:
+      - "tune-widget/**"
+      - ".github/workflows/widget-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: widget-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  widget:
+    name: Widget (compilation)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tune-widget/src-tauri
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo check --release
+        working-directory: tune-widget/src-tauri
+      - run: cargo test
+        working-directory: tune-widget/src-tauri

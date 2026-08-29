@@ -4,6 +4,9 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+// Repli NFC/NFD partagé (#1865) — voir `crate::library::local_path`.
+use crate::library::local_path::resolve_existing_local_path;
+
 /// Error marker returned by `resolve_local_track` when a play was superseded by
 /// a newer tap before its transcode started; `play_inner` maps it to a quiet
 /// no-op result instead of a user-facing error.
@@ -21,6 +24,14 @@ const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from
 /// A public `play()` for the track ALREADY playing on a zone that arrives within
 /// this window of the track's start is treated as a redundant controller
 /// double-dispatch (a re-tap) and coalesced at the entry point — BEFORE any
+/// Retard de départ délibéré sur une radio live, en secondes (#1628).
+///
+/// Trois secondes couvrent une frontière de segment entière (~8 s de cadence
+/// observée, arrivées jusqu'à 100 ms en retard) tout en restant imperceptibles
+/// au zapping. En dessous, la réserve se vide à la première irrégularité ;
+/// au-dessus, on ferait attendre l'auditeur pour rien.
+const RADIO_PREBUFFER_SECS: u64 = 3;
+
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
 /// catches an OVERLAPPING second play; when the second play arrives just AFTER
 /// the first fully established playback (sequential, a few seconds apart), that
@@ -29,6 +40,20 @@ const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from
 /// 0" — #1271). Kept short so a deliberate replay of the same track — which
 /// lands far later — plays normally; a seek is exempt regardless.
 const RETAP_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Resuming a WEBRADIO after a pause longer than this is treated as a re-play
+/// of the station (new upstream connection, new decode session, new stream URL
+/// to the output) instead of resuming the paused pipeline. A radio stream is
+/// LIVE: while the zone is paused its pipeline keeps ageing — the icecast
+/// connection can die through debug-only exit paths, the output keeps
+/// buffering an unbounded backlog, and OAAT packet timestamps fall behind the
+/// endpoint clock by the whole pause — so a "resume" past a few seconds
+/// renders silence with nothing in the logs (#1629, .42: 19 min pause → total
+/// silence, volume changes ignored). Chosen ABOVE `DUPLICATE_NET_PLAY_WINDOW`
+/// (12 s) so the re-play issued here can never be coalesced as a duplicate
+/// net send; short pauses below the threshold keep today's working in-place
+/// resume.
+const RADIO_RESUME_REPLAY_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
 /// concurrent plays, keyed by source path. A burst of play taps for a
@@ -151,6 +176,7 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
+use crate::outputs::{OutputCommand, OutputCommandError, OutputCommandResult};
 use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
@@ -584,11 +610,69 @@ pub struct PlaybackOrchestrator {
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
     levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// Anti-rebond du redémarrage de flux déclenché par un changement
+    /// d'égaliseur sur un chemin NON local (#1710, lot 2).
+    ///
+    /// Deux états, deux rôles distincts :
+    /// - `eq_replay_gen` : numéro de la dernière demande par zone. Chaque
+    ///   demande incrémente, puis une tâche différée vérifie qu'elle est
+    ///   toujours la plus récente avant d'agir. Un curseur de 31 bandes
+    ///   qu'on fait glisser produit donc UN redémarrage, pas 31.
+    /// - `eq_replay_last` : quand la zone a réellement redémarré. Plancher
+    ///   dur, pour qu'une rafale espacée juste au-delà de l'anti-rebond ne
+    ///   hache pas la lecture malgré tout.
+    ///
+    /// Verrous std : accès très courts, jamais tenus à travers un await.
+    eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
+    eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
-    last_net_play: Mutex<HashMap<i64, (String, Option<String>, std::time::Instant)>>,
+    last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
+    /// Annonces « en écoute » DIFFÉRÉES des zones navigateur (#1998).
+    ///
+    /// Une zone navigateur n'a pas de périphérique de sortie : la sortie est
+    /// l'onglet, qui tire `stream_url` lui-même. `output_sent` y vaut donc
+    /// toujours faux, et la garde posée pour le cas BluOS a du même coup
+    /// supprimé TOUT scrobble de zone navigateur, y compris quand elle joue.
+    ///
+    /// On ne renonce pas à l'annonce et on ne la rend pas non plus gratuite :
+    /// on la met en attente ici, et elle ne part qu'une fois constaté que
+    /// l'onglet tire réellement des octets du flux — la même preuve que celle
+    /// dont `output_reach` se sert déjà (`tune-server/src/routes/zones.rs`).
+    /// Une piste que personne ne tire n'est jamais annoncée : l'entrée est
+    /// simplement écrasée par la lecture suivante.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+}
+
+/// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
+/// fois la lecture prouvée (voir [`PlaybackOrchestrator::annonces_navigateur`]).
+///
+/// Tout est capturé au démarrage, y compris `record_history` : une re-création
+/// de flux pour une piste déjà en cours (recherche de position, reconnexion
+/// radio) passe par `play_without_history` et ne doit PAS ajouter une seconde
+/// ligne d'historique. Reconstruire ce drapeau depuis le poller serait le
+/// perdre — et ferait doublonner l'historique à chaque déplacement du curseur.
+#[derive(Debug, Clone)]
+struct AnnonceNavigateurDifferee {
+    /// Flux dont on attend qu'il soit tiré. Identifie la lecture : une
+    /// nouvelle lecture crée un nouveau flux, donc l'annonce en attente d'une
+    /// piste abandonnée ne peut pas partir sous l'identité de la suivante.
+    stream_id: String,
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    source: String,
+    source_id: Option<String>,
+    /// Ligne de bibliothèque, quand il y en a une : l'album n'est relu qu'au
+    /// moment d'écrire l'historique, pas à chaque démarrage.
+    track_id: Option<i64>,
+    duration_ms: i64,
+    cover_path: Option<String>,
+    record_history: bool,
 }
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
@@ -627,6 +711,10 @@ pub struct PlayRequest {
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
     pub media_format: Option<String>,
+    /// Album numbering, passed on to the output in `PlayMedia`. Filled from the
+    /// queue row (or the library track) so an output does not have to guess it.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -658,12 +746,29 @@ pub struct ResolvedStream {
     /// endpoints. Carried through to `PlayMedia::origin_url` so an output can
     /// reach the source as it was published; see that field for the rationale.
     pub origin_url: Option<String>,
+    /// Débit CONSTANT du flux SOURCE, en kbit/s, quand la source le nomme
+    /// elle-même. Jamais déduit, jamais estimé : `None` dit « on ne sait pas »
+    /// et rien ne sera affiché.
+    ///
+    /// Sa raison d'être est le 128 kbit/s de Bandcamp (#2074). La qualité
+    /// était annoncée sur l'écran Bandcamp et se perdait au passage en zone :
+    /// le chemin du signal n'affichait plus que « MP3 », indiscernable d'un
+    /// 320. Or Tune s'adresse à des gens qui règlent leur chaîne au bit près,
+    /// et la règle écrite dans `tune-bandcamp` veut que ce débit soit
+    /// « annoncé comme tel partout où il apparaît ».
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// Warm-cache for Tidal/Qobuz HI-RES DASH transcodes is opt-in: it changes the
 /// file served on the HI-RES streaming path (cache-hit → a previously-finished
 /// transcode instead of a fresh one), so it stays OFF until validated on a real
 /// DLNA renderer. Enable with `TUNE_DASH_WARM_CACHE=1`.
+/// Facteur linéaire d'un trim de gain par renderer (`zone_{id}_gain_trim_db`).
+/// Clampe à ±12 dB — au-delà, on harmonise plus rien, on casse.
+fn gain_trim_factor(trim_db: f64) -> f64 {
+    10f64.powf(trim_db.clamp(-12.0, 12.0) / 20.0)
+}
+
 fn dash_warm_cache_enabled() -> bool {
     std::env::var("TUNE_DASH_WARM_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -692,6 +797,13 @@ pub struct ResolvedQueueItem {
     /// local tracks resolved via the local-file gapless path; None for streaming
     /// tracks and for the normal transcode/URL resolution.
     pub file_path: Option<String>,
+    /// Where the item came from, and its id there — passed to the output so it
+    /// can identify the track without guessing from artist/album/title.
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    /// Album numbering carried by the queue row.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 /// DIDL `res@duration` (ms) for a native passthrough stream served raw to a
@@ -763,6 +875,19 @@ pub(crate) fn command_may_have_landed(err: &str) -> bool {
     // tête. Un test couvre précisément ce chemin — s'y fier plutôt qu'à la forme
     // supposée de la chaîne.
     err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
+}
+
+/// Le flux qui part sur le fil est-il du DSD BRUT ?
+///
+/// `application/x-dsd` par défaut, ou le MIME que le lecteur a lui-même
+/// annoncé pour le DSF/DFF (`audio/x-dsf`, `audio/dff`…) : le passthrough
+/// reprend celui-là quand il existe, parce que certains renderers n'acceptent
+/// que le MIME exact qu'ils publient. Aucun MIME PCM ne porte ces trois
+/// lettres, donc la reconnaissance ne peut pas mordre à côté — un FLAC servi à
+/// la même zone n'est jamais confondu avec un DSD.
+fn est_dsd_brut(mime_type: &str) -> bool {
+    let m = mime_type.to_ascii_lowercase();
+    m.contains("dsd") || m.contains("dsf") || m.contains("dff")
 }
 
 /// Should a network output be fed from a pre-transcoded temp file (blocking,
@@ -841,6 +966,117 @@ fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
     )
 }
 
+/// Profondeur de bits admissible par un appareil de lecture, en sortie.
+///
+/// Plancher a 16 : en dessous, plus rien ne lit le PCM de facon fiable.
+/// Plafond a 24 : c'est la limite de la quasi-totalite des lecteurs reseau —
+/// le Marantz ND8006 de Jean Valjean affiche « format non supporte » et reste
+/// muet devant un flux 32 bits, qu'il soit transcode en WAV ou envoye en FLAC
+/// direct (#1610). Le 32 bits venait de `track.bit_depth`, donc du scan : le
+/// format FLAC l'autorise, et rien ne le ramenait a une valeur jouable.
+///
+/// La regle etait deja appliquee a trois endroits, ecrite de trois facons
+/// (`max(16).min(24)`, `min(24).max(16)`) — et oubliee au quatrieme. Une
+/// fonction unique rend l'oubli impossible a reproduire.
+pub(crate) fn cap_output_bit_depth(bit_depth: u16) -> u16 {
+    bit_depth.clamp(16, 24)
+}
+
+/// Resolution ANNONCEE d'une piste : frequence ou profondeur, telle que le
+/// client l'affiche.
+///
+/// `ligne` est la valeur de la ligne `tracks` (la source, ce que le scan a lu
+/// dans le fichier). `resolu` est celle du `ResolvedStream` — pour une piste
+/// locale c'est la resolution de SORTIE, et `resolve_local_track` la fabrique
+/// quand la ligne se tait (`unwrap_or(44100)` / `unwrap_or(16)`, puis
+/// `cap_output_bit_depth`). La substituer affiche un chiffre que personne n'a
+/// mesure.
+///
+/// Le streaming, lui, n'a pas de ligne en bibliotheque : `resolu` y EST la
+/// resolution de la source, et reste le repli legitime.
+pub(crate) fn resolution_annoncee(
+    ligne: Option<u32>,
+    resolu: Option<u32>,
+    source_locale: bool,
+) -> Option<u32> {
+    if source_locale {
+        // La ligne, ou rien. Jamais un chiffre fabrique par la sortie.
+        ligne
+    } else {
+        ligne.or(resolu)
+    }
+}
+
+/// Faut-il emballer ce DSD en DoP (trames PCM 24 bits au seizième du débit) ?
+///
+/// - **Sortie locale** : « natif » et « dop » y mènent tous deux, une carte son
+///   ne recevant pas de DSD autrement.
+/// - **Renderer réseau** : uniquement sur choix EXPLICITE « dop ». En « auto »
+///   ou « natif », c'est `should_dsd_passthrough` qui tranche entre l'envoi du
+///   fichier tel quel et le transcodage.
+///
+/// Règle extraite en fonction libre parce que son absence côté réseau était
+/// invisible : `"dop"` n'était comparé qu'à un seul endroit du dépôt, sous un
+/// garde `is_local_output` (#1772).
+/// Cadence et canaux à ANNONCER pour un flux DoP, le fichier faisant foi.
+///
+/// L'en-tête WAV et la charge utile doivent décrire la même chose. L'encodeur
+/// (`decode_dsd_to_dop_streaming`) se construit sur ce que rend
+/// `parse_dsf`/`parse_dff` ; annoncer la ligne `tracks` à la place revient à
+/// parier que la base et le fichier concordent. Quand ils divergent d'un canal,
+/// chaque mot de 24 bits est décalé, le marqueur DoP ne tombe plus sur l'octet
+/// de poids fort, et le DAC joue le train DSD comme du PCM : du bruit blanc.
+///
+/// La base ne sert que de repli, pour un en-tête illisible — mieux vaut
+/// diffuser avec des valeurs approximatives que refuser de lire.
+fn dop_wire_params(
+    probe: Option<(u32, u32)>,
+    db_rate: Option<u32>,
+    db_channels: u32,
+) -> (u32, u16) {
+    let rate = probe
+        .map(|(sr, _)| sr)
+        .unwrap_or_else(|| db_rate.unwrap_or(2_822_400));
+    let channels = probe
+        .map(|(_, ch)| ch as u16)
+        .unwrap_or(db_channels as u16)
+        .max(2);
+    (rate, channels)
+}
+
+/// Le conteneur peut-il porter plus de 16 bits alors que la base l'ignore ?
+///
+/// Seul l'ALAC est concerné : sa profondeur ne se lit ni dans les tags ni par
+/// `lofty`, mais dans le cookie magique du fichier. Tous les autres conteneurs
+/// renseignent la leur au scan, donc les sonder serait de l'E/S pour rien.
+fn conteneur_a_profondeur_cachee(fmt: Option<AudioFormat>) -> bool {
+    matches!(fmt, Some(AudioFormat::Alac))
+}
+
+/// Profondeur réelle lue DANS le fichier, quand la base ne la connaît pas.
+///
+/// Rend `None` — donc « garder ce que dit la base » — dès que le conteneur
+/// n'est pas concerné, que le fichier est illisible, ou que la sonde ne trouve
+/// rien. Ne jamais échouer la lecture pour une profondeur : au pire on reste
+/// sur le comportement d'avant.
+fn profondeur_sondee_si_la_base_ignore(file_path: &str, fmt: Option<AudioFormat>) -> Option<u16> {
+    if !conteneur_a_profondeur_cachee(fmt) {
+        return None;
+    }
+    let (_, bd) = crate::metadata::probe_m4a_props(std::path::Path::new(file_path))?;
+    let bd = bd?;
+    info!(
+        path = %file_path,
+        bit_depth = bd,
+        "alac_bit_depth_probed_from_file_for_wav24"
+    );
+    Some(bd)
+}
+
+pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
+    (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
+}
+
 impl PlaybackOrchestrator {
     pub fn new(
         db: Arc<dyn crate::db::backend::DbBackend>,
@@ -864,8 +1100,77 @@ impl PlaybackOrchestrator {
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
+            annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
+    /// radios du MediaServer.
+    ///
+    /// La connexion à la station ne commence qu'ici, au GET audio — jamais au
+    /// Browse ni au HEAD. La route HTTP possède la durée de vie de la session
+    /// et la retire lorsque son corps est terminé ou abandonné.
+    pub async fn create_media_server_radio_session(&self, radio_url: String) -> String {
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (stream_id, tx, data_ready, session) =
+            self.streamer.create_radio_session(wav_info, 256).await;
+        let stream_id_for_task = stream_id.clone();
+        let session_for_done = session.clone();
+
+        info!(
+            stream_id = %stream_id,
+            url = %radio_url,
+            "media_server_radio_decode_started"
+        );
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None)
+            })
+            .await;
+
+            session_for_done
+                .producer_done
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Réveille aussi le corps qui attend encore la détection du vrai
+            // format. `notify_one` mémorise un permis si l'échec précède son
+            // premier poll, contrairement à `notify_waiters`.
+            session_for_done.data_ready.notify_one();
+            // `create_radio_session` conserve un émetteur de garde pour les
+            // flux permanents. Cette session est liée à une requête : quand le
+            // producteur finit, le corps HTTP doit recevoir EOF.
+            session_for_done.close_sender().await;
+
+            match result {
+                Ok(Ok(())) => debug!(
+                    stream_id = %stream_id_for_task,
+                    "media_server_radio_decode_ended"
+                ),
+                Ok(Err(error)) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_failed"
+                ),
+                Err(error) => warn!(
+                    stream_id = %stream_id_for_task,
+                    error = %error,
+                    "media_server_radio_decode_task_panicked"
+                ),
+            }
+        });
+
+        stream_id
     }
 
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
@@ -948,20 +1253,44 @@ impl PlaybackOrchestrator {
     /// `DUPLICATE_NET_PLAY_WINDOW` of `now` (⇒ a redundant re-send to coalesce);
     /// otherwise records it as the new last play and returns `false`. Pure map
     /// logic split out of `play_inner` for unit testing.
+    /// La cle doit identifier la PISTE, pas seulement sa source.
+    ///
+    /// `source_id` ne suffit pas : une piste de la bibliotheque locale se joue
+    /// par `track_id`, et `play_from_queue` laisse alors `source` et
+    /// `source_id` a `None`. La cle valait donc `("local", None)` pour TOUTES
+    /// les pistes locales d'une zone, si bien que deux morceaux DIFFERENTS
+    /// envoyes au meme renderer reseau a moins de douze secondes d'intervalle
+    /// se ressemblaient parfaitement.
+    ///
+    /// Consequence pour l'utilisateur : sur Chromecast, DLNA ou AirPlay, appuyer
+    /// sur « piste suivante » pendant les douze premieres secondes faisait
+    /// avancer le serveur SANS rien envoyer au renderer, qui continuait le
+    /// morceau precedent. Le bouton paraissait mort (FabienM, v0.9.102, zone
+    /// Enfants en Chromecast : quinze `api_next_requested` d'affilee, tous
+    /// suivis d'un `orchestrator_play_coalesced_duplicate_net_send` sur des
+    /// titres pourtant differents).
+    ///
+    /// Le test d'origine n'exercait que `tidal` et `qobuz` — des sources qui
+    /// portent TOUJOURS un `source_id`. Il ne pouvait pas voir le cas local.
     fn record_or_detect_duplicate_net_play(
-        map: &mut HashMap<i64, (String, Option<String>, std::time::Instant)>,
+        map: &mut HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>,
         zone_id: i64,
         source: &str,
         source_id: &Option<String>,
+        track_id: Option<i64>,
         now: std::time::Instant,
     ) -> bool {
-        let dup = map.get(&zone_id).is_some_and(|(src, sid, when)| {
+        let dup = map.get(&zone_id).is_some_and(|(src, sid, tid, when)| {
             src == source
                 && sid == source_id
+                && *tid == track_id
                 && now.duration_since(*when) < DUPLICATE_NET_PLAY_WINDOW
         });
         if !dup {
-            map.insert(zone_id, (source.to_string(), source_id.clone(), now));
+            map.insert(
+                zone_id,
+                (source.to_string(), source_id.clone(), track_id, now),
+            );
         }
         dup
     }
@@ -1222,6 +1551,12 @@ impl PlaybackOrchestrator {
         record_history: bool,
     ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
+        // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
+        // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
+        // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
+        // (#1998). Une zone navigateur n'a JAMAIS d'`output_device_id` : si le
+        // demandeur en fournit un, ce n'en est pas une.
+        let mut zone_navigateur = false;
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
         // the zone's DB record.  This is the primary gate for send_to_output —
@@ -1262,7 +1597,8 @@ impl PlaybackOrchestrator {
                 // absent from the DB keep the old behaviour (in-memory tests /
                 // transient states).
                 if let Some(ref zone) = zone_db {
-                    if zone.output_type.as_deref() != Some("browser") {
+                    zone_navigateur = zone.output_type.as_deref() == Some("browser");
+                    if !zone_navigateur {
                         let msg = format!(
                             "zone_no_output_device:Zone '{}' has no output device assigned — assign an output device to this zone or delete it and re-create it from a device.",
                             zone.name
@@ -1316,8 +1652,25 @@ impl PlaybackOrchestrator {
         // can run into the 300s timeout from the previous track.
         let play_gen = self.playback.bump_generation(req.zone_id).await;
 
+        // Signaler la recherche AVANT de la lancer : sur YouTube elle peut durer
+        // une trentaine de secondes, et un écran muet pendant ce temps se lit
+        // comme une panne (forum #1359). Le drapeau retombe dans `play()`, dès
+        // qu'une URL jouable existe — y compris sur les chemins d'erreur, qui
+        // passent tous par un `play()` ou un `stop()` ultérieur.
+        self.playback.set_resolving(req.zone_id, true).await;
+
+        // ⚠ TOUTE sortie de ce bloc doit abaisser le drapeau, sinon la zone reste
+        // affichée « recherche en cours » indéfiniment. Trois chemins quittent
+        // ici sans passer par `play()` : l'échec du fichier uploadé, la reprise
+        // par une lecture plus récente, et l'échec de résolution.
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
-            self.resolve_uploaded_file(temp_path, &req).await?
+            match self.resolve_uploaded_file(temp_path, &req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
+            }
         } else {
             match self.resolve_stream(&req).await {
                 Ok(r) => r,
@@ -1329,6 +1682,8 @@ impl PlaybackOrchestrator {
                         zone_id = req.zone_id,
                         "orchestrator_play_superseded_before_transcode"
                     );
+                    // La lecture gagnante a pose son propre drapeau : ne pas
+                    // l'abaisser ici, on effacerait SON etat de recherche.
                     return Ok(PlayResult {
                         stream_url: None,
                         output_sent: false,
@@ -1336,7 +1691,10 @@ impl PlaybackOrchestrator {
                         error: Some("superseded by a newer play".into()),
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.playback.set_resolving(req.zone_id, false).await;
+                    return Err(e);
+                }
             }
         };
         let resolve_ms = play_start.elapsed().as_millis();
@@ -1399,6 +1757,7 @@ impl PlaybackOrchestrator {
                     req.zone_id,
                     &resolved.source,
                     &req.source_id,
+                    req.track_id,
                     std::time::Instant::now(),
                 )
             };
@@ -1448,6 +1807,26 @@ impl PlaybackOrchestrator {
                 // (Progman/Cyrille: Qobuz shown compressed / wrong format).
                 .or_else(|| match resolved.source.as_str() {
                     "qobuz" => Some("flac".to_string()),
+                    // Bandcamp : le dire ici — et non depuis le client — pour
+                    // deux raisons : le repli sur le type MIME afficherait
+                    // « MPEG » au lieu de « MP3 », et surtout l'avance de file
+                    // re-résout la piste SANS qu'aucun client repasse un
+                    // format. Sans cette ligne, la piste 1 s'affichait
+                    // autrement que la piste 2 du même album.
+                    //
+                    // Le codec vient de l'URL, pas du nom du service : sans
+                    // achat Bandcamp ne sert que du `mp3-128`, mais un fichier
+                    // acheté descend en `flac`/`alac` par la même porte, et
+                    // l'annoncer « MP3 » serait faux (#2074). Repli sur `mp3`
+                    // quand l'URL ne nomme rien : c'est l'écoute libre.
+                    "bandcamp" => Some(
+                        req.source_id
+                            .as_deref()
+                            .and_then(bandcamp_encoding)
+                            .and_then(|enc| bandcamp_quality(&enc))
+                            .map(|q| q.codec.to_string())
+                            .unwrap_or_else(|| "mp3".to_string()),
+                    ),
                     _ => None,
                 })
                 // A media-server (UPnP/NAS) item has no local track row, so the
@@ -1470,18 +1849,51 @@ impl PlaybackOrchestrator {
             // the "now playing" label must show the file's real depth (16/24) —
             // matching the gapless path (advance_queue_metadata), which avoids the
             // "first tracks show 32-bit then correct to 16" glitch. Streaming has
-            // no local row (track_meta = None) so it falls back to the resolved
-            // stream format. DSD display is handled separately in zones.rs.
-            sample_rate: track_meta
-                .as_ref()
-                .and_then(|t| t.sample_rate.map(|v| v as u32))
-                .or(resolved.sample_rate),
-            bit_depth: track_meta
-                .as_ref()
-                .and_then(|t| t.bit_depth.map(|v| v as u32))
-                .or(resolved.bit_depth),
+            // no local row so it falls back to the resolved stream format. DSD
+            // display is handled separately in zones.rs.
+            //
+            // Le repli tenait sur `track_meta = None`, et c'etait trop large :
+            // une piste LOCALE dont la ligne ignore la frequence ou la
+            // profondeur y retombait aussi, et heritait alors du chiffre que
+            // `resolve_local_track` venait de fabriquer (`unwrap_or(44100)` /
+            // `unwrap_or(16)`). La meme ligne atteinte par avance gapless,
+            // elle, n'annoncait rien (`NowPlaying::from_track`). La lecture
+            // aleatoire rendait l'ecart visible : elle demarre sans cesse une
+            // PREMIERE piste tiree au hasard (#2250, fil 1036). Le predicat
+            // porte desormais sur la SOURCE, pas sur la presence d'une ligne.
+            sample_rate: resolution_annoncee(
+                track_meta
+                    .as_ref()
+                    .and_then(|t| t.sample_rate.map(|v| v as u32)),
+                resolved.sample_rate,
+                resolved.source == "local",
+            ),
+            bit_depth: resolution_annoncee(
+                track_meta
+                    .as_ref()
+                    .and_then(|t| t.bit_depth.map(|v| v as u32)),
+                resolved.bit_depth,
+                resolved.source == "local",
+            ),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
             year: track_meta.as_ref().and_then(|t| t.year),
+            // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
+            // deviner l'album depuis son TITRE : cliquer sur « Entreat (2010) »
+            // ouvrait la page de The Cure (FabienM, v0.9.102). `track_meta` les
+            // a deja sous la main — c'est la ligne de la bibliotheque.
+            //
+            // `None` pour une radio ou un flux : ils n'ont pas d'entree en
+            // bibliotheque, et inventer un identifiant serait pire que de n'en
+            // donner aucun.
+            album_id: track_meta.as_ref().and_then(|t| t.album_id),
+            artist_id: track_meta.as_ref().and_then(|t| t.artist_id),
+            // Le débit annoncé par la SOURCE, quand elle le nomme. C'est ce
+            // qui manquait au 128 kbit/s de Bandcamp : annoncé sur l'écran de
+            // découverte, il disparaissait dès que la piste partait en zone —
+            // le chemin du signal ne montrait plus qu'un « MP3 » qu'aucun
+            // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
+            // n'en porte pas : sa résolution réelle est lue au scan.
+            bitrate_kbps: resolved.bitrate_kbps,
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -1491,12 +1903,17 @@ impl PlaybackOrchestrator {
             .save_play_state(req.zone_id, "playing")
             .ok();
 
-        // Multi-service now-playing dispatch with tier gating
-        self.dispatch_now_playing(
-            &resolved.title,
-            resolved.artist.as_deref(),
-            album.as_deref(),
-        );
+        // L'annonce « en écoute » N'EST PLUS ici : elle attend de savoir si la
+        // sortie a accepté le titre. Voir plus bas, après `output_sent`.
+        //
+        // Elle partait à cet endroit, c'est-à-dire AVANT toute tentative
+        // d'envoi. Chez Bilou (#1998), quatre échecs de sortie BluOS d'affilée
+        // ont produit quatre annonces à Last.fm pour un titre jamais entendu :
+        // `output_sent=false`, zone arrêtée sur-le-champ, session de flux
+        // fermée — et 233 ms plus tard « en écoute ».
+        //
+        // Le profil d'écoute est publié hors de chez l'utilisateur, sur un
+        // service tiers, sans correction commode. Une écoute inventée y reste.
 
         // For local outputs, keep the old stream alive until after play_url()
         // calls stop() — otherwise the audio thread gets a read error when the
@@ -1514,16 +1931,56 @@ impl PlaybackOrchestrator {
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
-            let local_file_path = if resolved.source == "local" {
+            // One DB read for the local row: the output needs its path, and its
+            // album numbering when the request did not carry any (a play by
+            // track id, not from a queue row).
+            let local_track = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
                     TrackRepo::with_backend(self.db.clone())
                         .get(tid)
                         .ok()
                         .flatten()
-                        .and_then(|t| t.file_path)
                 })
             } else {
                 None
+            };
+            let local_file_path = local_track.as_ref().and_then(|t| t.file_path.clone());
+            let media_source_id = req
+                .source_id
+                .clone()
+                .or_else(|| req.track_id.map(|t| t.to_string()));
+            // The library row stores 0 for "unknown", so filter it out rather
+            // than telling the output this is track 0.
+            let media_track_number = req.track_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.track_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
+            let media_disc_number = req.disc_number.or_else(|| {
+                local_track
+                    .as_ref()
+                    .map(|t| t.disc_number)
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
+            });
+            // Une session-canal (conversion à la volée) ne sait pas rejouer un
+            // octet passé : la DIDL doit annoncer DLNA.ORG_OP=00, sans quoi le
+            // renderer seeke par tranches et gèle à 0:00 (DMP-A8, DSD, 24/08).
+            let byte_seekable = match resolved.stream_id.as_deref() {
+                Some(sid) => {
+                    let session = {
+                        let sessions = self.streamer.sessions_state();
+                        let guard = sessions.lock().await;
+                        guard.get(sid).cloned()
+                    };
+                    match session {
+                        Some(s) => !s.is_channel().await,
+                        None => true,
+                    }
+                }
+                None => true,
             };
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
@@ -1542,7 +1999,12 @@ impl PlaybackOrchestrator {
                 // DLNA DIDL advertises live/senderPaced semantics instead of a
                 // seekable file (Yamaha R-N2000A stays silent otherwise).
                 live_stream: resolved.source == "radio",
+                byte_seekable,
                 origin_url: resolved.origin_url.as_deref(),
+                source: Some(&resolved.source),
+                source_id: media_source_id.as_deref(),
+                track_number: media_track_number,
+                disc_number: media_disc_number,
             };
             let zone_audiophile = self.zone_audiophile(req.zone_id);
 
@@ -1566,24 +2028,72 @@ impl PlaybackOrchestrator {
             //     freezes the start of playback; `Play` is sent regardless.
             // The poller FSM is untouched: its 45s track-load grace already
             // tolerates the few extra seconds before Play.
+            //
+            // La RADIO a besoin de la même barrière quelle que soit la sortie
+            // (#1628). Un flux live n'a pas de réserve par construction : on ne
+            // peut envoyer que ce que la station a déjà émis. En partant sans
+            // retard délibéré, la lecture colle au bord du direct et chaque
+            // frontière de segment arrivant un peu tard passe sous le lead —
+            // mesuré sur FIP → endpoint OAAT le 13/08 : des underruns
+            // rythmiques toutes les ~8 s (la cadence des segments), de 0 à
+            // 96 ms, indéfiniment. Les 2 s de tampon de l'endpoint n'y peuvent
+            // rien : elles ne sont JAMAIS remplies. Accumuler ce retard avant
+            // de lancer la lecture donne au flux la réserve qui lui manque ;
+            // le coût est quelques secondes au zapping d'une station.
+            // Temps réellement passé dans cette barrière. Il était jusqu'ici
+            // noyé dans `output_ms` de `playback_timing`, ce qui rendait la
+            // ligne trompeuse sur DLNA : jusqu'à 4 s d'attente DÉLIBÉRÉE s'y
+            // lisaient comme « la sortie traîne » (#2488). Reste 0 quand la
+            // barrière ne s'applique pas.
+            let mut prebuffer_ms: u128 = 0;
             if let Some(ref sid) = resolved.stream_id {
-                if self.output_type_of(device_id).await.as_deref() == Some("dlna") {
+                let is_dlna = self.output_type_of(device_id).await.as_deref() == Some("dlna");
+                let is_radio = resolved.source == "radio";
+                if is_dlna || is_radio {
+                    let prebuffer_start = std::time::Instant::now();
                     let sr = resolved.sample_rate.unwrap_or(44100) as u64;
                     let ch = (resolved.channels.unwrap_or(2) as u64).max(1);
                     let bytes_per_sample = ((resolved.bit_depth.unwrap_or(16) as u64) / 8).max(1);
-                    let target_bytes = sr * ch * bytes_per_sample * 2; // ~2s of audio
+                    // La radio vise plus large : il faut couvrir une frontière
+                    // de segment entière (~8 s observées) sans jamais toucher
+                    // le fond, là où un fichier n'a qu'un démarrage à froid à
+                    // absorber.
+                    let secs = if is_radio { RADIO_PREBUFFER_SECS } else { 2 };
+                    let target_bytes = sr * ch * bytes_per_sample * secs;
+                    // Plafond : une station lente ou muette ne doit jamais
+                    // geler le départ — `Play` part de toute façon.
+                    let timeout = std::time::Duration::from_secs(if is_radio { 8 } else { 4 });
                     let reached = self
                         .streamer
-                        .wait_prefill_ready(sid, target_bytes, std::time::Duration::from_secs(4))
+                        .wait_prefill_ready(sid, target_bytes, timeout)
                         .await;
+                    prebuffer_ms = prebuffer_start.elapsed().as_millis();
                     info!(
                         zone_id = req.zone_id,
                         stream_id = %sid,
                         target_bytes,
                         reached,
-                        "dlna_initial_prebuffer_done"
+                        is_radio,
+                        prebuffer_ms,
+                        "initial_prebuffer_done"
                     );
                 }
+            }
+
+            // A local output opens this URL in its own reader thread just
+            // after `play_media`. If that reader never starts, the session is
+            // alive but silent and used to leave only `stale_session_removed`
+            // thirty minutes later (#2270). Arming here excludes sessions that
+            // are merely prepared in advance for gapless playback.
+            if is_local && let Some(ref sid) = resolved.stream_id {
+                let _ = arm_local_stream_consumer_watch(
+                    self.streamer.clone(),
+                    sid.clone(),
+                    req.zone_id,
+                    device_id.clone(),
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
             }
 
             let result = self
@@ -1597,10 +2107,16 @@ impl PlaybackOrchestrator {
                 )
                 .await;
             let total_ms = play_start.elapsed().as_millis();
+            // `output_ms` ne compte plus l'attente de pré-tampon : les trois
+            // termes s'additionnent maintenant pour donner `total_ms`, et un
+            // blanc s'impute à la bonne étape sans relire la source.
             info!(
                 zone_id = req.zone_id,
                 resolve_ms,
-                output_ms = total_ms.saturating_sub(resolve_ms),
+                prebuffer_ms,
+                output_ms = total_ms
+                    .saturating_sub(resolve_ms)
+                    .saturating_sub(prebuffer_ms),
                 total_ms,
                 title = %resolved.title,
                 "playback_timing"
@@ -1634,7 +2150,7 @@ impl PlaybackOrchestrator {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         let arc = { outputs.lock().await.get(&did) };
                         if let Some(output) = arc {
-                            if let Err(e) = output.lock().await.set_volume(1.0).await {
+                            if let Err(e) = output.lock().await.checked_set_volume(1.0).await {
                                 warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
                             } else {
                                 info!(zone_id, volume = 1.0, "play_initial_volume_sent");
@@ -1672,16 +2188,97 @@ impl PlaybackOrchestrator {
         // relation to what was heard, plus a fresh bogus row on every replay
         // click (Bilou). Station plays are already tracked in the radio_stations
         // table (record_play), so nothing is lost.
-        if record_history && resolved.source != "radio" {
+        // Ce que la sortie a refusé n'a été entendu nulle part.
+        //
+        // `output_sent` est établi juste au-dessus, et l'arrêt immédiat de la
+        // zone s'appuie déjà dessus quelques lignes plus bas : le signal
+        // existait, dans la même fonction, et ces deux écritures ne le
+        // consultaient pas.
+        //
+        // Le cas « aucune sortie configurée » rend lui aussi `false` (avec
+        // `no_output_device_id_skipping_send_to_output`) : ne rien annoncer y
+        // est également juste — le titre n'est parti vers aucun appareil.
+        //
+        // SAUF la zone navigateur, dont la sortie EST l'onglet : elle n'a pas
+        // de périphérique, `output_sent` y vaut toujours faux, et une lecture
+        // peut parfaitement avoir lieu. La garde ci-dessus lui a supprimé toute
+        // annonce, y compris quand elle joue — c'est ce que ce ticket a rouvert
+        // (#1998). Elle n'est pas remise dans le cas général : son annonce est
+        // DIFFÉRÉE jusqu'à la preuve que l'onglet tire le flux.
+        if !output_sent && !zone_navigateur {
+            debug!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                "play_not_announced_output_not_sent"
+            );
+        }
+
+        if !output_sent && zone_navigateur {
+            let attente = AnnonceNavigateurDifferee {
+                stream_id: resolved.stream_id.clone().unwrap_or_default(),
+                title: resolved.title.clone(),
+                artist: resolved.artist.clone(),
+                album: album.clone(),
+                source: resolved.source.clone(),
+                source_id: req.source_id.clone(),
+                track_id: req.track_id,
+                duration_ms: resolved.duration_ms.unwrap_or(0),
+                cover_path: cover_path.clone(),
+                record_history,
+            };
+            if attente.stream_id.is_empty() {
+                // Sans flux, rien à observer : on ne saurait jamais dire que
+                // l'onglet a lu. Ne rien mettre en attente vaut mieux qu'une
+                // entrée qu'aucune preuve ne pourra jamais libérer.
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    "browser_now_playing_not_deferred_no_stream"
+                );
+            } else {
+                debug!(
+                    zone_id = req.zone_id,
+                    title = %resolved.title,
+                    stream_id = %attente.stream_id,
+                    "browser_now_playing_deferred_until_stream_pulled"
+                );
+                if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+                    en_attente.insert(req.zone_id, attente);
+                }
+            }
+        }
+
+        // Annonce « en écoute » multi-service, avec palier de licence.
+        if output_sent {
+            self.dispatch_now_playing(
+                &resolved.title,
+                resolved.artist.as_deref(),
+                album.as_deref(),
+            );
+        }
+
+        // `record_listen` alimente `listen_history`, la statistique locale. Il
+        // souffrait du même défaut, et l'issue posait la question sans pouvoir
+        // la trancher sur les seuls journaux : oui, l'historique local était
+        // falsifié lui aussi.
+        //
+        // Le scrobble DÉFINITIF, lui, n'a jamais été concerné : il est
+        // déclenché par le poller une fois le seuil des 50 % / 4 min franchi
+        // (`dispatch_scrobble`, #1113), et une lecture qui n'a jamais démarré
+        // ne l'atteint pas. C'est la seconde question ouverte du ticket.
+        if output_sent && record_history && resolved.source != "radio" {
             // Owning profile = the zone's current session, set by the play
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
             // in async context so record_listen itself stays sync.
-            let session_profile_id = self
-                .playback
-                .get_state(req.zone_id)
-                .await
-                .session_profile_id;
+            // Meme lecture, meme raison que le profil : l'etat de zone porte
+            // aussi CE QUE l'auditeur a demande (piste, album, playlist,
+            // artiste, label), pose par le gestionnaire de `play` a partir du
+            // corps de la requete. Une avance automatique herite du contexte
+            // sans y toucher.
+            let etat = self.playback.get_state(req.zone_id).await;
+            let session_profile_id = etat.session_profile_id;
+            let context = (etat.session_context_type, etat.session_context_id);
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -1699,6 +2296,8 @@ impl PlaybackOrchestrator {
                 req.zone_id,
                 cover_path.as_deref(),
                 session_profile_id,
+                context.0.as_deref(),
+                context.1.as_deref(),
             );
         }
 
@@ -1856,61 +2455,182 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Faut-il envoyer le DSD tel quel au renderer ?
+    ///
+    /// Fonction PURE : le mode reglé, et ce que le sondage a repondu —
+    /// `Some(true)` / `Some(false)` sur une reponse concluante, `None` sinon. La
+    /// sonde reseau vit dans `sonder_dsd` ; ici il n'y a que la decision, donc
+    /// elle se teste.
+    ///
+    /// La subtilite est le troisieme cas. `None` ne veut PAS dire « non » : des
+    /// renderers lisent le DSD sans l'annoncer dans leur GetProtocolInfo.
+    /// Ecraser un reglage explicite sur une absence de reponse priverait de DSD
+    /// natif des gens qui l'avaient — la faute symetrique de celle qu'on
+    /// corrige (#2122).
+    pub(crate) fn decider_passthrough_dsd(mode: &str, annonce: Option<bool>) -> bool {
+        match mode {
+            "pcm" => false,
+            // `dop` n'est pas du passthrough : le renderer doit recevoir le DSD
+            // emballe en trames PCM, pas le .dsf brut.
+            "dop" => false,
+            // Choix explicite : la parole de l'utilisateur, TOUJOURS.
+            //
+            // La version precedente cedait devant un « non » du Sink
+            // (`annonce != Some(false)`, #2122). Le terrain l'a dementie :
+            // l'Eversolo DMP-A8 annonce 392 formats dans son GetProtocolInfo,
+            // AUCUN DSD — et joue le .dsf brut qu'on lui envoie. Un Sink qui
+            // omet un format n'est pas un refus, meme quand il a l'air
+            // exhaustif : une absence n'est pas une preuve.
+            //
+            // `native` n'est pas un reglage d'usine : quelqu'un l'a choisi,
+            // pour CE renderer. Si la zone reste muette, c'est ce reglage
+            // qu'il faut changer — et le journal le dit — pas le serveur qui
+            // decide en silence de convertir.
+            "native" => true,
+            // `auto` : sans reponse claire, on prend le chemin sur.
+            _ => annonce.unwrap_or(false),
+        }
+    }
+
+    /// Le message d'échec de lecture, tel que l'utilisateur le lit.
+    ///
+    /// Un message d'échec doit permettre d'AGIR. Celui du DLNA — « Le renderer
+    /// a acquitté Play mais joue toujours une autre source » — décrit
+    /// fidèlement ce que l'appareil a fait, et c'est justement le problème :
+    /// il désigne le matériel. L'utilisateur cherche du côté du renderer, du
+    /// réseau, de son installation ; l'un d'eux a réinstallé son système
+    /// entier (#2396).
+    ///
+    /// Or dans un cas précis le serveur SAIT, avant même d'envoyer, pourquoi
+    /// cela ne marchera probablement pas : la zone est en DSD « natif », le
+    /// Sink du lecteur a répondu qu'il ne lit pas le DSD, et on lui envoie le
+    /// flux brut quand même. Ce choix-là n'est pas remis en cause — « natif »
+    /// est un réglage explicite et des renderers lisent le DSD sans l'annoncer
+    /// (Eversolo DMP-A8), cf. [`Self::decider_passthrough_dsd`]. Ce qui était
+    /// faux, c'est le message : il accusait l'appareil au lieu de nommer le
+    /// réglage et l'action qui le corrige.
+    ///
+    /// Hors de ce cas — le lecteur a dit oui, le sondage est resté muet, la
+    /// zone est en `auto`, la source n'est pas du DSD brut — le message ne
+    /// change pas d'un caractère. Accuser un réglage à tort serait la faute
+    /// symétrique de celle qu'on corrige.
+    ///
+    /// Le préfixe « Output device error » est conservé dans tous les cas : la
+    /// route de lecture s'en sert pour rendre un 503 « appareil indisponible »
+    /// plutôt qu'un 500 (`tune-server/src/routes/playback.rs`), et
+    /// [`command_may_have_landed`] cherche le marqueur de timeout SOAP à
+    /// l'intérieur.
+    pub(crate) fn message_echec_sortie(
+        erreur: &str,
+        dsd_mode: &str,
+        annonce: Option<bool>,
+        mime_type: &str,
+    ) -> String {
+        if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
+            return format!(
+                "Output device error: le mode DSD de cette zone est réglé sur « natif » \
+                 et ce lecteur annonce ne pas lire le DSD — le flux DSD brut lui a été \
+                 envoyé quand même, et il ne l'a pas appliqué. Passer le mode DSD de la \
+                 zone en « DoP » ou « PCM » pour lire ce fichier. \
+                 (réponse du lecteur : {erreur})"
+            );
+        }
+        format!("Output device error: {erreur}")
+    }
+
+    /// Le réglage DSD de la zone et ce que le lecteur en avait dit.
+    ///
+    /// Relu sur le chemin d'ERREUR seulement, et sans jamais resonder le
+    /// réseau : le sondage a déjà eu lieu avant l'envoi ([`Self::sonder_dsd`])
+    /// et seul un sondage CONCLUANT entre en cache. Un cache vide rend donc
+    /// `None` — « je ne sais pas », jamais « non ». C'est précisément ce qui
+    /// empêche d'imputer un échec à un réglage sur une absence de réponse.
+    async fn contexte_dsd(&self, zone_id: i64, device_id: &str) -> (String, Option<bool>) {
+        let mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
+        let annonce = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.supports_dsf || cap.supports_dff);
+        (mode, annonce)
+    }
+
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
         let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
-        match dsd_mode.as_str() {
-            "pcm" => false,
-            "native" => true,
-            _ => {
-                // Auto mode: probe renderer.
-                //
-                // Only a CONCLUSIVE probe goes into the cache. `probe_dsd_support`
-                // returns `None` when GetProtocolInfo failed or the Sink was
-                // empty, and a renderer that isn't a DLNA output (or has since
-                // left the map) is just as inconclusive. Caching those would
-                // pin the device to "no DSD" for the whole process lifetime —
-                // a single transient failure right after discovery would
-                // silently force DSD→PCM transcoding on a renderer that plays
-                // DSD natively, with no way to recover short of a restart.
-                // Same rule as `DlnaOutput::supports_mime`.
-                let mut cache = self.dsd_capabilities.lock().await;
-                if let Some(cap) = cache.get(device_id) {
-                    return cap.supports_dsf || cap.supports_dff;
-                }
-                let cap = {
-                    let arc = { self.outputs.lock().await.get(device_id) };
-                    match arc {
-                        Some(output) => {
-                            let locked = output.lock().await;
-                            match locked
-                                .as_any()
-                                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                            {
-                                Some(dlna) => dlna.probe_dsd_support().await,
-                                None => None,
-                            }
-                        }
+        // Le sondage n'a de sens que si la decision peut en dependre : `pcm` et
+        // `dop` tranchent sans lui, inutile d'aller sur le reseau.
+        let annonce = match dsd_mode.as_str() {
+            "pcm" | "dop" => None,
+            _ => self.sonder_dsd(device_id).await,
+        };
+        let passthrough = Self::decider_passthrough_dsd(&dsd_mode, annonce);
+        // La ligne qui manquait : ce qui part VRAIMENT sur le fil. Sans elle, le
+        // seul événement DSD du journal était celui du DoP, qui ne décide de
+        // rien sur une sortie réseau (#2122).
+        info!(
+            zone_id,
+            device_id,
+            dsd_mode = %dsd_mode,
+            annonce_du_renderer = ?annonce,
+            passthrough,
+            "dsd_passthrough_decide"
+        );
+        if dsd_mode == "native" && annonce == Some(false) {
+            tracing::info!(
+                zone_id,
+                device_id,
+                "dsd_natif_sans_annonce_du_renderer — le Sink n'annonce pas de \
+                 DSD, on envoie le flux brut QUAND MEME : « natif » est un \
+                 reglage explicite, et des renderers lisent le DSD sans \
+                 l'annoncer (Eversolo DMP-A8). Si la zone reste muette, passer \
+                 le mode DSD de la zone en « auto » ou « pcm »."
+            );
+        }
+        passthrough
+    }
+
+    /// Le renderer annonce-t-il savoir lire du DSD ?
+    ///
+    /// `Some(true)` / `Some(false)` sur un sondage CONCLUANT, `None` sinon —
+    /// et la distinction compte : `None` ne veut pas dire « non ».
+    ///
+    /// Extrait pour etre partage par `native` et `auto`. Les deux posaient la
+    /// meme question ; un seul la posait.
+    async fn sonder_dsd(&self, device_id: &str) -> Option<bool> {
+        // Seul un sondage CONCLUANT entre en cache. `probe_dsd_support` rend
+        // `None` quand GetProtocolInfo a echoue ou que le Sink etait vide, et un
+        // appareil qui n'est pas une sortie DLNA (ou qui a quitte la table)
+        // n'est pas plus concluant. Mettre ces cas en cache epinglerait
+        // l'appareil sur « pas de DSD » pour toute la vie du processus — un
+        // echec passager juste apres la decouverte forcerait silencieusement le
+        // transcodage PCM sur un renderer qui lit le DSD nativement, sans
+        // recours autre qu'un redemarrage. Meme regle que `DlnaOutput::supports_mime`.
+        let mut cache = self.dsd_capabilities.lock().await;
+        if let Some(cap) = cache.get(device_id) {
+            return Some(cap.supports_dsf || cap.supports_dff);
+        }
+        let cap = {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            match arc {
+                Some(output) => {
+                    let locked = output.lock().await;
+                    match locked
+                        .as_any()
+                        .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                    {
+                        Some(dlna) => dlna.probe_dsd_support().await,
                         None => None,
                     }
-                };
-                match cap {
-                    Some(cap) => {
-                        let result = cap.supports_dsf || cap.supports_dff;
-                        cache.insert(device_id.to_string(), cap);
-                        result
-                    }
-                    None => {
-                        // Inconclusive: fall back to the safe path (transcode to
-                        // PCM) for THIS track only, and re-probe next time.
-                        tracing::debug!(
-                            device_id,
-                            "dsd_probe_inconclusive_not_cached_falling_back_to_pcm"
-                        );
-                        false
-                    }
                 }
+                None => None,
             }
-        }
+        };
+        cap.map(|cap| {
+            let resultat = cap.supports_dsf || cap.supports_dff;
+            cache.insert(device_id.to_string(), cap);
+            resultat
+        })
     }
 
     async fn resolve_uploaded_file(
@@ -2006,6 +2726,7 @@ impl PlaybackOrchestrator {
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
             origin_url: None,
+            bitrate_kbps: None,
             cover_url: None,
             file_size,
         })
@@ -2028,7 +2749,14 @@ impl PlaybackOrchestrator {
                     .ok_or("upload source requires source_id (file path)")?;
                 return self.resolve_uploaded_file(path, req).await;
             }
-            if source == "podcast" || source == "radio" || source == "upnp" {
+            // `bandcamp` entre par la MÊME porte qu'un podcast ou une radio :
+            // une URL distante déjà jouable, sans service enregistré derrière.
+            // Sans cette ligne il tombait dans `resolve_streaming_url`, qui
+            // cherche un service nommé « bandcamp » dans le registre et
+            // échoue — c'est pour ça que la vue jouait dans l'onglet plutôt
+            // que dans la zone (#1768).
+            if source == "podcast" || source == "radio" || source == "upnp" || source == "bandcamp"
+            {
                 return self.resolve_direct_url(req).await;
             }
             return self.resolve_streaming_url(source, req).await;
@@ -2121,8 +2849,31 @@ impl PlaybackOrchestrator {
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
         let source = req.source.clone().unwrap_or_else(|| "podcast".into());
-        let mime_type = guess_mime_from_url(audio_url);
+        // La qualité Bandcamp est LUE DANS L'URL, jamais déduite du nom du
+        // service. L'écoute libre est du `mp3-128` ; un fichier ACHETÉ entre
+        // par la même porte en `flac`, `alac` ou `mp3-320`, et l'étiqueter
+        // « MP3 128 » serait un mensonge dans le sens le plus coûteux pour ce
+        // logiciel (#2074). `None` quand l'URL ne nomme rien : on retombe
+        // alors sur ce que Bandcamp sert sans session, sans rien affirmer de
+        // plus.
+        let bc_quality = (source == "bandcamp")
+            .then(|| bandcamp_encoding(audio_url))
+            .flatten()
+            .and_then(|enc| bandcamp_quality(&enc));
+        // Les URL de flux Bandcamp (`t4.bcbits.com/stream/<hash>/mp3-128/<id>`)
+        // n'ont pas d'extension : `guess_mime_from_url` retomberait sur son
+        // défaut, qui se trouve être le bon. On l'affirme plutôt que d'en
+        // dépendre — si ce défaut changeait, la zone recevrait un MIME faux.
+        let mime_type = if source == "bandcamp" {
+            bc_quality
+                .as_ref()
+                .map(|q| q.mime_type)
+                .unwrap_or("audio/mpeg")
+        } else {
+            guess_mime_from_url(audio_url)
+        };
         let is_radio = source == "radio";
+        let is_bandcamp = source == "bandcamp";
 
         let is_local_output = req
             .output_device_id
@@ -2132,6 +2883,35 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+        // Une zone navigateur n'a volontairement aucun `output_device_id` :
+        // l'onglet est la sortie et tire lui-même `stream_url`. On doit donc
+        // lire son type en base plutôt que déduire « aucune sortie » de
+        // l'absence de périphérique (#2076, #2158). Cette propriété vaut pour
+        // Bandcamp comme pour la radio dont l'EQ force désormais le proxy WAV.
+        let is_browser_output = req.output_device_id.is_none()
+            && ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|zone| zone.output_type)
+                .as_deref()
+                == Some("browser");
+
+        // La sortie locale applique déjà l'EQ dans son callback : le refaire
+        // ici colorerait le signal deux fois. OAAT, DLNA et navigateur
+        // consomment en revanche le WAV construit par ce décodeur ; le profil
+        // doit voyager jusqu'au moment où son format réel sera connu (#2063).
+        // Un profil neutre ne force aucun transcodage inutile.
+        let radio_eq_profile = if is_radio
+            && !is_local_output
+            && (is_oaat_output || req.output_device_id.is_some() || is_browser_output)
+        {
+            self.load_eq_profile(req.zone_id).filter(|profile| {
+                crate::audio::eq::EqProcessor::new(profile, 44_100, 2).is_enabled()
+            })
+        } else {
+            None
+        };
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = if is_radio
             && (is_local_output || is_oaat_output)
@@ -2176,13 +2956,39 @@ impl PlaybackOrchestrator {
             } else {
                 None
             };
+            // Clone kept OUTSIDE the decode task: several of its exit paths
+            // (consumer dropped, reconnect give-up) only log at debug!, so in
+            // production the producer can die invisibly. The flag lets
+            // resume() detect that state and re-play the station (#1629).
+            let session_for_done = session.clone();
+            // De quoi DIRE l'échec plutôt que de le laisser au journal.
+            let err_bus = self.event_bus.clone();
+            let err_zone = req.zone_id;
+            let err_station = title.clone();
             tokio::spawn(async move {
                 // Download + decode in a blocking thread since symphonia and
                 // reqwest::blocking are both synchronous.
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, radio_levels_tx)
+                    decode_radio_stream_to_pcm(
+                        radio_url,
+                        tx,
+                        data_ready,
+                        session,
+                        if is_local_output {
+                            None
+                        } else {
+                            radio_eq_profile.clone()
+                        },
+                        radio_levels_tx,
+                    )
                 })
                 .await;
+
+                // Whatever the exit path — clean end, error or panic — nothing
+                // will produce PCM for this session anymore.
+                session_for_done
+                    .producer_done
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
                 match result {
                     Ok(Ok(())) => {
@@ -2190,9 +2996,16 @@ impl PlaybackOrchestrator {
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "radio_local_decode_failed");
+                        emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
                     }
                     Err(e) => {
                         warn!(error = %e, "radio_local_decode_task_panic");
+                        emit_radio_playback_error(
+                            &err_bus,
+                            err_zone,
+                            &err_station,
+                            "erreur interne du décodeur",
+                        );
                     }
                 }
             });
@@ -2203,6 +3016,122 @@ impl PlaybackOrchestrator {
                 stream_url,
                 Some(session_id),
                 "audio/wav".to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
+        } else if is_bandcamp && is_oaat_output {
+            // Un endpoint OAAT ne consomme que du PCM en conteneur WAV : son
+            // chemin HTTP le dit noir sur blanc (« Compressed formats fall
+            // through to HTTP streaming where the orchestrator already decoded
+            // them to WAV »). Lui pousser le mp3-128 de Bandcamp tel quel
+            // donnerait un flux qu'il ne sait pas ouvrir — c'est-à-dire le
+            // silence, exactement ce qu'on corrige.
+            //
+            // On réutilise la MÊME session de décodage que la radio sur OAAT,
+            // qui tourne en production sur .18 : `decode_radio_stream_to_pcm`
+            // décode un flux HTTP au fil de l'eau et se termine proprement à
+            // la fin des octets — une piste finie n'est qu'un flux qui
+            // s'arrête. Aucun chemin existant n'est modifié : la branche est
+            // fermée sur `source == "bandcamp"`.
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+                ..Default::default()
+            };
+            let (session_id, tx, data_ready, session) =
+                self.streamer.create_radio_session(wav_info, 256).await;
+            info!(url = %audio_url, "bandcamp_decode_to_wav_for_oaat_output");
+            let bc_url = audio_url.to_string();
+            let bc_levels_tx = if let Some(ref bus) = self.event_bus {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                Some(spawn_paced_levels_forwarder(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    0,
+                ))
+            } else {
+                None
+            };
+            let session_for_done = session.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, None, bc_levels_tx)
+                })
+                .await;
+                session_for_done
+                    .producer_done
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                match result {
+                    Ok(Ok(())) => debug!("bandcamp_oaat_decode_stream_ended"),
+                    Ok(Err(e)) => warn!(error = %e, "bandcamp_oaat_decode_failed"),
+                    Err(e) => warn!(error = %e, "bandcamp_oaat_decode_task_panic"),
+                }
+            });
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (
+                stream_url,
+                Some(session_id),
+                "audio/wav".to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
+        } else if is_bandcamp
+            && !is_local_output
+            && (req.output_device_id.is_some() || is_browser_output)
+        {
+            // Sortie RÉSEAU (DLNA/OpenHome) ou navigateur. Bandcamp ne publie
+            // ses flux qu'en HTTPS : un renderer DLNA ne sait pas ouvrir TLS,
+            // tandis que le client web réécrit une URL tierce en chemin local
+            // et reçoit alors du text/html au lieu du MP3 (#2076, #2158).
+            //
+            // On la sert donc par une session proxy locale, en clair, comme
+            // les pistes Tidal/Qobuz (`create_proxy_session`). Les octets
+            // passent verbatim : c'est du MP3 que tout renderer sait lire, il
+            // n'y a rien à transcoder.
+            //
+            // Conteneur et MIME suivent l'encodage LU DANS L'URL, avec repli
+            // sur le `mp3` de l'écoute libre : le proxy passe les octets tels
+            // quels, donc annoncer `audio/mpeg` sur un FLAC acheté ferait
+            // exactement le mislabel dont ce chemin se protège (#2074).
+            let bc_codec = bc_quality.as_ref().map(|q| q.codec).unwrap_or("mp3");
+            let info = StreamInfo {
+                format: bc_codec.into(),
+                mime_type: mime_type.to_string(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: duration_ms.map(|d| d as u64),
+                ..Default::default()
+            };
+            let session_id = self
+                .streamer
+                .create_proxy_session(info, audio_url.to_string(), false)
+                .await;
+            let server_ip = self.server_ip();
+            let stream_url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, bc_codec);
+            info!(
+                url = %audio_url,
+                browser = is_browser_output,
+                codec = bc_codec,
+                "bandcamp_proxy_for_network_or_browser_output"
+            );
+            (
+                stream_url,
+                Some(session_id),
+                mime_type.to_string(),
                 Some(44100u32),
                 Some(16u32),
                 Some(2u32),
@@ -2236,11 +3165,33 @@ impl PlaybackOrchestrator {
             // WAV is universally supported, so proxying guarantees sound at
             // low CPU/LAN cost. Only device-less network resolves (no HEAD to
             // gamble on) keep the extension-based passthrough.
-            let needs_proxy = if req.output_device_id.is_some() {
-                true
-            } else {
-                !reliable_ext
-            };
+            // Un EQ actif interdit le passthrough, même pour un MP3 explicite :
+            // les octets compressés contourneraient entièrement le DSP. C'est
+            // notamment le cas d'une zone navigateur, qui n'a aucun device_id
+            // mais doit recevoir le WAV déjà égalisé par Tune (#2063).
+            //
+            // Une zone NAVIGATEUR n'a jamais droit au passthrough, EQ ou pas
+            // (#2670). Le client web reecrit toute URL absolue en chemin
+            // relatif — `browserPlay`, `u.pathname + u.search`, pour joindre
+            // l'hote Tune plutot que l'IP annoncee par le serveur. Lui rendre
+            // l'URL de la station fait donc demander `/tsfjazz-high.mp3` a
+            // Tune, qui repond par son repli SPA : 200 `text/html`, sa propre
+            // page. L'auditeur recoit une page web a la place du flux, et Tune
+            // n'a rien a en dire puisqu'il n'a jamais ouvert le flux lui-meme :
+            // le controle `non_audio_content_type` vit dans
+            // `decode_radio_stream_to_pcm`, que ce chemin court-circuite.
+            // C'est la MEME cause que #2076 / #2158, deja corrigee pour
+            // Bandcamp quelques branches plus haut par un proxy local.
+            //
+            // La bascule ne coute rien de nouveau : une zone navigateur recoit
+            // deja du WAV pour toute station au codec ambigu (.aac, .ogg, sans
+            // extension), soit 44 des 51 entrees de l'annuaire au 28/08/2026.
+            // Seules les rares URL en .mp3/.flac/.wav prenaient ce raccourci —
+            // TSF Jazz en fait partie, et c'est la station signalee.
+            let needs_proxy = req.output_device_id.is_some()
+                || is_browser_output
+                || !reliable_ext
+                || radio_eq_profile.is_some();
 
             if needs_proxy {
                 let wav_info = StreamInfo {
@@ -2271,6 +3222,14 @@ impl PlaybackOrchestrator {
                 } else {
                     None
                 };
+                // Même marquage que le chemin local/OAAT : resume() lit ce
+                // drapeau pour savoir que plus rien n'alimente la session et
+                // rejouer la station (#1629).
+                let session_for_done = session.clone();
+                // Même dette que le chemin local : l'échec restait au journal.
+                let err_bus = self.event_bus.clone();
+                let err_zone = req.zone_id;
+                let err_station = title.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         decode_radio_stream_to_pcm(
@@ -2278,14 +3237,29 @@ impl PlaybackOrchestrator {
                             tx,
                             data_ready,
                             session,
+                            radio_eq_profile.clone(),
                             radio_levels_tx,
                         )
                     })
                     .await;
+                    session_for_done
+                        .producer_done
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     match result {
                         Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
-                        Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
-                        Err(e) => warn!(error = %e, "radio_dlna_decode_task_panic"),
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "radio_dlna_decode_failed");
+                            emit_radio_playback_error(&err_bus, err_zone, &err_station, &e);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "radio_dlna_decode_task_panic");
+                            emit_radio_playback_error(
+                                &err_bus,
+                                err_zone,
+                                &err_station,
+                                "erreur interne du décodeur",
+                            );
+                        }
                     }
                 });
                 let server_ip = self.server_ip();
@@ -2308,6 +3282,24 @@ impl PlaybackOrchestrator {
                 };
                 (direct_url, None, mime_type.to_string(), None, None, None)
             }
+        } else if is_bandcamp {
+            // Sortie LOCALE (ou aucune sortie encore liée). `LocalOutput`
+            // télécharge et décode lui-même un flux HTTP compressé
+            // (`local_audio_non_wav_stream_detected_decoding`) : rien à
+            // interposer, et un transcodage ne ferait que dégrader deux fois.
+            //
+            // La résolution est AFFIRMÉE plutôt que laissée au défaut
+            // (44,1 kHz / 16 bits est ce que le mp3-128 de Bandcamp décode) :
+            // le chemin du signal doit annoncer « MP3 — Avec perte », et non
+            // hériter d'une valeur par défaut qu'on n'aurait pas choisie.
+            (
+                audio_url.to_string(),
+                None,
+                mime_type.to_string(),
+                Some(44100u32),
+                Some(16u32),
+                Some(2u32),
+            )
         } else {
             // Media-server / podcast direct URL. Carry the real resolution the
             // client passed from the DIDL res@ attributes (e.g. 24-bit ALAC)
@@ -2345,6 +3337,11 @@ impl PlaybackOrchestrator {
             bit_depth: out_bd,
             channels: out_ch,
             origin_url,
+            // Le débit voyage jusqu'à la zone quelle que soit la sortie prise
+            // ci-dessus — locale, WAV décodé pour OAAT, ou proxy MP3 pour un
+            // renderer réseau : les trois portent le MÊME flux source, et
+            // c'est LUI que le chemin du signal doit annoncer (#2074).
+            bitrate_kbps: bc_quality.as_ref().and_then(|q| q.bitrate_kbps),
         })
     }
 
@@ -2469,11 +3466,126 @@ impl PlaybackOrchestrator {
             .is_some_and(|id| id.starts_with("local:"));
         let local_needs_wav = is_local_output && source_format.is_some();
 
-        // DSD DoP (DSD over PCM) for local output when dsd_mode is "native"
-        if is_local_output && source_format == Some(AudioFormat::Dsd) {
-            let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id);
-            if dsd_mode == "native" || dsd_mode == "dop" {
-                let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
+        // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
+        // pour servir du DoP à un renderer réseau (#1772). Ne dépend que de
+        // `zone_output_type`, connu bien plus haut.
+        let is_network_output = matches!(
+            zone_output_type.as_deref(),
+            Some("dlna")
+                | Some("openhome")
+                | Some("chromecast")
+                | Some("bluos")
+                | Some("squeezebox")
+                | Some("slimproto")
+        );
+
+        // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
+        // trames PCM 24 bits au seizième du débit.
+        //
+        // Deux cas, et le second manquait (#1772, Marco Polo, Wiim Pro → DAC
+        // Denafrips) :
+        //
+        //  - sortie locale : « natif » comme « dop » passent par ici, la carte
+        //    son ne sachant pas recevoir de DSD autrement ;
+        //  - renderer réseau : uniquement sur choix EXPLICITE « dop ». Le
+        //    lecteur réseau qui ne sait pas lire un .dsf sait souvent lire le
+        //    DoP — c'est ce que fait MinimServer, que le testeur a comparé.
+        //
+        // Avant ce correctif, `"dop"` n'était comparé qu'ici, sous le garde
+        // `is_local_output` : sur un renderer, le réglage tombait dans le
+        // fourre-tout de `should_dsd_passthrough`, était traité comme « auto »,
+        // et le Wiim n'annonçant pas le DSF, le serveur transcodait en PCM. Le
+        // DAC recevait donc du WAV 176,4 kHz — le débit DoP du DSD64, ce qui
+        // rendait le symptôme parfaitement trompeur.
+        //
+        // Le DoP réseau est plus sûr que le local : les octets partent par HTTP
+        // sans passer par le rappel cpal, donc ni le volume ni le ReplayGain ne
+        // peuvent détruire les marqueurs (cf. le grésillement de Cyrille).
+        let dsd_mode = if source_format == Some(AudioFormat::Dsd) {
+            ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id)
+        } else {
+            String::new()
+        };
+        let dop_requested = dop_requested(is_local_output, is_network_output, &dsd_mode);
+
+        // Un mode « auto » qui ne fait rien d'automatique, et qui se taisait.
+        //
+        // `dop_requested` ne reconnaît que `"native"` et `"dop"` — et en réseau,
+        // `"dop"` seul. Le mode par DÉFAUT, `"auto"`, ne produit donc JAMAIS de
+        // DoP, nulle part. Une piste DSD y part en PCM, ce qui est un choix
+        // défendable, mais rien ne le disait : ni à l'écran, ni au journal.
+        //
+        // Conséquence vécue : un testeur dont un autre serveur lit le même
+        // fichier sur le même DAC conclut que Tune « bloque sur le DSD », et
+        // nous cherchons un défaut de lecture là où il n'y a qu'un réglage par
+        // défaut trompeur (Tades, Hifiman Serenade, #1657). Une ligne de journal
+        // aurait suffi à le voir sans lui poser la question.
+        //
+        // Tracé ici plutôt qu'en amont : c'est le seul endroit qui connaisse à
+        // la fois le format de la source, le type de sortie et le mode réglé.
+        //
+        // Le nom de l'événement disait « sera converti en PCM ». C'était faux sur
+        // une sortie réseau : ici, seul le DoP est écarté. La conversion, elle,
+        // dépend de `should_dsd_passthrough`, plus bas — et en mode « native »
+        // elle n'avait PAS lieu. Le journal annonçait donc du PCM pendant qu'une
+        // URL `.dsd` partait sur le fil, ce qui a coûté trois diagnostics faux
+        // (#2122). L'événement dit maintenant ce qu'il sait vraiment ; la
+        // décision de conversion est tracée là où elle est prise.
+        if source_format == Some(AudioFormat::Dsd) && !dop_requested {
+            info!(
+                zone_id = req.zone_id,
+                dsd_mode = %dsd_mode,
+                is_local_output,
+                is_network_output,
+                "dsd_dop_not_requested"
+            );
+        }
+
+        if source_format == Some(AudioFormat::Dsd) {
+            if dop_requested {
+                // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
+                // pas dans la base.
+                //
+                // L'en-tête WAV décrivait la ligne `tracks` pendant que la
+                // charge utile sortait de `parse_dsf`/`parse_dff` : deux
+                // sources qui n'ont aucune raison de coïncider. Un écart d'un
+                // canal désaligne chaque mot de 24 bits, le marqueur DoP ne
+                // tombe plus sur l'octet de poids fort, le DAC ne verrouille
+                // pas en DSD et joue le train DSD comme du PCM — c'est-à-dire
+                // du bruit blanc (Marco Polo, Wiim Pro, #1894). Un écart de
+                // cadence annonce un débit que le renderer n'appliquera pas.
+                //
+                // Le fichier est la seule source qui décrit ce qui part
+                // réellement sur le fil, et c'est la même que celle dont
+                // l'encodeur se sert (`decode_dsd_to_dop_streaming`). La base
+                // ne sert plus que de repli si l'en-tête est illisible.
+                let dsd_probe = {
+                    let ext = std::path::Path::new(&file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("dsf")
+                        .to_lowercase();
+                    if ext == "dff" {
+                        crate::audio::dff::parse_dff(&file_path)
+                            .ok()
+                            .map(|i| (i.sample_rate, i.channels))
+                    } else {
+                        crate::audio::dsf::parse_dsf(&file_path)
+                            .ok()
+                            .map(|i| (i.sample_rate, i.channels))
+                    }
+                };
+                if dsd_probe.is_none() {
+                    warn!(
+                        path = %file_path,
+                        "dsd_header_unreadable_falling_back_to_db_metadata"
+                    );
+                }
+                let (dsd_rate, dop_channels) = dop_wire_params(
+                    dsd_probe,
+                    track.sample_rate.map(|v| v as u32),
+                    track.channels as u32,
+                );
                 let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
                 // Réutilise le plafond déjà combiné avec le quirk catalogue.
                 let zone_max_sr = zone_max_sample_rate;
@@ -2487,7 +3599,8 @@ impl PlaybackOrchestrator {
                     }
                 }
                 if zone_max_sr.is_none_or(|max_sr| dop_rate <= max_sr) {
-                    let dop_channels = track.channels.max(2) as u16;
+                    // `dop_channels` vient de `dop_wire_params`, calculé plus
+                    // haut avec la cadence : même source, même raison.
 
                     let wav_info = StreamInfo {
                         format: "wav".into(),
@@ -2508,7 +3621,8 @@ impl PlaybackOrchestrator {
                         dsd_rate,
                         dop_rate,
                         channels = dop_channels,
-                        "dsd_dop_streaming_for_local_output"
+                        sortie = if is_local_output { "locale" } else { "réseau" },
+                        "dsd_dop_streaming"
                     );
 
                     let fp = file_path.clone();
@@ -2550,6 +3664,7 @@ impl PlaybackOrchestrator {
                         bit_depth: Some(24),
                         channels: Some(dop_channels as u32),
                         origin_url: None,
+                        bitrate_kbps: None,
                         cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
                         file_size: None,
                     });
@@ -2559,15 +3674,7 @@ impl PlaybackOrchestrator {
 
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC, WMA) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
-        let is_network_output = matches!(
-            zone_output_type.as_deref(),
-            Some("dlna")
-                | Some("openhome")
-                | Some("chromecast")
-                | Some("bluos")
-                | Some("squeezebox")
-                | Some("slimproto")
-        );
+        // (`is_network_output` est calculé plus haut, la branche DoP en a besoin.)
 
         // Browser (Web Audio) zones pull the file themselves via <audio> and can
         // only decode the mainstream web codecs (FLAC/MP3/AAC/WAV/Ogg/Opus). An
@@ -2618,9 +3725,26 @@ impl PlaybackOrchestrator {
         // longer maps the stream back to 16-bit and reads misaligned samples
         // (the #1137 silence class). Only meaningful when the source is deeper
         // than 16-bit; a 16-bit source keeps the plain LPCM path.
-        let dlna_wav24 = is_network_output
-            && bit_depth > 16
+        // `bit_depth` vient de la ligne `tracks`, et pour un ALAC elle peut y
+        // être absente : la profondeur n'est lisible que par une sonde
+        // Symphonia sur le cookie magique (`probe_m4a_props`), arrivée après
+        // coup. Une piste scannée avant — ou dont la sonde a échoué — porte
+        // alors le défaut `16`, et l'opt-in 24 bits ne s'arme JAMAIS, quel que
+        // soit le réglage : coché, vérifié, sans effet (Yves, ALAC 24/96, #1654).
+        //
+        // Sonder le fichier lève l'ambiguïté, et le coût est nul en pratique :
+        // la sonde ne tourne que si la zone a EXPLICITEMENT demandé le 24 bits
+        // (opt-in rare) et que la base annonce 16 ou moins sur un conteneur qui
+        // sait porter davantage. Un vrai ALAC 16 bits répond 16 et rien ne
+        // change.
+        let wav24_opt_in = is_network_output
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
+        let bit_depth_wire = if wav24_opt_in && bit_depth <= 16 {
+            profondeur_sondee_si_la_base_ignore(&file_path, source_format).unwrap_or(bit_depth)
+        } else {
+            bit_depth
+        };
+        let dlna_wav24 = wav24_opt_in && bit_depth_wire > 16;
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
         //
         // …SAUF sur une source FLAC dont la zone demande explicitement le FLAC
@@ -2662,6 +3786,19 @@ impl PlaybackOrchestrator {
             && !dlna_force_wav
             && !dlna_cap_16bit
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+        // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
+        // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
+        // que retarder le premier son et consommer du processeur — l'AAC étant
+        // déjà compressé avec perte, le transcodage n'apporte aucune qualité.
+        //
+        // Pas de garde `dlna_cap_16bit` ici, contrairement à l'ALAC : ce plafond
+        // vise les sources plus profondes que 16 bits, ce qu'un AAC n'est jamais.
+        // `dlna_force_wav` reste respecté — un renderer qui exige du LPCM le
+        // dit, et son exigence prime sur une préférence.
+        let aac_passthrough = source_format == Some(AudioFormat::Aac)
+            && is_network_output
+            && !dlna_force_wav
+            && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
         // DLNA renderers — notably it cannot play AIFF (which DLNA plays
@@ -2673,6 +3810,7 @@ impl PlaybackOrchestrator {
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
             && !alac_passthrough
+            && !aac_passthrough
             && source_format.as_ref().is_some_and(|f| {
                 if is_chromecast {
                     f.needs_transcode_for_chromecast()
@@ -2873,7 +4011,7 @@ impl PlaybackOrchestrator {
             } else if oaat_needs_wav {
                 // OAAT endpoints (Tune's own RPi renderers) parse the WAV fmt
                 // chunk and handle true 24-bit PCM: cap at 24-bit.
-                bit_depth.max(16).min(24)
+                cap_output_bit_depth(bit_depth)
             } else if dlna_wav24 {
                 // Zone opt-in: serve genuine 24-bit WAV to a renderer that
                 // advertises `audio/L24`. The DIDL drops the 16-bit-only
@@ -2881,8 +4019,15 @@ impl PlaybackOrchestrator {
                 // on this bit_depth), so the renderer parses the real 24-bit WAV
                 // header instead of mapping a false profile back to 16-bit and
                 // reading misaligned samples (#1137). `dlna_wav24` is already
-                // gated on `bit_depth > 16` above; cap at 24 (FLAC/WAV ceiling).
-                bit_depth.min(24)
+                // gated on `bit_depth_wire > 16` above; cap at 24 (FLAC/WAV
+                // ceiling).
+                //
+                // `bit_depth_wire`, pas `bit_depth` : sur un ALAC dont la base
+                // ignore la profondeur, c'est la sonde du fichier qui fait foi.
+                // Prendre la valeur de la base ici servirait un en-tête 16 bits
+                // pour un flux 24 — exactement le défaut que ce chemin corrige
+                // (#1654).
+                bit_depth_wire.min(24)
             } else if dlna_needs_wav {
                 // Generic DLNA renderers that need a WAV/LPCM fallback: cap at
                 // 16-bit.
@@ -2909,9 +4054,9 @@ impl PlaybackOrchestrator {
             } else if src_fmt == AudioFormat::Alac {
                 // ALAC: transcode to FLAC for DLNA (universally supported).
                 // FLAC max is 24-bit; cap at min(source_bd, 24) but at least 16.
-                bit_depth.min(24).max(16)
+                cap_output_bit_depth(bit_depth)
             } else {
-                bit_depth.max(16)
+                cap_output_bit_depth(bit_depth)
             };
             let out_mime = if oaat_needs_wav || local_needs_wav {
                 "audio/wav".to_string()
@@ -3154,6 +4299,10 @@ impl PlaybackOrchestrator {
                         budget_s = transcode_budget.as_secs(),
                         "transcode_budget_selected"
                     );
+                    // Même raison que le pré-transcode DASH plus bas : la ligne
+                    // de fin doit porter sa propre durée, pour rester lisible
+                    // seule dans un export de journal tronqué par la rotation.
+                    let file_transcode_start = std::time::Instant::now();
                     let transcode_result = tokio::time::timeout(
                         transcode_budget,
                         transcode_source_to_file(
@@ -3198,6 +4347,7 @@ impl PlaybackOrchestrator {
                                 file = %file_path,
                                 tmp = %serve_path,
                                 file_size,
+                                elapsed_ms = file_transcode_start.elapsed().as_millis() as u64,
                                 "transcode_to_temp_file_complete"
                             );
 
@@ -3696,6 +4846,7 @@ impl PlaybackOrchestrator {
             bit_depth: resolved_bd,
             channels: resolved_ch,
             origin_url: None,
+            bitrate_kbps: None,
         })
     }
 
@@ -3776,7 +4927,7 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
-        let mut svc = svc.lock().await;
+        let mut svc = svc.write().await;
 
         // Try to get the track URL; if it fails with an auth error, attempt
         // a token refresh and retry once. This handles Qobuz tokens expiring
@@ -3868,7 +5019,7 @@ impl PlaybackOrchestrator {
             let bd = if is_local_stream {
                 32
             } else {
-                stream_data.quality.bit_depth.max(16).min(24)
+                cap_output_bit_depth(stream_data.quality.bit_depth)
             };
 
             let wav_info = StreamInfo {
@@ -3939,6 +5090,13 @@ impl PlaybackOrchestrator {
             // Detect file:// URLs from DASH multi-segment downloads — the fMP4
             // is already on disk, skip the HTTP download step.
             let is_dash_local = upstream_url.starts_with("file://");
+            // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
+            // atome `moov` a la fin : une source HTTP seekable permet a
+            // Symphonia de lire cet index puis de revenir aux premiers paquets,
+            // sans attendre le telechargement complet (#1885). Les autres
+            // services gardent leur chemin eprouve dans cette premiere vague.
+            let use_http_range = service_name.eq_ignore_ascii_case("youtube")
+                && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
 
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
@@ -3962,9 +5120,38 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // For DASH file:// URLs the fMP4 is already on disk — use it
-                // directly instead of downloading via HTTP.
-                let tmp_file = if is_dash_local {
+                // Sonde Range AVANT d'envoyer un en-tete WAV. Si le CDN le
+                // refuse, aucun octet n'a encore rejoint la session et le repli
+                // historique par fichier temporaire reste parfaitement propre.
+                let ranged_source = if use_http_range {
+                    let upstream = upstream_url.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::audio::http_range::HttpRangeSource::open(&upstream)
+                    })
+                    .await
+                    {
+                        Ok(Ok(source)) => {
+                            info!("streaming_http_range_decode_selected");
+                            Some(source)
+                        }
+                        Ok(Err(e)) => {
+                            info!(error = %e, "streaming_http_range_unavailable_falling_back");
+                            None
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_http_range_probe_task_failed");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Sans source Range, conserver strictement le chemin existant :
+                // fichier DASH deja local ou telechargement complet vers un temp.
+                let tmp_file = if ranged_source.is_some() {
+                    None
+                } else if is_dash_local {
                     let file_path = upstream_url
                         .strip_prefix("file://")
                         .unwrap_or(&upstream_url)
@@ -3978,9 +5165,8 @@ impl PlaybackOrchestrator {
                         file_size,
                         "streaming_dash_file_already_on_disk"
                     );
-                    file_path
+                    Some((file_path, false))
                 } else {
-                    // Download to temp file on a blocking thread
                     let tmp_path = std::env::temp_dir()
                         .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
                         .to_string_lossy()
@@ -4013,7 +5199,7 @@ impl PlaybackOrchestrator {
                     .await;
 
                     match download_result {
-                        Ok(Ok(path)) => path,
+                        Ok(Ok(path)) => Some((path, true)),
                         Ok(Err(e)) => {
                             warn!(error = %e, "streaming_transcode_download_failed");
                             let _ = std::fs::remove_file(&tmp_path);
@@ -4027,27 +5213,42 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // Progressive decode: stream PCM chunks as they are decoded.
-                // The DLNA renderer can start fetching as soon as first chunks
-                // arrive, reducing transition latency after download completes.
-                let tmp_file_clone = tmp_file.clone();
-                let tx_clone = tx.clone();
+                let tx_for_decode = tx.clone();
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_seeked(
-                        &tmp_file_clone,
-                        Some(sr),
-                        Some(2),
-                        Some(bd),
-                        tx_clone,
-                        32768,
-                        data_ready,
-                        levels_tx,
-                        seek_s,
-                    )
-                })
-                .await;
+                let decode_result = if let Some(source) = ranged_source {
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                            source,
+                            &codec,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                } else {
+                    let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
+                            &tmp_file_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_for_decode,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            seek_s,
+                        )
+                    })
+                    .await
+                };
 
                 // Clean up the temp file — but ONLY if WE downloaded it. For a
                 // file:// DASH source, tmp_file IS the Tidal-cache-owned
@@ -4058,7 +5259,9 @@ impl PlaybackOrchestrator {
                 // ~54MB DASH — while concurrent transcodes raced on the emptied
                 // file (file_size=0 → decode failed). That was the ASIO "repeat"
                 // runaway (also on Qobuz). Leave cache-owned files alone.
-                if !is_dash_local {
+                if let Some((tmp_file, owned)) = tmp_file
+                    && owned
+                {
                     let _ = std::fs::remove_file(&tmp_file);
                 }
 
@@ -4272,6 +5475,7 @@ impl PlaybackOrchestrator {
                             bit_depth: Some(stream_data.quality.bit_depth as u32),
                             channels: Some(2),
                             origin_url: None,
+                            bitrate_kbps: None,
                         });
                     }
                 }
@@ -4441,6 +5645,7 @@ impl PlaybackOrchestrator {
                     bit_depth: Some(bd as u32),
                     channels: Some(2),
                     origin_url: None,
+                    bitrate_kbps: None,
                 });
             }
 
@@ -4458,6 +5663,19 @@ impl PlaybackOrchestrator {
             // aiguilles figées. Le chemin remux (opt-in TUNE_DASH_REMUX) ne
             // décode rien : VU légitimement muets dans ce cas.
             let dash_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
+            // Durée du pré-transcode, sur la ligne de FIN.
+            //
+            // C'est l'étape qui domine le démarrage d'une piste DASH (Tidal
+            // HI-RES) vers un renderer réseau : décodage intégral en PCM puis
+            // ré-encodage, avant que le moindre octet ne parte. Le journal
+            // disait qu'elle avait eu lieu, jamais combien elle avait coûté :
+            // il fallait soustraire deux horodatages. Or le fichier de journal
+            // est plafonné et tourne — la ligne de DÉBUT peut avoir disparu de
+            // l'export d'un testeur alors que la ligne de FIN y est encore, et
+            // la durée devenait alors impossible à établir. Même convention que
+            // `tidal_dash_multi_segment_download_complete`, qui porte déjà son
+            // `elapsed_ms` (`streaming/tidal.rs`).
+            let pre_transcode_start = std::time::Instant::now();
             let transcode_result = tokio::task::spawn_blocking(move || {
                 // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
                 // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
@@ -4538,6 +5756,7 @@ impl PlaybackOrchestrator {
                         tmp = %tmp_path,
                         file_size,
                         bit_depth = actual_bd,
+                        elapsed_ms = pre_transcode_start.elapsed().as_millis() as u64,
                         "streaming_dash_pre_transcode_complete"
                     );
 
@@ -4640,48 +5859,32 @@ impl PlaybackOrchestrator {
                 // FLAC temp file so we serve with Content-Length (chunked WAV
                 // causes noise on many renderers).
                 let sr = stream_data.quality.sample_rate;
-                let bd = stream_data.quality.bit_depth.max(16).min(24);
+                let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
 
                 info!(
                     service = service_name,
                     codec = %codec_lower,
                     sample_rate = sr,
-                    bit_depth = bd,
-                    "streaming_aac_pre_transcode_to_wav_for_dlna"
+                    "streaming_aac_transcode_to_wav_channel"
                 );
 
-                // FLAC-rejecting DLNA renderers (Revox/Denon/Marantz) get WAV.
-                let aac_did = req.output_device_id.as_deref().unwrap_or("");
-                let aac_enc_format =
-                    if aac_did.is_empty() || self.dlna_supports_mime(aac_did, "audio/flac").await {
-                        "flac"
-                    } else {
-                        "wav"
-                    };
-
+                // ── Téléchargement court, puis CANAL streaming ──
+                //
+                // L'ancien chemin transcodait la PISTE ENTIÈRE en fichier avant
+                // de jouer : télécharger + tout décoder + tout encoder = 34 s
+                // mesurées entre la décision et le play (Tidal AAC → DMP-A8,
+                // .18, 25/08). Le canal WAV — le chemin des DSD et des radios,
+                // au contrat rendu honnête en 0.9.106 — démarre dès les
+                // premiers blocs décodés. Seul le téléchargement du fichier
+                // AAC reste devant le play : quelques secondes.
                 let upstream_url = stream_data.url.clone();
                 let codec = codec_lower.clone();
                 let tmp_dl = std::env::temp_dir()
                     .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
                     .to_string_lossy()
                     .to_string();
-                let tmp_flac = std::env::temp_dir()
-                    .join(format!(
-                        "tune-aac-transcode-{}.{}",
-                        uuid::Uuid::new_v4(),
-                        aac_enc_format
-                    ))
-                    .to_string_lossy()
-                    .to_string();
-
                 let tmp_dl_clone = tmp_dl.clone();
-                let tmp_flac_clone = tmp_flac.clone();
-                // VU-mètres : ce pré-transcode a le PCM décodé en main — il
-                // alimente aussi le forwarder de niveaux (YouTube/AAC sur
-                // DLNA restait aiguilles figées).
-                let aac_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
-                let transcode_result = tokio::task::spawn_blocking(move || {
-                    // 1. Download
+                let dl = tokio::task::spawn_blocking(move || {
                     let resp = crate::http::client::blocking_builder()
                         .timeout(std::time::Duration::from_secs(120))
                         .build()
@@ -4692,116 +5895,102 @@ impl PlaybackOrchestrator {
                     }
                     let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
                     std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
-
-                    // 2. Decode to PCM
-                    let decoded = crate::audio::decode::decode_to_pcm(
-                        &tmp_dl_clone,
-                        Some(sr),
-                        Some(2),
-                        0.0,
-                        0.0,
-                    )?;
-                    let mut pcm_bytes = decoded.pcm_bytes();
-                    let mut actual_bd = decoded.bit_depth;
-
-                    // WAV/LPCM fallback is a 16-bit-only DLNA profile
-                    // (DLNA.ORG_PN=LPCM); a >16-bit source served under it plays
-                    // silence on strict renderers (#1137). Cap to 16-bit for
-                    // WAV; FLAC keeps full depth.
-                    if aac_enc_format == "wav" && actual_bd > 16 {
-                        pcm_bytes =
-                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                        actual_bd = 16;
-                    }
-
-                    if let Some(ref ltx) = aac_levels_tx {
-                        crate::audio::tap::send_windowed_pcm(
-                            ltx,
-                            &pcm_bytes,
-                            actual_bd,
-                            decoded.channels as u16,
-                            decoded.sample_rate,
-                        );
-                    }
-
-                    // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
-                    //    FLAC-rejecting renderer (Revox/Denon/Marantz).
-                    //    Encoding is pure CPU work, so run it synchronously on
-                    //    this blocking thread. Previously this drove the async
-                    //    encoder via a nested `Handle::block_on`, which could
-                    //    deadlock the runtime and hang the transcode forever
-                    //    (no complete/failed log) — the "YouTube→DLNA does
-                    //    nothing" bug on small servers.
-                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        aac_enc_format,
-                        decoded.sample_rate,
-                        actual_bd as u32,
-                        decoded.channels,
-                    );
-                    encoder.start_sync()?;
-                    encoder.write_sync(&pcm_bytes)?;
-                    let encoded_data = encoder.finish_sync()?;
-
-                    std::fs::write(&tmp_flac_clone, &encoded_data)
-                        .map_err(|e| format!("write flac: {e}"))?;
-
-                    let _ = std::fs::remove_file(&tmp_dl_clone);
-                    let file_size = encoded_data.len() as u64;
-                    Ok::<(u64, u16), String>((file_size, actual_bd))
+                    Ok::<(), String>(())
                 })
                 .await;
-
-                match transcode_result {
-                    Ok(Ok((file_size, actual_bd))) => {
-                        info!(
-                            tmp = %tmp_flac,
-                            file_size,
-                            bit_depth = actual_bd,
-                            "streaming_aac_pre_transcode_complete"
-                        );
-
-                        // Label consistently with what was actually encoded
-                        // (previously said audio/wav while emitting FLAC bytes).
-                        let aac_mime = if aac_enc_format == "flac" {
-                            "audio/flac"
-                        } else {
-                            "audio/wav"
-                        };
-                        let file_info = StreamInfo {
-                            format: aac_enc_format.into(),
-                            mime_type: aac_mime.into(),
-                            sample_rate: sr,
-                            // Encoded depth: WAV fallback is capped to 16-bit.
-                            bit_depth: actual_bd,
-                            channels: 2,
-                            file_size: Some(file_size),
-                            duration_ms: None,
-                            ..Default::default()
-                        };
-                        let session_id = self
-                            .streamer
-                            .create_file_session(file_info, tmp_flac, false)
-                            .await;
-
-                        let server_ip = self.server_ip();
-                        let url =
-                            self.streamer
-                                .get_stream_url(&session_id, &server_ip, aac_enc_format);
-                        (url, Some(session_id), aac_mime.to_string(), Some(file_size))
-                    }
+                match dl {
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_aac_pre_transcode_failed");
+                        warn!(error = %e, "streaming_aac_download_failed");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        let _ = std::fs::remove_file(&tmp_flac);
-                        return Err(format!("AAC transcode failed: {e}"));
+                        return Err(format!("AAC download failed: {e}"));
                     }
                     Err(e) => {
-                        warn!(error = %e, "streaming_aac_pre_transcode_task_panic");
+                        warn!(error = %e, "streaming_aac_download_task_panic");
                         let _ = std::fs::remove_file(&tmp_dl);
-                        let _ = std::fs::remove_file(&tmp_flac);
-                        return Err(format!("AAC transcode task panic: {e}"));
+                        return Err(format!("AAC download task panic: {e}"));
                     }
                 }
+
+                let info = StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: sr,
+                    bit_depth: bd,
+                    channels: 2,
+                    ..Default::default()
+                };
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(info, false, 256).await;
+                {
+                    let sessions = self.streamer.sessions_state();
+                    let sessions = sessions.lock().await;
+                    if let Some(session) = sessions.get(&session_id) {
+                        session
+                            .wav_header_included
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+
+                let ev_bus = self.event_bus.clone();
+                let playback = self.playback.clone();
+                let zone_id = req.zone_id;
+                let attach_levels = self.levels_attach_allowed(zone_id);
+                let fp = tmp_dl.clone();
+                tokio::spawn(async move {
+                    let err_bus = ev_bus.clone();
+                    let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                        Some(bus) => {
+                            let play_seq = playback.current_play_seq(zone_id).await;
+                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
+                        }
+                        None => {
+                            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
+                        }
+                    };
+                    let fp_clone = fp.clone();
+                    let tx_clone = tx.clone();
+                    drop(tx);
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
+                            &fp_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_clone,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                            0.0,
+                        )
+                    })
+                    .await;
+                    let _ = std::fs::remove_file(&fp);
+                    match result {
+                        Ok(Ok(_)) => {
+                            debug!("streaming_aac_channel_complete");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "streaming_aac_channel_decode_failed");
+                            if let Some(ref bus) = err_bus {
+                                bus.emit(
+                                    "zone.playback_error",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "error": format!("Impossible de décoder la piste : {e}"),
+                                    }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_aac_channel_task_panic");
+                        }
+                    }
+                });
+
+                let server_ip = self.server_ip();
+                let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                (url, Some(session_id), "audio/wav".to_string(), None)
             } else {
                 // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
                 // actually supports this MIME type before proxying directly.
@@ -5013,7 +6202,7 @@ impl PlaybackOrchestrator {
                                 let svc = registry
                                     .get(&service_name)
                                     .ok_or_else(|| format!("unknown service: {service_name}"))?;
-                                let mut svc = svc.lock().await;
+                                let mut svc = svc.write().await;
                                 // Best-effort token refresh, then re-resolve with
                                 // the same default quality the initial play used.
                                 let _ = svc.refresh_if_needed().await;
@@ -5160,6 +6349,7 @@ impl PlaybackOrchestrator {
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
             origin_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -5224,7 +6414,7 @@ impl PlaybackOrchestrator {
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
                         title = track.title;
@@ -5316,41 +6506,30 @@ impl PlaybackOrchestrator {
                         .map_err(|e| format!("write wav header: {e}"))?;
                     f.write_all(&pcm_data)
                         .map_err(|e| format!("write wav pcm: {e}"))?;
-                    Ok(())
+                    Ok::<(), String>(())
                 } else {
-                    let tmp_wav = format!("{}.wav", encode_path);
-                    {
-                        let mut f = std::fs::File::create(&tmp_wav)
-                            .map_err(|e| format!("create tmp wav: {e}"))?;
-                        let mut hdr = Vec::with_capacity(44);
-                        hdr.extend_from_slice(b"RIFF");
-                        hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
-                        hdr.extend_from_slice(b"WAVEfmt ");
-                        hdr.extend_from_slice(&16u32.to_le_bytes());
-                        hdr.extend_from_slice(&1u16.to_le_bytes());
-                        hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
-                        hdr.extend_from_slice(&encode_sr.to_le_bytes());
-                        hdr.extend_from_slice(&byte_rate.to_le_bytes());
-                        hdr.extend_from_slice(&block_align.to_le_bytes());
-                        hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
-                        hdr.extend_from_slice(b"data");
-                        hdr.extend_from_slice(&data_size.to_le_bytes());
-                        f.write_all(&hdr)
-                            .map_err(|e| format!("write wav header: {e}"))?;
-                        f.write_all(&pcm_data)
-                            .map_err(|e| format!("write wav pcm: {e}"))?;
-                    }
-                    let status = std::process::Command::new("ffmpeg")
-                        .args(["-y", "-i", &tmp_wav, "-c:a", "flac", &encode_path])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                    let _ = std::fs::remove_file(&tmp_wav);
-                    match status {
-                        Ok(s) if s.success() => Ok(()),
-                        Ok(s) => Err(format!("ffmpeg exit {s}")),
-                        Err(e) => Err(format!("ffmpeg: {e}")),
-                    }
+                    // Encodage FLAC NATIF. Le chemin precedent ecrivait un WAV
+                    // temporaire puis lancait `ffmpeg -c:a flac` — un binaire
+                    // externe retire du projet en v0.8.46, donc un echec
+                    // systematique partout ou il n'est pas installe par
+                    // ailleurs, et un fichier de cache jamais produit.
+                    //
+                    // `AudioEncoder` est deja dans l'arbre et fait le meme
+                    // travail sans processus externe ni fichier intermediaire.
+                    // On est dans un `spawn_blocking`, donc les variantes
+                    // `_sync` sont exactement ce qu'il faut (cf. leur
+                    // documentation : pas d'await, encodage pur CPU).
+                    let mut enc = crate::audio::encoder::AudioEncoder::new(
+                        "flac",
+                        encode_sr,
+                        encode_bd as u32,
+                        encode_ch as u32,
+                    );
+                    enc.start_sync()?;
+                    enc.write_sync(&pcm_data)?;
+                    let flac = enc.finish_sync()?;
+                    std::fs::write(&encode_path, &flac).map_err(|e| format!("write flac: {e}"))?;
+                    Ok(())
                 }
             })
             .await
@@ -5409,6 +6588,7 @@ impl PlaybackOrchestrator {
                 // from this path, so without it short tracks were the only ones
                 // captured through the proxy — and filed under `Stream/`.
                 origin_url: prefetched.upstream_url,
+                bitrate_kbps: None,
                 cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
@@ -5505,6 +6685,7 @@ impl PlaybackOrchestrator {
             // the decoded buffer, so an output that wants the source container
             // needs the service's own URL, not ours.
             origin_url: prefetched.upstream_url,
+            bitrate_kbps: None,
         })
     }
 
@@ -5544,8 +6725,8 @@ impl PlaybackOrchestrator {
         let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
         if let Some(position_ms) = start_position_ms {
             local_out.set_pending_start_position_ms(position_ms);
-            let producer_seeked = media.file_path.is_some();
-            local_out.set_producer_seeked(producer_seeked);
+            // Producer always pre-seeked — see the comment in send_to_output.
+            local_out.set_producer_seeked(true);
         }
         {
             let mut outputs = self.outputs.lock().await;
@@ -5654,12 +6835,17 @@ impl PlaybackOrchestrator {
                         .downcast_ref::<crate::outputs::local::LocalOutput>()
                     {
                         local_output.set_pending_start_position_ms(position_ms);
-                        // Only mark as pre-seeked when the media has a local
-                        // file_path — meaning the decoder used seek_s. For
-                        // streaming sources (TIDAL/Qobuz), the producer always
-                        // starts from 0s and needs consumer-side skip.
-                        let producer_seeked = media.file_path.is_some();
-                        local_output.set_producer_seeked(producer_seeked);
+                        // The WAV a local output receives is ALWAYS pre-seeked:
+                        // since b3a4a79f the streaming (Qobuz/Tidal) transcode
+                        // arm feeds seek_s to decode_to_pcm_streaming_seeked,
+                        // exactly like the local-file arm. Deriving this flag
+                        // from media.file_path (streaming → false → consumer
+                        // byte-skip) made the output skip the seek offset a
+                        // SECOND time on an already-seeked stream: a seek at
+                        // 4:30 discarded the entire remainder of the track —
+                        // silence, then a ~3s restart loop as the poller kept
+                        // recovering the "ended" track (Vincent, #1518).
+                        local_output.set_producer_seeked(true);
                     }
                     drop(output);
                 }
@@ -5694,6 +6880,24 @@ impl PlaybackOrchestrator {
                     // stream sample rate so the delay line matches the DAC clock.
                     let cf_sr = media.sample_rate.unwrap_or(44100);
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
+                    // Zone equalizer, applied by the output itself for a local
+                    // DAC — exactly like the crossfeed above, and for the same
+                    // reason: a local zone never goes through
+                    // `transcode_source_to_file`, the ONLY place the
+                    // `EqProcessor` was ever run. `use_file_transcode_for`
+                    // requires a network output, so a local zone always took the
+                    // streaming pipe, which touches no DSP. Result: the EQ was
+                    // applied nowhere at all on a local output — profil
+                    // enregistré, courbe affichée, zéro effet au DAC (Jean
+                    // Marie, forum #1416 : ses journaux ne montrent QUE des
+                    // sorties `local:`, sur les deux zones qu'il a essayées).
+                    //
+                    // `load_eq_processor` returns None in PURE mode, so the
+                    // bit-perfect promise is kept without a second guard.
+                    // Built at the resolved stream's rate/channel count so the
+                    // biquads match the DAC clock, mirroring the crossfeed.
+                    let eq_ch = media.channels.unwrap_or(2).clamp(1, 8) as u16;
+                    local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
                 }
                 drop(output);
             }
@@ -5707,7 +6911,21 @@ impl PlaybackOrchestrator {
                 Err(e) => {
                     drop(output);
                     warn!(device_id = %used_device_id, error = %e, "output_play_failed");
-                    (false, Some(format!("Output device error: {e}")))
+                    // Le message rendu à l'utilisateur nomme le RÉGLAGE quand
+                    // le serveur savait, avant d'envoyer, que la zone forçait
+                    // du DSD brut vers un lecteur qui annonce ne pas le lire
+                    // (#2396). Relecture sur le chemin d'erreur uniquement :
+                    // aucun coût sur une lecture qui démarre.
+                    let (dsd_mode, annonce) = self.contexte_dsd(zone_id, &used_device_id).await;
+                    (
+                        false,
+                        Some(Self::message_echec_sortie(
+                            &e,
+                            &dsd_mode,
+                            annonce,
+                            media.mime_type,
+                        )),
+                    )
                 }
             }
         } else if device_id.starts_with("local:") {
@@ -5874,7 +7092,7 @@ impl PlaybackOrchestrator {
                 let Some(svc) = registry.get(&source) else {
                     return;
                 };
-                let svc = svc.lock().await;
+                let svc = svc.read().await;
                 match svc.get_track_url(&source_id, None).await {
                     Ok(d) => d,
                     Err(_) => return,
@@ -5997,6 +7215,490 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Réappliquer l'égaliseur d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// `set_eq` n'était appelé qu'au démarrage d'une piste — « rebuilt at each
+    /// play », par construction, puisqu'un `EqProcessor` se bâtit POUR un couple
+    /// (taux, canaux). Bouger un curseur en cours de lecture persistait donc le
+    /// profil, renvoyait 200, et ne changeait rien avant la piste suivante
+    /// (#1725). Or c'est exactement le geste par lequel on règle un égaliseur :
+    /// musique en cours, à l'oreille. Trois signalements « l'égaliseur ne
+    /// fonctionne pas » (#1372, #1555, #1688) l'ont précédé.
+    ///
+    /// `LocalOutput::current_format` mémorise désormais le couple réellement vu
+    /// par `apply_local_dsp`, ce qui permet de rebâtir aux bons coefficients.
+    ///
+    /// Renvoie `true` si une sortie locale vivante a reçu le nouveau contrat,
+    /// y compris quand ce contrat retire l'égaliseur (`None`) en mode PURE ou
+    /// avec un profil désactivé. `false` est réservé à l'absence de chemin
+    /// local vivant : zone distante, sortie absente ou format encore inconnu.
+    pub async fn refresh_zone_eq(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Pas de flux en cours : la prochaine lecture rebâtira l'EQ de
+            // toute façon, et bâtir pour un format inconnu donnerait des
+            // coefficients faux.
+            let Some((taux, canaux)) = local_output.current_format() else {
+                return false;
+            };
+            let eq = self.load_eq_processor(zone_id, taux, canaux);
+            let actif = eq.is_some();
+            // `replace_eq_live` et non `set_eq` : la piste est en cours, donc
+            // l'historique des biquads doit survivre au remplacement, sinon le
+            // geste même qu'on vient de rendre possible — bouger un curseur en
+            // écoutant — claque à chaque cran.
+            local_output.replace_eq_live(eq);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                sample_rate = taux,
+                channels = canaux,
+                actif,
+                "zone_eq_refreshed_live"
+            );
+            true
+        }
+    }
+
+    /// Rejouer la piste en cours d'une zone **à sa position courante**, en
+    /// recréant le flux.
+    ///
+    /// Extrait tel quel de la branche `seek` (#1710, lot 1). Aucun changement
+    /// de comportement : le seek passe désormais par ici, et les mêmes
+    /// événements sont journalisés par l'appelant.
+    ///
+    /// Pourquoi cette manœuvre existe : une sortie locale ou OAAT consomme un
+    /// flux HTTP **séquentiel** (mpsc / chunké). On ne peut pas y chercher une
+    /// position par `Range` — sur un DSD servi en WAV chunké, une requête
+    /// `Range` brute atterrit au milieu d'un bloc DSD et joue du BRUIT BLANC
+    /// (Xavier). Il faut arrêter et rejouer depuis l'offset.
+    ///
+    /// Elle est extraite parce qu'elle ne sert pas qu'au seek : c'est la seule
+    /// voie connue pour faire prendre effet un changement d'égaliseur sur un
+    /// chemin transcodé ou navigateur, où le fichier est déjà écrit et déjà
+    /// téléchargé (#1710). `raison` sert à distinguer les appelants dans les
+    /// journaux — un redémarrage inattendu doit pouvoir être imputé.
+    ///
+    /// ⚠️ Coûteux et AUDIBLE : environ une seconde de silence. Tout appelant
+    /// déclenché par un geste répétable — un curseur qu'on fait glisser — doit
+    /// l'anti-rebondir lui-même, sinon il produit une coupure par cran.
+    ///
+    /// Rend `Err` si la zone n'a rien en lecture ou si la relecture échoue ;
+    /// la position est repositionnée dans les deux cas, pour que le poller ne
+    /// prenne pas un état `Stopped` pour une panne de lecture.
+    pub async fn replay_zone_at_position(
+        &self,
+        zone_id: i64,
+        position_ms: u64,
+        raison: &str,
+    ) -> Result<(), String> {
+        let state = self.playback.get_state(zone_id).await;
+        let Some(np) = state.now_playing.clone() else {
+            return Err("rien en lecture sur cette zone".into());
+        };
+        self.playback.seek(zone_id, position_ms as i64).await;
+
+        let output_device_id = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+
+        // Arrêter la sortie AVANT que play() n'en crée une autre : sans ça,
+        // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
+        // nouvelle session démarre — d'où un « request or response body error »
+        // intermittent. Les 300 ms lui laissent relâcher le périphérique.
+        if let Some(ref did) = output_device_id {
+            if did.starts_with("local:") || did.starts_with("oaat:") {
+                let arc = { self.outputs.lock().await.get(did.as_str()) };
+                if let Some(output) = arc {
+                    let _ = output.lock().await.stop().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+
+        let req = PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: np.track_id,
+            source: Some(np.source.clone()),
+            source_id: np.source_id.clone(),
+            title: Some(np.title.clone()),
+            artist_name: np.artist_name.clone(),
+            album_title: np.album_title.clone(),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(np.duration_ms),
+            seek_ms: Some(position_ms),
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resultat = self.play_without_history(req).await;
+        // Repositionner DANS LES DEUX CAS : à la réussite pour que la grâce du
+        // poller parte d'après la relecture, à l'échec pour qu'il ne prenne pas
+        // l'état `Stopped` pour une panne.
+        self.playback.seek(zone_id, position_ms as i64).await;
+        match resultat {
+            Ok(_) => {
+                info!(zone_id, position_ms, raison, "zone_replayed_at_position");
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Faire prendre effet un changement d'égaliseur, PAR TOUS LES CHEMINS.
+    ///
+    /// Point d'entrée unique des routes qui écrivent `zone_{id}_eq_profile`.
+    /// Il existe parce que la règle « local d'abord, redémarrage sinon » ne
+    /// doit vivre qu'à un seul endroit : c'est sa duplication implicite entre
+    /// quatre routes qui avait produit #1725.
+    ///
+    /// - **sortie locale** : [`Self::refresh_zone_eq`] remplace l'`EqProcessor`
+    ///   derrière son mutex — immédiat, inaudible, aucune coupure ;
+    /// - **tout le reste** (DLNA, navigateur) : le fichier transcodé est déjà
+    ///   écrit et téléchargé, rien à remplacer. [`Self::schedule_eq_replay`]
+    ///   programme un redémarrage anti-rebondi (#1710).
+    ///
+    /// Rend `true` quand le réglage a atteint le son **immédiatement** — donc
+    /// uniquement sur le chemin local. Un redémarrage programmé rend `false` :
+    /// il n'a pas encore eu lieu, et une demande plus récente peut encore
+    /// l'annuler. L'interface continue donc d'annoncer « prendra effet à la
+    /// piste suivante », ce qui est vrai jusqu'à ce que le redémarrage advienne
+    /// — mieux vaut cela qu'une promesse que l'anti-rebond peut retirer.
+    ///
+    /// Toute mutation annonce ensuite `zone.updated`. Le contrat de cet
+    /// événement est volontairement minimal : les clients rechargent la zone
+    /// et reconstruisent ainsi `signal_path` depuis le profil EQ qui vient
+    /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
+    pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let applique_a_chaud = self.refresh_zone_eq(zone_id).await;
+        if !applique_a_chaud {
+            // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
+            // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
+            // seule, et redémarrer un flux inexistant n'a aucun sens.
+            let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
+            if joue {
+                self.schedule_eq_replay(zone_id);
+            }
+        }
+
+        if let Some(ref bus) = self.event_bus {
+            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        applique_a_chaud
+    }
+
+    /// Délai d'anti-rebond avant de redémarrer un flux sur changement d'EQ.
+    ///
+    /// Assez long pour qu'un curseur qu'on fait glisser ne produise qu'un seul
+    /// redémarrage, assez court pour que le réglage s'entende dans la seconde.
+    const EQ_REPLAY_DEBOUNCE_MS: u64 = 500;
+    /// Plancher dur entre deux redémarrages d'une même zone.
+    ///
+    /// L'anti-rebond seul ne suffit pas : une rafale espacée de 600 ms le
+    /// franchirait à chaque fois et hacherait la lecture. Le redémarrage coûte
+    /// environ une seconde de silence — deux par cinq secondes est déjà
+    /// beaucoup.
+    const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+
+    /// Faire prendre effet un changement d'égaliseur sur un chemin **non
+    /// local**, en redémarrant le flux à la position courante (#1710, lot 2).
+    ///
+    /// Sur une sortie locale, `refresh_zone_eq` suffit : l'`EqProcessor` vit
+    /// derrière un mutex relu à chaque paquet. Ailleurs — DLNA, navigateur — le
+    /// fichier transcodé est déjà écrit, déjà en cours de téléchargement,
+    /// souvent déjà en cache. Rien à remplacer : il faut re-résoudre.
+    ///
+    /// **Anti-rebondi et planchéié**, parce que la manœuvre est audible. Sans
+    /// ça, un curseur de 31 bandes produirait 31 coupures d'une seconde — un
+    /// remède pire que le mal. Voir [`Self::replay_zone_at_position`].
+    ///
+    /// Rend immédiatement : le redémarrage est différé dans une tâche. La
+    /// valeur dit si un redémarrage a été **programmé**, pas s'il a eu lieu —
+    /// une demande plus récente peut encore l'annuler.
+    pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let generation = {
+            let mut gens = self.eq_replay_gen.lock().unwrap();
+            let g = gens.entry(zone_id).or_insert(0);
+            *g += 1;
+            *g
+        };
+        let moi = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                Self::EQ_REPLAY_DEBOUNCE_MS,
+            ))
+            .await;
+            // Une demande plus récente est arrivée pendant l'attente : c'est
+            // elle qui redémarrera, pas nous.
+            {
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
+                    return;
+                }
+            }
+            // Plancher : trop tôt après le précédent, on renonce plutôt que de
+            // hacher. Le réglage prendra effet à la piste suivante, ce que le
+            // client sait déjà dire (`applied_live: false`).
+            {
+                let derniers = moi.eq_replay_last.lock().unwrap();
+                if let Some(t) = derniers.get(&zone_id) {
+                    if t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128 {
+                        info!(zone_id, "eq_replay_skipped_floor");
+                        return;
+                    }
+                }
+            }
+            let position_ms = moi.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+            match moi
+                .replay_zone_at_position(zone_id, position_ms, "eq_change")
+                .await
+            {
+                Ok(()) => {
+                    moi.eq_replay_last
+                        .lock()
+                        .unwrap()
+                        .insert(zone_id, std::time::Instant::now());
+                    info!(zone_id, position_ms, "eq_replay_done");
+                }
+                Err(e) => warn!(zone_id, error = %e, "eq_replay_failed"),
+            }
+        });
+        true
+    }
+
+    /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// Jumeau de [`Self::refresh_zone_eq`], pour le même défaut : `set_crossfeed`
+    /// n'était appelé qu'au démarrage d'une piste (`orchestrator.rs`, chemin de
+    /// lecture), si bien qu'activer le crossfeed ou déplacer `amount` /
+    /// `delay_ms` en écoutant persistait la configuration, renvoyait un succès,
+    /// et ne changeait rien avant la piste suivante (#1786).
+    ///
+    /// Renvoie `true` si un crossfeed a été poussé vers une sortie vivante.
+    /// `false` couvre tout le reste — zone sans sortie locale, rien en lecture,
+    /// crossfeed désactivé, mode PURE (où `load_crossfeed_processor` rend `None`,
+    /// donc la promesse bit-perfect tient sans garde supplémentaire).
+    pub async fn refresh_zone_crossfeed(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Pas de flux en cours : la prochaine lecture rebâtira le crossfeed
+            // de toute façon, et le bâtir pour un taux inconnu donnerait une
+            // ligne à retard de la mauvaise longueur.
+            let Some((taux, _canaux)) = local_output.current_format() else {
+                return false;
+            };
+            let cf = self.load_crossfeed_processor(zone_id, taux);
+            let actif = cf.is_some();
+            // `replace_crossfeed_live` et non `set_crossfeed` : la piste est en
+            // cours, donc les lignes à retard doivent survivre au remplacement.
+            local_output.replace_crossfeed_live(cf);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                sample_rate = taux,
+                actif,
+                "zone_crossfeed_refreshed_live"
+            );
+            actif
+        }
+    }
+
+    /// Réappliquer TOUT ce que le mode PURE gouverne à la sortie locale qui
+    /// joue, sans attendre la piste suivante.
+    ///
+    /// Le bloc PURE du chemin de lecture — `set_pure_bypass`, ReplayGain,
+    /// crossfeed, égaliseur — n'était exécuté qu'au démarrage d'une piste, et
+    /// son commentaire l'assumait : « so a zone toggled in/out of PURE takes
+    /// effect on the **next track** ». Or basculer PURE est un geste qu'on fait
+    /// en écoutant, exactement comme bouger un curseur d'égaliseur (#1725) ou
+    /// de crossfeed (#1786). Entre le clic et la piste suivante, l'interrupteur
+    /// est vert, le badge PURE est allumé, le panneau annonce un chemin
+    /// intouché — et l'`EqProcessor` installé dans la sortie continue de
+    /// filtrer chaque échantillon (Jean Valjean, #1986 : « il me semble que
+    /// l'égaliseur est toujours actif », +8 dB de Bass Boost en PURE).
+    ///
+    /// Ici l'écart est plus grave que pour l'EQ ou le crossfeed : ces deux-là
+    /// ne promettaient qu'un réglage tardif. PURE promet, lui, que rien ne
+    /// touche le signal — et l'affichage le REPETE, puisque le chemin du signal
+    /// lit la même clé (`zones.rs`, `zone_eq_alters_signal`). Le panneau disait
+    /// donc vrai sur l'intention et faux sur le son.
+    ///
+    /// La sortie de PURE est tout aussi concernée, et c'est le point 3 du même
+    /// signalement (« je devrais revenir au réglage précédent ») : les
+    /// processeurs restent alors à `None` et l'égaliseur choisi par
+    /// l'utilisateur ne revient qu'à la piste suivante.
+    ///
+    /// Les quatre réglages sont repoussés ensemble, sous le même verrou, parce
+    /// qu'ils décrivent un seul état : en repousser trois laisserait une
+    /// combinaison que le chemin de lecture ne produit jamais.
+    ///
+    /// Rend `true` quand une sortie locale VIVANTE a reçu le nouvel état —
+    /// sans rien dire de ce qu'il contient. C'est la différence avec
+    /// [`Self::refresh_zone_eq`], qui rend `true` si un égaliseur est actif :
+    /// entrer en PURE éteint tout, donc un `false` de ce genre signifierait
+    /// « rien reçu » alors que tout vient d'être appliqué.
+    pub async fn refresh_zone_pure_dsp(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            // Le track_id est lu AVANT de prendre le verrou de la sortie : le
+            // ReplayGain en dépend, et `get_state` prend ses propres verrous.
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            // Rien en cours : la prochaine lecture appliquera l'état complet de
+            // toute façon, et bâtir des filtres pour un format inconnu donnerait
+            // des coefficients faux. Même garde que les deux jumelles.
+            let Some((taux, canaux)) = local_output.current_format() else {
+                return false;
+            };
+
+            let pure = self.zone_audiophile(zone_id);
+            local_output.set_pure_bypass(pure);
+            // Mêmes expressions que le bloc du chemin de lecture, à dessein :
+            // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
+            // celui qu'une lecture démarrée maintenant produirait.
+            let rg = match (pure, track_id) {
+                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+                _ => 1.0,
+            };
+            local_output.set_replaygain_factor(rg);
+            // `replace_*_live` et non `set_*` : la piste est en cours, donc
+            // l'historique des biquads et les lignes à retard doivent survivre
+            // au remplacement — sinon la bascule claque.
+            local_output.replace_crossfeed_live(self.load_crossfeed_processor(zone_id, taux));
+            local_output.replace_eq_live(self.load_eq_processor(zone_id, taux, canaux));
+            info!(
+                zone_id,
+                device_id = %device_id,
+                pure,
+                sample_rate = taux,
+                channels = canaux,
+                replaygain = rg,
+                "zone_pure_dsp_refreshed_live"
+            );
+            true
+        }
+    }
+
+    /// Faire prendre effet une bascule du mode PURE, PAR TOUS LES CHEMINS.
+    ///
+    /// Jumeau de [`Self::apply_eq_change`], et pour la même raison : la règle
+    /// « local d'abord, redémarrage sinon » ne doit vivre qu'à un endroit.
+    ///
+    /// - **sortie locale** : [`Self::refresh_zone_pure_dsp`] repousse l'état
+    ///   derrière les mutex de la sortie — immédiat, sans coupure ;
+    /// - **tout le reste** (DLNA, navigateur) : les traitements ont été gravés
+    ///   dans le fichier transcodé, déjà écrit et déjà téléchargé. Rien à
+    ///   remplacer ; seul un redémarrage du flux le re-rend, et c'est
+    ///   exactement ce que [`Self::schedule_eq_replay`] sait faire — même
+    ///   anti-rebond, même plancher, parce que c'est le même coût (environ une
+    ///   seconde de silence) et le même geste répétable.
+    ///
+    /// Rend `true` quand la bascule a atteint le son **immédiatement**. Un
+    /// redémarrage programmé rend `false` : il n'a pas encore eu lieu.
+    pub async fn apply_audiophile_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        if self.refresh_zone_pure_dsp(zone_id).await {
+            return true;
+        }
+        // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
+        // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
+        let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
+        if joue {
+            self.schedule_eq_replay(zone_id);
+        }
+        false
+    }
+
     fn zone_has_active_eq(&self, zone_id: i64) -> bool {
         // 44100/2 is only a probe: EqProcessor::is_enabled() depends on the
         // gains, not the rate.
@@ -6009,8 +7711,18 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
-        // PURE mode: never build an EqProcessor (no EQ, no room-correction
-        // gains) so the PCM reaches the output untouched.
+        let profile = self.load_eq_profile(zone_id)?;
+        let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
+        if eq.is_enabled() { Some(eq) } else { None }
+    }
+
+    /// Profil EQ réellement actif pour une zone, sans encore le lier à un
+    /// format PCM. Le décodeur radio ne connaît le taux et le nombre de canaux
+    /// qu'après sa sonde ; lui transmettre le profil permet de construire les
+    /// coefficients exacts à cet instant au lieu de supposer 44,1 kHz (#2063).
+    fn load_eq_profile(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
+        // PURE mode: never build an EqProcessor so the PCM reaches the output
+        // untouched.
         if self.zone_audiophile(zone_id) {
             return None;
         }
@@ -6024,8 +7736,7 @@ impl PlaybackOrchestrator {
         if !profile.enabled {
             return None;
         }
-        let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
-        if eq.is_enabled() { Some(eq) } else { None }
+        Some(profile)
     }
 
     /// True when the zone has an uploaded room-correction IR and is not in PURE
@@ -6134,6 +7845,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
+        context_type: Option<&str>,
+        context_id: Option<&str>,
     ) {
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
@@ -6155,6 +7868,13 @@ impl PlaybackOrchestrator {
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
             profile_id: session_profile_id,
+            // Ce que l'auditeur a demande. Ecrit tel qu'il l'a dit : rien
+            // n'est deduit ici de ce qui a fini par jouer. Le ticket #2441
+            // etablit que cette information n'etait ecrite NULLE PART — la
+            // section « Continuer l'ecoute » ne pouvait donc que repartir de
+            // la table `albums`.
+            context_type: context_type.map(Into::into),
+            context_id: context_id.map(Into::into),
         })
         .ok();
 
@@ -6166,6 +7886,116 @@ impl PlaybackOrchestrator {
         // every other track on an album was silently dropped (Bilou, #1113). The
         // poller now dispatches the scrobble once the track has actually been
         // listened past the threshold (see `dispatch_scrobble`).
+    }
+
+    /// L'onglet a-t-il commencé à tirer le flux de cette zone ? Si oui, et
+    /// seulement alors, l'annonce « en écoute » mise en attente au démarrage
+    /// part — une fois (#1998).
+    ///
+    /// Appelée à chaque tick par le poller pour une zone SANS périphérique de
+    /// sortie. C'est le poller qui a l'horloge ; la décision, elle, reste ici,
+    /// avec les données du démarrage — `record_history` en particulier, qu'un
+    /// observateur extérieur ne peut pas reconstituer.
+    ///
+    /// La preuve est celle dont `output_reach` se sert déjà pour dire
+    /// « browser_unattended » (`tune-server/src/routes/zones.rs`) : des octets
+    /// réellement partis sur la session de flux. Aucune détection nouvelle.
+    ///
+    /// Le délai vaut au plus un tick de poller (~1 s) après le premier octet
+    /// tiré : la règle de durée minimale de Last.fm porte sur le scrobble
+    /// définitif (50 % / 4 min, côté poller), pas sur « en écoute », et une
+    /// seconde ne coûte aucune écoute légitime.
+    ///
+    /// Rend `true` quand l'annonce vient de partir.
+    pub async fn confirmer_lecture_navigateur(&self, zone_id: i64, stream_id: &str) -> bool {
+        // Rien en attente pour CE flux → rien à faire, et surtout pas
+        // d'interrogation du streamer à chaque tick de chaque zone.
+        {
+            let Ok(en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            if en_attente.get(&zone_id).map(|a| a.stream_id.as_str()) != Some(stream_id) {
+                return false;
+            }
+        }
+
+        let tire = self
+            .streamer
+            .stream_bytes_sent(stream_id)
+            .await
+            .is_some_and(|n| n > 0);
+        if !tire {
+            return false;
+        }
+
+        // Retirer AVANT d'annoncer : le verrou « une seule fois » est le retrait
+        // lui-même. Re-vérifier le flux protège d'une lecture qui aurait
+        // remplacé l'entrée pendant l'attente ci-dessus.
+        let attente = {
+            let Ok(mut en_attente) = self.annonces_navigateur.lock() else {
+                return false;
+            };
+            match en_attente.get(&zone_id) {
+                Some(a) if a.stream_id == stream_id => en_attente.remove(&zone_id),
+                _ => None,
+            }
+        };
+        let Some(attente) = attente else {
+            return false;
+        };
+
+        info!(
+            zone_id,
+            title = %attente.title,
+            source = %attente.source,
+            stream_id = %stream_id,
+            "browser_playback_confirmed_announcing"
+        );
+
+        self.dispatch_now_playing(
+            &attente.title,
+            attente.artist.as_deref(),
+            attente.album.as_deref(),
+        );
+
+        // Même exclusion que le chemin nominal : la radio n'entre pas dans
+        // l'historique local (son titre au démarrage est un instantané figé),
+        // et une re-création de flux pour une piste déjà en cours
+        // (`play_without_history`) ne doit pas doublonner la ligne.
+        if attente.record_history && attente.source != "radio" {
+            let etat = self.playback.get_state(zone_id).await;
+            let album_id = attente.track_id.and_then(|tid| {
+                TrackRepo::with_backend(self.db.clone())
+                    .get(tid)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.album_id)
+            });
+            self.record_listen(
+                &attente.title,
+                attente.artist.as_deref(),
+                attente.album.as_deref(),
+                &attente.source,
+                attente.source_id.as_deref(),
+                album_id,
+                attente.duration_ms,
+                zone_id,
+                attente.cover_path.as_deref(),
+                etat.session_profile_id,
+                etat.session_context_type.as_deref(),
+                etat.session_context_id.as_deref(),
+            );
+        }
+
+        true
+    }
+
+    /// Oublie l'annonce en attente d'une zone navigateur : la lecture s'arrête
+    /// sans que l'onglet ait rien tiré, il n'y a donc rien à annoncer.
+    fn oublier_annonce_navigateur(&self, zone_id: i64) {
+        if let Ok(mut en_attente) = self.annonces_navigateur.lock() {
+            en_attente.remove(&zone_id);
+        }
     }
 
     /// Dispatch scrobbles to all configured services, respecting tier limits.
@@ -6387,60 +8217,171 @@ impl PlaybackOrchestrator {
         });
     }
 
-    pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) {
+    pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        if let Some(did) = device_id {
+            // Le backend confirme la commande AVANT que la copie mémoire et
+            // la base annoncent Paused.
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Pause,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output.lock().await.checked_pause().await?;
+        }
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "paused")
             .ok();
         self.playback.pause(zone_id).await;
-        if let Some(did) = device_id {
-            // Snapshot the output Arc under a short lock, then release the
-            // registry lock BEFORE the SOAP call: holding it across per-device
-            // network I/O lets one slow/offline renderer freeze all playback.
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                if let Err(e) = output.lock().await.pause().await {
-                    warn!(zone_id, error = %e, "device_pause_failed");
+        Ok(())
+    }
+
+    pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        // Position is preserved across pause (playback state isn't reset), so we
+        // know where to resume from.
+        let state = self.playback.get_state(zone_id).await;
+        let position_ms = state.position_ms.max(0) as u64;
+
+        // WEBRADIO : une reprise après une pause longue — ou après la mort du
+        // producteur de décodage — est traitée comme un RE-PLAY de la station
+        // (#1629). Un flux radio est un DIRECT : pendant la pause le pipeline
+        // continue de se périmer (la connexion icecast peut mourir par un
+        // chemin qui ne logge qu'en debug!, la sortie accumule un retard sans
+        // borne, les horodatages OAAT prennent toute la durée de la pause de
+        // retard) et la reprise « sur place » rend du silence sans la moindre
+        // erreur (.42 : pause 15:48 → reprise 16:07, aucun son, volume dans le
+        // vide). Rejouer dans CE chemin commun couvre les trois familles de
+        // sorties (locale, OAAT, réseau) — et c'est de toute façon le
+        // comportement attendu d'un direct : on reprend le direct, pas un
+        // différé de 19 minutes.
+        if let Some(np) = state.now_playing.as_ref() {
+            let has_url = np.source_id.as_deref().is_some_and(|s| !s.is_empty());
+            if np.source == "radio" && has_url {
+                let paused_long = state
+                    .paused_at
+                    .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
+                // Producteur mort même sous le seuil : plus rien n'alimente la
+                // session WAV, reprendre sur place serait silencieux aussi.
+                let producer_dead = match np.stream_id.as_deref() {
+                    Some(sid) => self.streamer.radio_producer_done(sid).await,
+                    None => false,
+                };
+                if paused_long || producer_dead {
+                    let did = device_id.map(str::to_string).or_else(|| {
+                        ZoneRepo::with_backend(self.db.clone())
+                            .get(zone_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|z| z.output_device_id)
+                    });
+                    if let Some(did) = did {
+                        info!(zone_id, paused_long, producer_dead, "radio_resume_replay");
+                        let req = PlayRequest {
+                            zone_id,
+                            output_device_id: Some(did),
+                            track_id: None,
+                            source: Some("radio".into()),
+                            source_id: np.source_id.clone(),
+                            title: Some(np.title.clone()),
+                            artist_name: np.artist_name.clone(),
+                            album_title: np.album_title.clone(),
+                            cover_url: np.cover_path.clone(),
+                            duration_ms: None,
+                            seek_ms: None,
+                            temp_file_path: None,
+                            sample_rate: None,
+                            bit_depth: None,
+                            media_format: None,
+                            track_number: None,
+                            disc_number: None,
+                        };
+                        // Même station, même écoute logique : pas de nouvelle
+                        // ligne d'historique (même règle que radio_auto_retry).
+                        match self.play_without_history(req).await {
+                            Ok(_) => return Ok(()),
+                            Err(e) => warn!(
+                                zone_id,
+                                error = %e,
+                                "radio_resume_replay_failed_falling_back"
+                            ),
+                        }
+                    }
                 }
             }
         }
-    }
 
-    pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) {
-        // Position is preserved across pause (playback state isn't reset), so we
-        // know where to resume from.
-        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
-        self.playback.resume(zone_id).await;
-
-        let Some(did) = device_id else { return };
-        let output_type = {
-            let arc = { self.outputs.lock().await.get(did) };
-            let Some(output) = arc else {
-                return;
-            };
+        let output_type = if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Resume,
+                    format!("output {did} is not registered"),
+                )
+            })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            if let Err(e) = out.resume().await {
-                warn!(zone_id, error = %e, "device_resume_failed");
-            }
-            t
+            out.checked_resume().await?;
+            Some(t)
+        } else {
+            None
         };
+
+        self.playback.resume(zone_id).await;
+        crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .save_play_state(zone_id, "playing")
+            .ok();
 
         // Legacy DLNA/OpenHome renderers (e.g. Cyrus Stream X) restart the stream
         // on Play-after-Pause instead of resuming. Seek back to the paused
         // position once the renderer has had a moment to (re)start, so playback
         // continues instead of replaying from the top. Locks are released during
         // the wait so other zones aren't blocked.
-        if (output_type == "dlna" || output_type == "openhome") && position_ms > 3000 {
+        if matches!(output_type.as_deref(), Some("dlna" | "openhome")) && position_ms > 3000 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                match output.lock().await.seek(position_ms).await {
+            let did = device_id.expect("output type only exists with a device id");
+            let output = { self.outputs.lock().await.get(did) };
+            if let Some(output) = output {
+                match output.lock().await.checked_seek(position_ms).await {
                     Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
                     Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Les appareils qu'une AUTRE zone que `zone_id` revendique comme sienne.
+    ///
+    /// Sert à borner le repli de `stop` : ces sorties-là ne lui appartiennent
+    /// pas, les arrêter revient à couper la musique de quelqu'un d'autre.
+    /// Prend une projection `(id de zone, appareil)` plutôt que des `Zone`
+    /// entières : la règle ne dépend que de ces deux champs, et une fonction
+    /// qui n'exige pas de construire une zone complète est une fonction qu'on
+    /// peut réellement tester.
+    fn sorties_revendiquees_par_les_autres_zones<'a>(
+        zones: impl IntoIterator<Item = (Option<i64>, Option<&'a str>)>,
+        zone_id: i64,
+    ) -> std::collections::HashSet<String> {
+        zones
+            .into_iter()
+            .filter(|(id, _)| *id != Some(zone_id))
+            .filter_map(|(_, appareil)| appareil.map(str::to_string))
+            .collect()
+    }
+
+    /// Quelles sorties le repli de `stop` a le droit de toucher.
+    ///
+    /// Tout ce qui est revendiqué par une autre zone est épargné, sans
+    /// exception : c'est l'invariant que ce repli avait perdu.
+    fn sorties_a_arreter_en_repli(
+        toutes: &[String],
+        revendiquees_ailleurs: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        toutes
+            .iter()
+            .filter(|did| !revendiquees_ailleurs.contains(did.as_str()))
+            .cloned()
+            .collect()
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
@@ -6453,6 +8394,10 @@ impl PlaybackOrchestrator {
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);
+        // Une zone navigateur arrêtée avant que l'onglet ait tiré quoi que ce
+        // soit n'a rien fait entendre : son annonce en attente meurt ici
+        // (#1998).
+        self.oublier_annonce_navigateur(zone_id);
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -6477,22 +8422,53 @@ impl PlaybackOrchestrator {
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback.
+            // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
+            // enregistrées — et c'est ainsi qu'un `next` sur une zone
+            // « navigateur » (son dans le navigateur, donc AUCUN appareil côté
+            // serveur, par construction : `reject_if_zone_has_no_output_device`
+            // laisse justement passer ce cas) coupait la musique de tout le
+            // monde.
+            //
+            // Mesuré sur .18 le 28/08/2026 : dix arrêts en une heure, cadence
+            // ~100 s, chacun envoyant `dlna_stop` à l'Eversolo qui jouait la
+            // zone 10 et aux deux Sonos. La zone 10 n'étant elle-même jamais
+            // passée en « stopped », rien ne reprenait avant que le poller ne
+            // déclenche `radio_auto_retry` — jusqu'à près de trois minutes de
+            // silence à chaque fois.
+            //
+            // Le repli garde son utilité — rattraper une sortie orpheline que
+            // CETTE zone aurait laissée ouverte — mais il ne doit jamais
+            // toucher une sortie qu'une AUTRE zone revendique. Même famille
+            // que #2571 : un ordre qui sort du périmètre de la zone active.
+            let toutes_les_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .list()
+                .unwrap_or_default();
+            let revendiquees_ailleurs = Self::sorties_revendiquees_par_les_autres_zones(
+                toutes_les_zones
+                    .iter()
+                    .map(|z| (z.id, z.output_device_id.as_deref())),
+                zone_id,
+            );
             // Snapshot the Arcs first and release the registry lock, so a slow
             // or offline renderer's stop() SOAP timeout can't hold the lock and
             // starve concurrent playback for ~100s (send_to_output_lock_contention).
             let arcs: Vec<_> = {
                 let outputs = self.outputs.lock().await;
-                outputs
-                    .list()
+                Self::sorties_a_arreter_en_repli(&outputs.list(), &revendiquees_ailleurs)
                     .iter()
                     .filter_map(|did| outputs.get(did))
                     .collect()
             };
+            let arretees = arcs.len();
             for output in arcs {
                 let _ = output.lock().await.stop().await;
             }
-            warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
+            warn!(
+                zone_id,
+                arretees,
+                epargnees = revendiquees_ailleurs.len(),
+                "stop_fallback_no_device_id — repli borné aux sorties qu'aucune autre zone ne revendique"
+            );
         }
         // Remove session AFTER the output has been stopped
         if let Some(ref sid) = old_stream_id {
@@ -6500,11 +8476,30 @@ impl PlaybackOrchestrator {
         }
     }
 
-    pub async fn seek(&self, zone_id: i64, mut position_ms: u64, device_id: Option<&str>) {
+    pub async fn seek(
+        &self,
+        zone_id: i64,
+        mut position_ms: u64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         let seek_start = std::time::Instant::now();
+        if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::Seek,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output
+                .lock()
+                .await
+                .capabilities()
+                .require(OutputCommand::Seek)?;
+        }
         // Clamp seek to track duration to prevent out-of-bounds seek on files
         // with incorrect metadata duration (e.g. VBR MP3 with wrong header).
         let state = self.playback.get_state(zone_id).await;
+        let original_position_ms = state.position_ms;
         if let Some(ref np) = state.now_playing {
             if np.duration_ms > 0 && position_ms > np.duration_ms as u64 {
                 info!(
@@ -6516,20 +8511,6 @@ impl PlaybackOrchestrator {
                 position_ms = (np.duration_ms as u64).saturating_sub(1000);
             }
         }
-        self.playback.seek(zone_id, position_ms as i64).await;
-        let state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = state.now_playing {
-            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
-                zone_id,
-                position_ms as i64,
-                np.track_id,
-                Some(np.source.as_str()),
-                np.source_id.as_deref(),
-            ) {
-                warn!(zone_id, error = %e, "persist_seek_position_failed");
-            }
-        }
-
         if let Some(did) = device_id {
             // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
             // the seek strategy depends on whether the stream session supports
@@ -6597,13 +8578,13 @@ impl PlaybackOrchestrator {
                         "seek_streaming_direct_on_seekable_session"
                     );
 
-                    let arc = { self.outputs.lock().await.get(did) };
-                    if let Some(output) = arc {
-                        if let Err(e) = output.lock().await.seek(position_ms).await {
-                            warn!(zone_id, error = %e, "device_seek_on_seekable_session_failed");
-                        }
-                    }
-                    self.playback.seek(zone_id, position_ms as i64).await;
+                    let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                        OutputCommandError::failed(
+                            OutputCommand::Seek,
+                            format!("output {did} disappeared during seek"),
+                        )
+                    })?;
+                    output.lock().await.checked_seek(position_ms).await?;
                     info!(
                         zone_id,
                         position_ms,
@@ -6652,6 +8633,8 @@ impl PlaybackOrchestrator {
                         sample_rate: None,
                         bit_depth: None,
                         media_format: None,
+                        track_number: None,
+                        disc_number: None,
                     };
 
                     match self.play_without_history(req).await {
@@ -6663,11 +8646,17 @@ impl PlaybackOrchestrator {
                             // Stream is now fresh — issue the seek on the output.
                             // Small delay to let the renderer start buffering.
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            let arc = { self.outputs.lock().await.get(did) };
-                            if let Some(output) = arc {
-                                if let Err(e) = output.lock().await.seek(position_ms).await {
-                                    warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
-                                }
+                            let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(OutputCommandError::failed(
+                                    OutputCommand::Seek,
+                                    format!("output {did} disappeared during seek"),
+                                ));
+                            };
+                            if let Err(error) = output.lock().await.checked_seek(position_ms).await
+                            {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(error);
                             }
                             // Re-set the seek timestamp so the poller grace period
                             // starts from after the Seek SOAP command, not from
@@ -6686,11 +8675,17 @@ impl PlaybackOrchestrator {
                             // misinterpret the Stopped state as a playback failure.
                             self.playback.seek(zone_id, position_ms as i64).await;
                             // Fall back to direct seek (best effort)
-                            let arc = { self.outputs.lock().await.get(did) };
-                            if let Some(output) = arc {
-                                if let Err(e) = output.lock().await.seek(position_ms).await {
-                                    warn!(zone_id, error = %e, "device_seek_fallback_failed");
-                                }
+                            let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(OutputCommandError::failed(
+                                    OutputCommand::Seek,
+                                    format!("output {did} disappeared during seek"),
+                                ));
+                            };
+                            if let Err(error) = output.lock().await.checked_seek(position_ms).await
+                            {
+                                self.playback.seek(zone_id, original_position_ms).await;
+                                return Err(error);
                             }
                         }
                     }
@@ -6710,81 +8705,59 @@ impl PlaybackOrchestrator {
 
                 if (is_local_output || is_oaat_output) && has_track {
                     info!(zone_id, position_ms, "seek_local_output_recreating_stream");
-                    self.playback.seek(zone_id, position_ms as i64).await;
-
-                    // Stop the current output FIRST so the old ASIO/WASAPI
-                    // thread releases the device before play() creates a new
-                    // stream. Without this, the old thread may still hold the
-                    // HTTP connection when the new session starts, causing a
-                    // "request or response body error" race condition.
-                    if let Some(ref did) = state.now_playing.as_ref().and_then(|_| {
-                        ZoneRepo::with_backend(self.db.clone())
-                            .get(zone_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|z| z.output_device_id)
-                    }) {
-                        if did.starts_with("local:") || did.starts_with("oaat:") {
-                            let arc = { self.outputs.lock().await.get(did.as_str()) };
-                            if let Some(output) = arc {
-                                let _ = output.lock().await.stop().await;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        }
-                    }
-
-                    let np = state.now_playing.as_ref().unwrap();
-                    let output_device_id = ZoneRepo::with_backend(self.db.clone())
-                        .get(zone_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|z| z.output_device_id);
-                    let req = PlayRequest {
-                        zone_id,
-                        output_device_id,
-                        track_id: np.track_id,
-                        source: Some(np.source.clone()),
-                        source_id: np.source_id.clone(),
-                        title: Some(np.title.clone()),
-                        artist_name: np.artist_name.clone(),
-                        album_title: np.album_title.clone(),
-                        cover_url: np.cover_path.clone(),
-                        duration_ms: Some(np.duration_ms),
-                        seek_ms: Some(position_ms),
-                        temp_file_path: None,
-                        sample_rate: None,
-                        bit_depth: None,
-                        media_format: None,
-                    };
-
-                    match self.play_without_history(req).await {
-                        Ok(_) => {
-                            self.playback.seek(zone_id, position_ms as i64).await;
-                            info!(
-                                zone_id,
-                                position_ms,
-                                seek_ms = seek_start.elapsed().as_millis() as u64,
-                                "seek_local_output_complete"
-                            );
-                        }
+                    match self
+                        .replay_zone_at_position(zone_id, position_ms, "seek")
+                        .await
+                    {
+                        Ok(()) => info!(
+                            zone_id,
+                            position_ms,
+                            seek_ms = seek_start.elapsed().as_millis() as u64,
+                            "seek_local_output_complete"
+                        ),
                         Err(e) => {
                             warn!(zone_id, error = %e, "seek_local_output_play_failed");
-                            self.playback.seek(zone_id, position_ms as i64).await;
+                            self.playback.seek(zone_id, original_position_ms).await;
+                            return Err(OutputCommandError::failed(OutputCommand::Seek, e));
                         }
                     }
                 } else {
-                    let arc = { self.outputs.lock().await.get(did) };
-                    if let Some(output) = arc {
-                        if let Err(e) = output.lock().await.seek(position_ms).await {
-                            warn!(zone_id, error = %e, "device_seek_failed");
-                        }
-                    }
+                    let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                        OutputCommandError::failed(
+                            OutputCommand::Seek,
+                            format!("output {did} disappeared during seek"),
+                        )
+                    })?;
+                    output.lock().await.checked_seek(position_ms).await?;
                 }
             }
         }
+
+        // La position publique et persistée ne change qu'après confirmation du
+        // backend. Les `seek()` temporaires ci-dessus servent uniquement de
+        // garde au poller pendant une recréation de flux.
+        self.playback.seek(zone_id, position_ms as i64).await;
+        let confirmed_state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = confirmed_state.now_playing {
+            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
+                zone_id,
+                position_ms as i64,
+                np.track_id,
+                Some(np.source.as_str()),
+                np.source_id.as_deref(),
+            ) {
+                warn!(zone_id, error = %e, "persist_seek_position_failed");
+            }
+        }
+        Ok(())
     }
 
-    pub async fn set_volume(&self, zone_id: i64, volume: f64, device_id: Option<&str>) {
+    pub async fn set_volume(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -6793,58 +8766,89 @@ impl PlaybackOrchestrator {
             .flatten();
         if zone.as_ref().is_some_and(|z| z.fixed_volume) {
             self.playback.set_volume(zone_id, 1.0).await;
-            return;
+            ZoneRepo::with_backend(self.db.clone())
+                .update_volume(zone_id, 100)
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+            return Ok(());
         }
 
-        self.playback.set_volume(zone_id, volume).await;
-        self.playback.mark_volume_changed(zone_id).await;
+        // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
+        // composé UNIQUEMENT dans la valeur envoyée au device. Le volume
+        // affiché/persisté reste celui de l'utilisateur, le cache de
+        // transcodage n'est pas affecté (rien n'est cuit dans le PCM), et les
+        // zones fixed_volume ne passent jamais ici (early return ci-dessus).
+        // Limite assumée : un trim positif est plafonné quand user_volume est
+        // déjà haut (clamp 0..1).
+        let device_volume = {
+            let trim_db = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+                .get(&format!("zone_{zone_id}_gain_trim_db"))
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
+        };
         if let Some(did) = device_id {
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                info!(
-                    zone_id,
-                    volume,
-                    device_id = did,
-                    "device_set_volume_sending"
-                );
-                if let Err(e) = output.lock().await.set_volume(volume).await {
-                    warn!(zone_id, error = %e, "device_set_volume_failed");
-                    // A refused volume used to stop at this log line: the DB kept
-                    // the new value, the slider stayed where the user left it,
-                    // and the sound never changed. Tell the UI, using the same
-                    // channel an unavailable output already uses.
-                    if let Some(ref bus) = self.event_bus {
-                        bus.emit(
-                            "zone.playback_error",
-                            serde_json::json!({
-                                "zone_id": zone_id,
-                                "error": e,
-                            }),
-                        );
-                    }
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::SetVolume,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            info!(
+                zone_id,
+                volume,
+                device_volume,
+                device_id = did,
+                "device_set_volume_sending"
+            );
+            if let Err(error) = output.lock().await.checked_set_volume(device_volume).await {
+                warn!(zone_id, error = %error, "device_set_volume_failed");
+                if let Some(ref bus) = self.event_bus {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "error": error.to_string(),
+                        }),
+                    );
                 }
-            } else {
-                warn!(
-                    zone_id,
-                    device_id = did,
-                    "device_set_volume_output_not_found"
-                );
+                return Err(error);
             }
         } else {
             info!(zone_id, volume, "set_volume_no_device_id");
         }
+
+        // Le backend a accepté la commande : seulement maintenant les deux
+        // copies internes et la base peuvent annoncer la nouvelle valeur.
+        self.playback.set_volume(zone_id, volume).await;
+        self.playback.mark_volume_changed(zone_id).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        Ok(())
     }
 
-    pub async fn set_mute(&self, zone_id: i64, muted: bool, device_id: Option<&str>) {
-        self.playback.set_mute(zone_id, muted).await;
+    pub async fn set_mute(
+        &self,
+        zone_id: i64,
+        muted: bool,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
         if let Some(did) = device_id {
-            let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                if let Err(e) = output.lock().await.set_mute(muted).await {
-                    warn!(zone_id, error = %e, "device_set_mute_failed");
-                }
-            }
+            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+                OutputCommandError::failed(
+                    OutputCommand::SetMute,
+                    format!("output {did} is not registered"),
+                )
+            })?;
+            output.lock().await.checked_set_mute(muted).await?;
         }
+        self.playback.set_mute(zone_id, muted).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_muted(zone_id, muted)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetMute, message))?;
+        Ok(())
     }
 
     /// Clear the prefetch buffer. Should be called when the queue changes
@@ -6876,6 +8880,38 @@ impl PlaybackOrchestrator {
         if let Err(e) = repo.set_streaming_queue(zone_id, tracks) {
             warn!(zone_id, error = %e, "persist_streaming_queue_failed");
         }
+    }
+
+    /// Cette sortie produit-elle des niveaux exploitables ?
+    ///
+    /// `false` sur le seul chemin qui n'en produit aucun : OAAT en DSD natif,
+    /// où la sortie ouvre le `.dsf` elle-même et expédie du 1 bit sans que
+    /// personne ne décode. Les VU-mètres n'y reçoivent rien — l'aiguille reste
+    /// où elle est, ce qui se lit comme une panne alors que c'est une absence
+    /// de mesure. Le client ne peut pas deviner la différence entre « pas de
+    /// niveaux » et « des niveaux qui tardent » : c'est au serveur de le dire.
+    ///
+    /// Rendre du DSD en PCM en parallèle rien que pour animer deux aiguilles
+    /// coûterait, pendant l'écoute, exactement le décodage qu'on a retiré de
+    /// ce chemin (blocage Zicmu, `dsd_streaming_send_timeout`).
+    pub async fn output_produces_levels(&self, device_id: Option<&str>) -> bool {
+        let Some(device_id) = device_id else {
+            return true;
+        };
+        #[cfg(feature = "oaat")]
+        if device_id.starts_with("oaat:") {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(arc) = arc {
+                let output = arc.lock().await;
+                if let Some(oaat) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                {
+                    return !oaat.is_native_dsd_active();
+                }
+            }
+        }
+        true
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
@@ -6916,6 +8952,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         } else {
             // Streaming track.
@@ -6990,6 +9028,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             }
         };
 
@@ -7165,7 +9205,7 @@ impl PlaybackOrchestrator {
                         };
                         let svc = svc.clone();
                         drop(registry);
-                        let svc = svc.lock().await;
+                        let svc = svc.read().await;
                         svc.get_track_url(&source_id, None).await.ok()
                     };
                     let Some(data) = resolved else {
@@ -7256,6 +9296,8 @@ impl PlaybackOrchestrator {
                 sample_rate: None,
                 bit_depth: None,
                 media_format: None,
+                track_number: None,
+                disc_number: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -7279,6 +9321,10 @@ impl PlaybackOrchestrator {
                 channels: resolved.channels,
                 file_size: resolved.file_size,
                 file_path: None,
+                source: Some("local".into()),
+                source_id: Some(track_id.to_string()),
+                track_number: entry.track_number.map(|n| n as u32),
+                disc_number: entry.disc_number.map(|n| n as u32),
             });
         }
 
@@ -7313,7 +9359,7 @@ impl PlaybackOrchestrator {
             output_device_id,
             track_id: None,
             source: Some(source),
-            source_id: Some(source_id),
+            source_id: Some(source_id.clone()),
             title: title.clone(),
             artist_name: artist.clone(),
             album_title: album.clone(),
@@ -7324,6 +9370,8 @@ impl PlaybackOrchestrator {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -7350,6 +9398,10 @@ impl PlaybackOrchestrator {
             channels: resolved.channels,
             file_size: resolved.file_size,
             file_path: None,
+            source: entry.source.clone(),
+            source_id: Some(source_id.clone()),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -7401,6 +9453,16 @@ impl PlaybackOrchestrator {
             channels: None,
             file_size: None,
             file_path,
+            source: entry
+                .source
+                .clone()
+                .or_else(|| entry.track_id.map(|_| "local".to_string())),
+            source_id: entry
+                .source_id
+                .clone()
+                .or_else(|| entry.track_id.map(|t| t.to_string())),
+            track_number: entry.track_number.map(|n| n as u32),
+            disc_number: entry.disc_number.map(|n| n as u32),
         })
     }
 
@@ -7410,6 +9472,13 @@ impl PlaybackOrchestrator {
 
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
+    }
+    /// Consigne le constat « aucun onglet ne reçoit le son de cette zone »
+    /// (voir [`crate::playback::PlaybackManager::note_browser_unattended`]).
+    pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
+        self.playback
+            .note_browser_unattended(zone_id, unattended)
+            .await;
     }
 
     /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
@@ -7430,6 +9499,96 @@ impl PlaybackOrchestrator {
                 )
                 .ok();
         }
+    }
+}
+
+/// Les encodages que Bandcamp nomme dans le CHEMIN d'une URL de flux.
+///
+/// Liste fermée et non heuristique : un segment de chemin Bandcamp est le plus
+/// souvent un hachage hexadécimal, et prendre n'importe quel segment pour un
+/// encodage inventerait une qualité.
+const BC_KNOWN_ENCODINGS: &[&str] = &[
+    "mp3-128",
+    "mp3-320",
+    "mp3-v0",
+    "flac",
+    "alac",
+    "aac-hi",
+    "aiff-lossless",
+    "vorbis",
+    "wav",
+];
+
+/// L'encodage nommé par une URL Bandcamp, en minuscules.
+///
+/// Bandcamp écrit le nom de l'encodage dans l'URL elle-même, sous deux formes :
+///
+/// * segment de chemin — `https://t4.bcbits.com/stream/<hash>/mp3-128/<id>?…` ;
+/// * paramètre de requête — `https://bandcamp.com/stream_redirect?enc=mp3-128&…`.
+///
+/// Un fichier d'album **acheté** emprunte la seconde forme avec une autre
+/// valeur (`enc=flac`, `enc=mp3-320`, `enc=alac`…). C'est toute la raison
+/// d'être de cette fonction : la règle écrite dans le plugin — « un flux à
+/// 128 kbit/s doit être annoncé comme tel partout où il apparaît »,
+/// `plugins/tune-bandcamp/src/lib.rs` — porte sur la QUALITÉ du flux, jamais
+/// sur le nom du service. Décider depuis `source == "bandcamp"` collerait
+/// « 128 kbit/s » sur un FLAC acheté (#2074).
+///
+/// Rend `None` quand l'URL ne nomme aucun encodage connu : on n'annonce alors
+/// rien plutôt que de deviner un chiffre.
+pub fn bandcamp_encoding(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let (path, query) = lower.split_once('?').unwrap_or((lower.as_str(), ""));
+    if let Some(enc) = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("enc="))
+        .filter(|v| !v.is_empty())
+    {
+        return Some(enc.to_string());
+    }
+    path.split('/')
+        .find(|seg| BC_KNOWN_ENCODINGS.contains(seg))
+        .map(|seg| seg.to_string())
+}
+
+/// Ce qu'un encodage Bandcamp vaut réellement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandcampQuality {
+    /// Codec, sous la forme d'extension que lit le chemin du signal.
+    pub codec: &'static str,
+    /// Type MIME à annoncer à la zone.
+    pub mime_type: &'static str,
+    /// Débit CONSTANT en kbit/s. `None` pour un débit variable ou un encodage
+    /// sans perte : un débit inventé serait pire que pas de débit du tout.
+    pub bitrate_kbps: Option<u32>,
+}
+
+/// Traduire un encodage Bandcamp en codec, MIME et débit annonçables.
+pub fn bandcamp_quality(enc: &str) -> Option<BandcampQuality> {
+    let q = |codec, mime_type, bitrate_kbps| {
+        Some(BandcampQuality {
+            codec,
+            mime_type,
+            bitrate_kbps,
+        })
+    };
+    match enc {
+        "flac" => q("flac", "audio/flac", None),
+        "alac" => q("alac", "audio/mp4", None),
+        "aiff-lossless" => q("aiff", "audio/aiff", None),
+        "wav" => q("wav", "audio/wav", None),
+        "vorbis" => q("ogg", "audio/ogg", None),
+        "aac-hi" => q("aac", "audio/mp4", None),
+        // Débit variable : le nom ne porte aucun chiffre, et en inventer un
+        // serait exactement le mensonge que ce correctif supprime.
+        "mp3-v0" => q("mp3", "audio/mpeg", None),
+        // `mp3-128` (écoute libre) et `mp3-320` (achat) partagent la même
+        // forme : on lit le nombre plutôt que d'énumérer, sinon un futur
+        // `mp3-256` retomberait silencieusement sans débit.
+        other => other
+            .strip_prefix("mp3-")
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|kbps| q("mp3", "audio/mpeg", Some(kbps))),
     }
 }
 
@@ -7495,11 +9654,118 @@ pub(crate) fn renderer_safe_wav_rate(source_rate: u32) -> u32 {
     }
 }
 
+/// Dire à l'auditeur pourquoi une station n'a pas joué.
+///
+/// Le décodage d'un flux radio tourne dans une tâche détachée : jusqu'ici son
+/// échec ne laissait qu'un `warn!` dans les journaux. Côté interface la lecture
+/// partait, la zone affichait la station, et il ne sortait rien — impossible de
+/// distinguer « la station est morte » de « Tune est cassé » (issue #1960).
+///
+/// `fatal: true` est indispensable et non décoratif : le client web étouffe un
+/// `zone.playback_error` reçu dans la fenêtre de grâce qui suit un ordre de
+/// lecture (elle couvre les pré-transcodages HI-RES lents, #1146), SAUF s'il
+/// est marqué fatal. Or une station morte échoue en moins d'une seconde,
+/// c'est-à-dire en plein dans cette fenêtre : sans ce drapeau le message
+/// afficherait « chargement… » puis plus rien du tout.
+fn emit_radio_playback_error(
+    bus: &Option<Arc<EventBus>>,
+    zone_id: i64,
+    station: &str,
+    error: &str,
+) {
+    let Some(bus) = bus else { return };
+    // Le flux répond, mais ce n'est pas de l'audio : on dit ce qui est arrivé
+    // en clair plutôt que de recopier une erreur de décodeur.
+    let message = if error.starts_with(RADIO_NOT_AUDIO) {
+        format!(
+            "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
+        )
+    } else {
+        format!("Impossible de lire la station « {station} » : {error}")
+    };
+    bus.emit(
+        "zone.playback_error",
+        serde_json::json!({
+            "zone_id": zone_id,
+            "error": message,
+            "fatal": true,
+        }),
+    );
+}
+
+/// Préfixe des erreurs « le flux annoncé audio n'en est pas ». Il permet à
+/// l'appelant de distinguer ce cas d'une panne réseau : une station remplacée
+/// par une page web ne guérira pas en réessayant.
+pub(crate) const RADIO_NOT_AUDIO: &str = "radio_not_audio";
+
+/// Le `Content-Type` d'un flux radio dit-il, sans ambiguïté, que ce n'est PAS
+/// de l'audio ?
+///
+/// Le cas qui motive ce contrôle (issue #1960) : BBC Radio 3 a retiré son flux,
+/// `stream.live.vc.bbcmedia.co.uk/bbc_radio_three` redirige vers
+/// `www.bbc.co.uk` et répond **200 OK** en `text/html`. Rien n'échoue — le
+/// décodeur reçoit du HTML, ne trouve pas de piste audio, et l'auditeur n'a que
+/// du silence sans le moindre message. Un 404 se voit ; un 200 en HTML, non.
+///
+/// Volontairement une LISTE NOIRE, pas une liste blanche : les serveurs
+/// Icecast/Shoutcast annoncent tout et n'importe quoi (`application/octet-stream`,
+/// `application/ogg`, `audio/aacp`, parfois rien du tout), et refuser un flux
+/// sur un type inconnu ferait taire des stations qui marchent. On ne rejette
+/// donc que ce qui ne peut en aucun cas être un flux audio.
+///
+/// Renvoie `Some(étiquette)` — le type normalisé, à afficher — quand le flux
+/// n'est pas de l'audio ; `None` dans tous les autres cas, y compris un
+/// en-tête absent ou illisible.
+pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
+    // `text/html; charset=UTF-8` → `text/html`
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.is_empty() {
+        return None;
+    }
+    const NEVER_AUDIO: [&str; 5] = [
+        "text/html",
+        "application/xhtml+xml",
+        "text/css",
+        "application/json",
+        "image/",
+    ];
+    // Une entrée terminée par `/` est un préfixe de famille (`image/`), les
+    // autres sont des types exacts.
+    NEVER_AUDIO
+        .iter()
+        .any(|bad| {
+            if bad.ends_with('/') {
+                ct.starts_with(bad)
+            } else {
+                ct == *bad
+            }
+        })
+        .then_some(ct)
+}
+
+/// Applique l'EQ au PCM radio déjà décodé, avant sa quantification en i16.
+/// `None` est une identité stricte : les chemins sans EQ conservent exactement
+/// les mêmes échantillons et ne paient aucun traitement supplémentaire.
+fn apply_radio_eq(eq: &mut Option<crate::audio::eq::EqProcessor>, interleaved: &mut [f32]) {
+    if let Some(eq) = eq.as_mut() {
+        eq.process_interleaved(interleaved);
+    }
+}
+
 fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    // Le profil voyage sans coefficients : le taux/canaux réels ne sont connus
+    // qu'après la sonde Symphonia. `None` garde le PCM historique à l'identique
+    // (notamment la sortie locale, qui applique déjà son propre EQ).
+    eq_profile: Option<crate::audio::eq::EqProfile>,
     // Pur observateur : les VU-mètres. Un flux radio est décodé live (pas de
     // fichier), donc le décodage-pour-niveaux des pistes locales ne s'applique
     // pas — on tappe ici le PCM déjà décodé. `None` = pas de bus (tests).
@@ -7537,6 +9803,10 @@ fn decode_radio_stream_to_pcm(
     // different rate/channel layout would feed PCM that doesn't match the WAV
     // header already sent to the renderer, so we bail to a fresh session instead.
     let mut expected_format: Option<(u16, u32)> = None;
+    // Construit une seule fois au format réellement détecté, puis conservé à
+    // travers les reconnexions compatibles : réinitialiser les biquads à chaque
+    // coupure amont créerait un transitoire audible (#2063).
+    let mut radio_eq: Option<crate::audio::eq::EqProcessor> = None;
 
     'reconnect: loop {
         // ---- Connect + probe + build decoder ----
@@ -7560,7 +9830,25 @@ fn decode_radio_stream_to_pcm(
             if !response.status().is_success() {
                 return Err(format!("radio HTTP error: {}", response.status()));
             }
-            info!(url = %url, "radio_local_decode_stream_connected");
+            // Le type réellement reçu, tracé à CHAQUE connexion : c'est la
+            // seule façon de savoir, la prochaine fois qu'une station meurt,
+            // ce que son serveur a répondu (issue #1960).
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            // Une station peut disparaître en répondant 200 : la BBC redirige
+            // son ancien flux vers sa page d'accueil. Sans ce contrôle, le
+            // décodeur avale du HTML, échoue plus loin sur un message obscur
+            // (« no audio track found ») et l'auditeur n'a que du silence.
+            if let Some(bad) = non_audio_content_type(&content_type) {
+                return Err(format!(
+                    "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
+                ));
+            }
+            info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
 
             let source = ReadOnlySource::new(response);
             let mss = MediaSourceStream::new(Box::new(source), Default::default());
@@ -7629,6 +9917,13 @@ fn decode_radio_stream_to_pcm(
                     // Initial connection failed — fail fast (bad URL, etc.)
                     return Err(e);
                 }
+                // Une station remplacée par une page web ne redeviendra pas un
+                // flux audio en réessayant trente fois : on remonte l'erreur
+                // tout de suite pour qu'elle soit DITE, au lieu de quinze
+                // secondes de silence suivies d'un abandon muet.
+                if e.starts_with(RADIO_NOT_AUDIO) {
+                    return Err(e);
+                }
                 reconnects += 1;
                 if reconnects > MAX_RECONNECTS {
                     warn!(url = %url, error = %e, "radio_reconnect_giving_up");
@@ -7661,17 +9956,22 @@ fn decode_radio_stream_to_pcm(
         // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
         let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
         let needs_resample = output_sample_rate != source_sample_rate;
+        if radio_eq.is_none() {
+            radio_eq = eq_profile.as_ref().and_then(|profile| {
+                let eq = crate::audio::eq::EqProcessor::new(
+                    profile,
+                    output_sample_rate,
+                    source_channels,
+                );
+                if eq.is_enabled() { Some(eq) } else { None }
+            });
+        }
 
         // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
         // that matches the PCM we actually feed (FIP is 48000 → advertised as
         // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
         // BEFORE first_chunk so the header, emitted after data_ready, is right.
-        session
-            .detected_sample_rate
-            .store(output_sample_rate, std::sync::atomic::Ordering::Relaxed);
-        session
-            .detected_channels
-            .store(source_channels, std::sync::atomic::Ordering::Relaxed);
+        session.publish_detected_output_format(output_sample_rate, source_channels);
 
         // Measure the reconnect gap: how long the session went without fresh
         // PCM. A long gap can starve the renderer's HTTP read.
@@ -7757,6 +10057,11 @@ fn decode_radio_stream_to_pcm(
                 );
             }
 
+            // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
+            // le profil de zone. Le traitement se fait en f32 avant i16, comme
+            // les autres chemins DSP, et les VU observent ainsi le signal final.
+            apply_radio_eq(&mut radio_eq, &mut interleaved);
+
             let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
             for sample in &interleaved {
                 let s16: i16 = (*sample).into_sample();
@@ -7816,28 +10121,70 @@ fn decode_radio_stream_to_pcm(
     }
 }
 
-/// On-disk path candidates for a stored (NFC-normalized) DB path, in
-/// resolution order: the stored spelling first, then its NFD (decomposed)
-/// form. The scanner stores paths NFC-normalized for consistent DB lookups,
-/// but Samba/CIFS and macOS-origin shares hold filenames in NFD, so the stored
-/// spelling can miss the real file when handed to the OS to open.
-fn local_path_candidates(stored: &str) -> Vec<String> {
-    use unicode_normalization::UnicodeNormalization as _;
-    let mut candidates = vec![stored.to_string()];
-    let nfd: String = stored.nfd().collect();
-    if nfd != stored {
-        candidates.push(nfd);
+/// Arm a one-shot diagnostic for a stream URL handed to a local output.
+///
+/// Creating a stream session is not enough to infer a fault: gapless prepares
+/// sessions well before they are meant to be consumed. The orchestrator calls
+/// this only on the main local-play path, immediately before `play_media`.
+/// Returning the task handle keeps the behaviour directly testable without
+/// scraping logs.
+async fn arm_local_stream_consumer_watch(
+    streamer: Arc<AudioStreamer>,
+    stream_id: String,
+    zone_id: i64,
+    device_id: String,
+    grace: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<bool>> {
+    use std::sync::atomic::Ordering;
+
+    let sessions = streamer.sessions_state();
+    let session = {
+        let guard = sessions.lock().await;
+        guard.get(&stream_id).cloned()
+    }?;
+
+    if session.consumer_watch_armed.swap(true, Ordering::AcqRel) {
+        return None;
     }
-    candidates
+
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+
+        let Some(bytes_sent) = streamer.stream_bytes_sent(&stream_id).await else {
+            // The normal failure/stop paths remove the session. They already
+            // carry their own diagnostic and must not trigger a stale alert.
+            return false;
+        };
+        if bytes_sent != 0 {
+            return false;
+        }
+
+        let file_path = session.file_path.lock().await.clone();
+        let proxy_url = session.proxy_url.lock().await.clone();
+        let active_consumers = session.active_consumers.load(Ordering::Relaxed);
+        let session_age_ms = session.created_at.elapsed().as_millis() as u64;
+        warn!(
+            zone_id,
+            device_id = %device_id,
+            stream_id = %stream_id,
+            grace_ms = grace.as_millis() as u64,
+            session_age_ms,
+            format = %session.info.format,
+            mime_type = %session.info.mime_type,
+            file_path = ?file_path,
+            proxy_url = ?proxy_url,
+            active_consumers,
+            "local_stream_never_consumed"
+        );
+        true
+    }))
 }
 
-/// First path spelling that actually exists on disk (see
-/// [`local_path_candidates`]), or `None` when the file is genuinely gone.
-fn resolve_existing_local_path(stored: &str) -> Option<String> {
-    local_path_candidates(stored)
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-}
+// Le repli NFC/NFD qui vivait ici en `fn` privée est parti dans
+// `crate::library::local_path` (#1865) : il était connu, documenté et
+// correct, mais enfermé — la lecture en profitait, aucune passe de fond ne
+// pouvait s'en servir. Il est importé en haut de fichier, pas réécrit : une
+// seconde normalisation, forcément divergente, serait pire que l'absence.
 
 #[cfg(test)]
 mod transcode_budget_tests {
@@ -7896,6 +10243,266 @@ mod transcode_budget_tests {
     }
 }
 
+/// La regle de decision du passthrough DSD (#2122).
+///
+/// Les douze combinaisons : quatre modes croises avec les trois reponses
+/// possibles du sondage. La sonde reseau n'est pas testee ici — c'est
+/// justement pour la sortir du chemin qu'elle a ete extraite.
+#[cfg(test)]
+mod dsd_passthrough_tests {
+    use super::PlaybackOrchestrator as O;
+
+    /// La parole de l'utilisateur prime sur le Sink — le terrain l'a exige.
+    ///
+    /// L'Eversolo DMP-A8 annonce 392 formats dans son GetProtocolInfo, aucun
+    /// DSD — et JOUE le .dsf brut. La version precedente de cette regle cedait
+    /// devant ce « non » apparent et convertissait en PCM un flux que le
+    /// renderer savait lire. Un Sink qui omet un format n'est pas un refus.
+    #[test]
+    fn la_parole_de_lutilisateur_prime_sur_le_sink() {
+        assert!(O::decider_passthrough_dsd("native", Some(false)));
+    }
+
+    /// La faute symetrique, celle qu'on ne veut PAS commettre en corrigeant :
+    /// un sondage muet n'est pas un refus. Le reglage explicite tient.
+    #[test]
+    fn native_tient_quand_le_sondage_ne_repond_pas() {
+        assert!(O::decider_passthrough_dsd("native", None));
+    }
+
+    #[test]
+    fn native_tient_quand_le_renderer_confirme() {
+        assert!(O::decider_passthrough_dsd("native", Some(true)));
+    }
+
+    /// `pcm` est un refus de l'utilisateur : aucune reponse du renderer ne le
+    /// renverse, pas meme un oui franc.
+    #[test]
+    fn pcm_refuse_quoi_que_reponde_le_renderer() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("pcm", annonce),
+                "pcm a laisse passer du DSD avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `dop` non plus n'est pas du passthrough : le renderer doit recevoir le
+    /// DSD emballe en trames PCM, donc le fichier passe par la conversion.
+    #[test]
+    fn dop_n_est_pas_du_passthrough() {
+        for annonce in [Some(true), Some(false), None] {
+            assert!(
+                !O::decider_passthrough_dsd("dop", annonce),
+                "dop a laisse passer du DSD brut avec {annonce:?}"
+            );
+        }
+    }
+
+    /// `auto` suit le renderer, et sans reponse prend le chemin sur.
+    #[test]
+    fn auto_suit_le_sondage_et_se_replie_dans_le_doute() {
+        assert!(O::decider_passthrough_dsd("auto", Some(true)));
+        assert!(!O::decider_passthrough_dsd("auto", Some(false)));
+        assert!(!O::decider_passthrough_dsd("auto", None));
+    }
+
+    /// Un mode inconnu en base (valeur ecrite par une version future, champ
+    /// vide) doit se comporter comme `auto`, pas envoyer du DSD au hasard.
+    #[test]
+    fn un_mode_inconnu_se_comporte_comme_auto() {
+        assert!(!O::decider_passthrough_dsd("", None));
+        assert!(
+            !O::decider_passthrough_dsd("Native", None),
+            "la casse compte"
+        );
+    }
+
+    // ── Le message d'échec doit nommer le RÉGLAGE (#2396) ─────────────────
+    //
+    // Le choix d'envoyer quand même n'est pas remis en cause : « natif » est un
+    // réglage explicite et des renderers lisent le DSD sans l'annoncer. C'est
+    // le message d'ÉCHEC qui était faux. Il disait « Le renderer a acquitté
+    // Play mais joue toujours une autre source » — il accusait l'appareil,
+    // alors que le serveur savait AVANT d'envoyer que le Sink annonçait
+    // `Some(false)` et que la zone était en « natif ». L'utilisateur cherchait
+    // du côté du matériel ; l'un d'eux a réinstallé son système entier.
+
+    /// Le message tel que le renderer le renvoie — celui de #2396, mot pour mot.
+    const ECHEC_DLNA: &str = "Le renderer a acquitté Play mais joue toujours une \
+         autre source (URI non appliquée après relance)";
+
+    #[test]
+    fn le_message_nomme_le_reglage_et_l_action_pas_l_appareil() {
+        let msg = O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), "application/x-dsd");
+
+        assert!(
+            msg.contains("natif"),
+            "le message doit NOMMER le réglage en cause : {msg}"
+        );
+        assert!(
+            msg.contains("DoP") && msg.contains("PCM"),
+            "le message doit nommer l'action qui corrige (DoP ou PCM) : {msg}"
+        );
+        assert!(
+            msg.contains("Output device error"),
+            "le marqueur qui pilote le 503 côté route ne doit pas disparaître : {msg}"
+        );
+    }
+
+    /// Zéro régression : hors de ce cas précis, le message ne change pas d'un
+    /// caractère. Accuser un réglage à tort serait la faute symétrique.
+    #[test]
+    fn les_autres_echecs_gardent_leur_message_mot_pour_mot() {
+        let intact = format!("Output device error: {ECHEC_DLNA}");
+
+        // Le renderer a dit OUI : l'échec ne vient pas du réglage.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", Some(true), "application/x-dsd"),
+            intact
+        );
+        // Sondage muet : une absence n'est pas une preuve, on n'accuse rien.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", None, "application/x-dsd"),
+            intact
+        );
+        // `auto` n'a forcé personne : le passthrough a suivi le renderer.
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "auto", Some(false), "application/x-dsd"),
+            intact
+        );
+        // Même zone, même appareil, un FLAC : le DSD n'y est pour rien. C'est
+        // la preuve par contraste du ticket (FLAC OK / DSF muet à 3 min).
+        assert_eq!(
+            O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), "audio/flac"),
+            intact
+        );
+    }
+
+    /// Les MIME que prend un DSD brut sur le fil : `application/x-dsd` par
+    /// défaut, ou celui que le renderer a annoncé (`audio/x-dsf`, `audio/dff`).
+    #[test]
+    fn tous_les_mime_dsd_bruts_declenchent_l_explication() {
+        for mime in ["application/x-dsd", "audio/x-dsf", "audio/dff", "audio/dsf"] {
+            let msg = O::message_echec_sortie(ECHEC_DLNA, "native", Some(false), mime);
+            assert!(
+                msg.contains("natif"),
+                "le MIME {mime} est du DSD brut et n'a pas déclenché l'explication : {msg}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolution_annoncee_tests {
+    use super::resolution_annoncee;
+    use crate::db::models::Track;
+    use crate::playback::NowPlaying;
+
+    /// Une piste de la bibliotheque dont la ligne ne porte NI frequence NI
+    /// profondeur ne doit rien annoncer.
+    ///
+    /// Le repli `.or(resolved)` de `play_inner` y substituait la resolution de
+    /// SORTIE — et pour une piste locale cette valeur est FABRIQUEE :
+    /// `resolve_local_track` fait `track.sample_rate.unwrap_or(44100)` et
+    /// `track.bit_depth.unwrap_or(16)` precisement quand la ligne se tait, puis
+    /// `cap_output_bit_depth` la ramene dans 16..24. Le client affichait donc
+    /// « 44,1 kHz / 16 bits » pour un fichier que personne n'a mesure.
+    ///
+    /// C'est la lecture aleatoire qui le rend visible : elle demarre sans
+    /// cesse une PREMIERE piste tiree au hasard, donc une ligne muette bien
+    /// plus souvent qu'un album qu'on a choisi (fil 1036, william — #2250).
+    #[test]
+    fn une_ligne_locale_muette_n_annonce_rien_plutot_qu_une_valeur_inventee() {
+        assert_eq!(
+            resolution_annoncee(None, Some(44100), true),
+            None,
+            "frequence : une piste locale sans frequence en base doit rester muette, \
+             pas heriter du 44100 fabrique par resolve_local_track"
+        );
+        assert_eq!(
+            resolution_annoncee(None, Some(16), true),
+            None,
+            "profondeur : une piste locale sans profondeur en base doit rester muette, \
+             pas heriter du 16 fabrique par resolve_local_track"
+        );
+    }
+
+    /// Quand la ligne SAIT, c'est elle qui parle — y compris (surtout) lorsque
+    /// la sortie transcode. C'est la regle deja en place, que ce correctif ne
+    /// doit pas defaire.
+    #[test]
+    fn une_ligne_locale_qui_sait_repond_par_sa_propre_valeur() {
+        assert_eq!(
+            resolution_annoncee(Some(96000), Some(44100), true),
+            Some(96000)
+        );
+        assert_eq!(resolution_annoncee(Some(24), Some(16), true), Some(24));
+    }
+
+    /// Le streaming n'a AUCUNE ligne en bibliotheque : la resolution resolue y
+    /// est celle de la source, pas d'une sortie. Le repli doit survivre —
+    /// sinon Qobuz et Tidal perdent leur affichage.
+    #[test]
+    fn le_streaming_garde_le_repli_sur_le_format_du_flux() {
+        assert_eq!(resolution_annoncee(None, Some(96000), false), Some(96000));
+        assert_eq!(resolution_annoncee(None, Some(24), false), Some(24));
+    }
+
+    /// La MEME ligne doit s'annoncer pareil qu'on l'atteigne en premiere piste
+    /// (`play_inner`) ou par avance gapless (`advance_queue_metadata`, qui
+    /// passe par `NowPlaying::from_track`).
+    ///
+    /// C'est l'asymetrie que decrivait william : la piste 1 d'une file
+    /// aleatoire affichait un chiffre, la piste 2 de la meme file n'affichait
+    /// rien — pour des lignes de base identiquement muettes.
+    #[test]
+    fn les_deux_surfaces_annoncent_la_meme_chose_pour_une_ligne_muette() {
+        let mut ligne = Track::new("16 bits, profondeur absente de la base".into());
+        ligne.id = Some(1);
+        ligne.sample_rate = None;
+        ligne.bit_depth = None;
+
+        let par_avance_gapless = NowPlaying::from_track(&ligne);
+
+        // Ce que `play_inner` annonce pour cette meme ligne, la sortie ayant
+        // fabrique 44100/16.
+        let par_premiere_piste_sr =
+            resolution_annoncee(ligne.sample_rate.map(|v| v as u32), Some(44100), true);
+        let par_premiere_piste_bd =
+            resolution_annoncee(ligne.bit_depth.map(|v| v as u32), Some(16), true);
+
+        assert_eq!(
+            par_premiere_piste_sr, par_avance_gapless.sample_rate,
+            "premiere piste et avance gapless doivent annoncer la MEME frequence"
+        );
+        assert_eq!(
+            par_premiere_piste_bd, par_avance_gapless.bit_depth,
+            "premiere piste et avance gapless doivent annoncer la MEME profondeur"
+        );
+    }
+
+    /// Garde-fou de site d'appel : `play_inner` doit passer par la regle, et
+    /// non refaire un `.or(resolved.…)` en direct. Sans cela, la regle
+    /// ci-dessus serait vraie en isolation et fausse en production.
+    #[test]
+    fn play_inner_passe_bien_par_la_regle() {
+        let src = include_str!("orchestrator.rs");
+        let np = src
+            .find("            sample_rate: resolution_annoncee(")
+            .zip(src.find("            bit_depth: resolution_annoncee("));
+        assert!(
+            np.is_some(),
+            "le NowPlaying de play_inner doit construire sample_rate ET bit_depth \
+             via resolution_annoncee(), sinon la regle ne protege rien"
+        );
+        assert!(
+            !src.contains(".and_then(|t| t.bit_depth.map(|v| v as u32))\n                .or(resolved.bit_depth)"),
+            "le repli direct .or(resolved.bit_depth) doit avoir disparu de play_inner"
+        );
+    }
+}
+
 #[cfg(test)]
 mod wav_override_tests {
     use super::wav_override_applies;
@@ -7931,8 +10538,89 @@ mod wav_override_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        non_audio_content_type,
+    };
+    use crate::event_bus::EventBus;
     use crate::outputs::mock::MockOutput;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+
+        // No warning before the grace period, then one warning for a live
+        // session whose HTTP body has never emitted a byte.
+        let (unconsumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            unconsumed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("first arm creates the watchdog");
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!task.is_finished(), "the grace period must be respected");
+        assert!(task.await.expect("watchdog task"));
+        assert!(
+            arm_local_stream_consumer_watch(
+                streamer.clone(),
+                unconsumed,
+                7,
+                "local:test".to_string(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .is_none(),
+            "the same session must never report twice"
+        );
+
+        // A body that emitted at least one byte is consumed, even if no reader
+        // happens to be active at the exact observation instant.
+        let (consumed, _tx, _ready) = streamer.create_session(info.clone(), false, 1).await;
+        {
+            let sessions = streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard[&consumed]
+                .bytes_sent
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            consumed,
+            7,
+            "local:test".to_string(),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("consumed session is armed");
+        assert!(!task.await.expect("watchdog task"));
+
+        // A session removed by a normal stop/error path during the grace
+        // period does not produce this diagnostic either.
+        let (removed, _tx, _ready) = streamer.create_session(info, false, 1).await;
+        let task = arm_local_stream_consumer_watch(
+            streamer.clone(),
+            removed.clone(),
+            7,
+            "local:test".to_string(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect("live session is armed");
+        streamer.remove_session(&removed).await;
+        assert!(!task.await.expect("watchdog task"));
+    }
 
     /// Le débit WAV servi au renderer DLNA doit être « renderer-safe » : un
     /// flux HE-AAC/aacPlus décodé à 22050 Hz (Radio Morow) est rééchantillonné
@@ -7954,6 +10642,115 @@ mod tests {
         // Hi-res radio kept as-is
         assert_eq!(renderer_safe_wav_rate(88200), 88200);
         assert_eq!(renderer_safe_wav_rate(96000), 96000);
+    }
+
+    /// Issue #1960 — le cas qui motive tout : BBC Radio 3 a retiré son flux,
+    /// l'ancienne adresse redirige vers la page d'accueil de la BBC et répond
+    /// **200 OK** en `text/html`. Rien n'échoue, le lecteur reçoit du HTML, et
+    /// l'auditeur n'a que du silence. Mesuré le 2026-08-20 :
+    /// `curl -sSL http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three`
+    /// → `200 | text/html | https://www.bbc.co.uk/`.
+    #[test]
+    fn html_served_instead_of_audio_is_detected() {
+        assert_eq!(
+            non_audio_content_type("text/html"),
+            Some("text/html".to_string())
+        );
+        // Le paramètre `charset` ne doit pas masquer le type — c'est la forme
+        // que renvoie Icecast sur ses 404 (`text/html; charset=UTF-8`).
+        assert_eq!(
+            non_audio_content_type("text/html; charset=UTF-8"),
+            Some("text/html".to_string())
+        );
+        // Casse et espaces : un en-tête HTTP n'est pas normalisé.
+        assert_eq!(
+            non_audio_content_type("  TEXT/HTML ;charset=utf-8"),
+            Some("text/html".to_string())
+        );
+        assert_eq!(
+            non_audio_content_type("application/json"),
+            Some("application/json".to_string())
+        );
+        assert_eq!(
+            non_audio_content_type("image/png"),
+            Some("image/png".to_string())
+        );
+    }
+
+    /// L'échec doit être DIT, et il doit survivre au client.
+    ///
+    /// Le client web étouffe un `zone.playback_error` reçu dans la fenêtre de
+    /// grâce qui suit un ordre de lecture, sauf s'il porte `fatal: true`
+    /// (App.svelte, `suppressedByPlayGrace`). Une station morte échoue en une
+    /// fraction de seconde, donc EN PLEIN dans cette fenêtre : sans le drapeau,
+    /// ce correctif afficherait « chargement… » et rien d'autre.
+    #[tokio::test]
+    async fn a_dead_station_is_reported_and_survives_the_grace_window() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+
+        emit_radio_playback_error(
+            &Some(bus.clone()),
+            7,
+            "BBC Radio 3",
+            &format!(
+                "{RADIO_NOT_AUDIO}: le serveur a répondu « text/html » au lieu d'un flux audio"
+            ),
+        );
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event_type, "zone.playback_error");
+        assert_eq!(ev.data["zone_id"], 7);
+        assert_eq!(
+            ev.data["fatal"], true,
+            "sans fatal:true le client étouffe le message dans sa fenêtre de grâce"
+        );
+        let msg = ev.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("BBC Radio 3"),
+            "le message doit nommer la station : {msg}"
+        );
+        assert!(
+            msg.contains("page web"),
+            "le message doit dire ce qui a été reçu à la place de l'audio : {msg}"
+        );
+    }
+
+    /// Sans bus (tests, démarrage partiel) on ne panique pas, on se tait.
+    #[test]
+    fn no_event_bus_is_not_a_panic() {
+        emit_radio_playback_error(&None, 1, "Station", "boom");
+    }
+
+    /// Le garde-fou ne doit RIEN casser : les types réellement servis par les
+    /// stations que nous livrons doivent tous passer. Relevés le 2026-08-20 sur
+    /// les 46 entrées de l'annuaire — `audio/aac` (Radio France),
+    /// `audio/mpeg` (Radio Classique, TSF Jazz, KEXP) — plus les fantaisies
+    /// classiques d'Icecast/Shoutcast, et le cas de l'en-tête absent.
+    #[test]
+    fn real_radio_content_types_pass_through() {
+        for ct in [
+            "audio/aac",
+            "audio/mpeg",
+            "audio/aacp",
+            "audio/ogg",
+            "audio/flac",
+            "audio/x-flac",
+            "application/ogg",
+            "application/octet-stream",
+            "audio/x-mpegurl",
+            "application/vnd.apple.mpegurl",
+            "video/mp2t",
+            // En-tête absent ou vide : on ne sait pas, donc on laisse passer.
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                non_audio_content_type(ct),
+                None,
+                "content-type « {ct} » refusé à tort — une station qui marche deviendrait muette"
+            );
+        }
     }
 
     /// Le rééchantillonnage 22050→44100 double bien le nombre de trames
@@ -8233,24 +11030,27 @@ mod tests {
         );
     }
 
+    /// Le repli NFC/NFD lui-même est éprouvé dans
+    /// `crate::library::local_path` (#1865). Ce qui se teste ICI, c'est que la
+    /// lecture continue de PASSER PAR LUI : la sortir du module l'a rendue
+    /// partageable, elle ne doit pas s'en trouver débranchée.
     #[test]
-    fn local_path_candidates_offers_nfd_for_accented_paths() {
-        // Pure ASCII path: only the stored spelling, no redundant candidate.
-        assert_eq!(
-            super::local_path_candidates("/music/Gramophone/01.flac"),
-            vec!["/music/Gramophone/01.flac".to_string()]
-        );
-        // NFC path with a composed "é" (U+00E9): a second, NFD candidate
-        // ("e" + combining acute U+0301) is offered so an NFD Samba/CIFS or
-        // macOS-origin share still resolves to the real file (Dominique Comet).
-        let nfc = "/music/Caf\u{00e9}/track.flac";
-        let cands = super::local_path_candidates(nfc);
-        assert_eq!(cands.len(), 2, "accented path must offer stored + NFD");
-        assert_eq!(cands[0], nfc);
-        assert_ne!(cands[1], nfc);
+    fn la_lecture_locale_passe_par_le_repli_partage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Sur le disque en NFD (graphie d'un partage SMB / d'un Mac)…
+        let nfd = tmp.path().join("Bjo\u{0308}rk - Jo\u{0301}ga.flac");
+        std::fs::write(&nfd, b"x").unwrap();
+        // …et en base en NFC, comme le scanner l'enregistre.
+        let nfc = tmp
+            .path()
+            .join("Bj\u{00f6}rk - J\u{00f3}ga.flac")
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(nfc, nfd.to_string_lossy(), "les deux graphies different");
         assert!(
-            cands[1].contains('\u{0301}'),
-            "second candidate must be NFD (combining acute accent)"
+            super::resolve_existing_local_path(&nfc).is_some(),
+            "resolve_existing_local_path doit venir de library::local_path et \
+             retrouver le fichier NFD depuis le chemin NFC de la base"
         );
     }
 
@@ -8261,6 +11061,7 @@ mod tests {
     use crate::db::zone_repo::ZoneRepo;
     use crate::http::streamer::AudioStreamer;
     use crate::outputs::registry::OutputRegistry;
+    use crate::outputs::{OutputCapabilities, OutputCommand, OutputCommandError};
     use crate::playback::{NowPlaying, PlayState, PlaybackManager};
     use crate::streaming::registry::ServiceRegistry;
 
@@ -8375,16 +11176,23 @@ mod tests {
     fn duplicate_net_play_coalesces_same_track_within_window() {
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
-        type Map = HashMap<i64, (String, Option<String>, Instant)>;
+        type Map = HashMap<i64, (String, Option<String>, Option<i64>, Instant)>;
         let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
         let t0 = Instant::now();
         let sid = Some("tidal-123".to_string());
 
         let mut map: Map = HashMap::new();
         // First play of the track → recorded, NOT a duplicate.
-        assert!(!f(&mut map, 5, "tidal", &sid, t0));
+        assert!(!f(&mut map, 5, "tidal", &sid, None, t0));
         // Same (source, source_id) a few seconds later → duplicate (coalesce).
-        assert!(f(&mut map, 5, "tidal", &sid, t0 + Duration::from_secs(4)));
+        assert!(f(
+            &mut map,
+            5,
+            "tidal",
+            &sid,
+            None,
+            t0 + Duration::from_secs(4)
+        ));
         // A DIFFERENT track (real advance) → NOT a duplicate.
         let other = Some("tidal-999".to_string());
         assert!(!f(
@@ -8392,22 +11200,93 @@ mod tests {
             5,
             "tidal",
             &other,
+            None,
             t0 + Duration::from_secs(4)
         ));
         // Different source, same id → NOT a duplicate.
-        assert!(!f(&mut map, 5, "qobuz", &sid, t0 + Duration::from_secs(4)));
+        assert!(!f(
+            &mut map,
+            5,
+            "qobuz",
+            &sid,
+            None,
+            t0 + Duration::from_secs(4)
+        ));
 
         // Same track but OUTSIDE the window (repeat-one / dup-in-queue, minutes
         // later) → NOT a duplicate.
         let mut map2: Map = HashMap::new();
-        assert!(!f(&mut map2, 7, "tidal", &sid, t0));
+        assert!(!f(&mut map2, 7, "tidal", &sid, None, t0));
         let far = t0 + super::DUPLICATE_NET_PLAY_WINDOW + Duration::from_secs(1);
-        assert!(!f(&mut map2, 7, "tidal", &sid, far));
+        assert!(!f(&mut map2, 7, "tidal", &sid, None, far));
 
         // Different zones never collide.
         let mut map3: Map = HashMap::new();
-        assert!(!f(&mut map3, 1, "tidal", &sid, t0));
-        assert!(!f(&mut map3, 2, "tidal", &sid, t0));
+        assert!(!f(&mut map3, 1, "tidal", &sid, None, t0));
+        assert!(!f(&mut map3, 2, "tidal", &sid, None, t0));
+    }
+
+    /// Deux pistes LOCALES differentes ne sont pas un doublon.
+    ///
+    /// La bibliotheque locale se joue par `track_id` : `play_from_queue` laisse
+    /// `source` et `source_id` a `None`. La cle valait donc `("local", None)`
+    /// pour toutes les pistes de la zone, et « piste suivante » sur un renderer
+    /// reseau ne poussait plus rien pendant douze secondes — le serveur
+    /// avancait, le Chromecast rejouait le meme morceau (FabienM, v0.9.102).
+    ///
+    /// Le test d'origine n'exercait que `tidal` et `qobuz`, qui portent
+    /// TOUJOURS un `source_id` : il ne pouvait pas voir ce cas.
+    #[test]
+    fn deux_pistes_locales_differentes_ne_sont_pas_un_doublon() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        type Map = HashMap<i64, (String, Option<String>, Option<i64>, Instant)>;
+        let f = PlaybackOrchestrator::record_or_detect_duplicate_net_play;
+        let t0 = Instant::now();
+        let mut map: Map = HashMap::new();
+
+        // Piste 101 : premier envoi.
+        assert!(!f(&mut map, 1, "local", &None, Some(101), t0));
+
+        // « Piste suivante » deux secondes plus tard, piste 102 : c'est une
+        // AUTRE piste, elle doit partir au renderer.
+        assert!(
+            !f(
+                &mut map,
+                1,
+                "local",
+                &None,
+                Some(102),
+                t0 + Duration::from_secs(2)
+            ),
+            "deux pistes locales differentes ne sont pas un doublon : le \
+             renderer resterait sur le morceau precedent"
+        );
+
+        // Enchainement rapide : encore une autre.
+        assert!(!f(
+            &mut map,
+            1,
+            "local",
+            &None,
+            Some(103),
+            t0 + Duration::from_secs(4)
+        ));
+
+        // La MEME piste relancee dans la fenetre reste un doublon : c'est la
+        // course que le garde-fou existe pour absorber (#1146, Philippe Vella).
+        assert!(f(
+            &mut map,
+            1,
+            "local",
+            &None,
+            Some(103),
+            t0 + Duration::from_secs(6)
+        ));
+
+        // Et hors fenetre, elle repart (repeat-one, doublon dans la file).
+        let loin = t0 + Duration::from_secs(6) + super::DUPLICATE_NET_PLAY_WINDOW;
+        assert!(!f(&mut map, 1, "local", &None, Some(103), loin));
     }
 
     #[test]
@@ -8533,6 +11412,76 @@ mod tests {
         );
     }
 
+    /// Le garde-fou que JP Robbe a demande en revue de #2220 : une sortie OAAT
+    /// REELLEMENT ENREGISTREE, drapeau DSD natif actif, doit rendre `false`.
+    ///
+    /// Mon premier test ne couvrait que les retours `true`. Une inversion de
+    /// booleen, un mauvais prefixe ou un downcast rate y seraient passes
+    /// inapercus : c'est ce test-ci qui verrouille le prefixe, le lookup, le
+    /// downcast et l'inversion ENSEMBLE.
+    #[cfg(feature = "oaat")]
+    #[tokio::test]
+    async fn une_sortie_oaat_en_dsd_natif_ne_mesure_pas() {
+        let orch = test_orchestrator();
+        let sortie = crate::outputs::oaat::OaatOutput::new(
+            "Zicmu".into(),
+            "192.168.1.99".into(),
+            9000,
+            "oaat:zicmu-test".into(),
+        );
+        // Le constructeur pose le prefixe `oaat:`, et c'est lui qui conditionne
+        // le lookup dans `output_produces_levels`.
+        let device_id = "oaat:zicmu-test".to_string();
+
+        // En PCM la sortie mesure : ce sont les niveaux du decodage de
+        // l'orchestrateur qui alimentent les VU.
+        orch.outputs.lock().await.register(Box::new(sortie));
+        assert!(
+            orch.output_produces_levels(Some(&device_id)).await,
+            "hors DSD natif, la chaine mesure"
+        );
+
+        // DSD natif : la sortie ouvre le .dsf elle-meme, plus personne ne
+        // decode, donc plus aucune fenetre de niveaux.
+        {
+            let registre = orch.outputs.lock().await;
+            let arc = registre.get(&device_id).expect("sortie enregistree");
+            let sortie = arc.lock().await;
+            let oaat = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                .expect("downcast vers OaatOutput");
+            oaat.set_native_dsd_active_for_test(true);
+        }
+        assert!(
+            !orch.output_produces_levels(Some(&device_id)).await,
+            "en DSD natif rien ne mesure : l'ecran doit pouvoir le dire"
+        );
+    }
+
+    /// Une zone sans sortie, ou une sortie qui n'est pas OAAT, mesure :
+    /// `false` est réservé au seul chemin qui ne produit rien.
+    ///
+    /// Le cas DSD natif lui-même se teste là où vit le drapeau
+    /// (`outputs::oaat::integration_test`) : il demande une sortie OAAT
+    /// enregistrée, pas un orchestrateur nu.
+    #[tokio::test]
+    async fn sans_sortie_ou_hors_oaat_on_mesure() {
+        let orch = test_orchestrator();
+        assert!(orch.output_produces_levels(None).await);
+        for did in [
+            "local:Haut-parleurs",
+            "dlna:uuid:1234",
+            "airplay:salon",
+            "oaat:zicmu", // enregistré nulle part : on ne conclut pas à l'absence
+        ] {
+            assert!(
+                orch.output_produces_levels(Some(did)).await,
+                "{did} : rien ne prouve que cette sortie ne mesure pas"
+            );
+        }
+    }
+
     fn test_orchestrator() -> PlaybackOrchestrator {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -8546,6 +11495,371 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend
+    /// `applied_live=false`, mais ce n'est pas une raison pour laisser le
+    /// client afficher l'ancien chemin du signal. `zone.updated` lui ordonne
+    /// de relire la zone, donc de reconstruire `signal_path` avec le profil qui
+    /// vient d'être écrit.
+    #[tokio::test]
+    async fn eq_change_announces_a_fresh_signal_path_without_live_output() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        let mut orch = test_orchestrator();
+        orch.event_bus = Some(bus);
+        let orch = Arc::new(orch);
+
+        assert!(
+            !orch.apply_eq_change(1_985).await,
+            "sans sortie locale vivante, le réglage ne peut pas être appliqué à chaud"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("le client ne doit pas conserver un signal_path périmé")
+            .expect("le bus doit rester ouvert");
+        assert_eq!(event.event_type, "zone.updated");
+        assert_eq!(event.data, serde_json::json!({ "zone_id": 1_985 }));
+    }
+
+    /// Zone locale gréée pour les tests de bascule PURE : une `LocalOutput`
+    /// enregistrée, un format déclaré (sinon les rafraîchisseurs renoncent), et
+    /// un profil d'égaliseur audible en base.
+    #[cfg(feature = "local-audio")]
+    async fn zone_locale_avec_eq(orch: &PlaybackOrchestrator) -> i64 {
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some("local"), Some("local:DAC"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(crate::outputs::local::LocalOutput::new(
+                "DAC".to_string(),
+            )));
+
+        let profil = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 80.0,
+                gain: 8.0,
+                q: 0.71,
+                band_type: "low_shelf".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&profil).unwrap(),
+            )
+            .unwrap();
+        zone_id
+    }
+
+    #[cfg(feature = "local-audio")]
+    async fn avec_sortie_locale<T>(
+        orch: &PlaybackOrchestrator,
+        f: impl FnOnce(&crate::outputs::local::LocalOutput) -> T,
+    ) -> T {
+        let arc = orch.outputs.lock().await.get("local:DAC").unwrap();
+        let sortie = arc.lock().await;
+        let local = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .expect("sortie locale");
+        f(local)
+    }
+
+    #[cfg(feature = "local-audio")]
+    fn regler_pure(orch: &PlaybackOrchestrator, zone_id: i64, actif: bool) {
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_audiophile"),
+                &format!(r#"{{"enabled":{actif}}}"#),
+            )
+            .unwrap();
+    }
+
+    /// #2102 : retirer l'EQ d'une sortie locale vivante est une application à
+    /// chaud réussie, pas un échec qui autorise le redémarrage audible réservé
+    /// aux sorties réseau. L'état Playing est indispensable à la
+    /// contre-épreuve : c'est lui qui faisait armer `eq_replay_gen` auparavant.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn removing_local_eq_does_not_schedule_a_stream_replay() {
+        let orch = Arc::new(test_orchestrator());
+        let zone_id = zone_locale_avec_eq(&orch).await;
+
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(orch.load_eq_processor(zone_id, 44_100, 2));
+            assert!(local.has_eq(), "le test doit commencer avec un EQ monté");
+        })
+        .await;
+        orch.playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+
+        regler_pure(&orch, zone_id, true);
+        assert!(
+            orch.apply_eq_change(zone_id).await,
+            "replace_eq_live(None) a bien servi la sortie locale immédiatement"
+        );
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                !local.has_eq(),
+                "la bascule PURE doit retirer l'EqProcessor du flux vivant"
+            );
+        })
+        .await;
+        assert!(
+            !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+            "une sortie locale déjà servie ne doit jamais armer une relecture de flux"
+        );
+    }
+
+    /// Le signalement de Jean Valjean (#1986), rejoué : Bass Boost audible,
+    /// bascule en PURE **pendant** la lecture. Avant, la clé était écrite et la
+    /// sortie n'apprenait rien — l'`EqProcessor` restait monté et `pure_bypass`
+    /// à faux, donc chaque échantillon continuait d'être filtré pendant que le
+    /// badge PURE s'allumait.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn switching_to_pure_mid_track_stops_the_eq_at_once() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+
+        // Ce que fait le chemin de lecture au démarrage d'une piste hors PURE.
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(orch.load_eq_processor(zone_id, 44_100, 2));
+            local.set_pure_bypass(false);
+            local.set_replaygain_factor(0.5);
+        })
+        .await;
+        avec_sortie_locale(&orch, |local| {
+            assert!(local.has_eq(), "l'égaliseur doit être monté au départ");
+        })
+        .await;
+
+        regler_pure(&orch, zone_id, true);
+        assert!(
+            orch.refresh_zone_pure_dsp(zone_id).await,
+            "une sortie locale vivante doit recevoir le nouvel état"
+        );
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                !local.has_eq(),
+                "PURE promet un chemin intouché : l'EqProcessor doit être retiré"
+            );
+            assert!(
+                local.pure_bypass_for_test(),
+                "le drapeau que lit apply_local_dsp doit être armé"
+            );
+            // Le ReplayGain n'est PAS couvert par ce drapeau — il multiplie les
+            // échantillons dans les callbacks de rendu. Sans sa remise à
+            // l'unité, PURE laisserait un gain en place.
+            assert_eq!(local.replaygain_units_for_test(), 1000);
+        })
+        .await;
+    }
+
+    /// Point 3 du même signalement : « je devrais revenir au réglage
+    /// précédent ». Sortir de PURE doit remonter l'égaliseur choisi par
+    /// l'utilisateur, sans attendre la piste suivante.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn leaving_pure_mid_track_brings_the_eq_back() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+        regler_pure(&orch, zone_id, true);
+
+        avec_sortie_locale(&orch, |local| {
+            local.declare_current_format_for_test(44_100, 2);
+            local.set_eq(None);
+            local.set_pure_bypass(true);
+        })
+        .await;
+
+        regler_pure(&orch, zone_id, false);
+        assert!(orch.refresh_zone_pure_dsp(zone_id).await);
+
+        avec_sortie_locale(&orch, |local| {
+            assert!(
+                local.has_eq(),
+                "hors PURE, le profil activé de la zone doit revenir tout de suite"
+            );
+            assert!(!local.pure_bypass_for_test());
+        })
+        .await;
+    }
+
+    /// Sans flux en cours, on ne rafraîchit rien : bâtir des biquads pour un
+    /// format inconnu donnerait des coefficients faux, et la prochaine lecture
+    /// appliquera l'état complet de toute façon. Le `false` rendu est ce qui
+    /// distingue « rien reçu » de « reçu, et vide ».
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn nothing_playing_means_nothing_to_refresh() {
+        let orch = test_orchestrator();
+        let zone_id = zone_locale_avec_eq(&orch).await;
+        regler_pure(&orch, zone_id, true);
+        // `declare_current_format_for_test` volontairement non appelé.
+        assert!(!orch.refresh_zone_pure_dsp(zone_id).await);
+    }
+
+    /// Une zone réseau n'a pas de sortie locale à rafraîchir : le traitement est
+    /// gravé dans le fichier transcodé. `refresh_zone_pure_dsp` doit rendre
+    /// `false` pour que `apply_audiophile_change` bascule sur le redémarrage.
+    #[tokio::test]
+    async fn a_network_zone_has_no_live_local_output() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ampli", Some("dlna"), Some("dlna:uuid-42"))
+            .unwrap();
+        assert!(!orch.refresh_zone_pure_dsp(zone_id).await);
+    }
+
+    /// Régression #1629 — reprendre une webradio dont le PRODUCTEUR de
+    /// décodage est mort (connexion icecast tombée pendant la pause, chemin de
+    /// sortie sans log) doit déclencher un RE-PLAY de la station — un nouveau
+    /// `play_media` vers la sortie, comme au premier lancement — et non une
+    /// reprise « sur place » qui rend du silence.
+    #[tokio::test]
+    async fn resuming_a_radio_with_a_dead_producer_replays_the_station() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Zone Radio", Some("mock"), Some("mock-radio"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-radio", "Mock Radio")));
+
+        // Session radio dont le producteur s'est terminé (comme après
+        // `radio_reconnect_giving_up` ou un `consumer_dropped` silencieux).
+        let (sid, _tx, _ready, session) = orch
+            .streamer
+            .create_radio_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 48000,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+        session
+            .producer_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // La zone joue cette radio, puis est mise en pause (pause COURTE :
+        // c'est bien la mort du producteur qui doit déclencher le re-play).
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    source_id: Some("http://icecast.example/fip.aac".into()),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.pause(zone_id).await;
+
+        orch.resume(zone_id, Some("mock-radio")).await.unwrap();
+
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get("mock-radio").unwrap();
+        let guard = out.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            1,
+            "producteur mort ⇒ la reprise doit rejouer la station (nouveau play_media)"
+        );
+        // Et la zone doit repartir en lecture avec une NOUVELLE session de flux.
+        let state = orch.playback.get_state(zone_id).await;
+        let np = state.now_playing.expect("now_playing après re-play");
+        assert_eq!(np.source, "radio");
+    }
+
+    /// Contre-épreuve #1629 — pause courte ET producteur vivant : la reprise
+    /// reste une reprise sur place (aucun nouveau `play_media`), le
+    /// comportement d'aujourd'hui qui fonctionne.
+    #[tokio::test]
+    async fn resuming_a_radio_with_a_live_producer_after_a_short_pause_does_not_replay() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Zone Radio", Some("mock"), Some("mock-radio"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-radio", "Mock Radio")));
+
+        // Producteur VIVANT : le tx du décodeur est encore détenu (par le
+        // test) et `producer_done` reste false.
+        let (sid, _tx, _ready, _session) = orch
+            .streamer
+            .create_radio_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 48000,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    source_id: Some("http://icecast.example/fip.aac".into()),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.pause(zone_id).await;
+
+        orch.resume(zone_id, Some("mock-radio")).await.unwrap();
+
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get("mock-radio").unwrap();
+        let guard = out.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "pause courte + producteur vivant ⇒ reprise sur place, pas de re-play"
+        );
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Playing,
+            "la zone doit être repassée en lecture"
+        );
     }
 
     /// Crée une zone offline pointant vers un device réseau disparu, comme la
@@ -8784,6 +12098,56 @@ mod tests {
         id: String,
     }
 
+    struct FailingCommandOutput {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::outputs::traits::OutputTarget for FailingCommandOutput {
+        fn name(&self) -> &str {
+            "FailingCommand"
+        }
+        fn device_id(&self) -> &str {
+            &self.id
+        }
+        fn output_type(&self) -> &str {
+            "test"
+        }
+        fn capabilities(&self) -> OutputCapabilities {
+            OutputCapabilities::v1(true, true, true, true, true, false)
+        }
+        async fn play_media(
+            &self,
+            _media: &crate::outputs::traits::PlayMedia<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn pause(&self) -> Result<(), String> {
+            Err("pause refused".into())
+        }
+        async fn resume(&self) -> Result<(), String> {
+            Err("resume refused".into())
+        }
+        async fn stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+            Err("seek refused".into())
+        }
+        async fn set_volume(&self, _volume: f64) -> Result<(), String> {
+            Err("volume refused".into())
+        }
+        async fn set_mute(&self, _muted: bool) -> Result<(), String> {
+            Err("mute refused".into())
+        }
+        async fn get_status(&self) -> Result<crate::outputs::traits::OutputStatus, String> {
+            Ok(Default::default())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::outputs::traits::OutputTarget for TimingOutOutput {
         fn name(&self) -> &str {
@@ -8831,13 +12195,151 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn une_capacite_absente_ne_modifie_ni_memoire_ni_base() {
+        let orch = test_orchestrator();
+        let device_id = "legacy-noop";
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Legacy", Some("test"), Some(device_id))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(TimingOutOutput {
+                id: device_id.into(),
+            }));
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(42),
+                    title: "Contrat fail-closed".into(),
+                    duration_ms: 120_000,
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, 12_000).await;
+        orch.playback.set_volume(zone_id, 0.5).await;
+        orch.playback.set_mute(zone_id, false).await;
+
+        for (result, command) in [
+            (
+                orch.pause(zone_id, Some(device_id)).await,
+                OutputCommand::Pause,
+            ),
+            (
+                orch.seek(zone_id, 42_000, Some(device_id)).await,
+                OutputCommand::Seek,
+            ),
+            (
+                orch.set_volume(zone_id, 0.8, Some(device_id)).await,
+                OutputCommand::SetVolume,
+            ),
+            (
+                orch.set_mute(zone_id, true, Some(device_id)).await,
+                OutputCommand::SetMute,
+            ),
+        ] {
+            assert_eq!(
+                result,
+                Err(OutputCommandError::Unsupported { command }),
+                "{command} doit être refusée avant toute mutation"
+            );
+        }
+
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Playing);
+        assert_eq!(state.position_ms, 12_000);
+        assert!((state.volume - 0.5).abs() < f64::EPSILON);
+        assert!(!state.muted);
+
+        let persisted = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(persisted.last_position_ms, 0);
+        assert_eq!(persisted.volume, 50);
+        assert!(!persisted.muted);
+    }
+
+    #[tokio::test]
+    async fn un_backend_qui_refuse_ne_modifie_ni_memoire_ni_base() {
+        let orch = test_orchestrator();
+        let device_id = "failing-command";
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Failing", Some("test"), Some(device_id))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(FailingCommandOutput {
+                id: device_id.into(),
+            }));
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(43),
+                    title: "Refus backend".into(),
+                    duration_ms: 120_000,
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, 13_000).await;
+        orch.playback.set_volume(zone_id, 0.5).await;
+
+        assert!(matches!(
+            orch.pause(zone_id, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::Pause,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.seek(zone_id, 42_000, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::Seek,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.set_volume(zone_id, 0.8, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::SetVolume,
+                ..
+            })
+        ));
+        assert!(matches!(
+            orch.set_mute(zone_id, true, Some(device_id)).await,
+            Err(OutputCommandError::Failed {
+                command: OutputCommand::SetMute,
+                ..
+            })
+        ));
+
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Playing);
+        assert_eq!(state.position_ms, 13_000);
+        assert_eq!(state.volume, 0.5);
+        assert!(!state.muted);
+        let persisted = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(persisted.last_position_ms, 0);
+        assert_eq!(persisted.volume, 50);
+        assert!(!persisted.muted);
+    }
+
     /// Un timeout de transport ne doit PAS détruire la session de flux : la
     /// commande a pu atteindre le renderer, qui ira chercher l'URL. La détruire
     /// lui fait afficher « chanson non trouvée ». Un refus, lui, est concluant.
     #[tokio::test]
     async fn transport_timeout_keeps_the_stream_session_but_refusal_drops_it() {
         let orch = test_orchestrator();
-        let f = std::env::temp_dir().join("tune-timeout-session-test.flac");
+        let flac = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        let f = flac.path().to_path_buf();
         std::fs::write(&f, b"fake audio").unwrap();
 
         for (device_id, output, doit_survivre) in [
@@ -8900,7 +12402,49 @@ mod tests {
                 "{device_id} : session présente={encore_la}, attendu={doit_survivre}"
             );
         }
-        let _ = std::fs::remove_file(&f);
+    }
+
+    /// #1518 (Vincent) : seek d'une piste STREAMING (Qobuz/Tidal) sur sortie
+    /// locale. Depuis b3a4a79f le transcodage WAV streaming est pré-seeké
+    /// (decode_to_pcm_streaming_seeked reçoit seek_s), comme le chemin fichier
+    /// local. Dériver le drapeau de media.file_path (None en streaming) faisait
+    /// re-sauter l'offset une DEUXIÈME fois côté consommateur : un seek à 4:30
+    /// jetait tout le PCM restant de la piste → silence total, puis boucle de
+    /// redémarrage ~3 s (le poller voit la piste « finie » et la relance).
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn streaming_seek_on_local_output_is_producer_preseeked_no_consumer_skip() {
+        let orch = test_orchestrator();
+        let device_id = "local:Test Device 1518";
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(crate::outputs::local::LocalOutput::new(
+                "Test Device 1518".to_string(),
+            )));
+
+        // Média streaming : PAS de file_path (cas Qobuz/Tidal). L'URL refuse
+        // la connexion, le thread audio s'arrête avant de toucher un device.
+        let media = crate::outputs::traits::PlayMedia {
+            url: "http://127.0.0.1:1/stream",
+            mime_type: "audio/wav",
+            ..Default::default()
+        };
+        let (sent, err) = orch
+            .send_to_output(device_id, &media, Some(270_000), false, 1, None)
+            .await;
+        assert!(sent, "play_media doit partir : {err:?}");
+
+        let arc = orch.outputs.lock().await.get(device_id).unwrap();
+        let out = arc.lock().await;
+        let local = out
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .unwrap();
+        assert!(
+            local.producer_seeked(),
+            "flux streaming transcodé = déjà pré-seeké : le consommateur ne doit PAS re-sauter l'offset (#1518)"
+        );
     }
 
     #[test]
@@ -8937,12 +12481,12 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Pause
-        orch.pause(zone_id, None).await;
+        orch.pause(zone_id, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert_eq!(state.state, PlayState::Paused);
 
         // Resume
-        orch.resume(zone_id, None).await;
+        orch.resume(zone_id, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert_eq!(state.state, PlayState::Playing);
 
@@ -8976,7 +12520,7 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Seek to 42 seconds
-        orch.seek(zone_id, 42_000, None).await;
+        orch.seek(zone_id, 42_000, None).await.unwrap();
 
         // Verify in-memory state updated
         let state = orch.playback.get_state(zone_id).await;
@@ -9010,19 +12554,50 @@ mod tests {
         orch.playback.play(zone_id, np).await;
 
         // Set volume to 80%
-        orch.set_volume(zone_id, 0.8, None).await;
+        orch.set_volume(zone_id, 0.8, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.8).abs() < f64::EPSILON);
 
         // Set volume to 0 (mute level)
-        orch.set_volume(zone_id, 0.0, None).await;
+        orch.set_volume(zone_id, 0.0, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.0).abs() < f64::EPSILON);
 
         // Set volume to 1.0 (max)
-        orch.set_volume(zone_id, 1.0, None).await;
+        orch.set_volume(zone_id, 1.0, None).await.unwrap();
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gain_trim_factor_convertit_et_clampe() {
+        use crate::orchestrator::gain_trim_factor;
+        assert!((gain_trim_factor(0.0) - 1.0).abs() < 1e-9);
+        // -6 dB ≈ ×0.5012
+        assert!((gain_trim_factor(-6.0) - 0.501_187).abs() < 1e-4);
+        // +6 dB ≈ ×1.9953
+        assert!((gain_trim_factor(6.0) - 1.995_262).abs() < 1e-4);
+        // Clamp ±12 dB
+        assert!((gain_trim_factor(-40.0) - gain_trim_factor(-12.0)).abs() < 1e-9);
+        assert!((gain_trim_factor(40.0) - gain_trim_factor(12.0)).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn le_trim_ne_touche_pas_le_volume_utilisateur() {
+        // Le trim n'affecte que la valeur envoyée au device : l'état de
+        // lecture (ce que l'UI affiche) et la base gardent le volume brut.
+        let orch = test_orchestrator();
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo.create("Trim Zone", None, None).unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&format!("zone_{zone_id}_gain_trim_db"), "-6")
+            .unwrap();
+
+        orch.set_volume(zone_id, 0.8, None).await.unwrap();
+        let state = orch.playback.get_state(zone_id).await;
+        assert!((state.volume - 0.8).abs() < f64::EPSILON);
+        let zone = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(zone.volume, 80);
     }
 
     #[tokio::test]
@@ -9050,7 +12625,7 @@ mod tests {
         orch.playback.update_position(zone_id, 55_000).await;
 
         // Pause triggers persist_position
-        orch.pause(zone_id, None).await;
+        orch.pause(zone_id, None).await.unwrap();
 
         let zone = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(zone.last_position_ms, 55_000);
@@ -9109,6 +12684,8 @@ mod tests {
             zone_id,
             None,
             Some(7),
+            Some("playlist"),
+            Some("12"),
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -9127,7 +12704,263 @@ mod tests {
             .flatten()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
         assert_eq!(stored_profile, Some(7));
+        // #2441 — l'intention passee par l'appelant est ecrite telle quelle.
+        // Sans elle, cette ligne est indiscernable de la meme piste jouee
+        // seule, et aucune rubrique ne peut « refleter la realite de ce qu'a
+        // voulu faire l'auditeur ».
+        assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
+        assert_eq!(history[0].context_id.as_deref(), Some("12"));
         assert_eq!(history[0].source, "local");
+    }
+
+    // ------------------------------------------------------------------
+    // #1998 — zone navigateur : l'annonce suit la PREUVE de lecture.
+    //
+    // Aucun de ces tests ne touche le réseau : sans clé Last.fm ni jeton
+    // ListenBrainz dans la base de test, `dispatch_now_playing` sort avant le
+    // moindre appel. Ce qui est observé ici est l'effet vérifiable côté
+    // serveur — la ligne `listen_history` et le verrou « une seule fois ».
+    // ------------------------------------------------------------------
+
+    /// Une session de flux dont l'onglet a tiré `octets` octets.
+    async fn session_navigateur(
+        orch: &PlaybackOrchestrator,
+        fichier: &std::path::Path,
+        octets: u64,
+    ) -> String {
+        let sid = orch
+            .streamer
+            .create_file_session(
+                crate::http::streamer::StreamInfo {
+                    format: "flac".into(),
+                    mime_type: "audio/flac".into(),
+                    ..Default::default()
+                },
+                fichier.to_string_lossy().into_owned(),
+                false,
+            )
+            .await;
+        if octets > 0 {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .expect("la session vient d'être créée")
+                .bytes_sent
+                .store(octets, std::sync::atomic::Ordering::Relaxed);
+        }
+        sid
+    }
+
+    fn annonce_en_attente(
+        stream_id: &str,
+        record_history: bool,
+        source: &str,
+    ) -> super::AnnonceNavigateurDifferee {
+        super::AnnonceNavigateurDifferee {
+            stream_id: stream_id.to_string(),
+            title: "Come on In".into(),
+            artist: Some("Bridge City Sinners".into()),
+            album: Some("Unholy Hymns".into()),
+            source: source.into(),
+            source_id: None,
+            track_id: None,
+            duration_ms: 180_000,
+            cover_path: None,
+            record_history,
+        }
+    }
+
+    fn lignes_historique(orch: &PlaybackOrchestrator) -> usize {
+        crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+            .recent(10)
+            .unwrap()
+            .len()
+    }
+
+    /// Le cœur du ticket rouvert : tant que l'onglet n'a rien tiré, rien n'est
+    /// annoncé ; dès qu'il tire, l'annonce part — et une seule fois.
+    #[tokio::test]
+    async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+
+        // Onglet muet : la session existe, personne ne la consomme.
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "aucun octet tiré : l'annonce ne doit pas partir — c'est le défaut d'origine"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "listen_history ne doit rien porter tant que rien n'a été entendu"
+        );
+        assert!(
+            orch.annonces_navigateur
+                .lock()
+                .unwrap()
+                .contains_key(&zone_id),
+            "l'annonce reste en attente : l'onglet peut encore démarrer"
+        );
+
+        // L'onglet tire le flux : c'est la preuve.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            sessions
+                .get(&sid)
+                .unwrap()
+                .bytes_sent
+                .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'onglet consomme le flux : l'annonce doit partir"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "l'historique local doit enfin porter cette écoute"
+        );
+
+        // Le tick suivant ne doit pas re-annoncer.
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "le poller repasse chaque seconde : une écoute, une annonce"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            1,
+            "pas de doublon au tick suivant"
+        );
+    }
+
+    /// `record_history=false` (recherche de position, reconnexion) : l'annonce
+    /// « en écoute » part, mais l'historique ne doublonne pas. Sans ce report
+    /// du drapeau, déplacer le curseur ajouterait une ligne à chaque fois.
+    #[tokio::test]
+    async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, false, "local"));
+
+        assert!(
+            orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+            "l'annonce « en écoute » part quand même : la piste est bien entendue"
+        );
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "une re-création de flux pour une piste déjà en cours ne s'ajoute pas à l'historique"
+        );
+    }
+
+    /// La radio n'entre pas dans l'historique local — même exclusion que le
+    /// chemin nominal, pour la même raison (titre figé au démarrage).
+    #[tokio::test]
+    async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
+
+        assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(
+            lignes_historique(&orch),
+            0,
+            "la radio ne s'écrit pas dans listen_history"
+        );
+    }
+
+    /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même
+    /// si un vieux flux traîne : l'attente est identifiée par SON flux.
+    #[tokio::test]
+    async fn zone_navigateur_un_autre_flux_ne_libere_pas_l_annonce() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let attendu = session_navigateur(&orch, &f, 0).await;
+        let autre = session_navigateur(&orch, &f, 64 * 1024).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&attendu, true, "local"));
+
+        assert!(
+            !orch.confirmer_lecture_navigateur(zone_id, &autre).await,
+            "les octets d'un AUTRE flux ne prouvent rien sur celui-ci"
+        );
+        assert_eq!(lignes_historique(&orch), 0);
+    }
+
+    /// Arrêt avant le premier octet : il n'y a rien eu à entendre, l'attente
+    /// meurt avec la lecture.
+    #[tokio::test]
+    async fn zone_navigateur_l_arret_annule_l_annonce_en_attente() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("piste.flac");
+        std::fs::write(&f, b"fake audio").unwrap();
+        let sid = session_navigateur(&orch, &f, 0).await;
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+
+        orch.stop(zone_id, None).await;
+
+        assert!(
+            orch.annonces_navigateur.lock().unwrap().is_empty(),
+            "l'arrêt oublie l'annonce en attente"
+        );
+        // Même si l'onglet tire des octets après coup (fin de tampon), plus
+        // rien ne part : la lecture est terminée.
+        {
+            let sessions = orch.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(s) = sessions.get(&sid) {
+                s.bytes_sent
+                    .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        assert!(!orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+        assert_eq!(lignes_historique(&orch), 0);
     }
 
     #[tokio::test]
@@ -9193,6 +13026,156 @@ mod tests {
         assert_eq!(queue.len(), 3);
     }
 
+    fn radio_test_eq_profile() -> crate::audio::eq::EqProfile {
+        crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 80.0,
+                gain: 8.0,
+                q: 0.71,
+                band_type: "low_shelf".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn f32_bytes(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    /// #2063 — contre-épreuve négative : ajouter le crochet DSP au décodeur
+    /// radio ne doit modifier AUCUN octet quand la zone n'a pas d'EQ actif.
+    #[test]
+    fn radio_without_eq_keeps_pcm_byte_for_byte() {
+        let mut samples = vec![0.0, -0.0, 0.125, -0.25, 0.75, -0.875];
+        let expected = f32_bytes(&samples);
+        let mut eq = None;
+        super::apply_radio_eq(&mut eq, &mut samples);
+        assert_eq!(f32_bytes(&samples), expected);
+    }
+
+    /// Le témoin positif complète le précédent : un profil réellement actif
+    /// doit atteindre le PCM que Tune servira dans le WAV, pas seulement
+    /// forcer une route de transcodage qui oublierait ensuite le processeur.
+    #[test]
+    fn radio_with_eq_changes_the_pcm_served_to_the_renderer() {
+        let profile = radio_test_eq_profile();
+        let mut eq = Some(crate::audio::eq::EqProcessor::new(&profile, 44_100, 2));
+        let mut samples = vec![0.10f32; 2 * 1024];
+        let untouched = f32_bytes(&samples);
+        super::apply_radio_eq(&mut eq, &mut samples);
+        assert_ne!(f32_bytes(&samples), untouched);
+    }
+
+    /// Une URL MP3 explicite passait directement au navigateur. Avec un EQ,
+    /// ce passthrough contournerait tous les filtres : la zone doit recevoir
+    /// une session WAV Tune même sans `output_device_id`.
+    #[tokio::test]
+    async fn browser_radio_with_eq_is_forced_through_the_wav_session() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        let source = "http://127.0.0.1:9/station.mp3";
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some(source.into()),
+            title: Some("Radio avec EQ".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "l'EQ actif doit interdire le passthrough MP3"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.origin_url.as_deref(), Some(source));
+    }
+
+    /// #2670 — une zone NAVIGATEUR ne doit jamais recevoir l'URL de la station.
+    ///
+    /// Le client web reecrit toute URL absolue en chemin relatif
+    /// (`browserPlay` : `u.pathname + u.search`), pour joindre l'hote Tune
+    /// plutot que l'IP que le serveur annonce. L'URL d'une station en `.mp3`
+    /// devient donc une requete `/station.mp3` adressee a Tune, a laquelle le
+    /// repli SPA (`routes/mod.rs`, `ServeDir::fallback(ServeFile(index.html))`)
+    /// repond 200 `text/html` : une page web au lieu du flux.
+    ///
+    /// Et Tune ne peut rien en dire : sans session locale il n'ouvre jamais le
+    /// flux, donc ni `non_audio_content_type` ni `RADIO_NOT_AUDIO` — qui vivent
+    /// dans `decode_radio_stream_to_pcm` — ne peuvent se declencher. C'etait le
+    /// seul chemin radio ou une station morte restait muette ET silencieuse.
+    #[tokio::test]
+    async fn browser_radio_mp3_is_never_handed_the_station_url() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        // Aucun profil EQ n'est ecrit : c'est precisement le cas que le
+        // passthrough laissait passer (#2063 ne couvrait que l'EQ actif).
+        // Port 9 (discard) : la tache de decodage echoue en local, aucun appel
+        // reseau reel ne sort de ce test.
+        let source = "http://127.0.0.1:9/tsfjazz-high.mp3";
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some(source.into()),
+            title: Some("TSF Jazz".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "une zone navigateur doit recevoir une session Tune, pas l'URL de la station"
+        );
+        assert_ne!(
+            resolved.url, source,
+            "l'URL de la station renvoyee telle quelle est reecrite en chemin local par le client, \
+             qui recoit alors la page HTML de Tune"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+        // L'amont voyage quand meme : un enregistreur ou les titres ICY n'ont
+        // pas d'autre chemin de retour vers la source.
+        assert_eq!(resolved.origin_url.as_deref(), Some(source));
+    }
+
     #[tokio::test]
     async fn radio_resolve_direct_url_without_output_device() {
         let orch = test_orchestrator();
@@ -9212,6 +13195,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -9251,6 +13236,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -9281,6 +13268,8 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
             media_format: None,
+            track_number: None,
+            disc_number: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -9288,6 +13277,371 @@ mod tests {
             "podcast should not create proxy session"
         );
         assert_eq!(resolved.url, "https://cdn.podcast.com/episode.mp3");
+    }
+
+    /// Une URL de flux Bandcamp telle qu'elle est publiée : pas d'extension,
+    /// le codec est dans le CHEMIN (`/mp3-128/`), pas au bout du nom.
+    const BC_STREAM: &str =
+        "https://t4.bcbits.com/stream/0123456789abcdef/mp3-128/1234567?p=0&ts=1&sig=deadbeef";
+
+    #[tokio::test]
+    async fn bandcamp_resolves_by_the_direct_url_door() {
+        // Le point de la correction : `source = "bandcamp"` doit ARRIVER dans
+        // `resolve_direct_url` via `resolve_stream`, et non partir chercher un
+        // service « bandcamp » dans le registre (qui n'existe pas) — c'est
+        // l'échec qui laissait la lecture dans l'onglet du navigateur.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: Some("An Artist".into()),
+            album_title: Some("An Album".into()),
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: Some("mp3".into()),
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_stream(&req).await.unwrap();
+        assert_eq!(resolved.source, "bandcamp");
+        assert_eq!(
+            resolved.url, BC_STREAM,
+            "sans sortie : URL servie telle quelle"
+        );
+        assert!(resolved.stream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn bandcamp_mime_is_asserted_not_guessed() {
+        // L'URL n'a pas d'extension : `guess_mime_from_url` retomberait sur son
+        // défaut. On veut que le MIME soit AFFIRMÉ — Bandcamp ne sert que du
+        // mp3-128 —, pas hérité d'un défaut qui pourrait changer.
+        assert_eq!(super::guess_mime_from_url(BC_STREAM), "audio/mpeg");
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some("https://t4.bcbits.com/stream/x/mp3-128/42".into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_proxied_in_clear_http_for_a_network_renderer() {
+        // Bandcamp ne publie qu'en HTTPS ; un renderer DLNA ne sait pas ouvrir
+        // TLS. Sans proxy local, il annonce PLAYING et n'émet rien — le faux
+        // positif déjà vu sur le Yamaha R-N2000A.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("dlna:uuid-1234".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "une sortie réseau doit passer par une session proxy locale"
+        );
+        assert!(
+            resolved.url.starts_with("http://"),
+            "l'URL servie au renderer doit être en clair, pas en TLS : {}",
+            resolved.url
+        );
+        // Les octets passent verbatim : c'est toujours du MP3, rien n'est
+        // transcodé. Le renderer doit donc lire « audio/mpeg ».
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_proxied_for_a_browser_zone_without_an_output_device() {
+        // Contre-épreuve #2076/#2158 : une zone navigateur n'a jamais de
+        // `output_device_id`. Ce n'est pas une zone orpheline — l'onglet est la
+        // sortie — et il doit tirer une URL Tune locale, pas l'URL tierce que le
+        // client réécrirait en chemin relatif avant de recevoir du text/html.
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Ce PC", Some("browser"), None)
+            .unwrap();
+        let req = super::PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        let stream_id = resolved
+            .stream_id
+            .as_deref()
+            .expect("une zone navigateur doit recevoir une session proxy");
+        assert!(
+            resolved.url.ends_with(&format!("/stream/{stream_id}.mp3")),
+            "le navigateur doit tirer le MP3 depuis Tune : {}",
+            resolved.url
+        );
+        assert!(
+            !resolved.url.contains("bcbits.com"),
+            "l'URL Bandcamp ne doit jamais être rendue au navigateur"
+        );
+        assert_eq!(resolved.origin_url.as_deref(), Some(BC_STREAM));
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn bandcamp_is_decoded_to_wav_for_an_oaat_endpoint() {
+        // Un endpoint OAAT ne consomme que du PCM en conteneur WAV.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("oaat:endpoint-1".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(resolved.stream_id.is_some());
+        assert_eq!(resolved.mime_type, "audio/wav");
+        assert_eq!(resolved.sample_rate, Some(44100));
+    }
+
+    #[tokio::test]
+    async fn bandcamp_goes_straight_to_a_local_dac() {
+        // La sortie locale télécharge et décode elle-même un flux HTTP
+        // compressé (`local_audio_non_wav_stream_detected_decoding`) : rien à
+        // interposer, et surtout rien à transcoder pour rien.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("local:default".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some(BC_STREAM.into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(resolved.stream_id.is_none());
+        assert_eq!(resolved.url, BC_STREAM);
+        assert_eq!(resolved.mime_type, "audio/mpeg");
+        // Affirmée, pas héritée d'un défaut : le chemin du signal doit
+        // annoncer « MP3 — Avec perte » de sa propre autorité.
+        assert_eq!(resolved.sample_rate, Some(44100));
+        assert_eq!(resolved.bit_depth, Some(16));
+    }
+
+    /// #2074 — l'URL est la seule autorité sur la qualité.
+    ///
+    /// Bandcamp nomme l'encodage dans l'URL, sous deux formes. Un fichier
+    /// ACHETÉ emprunte la même porte avec une autre valeur : la règle doit
+    /// donc porter sur le flux, jamais sur le nom du service.
+    #[test]
+    fn bandcamp_quality_is_read_from_the_url_never_from_the_source_name() {
+        use super::{bandcamp_encoding, bandcamp_quality};
+
+        // Forme « segment de chemin » — l'écoute libre publiée par Bandcamp.
+        assert_eq!(bandcamp_encoding(BC_STREAM).as_deref(), Some("mp3-128"));
+        let libre = bandcamp_quality("mp3-128").expect("mp3-128 est connu");
+        assert_eq!(libre.codec, "mp3");
+        assert_eq!(libre.mime_type, "audio/mpeg");
+        assert_eq!(libre.bitrate_kbps, Some(128));
+
+        // Forme « paramètre de requête » — la redirection de flux.
+        assert_eq!(
+            bandcamp_encoding("https://bandcamp.com/stream_redirect?enc=mp3-128&track_id=1")
+                .as_deref(),
+            Some("mp3-128")
+        );
+
+        // ACHAT en lossless : ni MP3, ni débit. C'est le cœur de la règle.
+        let achete = bandcamp_quality(
+            &bandcamp_encoding("https://popplers5.bandcamp.com/download/track?enc=flac&id=42")
+                .expect("enc=flac doit être lu"),
+        )
+        .expect("flac est connu");
+        assert_eq!(achete.codec, "flac");
+        assert_eq!(achete.mime_type, "audio/flac");
+        assert_eq!(
+            achete.bitrate_kbps, None,
+            "un flux sans perte n'a aucun débit à annoncer"
+        );
+
+        // ACHAT en MP3 320 : même codec que l'extrait, débit différent.
+        assert_eq!(
+            bandcamp_quality("mp3-320").map(|q| q.bitrate_kbps),
+            Some(Some(320))
+        );
+        // Débit VARIABLE : on n'invente pas de chiffre.
+        assert_eq!(
+            bandcamp_quality("mp3-v0").map(|q| q.bitrate_kbps),
+            Some(None)
+        );
+
+        // Un hachage de chemin ne doit jamais passer pour un encodage.
+        assert_eq!(
+            bandcamp_encoding("https://t4.bcbits.com/stream/0123456789abcdef/7654321?p=0"),
+            None
+        );
+        assert_eq!(bandcamp_quality("chose-inconnue"), None);
+    }
+
+    #[tokio::test]
+    async fn bandcamp_carries_its_128_kbps_all_the_way_to_the_zone() {
+        // Le défaut de #2074 : la qualité était annoncée sur l'écran Bandcamp
+        // et se perdait au passage en zone. Les TROIS sorties câblées en
+        // 0.9.89 portent le même flux source — locale, WAV décodé pour OAAT,
+        // proxy MP3 pour un renderer réseau — donc les trois doivent porter
+        // le même débit jusqu'au chemin du signal.
+        let orch = test_orchestrator();
+        let sorties = [
+            None,
+            Some("local:default".to_string()),
+            Some("oaat:endpoint-1".to_string()),
+            Some("dlna:uuid-1234".to_string()),
+        ];
+        assert_eq!(sorties.len(), 4, "quatre sorties examinées");
+        for sortie in sorties {
+            let req = super::PlayRequest {
+                zone_id: 1,
+                output_device_id: sortie.clone(),
+                track_id: None,
+                source: Some("bandcamp".into()),
+                source_id: Some(BC_STREAM.into()),
+                title: Some("A Track".into()),
+                artist_name: None,
+                album_title: None,
+                cover_url: None,
+                duration_ms: Some(212_000),
+                seek_ms: None,
+                temp_file_path: None,
+                sample_rate: None,
+                bit_depth: None,
+                media_format: None,
+                track_number: None,
+                disc_number: None,
+            };
+            let resolved = orch.resolve_direct_url(&req).await.unwrap();
+            assert_eq!(
+                resolved.bitrate_kbps,
+                Some(128),
+                "sortie {sortie:?} : le 128 kbit/s doit atteindre la zone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purchased_bandcamp_file_is_never_labelled_mp3_128() {
+        // Cas de l'ACHAT : la même porte, un autre encodage. Coller
+        // « MP3 128 kbit/s » sur un FLAC serait le mensonge inverse.
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: Some("dlna:uuid-1234".into()),
+            track_id: None,
+            source: Some("bandcamp".into()),
+            source_id: Some("https://popplers5.bandcamp.com/download/track?enc=flac&id=42".into()),
+            title: Some("A Track".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(212_000),
+            seek_ms: None,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert_eq!(
+            resolved.bitrate_kbps, None,
+            "aucun débit ne doit être annoncé sur un achat lossless"
+        );
+        assert_eq!(
+            resolved.mime_type, "audio/flac",
+            "le renderer doit recevoir le vrai type, pas audio/mpeg"
+        );
+        let stream_id = resolved
+            .stream_id
+            .as_deref()
+            .expect("une sortie réseau passe toujours par le proxy en clair");
+        assert!(
+            resolved.url.ends_with(&format!("/stream/{stream_id}.flac")),
+            "le conteneur servi doit suivre l'encodage réel : {}",
+            resolved.url
+        );
     }
 
     /// An output that rejects `play_media` — mirrors an AirPlay renderer whose
@@ -9396,5 +13750,425 @@ mod tests {
             PlayState::Stopped,
             "output send error must leave the zone Stopped, not Playing"
         );
+    }
+}
+
+/// Plafond de profondeur en sortie (#1610).
+///
+/// Marantz ND8006 muet, « format non supporte » : le flux partait en 32 bits,
+/// valeur lue dans `track.bit_depth` et jamais ramenee a une profondeur que
+/// l'appareil sait lire. La regle existait a trois endroits et manquait au
+/// quatrieme.
+#[cfg(test)]
+mod bit_depth_cap_tests {
+    use super::cap_output_bit_depth;
+
+    #[test]
+    fn le_32_bits_est_ramene_a_24() {
+        // Le cas de Jean Valjean : un FLAC annonce en 32 bits.
+        assert_eq!(cap_output_bit_depth(32), 24);
+    }
+
+    #[test]
+    fn les_profondeurs_courantes_passent_intactes() {
+        // Ne rien changer pour ceux que ca marchait deja.
+        assert_eq!(cap_output_bit_depth(16), 16);
+        assert_eq!(cap_output_bit_depth(24), 24);
+    }
+
+    #[test]
+    fn en_dessous_de_16_on_remonte() {
+        // Plancher : sous 16 bits, plus rien ne lit le PCM de facon fiable.
+        assert_eq!(cap_output_bit_depth(8), 16);
+        assert_eq!(cap_output_bit_depth(1), 16);
+        assert_eq!(cap_output_bit_depth(0), 16);
+    }
+
+    #[test]
+    fn une_valeur_aberrante_reste_jouable() {
+        // Une metadonnee fantaisiste ne doit pas produire un flux injouable.
+        assert_eq!(cap_output_bit_depth(64), 24);
+        assert_eq!(cap_output_bit_depth(u16::MAX), 24);
+    }
+}
+
+#[cfg(test)]
+mod dop_routing_tests {
+    use super::{
+        AudioFormat, conteneur_a_profondeur_cachee, dop_requested, dop_wire_params,
+        profondeur_sondee_si_la_base_ignore,
+    };
+
+    /// #1772 — le cas RÉEL de Marco Polo : Wiim Pro (renderer DLNA) relié en
+    /// optique à un DAC Denafrips, zone réglée sur « dop ». Avant le correctif,
+    /// ce choix n'était comparé nulle part pour une sortie réseau : le DAC
+    /// recevait du PCM 176,4 kHz, soit très exactement le débit DoP du DSD64 —
+    /// d'où un symptôme qui ressemblait à s'y méprendre à du DoP qui marche.
+    #[test]
+    fn un_renderer_reseau_regle_sur_dop_recoit_du_dop() {
+        assert!(
+            dop_requested(false, true, "dop"),
+            "le choix explicite « dop » doit être honoré sur un renderer réseau"
+        );
+    }
+
+    /// La sortie locale ne régresse pas : ses deux modes historiques passent
+    /// toujours par le DoP, faute pour une carte son de recevoir du DSD.
+    #[test]
+    fn la_sortie_locale_gardes_ses_deux_modes() {
+        assert!(dop_requested(true, false, "native"));
+        assert!(dop_requested(true, false, "dop"));
+    }
+
+    /// Le renderer réseau en « natif » ou « auto » ne doit PAS être détourné
+    /// vers le DoP : c'est `should_dsd_passthrough` qui arbitre, et lui seul
+    /// sait si l'appareil annonce le DSF/DFF.
+    #[test]
+    fn un_renderer_en_natif_ou_auto_n_est_pas_detourne() {
+        assert!(!dop_requested(false, true, "native"));
+        assert!(!dop_requested(false, true, "auto"));
+        assert!(!dop_requested(false, true, ""));
+    }
+
+    /// « pcm » est un refus explicite : il ne produit jamais de DoP, nulle part.
+    #[test]
+    fn le_mode_pcm_ne_produit_jamais_de_dop() {
+        assert!(!dop_requested(true, false, "pcm"));
+        assert!(!dop_requested(false, true, "pcm"));
+    }
+
+    /// Une zone qui n'est ni locale ni réseau (navigateur, OAAT) ne reçoit pas
+    /// de DoP : ces chemins ont leur propre traitement du DSD.
+    #[test]
+    fn ni_locale_ni_reseau_ne_recoit_rien() {
+        assert!(!dop_requested(false, false, "dop"));
+        assert!(!dop_requested(false, false, "native"));
+    }
+
+    /// #1657 — le mode par DÉFAUT ne produit de DoP nulle part.
+    ///
+    /// Ce test ne demande pas que « auto » change de comportement : il fixe le
+    /// fait, pour que personne ne le redécouvre en cherchant un défaut de
+    /// lecture. C'est ce fait, tu et non documenté, qui a fait passer un réglage
+    /// par défaut pour un DSD cassé.
+    #[test]
+    fn le_mode_auto_ne_produit_de_dop_nulle_part() {
+        assert!(!dop_requested(true, false, "auto"));
+        assert!(!dop_requested(false, true, "auto"));
+        assert!(!dop_requested(false, false, "auto"));
+        // Et le voisin qui piège tout autant : en RÉSEAU, « natif » non plus.
+        assert!(!dop_requested(false, true, "native"));
+    }
+
+    /// #1654 — seul l'ALAC cache sa profondeur ; sonder le reste serait de
+    /// l'E/S pour rien.
+    #[test]
+    fn seul_lalac_a_une_profondeur_cachee() {
+        assert!(conteneur_a_profondeur_cachee(Some(AudioFormat::Alac)));
+        for f in [
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Dsd,
+            AudioFormat::Aac,
+            AudioFormat::Mp3,
+        ] {
+            assert!(!conteneur_a_profondeur_cachee(Some(f)), "{f:?}");
+        }
+        assert!(!conteneur_a_profondeur_cachee(None));
+    }
+
+    /// Un fichier illisible ne doit jamais faire échouer la lecture : la sonde
+    /// rend `None`, l'appelant garde ce que dit la base.
+    #[test]
+    fn une_sonde_qui_echoue_laisse_la_base_decider() {
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.m4a", Some(AudioFormat::Alac)),
+            None
+        );
+        // Et un conteneur hors périmètre n'est même pas ouvert.
+        assert_eq!(
+            profondeur_sondee_si_la_base_ignore("/inexistant/x.flac", Some(AudioFormat::Flac)),
+            None
+        );
+    }
+
+    /// #1894 — l'en-tête WAV doit décrire le FICHIER, jamais la ligne `tracks`.
+    #[test]
+    fn le_fichier_prime_sur_la_base_pour_annoncer_un_flux_dop() {
+        // Le cas qui produit du bruit blanc : la base dit stéréo, le fichier
+        // est multicanal. Annoncer 2 canaux pour une charge utile qui en porte
+        // 5 décale chaque mot de 24 bits et noie le marqueur DoP.
+        let (rate, ch) = dop_wire_params(Some((2_822_400, 5)), Some(2_822_400), 2);
+        assert_eq!(ch, 5);
+        assert_eq!(rate, 2_822_400);
+
+        // Et le cas symétrique : une cadence périmée en base (DSD64 scanné,
+        // fichier remplacé par du DSD128) annoncerait un débit DoP faux.
+        let (rate, ch) = dop_wire_params(Some((5_644_800, 2)), Some(2_822_400), 2);
+        assert_eq!(rate, 5_644_800);
+        assert_eq!(ch, 2);
+    }
+
+    #[test]
+    fn un_entete_dsd_illisible_retombe_sur_la_base_plutot_que_de_refuser() {
+        // Mieux vaut diffuser avec des valeurs approximatives que ne rien lire.
+        let (rate, ch) = dop_wire_params(None, Some(5_644_800), 2);
+        assert_eq!(rate, 5_644_800);
+        assert_eq!(ch, 2);
+
+        // Base muette : le défaut DSD64, et jamais moins de deux canaux —
+        // un en-tête WAV à 0 canal est injouable partout.
+        let (rate, ch) = dop_wire_params(None, None, 0);
+        assert_eq!(rate, 2_822_400);
+        assert_eq!(ch, 2);
+    }
+
+    #[test]
+    fn le_plancher_a_deux_canaux_ne_masque_jamais_le_fichier() {
+        // `.max(2)` est un plancher, pas un plafond : il ne doit pas rabattre
+        // un fichier multicanal — c'était le risque du `track.channels.max(2)`
+        // d'origine, qui ignorait le fichier de bout en bout.
+        assert_eq!(dop_wire_params(Some((2_822_400, 6)), None, 2).1, 6);
+        assert_eq!(dop_wire_params(Some((2_822_400, 1)), None, 2).1, 2);
+    }
+}
+
+/// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
+///
+/// Chez Bilou, quatre échecs de sortie BluOS d'affilée ont produit quatre
+/// annonces « en écoute » à Last.fm pour un titre jamais entendu. L'annonce
+/// partait AVANT la tentative d'envoi ; `output_sent` était établi vingt lignes
+/// plus bas, dans la même fonction, et l'arrêt immédiat de la zone s'appuyait
+/// déjà dessus.
+///
+/// Ce test relit la source plutôt que d'exercer le chemin de lecture : la
+/// propriété à tenir est un ORDRE et une CONDITION dans une fonction async de
+/// plusieurs centaines de lignes, et c'est exactement ce qu'un copier-coller
+/// ultérieur ré-inverse. Même procédé que `eq_refresh_guard` dans
+/// `tune-server/src/routes/mod.rs`, et pour la même raison.
+#[cfg(test)]
+mod annonce_apres_sortie_guard {
+    /// Le fichier PRIVÉ de ce module de test.
+    ///
+    /// ⚠️ La découpe n'est pas un détail. `include_str!` rend le fichier
+    /// ENTIER, module de test compris — et les motifs cherchés ci-dessous
+    /// figurent aussi, mot pour mot, dans les messages d'assertion. Un
+    /// `code_de_production().contains(...)` sur le fichier complet se trouve donc lui-même
+    /// et rend vrai quoi qu'il arrive.
+    ///
+    /// C'est vécu : la première version de ce garde-fou a survécu au sabotage
+    /// de la condition qu'elle prétendait garder. Un contrôle qui ne peut pas
+    /// dire non ne contrôle rien (#2082).
+    fn code_de_production() -> &'static str {
+        const TOUT: &str = include_str!("orchestrator.rs");
+        const BORNE: &str = "mod annonce_apres_sortie_guard";
+        let fin = TOUT
+            .find(BORNE)
+            .unwrap_or_else(|| panic!("ce module a été renommé : la découpe ne protège plus rien"));
+        &TOUT[..fin]
+    }
+
+    /// Position de la première occurrence, ou panique avec un message qui dit
+    /// quoi chercher — un garde-fou muet sur son propre désaccordage ne garde
+    /// rien.
+    fn position(motif: &str) -> usize {
+        code_de_production().find(motif).unwrap_or_else(|| {
+            panic!(
+                "motif introuvable dans orchestrator.rs : « {motif} ».\n\
+                 Le code a été remanié ; ce garde-fou ne garde plus rien tant \
+                 qu'il n'a pas suivi. Voir #1998."
+            )
+        })
+    }
+
+    /// `output_sent` doit être CONNU avant qu'on annonce quoi que ce soit.
+    #[test]
+    fn l_annonce_vient_apres_le_resultat_de_la_sortie() {
+        let resultat = position("let (output_sent, output_error) =");
+        let annonce = position("self.dispatch_now_playing(");
+        assert!(
+            resultat < annonce,
+            "`dispatch_now_playing` est appelé AVANT que `output_sent` soit \
+             connu : une sortie en échec annoncera de nouveau une écoute qui \
+             n'a pas eu lieu (#1998)."
+        );
+    }
+
+    /// Et il doit être CONSULTÉ, pas seulement connu.
+    #[test]
+    fn l_annonce_est_conditionnee_a_output_sent() {
+        assert!(
+            code_de_production()
+                .contains("if output_sent {\n            self.dispatch_now_playing("),
+            "`dispatch_now_playing` n'est plus gardé par `if output_sent` — \
+             l'annonce « en écoute » repartirait sur un envoi refusé (#1998)."
+        );
+    }
+
+    /// L'historique local souffrait du même défaut. C'était la question laissée
+    /// ouverte par le ticket ; la réponse est oui, et elle est corrigée ici.
+    #[test]
+    fn l_historique_local_est_conditionne_lui_aussi() {
+        assert!(
+            code_de_production().contains("if output_sent && record_history"),
+            "`record_listen` n'est plus gardé par `output_sent` : \
+             `listen_history` se remplirait de titres jamais joués (#1998)."
+        );
+    }
+
+    /// Le scrobble DÉFINITIF n'a jamais été concerné — il part du poller, une
+    /// fois le seuil des 50 % / 4 min franchi. Ce test épingle cette séparation
+    /// pour que personne ne la « répare » en le ramenant au démarrage : c'est
+    /// précisément ce que #1113 avait défait.
+    #[test]
+    fn le_scrobble_definitif_reste_hors_du_demarrage() {
+        let play = position("async fn play_inner(");
+        let src = code_de_production();
+        let apres = &src[play..];
+        let fin = apres
+            .find("\n    async fn ")
+            .or_else(|| apres.find("\n    pub async fn "))
+            .unwrap_or(apres.len());
+        assert!(
+            !apres[..fin].contains("dispatch_scrobble("),
+            "le scrobble définitif est reparti dans le chemin de démarrage : \
+             il scrobblerait un titre à la seconde où il commence, en ignorant \
+             la règle des 50 % / 4 min de Last.fm (#1113)."
+        );
+    }
+
+    /// Corps d'une méthode, de sa signature jusqu'à son accolade fermante au
+    /// même niveau d'indentation. Sert à vérifier une propriété DANS une
+    /// fonction sans que le reste du fichier puisse la satisfaire à sa place.
+    fn corps_de(signature: &str) -> &'static str {
+        let debut = position(signature);
+        let apres = &code_de_production()[debut..];
+        let fin = apres
+            .find("\n    }\n")
+            .map(|i| i + 7)
+            .unwrap_or(apres.len());
+        &apres[..fin]
+    }
+
+    /// La zone navigateur n'a PAS de périphérique : `output_sent` y vaut
+    /// toujours faux. La garde ci-dessus lui avait donc supprimé toute annonce,
+    /// y compris quand elle joue — c'est la régression pour laquelle #1998 a
+    /// été rouvert. Son annonce doit être DIFFÉRÉE, pas supprimée.
+    #[test]
+    fn la_zone_navigateur_ne_perd_pas_son_annonce() {
+        assert!(
+            code_de_production().contains("if !output_sent && zone_navigateur {"),
+            "le démarrage ne met plus rien en attente pour une zone navigateur : \
+             elle ne scrobblerait plus RIEN, même en jouant (#1998, réouverture \
+             du 22/08). La sortie d'une zone navigateur est l'onglet, pas un \
+             appareil."
+        );
+    }
+
+    /// Et cette annonce différée ne part que sur PREUVE : des octets réellement
+    /// tirés de la session de flux. Pas sur l'intention de jouer.
+    #[test]
+    fn l_annonce_navigateur_suit_la_preuve_de_lecture() {
+        let corps = corps_de("pub async fn confirmer_lecture_navigateur(");
+        let preuve = corps
+            .find(".stream_bytes_sent(stream_id)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "`confirmer_lecture_navigateur` n'interroge plus les octets tirés : \
+                 elle annoncerait une écoute de zone navigateur sans preuve, ce que \
+                 #1998 reproche au démarrage."
+                )
+            });
+        let annonce = corps.find("self.dispatch_now_playing(").unwrap_or_else(|| {
+            panic!("`confirmer_lecture_navigateur` n'annonce plus rien du tout (#1998)")
+        });
+        assert!(
+            preuve < annonce,
+            "l'annonce de zone navigateur part AVANT la preuve que l'onglet tire \
+             le flux : c'est très exactement le défaut d'origine, déplacé (#1998)."
+        );
+    }
+
+    /// L'historique local de zone navigateur suit la même preuve, et garde le
+    /// drapeau `record_history` du démarrage : une re-création de flux pour une
+    /// piste déjà en cours (recherche de position) ne doit pas doublonner.
+    #[test]
+    fn l_historique_navigateur_garde_record_history() {
+        assert!(
+            corps_de("pub async fn confirmer_lecture_navigateur(")
+                .contains("if attente.record_history && attente.source != \"radio\" {"),
+            "l'historique de zone navigateur ne consulte plus `record_history` : \
+             déplacer le curseur ajouterait une ligne à chaque fois (#1998)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_scope_tests {
+    use super::PlaybackOrchestrator;
+
+    /// Le repli de `stop` ne doit JAMAIS toucher l'appareil d'une autre zone.
+    ///
+    /// Le défaut mesuré sur .18 le 28/08/2026 : la zone 15 « Cet ordinateur »
+    /// est une sortie navigateur, donc sans `output_device_id` par
+    /// construction. Chaque `next` dessus tombait dans le repli, qui arrêtait
+    /// TOUTES les sorties enregistrées — l'Eversolo de la zone 10 compris, en
+    /// pleine lecture. Même famille que #2571.
+    #[test]
+    fn le_repli_de_stop_epargne_les_sorties_des_autres_zones() {
+        // Zone 15 : navigateur, aucun appareil. Zones 10 et 8 : renderers.
+        let zones = [
+            (Some(15i64), None),
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 15);
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+            "uuid:orpheline-sans-zone".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+
+        assert!(
+            !a_arreter.contains(&"uuid:eversolo-dmp-a8".to_string()),
+            "un stop sur la zone 15 ne doit pas couper l'Eversolo, qui joue la zone 10"
+        );
+        assert!(
+            !a_arreter.contains(&"uuid:sonos-chambre".to_string()),
+            "ni le Sonos de la zone 8"
+        );
+        assert_eq!(
+            a_arreter,
+            vec!["uuid:orpheline-sans-zone".to_string()],
+            "le repli garde son seul objet légitime : une sortie qu'aucune zone ne revendique"
+        );
+    }
+
+    /// Et la zone qui demande l'arrêt ne s'épargne pas elle-même : si elle a
+    /// laissé une sortie ouverte, le repli doit encore pouvoir la fermer.
+    #[test]
+    fn le_repli_peut_toujours_fermer_la_sortie_de_la_zone_qui_arrete() {
+        let zones = [
+            (Some(10i64), Some("uuid:eversolo-dmp-a8")),
+            (Some(8i64), Some("uuid:sonos-chambre")),
+        ];
+        let revendiquees =
+            PlaybackOrchestrator::sorties_revendiquees_par_les_autres_zones(zones, 10);
+        assert!(
+            !revendiquees.contains("uuid:eversolo-dmp-a8"),
+            "son propre appareil n'est pas « revendiqué ailleurs »"
+        );
+
+        let enregistrees = vec![
+            "uuid:eversolo-dmp-a8".to_string(),
+            "uuid:sonos-chambre".to_string(),
+        ];
+        let a_arreter =
+            PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
+        assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
     }
 }

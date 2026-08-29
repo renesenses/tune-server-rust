@@ -1,6 +1,12 @@
 #![deny(warnings)]
 
-use std::{borrow::Cow, net::TcpStream, sync::Arc};
+use std::{
+    borrow::Cow,
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use rustls::{
     CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore,
@@ -31,6 +37,139 @@ mod utils;
 const DEFAULT_SENDER_ID: &str = "sender-0";
 const DEFAULT_RECEIVER_ID: &str = "receiver-0";
 
+/// Le seul texte que doive porter une commande Cast abandonnée faute de temps.
+///
+/// Il existait déjà, mais n'était produit que par la branche « échéance déjà
+/// franchie AVANT l'appel » de [`DeadlineTcpStream::remaining`]. Le cas
+/// fréquent — l'échéance tombe PENDANT le read — laissait parler la socket, et
+/// la socket dit tout autre chose (voir
+/// [`DeadlineTcpStream::as_deadline_error`]).
+pub(crate) const DEADLINE_ELAPSED: &str = "Cast command deadline elapsed";
+
+/// Un délai de socket qui expire est-il en train de dire « échéance atteinte » ?
+///
+/// `TcpStream::set_read_timeout` / `set_write_timeout` documentent leur
+/// expiration ainsi : l'erreur rendue est de type **`WouldBlock` sur Unix** et
+/// **`TimedOut` sur Windows**. Les deux valent donc « le temps imparti est
+/// écoulé », et rien d'autre — ce flux est bloquant, il n'y a pas de second
+/// producteur de `WouldBlock` ici.
+///
+/// ⚠️ Cette crate est vendorisée et n'est PAS membre du workspace
+/// (`Cargo.toml` racine, clé `members`) : des tests écrits ici ne seraient
+/// jamais joués par la CI. La règle est donc éprouvée depuis `tune-core`, de
+/// bout en bout, par `outputs::chromecast::deadline_tests` — dont
+/// `une_liaison_coupee_n_est_pas_maquillee_en_echeance`, qui vérifie
+/// précisément que le test de `kind()` ci-dessous ne se laisse pas retirer.
+pub(crate) fn is_socket_deadline_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Blocking TCP stream whose every read and write is bounded by one absolute
+/// deadline. Refreshing the socket timeout before each operation prevents a
+/// sequence of individually bounded Cast requests from exceeding the command's
+/// global budget.
+pub struct DeadlineTcpStream {
+    inner: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineTcpStream {
+    fn unbounded(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            deadline: None,
+        }
+    }
+
+    fn bounded(inner: TcpStream, deadline: Instant) -> Self {
+        Self {
+            inner,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        self.deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED))
+            })
+            .transpose()
+    }
+
+    /// Traduire l'expiration du délai de socket en échéance de commande (#2566).
+    ///
+    /// **Le défaut.** Le délai posé par [`Self::refresh_read_timeout`] expire en
+    /// rendant `WouldBlock` sur Unix. Sur macOS, `WouldBlock` est `EAGAIN`,
+    /// c'est-à-dire **`os error 35`**, dont le texte système est *« Resource
+    /// temporarily unavailable »* ; sur Linux, `os error 11` et le même texte.
+    /// Ce texte remontait tel quel jusqu'au journal :
+    ///
+    /// ```text
+    /// error=media status: Resource temporarily unavailable (os error 35)
+    /// ```
+    ///
+    /// Il envoie chercher une ressource occupée qui n'existe pas, et son
+    /// « temporarily » suggère de réessayer alors que la cause est un budget
+    /// épuisé. Chez Dimitri (0.9.115 macOS, fil 1577), cette ligne s'est répétée
+    /// **79 fois de suite** sans jamais dire ce qui se passait vraiment.
+    ///
+    /// **Pourquoi la traduction est exacte, et non une approximation.** Le délai
+    /// posé sur la socket ne vaut pas une durée arbitraire : il VAUT le temps
+    /// restant jusqu'à `deadline` ([`Self::refresh_read_timeout`] le
+    /// recalcule avant chaque opération). Son expiration est donc littéralement
+    /// l'échéance atteinte — le même événement que la branche `Err` de
+    /// [`Self::remaining`], qui porte déjà le bon message quand l'échéance est
+    /// franchie AVANT le read. Les deux chemins disent désormais la même chose.
+    ///
+    /// **Sans échéance, on ne traduit rien.** [`Self::unbounded`] ne pose aucun
+    /// délai : un `WouldBlock` y viendrait d'autre chose, et l'écraser
+    /// perdrait l'information.
+    fn as_deadline_error(&self, error: io::Error) -> io::Error {
+        if self.deadline.is_some() && is_socket_deadline_error(&error) {
+            return io::Error::new(io::ErrorKind::TimedOut, DEADLINE_ELAPSED);
+        }
+        error
+    }
+
+    fn refresh_read_timeout(&self) -> io::Result<()> {
+        if let Some(remaining) = self.remaining()? {
+            self.inner.set_read_timeout(Some(remaining))?;
+        }
+        Ok(())
+    }
+
+    fn refresh_write_timeout(&self) -> io::Result<()> {
+        if let Some(remaining) = self.remaining()? {
+            self.inner.set_write_timeout(Some(remaining))?;
+        }
+        Ok(())
+    }
+}
+
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.refresh_read_timeout()?;
+        self.inner.read(buf).map_err(|e| self.as_deadline_error(e))
+    }
+}
+
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.refresh_write_timeout()?;
+        self.inner.write(buf).map_err(|e| self.as_deadline_error(e))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.refresh_write_timeout()?;
+        self.inner.flush().map_err(|e| self.as_deadline_error(e))
+    }
+}
+
 #[cfg(feature = "thread_safe")]
 type Lrc<T> = std::sync::Arc<T>;
 #[cfg(not(feature = "thread_safe"))]
@@ -54,19 +193,19 @@ pub enum ChannelMessage {
 
 /// Structure that manages connection to a cast device.
 pub struct CastDevice<'a> {
-    message_manager: Lrc<MessageManager<StreamOwned<ClientConnection, TcpStream>>>,
+    message_manager: Lrc<MessageManager<StreamOwned<ClientConnection, DeadlineTcpStream>>>,
 
     /// Channel that manages connection responses/requests.
-    pub connection: ConnectionChannel<'a, StreamOwned<ClientConnection, TcpStream>>,
+    pub connection: ConnectionChannel<'a, StreamOwned<ClientConnection, DeadlineTcpStream>>,
 
     /// Channel that allows connection to stay alive (via ping-pong requests/responses).
-    pub heartbeat: HeartbeatChannel<'a, StreamOwned<ClientConnection, TcpStream>>,
+    pub heartbeat: HeartbeatChannel<'a, StreamOwned<ClientConnection, DeadlineTcpStream>>,
 
     /// Channel that manages various media stuff.
-    pub media: MediaChannel<'a, StreamOwned<ClientConnection, TcpStream>>,
+    pub media: MediaChannel<'a, StreamOwned<ClientConnection, DeadlineTcpStream>>,
 
     /// Channel that manages receiving platform (e.g. Chromecast).
-    pub receiver: ReceiverChannel<'a, StreamOwned<ClientConnection, TcpStream>>,
+    pub receiver: ReceiverChannel<'a, StreamOwned<ClientConnection, DeadlineTcpStream>>,
 }
 
 impl<'a> CastDevice<'a> {
@@ -114,7 +253,8 @@ impl<'a> CastDevice<'a> {
             log::debug!("Successfully parsed {valid} root certificates.");
         }
 
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
             .with_root_certificates(root_store)
             .with_no_client_auth();
         config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -123,7 +263,10 @@ impl<'a> CastDevice<'a> {
             config.into(),
             ServerName::try_from(host.as_ref())?.to_owned(),
         )?;
-        let stream = StreamOwned::new(conn, TcpStream::connect((host.as_ref(), port))?);
+        let stream = StreamOwned::new(
+            conn,
+            DeadlineTcpStream::unbounded(TcpStream::connect((host.as_ref(), port))?),
+        );
 
         log::debug!("Connection with {host}:{port} successfully established.");
 
@@ -163,7 +306,8 @@ impl<'a> CastDevice<'a> {
 
         log::debug!("Establishing non-verified connection with cast device at {host}:{port}…");
 
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
             .with_no_client_auth();
@@ -173,10 +317,81 @@ impl<'a> CastDevice<'a> {
                 Arc::new(config),
                 ServerName::try_from(host.as_ref())?.to_owned(),
             )?,
-            TcpStream::connect((host.as_ref(), port))?,
+            DeadlineTcpStream::unbounded(TcpStream::connect((host.as_ref(), port))?),
         );
 
         log::debug!("Connection with {host}:{port} successfully established.");
+
+        CastDevice::connect_to_device(stream)
+    }
+
+    /// Connects without host verification while enforcing one absolute
+    /// deadline across every resolved address and every subsequent TLS/Cast
+    /// read or write.
+    pub fn connect_without_host_verification_with_deadline(
+        host: String,
+        addresses: &[SocketAddr],
+        deadline: Instant,
+    ) -> Result<CastDevice<'static>, Error> {
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "Cast host resolved to no address",
+            )
+            .into());
+        }
+
+        let mut last_error = None;
+        let mut tcp_stream = None;
+        for (index, address) in addresses.iter().enumerate() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Cast connect deadline elapsed",
+                )
+                .into());
+            };
+            let addresses_left = (addresses.len() - index) as u32;
+            let attempt_budget = remaining / addresses_left;
+            if attempt_budget.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Cast connect deadline elapsed",
+                )
+                .into());
+            }
+            match TcpStream::connect_timeout(address, attempt_budget) {
+                Ok(stream) => {
+                    tcp_stream = Some(stream);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let tcp_stream = match tcp_stream {
+            Some(stream) => stream,
+            None => {
+                return Err(last_error
+                    .unwrap_or_else(|| {
+                        io::Error::new(io::ErrorKind::TimedOut, "Cast connect deadline elapsed")
+                    })
+                    .into());
+            }
+        };
+
+        let mut config = ClientConfig::builder_with_provider(default_provider().into())
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
+            .with_no_client_auth();
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        let stream = StreamOwned::new(
+            ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from(host.as_str())?.to_owned(),
+            )?,
+            DeadlineTcpStream::bounded(tcp_stream, deadline),
+        );
 
         CastDevice::connect_to_device(stream)
     }
@@ -246,7 +461,7 @@ impl<'a> CastDevice<'a> {
     ///
     /// Instance of `CastDevice` that allows you to manage connection.
     fn connect_to_device(
-        ssl_stream: StreamOwned<ClientConnection, TcpStream>,
+        ssl_stream: StreamOwned<ClientConnection, DeadlineTcpStream>,
     ) -> Result<CastDevice<'a>, Error> {
         let message_manager_rc = Lrc::new(MessageManager::new(ssl_stream));
 

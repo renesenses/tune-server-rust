@@ -30,6 +30,11 @@ pub fn router() -> Router<AppState> {
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
+        .route("/other-versions", get(other_versions))
+        .route(
+            "/artist-releases",
+            get(super::artist_releases::artist_releases),
+        )
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
 }
@@ -116,6 +121,18 @@ async fn continue_listening(
     Ok(Json(json!(items)))
 }
 
+// #2441 — cette requete part de `albums` et se termine par
+// `HAVING listened_tracks < a.track_count` : elle ne PEUT rien rendre d'autre
+// qu'un album de la bibliotheque locale, quelle que soit la nature de ce que
+// l'auditeur avait demande. C'est le defaut releve par FabienM (fil 1557).
+//
+// Depuis la migration 84, `listen_history` porte `context_type` /
+// `context_id` : l'intention est desormais ECRITE. Ce qu'il faut en AFFICHER
+// — mettre une playlist a cote d'un album, un artiste, un titre isole ; le
+// devenir du `HAVING` qui fait disparaitre un album fini ; les badges par
+// type — releve d'un arbitrage produit qui n'a pas ete rendu. La requete
+// n'est donc pas touchee ici : il n'y a rien de moins fiable qu'une regle
+// d'affichage inventee par celui qui pose le socle.
 fn fetch_continue_listening(
     state: &AppState,
     limit: i64,
@@ -461,6 +478,251 @@ async fn new_in_library(
         })
         .collect();
     Ok(Json(json!(items)))
+}
+
+/// Les ecoutes recentes examinees pour la recherche STREAMING. Chacune coute
+/// une recherche par service connecte (moins le cache) : ce nombre est le
+/// budget reseau de la section, pas un choix d'affichage.
+const ECOUTES_STREAMING: usize = 6;
+
+/// `GET /home/other-versions` — les autres versions, DANS LA BIBLIOTHEQUE, des
+/// morceaux ecoutes RECEMMENT.
+///
+/// ## Pourquoi les N dernieres ecoutes, et non « aujourd'hui »
+///
+/// La premiere version bornait sur le jour CIVIL, en UTC. Deux defauts, vus
+/// des la mise en service :
+///
+/// 1. **Minuit UTC coupe la soiree.** A 10 h du matin en France, tout ce qui
+///    a ete ecoute la veille apres 2 h — donc toute la soiree — etait deja
+///    hors fenetre. Le jour civil de l'utilisateur ne commence pas a la meme
+///    heure que celui du serveur, et le fuseau du navigateur n'arrive pas
+///    jusqu'ici.
+/// 2. **Un jour ordinaire ne contient pas assez de matiere.** Mesure sur une
+///    bibliotheque reelle : UNE ecoute dans la fenetre, et donc une section
+///    vide la plupart du temps.
+///
+/// J'avais justifie l'UTC en invoquant le correctif des horaires de favoris
+/// radio (#2179). C'etait un mauvais raisonnement : ce defaut-la portait sur
+/// l'AFFICHAGE d'un horodatage, pas sur la definition d'une journee.
+///
+/// Les N dernieres ecoutes n'ont ni fuseau ni bord de journee. La fenetre ne
+/// glisse pas, ne depend d'aucune horloge, et contient toujours de la matiere.
+///
+/// Le cas concret : on ecoute « Ordinary World » depuis The Wedding Album, et
+/// on possede aussi la version acoustique sur une compilation. Rien ne le dit
+/// aujourd'hui — il faut chercher le titre a la main pour s'en apercevoir.
+///
+/// ## Ce que cette route fait, et ce qu'elle ne fait PAS
+///
+/// Elle rapproche **titre + artiste**, et ne retient que les pistes d'un
+/// **autre album** que celui ecoute. C'est volontairement etroit :
+///
+/// - pas de reprises par un autre interprete (« Comme d'habitude » / « My Way ») :
+///   cela demande les relations d'oeuvre de MusicBrainz, donc un MBID, et la
+///   couverture MBID de la bibliotheque est encore trop faible pour que le
+///   resultat soit autre chose qu'un hasard ;
+/// - les versions des services de streaming sont cherchees sur un vivier plus
+///   petit et mises en cache six heures, afin de borner les appels distants.
+///
+/// Le rapprochement local est insensible a la casse et strict sur le coeur du
+/// titre : seul un suffixe d'edition delimite par ` (` ou ` [` est admis. Il
+/// ne s'agit pas d'une recherche floue.
+async fn other_versions(
+    State(state): State<AppState>,
+    Query(p): Query<HomeParams>,
+) -> Result<Json<Value>, AppError> {
+    // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
+    // venir tel quel de l'URL.
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    // Le vivier d'ecoutes examine. Large devant `limit` : beaucoup de morceaux
+    // n'ont aucune autre version, il en faut donc bien plus que de groupes
+    // souhaites pour en remplir quelques-uns.
+    const ECOUTES_EXAMINEES: usize = 200;
+
+    // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
+    // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
+    // SQLite et PostgreSQL.
+    // Le rapprochement lui-meme est ecrit UNE fois, dans
+    // `routes::versions` : la route par piste (#2372) applique exactement
+    // la meme regle a un vivier different.
+    let predicat = crate::routes::versions::predicat_rapprochement(
+        "lh.title",
+        "lh.artist_name",
+        "lh.album_title",
+    );
+    let sql = format!(
+        "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms \
+        FROM (SELECT title, artist_name, album_title, listened_at \
+              FROM listen_history \
+              WHERE artist_name IS NOT NULL \
+              ORDER BY listened_at DESC \
+              LIMIT {ECOUTES_EXAMINEES}) lh \
+        CROSS JOIN tracks t \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
+        LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+        WHERE {predicat} \
+        ORDER BY lh.listened_at DESC \
+        LIMIT {limit}"
+    );
+
+    // Une piste ecoutee, ses autres versions : on regroupe cote serveur pour
+    // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
+    // chacun des trois clients).
+    let mut groupes: Vec<Value> = Vec::new();
+    for cols in state.backend.query_many(&sql, &[]).unwrap_or_default() {
+        let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+        let version = json!({
+            "track_id": cols.get(3).and_then(|v| v.as_i64()),
+            "album_id": cols.get(4).and_then(|v| v.as_i64()),
+            "album_title": cols.get(5).and_then(|v| v.as_string()),
+            "cover_path": cols.get(6).and_then(|v| v.as_string()),
+            "duration_ms": cols.get(7).and_then(|v| v.as_i64()),
+        });
+        match groupes.iter_mut().find(|g| {
+            g["title"].as_str() == Some(titre.as_str())
+                && g["artist_name"].as_str() == Some(artiste.as_str())
+        }) {
+            Some(g) => {
+                if let Some(arr) = g["versions"].as_array_mut() {
+                    arr.push(version);
+                }
+            }
+            None => groupes.push(json!({
+                "title": titre,
+                "artist_name": artiste,
+                "played_album": joue,
+                "versions": [version],
+            })),
+        }
+    }
+
+    // ── Les versions et reprises DISPONIBLES EN STREAMING ──
+    //
+    // La doc de cette route promettait ce branchement « quand la section
+    // aurait fait ses preuves en local » : c'est demande explicitement
+    // maintenant. Budget borne : les ECOUTES_STREAMING dernieres ecoutes
+    // distinctes, UNE recherche par service et par titre, cache six heures.
+    // Les N derniers TITRES distincts — pas les N dernières lignes. Trois
+    // réécoutes du même morceau mangeaient tout le budget : sur un accueil
+    // réel, un seul groupe sur sept avait sa recherche streaming, et
+    // « Billie Jean » — écoutée juste avant — n'en avait aucune (25/08).
+    let sql_recentes = format!(
+        "SELECT title, artist_name, MAX(COALESCE(album_title, '')) FROM (SELECT title, artist_name, album_title, listened_at FROM listen_history WHERE artist_name IS NOT NULL ORDER BY listened_at DESC LIMIT 200) le GROUP BY title, artist_name ORDER BY MAX(listened_at) DESC LIMIT {ECOUTES_STREAMING}"
+    );
+    let recentes: Vec<(String, String, String)> = state
+        .backend
+        .query_many(&sql_recentes, &[])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cols| {
+            Some((
+                cols.first().and_then(|v| v.as_string())?,
+                cols.get(1).and_then(|v| v.as_string())?,
+                cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+            ))
+        })
+        .collect();
+
+    for (titre, artiste, album) in recentes {
+        let trouvees =
+            crate::routes::versions::versions_streaming(&state, &titre, &artiste, &album).await;
+        if trouvees.is_empty() {
+            continue;
+        }
+        match groupes.iter_mut().find(|g| {
+            g["title"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&titre))
+                && g["artist_name"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(&artiste))
+        }) {
+            Some(g) => g["streaming"] = json!(trouvees),
+            // Un morceau sans autre version LOCALE forme quand meme un groupe
+            // si le streaming en a : c'est le cas « Billie Jean » — aucune
+            // autre version possedee, des dizaines disponibles.
+            None => groupes.push(json!({
+                "title": titre,
+                "artist_name": artiste,
+                "played_album": album,
+                "versions": [],
+                "streaming": trouvees,
+            })),
+        }
+    }
+
+    Ok(Json(json!(groupes)))
+}
+
+#[cfg(test)]
+mod tests_other_versions {
+    use super::*;
+
+    /// Le second appelant du predicat partage (#2638) doit accepter la meme
+    /// variante de titre que la route par piste, sans perdre l'artiste reel
+    /// d'une piste rangee dans une compilation « Artistes divers ».
+    #[tokio::test]
+    async fn accueil_retrouve_une_edition_suffixee_du_titre_ecoute() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Hit Collection', ?1)",
+            &[&divers as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Before The Dawn', ?1)",
+            &[&kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let before = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Running Up That Hill (A Deal With God)', ?1, ?2, 296000, '/before.flac')",
+            &[&before as &dyn ToSqlValue, &kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, listened_at) \
+             VALUES ('Running Up that Hill', 'Kate Bush', 'Hit Collection', \
+                     '2026-08-28T09:32:00Z')",
+            &[],
+        )
+        .unwrap();
+
+        let resultat = other_versions(
+            State(state),
+            Query(HomeParams {
+                limit: Some(20),
+                zone_id: None,
+            }),
+        )
+        .await;
+        let Json(groupes) = match resultat {
+            Ok(reponse) => reponse,
+            Err(_) => panic!("la route doit repondre"),
+        };
+
+        let groupes = groupes.as_array().expect("groupes de versions");
+        assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
+        assert_eq!(
+            groupes[0]["versions"][0]["album_title"].as_str(),
+            Some("Before The Dawn")
+        );
+    }
 }
 
 /// Favorite radios + recently played radios.

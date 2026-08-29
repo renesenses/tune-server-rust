@@ -1,5 +1,6 @@
 pub mod artwork;
 pub mod artwork_cache;
+pub mod audit;
 pub mod cover_fetcher;
 pub mod duplicate_detector;
 pub mod export;
@@ -8,6 +9,8 @@ pub mod full_text_search;
 pub mod genre_tree;
 pub mod importer;
 pub mod ingest;
+pub mod local_path;
+pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod playlist_scan;
 pub mod smart_collections;

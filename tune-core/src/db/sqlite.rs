@@ -365,7 +365,15 @@ CREATE TABLE IF NOT EXISTS albums (
     original_date TEXT,
     -- The folder on disk holding this release. What identifies an album: see
     -- `scanner::album_folder`.
-    folder_path TEXT
+    folder_path TEXT,
+    -- Le disque est-il une compilation ? 0/1, jamais NUL en pratique (#1957).
+    -- Le drapeau etait lu dans les tags (TCMP) et servait au scan a decider du
+    -- regroupement par artiste d'album, puis il etait jete : aucune requete ne
+    -- pouvait le rendre, aucun ecran l'afficher. Il est desormais ecrit ici par
+    -- le scan, avec exactement la decision qui a produit le regroupement — donc
+    -- la pastille explique toujours ce que l'utilisateur voit.
+    -- PG : SMALLINT 0/1 (migration 028), meme convention que muted/is_hidden.
+    is_compilation INTEGER DEFAULT 0
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
@@ -406,7 +414,14 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- Cover embedded in THIS file. The album cover stays the norm; this is the
     -- override for a track whose album is a folder of unrelated files, where
     -- one track's artwork must not stand for all the others (forum #1312).
-    cover_path TEXT
+    cover_path TEXT,
+    -- Piste virtuelle issue d'une feuille CUE (#1763). `file_path` reste NUL
+    -- pour ces pistes — plusieurs partagent le meme fichier, ce que la
+    -- contrainte UNIQUE interdirait, mais elle tolere plusieurs NULL. Le vrai
+    -- chemin vit ici, avec les bornes de la piste dans le fichier.
+    cue_media_path TEXT,
+    cue_start_ms INTEGER,
+    cue_end_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -470,6 +485,9 @@ CREATE TABLE IF NOT EXISTS zones (
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
     dlna_native_flac INTEGER DEFAULT 0,
+    -- Servir l'AAC tel quel au renderer qui le decode (#1424). Eteint par
+    -- defaut : un renderer qui l'annonce peut le refuser en pratique.
+    aac_passthrough INTEGER DEFAULT 0,
     host TEXT,
     mac TEXT,
     -- Décalage des paroles synchronisées, en ms (positif = retardées).

@@ -556,24 +556,22 @@ mod tests {
         form.extend_from_slice(&ssnd);
 
         // Write to temp file
-        let tmp = std::env::temp_dir().join("test_synthetic.aiff");
-        std::fs::write(&tmp, &form).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
+        std::fs::write(tmp.path(), &form).unwrap();
 
-        let info = parse_aiff(tmp.to_str().unwrap()).unwrap();
+        let info = parse_aiff(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(info.channels, 1);
         assert_eq!(info.num_frames, 4);
         assert_eq!(info.bits_per_sample, 16);
         assert!((info.sample_rate - 44100.0).abs() < 0.01);
         assert!(!info.is_aifc);
 
-        let decoded = decode_aiff_to_pcm(tmp.to_str().unwrap(), 0.0, 0.0).unwrap();
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
         assert_eq!(decoded.samples_i32.len(), 4);
         assert_eq!(decoded.samples_i32[0], 1000);
         assert_eq!(decoded.samples_i32[1], -1000);
         assert_eq!(decoded.samples_i32[2], 2000);
         assert_eq!(decoded.samples_i32[3], -2000);
-
-        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
@@ -617,18 +615,16 @@ mod tests {
         form.extend_from_slice(&comm);
         form.extend_from_slice(&ssnd);
 
-        let tmp = std::env::temp_dir().join("test_synthetic_sowt.aiff");
-        std::fs::write(&tmp, &form).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
+        std::fs::write(tmp.path(), &form).unwrap();
 
-        let info = parse_aiff(tmp.to_str().unwrap()).unwrap();
+        let info = parse_aiff(tmp.path().to_str().unwrap()).unwrap();
         assert!(info.is_aifc);
         assert_eq!(info.compression.as_deref(), Some("sowt"));
 
-        let decoded = decode_aiff_to_pcm(tmp.to_str().unwrap(), 0.0, 0.0).unwrap();
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
         assert_eq!(decoded.samples_i32.len(), 2);
         assert_eq!(decoded.samples_i32[0], 500);
         assert_eq!(decoded.samples_i32[1], -500);
-
-        std::fs::remove_file(&tmp).ok();
     }
 }

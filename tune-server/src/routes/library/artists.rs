@@ -74,12 +74,29 @@ pub(super) async fn artist_bio(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let lang = q.lang.as_deref().unwrap_or("fr");
+
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
     // TheAudioDB bio and its licence to the client.
+    //
+    // MAIS seulement si elle est dans la bonne langue (#1849, Dimitri).
+    //
+    // Cette branche rendait la bio stockée sans jamais regarder ni sa langue ni
+    // celle qu'on demande, et le `lang` ci-dessus n'était donc JAMAIS atteint
+    // pour un artiste qui en possédait une. Or l'enrichissement récupère les
+    // bios dans la langue de CELUI QUI LE LANCE (`enrich.rs:139`,
+    // `lang_from_header`) : une bibliothèque enrichie depuis une interface en
+    // français stocke tout en français, et le sert ensuite à tout le monde.
+    // C'est exactement ce que voit Dimitri.
+    let prov = repo.bio_provenance(id).ok().flatten();
+    let bio_lang = prov
+        .as_ref()
+        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
+    let stored_ok = langue_convient(bio_lang, lang);
+
     if let Some(ref bio) = artist.bio {
-        if !bio.is_empty() {
-            let prov = repo.bio_provenance(id).ok().flatten();
+        if !bio.is_empty() && stored_ok {
             return Json(json!({
                 "artist": artist.name,
                 "bio": bio,
@@ -91,7 +108,6 @@ pub(super) async fn artist_bio(
     // Community artist-bio API is keyed by NAME (AI-generated on demand) — NO
     // MusicBrainz id required, so it works for the whole library, most of which
     // has no MBID. Mirrors the album path.
-    let lang = q.lang.as_deref().unwrap_or("fr");
     let cache_key = format!("cache:artistbio:{}:{lang}", artist.name);
     if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
@@ -99,7 +115,12 @@ pub(super) async fn artist_bio(
     match state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/artists/bio")
-        .query(&[("name", artist.name.as_str())])
+        // `lang` est transmis au site, qui ne le recevait pas : il ne servait
+        // qu'à nommer l'entrée de cache. ⚠️ L'effet dépend du site
+        // (`site-mozaiklabs`) : s'il ignore le paramètre, il rendra la même
+        // langue qu'avant — sans régression, mais sans gain non plus. À
+        // vérifier là-bas avant d'annoncer #1849 comme réglé.
+        .query(&[("name", artist.name.as_str()), ("lang", lang)])
         .send()
         .await
     {
@@ -115,7 +136,54 @@ pub(super) async fn artist_bio(
             }
             Json(out).into_response()
         }
-        _ => Json(json!({"artist": artist.name, "bio": null})).into_response(),
+        _ => repli_sur_la_bio_stockee(&artist.name, artist.bio.as_deref(), prov),
+    }
+}
+
+/// La langue d'une bio stockée convient-elle à celle qu'on demande ?
+///
+/// Comparaison sur la base seule : `fr` et `fr-FR` désignent la même chose, et
+/// une bio Wikipédia française n'est pas moins française parce qu'un client
+/// annonce `fr-CA`.
+///
+/// ⚠️ Une langue INCONNUE — colonne vide sur une ligne ancienne — est acceptée.
+/// C'est délibéré : refuser déclencherait un appel réseau pour chaque artiste
+/// dont la provenance n'a jamais été renseignée, à la première ouverture de
+/// chaque fiche. On ne dispose d'aucune preuve que ces bios soient dans la
+/// mauvaise langue ; un ré-enrichissement renseignera `bio_lang` et la
+/// comparaison redeviendra exacte.
+pub(super) fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
+    let Some(stockee) = stockee.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let base = |s: &str| {
+        s.split(['-', '_'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    base(stockee) == base(demandee)
+}
+
+/// Ressert la bio stockée quand la langue demandée n'a rien donné.
+///
+/// « Une biographie en français vaut mieux qu'un panneau vide » — le ticket le
+/// dit, et c'est juste : refuser une bio dans la mauvaise langue serait
+/// remplacer un défaut par un pire. La provenance part avec elle, donc le
+/// client sait dans quelle langue elle est et peut le signaler.
+fn repli_sur_la_bio_stockee(
+    nom: &str,
+    bio: Option<&str>,
+    prov: Option<Value>,
+) -> axum::response::Response {
+    match bio.filter(|b| !b.is_empty()) {
+        Some(b) => Json(json!({
+            "artist": nom,
+            "bio": b,
+            "bio_provenance": prov,
+        }))
+        .into_response(),
+        None => Json(json!({"artist": nom, "bio": null})).into_response(),
     }
 }
 
@@ -430,4 +498,44 @@ pub(super) async fn update_artist(
     }
 
     Json(json!(artist)).into_response()
+}
+
+#[cfg(test)]
+mod tests_langue_bio {
+    use super::langue_convient;
+
+    /// Le cas de Dimitri (#1849) : bibliothèque enrichie en français, lecteur
+    /// anglophone. La bio stockée ne doit PAS être resservie telle quelle.
+    #[test]
+    fn une_bio_francaise_ne_convient_pas_a_une_demande_anglaise() {
+        assert!(!langue_convient(Some("fr"), "en"));
+    }
+
+    #[test]
+    fn la_meme_langue_convient() {
+        assert!(langue_convient(Some("fr"), "fr"));
+        assert!(langue_convient(Some("en"), "en"));
+    }
+
+    /// `fr` et `fr-FR` désignent la même chose : une bio Wikipédia française
+    /// n'est pas moins française parce qu'un client annonce `fr-CA`.
+    #[test]
+    fn seule_la_base_de_la_langue_compte() {
+        assert!(langue_convient(Some("fr"), "fr-FR"));
+        assert!(langue_convient(Some("fr-FR"), "fr"));
+        assert!(langue_convient(Some("fr_CA"), "fr-BE"));
+        assert!(langue_convient(Some("EN"), "en-GB"));
+        assert!(!langue_convient(Some("fr-FR"), "en-GB"));
+    }
+
+    /// Une langue inconnue est ACCEPTÉE, délibérément. Refuser déclencherait un
+    /// appel réseau pour chaque artiste dont la provenance n'a jamais été
+    /// renseignée, à la première ouverture de chaque fiche — et rien ne dit que
+    /// ces bios soient dans la mauvaise langue.
+    #[test]
+    fn une_langue_inconnue_est_acceptee() {
+        assert!(langue_convient(None, "en"));
+        assert!(langue_convient(Some(""), "en"));
+        assert!(langue_convient(Some("   "), "en"));
+    }
 }

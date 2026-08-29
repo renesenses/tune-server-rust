@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
@@ -53,6 +54,7 @@ pub struct SqueezeboxOutput {
     player_id: String,
     lms_host: String,
     lms_port: u16,
+    muted: AtomicBool,
 }
 
 impl SqueezeboxOutput {
@@ -67,6 +69,7 @@ impl SqueezeboxOutput {
             player_id,
             lms_host,
             lms_port,
+            muted: AtomicBool::new(false),
         }
     }
 
@@ -182,6 +185,10 @@ impl OutputTarget for SqueezeboxOutput {
         "squeezebox"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, true, false)
+    }
+
     /// Opt out of the poller's position-polling (DLNA-style) gapless. On this
     /// LMS-CLI proxy, staging the next track is `playlist add` (an append to
     /// LMS's OWN playlist), and the poller's gapless advance is metadata-only —
@@ -250,6 +257,7 @@ impl OutputTarget for SqueezeboxOutput {
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
         let val = if muted { 1 } else { 0 };
         self.player_command(&format!("mixer muting {val}"))?;
+        self.muted.store(muted, Ordering::Relaxed);
         Ok(())
     }
 
@@ -288,13 +296,16 @@ impl OutputTarget for SqueezeboxOutput {
             position_ms,
             duration_ms,
             volume,
-            muted: false,
+            muted: self.muted.load(Ordering::Relaxed),
             current_uri,
             track_title,
             track_artist,
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 

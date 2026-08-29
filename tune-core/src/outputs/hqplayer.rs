@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 /// Default HQPlayer Control API port (v4/v5).
 pub const HQPLAYER_DEFAULT_PORT: u16 = 4321;
@@ -433,6 +433,10 @@ impl OutputTarget for HqplayerOutput {
         "hqplayer"
     }
 
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::v1(true, true, true, true, false, false)
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host)
     }
@@ -499,8 +503,7 @@ impl OutputTarget for HqplayerOutput {
     }
 
     async fn set_mute(&self, _muted: bool) -> Result<(), String> {
-        // HQPlayer protocol does not have a mute toggle
-        Ok(())
+        Err("mute not supported by the HQPlayer protocol".into())
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -541,6 +544,9 @@ impl OutputTarget for HqplayerOutput {
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
+            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
+            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
+            dop_active: false,
         })
     }
 

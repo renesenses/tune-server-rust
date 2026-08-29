@@ -1,6 +1,79 @@
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+/// Réponse impulsionnelle en domaine temporel, indépendante d'un flux.
+///
+/// La configuration conserve volontairement les taps et leur cadence source :
+/// une instance [`Convolver`] est un état de traitement lié à un nombre de
+/// canaux et doit être reconstruite quand le format du flux change (#2210).
+#[derive(Clone)]
+pub struct ConvolverConfig {
+    impulse_response: Arc<[Vec<f32>]>,
+    sample_rate: u32,
+}
+
+impl ConvolverConfig {
+    pub fn new(impulse_response: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("la cadence de la réponse impulsionnelle doit être positive".into());
+        }
+        if impulse_response.is_empty() || impulse_response.iter().any(Vec::is_empty) {
+            return Err("la réponse impulsionnelle doit contenir des taps sur chaque canal".into());
+        }
+        Ok(Self {
+            impulse_response: impulse_response.into(),
+            sample_rate,
+        })
+    }
+
+    pub fn from_wav(path: &str) -> Result<Self, String> {
+        let (impulse_response, sample_rate) = Convolver::read_wav_ir(path)?;
+        Self::new(impulse_response, sample_rate)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn source_channels(&self) -> usize {
+        self.impulse_response.len()
+    }
+
+    /// Bâtir le moteur pour le format réellement négocié.
+    ///
+    /// Aucun rééchantillonnage silencieux : l'utilisateur reçoit la cadence à
+    /// laquelle réexporter son filtre. Une IR mono est explicitement dupliquée
+    /// sur tous les canaux ; tout autre écart de layout est refusé.
+    pub fn build_for(
+        &self,
+        block_size: usize,
+        target_sample_rate: u32,
+        target_channels: usize,
+    ) -> Result<Convolver, String> {
+        if target_channels == 0 {
+            return Err("le flux ne contient aucun canal audio".into());
+        }
+        if self.sample_rate != target_sample_rate {
+            return Err(format!(
+                "Réponse impulsionnelle à {} Hz incompatible avec le flux à {target_sample_rate} Hz ; réexportez le filtre à {target_sample_rate} Hz",
+                self.sample_rate
+            ));
+        }
+        let adapted = if self.impulse_response.len() == target_channels {
+            self.impulse_response.to_vec()
+        } else if self.impulse_response.len() == 1 {
+            vec![self.impulse_response[0].clone(); target_channels]
+        } else {
+            return Err(format!(
+                "Réponse impulsionnelle à {} canaux incompatible avec le flux à {target_channels} canaux ; fournissez une IR mono ou une IR à {target_channels} canaux",
+                self.impulse_response.len()
+            ));
+        };
+        Ok(Convolver::new(&adapted, block_size))
+    }
+}
 
 /// Partitioned overlap-save FFT convolver for real-time FIR filtering.
 ///
@@ -20,6 +93,20 @@ pub struct Convolver {
     fdl_pos: usize,
     /// Overlap buffer per channel (tail from previous block).
     overlap: Vec<Vec<f32>>,
+    /// File de sortie par canal, amorcée de `block_size` zéros.
+    ///
+    /// Une convolution par blocs ne peut pas rendre un échantillon avant
+    /// d'avoir vu le bloc qui le contient : elle a une latence, et c'est
+    /// `block_size`. L'ancien code la niait — il réécrivait le bloc traité
+    /// À REBOURS dans le tampon d'entrée, ce qui suppose que le bloc s'y
+    /// trouve en entier. Dès qu'un bloc partiel était reporté d'un appel au
+    /// suivant, `frame + 1 - block_size` sous-débordait (#2209).
+    ///
+    /// Avec une file amorcée, chaque trame entrée rend une trame sortie, et le
+    /// résultat ne dépend plus du découpage des appels.
+    output_buf: Vec<VecDeque<f32>>,
+    /// Tampon de travail d'un bloc, réutilisé — il était alloué à chaque bloc.
+    scratch: Vec<Vec<f32>>,
     fwd: Arc<dyn RealToComplex<f32>>,
     inv: Arc<dyn ComplexToReal<f32>>,
 }
@@ -62,6 +149,9 @@ impl Convolver {
 
         let input_buf = vec![Vec::with_capacity(block_size); channels];
         let overlap = vec![vec![0.0f32; fft_size - block_size]; channels];
+        // Amorçage : la latence de la convolution, rendue explicite.
+        let output_buf = vec![VecDeque::from(vec![0.0f32; block_size]); channels];
+        let scratch = vec![vec![0.0f32; block_size]; channels];
 
         Self {
             block_size,
@@ -72,6 +162,8 @@ impl Convolver {
             fdl,
             fdl_pos: 0,
             overlap,
+            output_buf,
+            scratch,
             fwd,
             inv,
         }
@@ -200,8 +292,8 @@ impl Convolver {
 
     /// Load an impulse response from a WAV file (any sample rate / channels).
     pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
-        let (ir, _sr) = Self::read_wav_ir(path)?;
-        Ok(Self::new(&ir, block_size))
+        let config = ConvolverConfig::from_wav(path)?;
+        Ok(Self::new(&config.impulse_response, block_size))
     }
 
     /// Read the raw taps of a WAV impulse response (per channel) plus its
@@ -211,6 +303,67 @@ impl Convolver {
     /// visualisation endpoint) re-reads them from the persisted file.
     pub fn read_ir_taps(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         Self::read_wav_ir(path)
+    }
+
+    /// Combiner deux reponses impulsionnelles MONO — gauche et droite — en un
+    /// seul WAV stereo, et rendre sa cadence.
+    ///
+    /// Le moteur sait deja convoluer un canal par reponse : `Convolver::new`
+    /// prend un `&[Vec<f32>]`, et un WAV stereo donne bien deux corrections
+    /// differentes. Ce qui manquait, c'est le CHEMIN D'ENTREE : les outils de
+    /// correction de piece — REW, Acourate, Audiolense — exportent DEUX
+    /// fichiers mono, `filter_L.wav` et `filter_R.wav`, jamais un stereo.
+    /// L'utilisateur devait donc les fusionner lui-meme dans un editeur audio
+    /// (Daniel, 24/08/2026).
+    ///
+    /// On ecrit le resultat au chemin que les consommateurs lisent DEJA, plutot
+    /// que d'ajouter un second reglage : la sortie locale, le chemin de
+    /// transcodage vers les renderers reseau et la visualisation
+    /// `/convolver/response` continuent de ne connaitre qu'un fichier.
+    ///
+    /// Les deux reponses doivent partager leur cadence — convoluer a des
+    /// cadences differentes decalerait un canal par rapport a l'autre. La plus
+    /// courte est completee de zeros : c'est neutre pour une convolution.
+    pub fn combiner_en_stereo(
+        chemin_gauche: &str,
+        chemin_droite: &str,
+        chemin_sortie: &str,
+    ) -> Result<u32, String> {
+        let (ir_g, sr_g) = Self::read_wav_ir(chemin_gauche)?;
+        let (ir_d, sr_d) = Self::read_wav_ir(chemin_droite)?;
+        if sr_g != sr_d {
+            return Err(format!(
+                "les deux filtres doivent partager leur cadence : {sr_g} Hz a gauche, {sr_d} Hz a droite"
+            ));
+        }
+        // Un fichier stereo passe aussi : on prend son canal correspondant, ce
+        // qui evite un refus incomprehensible si l'outil a exporte deux stereo.
+        let gauche = ir_g.first().ok_or("le filtre gauche est vide")?;
+        let droite = ir_d
+            .get(1)
+            .or_else(|| ir_d.first())
+            .ok_or("le filtre droit est vide")?;
+        if gauche.is_empty() || droite.is_empty() {
+            return Err("un des deux filtres ne contient aucun echantillon".into());
+        }
+
+        let n = gauche.len().max(droite.len());
+        let mut entrelace = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            entrelace.push(gauche.get(i).copied().unwrap_or(0.0));
+            entrelace.push(droite.get(i).copied().unwrap_or(0.0));
+        }
+        ecrire_wav_float32(chemin_sortie, &entrelace, 2, sr_g)?;
+        tracing::info!(
+            gauche = chemin_gauche,
+            droite = chemin_droite,
+            sortie = chemin_sortie,
+            sample_rate = sr_g,
+            taps_gauche = gauche.len(),
+            taps_droite = droite.len(),
+            "convolver_ir_stereo_combinee"
+        );
+        Ok(sr_g)
     }
 
     /// Load an IR for a specific stream rate + channel count. Requires the IR's
@@ -223,28 +376,73 @@ impl Convolver {
         target_sr: u32,
         target_channels: usize,
     ) -> Result<Self, String> {
-        let (ir, sr) = Self::read_wav_ir(path)?;
-        if sr != target_sr {
-            return Err(format!(
-                "IR sample rate {sr} Hz != stream rate {target_sr} Hz — export the FIR at {target_sr} Hz"
-            ));
+        ConvolverConfig::from_wav(path)?.build_for(block_size, target_sr, target_channels)
+    }
+
+    /// Remettre le moteur à zéro : plus rien de la piste précédente.
+    ///
+    /// Le convolveur est installé une fois (`set_convolver_ir`) et vit aussi
+    /// longtemps que la sortie. Sans cette remise à zéro, la file de sortie, la
+    /// ligne à retard et l'overlap portent la queue de la piste d'avant : elle
+    /// repart dans la suivante, et un seek ou un arrêt n'établit aucune
+    /// frontière (JP Robbe, revue de #2268).
+    pub fn reset(&mut self) {
+        for c in 0..self.channels {
+            self.input_buf[c].clear();
+            self.output_buf[c].clear();
+            // Ré-amorcer la latence : sans ça, la première trame de la piste
+            // suivante sortirait du néant.
+            self.output_buf[c].extend(std::iter::repeat_n(0.0f32, self.block_size));
+            self.overlap[c].iter_mut().for_each(|v| *v = 0.0);
+            for slot in self.fdl[c].iter_mut() {
+                slot.iter_mut().for_each(|v| *v = Complex::new(0.0, 0.0));
+            }
         }
-        let adapted = if ir.len() == target_channels {
-            ir
-        } else if ir.len() == 1 {
-            vec![ir[0].clone(); target_channels]
-        } else {
-            return Err(format!(
-                "IR has {} channels, stream has {target_channels}",
-                ir.len()
-            ));
-        };
-        Ok(Self::new(&adapted, block_size))
+        self.fdl_pos = 0;
+    }
+
+    /// Rendre ce que le moteur retient encore, en fin de piste.
+    ///
+    /// Une convolution par blocs garde `latency_frames()` trames en réserve —
+    /// c'est le prix de sa latence. Sans ce drainage, ces trames ne partent
+    /// jamais au périphérique : la fin de chaque piste était tronquée
+    /// (JP Robbe, revue de #2268).
+    ///
+    /// Rend des échantillons ENTRELACÉS, prêts à suivre le même chemin que le
+    /// reste. Le moteur est remis à zéro après : la piste est finie.
+    pub fn flush(&mut self) -> Vec<f32> {
+        let ch = self.channels;
+        if ch == 0 {
+            return Vec::new();
+        }
+        // Nourrir du silence pour pousser la queue hors du moteur, puis
+        // recueillir exactement ce qui restait.
+        let latence = self.latency_frames();
+        let mut queue = vec![0.0f32; latence * ch];
+        self.process_interleaved(&mut queue);
+        self.reset();
+        queue
+    }
+
+    /// Latence introduite par la convolution, en trames.
+    ///
+    /// Une convolution par blocs ne peut rien rendre avant d'avoir vu un bloc
+    /// entier. La déclarer permet aux appelants qui ont besoin d'un alignement
+    /// exact — `process_offline` — de la compenser.
+    pub fn latency_frames(&self) -> usize {
+        self.block_size
     }
 
     /// Process interleaved f32 samples in-place.
+    ///
+    /// Le résultat ne dépend PAS du découpage des appels : nourrir 1024 trames
+    /// d'un coup, ou 100 puis 924, ou 1 par 1, rend exactement la même suite,
+    /// décalée de `latency_frames()`.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
         let ch = self.channels;
+        if ch == 0 {
+            return;
+        }
         let frame_count = samples.len() / ch;
 
         for frame in 0..frame_count {
@@ -253,27 +451,31 @@ impl Convolver {
             }
 
             if self.input_buf[0].len() >= self.block_size {
-                let mut output = vec![vec![0.0f32; self.block_size]; ch];
-                self.process_block(&mut output);
-
-                let start_frame = frame + 1 - self.block_size;
-                for f in 0..self.block_size {
-                    for c in 0..ch {
-                        if start_frame + f < frame_count {
-                            samples[(start_frame + f) * ch + c] = output[c][f];
-                        }
-                    }
-                }
+                let mut sortie = std::mem::take(&mut self.scratch);
+                self.process_block(&mut sortie);
                 for c in 0..ch {
+                    self.output_buf[c].extend(sortie[c].iter().copied());
                     self.input_buf[c].drain(..self.block_size);
                 }
+                self.scratch = sortie;
+            }
+
+            // Une trame entrée, une trame sortie. La file est amorcée, donc
+            // elle n'est jamais vide — le `unwrap_or` ne couvre qu'un canal
+            // dont l'IR aurait zéro partition.
+            for c in 0..ch {
+                samples[frame * ch + c] = self.output_buf[c].pop_front().unwrap_or(0.0);
             }
         }
     }
 
     fn process_block(&mut self, output: &mut [Vec<f32>]) {
         let spectrum_len = self.fft_size / 2 + 1;
-        let num_partitions = self.ir_partitions[0].len();
+        // La ligne à retard est dimensionnée sur le MAXIMUM de partitions parmi
+        // les canaux. Prendre `ir_partitions[0].len()` ignorait la fin d'une IR
+        // plus longue sur un autre canal — une IR stéréo aux deux canaux de
+        // longueurs différentes perdait sa queue (#2209).
+        let num_partitions = self.fdl[0].len();
 
         for ch in 0..self.channels {
             let mut padded = vec![0.0f32; self.fft_size];
@@ -339,7 +541,13 @@ impl Convolver {
             let pad = (self.block_size - rem) * ch;
             samples.extend(std::iter::repeat(0.0).take(pad));
         }
+        // Compenser la latence : `process_interleaved` rend la trame `i` à la
+        // position `i + latency`. On nourrit donc `latency` trames de silence
+        // en plus, et on jette autant de trames en tête.
+        let latence = self.latency_frames();
+        samples.extend(std::iter::repeat(0.0).take(latence * ch));
         self.process_interleaved(samples);
+        samples.drain(..latence * ch);
         samples.truncate(orig_len);
     }
 
@@ -432,6 +640,43 @@ pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
 ///
 /// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
 /// which JSON can't carry); phase is the principal atan2 value in degrees.
+/// Ecrire un WAV flottant 32 bits — le format que `read_wav_ir` relit sans
+/// perte (`format_tag = 3`).
+///
+/// Volontairement minimal : un `fmt ` et un `data`, rien d'autre. Une reponse
+/// impulsionnelle n'a que faire d'un `LIST/INFO`, et moins il y a de chunks,
+/// moins il y a de facons de se tromper en les relisant.
+fn ecrire_wav_float32(
+    chemin: &str,
+    entrelace: &[f32],
+    canaux: u16,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let bits: u16 = 32;
+    let bloc = canaux * bits / 8;
+    let octets_par_seconde = sample_rate * bloc as u32;
+    let taille_data = (entrelace.len() * 4) as u32;
+
+    let mut w = Vec::with_capacity(44 + taille_data as usize);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + taille_data).to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    w.extend_from_slice(&canaux.to_le_bytes());
+    w.extend_from_slice(&sample_rate.to_le_bytes());
+    w.extend_from_slice(&octets_par_seconde.to_le_bytes());
+    w.extend_from_slice(&bloc.to_le_bytes());
+    w.extend_from_slice(&bits.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&taille_data.to_le_bytes());
+    for e in entrelace {
+        w.extend_from_slice(&e.to_le_bytes());
+    }
+    std::fs::write(chemin, &w).map_err(|e| format!("ecriture du filtre combine : {e}"))
+}
+
 pub fn fir_frequency_response(
     taps: &[f32],
     sample_rate: u32,
@@ -476,17 +721,148 @@ pub fn fir_frequency_response(
 mod tests {
     use super::*;
 
+    /// Une convolution par blocs a une latence : elle ne peut rendre un
+    /// echantillon avant d'avoir vu le bloc qui le contient. Ce test lisait
+    /// autrefois la sortie DANS le meme appel, ce qui n'est vrai que si la
+    /// frontiere du bloc coincide avec celle de l'appel — l'hypothese meme qui
+    /// faisait sous-deborder l'ancien code (#2209). On nourrit donc la latence
+    /// et on lit decale.
+    /// Convolution directe de reference — la definition, sans FFT ni blocs.
+    fn convolution_directe(x: &[f32], h: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; x.len()];
+        for (n, yn) in y.iter_mut().enumerate() {
+            for (k, hk) in h.iter().enumerate() {
+                if n >= k {
+                    *yn += x[n - k] * hk;
+                }
+            }
+        }
+        y
+    }
+
+    /// Nourrit un convolveur neuf par lots de tailles donnees et rend la
+    /// sortie complete, latence comprise.
+    fn passer_par_lots(ir: &[Vec<f32>], block: usize, x: &[f32], lots: &[usize]) -> Vec<f32> {
+        let mut conv = Convolver::new(ir, block);
+        let mut entree = x.to_vec();
+        entree.extend(std::iter::repeat(0.0).take(conv.latency_frames()));
+        let mut sortie = Vec::with_capacity(entree.len());
+        let mut i = 0;
+        let mut t = 0;
+        while i < entree.len() {
+            let n = lots[t % lots.len()].min(entree.len() - i);
+            t += 1;
+            let mut morceau = entree[i..i + n].to_vec();
+            conv.process_interleaved(&mut morceau);
+            sortie.extend_from_slice(&morceau);
+            i += n;
+        }
+        sortie
+    }
+
+    /// LE test que ce correctif demandait. Le decoupage des appels ne doit rien
+    /// changer au resultat — c'est toute la difference entre un convolveur et
+    /// un convolveur qui suppose que ses blocs arrivent alignes.
+    ///
+    /// Le cas `[100, 924]` est celui du ticket : bloc 1024, un premier appel de
+    /// 100 trames, un second de 924. L'ancien code calculait
+    /// `frame + 1 - block_size` = `924 - 1024` sur des `usize`.
+    #[test]
+    fn le_decoupage_des_appels_ne_change_pas_le_resultat() {
+        let block = 1024;
+        let ir = vec![
+            (0..200)
+                .map(|k| 1.0 / (1.0 + k as f32))
+                .collect::<Vec<f32>>(),
+        ];
+        let x: Vec<f32> = (0..5000)
+            .map(|n| ((n as f32) * 0.037).sin() * 0.8)
+            .collect();
+
+        let reference = passer_par_lots(&ir, block, &x, &[block]);
+        for lots in [
+            vec![1usize],
+            vec![100, 924],
+            vec![1024],
+            vec![1500],
+            vec![7, 3, 991, 64, 1500, 1],
+        ] {
+            let obtenu = passer_par_lots(&ir, block, &x, &lots);
+            assert_eq!(obtenu.len(), reference.len(), "lots {lots:?}");
+            for (i, (o, r)) in obtenu.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (o - r).abs() < 1e-4,
+                    "lots {lots:?}, trame {i} : {o} au lieu de {r}"
+                );
+            }
+        }
+    }
+
+    /// Et le resultat doit etre LA convolution, pas seulement une valeur
+    /// stable : on compare a la definition directe.
+    #[test]
+    fn le_resultat_est_la_convolution_directe() {
+        let block = 64;
+        let h: Vec<f32> = (0..40)
+            .map(|k| ((k as f32) * 0.3).cos() / (1.0 + k as f32))
+            .collect();
+        let x: Vec<f32> = (0..1000).map(|n| ((n as f32) * 0.11).sin()).collect();
+
+        let attendu = convolution_directe(&x, &h);
+        let sortie = passer_par_lots(&[h.clone()], block, &x, &[37]);
+        let latence = block;
+        for (n, a) in attendu.iter().enumerate() {
+            let obtenu = sortie[latence + n];
+            assert!(
+                (obtenu - a).abs() < 1e-3,
+                "trame {n} : {obtenu} au lieu de {a}"
+            );
+        }
+    }
+
+    /// Une IR stereo dont les canaux n'ont pas la meme longueur : la queue du
+    /// canal le plus long etait ignoree, `process_block` bornant la boucle sur
+    /// le nombre de partitions du canal 0.
+    #[test]
+    fn la_queue_dune_ir_plus_longue_sur_lautre_canal_nest_pas_perdue() {
+        let block = 16;
+        let court = vec![1.0f32];
+        // Le canal droit porte une impulsion au-dela de la premiere partition.
+        let mut long = vec![0.0f32; 40];
+        long[0] = 1.0;
+        long[33] = 0.5;
+        let ir = vec![court, long];
+
+        let mut conv = Convolver::new(&ir, block);
+        let latence = conv.latency_frames();
+        let trames = 128;
+        let mut x = vec![0.0f32; trames * 2];
+        x[0] = 1.0; // impulsion a gauche
+        x[1] = 1.0; // impulsion a droite
+        x.extend(std::iter::repeat(0.0).take(latence * 2));
+        conv.process_interleaved(&mut x);
+
+        let droite = |n: usize| x[(latence + n) * 2 + 1];
+        assert!((droite(0) - 1.0).abs() < 1e-3, "premiere partition perdue");
+        assert!(
+            (droite(33) - 0.5).abs() < 1e-3,
+            "queue au-dela de la premiere partition perdue : {}",
+            droite(33)
+        );
+    }
+
     #[test]
     fn identity_ir() {
         let ir = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let mut conv = Convolver::new(&ir, 4);
-        let mut samples = vec![1.0, 0.5, 0.25, 0.125];
+        let latence = conv.latency_frames();
+        let attendu = [1.0f32, 0.5, 0.25, 0.125];
+        let mut samples = attendu.to_vec();
+        samples.extend(std::iter::repeat(0.0).take(latence));
         conv.process_interleaved(&mut samples);
-        for (i, &s) in samples.iter().enumerate() {
-            assert!(
-                (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.001,
-                "sample {i}: {s}"
-            );
+        for (i, &a) in attendu.iter().enumerate() {
+            let s = samples[latence + i];
+            assert!((s - a).abs() < 0.001, "sample {i}: {s}");
         }
     }
 
@@ -494,10 +870,55 @@ mod tests {
     fn stereo_ir() {
         let ir = vec![vec![1.0, 0.0]; 2];
         let mut conv = Convolver::new(&ir, 4);
+        let latence = conv.latency_frames();
         let mut samples = vec![1.0, 0.5, 0.25, 0.125, 1.0, 0.5, 0.25, 0.125];
+        samples.extend(std::iter::repeat(0.0).take(latence * 2));
         conv.process_interleaved(&mut samples);
-        assert!((samples[0] - 1.0).abs() < 0.01);
-        assert!((samples[1] - 0.5).abs() < 0.01);
+        assert!((samples[latence * 2] - 1.0).abs() < 0.01);
+        assert!((samples[latence * 2 + 1] - 0.5).abs() < 0.01);
+    }
+
+    /// #2210 — la cadence n'est plus une métadonnée jetée après lecture du
+    /// WAV. Chacune des cadences réellement livrées doit produire un moteur
+    /// seulement pour un flux de même cadence.
+    #[test]
+    fn la_configuration_est_liee_aux_cadences_441_48_96_et_192_khz() {
+        for sample_rate in [44_100, 48_000, 96_000, 192_000] {
+            let config = ConvolverConfig::new(vec![vec![1.0, 0.5]], sample_rate).unwrap();
+            let convolver = config
+                .build_for(4, sample_rate, 2)
+                .expect("une IR mono de même cadence doit être dupliquée");
+            assert_eq!(convolver.channels(), 2);
+
+            let other_rate = if sample_rate == 48_000 {
+                96_000
+            } else {
+                48_000
+            };
+            let error = config
+                .build_for(4, other_rate, 2)
+                .err()
+                .expect("une cadence différente doit être refusée");
+            assert!(error.contains(&sample_rate.to_string()), "{error}");
+            assert!(error.contains(&other_rate.to_string()), "{error}");
+            assert!(error.contains("réexportez"), "{error}");
+        }
+    }
+
+    #[test]
+    fn seule_une_ir_mono_est_dupliquee_implicitement() {
+        let mono = ConvolverConfig::new(vec![vec![1.0]], 48_000).unwrap();
+        assert_eq!(mono.build_for(4, 48_000, 8).unwrap().channels(), 8);
+
+        let stereo = ConvolverConfig::new(vec![vec![1.0], vec![0.5]], 48_000).unwrap();
+        let error = stereo
+            .build_for(4, 48_000, 6)
+            .err()
+            .expect("un layout non mono doit correspondre exactement");
+        assert!(
+            error.contains("2 canaux") && error.contains("6 canaux"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -532,18 +953,19 @@ mod tests {
         let riff_size = (wav.len() - 8) as u32;
         wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        let path = std::env::temp_dir().join("tune_ir_extrachunks_test.wav");
+        let ir_file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = ir_file.path().to_path_buf();
         std::fs::write(&path, &wav).unwrap();
         let mut conv = Convolver::from_wav(path.to_str().unwrap(), 4).unwrap();
-        std::fs::remove_file(&path).ok();
 
-        let mut samples = vec![1.0, 0.5, 0.25, 0.125];
+        let latence = conv.latency_frames();
+        let attendu = [1.0f32, 0.5, 0.25, 0.125];
+        let mut samples = attendu.to_vec();
+        samples.extend(std::iter::repeat(0.0).take(latence));
         conv.process_interleaved(&mut samples);
-        for (i, &s) in samples.iter().enumerate() {
-            assert!(
-                (s - [1.0, 0.5, 0.25, 0.125][i]).abs() < 0.01,
-                "sample {i}: {s}"
-            );
+        for (i, &a) in attendu.iter().enumerate() {
+            let s = samples[latence + i];
+            assert!((s - a).abs() < 0.01, "sample {i}: {s}");
         }
     }
 
@@ -653,5 +1075,125 @@ mod tests {
             "near fs/2: {} dB",
             pts[1].magnitude_db
         );
+    }
+
+    /// Ecrire un WAV mono flottant pour les tests de combinaison.
+    fn ecrire_ir_mono(chemin: &std::path::Path, taps: &[f32], sr: u32) {
+        super::ecrire_wav_float32(chemin.to_str().unwrap(), taps, 1, sr).unwrap();
+    }
+
+    /// Deux filtres MONO, gauche et droite, deviennent un WAV stereo dont
+    /// chaque canal porte SON filtre.
+    ///
+    /// C'est le chemin d'entree qui manquait : le moteur savait deja convoluer
+    /// un canal par reponse, mais REW, Acourate et Audiolense exportent deux
+    /// fichiers mono, jamais un stereo (Daniel, 24/08/2026).
+    #[test]
+    fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("gauche.wav");
+        let d = dir.join("droite.wav");
+        let out = dir.join("combine.wav");
+
+        // Deux filtres RECONNAISSABLES et de longueurs differentes.
+        ecrire_ir_mono(&g, &[1.0, 0.5, 0.25], 48_000);
+        ecrire_ir_mono(&d, &[-1.0, -0.5], 48_000);
+
+        let sr = Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .expect("la combinaison doit reussir");
+        assert_eq!(sr, 48_000);
+
+        let (ir, sr_relu) = Convolver::read_ir_taps(out.to_str().unwrap()).unwrap();
+        assert_eq!(sr_relu, 48_000);
+        assert_eq!(ir.len(), 2, "le fichier combine doit etre STEREO");
+        assert_eq!(
+            ir[0],
+            vec![1.0, 0.5, 0.25],
+            "le canal gauche doit porter le filtre gauche, intact"
+        );
+        assert_eq!(
+            ir[1],
+            vec![-1.0, -0.5, 0.0],
+            "le canal droit doit porter le filtre droit, complete de zeros — un \
+             zero est neutre pour une convolution, contrairement a une repetition"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Des cadences differentes sont un refus, pas un rattrapage silencieux :
+    /// convoluer a deux cadences decalerait un canal par rapport a l'autre.
+    #[test]
+    fn deux_cadences_differentes_sont_refusees() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-sr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("g.wav");
+        let d = dir.join("d.wav");
+        let out = dir.join("o.wav");
+        ecrire_ir_mono(&g, &[1.0, 0.0], 48_000);
+        ecrire_ir_mono(&d, &[1.0, 0.0], 44_100);
+
+        let e = Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .expect_err("deux cadences differentes doivent etre refusees");
+        assert!(
+            e.contains("48000") && e.contains("44100"),
+            "le refus doit NOMMER les deux cadences, sinon l'utilisateur ne sait \
+             pas lequel de ses deux fichiers reexporter — recu : {e}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Le fichier combine doit vraiment traverser le convolveur : deux
+    /// impulsions de signes opposes doivent ressortir de signes opposes.
+    #[test]
+    fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
+        let dir = std::env::temp_dir().join(format!("tune-fir-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = dir.join("g.wav");
+        let d = dir.join("d.wav");
+        let out = dir.join("o.wav");
+        // Gauche : gain 1. Droite : gain -1 (phase inversee).
+        ecrire_ir_mono(&g, &[1.0], 48_000);
+        ecrire_ir_mono(&d, &[-1.0], 48_000);
+        Convolver::combiner_en_stereo(
+            g.to_str().unwrap(),
+            d.to_str().unwrap(),
+            out.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mut conv = Convolver::from_wav(out.to_str().unwrap(), 4).unwrap();
+        let latence = conv.latency_frames();
+        // Une impulsion identique sur les deux canaux, entrelacee.
+        let mut sortie = vec![0.0f32; (latence + 4) * 2];
+        sortie[0] = 1.0;
+        sortie[1] = 1.0;
+        // Traitement EN PLACE : la tranche porte l'entree puis la sortie.
+        conv.process_interleaved(&mut sortie);
+
+        let i = latence * 2;
+        assert!(
+            (sortie[i] - 1.0).abs() < 1e-4,
+            "le canal gauche doit sortir en phase : {}",
+            sortie[i]
+        );
+        assert!(
+            (sortie[i + 1] + 1.0).abs() < 1e-4,
+            "le canal droit doit sortir en phase INVERSEE — s'il sort comme le \
+             gauche, les deux canaux partagent le meme filtre : {}",
+            sortie[i + 1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -397,9 +397,18 @@ fn service_to_device(
     let port = info.get_port();
     let port = if port > 0 { port } else { default_port };
 
-    let dev_id = format!("{}-{}-{}", output_type, host, port);
+    // L'identifiant que l'appareil annonce lui-meme, lu AVANT tout
+    // enrichissement et jamais reecrit ensuite (cf. `stable_id`).
+    let stable_id = info
+        .get_property_val_str("deviceid")
+        .or_else(|| info.get_property_val_str("id"))
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+
+    let dev_id = device_id_for(output_type, stable_id.as_deref(), &host, port);
 
     let mut device = DiscoveredDevice::new(dev_id, friendly_name, output_type, host, port);
+    device.stable_id = stable_id;
 
     // Extract capabilities from TXT records
     let mut caps = HashMap::new();
@@ -420,19 +429,45 @@ fn service_to_device(
         device.mac_address = Some(mac.to_string());
     }
 
-    // AirPlay version detection
+    // AirPlay version detection + features/flags parsing.
     if output_type == OutputType::Airplay {
-        let version = if info.get_property_val_str("features").is_some() {
-            "2"
-        } else {
-            "1"
-        };
+        let features_raw = info.get_property_val_str("features");
+        let version = if features_raw.is_some() { "2" } else { "1" };
         device.airplay_version = Some(version.to_string());
         caps.insert("airplay".to_string(), serde_json::Value::Bool(true));
         caps.insert(
             "airplay_version".to_string(),
             serde_json::Value::String(version.to_string()),
         );
+
+        // Parse the AirPlay `features` bitmask (and `flags`) so callers can tell
+        // whether the receiver demands a HomeKit-style pair-setup before it will
+        // accept an RTSP session (Apple TV, Samsung/LG TVs, HomePod, ...).
+        if let Some(raw) = features_raw {
+            if let Some(bits) = parse_airplay_features(raw) {
+                caps.insert(
+                    "airplay_features".to_string(),
+                    serde_json::Value::String(format!("0x{bits:016X}")),
+                );
+                let needs_pairing = airplay_requires_pairing(bits);
+                caps.insert(
+                    "airplay_requires_pairing".to_string(),
+                    serde_json::Value::Bool(needs_pairing),
+                );
+            }
+        }
+        // The `flags` TXT independently signals "PIN required" (bit 9 / 0x200)
+        // on many receivers even when features are ambiguous.
+        if let Some(flags_raw) = info.get_property_val_str("flags") {
+            if let Some(flags) = parse_hex_u64(flags_raw) {
+                if flags & AIRPLAY_FLAG_PIN_REQUIRED != 0 {
+                    caps.insert(
+                        "airplay_requires_pairing".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
+        }
     }
 
     // BluOS capabilities
@@ -502,43 +537,84 @@ fn service_to_device(
     device
 }
 
-fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
-    let local_prefix = detect_local_subnet();
-    let mut ipv4_same_subnet: Option<String> = None;
-    let mut ipv4_private: Option<String> = None;
-    let mut ipv4_any: Option<String> = None;
-
-    for addr in addrs {
-        let ip = addr.to_ip_addr();
-        if let std::net::IpAddr::V4(v4) = ip {
-            let s = v4.to_string();
-            if ipv4_any.is_none() {
-                ipv4_any = Some(s.clone());
-            }
-            let octets = v4.octets();
-            let is_private = octets[0] == 192
-                || octets[0] == 10
-                || (octets[0] == 172 && (16..=31).contains(&octets[1]));
-            if is_private && ipv4_private.is_none() {
-                ipv4_private = Some(s.clone());
-            }
-            if let Some(ref prefix) = local_prefix {
-                if s.starts_with(prefix) && ipv4_same_subnet.is_none() {
-                    ipv4_same_subnet = Some(s);
-                }
-            }
-        }
+/// L'identifiant durable d'un appareil.
+///
+/// Prefere ce que l'appareil annonce lui-meme ; ne retombe sur l'adresse que
+/// lorsqu'il n'annonce rien. C'est tout l'objet de #1528 : un bail DHCP
+/// renouvele changeait l'identite de l'appareil, donc dedoublait sa zone et
+/// faisait revenir les zones supprimees, puisque tout le cycle de vie d'une
+/// zone repose sur cette chaine.
+pub fn device_id_for(
+    output_type: OutputType,
+    stable_id: Option<&str>,
+    host: &str,
+    port: u16,
+) -> String {
+    match stable_id {
+        Some(id) => format!("{output_type}-{id}"),
+        None => legacy_device_id(output_type, host, port),
     }
+}
 
-    ipv4_same_subnet
-        .or(ipv4_private)
-        .or(ipv4_any)
+/// L'ancienne forme, derivee de l'adresse.
+///
+/// Toujours produite pour les appareils qui n'annoncent aucun identifiant, et
+/// surtout : c'est sous cette forme que sont enregistrees les zones creees
+/// AVANT #1528. La decouverte s'en sert pour les retrouver et les re-ancrer
+/// (`discovery_setup`), ce qui evite la migration SQL qui aurait fait perdre
+/// toutes les zones d'un coup.
+pub fn legacy_device_id(output_type: OutputType, host: &str, port: u16) -> String {
+    format!("{output_type}-{host}-{port}")
+}
+
+fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
+    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|a| a.to_ip_addr()).collect();
+    choose_address(&ips, detect_local_subnet().as_deref())
+}
+
+/// Choisit l'adresse qui servira d'identité à l'appareil.
+///
+/// Cette fonction **doit rendre le même résultat pour un même jeu d'adresses**,
+/// quel que soit l'ordre dans lequel elles arrivent. `device_id` en est dérivé
+/// (`{type}-{host}-{port}`) et tout le cycle de vie d'une zone repose dessus :
+/// une identité qui change d'un démarrage à l'autre dédouble la zone, et fait
+/// revenir celles que l'utilisateur avait supprimées — le garde-fou
+/// `is_device_hidden` porte sur l'ancien identifiant et ne reconnaît plus le
+/// nouveau (#1528).
+///
+/// Or l'appelant itère un `HashSet`, dont l'ordre n'est pas déterministe. Un
+/// appareil à deux pattes sur le même sous-réseau (Wi-Fi et Ethernet) tombait
+/// donc tantôt sur l'une, tantôt sur l'autre, **sans que rien n'ait bougé sur
+/// le réseau**. D'où le tri, qui ne coûte rien sur trois adresses.
+fn choose_address(addrs: &[std::net::IpAddr], local_prefix: Option<&str>) -> String {
+    let mut v4: Vec<std::net::Ipv4Addr> = addrs
+        .iter()
+        .filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect();
+    v4.sort_unstable();
+
+    let is_private = |v4: &std::net::Ipv4Addr| {
+        let o = v4.octets();
+        o[0] == 192 || o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]))
+    };
+
+    let same_subnet = local_prefix.and_then(|prefix| {
+        v4.iter()
+            .find(|v| v.to_string().starts_with(prefix))
+            .map(|v| v.to_string())
+    });
+
+    same_subnet
+        .or_else(|| v4.iter().find(|v| is_private(v)).map(|v| v.to_string()))
+        .or_else(|| v4.first().map(|v| v.to_string()))
         .unwrap_or_else(|| {
-            addrs
-                .iter()
-                .next()
-                .map(|a| a.to_ip_addr().to_string())
-                .unwrap_or_default()
+            // Que de l'IPv6 : on trie là aussi plutôt que de prendre au hasard.
+            let mut rest: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            rest.sort();
+            rest.into_iter().next().unwrap_or_default()
         })
 }
 
@@ -554,9 +630,106 @@ fn detect_local_subnet() -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AirPlay `features` / `flags` bitmask parsing.
+// ---------------------------------------------------------------------------
+
+/// `flags` TXT bit meaning "the receiver requires a PIN / password".
+/// (RAOP/AirPlay `flags`, bit 9.)
+const AIRPLAY_FLAG_PIN_REQUIRED: u64 = 0x200;
+
+// AirPlay feature bits relevant to whether pairing is mandatory. The `features`
+// value is a 64-bit mask; the low 32 bits are the first word and the high 32
+// bits the second (see the `features` TXT record used by RAOP/AirPlay 2).
+//
+//   bit 26 — SupportsSystemPairing / PairSetupAndMFi
+//   bit 27 — SupportsUnifiedPairSetupAndMFi
+//   bit 46 — SupportsCoreUtilsPairingAndEncryption
+//   bit 51 — SupportsUnifiedPairVerify (AirPlay 2 access control)
+const FT_BIT_SYSTEM_PAIRING: u64 = 1 << 26;
+const FT_BIT_UNIFIED_PAIR_SETUP: u64 = 1 << 27;
+const FT_BIT_COREUTILS_PAIR_ENC: u64 = 1 << 46;
+const FT_BIT_UNIFIED_PAIR_VERIFY: u64 = 1 << 51;
+
+/// Parse a single hex or decimal integer TXT value like `0x200` or `514`.
+fn parse_hex_u64(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse the AirPlay `features` TXT record into a single 64-bit mask.
+///
+/// The record appears in two shapes in the wild:
+///   * one word:  `0x5A7FFFF7`
+///   * two words: `0x5A7FFFF7,0x1E`  (low word first, high word second)
+/// Returns `None` if nothing parses.
+pub fn parse_airplay_features(raw: &str) -> Option<u64> {
+    let mut parts = raw.split(',');
+    let low = parse_hex_u64(parts.next()?.trim())?;
+    match parts.next() {
+        Some(high_str) => {
+            let high = parse_hex_u64(high_str.trim())?;
+            Some((high << 32) | (low & 0xFFFF_FFFF))
+        }
+        None => Some(low),
+    }
+}
+
+/// Whether the parsed `features` mask indicates the receiver mandates a
+/// HomeKit-style pair-setup/pair-verify before accepting an RTSP session.
+pub fn airplay_requires_pairing(features: u64) -> bool {
+    features
+        & (FT_BIT_SYSTEM_PAIRING
+            | FT_BIT_UNIFIED_PAIR_SETUP
+            | FT_BIT_COREUTILS_PAIR_ENC
+            | FT_BIT_UNIFIED_PAIR_VERIFY)
+        != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_features_single_and_double_word() {
+        // Single 32-bit word.
+        assert_eq!(parse_airplay_features("0x5A7FFFF7"), Some(0x5A7F_FFF7));
+        // Two words: high word shifted into bits 32..63.
+        assert_eq!(
+            parse_airplay_features("0x5A7FFFF7,0x1E"),
+            Some((0x1E << 32) | 0x5A7F_FFF7)
+        );
+        // Decimal fallback.
+        assert_eq!(parse_airplay_features("514"), Some(514));
+        // Garbage → None.
+        assert_eq!(parse_airplay_features("nope"), None);
+    }
+
+    #[test]
+    fn features_pairing_bit_detection() {
+        // Bit 27 set → requires pairing (typical AirPlay 2 receiver / TV).
+        let with_pairing = FT_BIT_UNIFIED_PAIR_SETUP | 0xFF;
+        assert!(airplay_requires_pairing(with_pairing));
+        // No pairing bits → legacy AirPlay 1, no pairing.
+        assert!(!airplay_requires_pairing(0x0000_00FF));
+        // Bit 51 (high word) also triggers.
+        assert!(airplay_requires_pairing(FT_BIT_UNIFIED_PAIR_VERIFY));
+
+        // End-to-end via the string parser: a two-word features value whose
+        // high word carries bit 51 (bit 19 of the high word).
+        let raw = format!("0x000000FF,0x{:X}", 1u64 << 19);
+        let bits = parse_airplay_features(&raw).unwrap();
+        assert!(airplay_requires_pairing(bits));
+    }
+
+    #[test]
+    fn pin_flag_constant() {
+        assert_eq!(AIRPLAY_FLAG_PIN_REQUIRED, 0x200);
+    }
 
     #[test]
     fn service_constants_end_with_local() {
@@ -599,5 +772,96 @@ mod tests {
             raw.to_string()
         };
         assert_eq!(name, "Mac Studio");
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn choose_address_is_the_same_whatever_the_order() {
+        // Le coeur de #1528 : deux adresses egalement recevables sur le meme
+        // sous-reseau. L'appelant itere un HashSet, donc l'ordre varie d'un
+        // demarrage a l'autre — l'identite de l'appareil, elle, ne doit pas.
+        let a = [ip("192.168.1.42"), ip("192.168.1.77")];
+        let b = [ip("192.168.1.77"), ip("192.168.1.42")];
+        assert_eq!(
+            choose_address(&a, Some("192.168.1.")),
+            choose_address(&b, Some("192.168.1.")),
+        );
+    }
+
+    #[test]
+    fn choose_address_prefers_the_local_subnet_then_private_then_the_rest() {
+        let addrs = [ip("8.8.8.8"), ip("10.0.0.5"), ip("192.168.1.42")];
+        assert_eq!(choose_address(&addrs, Some("192.168.1.")), "192.168.1.42");
+        // Hors sous-reseau connu, une privee vaut mieux qu'une publique.
+        assert_eq!(choose_address(&addrs, Some("172.20.")), "10.0.0.5");
+        // Aucune privee : il reste la publique, plutot que rien.
+        assert_eq!(choose_address(&[ip("8.8.8.8")], None), "8.8.8.8");
+    }
+
+    #[test]
+    fn choose_address_falls_back_to_ipv6_without_drawing_lots() {
+        let a = [ip("fe80::2"), ip("fe80::1")];
+        let b = [ip("fe80::1"), ip("fe80::2")];
+        assert_eq!(choose_address(&a, None), choose_address(&b, None));
+        assert!(!choose_address(&a, None).is_empty());
+    }
+
+    #[test]
+    fn choose_address_without_any_address_is_empty_not_a_panic() {
+        assert_eq!(choose_address(&[], Some("192.168.1.")), "");
+    }
+
+    #[test]
+    fn device_id_prefers_what_the_device_announces() {
+        // Le coeur de #1528 : deux adresses differentes, meme appareil, meme
+        // identifiant. C'est ce qui empeche un bail DHCP renouvele de dedoubler
+        // la zone et de faire revenir celles qu'on a supprimees.
+        let a = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.42",
+            8009,
+        );
+        let b = device_id_for(
+            OutputType::Chromecast,
+            Some("uuid-abc"),
+            "192.168.1.77",
+            8009,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn device_id_falls_back_to_the_address_when_nothing_is_announced() {
+        // Tous les appareils n'annoncent pas d'identifiant : on ne peut pas
+        // faire mieux que l'adresse, et c'est la forme historique.
+        assert_eq!(
+            device_id_for(OutputType::Dlna, None, "192.168.1.9", 8080),
+            legacy_device_id(OutputType::Dlna, "192.168.1.9", 8080),
+        );
+    }
+
+    #[test]
+    fn two_devices_announcing_different_ids_never_collide() {
+        // L'autre bord : meme adresse et meme port (un hote qui expose deux
+        // services), identifiants distincts.
+        assert_ne!(
+            device_id_for(OutputType::Airplay, Some("aa:bb"), "192.168.1.5", 7000),
+            device_id_for(OutputType::Airplay, Some("cc:dd"), "192.168.1.5", 7000),
+        );
+    }
+
+    #[test]
+    fn the_legacy_form_is_unchanged() {
+        // Les zones creees avant #1528 sont enregistrees sous cette forme
+        // exacte : la decouverte s'en sert pour les retrouver et les
+        // re-ancrer. La changer perdrait toutes les zones existantes.
+        assert_eq!(
+            legacy_device_id(OutputType::Bluos, "192.168.1.23", 11000),
+            format!("{}-192.168.1.23-11000", OutputType::Bluos),
+        );
     }
 }

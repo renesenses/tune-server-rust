@@ -36,7 +36,15 @@ use super::backend::{DbBackend, ToSqlValue};
 
 /// Types d'items locaux que `favorites` peut référencer par rowid. Tout autre
 /// `item_type` (streaming…) est ignoré — et surtout jamais supprimé.
-const LOCAL_ITEM_TYPES: [&str; 3] = ["track", "album", "artist"];
+///
+/// `playlist` a rejoint la liste avec #2442 (FabienM, fil 1557) : une playlist
+/// locale porte un `INTEGER PRIMARY KEY`, elle entre donc dans `favorites`
+/// sans aucune migration. Tant qu'elle restait hors de cette liste le favori
+/// s'écrivait bien, mais AUCUN instantané d'identité n'était figé : le cœur
+/// s'éteignait dès que l'id changeait (import M3U rejoué, playlist recréée,
+/// bascule SQLite→PostgreSQL). C'est exactement le défaut .18 des albums, sur
+/// un autre type.
+const LOCAL_ITEM_TYPES: [&str; 4] = ["track", "album", "artist", "playlist"];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileStats {
@@ -236,6 +244,8 @@ impl FavoritesReconciler {
                  FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id WHERE t.id = ?"
             }
             "artist" => "SELECT name, '', '' FROM artists WHERE id = ?",
+            // Une playlist n'a ni artiste ni chemin : son nom EST son identité.
+            "playlist" => "SELECT name, '', '' FROM playlists WHERE id = ?",
             _ => return Ok(None),
         };
         let params: [&dyn ToSqlValue; 1] = [&item_id];
@@ -279,6 +289,7 @@ impl FavoritesReconciler {
             "album" => self.find_album(ident),
             "track" => self.find_track(ident),
             "artist" => self.find_artist(ident),
+            "playlist" => self.find_playlist(ident),
             _ => Ok(None),
         }
     }
@@ -381,6 +392,26 @@ impl FavoritesReconciler {
         Ok(Self::first_id(&rows))
     }
 
+    /// Une playlist se retrouve par son nom, et UNIQUEMENT s'il est
+    /// univoque. Deux playlists homonymes ne donnent aucun gagnant : le
+    /// re-rattachement au hasard rendrait le favori à la mauvaise liste, ce
+    /// qui est pire qu'un cœur éteint — même règle que le repli « titre seul »
+    /// des albums.
+    fn find_playlist(&self, ident: &Identity) -> Result<Option<i64>, String> {
+        if ident.name.is_empty() {
+            return Ok(None);
+        }
+        let params: [&dyn ToSqlValue; 1] = [&ident.name];
+        let rows = self.db.query_many(
+            "SELECT id FROM playlists WHERE LOWER(name) = LOWER(?)",
+            &params,
+        )?;
+        if rows.len() == 1 {
+            return Ok(Self::first_id(&rows));
+        }
+        Ok(None)
+    }
+
     fn is_favorite(&self, profile_id: i64, item_type: &str, item_id: i64) -> Result<bool, String> {
         let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
         match self.db.query_one(
@@ -432,6 +463,13 @@ mod tests {
             &params,
         )
         .unwrap();
+        db.last_insert_rowid()
+    }
+
+    fn insert_playlist(db: &Arc<dyn DbBackend>, name: &str) -> i64 {
+        let params: [&dyn ToSqlValue; 1] = [&name];
+        db.execute("INSERT INTO playlists (name) VALUES (?)", &params)
+            .unwrap();
         db.last_insert_rowid()
     }
 
@@ -703,9 +741,13 @@ mod tests {
 
     #[test]
     fn streaming_favorites_and_unknown_types_untouched() {
+        // `playlist` servait ici d'exemple de type inconnu ; c'est desormais un
+        // type LOCAL (#2442). Le contrat teste — un type que la reconciliation
+        // ne connait pas n'est ni compte ni supprime — reste le meme, il se
+        // verifie juste sur un type reellement etranger.
         let db = test_db();
         db.execute(
-            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'playlist', 12345)",
+            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'radio', 12345)",
             &[],
         )
         .unwrap();
@@ -715,7 +757,130 @@ mod tests {
             .unwrap();
         assert_eq!(stats.scanned, 0);
         assert_eq!(stats.deleted, 0);
-        assert_eq!(fav_item_id(&db, "playlist"), Some(12345));
+        assert_eq!(fav_item_id(&db, "radio"), Some(12345));
+    }
+
+    // --- Favori de playlist locale (#2442, FabienM fil 1557) ---------------
+    //
+    // Une playlist locale porte un `INTEGER PRIMARY KEY` : elle entre dans
+    // `favorites` sans migration. Mais tant que `playlist` n'est pas un type
+    // LOCAL, la reconciliation l'ignore : aucun instantane d'identite n'est
+    // fige a l'ajout, et un favori orphelin n'est jamais re-rattache.
+
+    #[test]
+    fn un_favori_de_playlist_recoit_son_instantane_d_identite() {
+        let db = test_db();
+        let pl = insert_playlist(&db, "Dimanche matin");
+
+        ProfileRepo::with_backend(db.clone())
+            .add_favorite(1, "playlist", pl)
+            .unwrap();
+
+        let row = db
+            .query_one(
+                "SELECT item_name FROM favorites WHERE item_type = 'playlist'",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row[0].as_string().as_deref(),
+            Some("Dimanche matin"),
+            "le nom de la playlist doit etre fige a l'ajout, comme pour un album"
+        );
+    }
+
+    #[test]
+    fn un_favori_de_playlist_survit_a_une_reconciliation_complete() {
+        // Le piege de LOCAL_ITEM_TYPES : en ouvrant le type on ouvre AUSSI la
+        // suppression des orphelins. Une playlist bien vivante ne doit jamais
+        // etre balayee par la passe post-scan la plus agressive.
+        let db = test_db();
+        let pl = insert_playlist(&db, "Dimanche matin");
+        ProfileRepo::with_backend(db.clone())
+            .add_favorite(1, "playlist", pl)
+            .unwrap();
+
+        let stats = FavoritesReconciler::with_backend(db.clone())
+            .run(true)
+            .unwrap();
+
+        assert_eq!(stats.scanned, 1, "le favori de playlist doit etre examine");
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(fav_item_id(&db, "playlist"), Some(pl));
+    }
+
+    #[test]
+    fn un_favori_de_playlist_est_reattache_par_son_nom() {
+        // Import M3U rejoue, playlist recreee, bascule SQLite -> PostgreSQL :
+        // l'id change, le nom reste. Sans re-rattachement le coeur s'eteint.
+        let db = test_db();
+        let ancienne = insert_playlist(&db, "Dimanche matin");
+        ProfileRepo::with_backend(db.clone())
+            .add_favorite(1, "playlist", ancienne)
+            .unwrap();
+
+        let params: [&dyn ToSqlValue; 1] = [&ancienne];
+        db.execute("DELETE FROM playlists WHERE id = ?", &params)
+            .unwrap();
+        let nouvelle = insert_playlist(&db, "Dimanche matin");
+        assert_ne!(ancienne, nouvelle);
+
+        let stats = FavoritesReconciler::with_backend(db.clone())
+            .run(false)
+            .unwrap();
+
+        assert_eq!(stats.relinked, 1);
+        assert_eq!(fav_item_id(&db, "playlist"), Some(nouvelle));
+    }
+
+    #[test]
+    fn un_favori_de_playlist_introuvable_est_purge_apres_un_scan_complet() {
+        let db = test_db();
+        let pl = insert_playlist(&db, "Dimanche matin");
+        ProfileRepo::with_backend(db.clone())
+            .add_favorite(1, "playlist", pl)
+            .unwrap();
+        let params: [&dyn ToSqlValue; 1] = [&pl];
+        db.execute("DELETE FROM playlists WHERE id = ?", &params)
+            .unwrap();
+
+        // Demarrage / scan partiel : on garde, on ne devine pas.
+        let stats = FavoritesReconciler::with_backend(db.clone())
+            .run(false)
+            .unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert_eq!(fav_item_id(&db, "playlist"), Some(pl));
+
+        // Scan complet et sain : la playlist n'existe vraiment plus.
+        let stats = FavoritesReconciler::with_backend(db.clone())
+            .run(true)
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(fav_item_id(&db, "playlist"), None);
+    }
+
+    #[test]
+    fn deux_playlists_homonymes_ne_sont_pas_reattachees_au_hasard() {
+        let db = test_db();
+        let ancienne = insert_playlist(&db, "Dimanche matin");
+        ProfileRepo::with_backend(db.clone())
+            .add_favorite(1, "playlist", ancienne)
+            .unwrap();
+        let params: [&dyn ToSqlValue; 1] = [&ancienne];
+        db.execute("DELETE FROM playlists WHERE id = ?", &params)
+            .unwrap();
+        insert_playlist(&db, "Dimanche matin");
+        insert_playlist(&db, "Dimanche matin");
+
+        let stats = FavoritesReconciler::with_backend(db.clone())
+            .run(false)
+            .unwrap();
+        assert_eq!(
+            stats.relinked, 0,
+            "ambigu : on ne re-rattache pas au hasard"
+        );
+        assert_eq!(stats.unresolved, 1);
     }
 
     #[test]

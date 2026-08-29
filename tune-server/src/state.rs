@@ -56,7 +56,24 @@ pub struct AppState {
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
     pub port: u16,
+    /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
+    /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
+    /// nécessairement de zéro à chaque redémarrage — un `Instant` n'est ni
+    /// sérialisable ni persistable, et rien ne le restaure.
     pub started_at: Instant,
+    /// Le même instant, mais en horloge absolue (UTC) — #2117.
+    ///
+    /// `started_at` seul ne permet pas de répondre à « le serveur a-t-il
+    /// redémarré ? » : c'est un compteur RELATIF, et deux appels espacés de
+    /// deux minutes qui rendent 4765 puis 4903 se lisent aussi bien comme
+    /// « pas de redémarrage » que comme « je regarde un compteur qui ne dit
+    /// pas ce que je crois ». Il faut inférer, et l'inférence s'est révélée
+    /// fausse en diagnostic réel.
+    ///
+    /// Un horodatage absolu ne demande aucune inférence : il CHANGE au
+    /// redémarrage et reste identique tant que le processus vit. Deux appels
+    /// suffisent à trancher, sans arithmétique.
+    pub process_started_at: time::OffsetDateTime,
     pub bridge_responses:
         Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
     pub health_monitor: Arc<AdvancedHealthMonitor>,
@@ -111,7 +128,29 @@ pub struct AppState {
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
 
+impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpState {
+    fn from_ref(state: &AppState) -> Self {
+        Self::new(
+            state.backend.clone(),
+            state.services.clone(),
+            state.event_bus.clone(),
+        )
+    }
+}
+
 impl AppState {
+    /// L'horodatage absolu du démarrage du processus, en RFC 3339 (UTC).
+    ///
+    /// Publié à côté de `uptime_seconds` par les réponses de diagnostic
+    /// (#2117). Une seule implémentation : trois routes l'exposent, elles
+    /// doivent rendre exactement la même chaîne pour le même processus, sans
+    /// quoi la comparaison entre deux appels ne prouve plus rien.
+    pub fn process_started_at_rfc3339(&self) -> String {
+        self.process_started_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    }
+
     /// The SQLite handle, for the few operations with no engine-agnostic
     /// equivalent (FTS rebuild, `VACUUM`, WAL checkpoint, schema version).
     ///
@@ -272,7 +311,7 @@ impl AppState {
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
         let scanner = Arc::new(SsdpScanner::new(ssdp_tx));
 
-        let upnp = UpnpState::new(backend.clone(), port);
+        let upnp = UpnpState::new(backend.clone(), port, tune_config.advertised_ip.clone());
 
         let health_config = HealthMonitorConfig {
             db_path: db_path.into(),
@@ -320,6 +359,7 @@ impl AppState {
             http_client,
             port,
             started_at: Instant::now(),
+            process_started_at: time::OffsetDateTime::now_utc(),
             bridge_responses: Arc::new(Mutex::new(HashMap::new())),
             health_monitor,
             suggestion_store,

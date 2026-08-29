@@ -221,6 +221,14 @@ async fn apply_profile_handler(
             .map_err(AppError::internal)?;
     }
 
+    // Meme raison qu'en room_correction : persister ne suffit pas, sans ceci la
+    // calibration n'atteint le son qu'a la piste SUIVANTE sur une zone locale
+    // alors que la reponse annonce `applied: true` (#1725).
+    let applique_a_chaud = match zone_id.parse::<i64>() {
+        Ok(id) => state.orchestrator.apply_eq_change(id).await,
+        Err(_) => false,
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -228,6 +236,8 @@ async fn apply_profile_handler(
             "zone_id": zone_id,
             "slug": body.profile.slug,
             "filter_count": body.profile.corrections.len(),
+            // « persiste » d'un cote, « entendu maintenant » de l'autre.
+            "applied_live": applique_a_chaud,
         })),
     )
         .into_response())
@@ -251,6 +261,13 @@ async fn remove_zone_profile_handler(
         // Clear the EQ profile that was written by apply.
         let settings = SettingsRepo::with_backend(state.backend.clone());
         settings.delete(&format!("zone_{zone_id}_eq_profile")).ok();
+        // Et le faire taire TOUT DE SUITE : sans ceci la correction qu'on vient
+        // de retirer continuait de s'entendre jusqu'a la piste suivante
+        // (#1725). `load_eq_processor` ne trouve plus de profil et rend `None`,
+        // ce que `refresh_zone_eq` installe — l'egaliseur est bien vide.
+        if let Ok(id) = zone_id.parse::<i64>() {
+            state.orchestrator.apply_eq_change(id).await;
+        }
 
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {

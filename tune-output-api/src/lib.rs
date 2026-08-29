@@ -11,6 +11,147 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Version du contrat de capacités compris par ce binaire.
+pub const OUTPUT_CAPABILITIES_VERSION: u16 = 1;
+
+/// Commande optionnelle qu'une sortie peut accepter ou refuser.
+///
+/// Le nom fait partie du contrat HTTP : il est sérialisé en `snake_case` et
+/// permet à un client de distinguer une commande impossible d'une panne du
+/// renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCommand {
+    Pause,
+    Resume,
+    Seek,
+    SetVolume,
+    SetMute,
+}
+
+impl std::fmt::Display for OutputCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Seek => "seek",
+            Self::SetVolume => "set_volume",
+            Self::SetMute => "set_mute",
+        };
+        formatter.write_str(name)
+    }
+}
+
+/// Erreur structurée du chemin de commande d'une sortie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputCommandError {
+    Unsupported {
+        command: OutputCommand,
+    },
+    Failed {
+        command: OutputCommand,
+        message: String,
+    },
+}
+
+impl OutputCommandError {
+    pub fn unsupported(command: OutputCommand) -> Self {
+        Self::Unsupported { command }
+    }
+
+    pub fn failed(command: OutputCommand, message: impl Into<String>) -> Self {
+        Self::Failed {
+            command,
+            message: message.into(),
+        }
+    }
+
+    pub fn command(&self) -> OutputCommand {
+        match self {
+            Self::Unsupported { command } | Self::Failed { command, .. } => *command,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { command } => {
+                write!(formatter, "output command {command} is unsupported")
+            }
+            Self::Failed { command, message } => {
+                write!(formatter, "output command {command} failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutputCommandError {}
+
+pub type OutputCommandResult<T> = Result<T, OutputCommandError>;
+
+/// Capacités déclarées par une sortie.
+///
+/// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
+/// traite de façon conservatrice : aucune commande optionnelle n'est supposée
+/// réussir. Les listes de formats et de dispositions sont vides quand la
+/// sortie ne sait pas encore publier cette partie du contrat ; elles ne
+/// signifient donc pas que la sortie ne sait lire aucun son.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCapabilities {
+    pub version: u16,
+    pub can_pause: bool,
+    pub can_resume: bool,
+    pub can_seek: bool,
+    pub can_set_volume: bool,
+    pub can_mute: bool,
+    pub can_gapless: bool,
+    #[serde(default)]
+    pub formats: Vec<String>,
+    #[serde(default)]
+    pub channel_layouts: Vec<String>,
+}
+
+impl OutputCapabilities {
+    pub fn v1(
+        can_pause: bool,
+        can_resume: bool,
+        can_seek: bool,
+        can_set_volume: bool,
+        can_mute: bool,
+        can_gapless: bool,
+    ) -> Self {
+        Self {
+            version: OUTPUT_CAPABILITIES_VERSION,
+            can_pause,
+            can_resume,
+            can_seek,
+            can_set_volume,
+            can_mute,
+            can_gapless,
+            formats: Vec::new(),
+            channel_layouts: Vec::new(),
+        }
+    }
+
+    pub fn supports(&self, command: OutputCommand) -> bool {
+        match command {
+            OutputCommand::Pause => self.can_pause,
+            OutputCommand::Resume => self.can_resume,
+            OutputCommand::Seek => self.can_seek,
+            OutputCommand::SetVolume => self.can_set_volume,
+            OutputCommand::SetMute => self.can_mute,
+        }
+    }
+
+    pub fn require(&self, command: OutputCommand) -> OutputCommandResult<()> {
+        self.supports(command)
+            .then_some(())
+            .ok_or_else(|| OutputCommandError::unsupported(command))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportState {
@@ -48,6 +189,88 @@ pub struct OutputStatus {
     /// `ended_naturally` + `Stopped` means the track really is done, one second
     /// into a five-minute piece.
     pub realtime: bool,
+    /// La sortie est en train de servir du **DoP** : un train DSD emballé dans
+    /// du PCM 24 bits, reconnu à son marqueur alternant dans l'octet de poids
+    /// fort (`0x05`/`0xFA`).
+    ///
+    /// Conséquence visible pour l'utilisateur, et seule raison d'être de ce
+    /// champ : **le curseur de volume ne fait plus rien.** Tout facteur autre
+    /// que l'unité réécrit le marqueur, le DAC quitte le mode DSD et se coupe ;
+    /// le serveur épingle donc le volume à l'unité tant que dure le DoP
+    /// (#1735). Sans ce champ, le client ne peut pas distinguer un curseur
+    /// inerte d'un curseur cassé — et on remplacerait un silence inexpliqué par
+    /// une commande morte inexpliquée.
+    ///
+    /// **Détecté sur les octets, pas déduit des réglages.** Le mode DSD de la
+    /// zone dit ce qui a été *demandé* ; le plafond « Fréquence max » peut faire
+    /// retomber en PCM sans rien annoncer. Rejouer ces règles côté affichage
+    /// est précisément ce qui a fait mentir le chemin du signal (#1595).
+    ///
+    /// `false` pour tout ce qui n'est pas une sortie locale en DoP, donc pour
+    /// l'immense majorité des lectures et pour tous les plugins : champ
+    /// additif, aucun n'a à le renseigner.
+    pub dop_active: bool,
+}
+
+/// Runtime truth observed at the last boundary before an output backend.
+///
+/// This deliberately lives beside [`OutputTarget`] instead of adding fields to
+/// [`OutputStatus`]: out-of-tree plugins commonly construct `OutputStatus`
+/// with a struct literal, so extending that structure would be a source-level
+/// breaking change. The trait method returning this type has a default and is
+/// therefore additive for those plugins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputSignalPathStatus {
+    pub bit_perfect: bool,
+    pub sample_transport: OutputSampleTransport,
+    pub dsp: OutputDspState,
+    pub volume: OutputVolumeState,
+    pub reasons: Vec<OutputSignalReason>,
+}
+
+/// Compteurs DSP réellement observés par la sortie pendant la piste courante.
+///
+/// Séparé de [`OutputSignalPathStatus`] pour ne pas casser les plugins externes
+/// qui construisent encore cette structure par littéral. Le trait expose une
+/// méthode à défaut `None`, donc l'ajout reste compatible côté source (#2212).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDspMetrics {
+    pub eq_overs: u64,
+    pub eq_non_finite_samples: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputSampleTransport {
+    NativeInteger,
+    Float,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDspState {
+    Inactive,
+    Applied,
+    BypassedPure,
+    BypassedDop,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVolumeState {
+    Unity,
+    Applied,
+    BypassedDop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputSignalReason {
+    FloatTransport,
+    DspApplied,
+    DspStateUnknown,
+    SoftwareVolume,
 }
 
 impl Default for OutputStatus {
@@ -63,6 +286,7 @@ impl Default for OutputStatus {
             track_artist: None,
             ended_naturally: false,
             realtime: true,
+            dop_active: false,
         }
     }
 }
@@ -105,6 +329,34 @@ pub struct PlayMedia<'a> {
     ///
     /// Reading it is opt-in: an output that ignores it behaves exactly as before.
     pub origin_url: Option<&'a str>,
+    /// Which library or service the track came from (`"local"`, `"qobuz"`,
+    /// `"tidal"`, `"radio"`, …), paired with `source_id` below.
+    ///
+    /// Titles are not an identity: two tracks on one album can share a title
+    /// (an album and its alternate takes), and an output that keys on
+    /// artist/album/title alone will treat them as the same track. This pair is
+    /// the stable identity the host already has — an output can use it to tell
+    /// a genuine second play from a replay of the same track.
+    pub source: Option<&'a str>,
+    /// Identifier of the track within `source`: the local track id as a string,
+    /// or the service's own track id.
+    pub source_id: Option<&'a str>,
+    /// Album numbering, when the host knows it.
+    ///
+    /// Anything that lays tracks out in album order — an output that files
+    /// tracks by their rank, a display showing "3 / 12" — has no other way to
+    /// get it: the queue row
+    /// and the library track carry it, but it used to stop at the output
+    /// boundary, leaving outputs to invent a counter of their own.
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    /// False when `url` is a one-shot conversion channel (DSD→WAV à la volée) :
+    /// aucun octet passé ne peut être rejoué, la DIDL doit annoncer
+    /// `DLNA.ORG_OP=00` pour que le renderer streame séquentiellement au lieu
+    /// de chercher par tranches (l'Eversolo DMP-A8 seeke parce qu'on lui a dit
+    /// qu'il pouvait — et gèle à 0:00). True pour tout ce qui est servi depuis
+    /// un fichier, avec un vrai support des Range.
+    pub byte_seekable: bool,
 }
 
 impl Default for PlayMedia<'_> {
@@ -124,6 +376,11 @@ impl Default for PlayMedia<'_> {
             channels: None,
             live_stream: false,
             origin_url: None,
+            source: None,
+            source_id: None,
+            track_number: None,
+            disc_number: None,
+            byte_seekable: true,
         }
     }
 }
@@ -133,6 +390,14 @@ pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
+
+    /// Contrat explicite des commandes optionnelles de cette sortie.
+    ///
+    /// Le défaut `version == 0`, volontairement conservateur, garde les
+    /// plugins externes source-compatibles sans leur inventer des capacités.
+    fn capabilities(&self) -> OutputCapabilities {
+        OutputCapabilities::default()
+    }
 
     /// Whether this output can seamlessly chain a track staged via
     /// `set_next_media()` from inside its own playback loop (true), or whether
@@ -146,7 +411,7 @@ pub trait OutputTarget: Send + Sync {
     /// exclusive mode (ASIO / WASAPI exclusive) take a dedicated playback path
     /// that never consumes `next_media`, so they return false.
     fn supports_internal_gapless(&self) -> bool {
-        true
+        self.capabilities().can_gapless
     }
 
     /// Whether the poller should stage the gapless next track as a LOCAL FILE
@@ -197,6 +462,50 @@ pub trait OutputTarget: Send + Sync {
     async fn get_status(&self) -> Result<OutputStatus, String>;
     async fn is_available(&self) -> bool;
 
+    /// Entrées contrôlées utilisées par l'hôte. La capacité est vérifiée avant
+    /// tout appel au backend : une implémentation historique qui répondait
+    /// `Ok(())` sans rien faire ne peut donc plus transformer un refus en
+    /// succès.
+    async fn checked_pause(&self) -> OutputCommandResult<()> {
+        let command = OutputCommand::Pause;
+        self.capabilities().require(command)?;
+        self.pause()
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_resume(&self) -> OutputCommandResult<()> {
+        let command = OutputCommand::Resume;
+        self.capabilities().require(command)?;
+        self.resume()
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_seek(&self, position_ms: u64) -> OutputCommandResult<()> {
+        let command = OutputCommand::Seek;
+        self.capabilities().require(command)?;
+        self.seek(position_ms)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_set_volume(&self, volume: f64) -> OutputCommandResult<()> {
+        let command = OutputCommand::SetVolume;
+        self.capabilities().require(command)?;
+        self.set_volume(volume)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
+    async fn checked_set_mute(&self, muted: bool) -> OutputCommandResult<()> {
+        let command = OutputCommand::SetMute;
+        self.capabilities().require(command)?;
+        self.set_mute(muted)
+            .await
+            .map_err(|message| OutputCommandError::failed(command, message))
+    }
+
     /// A fatal error the output hit on its own, outside any call we made.
     ///
     /// Push-based outputs do their work on a background thread: by the time
@@ -246,6 +555,19 @@ pub trait OutputTarget: Send + Sync {
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// Actual signal contract observed by the output while rendering.
+    ///
+    /// `None` means that this output does not expose a runtime observation;
+    /// callers may retain their existing static description in that case.
+    fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+        None
+    }
+
+    /// Compteurs DSP de la piste courante, quand la sortie peut les observer.
+    fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        None
+    }
 }
 
 /// A source of out-of-tree outputs, handed to the server at startup.
@@ -254,7 +576,7 @@ pub trait OutputTarget: Send + Sync {
 /// the Diretta Host SDK cannot ship in a public build) plug into the public
 /// server without the public workspace ever referencing it: the private repo
 /// builds its own composer binary that calls
-/// `tune_server::run::main_blocking(RunOptions { output_providers, .. })`.
+/// `tune_server::bootstrap::run_with(RunOptions { output_providers, .. })`.
 /// The server polls `discover()` at startup and then periodically, registers
 /// each returned output in the output registry, and gives it the same zone
 /// lifecycle as built-in discovery (reconnect, auto-create, hidden zones).
@@ -262,6 +584,23 @@ pub trait OutputTarget: Send + Sync {
 pub trait OutputProvider: Send + Sync {
     /// Short provider name for logs (e.g. "diretta").
     fn provider_name(&self) -> &str;
+
+    /// The paid module id this provider needs (e.g. `"diretta"`), or `None`
+    /// for a free provider. **Declare it if you are a paid SKU.**
+    ///
+    /// Returning an empty list from [`discover`](Self::discover) when the
+    /// module is not owned is correct, but it is indistinguishable from a
+    /// provider that is absent, mis-compiled, or on a network that does not
+    /// answer — and a beta tester of the Diretta module reinstalled his whole
+    /// system over exactly that ambiguity (#2392). Declaring the module here
+    /// lets the SERVER say, in the logs and in `/system/diagnostics`, that the
+    /// provider is idle *because a paid entitlement is missing* and which one.
+    ///
+    /// Default `None`, so an existing out-of-tree provider keeps compiling and
+    /// behaving exactly as before; opting in is a one-line change.
+    fn required_module(&self) -> Option<&str> {
+        None
+    }
 
     /// Discover the devices reachable right now and build one [`OutputTarget`]
     /// per device. Return every visible device on each call — the server skips
@@ -291,5 +630,44 @@ impl ProviderContext {
     /// Whether the account owns the paid module `id` (e.g. "diretta").
     pub fn module_licensed(&self, id: &str) -> bool {
         self.licensed_modules.iter().any(|m| m == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_plugin_capabilities_fail_closed() {
+        let capabilities = OutputCapabilities::default();
+        assert_eq!(capabilities.version, 0);
+        for command in [
+            OutputCommand::Pause,
+            OutputCommand::Resume,
+            OutputCommand::Seek,
+            OutputCommand::SetVolume,
+            OutputCommand::SetMute,
+        ] {
+            assert_eq!(
+                capabilities.require(command),
+                Err(OutputCommandError::Unsupported { command })
+            );
+        }
+    }
+
+    #[test]
+    fn v1_contract_is_stable_and_machine_readable() {
+        let capabilities = OutputCapabilities::v1(true, true, false, true, false, false);
+        let json = serde_json::to_value(&capabilities).unwrap();
+
+        assert_eq!(json["version"], OUTPUT_CAPABILITIES_VERSION);
+        assert_eq!(json["can_pause"], true);
+        assert_eq!(json["can_seek"], false);
+        assert_eq!(
+            capabilities.require(OutputCommand::Seek),
+            Err(OutputCommandError::Unsupported {
+                command: OutputCommand::Seek,
+            })
+        );
     }
 }

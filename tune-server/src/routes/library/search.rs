@@ -172,6 +172,20 @@ pub(super) async fn acoustic_search(
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 200) as usize;
 
+    // La tour texte du CLAP est entraînée en anglais : une requête libre en
+    // français recale mal. Si l'utilisateur a configuré une clé API IA
+    // (anthropic/openai/gemini), on traduit sa requête (cache local, une
+    // seule traduction par requête) ; sans clé ou en cas d'échec, requête
+    // brute — comportement historique, les presets anglais ne changent pas.
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let effective_query = tune_core::ai::translate::translate_query(&settings, query)
+        .await
+        .unwrap_or_else(|| query.to_string());
+    if effective_query != query {
+        tracing::info!(query = %query, translated = %effective_query, "acoustic_query_translated");
+    }
+    let query = effective_query.as_str();
+
     // Text-tower embedding (provisions runtime + model + tokenizer on first call).
     let qvec = text_embedding::embed_query(&state.backend, query)
         .await
@@ -349,6 +363,23 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let eligible = 0_i64;
 
+    // Numérateur de la progression : les pistes TRAITÉES pour le modèle
+    // courant, pas celles dont on a tiré un embedding. Les deux diffèrent des
+    // échecs, et confondre les deux figeait la jauge sous 100 % à jamais
+    // (#1819). C'est `processed` qui doit piloter la barre : il atteint le
+    // dénominateur quand il ne reste plus rien à faire.
+    #[cfg(feature = "audio-embedding")]
+    let processed = tune_core::audio::embedding_store::processed_count(&state.backend);
+    #[cfg(not(feature = "audio-embedding"))]
+    let processed = 0_i64;
+
+    // Les pistes finies mais sans embedding. À dire franchement : « 51 pistes
+    // n'ont pas pu être analysées » se comprend, une jauge coincée à 99,8 % non.
+    #[cfg(feature = "audio-embedding")]
+    let failed = (processed - analysed).max(0);
+    #[cfg(not(feature = "audio-embedding"))]
+    let failed = 0_i64;
+
     let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .get("audio_embedding_throttle")
         .ok()
@@ -367,15 +398,54 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let model_ready = false;
 
+    // `model_ready` seul confond « jamais tenté », « en cours de
+    // téléchargement » et « en échec ». Les trois donnaient le même message à
+    // l'utilisateur, qui allait alors chercher la panne du côté de sa connexion
+    // (#1658) ou concluait à une jauge bloquée (#1512).
+    #[cfg(feature = "audio-embedding")]
+    let model_fetch = {
+        let f = tune_core::audio::embedding::fetch_state("audio_model");
+        json!({
+            "in_progress": f.in_progress,
+            "downloaded_bytes": f.downloaded,
+            "total_bytes": f.total,
+            "attempts": f.attempts,
+            "last_error": f.last_error,
+        })
+    };
+    #[cfg(not(feature = "audio-embedding"))]
+    let model_fetch = json!(null);
+
+    // Pourquoi la passe ne travaille pas, quand elle ne travaille pas.
+    //
+    // Une passe en pause et une passe cassée donnaient exactement le même
+    // écran — jauge immobile, rien qui bouge. Bilou a ouvert un fil sur une
+    // analyse « qui ne démarre pas » (#1457) alors qu'elle cédait le passage à
+    // sa musique, comme prévu. `null` quand rien ne l'empêche de tourner.
+    #[cfg(feature = "audio-embedding")]
+    let paused_reason = tune_core::audio::embedding::pause_acoustique().nom();
+    #[cfg(not(feature = "audio-embedding"))]
+    let paused_reason: Option<&str> = None;
+
     Json(json!({
         "available": available,
         "enabled": enabled,
         "model_ready": model_ready,
+        "model_fetch": model_fetch,
+        // « playback » | « thermal » | « low_memory » | « not_premium » | null
+        "paused_reason": paused_reason,
+        // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,
+        // Pistes traitées (embedding écrit OU échec constaté) : le numérateur
+        // de la barre, celui qui atteint le dénominateur quand c'est fini.
+        "processed_tracks": processed,
+        // Traitées sans embedding. L'interface doit les nommer, pas les taire.
+        "failed_tracks": failed,
         "eligible_tracks": eligible,
-        // Bornée à 0 : un modèle qui change repart de zéro et l'analyse peut
-        // dépasser brièvement l'ancien dénominateur.
-        "pending_tracks": (eligible - analysed).max(0),
+        // Ce qui RESTE à faire, mesuré sur les pistes traitées et non sur les
+        // embeddings : sinon les échecs restaient éternellement « en attente »
+        // et la jauge ne finissait jamais (#1819).
+        "pending_tracks": (eligible - processed).max(0),
         "throttle": throttle,
     }))
 }

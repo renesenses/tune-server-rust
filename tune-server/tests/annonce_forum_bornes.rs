@@ -400,3 +400,23 @@ fn le_workflow_de_veille_appelle_le_script_teste() {
         "tout job doit porter un plafond de duree (cf workflows_bornes)"
     );
 }
+
+/// Garde-fou sur le garde-fou : le job `forum` de `release.yml` doit rester
+/// eteint, et la raison doit rester ecrite a cote. Le rallumer en l'etat
+/// posterait publiquement des liens vers le depot prive.
+#[test]
+fn le_job_forum_de_release_yml_reste_eteint_et_motive() {
+    let release = lire(".github/workflows/release.yml");
+    let debut = release
+        .find("  forum:\n")
+        .expect("le job `forum` existe toujours dans release.yml");
+    let entete = &release[debut..(debut + 400).min(release.len())];
+    assert!(
+        entete.contains("if: false"),
+        "le job forum a ete rallume — lire #2328 avant, il poste des liens vers le depot prive"
+    );
+    assert!(
+        release.contains("#2328"),
+        "la raison de l'extinction doit rester lisible a cote du `if: false`"
+    );
+}

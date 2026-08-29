@@ -104,6 +104,10 @@ async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, Ap
     let cache_dir = offline_cache_dir(&settings);
 
     Ok(Json(json!({
+        // Contrat du client web (`getOfflineStatus` / OfflineView). Garder
+        // aussi les noms explicites ci-dessous pour les autres consommateurs.
+        "total": total,
+        "size_bytes": total_size,
         "total_tracks": total,
         "completed": completed,
         "pending": pending,

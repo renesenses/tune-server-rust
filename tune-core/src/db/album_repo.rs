@@ -10,8 +10,13 @@ use crate::TuneError;
 pub mod sql {
     use super::SqlDialect;
 
+    /// ⚠️ L'ordre des colonnes EST le contrat de [`super::row_to_album`], qui
+    /// lit par index. `is_compilation` est en 24 et `added_at` — injecté par
+    /// `list_filtered` juste avant `FROM albums a` — se retrouve en 25 : toute
+    /// colonne ajoutée ici doit l'être AVANT `FROM`, et `row_to_album` mis à
+    /// jour dans le même mouvement.
     pub fn select_album() -> &'static str {
-        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
+        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres, a.is_compilation FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -63,7 +68,7 @@ pub mod sql {
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date, is_compilation) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -86,6 +91,7 @@ pub mod sql {
             d.placeholder(20),
             d.placeholder(21),
             d.placeholder(22),
+            d.placeholder(23),
         )
     }
 
@@ -145,6 +151,17 @@ pub mod sql {
         )
     }
 
+    /// Lève le drapeau « compilation » (#1957). `COALESCE(is_compilation, 0)`
+    /// et non `is_compilation = 0` : une base migrée peut porter des NULL, et
+    /// `NULL = 0` est NULL — la ligne ne serait jamais mise à jour.
+    pub fn mark_compilation<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET is_compilation = 1 \
+             WHERE id = {} AND COALESCE(is_compilation, 0) = 0",
+            d.placeholder(1)
+        )
+    }
+
     pub fn get_artist_name<D: SqlDialect>(d: &D) -> String {
         format!("SELECT name FROM artists WHERE id = {}", d.placeholder(1))
     }
@@ -155,6 +172,42 @@ pub mod sql {
             d.placeholder(1),
             d.placeholder(2)
         )
+    }
+
+    /// Albums qui portent la signature étroite du collage #2458.
+    ///
+    /// On ne répare PAS tout désaccord album/pistes : un album classique peut
+    /// légitimement porter un artiste d'album différent de ses interprètes. Il
+    /// faut ici, simultanément :
+    /// - un artiste d'album dont le MBID est présent mais vide (valeur invalide
+    ///   que l'ancien `ArtistRepo::get_or_create` utilisait comme identité) ;
+    /// - un album local non compilation ;
+    /// - toutes les pistes rattachées au même autre `artist_id` ;
+    /// - aucun tag ALBUMARTIST non vide qui contredise cet artiste unanime.
+    pub fn empty_mbid_artist_collapse_candidates() -> &'static str {
+        "SELECT a.id, a.title, a.artist_id, unanimous.artist_id, target.name \
+         FROM albums a \
+         JOIN artists current_artist ON current_artist.id = a.artist_id \
+         JOIN ( \
+             SELECT album_id, MIN(artist_id) AS artist_id \
+             FROM tracks \
+             GROUP BY album_id \
+             HAVING COUNT(*) > 0 \
+                AND COUNT(artist_id) = COUNT(*) \
+                AND COUNT(DISTINCT artist_id) = 1 \
+         ) unanimous ON unanimous.album_id = a.id \
+         JOIN artists target ON target.id = unanimous.artist_id \
+         WHERE a.source = 'local' \
+           AND COALESCE(a.is_compilation, 0) = 0 \
+           AND current_artist.musicbrainz_id IS NOT NULL \
+           AND TRIM(current_artist.musicbrainz_id) = '' \
+           AND a.artist_id <> unanimous.artist_id \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM tracks tagged \
+               WHERE tagged.album_id = a.id \
+                 AND NULLIF(TRIM(tagged.album_artist), '') IS NOT NULL \
+                 AND LOWER(TRIM(tagged.album_artist)) <> LOWER(TRIM(target.name)) \
+           )"
     }
 
     pub fn update<D: SqlDialect>(d: &D) -> String {
@@ -200,6 +253,22 @@ pub mod sql {
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5)
+        )
+    }
+
+    /// Ecrit l'annee EN ECRASANT la valeur existante.
+    ///
+    /// `update_dates` ci-dessus fait un COALESCE et ne remplace jamais rien :
+    /// c'est ce qu'il faut quand on comble un trou laisse par le scan. Une
+    /// correction validee par l'utilisateur est le cas oppose — la valeur en
+    /// place est justement celle qu'il veut changer. Deux besoins contraires,
+    /// deux requetes ; les confondre rendrait l'arbitrage sans effet, en
+    /// silence.
+    pub fn set_year<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET year = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -418,7 +487,11 @@ impl AlbumRepo {
 
     pub fn create(&self, album: &Album) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
-        let params: [&dyn ToSqlValue; 22] = [
+        // `is_compilation` en 0/1 et non en booléen natif : SQLite n'a pas de
+        // type booléen et la colonne PG est un SMALLINT 0/1 (convention du
+        // schéma, cf. l'en-tête de 001_initial_schema.sql).
+        let is_compilation: i64 = i64::from(album.is_compilation);
+        let params: [&dyn ToSqlValue; 23] = [
             &album.title,
             &album.artist_id,
             &album.year,
@@ -441,6 +514,7 @@ impl AlbumRepo {
             &album.musicbrainz_release_group_id,
             &album.release_date,
             &album.original_date,
+            &is_compilation,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -705,6 +779,61 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Répare les albums déjà figés sur un artiste partagé par MBID vide.
+    ///
+    /// Cette passe est destinée à la fin d'un scan complet et sain. Sa requête
+    /// est volontairement fail-closed : au moindre artiste de piste divergent,
+    /// drapeau compilation ou ALBUMARTIST contradictoire, aucune ligne n'est
+    /// candidate. Le retour est le nombre d'albums effectivement réattribués.
+    pub fn repair_empty_mbid_artist_collapses(&self) -> Result<usize, TuneError> {
+        let candidate_sql = sql::empty_mbid_artist_collapse_candidates();
+        let update_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let mut repaired = 0usize;
+
+        self.db.write_tx(&mut |tx| {
+            let candidates = tx.query_many(candidate_sql, &[])?;
+            for row in candidates {
+                let Some(album_id) = row.first().and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let title = row
+                    .get(1)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                let previous_artist_id = row.get(2).and_then(|value| value.as_i64());
+                let Some(target_artist_id) = row.get(3).and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let target_name = row
+                    .get(4)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                if target_name
+                    .trim()
+                    .eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+                {
+                    continue;
+                }
+
+                let params: [&dyn ToSqlValue; 2] = [&target_artist_id, &album_id];
+                if tx.execute(&update_sql, &params)? > 0 {
+                    repaired += 1;
+                    tracing::warn!(
+                        album_id,
+                        album = %title,
+                        previous_artist_id = ?previous_artist_id,
+                        target_artist_id,
+                        target_artist = %target_name,
+                        "album_artist_repaired_empty_mbid_collapse"
+                    );
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(repaired)
+    }
+
     /// The id of the album a folder holds, if one is recorded.
     /// L'album auquel rattacher une piste dont le dossier est l'éclat d'une
     /// compilation rangée par artiste (#1440).
@@ -753,7 +882,7 @@ impl AlbumRepo {
                 continue;
             }
             // Même titre, dossiers frères — mais est-ce le MÊME disque ?
-            if folder_cover_fingerprint(&cand_folder).as_deref() != Some(empreinte.as_str()) {
+            if !folder_cover_fingerprint(&cand_folder).is_some_and(|f| f.matches(&empreinte)) {
                 continue;
             }
             let taken: Vec<i32> = row
@@ -795,6 +924,30 @@ impl AlbumRepo {
     pub fn set_folder_path(&self, album_id: i64, folder: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_folder_path, sql::set_folder_path);
         let params: [&dyn ToSqlValue; 2] = [&folder, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Marque l'album comme compilation (#1957). **Ne baisse jamais le
+    /// drapeau**, et c'est délibéré :
+    ///
+    /// - le scan voit les pistes une par une ; la première d'une anthologie
+    ///   peut, seule, ne rien avoir de « compilation ». Un `SET = <décision>`
+    ///   ferait dépendre le résultat de l'ordre d'arrivée des fichiers ;
+    /// - le regroupement lui-même est déjà irréversible dans les faits :
+    ///   l'album a pris « Various Artists » pour artiste et le rescan ne le lui
+    ///   reprend pas. Le drapeau décrit ce regroupement — il doit avoir la même
+    ///   durée de vie, sans quoi la pastille contredirait l'écran.
+    ///
+    /// La voie de réparation d'un faux positif reste le rescan complet, qui
+    /// repart d'un `DELETE FROM albums` (`track_repo::delete_all`) : les lignes
+    /// sont reconstruites, drapeau compris, d'après les tags du moment.
+    ///
+    /// Idempotent : la clause `COALESCE(is_compilation, 0) = 0` fait de tout
+    /// appel suivant un no-op, donc aucun coût sur un rescan.
+    pub fn mark_compilation(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::mark_compilation, sql::mark_compilation);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -881,6 +1034,14 @@ impl AlbumRepo {
             &original_date,
             &album_id,
         ];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Ecrit l'annee en ecrasant celle en place — voir `sql::set_year`.
+    pub fn set_year(&self, album_id: i64, year: i32) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_year, sql::set_year);
+        let params: [&dyn ToSqlValue; 2] = [&year, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -1124,7 +1285,7 @@ impl AlbumRepo {
         sort: &str,
         order: &str,
     ) -> Result<Vec<Album>, TuneError> {
-        self.list_filtered(limit, offset, sort, order, None, None)
+        self.list_filtered(limit, offset, sort, order, None, None, None)
     }
 
     pub fn list_filtered(
@@ -1135,25 +1296,33 @@ impl AlbumRepo {
         order: &str,
         format: Option<&str>,
         quality: Option<&str>,
+        // `Some(true)` = seulement les compilations, `Some(false)` = tout sauf
+        // elles, `None` = pas de filtre (#1957).
+        compilation: Option<bool>,
     ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
         } else {
             "ASC"
         };
+        // `a.id` en DERNIER départage de chaque tri : sans clé unique finale,
+        // l'ordre des égalités peut changer d'une requête à l'autre, et toute
+        // pagination (le Browse UPnP page par 200) SAUTE des albums et en
+        // double d'autres — six albums absents de la grille d'un serveur Tune
+        // distant (jeu des sept erreurs, 25/08).
         let order_clause = match sort {
-            "title" => format!("LOWER(a.title) {dir}"),
+            "title" => format!("LOWER(a.title) {dir}, a.id ASC"),
             "release_date" => format!(
-                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC"
+                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC"
             ),
             // The web client's sort dropdown labels this option "original_year"
             // (LibraryView AlbumSortKey); accept it as an alias for "year" so an
             // unknown key doesn't silently fall through to the `a.id` default.
             "year" | "original_year" => {
-                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC")
+                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC")
             }
             "artist" => {
-                format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
+                format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC, a.id ASC")
             }
             // "Date added" must survive a full rescan. A full rescan does
             // `DELETE FROM albums` + reinsert (track_repo::delete_all), so
@@ -1224,6 +1393,14 @@ impl AlbumRepo {
                 wheres.push("a.format IN ('mp3','aac','ogg','opus','wma')".to_string());
             }
             _ => {}
+        }
+        // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et
+        // `NULL = 0` vaut NULL — sans lui, « tout sauf les compilations »
+        // masquerait aussi les albums jamais rescannés.
+        match compilation {
+            Some(true) => wheres.push("COALESCE(a.is_compilation, 0) <> 0".to_string()),
+            Some(false) => wheres.push("COALESCE(a.is_compilation, 0) = 0".to_string()),
+            None => {}
         }
 
         let where_clause = if wheres.is_empty() {
@@ -1400,6 +1577,39 @@ impl AlbumRepo {
 
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// album-detail endpoint. Returns None when no sourced bio is recorded.
+    /// The album's Dynamic Range, as tagged by an external analyser.
+    ///
+    /// The value is written per track by the scanner (`track_metadata['dr_album']`,
+    /// read from the Vorbis `ALBUM DYNAMIC RANGE` field) because that is where
+    /// the tag physically lives — in each file — while it describes the album as
+    /// a whole. Any one track therefore answers for the album, hence `LIMIT 1`.
+    ///
+    /// Returns `None` when no track carries the tag, which is the common case:
+    /// tagging DR is a deliberate step most libraries never take. The caller
+    /// must render nothing at all rather than an empty field.
+    pub fn dynamic_range(&self, id: i64) -> Result<Option<String>, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = ? AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+            Engine::Postgres => {
+                "SELECT tm.value FROM track_metadata tm \
+                 JOIN tracks t ON t.id = tm.track_id \
+                 WHERE t.album_id = $1 AND tm.key = 'dr_album' AND tm.value <> '' \
+                 LIMIT 1"
+            }
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(sql, &params)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => {
@@ -1451,9 +1661,18 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         genre: cols.get(6).and_then(|v| v.as_string()),
         // Index 23 (after the 23-col select): a.genres
         genres: cols.get(23).and_then(|v| v.as_string()),
-        // Index 24: added_at — present only on the added-date sorted listing
+        // Index 24: a.is_compilation (#1957). `as_i64` tolère l'entier des deux
+        // moteurs ET le texte d'une base issue de `migrate-to-postgres` pas
+        // encore soignée par la migration PG 028 — donc jamais de faux « non »
+        // par simple désaccord de type. Absent/NUL = non.
+        is_compilation: cols
+            .get(24)
+            .and_then(|v| v.as_i64())
+            .map(|n| n != 0)
+            .unwrap_or(false),
+        // Index 25: added_at — present only on the added-date sorted listing
         // (list_filtered injects the column); None for every other query.
-        added_at: cols.get(24).and_then(|v| v.as_f64()),
+        added_at: cols.get(25).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
         cover_path: cols.get(9).and_then(|v| v.as_string()),
@@ -1491,26 +1710,48 @@ mod tests {
 
     /// Pose une piste numérotée sur un album, comme le fait le scan.
     fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
+        seed_track_with_album_artist(db, album_id, artist_id, n, path, None);
+    }
+
+    fn seed_track_with_album_artist(
+        db: &SqliteDb,
+        album_id: i64,
+        artist_id: i64,
+        n: i32,
+        path: &str,
+        album_artist: Option<&str>,
+    ) {
         use crate::db::models::Track;
         use crate::db::track_repo::TrackRepo;
         let mut t = Track::new(format!("piste {n}"));
         t.album_id = Some(album_id);
         t.artist_id = Some(artist_id);
+        t.album_artist = album_artist.map(str::to_string);
         t.track_number = n;
         t.file_path = Some(path.into());
         TrackRepo::new(db.clone()).create(&t).unwrap();
     }
 
     /// Crée un dossier d'album avec sa pochette, comme sur disque.
+    ///
+    /// `motif` désigne le disque ; `qualite` fait varier l'encodage d'un
+    /// dossier à l'autre, comme le fait Qobuz. Deux dossiers d'un même disque
+    /// n'ont donc pas un octet en commun — ce qui est exactement le cas que la
+    /// comparaison par SHA-256 ratait (#1470).
     fn dossier_avec_pochette(
         base: &std::path::Path,
         artiste: &str,
         album: &str,
-        image: &[u8],
+        motif: u32,
+        qualite: u8,
     ) -> String {
         let d = base.join(artiste).join(album);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("cover.jpg"), image).unwrap();
+        std::fs::write(
+            d.join("cover.jpg"),
+            crate::scanner::compilation::pochette_de_test(motif, 96, qualite),
+        )
+        .unwrap();
         d.to_string_lossy().into_owned()
     }
 
@@ -1525,8 +1766,8 @@ mod tests {
         let artists = ArtistRepo::new(db.clone());
         let a1 = artists.create(&Artist::new("Corte Real".into())).unwrap();
         let a2 = artists.create(&Artist::new("Alligator".into())).unwrap();
-        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, b"OUF-COVER");
-        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, b"OUF-COVER");
+        let f1 = dossier_avec_pochette(tmp.path(), "Corte Real", TITLE, 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, 1, 55);
 
         let first = arepo
             .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
@@ -1549,8 +1790,8 @@ mod tests {
         let artists = ArtistRepo::new(db.clone());
         let a1 = artists.create(&Artist::new("Pat Benatar".into())).unwrap();
         let a2 = artists.create(&Artist::new("Police".into())).unwrap();
-        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", b"BENATAR");
-        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", b"POLICE");
+        let f1 = dossier_avec_pochette(tmp.path(), "Pat Benatar", "Greatest Hits", 1, 92);
+        let f2 = dossier_avec_pochette(tmp.path(), "Police", "Greatest Hits", 3, 92);
 
         let first = arepo
             .get_or_create_for_folder_with_track(
@@ -1603,10 +1844,10 @@ mod tests {
             ("Oscar", 3, 5),
             ("Pia", 3, 1),
         ];
-        let images = [b"VOL-1".as_slice(), b"VOL-2", b"VOL-3", b"VOL-4"];
         let mut vus = std::collections::HashSet::new();
         for (artiste, vol, num) in arrivees {
-            let f = dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", images[vol]);
+            let f =
+                dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", vol as u32, 60 + (num as u8));
             let aid = artists.create(&Artist::new(artiste.into())).unwrap();
             let album = arepo
                 .get_or_create_for_folder_with_track(&f, "ALLOPOP", aid, None, None, Some(num))
@@ -2321,6 +2562,144 @@ mod tests {
         assert_eq!(desc[0].title, "Hot Rats");
     }
 
+    /// Le drapeau « compilation » doit SURVIVRE à l'écriture (#1957). Il était
+    /// lu dans les tags, utilisé au scan, puis jeté : aucune colonne, donc
+    /// aucune requête capable de le rendre.
+    #[test]
+    fn le_drapeau_compilation_survit_a_une_relecture() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let ordinaire = repo.create(&Album::new("Kind of Blue".into())).unwrap();
+        let anthologie = repo.create(&Album::new("Jazz sur Seine".into())).unwrap();
+
+        // Par défaut, personne n'est une compilation.
+        assert!(
+            !repo.get(anthologie).unwrap().unwrap().is_compilation,
+            "un album neuf ne doit pas naître compilation"
+        );
+
+        repo.mark_compilation(anthologie).unwrap();
+
+        assert!(
+            repo.get(anthologie).unwrap().unwrap().is_compilation,
+            "le drapeau posé par le scan doit se relire"
+        );
+        assert!(
+            !repo.get(ordinaire).unwrap().unwrap().is_compilation,
+            "marquer un album ne doit pas en marquer un autre"
+        );
+
+        // Le drapeau doit aussi ressortir des listes, pas seulement du get :
+        // c'est la vue album qui le réclame.
+        let liste = repo.list(100, 0).unwrap();
+        let vue: Vec<(String, bool)> = liste
+            .iter()
+            .map(|a| (a.title.clone(), a.is_compilation))
+            .collect();
+        assert!(
+            vue.contains(&("Jazz sur Seine".to_string(), true)),
+            "la liste doit porter le drapeau : {vue:?}"
+        );
+        assert!(
+            vue.contains(&("Kind of Blue".to_string(), false)),
+            "la liste doit distinguer les deux : {vue:?}"
+        );
+    }
+
+    /// `mark_compilation` LÈVE le drapeau et ne le baisse jamais — le scan voit
+    /// les pistes une par une, et une anthologie dont la première piste, seule,
+    /// ne ressemble à rien ne doit pas dépendre de l'ordre des fichiers.
+    /// Rejouable sans effet : un rescan ne doit rien réécrire.
+    #[test]
+    fn marquer_une_compilation_est_idempotent() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        let id = repo.create(&Album::new("Anthologie".into())).unwrap();
+
+        repo.mark_compilation(id).unwrap();
+        repo.mark_compilation(id).unwrap();
+        repo.mark_compilation(id).unwrap();
+
+        assert!(repo.get(id).unwrap().unwrap().is_compilation);
+    }
+
+    /// `create` doit transporter le drapeau : sans ça, un album créé
+    /// compilation ressortirait « non » et le round-trip du modèle mentirait.
+    #[test]
+    fn create_transporte_le_drapeau() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        let mut a = Album::new("Now That's What I Call Music".into());
+        a.is_compilation = true;
+        let id = repo.create(&a).unwrap();
+        assert!(repo.get(id).unwrap().unwrap().is_compilation);
+    }
+
+    /// Filtrer la bibliothèque sur les compilations — un des trois usages que
+    /// l'absence de colonne interdisait (#1957).
+    #[test]
+    fn list_filtered_isole_les_compilations() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        repo.create(&Album::new("Kind of Blue".into())).unwrap();
+        let comp = repo.create(&Album::new("Jazz sur Seine".into())).unwrap();
+        repo.mark_compilation(comp).unwrap();
+
+        let titres = |v: Vec<Album>| -> Vec<String> { v.into_iter().map(|a| a.title).collect() };
+
+        let seulement = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true))
+                .unwrap(),
+        );
+        assert_eq!(seulement, vec!["Jazz sur Seine".to_string()]);
+
+        let sauf = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false))
+                .unwrap(),
+        );
+        assert_eq!(sauf, vec!["Kind of Blue".to_string()]);
+
+        let tout = titres(
+            repo.list_filtered(100, 0, "title", "asc", None, None, None)
+                .unwrap(),
+        );
+        assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
+    }
+
+    /// `added_at` est injecté JUSTE AVANT `FROM albums a`, donc l'ajout de
+    /// `is_compilation` en fin de `select_album` l'a décalé d'un index.
+    /// `row_to_album` lit par index : ce test épingle les DEUX colonnes
+    /// ensemble, pour qu'un futur ajout ne fasse pas taire la date d'ajout.
+    #[test]
+    fn is_compilation_et_added_at_cohabitent_dans_le_meme_select() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let id = repo.create(&Album::new("Anthologie".into())).unwrap();
+        repo.mark_compilation(id).unwrap();
+        let mut t = Track::new("piste".into());
+        t.album_id = Some(id);
+        t.file_path = Some("/a.flac".into());
+        t.file_mtime = Some(1000.0);
+        trepo.create(&t).unwrap();
+
+        let tries = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        let a = tries.first().expect("un album attendu");
+        assert!(
+            a.is_compilation,
+            "le drapeau doit survivre au SELECT enrichi de added_at"
+        );
+        assert!(
+            a.added_at.is_some(),
+            "added_at doit rester lu, malgré le décalage d'index"
+        );
+    }
+
     #[test]
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
@@ -2356,6 +2735,61 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn dynamic_range_reads_the_tag_from_any_track_of_the_album() {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let db = test_db();
+        // `track_metadata` arrives by migration, not by CORE_SCHEMA, so the
+        // in-memory fixture does not have it. Create it here rather than run the
+        // whole migration chain: this test is about the join, not the schema.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata (
+                 track_id INTEGER NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (track_id, key)
+             );",
+        )
+        .unwrap();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+        let mrepo = TrackMetadataRepo::new(db.clone());
+
+        let album_id = arepo.create(&Album::new("Tri Repetae".into())).unwrap();
+        let mut t1 = Track::new("Dael".into());
+        t1.album_id = Some(album_id);
+        t1.file_path = Some("/m/1.flac".into());
+        let id1 = trepo.create(&t1).unwrap();
+        let mut t2 = Track::new("Clipper".into());
+        t2.album_id = Some(album_id);
+        t2.file_path = Some("/m/2.flac".into());
+        let id2 = trepo.create(&t2).unwrap();
+
+        // No tag anywhere yet: nothing to show, and that is the common case.
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // The tag lives in each file; the scanner therefore writes it per track
+        // even though it describes the album. Tagging the SECOND track proves
+        // the lookup does not just read the first one.
+        mrepo.set(id2, "dr_album", "12").unwrap();
+        assert_eq!(
+            arepo.dynamic_range(album_id).unwrap().as_deref(),
+            Some("12")
+        );
+
+        // An empty value must not masquerade as a measurement.
+        mrepo.set(id1, "dr_album", "").unwrap();
+        mrepo.delete(id2, "dr_album").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap(), None);
+
+        // DR0 is a real measurement on a crushed master, not an absence.
+        mrepo.set(id1, "dr_album", "0").unwrap();
+        assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
     }
 
     #[test]
@@ -2794,6 +3228,141 @@ mod tests {
             .unwrap();
         assert_eq!(after.id, created.id);
         assert_eq!(after.artist_id, Some(first));
+    }
+
+    /// Cas réduit de Philippe : l'album est figé sur l'artiste qui avait reçu
+    /// le MBID vide, tandis que toutes ses pistes portent le bon artiste.
+    #[test]
+    fn a_healthy_rescan_repairs_an_empty_mbid_artist_collapse() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let wrong = artist_repo
+            .create(&Artist::new("Classique - Saint-Saëns".into()))
+            .unwrap();
+        let right = artist_repo
+            .create(&Artist::new("Anouar Brahem".into()))
+            .unwrap();
+        DbBackend::execute(
+            &db,
+            "UPDATE artists SET musicbrainz_id = '' WHERE id = ?",
+            &[&wrong as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        let album = album_repo
+            .get_or_create_for_folder(
+                "/music/Anouar Brahem/After the Last Sky",
+                "After the Last Sky",
+                wrong,
+                Some(2025),
+                None,
+            )
+            .unwrap();
+        let album_id = album.id.unwrap();
+        seed_track(&db, album_id, right, 1, "/music/Anouar/01.flac");
+        seed_track(&db, album_id, right, 2, "/music/Anouar/02.flac");
+
+        assert_eq!(album_repo.repair_empty_mbid_artist_collapses().unwrap(), 1);
+        assert_eq!(
+            album_repo.get(album_id).unwrap().unwrap().artist_id,
+            Some(right)
+        );
+        assert_eq!(
+            album_repo.repair_empty_mbid_artist_collapses().unwrap(),
+            0,
+            "la réparation doit être idempotente"
+        );
+    }
+
+    /// Les quatre gardes qui empêchent une réattribution spéculative : absence
+    /// de la signature MBID vide, compilation, artistes de pistes divergents et
+    /// tag ALBUMARTIST explicite qui confirme l'attribution actuelle.
+    #[test]
+    fn ambiguous_album_artist_mismatches_are_never_repaired() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let current = artist_repo
+            .create(&Artist::new("Album Artist".into()))
+            .unwrap();
+        let invalid_current = artist_repo
+            .create(&Artist::new("Invalid Empty MBID Artist".into()))
+            .unwrap();
+        let track_a = artist_repo
+            .create(&Artist::new("Track Artist A".into()))
+            .unwrap();
+        let track_b = artist_repo
+            .create(&Artist::new("Track Artist B".into()))
+            .unwrap();
+        DbBackend::execute(
+            &db,
+            "UPDATE artists SET musicbrainz_id = '   ' WHERE id = ?",
+            &[&invalid_current as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        // MBID NULL : désaccord ordinaire, sans signature du collage #2458.
+        let ordinary = album_repo
+            .get_or_create_for_folder("/m/ordinary", "Ordinary", current, None, None)
+            .unwrap();
+        seed_track(&db, ordinary.id.unwrap(), track_a, 1, "/m/ordinary/01.flac");
+
+        // Compilation : plusieurs artistes sont attendus par construction.
+        let compilation = album_repo
+            .get_or_create_for_folder("/m/compilation", "Compilation", invalid_current, None, None)
+            .unwrap();
+        album_repo
+            .mark_compilation(compilation.id.unwrap())
+            .unwrap();
+        seed_track(
+            &db,
+            compilation.id.unwrap(),
+            track_a,
+            1,
+            "/m/compilation/01.flac",
+        );
+
+        // Deux artistes de pistes : aucun consensus à utiliser comme preuve.
+        let mixed = album_repo
+            .get_or_create_for_folder("/m/mixed", "Mixed", invalid_current, None, None)
+            .unwrap();
+        seed_track(&db, mixed.id.unwrap(), track_a, 1, "/m/mixed/01.flac");
+        seed_track(&db, mixed.id.unwrap(), track_b, 2, "/m/mixed/02.flac");
+
+        // Le tag ALBUMARTIST confirme l'artiste d'album distinct de celui des
+        // pistes : cas classique légitime, même si son vieux MBID est vide.
+        let tagged = album_repo
+            .get_or_create_for_folder("/m/tagged", "Tagged", invalid_current, None, None)
+            .unwrap();
+        seed_track_with_album_artist(
+            &db,
+            tagged.id.unwrap(),
+            track_a,
+            1,
+            "/m/tagged/01.flac",
+            Some("Invalid Empty MBID Artist"),
+        );
+
+        assert_eq!(album_repo.repair_empty_mbid_artist_collapses().unwrap(), 0);
+        assert_eq!(
+            album_repo
+                .get(ordinary.id.unwrap())
+                .unwrap()
+                .unwrap()
+                .artist_id,
+            Some(current)
+        );
+        for album_id in [
+            compilation.id.unwrap(),
+            mixed.id.unwrap(),
+            tagged.id.unwrap(),
+        ] {
+            assert_eq!(
+                album_repo.get(album_id).unwrap().unwrap().artist_id,
+                Some(invalid_current)
+            );
+        }
     }
 
     /// Même réparation sur le chemin MusicBrainz : un album retrouvé par son
