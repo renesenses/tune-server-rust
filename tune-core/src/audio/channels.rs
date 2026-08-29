@@ -595,6 +595,38 @@ mod tests {
         assert_eq!(frame, vec![0.25, 0.25, 0.0, 0.0, 0.0, 0.0]);
     }
 
+    // Garde reprise de #2577. Le correctif qu'elle portait est deja sur la
+    // ligne — `build_downmix_matrix(2, 1)` somme les deux voies a 0,5 — mais
+    // RIEN n'empechait la troncature de revenir :
+    // `stereo_vers_mono_melange_les_deux_cotes` teste un signal present des
+    // DEUX cotes, donc il resterait vert si l'on ne gardait que la gauche a
+    // pleine echelle. C'est exactement le trou qui avait laisse passer le
+    // defaut d'origine, verrouille pendant des mois par un test vert.
+
+    #[test]
+    fn mono_ne_perd_pas_ce_qui_est_panne_a_droite() {
+        // Le cas qui motive le reglage (#2362) : une seule enceinte, cablee a
+        // gauche. Si le mono jette la voie droite, tout ce qui n'existe qu'a
+        // droite disparait — c'est-a-dire precisement ce qu'on voulait
+        // recuperer. Un signal purement droit doit donc sortir NON NUL.
+        let purement_a_droite = adapt_channels_f32(&[0.0, 0.8, 0.0, -0.6], 2, 1).unwrap();
+        assert_eq!(purement_a_droite.len(), 2);
+        assert!(
+            purement_a_droite[0].abs() > 0.01 && purement_a_droite[1].abs() > 0.01,
+            "un signal panne uniquement a droite est sorti a zero : {purement_a_droite:?}"
+        );
+        assert!((purement_a_droite[0] - 0.4).abs() < 1e-6);
+        assert!((purement_a_droite[1] + 0.3).abs() < 1e-6);
+
+        // Symetrique : la gauche seule ne doit pas ressortir a pleine echelle,
+        // ce qui trahirait une simple troncature.
+        let purement_a_gauche = adapt_channels_f32(&[0.8, 0.0], 2, 1).unwrap();
+        assert!(
+            (purement_a_gauche[0] - 0.4).abs() < 1e-6,
+            "la voie gauche ressort a pleine echelle — c'est une troncature, pas un melange : {purement_a_gauche:?}"
+        );
+    }
+
     #[test]
     fn downmix_pleine_echelle_reste_dans_la_plage_sans_ecretage() {
         for channels in [6, 8] {
