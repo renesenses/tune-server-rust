@@ -953,6 +953,37 @@ fn wav_wire_bit_perfect(
     is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
 }
 
+/// Le fil est-il intact, du point de vue du VERDICT affiché ?
+///
+/// La sonde Windows (#2205/#2233) est autoritaire sur ce qui a atteint le ring,
+/// et son `bit_perfect` vaut `reasons.is_empty()` : le volume logiciel y figure
+/// au même rang que le DSP ou le transport flottant. Or `build_signal_path`
+/// applique depuis #1627 la règle inverse — « Volume is excluded, it's a user
+/// preference, not a signal degradation » — et l'applique encore, deux cents
+/// lignes plus bas, à toutes les autres sorties et à toutes les autres
+/// plateformes (macOS, Linux et le navigateur ne publient aucune sonde, donc
+/// `unwrap_or(true)`).
+///
+/// Conséquence vécue (#2053) : sous Windows, descendre le curseur à 85 % sur un
+/// FLAC sans égaliseur, sans ReplayGain et sans plafond de fréquence suffisait à
+/// faire tomber le verdict — et le client n'a qu'un seul mot pour dire « pas
+/// bit-perfect » : **« Transcodé »**. Un testeur qui n'a touché que son volume
+/// lisait donc qu'on transcodait sa musique.
+///
+/// On ne relève JAMAIS le verdict du producteur en promesse de pureté : seul le
+/// cas où le volume est la SEULE cause est neutralisé. Une raison de plus (DSP,
+/// transport flottant, état indéterminé) et le verdict reste négatif. La cause
+/// n'est pas effacée pour autant : elle reste dans `runtime_reasons` et dans le
+/// détail de l'étape Transport.
+fn runtime_transport_is_intact(status: &OutputSignalPathStatus) -> bool {
+    status.bit_perfect
+        || (!status.reasons.is_empty()
+            && status
+                .reasons
+                .iter()
+                .all(|reason| matches!(reason, OutputSignalReason::SoftwareVolume)))
+}
+
 fn runtime_signal_reason_detail(status: &OutputSignalPathStatus) -> Option<String> {
     let details: Vec<&str> = status
         .reasons
@@ -1316,7 +1347,7 @@ fn build_signal_path(
             };
             (
                 runtime_signal_path
-                    .map(|status| status.bit_perfect)
+                    .map(runtime_transport_is_intact)
                     .unwrap_or(true),
                 transport,
                 format_name,
@@ -1485,10 +1516,17 @@ fn build_signal_path(
     // réglage de zone.
     if let Some(runtime) = runtime_signal_path {
         match runtime.volume {
+            // Le même fait ne peut pas être peint de deux couleurs selon la
+            // plateforme : la branche sans sonde (macOS, Linux, navigateur,
+            // toutes les sorties réseau, quelques lignes plus bas) marque déjà
+            // l'étape Volume comme intacte, parce que le volume est une
+            // préférence et non une dégradation. L'étape reste affichée, avec
+            // son pourcentage : rien n'est caché, seule la couleur cesse de
+            // contredire le verdict (#2053).
             OutputVolumeState::Applied => steps.push(json!({
                 "name": "Volume",
                 "description": format!("Volume logiciel {}%", (ui_volume * 100.0).round() as i32),
-                "bit_perfect": false,
+                "bit_perfect": true,
             })),
             OutputVolumeState::BypassedDop => steps.push(json!({
                 "name": "Volume",
@@ -3908,6 +3946,118 @@ mod signal_path_tests {
                 .unwrap()["metrics"]["eq_overs"],
             17
         );
+    }
+
+    /// Monte une zone locale Windows dont la sonde a publié `reasons`.
+    fn local_runtime_zone(
+        volume_percent: i32,
+        volume: tune_core::outputs::traits::OutputVolumeState,
+        reasons: Vec<OutputSignalReason>,
+    ) -> (Zone, ZoneState, std::sync::Arc<dyn DbBackend>) {
+        use tune_core::outputs::traits::{OutputSampleTransport, OutputSignalPathStatus};
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create("DAC", Some("local"), Some("local:dac"))
+            .unwrap();
+        let mut zone = repo.get(id).unwrap().unwrap();
+        zone.volume = volume_percent;
+
+        let mut ps = wav24_playing();
+        ps.output_signal_path = Some(OutputSignalPathStatus {
+            // Le producteur a bien quitté la branche brute : ce buffer est
+            // passé par le flottant pour appliquer le facteur de volume.
+            bit_perfect: false,
+            sample_transport: OutputSampleTransport::NativeInteger,
+            dsp: OutputDspState::Inactive,
+            volume,
+            reasons,
+        });
+        (zone, ps, backend)
+    }
+
+    /// #2053 — « Lecture annoncée comme transcodée alors que je ne pense pas
+    /// avoir paramétré cela » (Tades, Windows).
+    ///
+    /// Le client n'a que deux mots pour ce champ : « Bit-perfect » ou
+    /// « Transcodé » (`NowPlaying.svelte`). Tout ce qui n'est pas bit-perfect
+    /// s'affiche donc comme un transcodage — y compris quand aucune conversion
+    /// n'a lieu. Depuis la sonde Windows, un simple curseur de volume à 85 %
+    /// suffisait à déclencher ce mot, sur une zone où rien n'a été paramétré.
+    ///
+    /// La règle inverse est écrite dans `build_signal_path` depuis #1627
+    /// (« Volume is excluded — it's a user preference, not a signal
+    /// degradation ») et reste appliquée à toutes les autres sorties et à
+    /// toutes les autres plateformes. Elle vaut aussi ici.
+    #[test]
+    fn software_volume_alone_does_not_announce_a_transcode() {
+        let (zone, ps, backend) = local_runtime_zone(
+            85,
+            OutputVolumeState::Applied,
+            vec![OutputSignalReason::SoftwareVolume],
+        );
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+        // Rien n'est caché : l'étape reste là, avec son pourcentage, et la
+        // cause reste nommée dans le contrat d'exécution.
+        assert_eq!(
+            step_desc(&sp, "Volume").as_deref(),
+            Some("Volume logiciel 85%")
+        );
+        assert_eq!(
+            sp["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["name"] == "Volume")
+                .unwrap()["bit_perfect"],
+            json!(true)
+        );
+        assert_eq!(sp.get("runtime_reasons"), Some(&json!(["software_volume"])));
+        assert_eq!(
+            step_detail(&sp, "Transport").as_deref(),
+            Some("Volume logiciel appliqué")
+        );
+        assert!(!sp["summary"].as_str().unwrap().contains("transcode"));
+    }
+
+    /// Contre-épreuve : l'exemption ne vaut QUE pour le volume seul. Dès qu'une
+    /// autre cause s'ajoute, le verdict du producteur reste négatif — on ne
+    /// relève jamais son verdict en promesse de pureté.
+    #[test]
+    fn a_second_cause_beside_volume_keeps_the_negative_verdict() {
+        let (zone, ps, backend) = local_runtime_zone(
+            85,
+            OutputVolumeState::Applied,
+            vec![
+                OutputSignalReason::FloatTransport,
+                OutputSignalReason::SoftwareVolume,
+            ],
+        );
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            step_detail(&sp, "Transport").as_deref(),
+            Some("Transport flottant imposé par le callback ; Volume logiciel appliqué")
+        );
+    }
+
+    /// Et un verdict négatif SANS raison nommée n'est pas non plus relevé :
+    /// l'exemption exige la liste explicite, jamais une liste vide.
+    #[test]
+    fn an_unexplained_negative_verdict_is_never_upgraded() {
+        let (zone, ps, backend) = local_runtime_zone(85, OutputVolumeState::Applied, vec![]);
+
+        let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
     }
 
     // ------------------------------------------------------------------
