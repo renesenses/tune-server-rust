@@ -114,7 +114,10 @@ async fn sans_corps_le_contrat_historique_est_inchange() {
     assert_eq!(body["status"].as_str(), Some("enrichment_run_started"));
     assert!(body["directory"].is_null(), "sans path : passe complète");
     assert!(
-        settings(&state).get("enrichment_last_run").unwrap().is_some(),
+        settings(&state)
+            .get("enrichment_last_run")
+            .unwrap()
+            .is_some(),
         "la passe complète se date"
     );
 }

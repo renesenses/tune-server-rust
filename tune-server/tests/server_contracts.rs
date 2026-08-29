@@ -13,6 +13,8 @@ mod bios_langue_album;
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "enrichissement_repertoire.rs"]
+mod enrichissement_repertoire;
 #[path = "etiquettes_types_et_playlists.rs"]
 mod etiquettes_types_et_playlists;
 #[path = "facettes_multivaleurs.rs"]
