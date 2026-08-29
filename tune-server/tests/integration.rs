@@ -893,6 +893,65 @@ async fn le_nom_de_la_machine_est_reglable_et_relu() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #1268 — [Forum HiFi] Linux : le sélecteur « Backend audio » proposait
+// Auto/WASAPI/ASIO sur Debian (Lapinou) puis Fedora (Benjithom, 0.9.94).
+// Le client écrivait ces choix en dur ; le serveur publie désormais la liste
+// vraie, filtrée par SA plateforme, dans /system/config (et /devices/audio).
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn les_backends_audio_proposes_suivent_la_plateforme_du_serveur() {
+    let app = make_app();
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+
+    let backends = config
+        .get("supported_audio_backends")
+        .and_then(|v| v.as_array())
+        .expect("/system/config doit publier `supported_audio_backends` : sans lui le sélecteur du client n'a d'autre choix que d'écrire Auto/WASAPI/ASIO en dur");
+    assert!(!backends.is_empty(), "la liste ne peut pas être vide");
+    assert_eq!(
+        backends[0].get("value").and_then(|v| v.as_str()),
+        Some("auto"),
+        "`auto` est le défaut et le repli : toujours présent, toujours premier"
+    );
+
+    // Le cœur du ticket : aucune technologie Windows proposée ailleurs.
+    #[cfg(not(target_os = "windows"))]
+    for b in backends {
+        let value = b.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            value != "wasapi" && value != "asio",
+            "backend Windows « {value} » proposé sur une plateforme non-Windows"
+        );
+    }
+}
+
+// #1268, volet compatibilité : une bibliothèque migrée d'une machine Windows
+// peut arriver avec `local_audio_backend = "wasapi"` en base. Sur un serveur
+// non-Windows, la lecture joue déjà via le host par défaut (repli de
+// `select_host`) ; la config affichée doit dire la même chose — `auto` — au
+// lieu de resservir au sélecteur un choix qui n'existe plus.
+#[cfg(all(feature = "local-audio", not(target_os = "windows")))]
+#[tokio::test]
+async fn une_valeur_windows_persistee_retombe_sur_auto_hors_windows() {
+    let app = make_app();
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "local_audio_backend": "wasapi" }),
+    )
+    .await;
+    assert!(status.is_success(), "écriture refusée : {status}");
+
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config.get("local_audio_backend").and_then(|v| v.as_str()),
+        Some("auto"),
+        "une valeur Windows persistée doit retomber sur `auto` hors Windows"
+    );
+}
+
 #[tokio::test]
 async fn le_nom_annonce_aux_autres_serveurs_suit_le_nom_choisi() {
     let app = make_app();

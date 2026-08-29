@@ -275,6 +275,94 @@ pub fn asio_available() -> bool {
     cfg!(all(target_os = "windows", feature = "asio"))
 }
 
+/// Un choix de backend audio local, tel que le sélecteur de l'interface doit
+/// le proposer : la valeur à persister dans `local_audio_backend`, et un
+/// libellé technique (des noms propres — pas de traduction à faire côté
+/// client, hormis « Auto »).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BackendChoice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// Les backends de sortie locale réellement sélectionnables sur CETTE machine.
+///
+/// #1268 ([Forum HiFi], Lapinou sous Debian puis Benjithom sous Fedora) : le
+/// sélecteur « Backend audio » du client web proposait Auto/WASAPI/ASIO — deux
+/// technologies Windows — parce que ces trois `<option>` étaient écrites en
+/// dur et que le serveur n'exposait nulle part la liste vraie. La voici,
+/// calculée à la compilation par plateforme, pour que l'interface n'ait plus
+/// rien à deviner.
+///
+/// `auto` est toujours présent et toujours premier : c'est le défaut, et c'est
+/// aussi le repli de [`select_host`] pour toute valeur inconnue — y compris
+/// une valeur Windows persistée avant qu'une bibliothèque ne migre vers une
+/// machine Linux.
+pub fn supported_backends() -> &'static [BackendChoice] {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+            BackendChoice {
+                value: "asio",
+                label: "ASIO (bit-perfect)",
+            },
+        ]
+    }
+    #[cfg(all(target_os = "windows", not(feature = "asio")))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (CoreAudio)",
+        }]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (ALSA)",
+        }]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto",
+        }]
+    }
+}
+
+/// Cette valeur de `local_audio_backend` correspond-elle à un backend
+/// sélectionnable sur cette machine ? Sert au repli d'affichage : une valeur
+/// Windows persistée sur un serveur Linux ne doit pas laisser le sélecteur
+/// sur un choix qui n'existe plus ([`select_host`] jouera de toute façon via
+/// le host par défaut de la plateforme).
+pub fn backend_value_is_supported(value: &str) -> bool {
+    supported_backends()
+        .iter()
+        .any(|b| b.value.eq_ignore_ascii_case(value))
+}
+
 /// List ASIO audio output devices specifically.
 ///
 /// On Windows with the `asio` feature enabled, this enumerates devices using
@@ -9044,6 +9132,70 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+#[cfg(test)]
+mod backends_supportes_tests {
+    use super::{backend_value_is_supported, supported_backends};
+
+    // #1268 — le cas Lapinou/Benjithom : sur Debian et Fedora, le sélecteur
+    // proposait WASAPI et ASIO. La liste que le serveur publie ne doit JAMAIS
+    // contenir un backend d'une autre plateforme.
+    #[test]
+    fn aucun_backend_windows_hors_windows() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let interdits = ["wasapi", "asio"];
+            for b in supported_backends() {
+                assert!(
+                    !interdits.contains(&b.value),
+                    "backend Windows « {} » proposé sur une plateforme non-Windows",
+                    b.value
+                );
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                supported_backends().iter().any(|b| b.value == "wasapi"),
+                "WASAPI doit rester proposé sous Windows"
+            );
+        }
+    }
+
+    // `auto` est le défaut ET le repli de select_host : toujours présent,
+    // toujours premier, sur toutes les plateformes.
+    #[test]
+    fn auto_toujours_present_et_premier() {
+        let backends = supported_backends();
+        assert!(!backends.is_empty());
+        assert_eq!(backends[0].value, "auto");
+        assert!(backend_value_is_supported("auto"));
+        assert!(backend_value_is_supported("AUTO"), "casse indifférente");
+    }
+
+    // ASIO n'apparaît que si le binaire sait réellement l'ouvrir — même
+    // vérité que `asio_available()`, qui voyage déjà dans la même réponse.
+    #[test]
+    fn asio_propose_ssi_disponible() {
+        assert_eq!(
+            supported_backends().iter().any(|b| b.value == "asio"),
+            super::asio_available()
+        );
+    }
+
+    // Le repli d'affichage : une valeur Windows persistée sur un serveur
+    // Linux/macOS est déclarée non supportée, pour que /system/config la
+    // ramène à `auto` au lieu de la resservir au sélecteur.
+    #[test]
+    fn une_valeur_d_une_autre_plateforme_est_declaree_non_supportee() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!backend_value_is_supported("wasapi"));
+            assert!(!backend_value_is_supported("asio"));
+        }
+        assert!(!backend_value_is_supported("n_importe_quoi"));
     }
 }
 
