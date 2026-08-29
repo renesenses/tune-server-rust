@@ -1425,6 +1425,41 @@ impl ZoneRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
     }
 
+    /// Zones réseau (DLNA/OpenHome) MASQUÉES à cet hôte — les suppressions
+    /// encore actives de l'utilisateur. Garde-fou #1281 : un appareil qui
+    /// s'annonce sous plusieurs identités SSDP (DLNA + OpenHome, double UUID —
+    /// buchardt A700) ne doit pas ressusciter, via son identité jumelle, la
+    /// zone qui vient d'être supprimée. `is_device_hidden` ne voit que
+    /// l'identité exacte ; ici on retrouve la suppression par l'hôte, et
+    /// l'appelant exige en plus une correspondance de NOM (une IP seule
+    /// n'identifie rien — leçon du ré-ancrage #1651).
+    pub fn hidden_zones_by_host(&self, host: &str) -> Vec<(i64, String)> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, name FROM zones WHERE host = {placeholder} \
+             AND output_type IN ('dlna', 'openhome') \
+             AND COALESCE(is_hidden, 0) = 1 ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&host];
+        // Strong read: la suppression vient parfois d'arriver dans la même
+        // session (même motif que zone_id_by_host).
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|cols| {
+                    let id = cols.first().and_then(|v| v.as_i64())?;
+                    let name = cols.get(1).and_then(|v| v.as_string())?;
+                    Some((id, name))
+                })
+                .collect(),
+            // Colonne `host` absente (base pré-migration) : pas de garde-fou.
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);

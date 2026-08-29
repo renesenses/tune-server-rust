@@ -714,6 +714,32 @@ async fn handle_ssdp_discovered(
             return;
         }
 
+        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+
+        // #1281 — l'appareil s'annonce sous PLUSIEURS identités SSDP (DLNA +
+        // OpenHome, ou deux UUID : buchardt A700). Supprimer sa zone la masque
+        // sous UNE de ces identités — `is_device_hidden` plus haut — mais la
+        // jumelle retombait ici et recréait la zone au scan suivant : « je la
+        // supprime, elle revient ». Une zone masquée à cet hôte qui porte
+        // encore le nom annoncé vaut suppression pour TOUTES les identités de
+        // l'appareil. Le nom est exigé pour ne pas bloquer un NOUVEL appareil
+        // qui hérite de l'adresse par le DHCP (leçon du ré-ancrage #1651 : une
+        // IP seule n'identifie rien).
+        if let Some((zid, _)) = zone_repo
+            .hidden_zones_by_host(&dev.host)
+            .into_iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(&dev.name) || n.eq_ignore_ascii_case(short_name))
+        {
+            tracing::debug!(
+                name = %dev.name,
+                id = %dev.id,
+                host = %dev.host,
+                zone_id = zid,
+                "ssdp_zone_hidden_twin_identity_skipping"
+            );
+            return;
+        }
+
         // Auto-created zones start dormant; the free-tier cap is enforced at
         // first play (orchestrator.play), so discovery always registers.
 
@@ -725,7 +751,6 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
         let existing_zones = zone_repo.list().unwrap_or_default();
         let name_taken = existing_zones.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
@@ -2830,5 +2855,109 @@ mod retrait_serveur_multimedia {
             "aucun événement ne doit être publié pour un identifiant inconnu"
         );
         assert_eq!(registre.lock().await.len(), 1);
+    }
+}
+
+/// #1281 — dédoublonnage des identités SSDP d'un même appareil physique.
+#[cfg(test)]
+mod dedup_identites_ssdp_1281 {
+    use super::OpenHomeEventListener;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    /// Un renderer SSDP synthétique complet : les URLs de service suffisent à
+    /// passer l'enregistrement DLNA/OpenHome, pas besoin du matériel (#1281).
+    fn renderer_ssdp(id: &str, name: &str, ty: OutputType, host: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(id.into(), name.into(), ty, host.into(), 49152);
+        dev.capabilities.insert(
+            "service_urls".into(),
+            serde_json::json!({"avtransport": "/av", "renderingcontrol": "/rc"}),
+        );
+        dev
+    }
+
+    /// Une PASSE de découverte à part entière : `seen_hosts` neuf à chaque
+    /// appel, comme entre deux scans réels — le garde intra-passe ne peut
+    /// donc pas masquer le défaut.
+    async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        let mut seen = std::collections::HashSet::new();
+        let listener: Option<std::sync::Arc<super::OpenHomeEventListener>> = None;
+        super::handle_ssdp_discovered(
+            dev,
+            &state.outputs,
+            &state.backend,
+            &state.config,
+            &state.event_bus,
+            &listener,
+            &state.playback,
+            &state.license,
+            &mut seen,
+        )
+        .await;
+    }
+
+    /// #1281 — un buchardt A700 s'annonce sous DEUX identités SSDP (DLNA +
+    /// OpenHome, deux UUID, même hôte), chacune dans sa propre passe. Un seul
+    /// appareil physique = une seule zone.
+    #[tokio::test]
+    async fn deux_identites_ssdp_du_meme_appareil_ne_font_qu_une_zone() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dlna = renderer_ssdp(
+            "uuid:a700-dlna",
+            "buchardt A700",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        let oh = renderer_ssdp(
+            "uuid:a700-oh",
+            "buchardt A700",
+            OutputType::Openhome,
+            "192.168.1.50",
+        );
+
+        annoncer(&state, &dlna).await;
+        annoncer(&state, &oh).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "un seul appareil physique = une seule zone, quelles que soient \
+             ses identités SSDP"
+        );
+    }
+
+    /// #1281, second volet — « I try deleting one and they both disappear »,
+    /// et au scan suivant la zone revenait : la suppression ne masquait que
+    /// l'identité exacte, la jumelle recréait la zone. Une zone supprimée doit
+    /// le rester pour TOUTES les identités du même appareil (même hôte, même
+    /// nom annoncé).
+    #[tokio::test]
+    async fn une_zone_supprimee_ne_renait_pas_sous_la_seconde_identite() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+
+        let dlna = renderer_ssdp(
+            "uuid:a700-dlna",
+            "buchardt A700",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        annoncer(&state, &dlna).await;
+        let zid = repo.list().unwrap()[0].id.expect("zone auto-créée");
+        repo.delete(zid).unwrap(); // suppression utilisateur = masquage
+
+        let oh = renderer_ssdp(
+            "uuid:a700-oh",
+            "buchardt A700",
+            OutputType::Openhome,
+            "192.168.1.50",
+        );
+        annoncer(&state, &oh).await;
+
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "la suppression doit tenir face à la seconde identité SSDP de \
+             l'appareil"
+        );
     }
 }
