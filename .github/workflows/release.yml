@@ -731,9 +731,11 @@ jobs:
           # supprime que ce qui existe reellement.
           libre_avant=$(df -g / | awk 'NR==2 {print $4}')
           echo "Espace libre avant : ${libre_avant} Gi"
-          echo "--- ce qui occupe la machine (top 12) ---"
-          sudo du -x -d 1 -g / 2>/dev/null | sort -rn | head -12 || true
-          sudo du -x -d 1 -g /Applications 2>/dev/null | sort -rn | head -8 || true
+          # PAS de `du` sur `/` : sur la v0.9.122 le `sudo du -x -d 1 -g /`
+          # que j'avais ajoute ici a fait EXPIRER les deux builds macOS au bout
+          # de 75 minutes — il parcourt le disque entier du runner. Une mesure
+          # doit couter moins cher que ce qu'elle mesure. On se limite donc aux
+          # candidats eux-memes, bornes et deja listes ci-dessous.
           # Candidats : uniquement des choses dont CE workflow ne se sert pas.
           # Xcode actif exclu — `xcode-select -p` le designe.
           xcode_actif="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer##')"
@@ -747,8 +749,10 @@ jobs:
                    /Users/runner/.rustup/toolchains/*-apple-darwin/lib/rustlib/src; do
             [ -e "$c" ] || continue
             [ "$c" = "$xcode_actif" ] && { echo "  garde (actif) : $c"; continue; }
-            taille=$(sudo du -x -s -m "$c" 2>/dev/null | cut -f1)
-            echo "  supprime : $c (${taille:-?} Mo)"
+            # Pas de `du` ici non plus : `timeout` n'existe pas sur macOS,
+            # donc on ne saurait pas le borner. La ligne `gagne : N Gi`
+            # ci-dessous dit deja ce qui compte, et elle ne coute rien.
+            echo "  supprime : $c"
             sudo rm -rf "$c" || true
           done
           libre_apres=$(df -g / | awk 'NR==2 {print $4}')
