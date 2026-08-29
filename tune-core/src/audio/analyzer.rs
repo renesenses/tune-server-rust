@@ -955,7 +955,13 @@ mod tests {
         acc.feed(&samples);
         let (_, peak, true_peak) = acc.finish().unwrap();
 
-        assert!((peak - 0.7071).abs() < 1e-3, "sample peak {peak}");
+        // 1/√2 : c'est EXACTEMENT ce que le test veut dire — une sinusoïde à
+        // fs/4 déphasée de π/4 n'est échantillonnée que sur ±1/√2, soit
+        // −3 dB sous le vrai maximum du signal continu.
+        assert!(
+            (peak - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+            "sample peak {peak}"
+        );
         assert!(
             true_peak > 0.85,
             "le true peak doit dépasser nettement le sample peak : {true_peak}"
