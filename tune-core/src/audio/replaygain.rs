@@ -768,7 +768,7 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
 }
 
 /// Parse a ReplayGain gain string ("-6.50 dB", "+3.2", "-6.50dB") to dB.
-fn parse_gain_db(s: String) -> Option<f64> {
+pub(crate) fn parse_gain_db(s: String) -> Option<f64> {
     s.to_lowercase()
         .replace("db", "")
         .trim()
