@@ -1130,6 +1130,12 @@ fn build_signal_path(
         .map(|status| status.dsp == OutputDspState::Applied)
         .unwrap_or(configured_dsp_enabled);
     let eq_step_description = zone_eq_step_description(&backend, zid);
+    let crossfade_requested = output_type == "local"
+        && SettingsRepo::with_backend(backend.clone())
+            .get(&format!("crossfade_enabled:{zid}"))
+            .ok()
+            .flatten()
+            .is_some_and(|value| value == "true" || value == "1");
 
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
@@ -1517,7 +1523,11 @@ fn build_signal_path(
     if let Some(runtime) = runtime_signal_path {
         let dsp_step = match runtime.dsp {
             OutputDspState::Applied => Some((
-                eq_step_description.as_deref().unwrap_or("DSP appliqué"),
+                if crossfade_requested && eq_step_description.is_none() {
+                    "Crossfade PCM local (equal-power)"
+                } else {
+                    eq_step_description.as_deref().unwrap_or("DSP appliqué")
+                },
                 false,
             )),
             OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
@@ -2181,6 +2191,16 @@ async fn patch_zone(
             gapless,
             repo.update_gapless_enabled(id, gapless)
         );
+        if gapless {
+            // Gapless et crossfade décrivent deux frontières de piste
+            // incompatibles. Le dernier réglage activé gagne, explicitement.
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            ecrire!(
+                "crossfade_enabled",
+                false,
+                settings.set(&format!("crossfade_enabled:{id}"), "false")
+            );
+        }
     }
     if let Some(ms) = body.sync_delay_ms {
         ecrire!("sync_delay_ms", ms, repo.update_sync_delay(id, ms));
