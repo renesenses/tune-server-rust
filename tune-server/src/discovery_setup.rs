@@ -2880,7 +2880,7 @@ mod dedup_identites_ssdp_1281 {
     /// donc pas masquer le défaut.
     async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
         let mut seen = std::collections::HashSet::new();
-        let listener: Option<std::sync::Arc<super::OpenHomeEventListener>> = None;
+        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
         super::handle_ssdp_discovered(
             dev,
             &state.outputs,
