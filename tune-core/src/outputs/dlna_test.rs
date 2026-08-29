@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -36,6 +37,9 @@ mod tests {
         /// SetAVTransportURI accepté, sauf si `media_info_fige` est vrai.
         current_uri: Arc<Mutex<String>>,
         media_info_fige: Arc<Mutex<bool>>,
+        /// Réponses successives de GetMediaInfo. Permet de reproduire un
+        /// renderer réveillé par SOAP mais qui publie CurrentURI plus tard.
+        media_info_reponses: Arc<Mutex<VecDeque<String>>>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
     }
@@ -56,6 +60,7 @@ mod tests {
                 stop_exige_pause: Arc::new(Mutex::new(false)),
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
+                media_info_reponses: Arc::new(Mutex::new(VecDeque::new())),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -155,7 +160,10 @@ mod tests {
                 .into_response()
             }
             "GetMediaInfo" => {
-                let uri = state.current_uri.lock().await.clone();
+                let uri = match state.media_info_reponses.lock().await.pop_front() {
+                    Some(uri) => uri,
+                    None => state.current_uri.lock().await.clone(),
+                };
                 soap_ok(
                     "GetMediaInfo",
                     &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
@@ -367,6 +375,95 @@ mod tests {
             "l'escalade Pause devait être tentée face au Stop ignoré"
         );
         assert_eq!(*state.current_uri.lock().await, url);
+        handle.abort();
+    }
+
+    /// Contre-épreuve Denon/HEOS #2749 : en Network Standby, Play est
+    /// acquitté mais CurrentURI reste vide pendant le réveil. Ce vide n'est
+    /// pas une autre source ; la même commande doit réussir dès que l'URI
+    /// attendue apparaît, sans relance destructive ni succès anticipé.
+    #[tokio::test]
+    async fn uri_vide_pendant_le_reveil_puis_uri_attendue_reussit() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        let url = "http://192.168.1.18:8888/stream/reveil-denon.wav";
+        state.media_info_reponses.lock().await.extend([
+            String::new(),
+            String::new(),
+            url.to_string(),
+        ]);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        output.play_media(&media_locatelli(url)).await.unwrap();
+
+        assert_eq!(
+            state.set_uri_corps.lock().await.len(),
+            1,
+            "le réveil ne doit pas marteler SetAVTransportURI"
+        );
+        assert_eq!(
+            state.play_count.load(Ordering::Relaxed),
+            1,
+            "le Play acquitté reste en attente jusqu'à la publication de l'URI"
+        );
+        handle.abort();
+    }
+
+    /// La fenêtre de réveil est bornée et son expiration n'est jamais un
+    /// succès silencieux ni le faux diagnostic « autre source » de #2749.
+    #[tokio::test]
+    async fn uri_restee_vide_expire_avec_un_echec_de_reveil_distinct() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let err = output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/reveil-expire.wav",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("réveil n'a pas abouti") && err.contains("CurrentURI est restée vide"),
+            "l'expiration doit rester explicite : {err}"
+        );
+        assert!(
+            !err.contains("autre source"),
+            "une URI vide n'est pas une autre source : {err}"
+        );
+        assert_eq!(
+            state.set_uri_corps.lock().await.len(),
+            1,
+            "l'expiration ne doit pas déclencher un repli SetURI silencieux"
+        );
+        handle.abort();
+    }
+
+    /// Une URI non vide réellement tenue reste un conflit : elle ne bénéficie
+    /// jamais de la fenêtre de réveil réservée à CurrentURI vide.
+    #[tokio::test]
+    async fn une_autre_uri_reellement_tenue_reste_un_echec_visible() {
+        let state = MockState::default();
+        *state.media_info_fige.lock().await = true;
+        *state.current_uri.lock().await =
+            "http://192.168.1.18:8888/stream/source-concurrente.flac".into();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let err = output
+            .play_media(&media_locatelli(
+                "http://192.168.1.18:8888/stream/nouvelle-source.dsf",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("source-concurrente.flac") && err.contains("autre source"),
+            "le vrai conflit doit rester nommé et visible : {err}"
+        );
         handle.abort();
     }
 
