@@ -641,16 +641,115 @@ impl QobuzService {
         Ok(all_items)
     }
 
+    /// Rôles Qobuz d'écriture pure (comparés sans espaces) : un intervenant qui
+    /// n'a que ceux-là est l'auteur de l'œuvre, pas son interprète.
+    fn role_d_ecriture(role: &str) -> bool {
+        matches!(
+            role.replace(' ', "").as_str(),
+            "Composer" | "ComposerLyricist" | "Lyricist" | "Author" | "Writer" | "MusicPublisher"
+        )
+    }
+
+    /// Les rôles crédités à `nom` dans la chaîne Qobuz `performers`
+    /// (« Nom, Rôle1, Rôle2 - Nom2, Rôle3 »). `None` si le nom n'y figure pas.
+    /// Le préfixe est comparé tel quel, ce qui tolère les noms contenant une
+    /// virgule (« Blood, Sweat & Tears, MainArtist »).
+    fn roles_credites<'a>(performers: &'a str, nom: &str) -> Option<Vec<&'a str>> {
+        performers.split(" - ").find_map(|entree| {
+            let reste = entree.trim().strip_prefix(nom)?;
+            if reste.is_empty() {
+                return Some(Vec::new());
+            }
+            let roles = reste.strip_prefix(", ")?;
+            Some(roles.split(", ").map(str::trim).collect())
+        })
+    }
+
+    /// Le premier intervenant crédité `MainArtist` dans la chaîne `performers`.
+    fn main_artist_des_roles(performers: &str) -> Option<String> {
+        performers.split(" - ").find_map(|entree| {
+            let mut segments = entree.trim().split(", ");
+            let nom = segments.next()?.trim();
+            (!nom.is_empty() && segments.any(|r| r.trim().replace(' ', "") == "MainArtist"))
+                .then(|| nom.to_string())
+        })
+    }
+
+    /// L'interprète à afficher comme « artiste » d'une piste Qobuz (#1407).
+    ///
+    /// En classique, Qobuz place souvent le compositeur dans `performer` (voire
+    /// dans l'artiste d'album), et « Lecture en cours » affichait Chopin au lieu
+    /// de la pianiste. Priorité : interprète d'abord — le compositeur ne sert
+    /// JAMAIS de valeur d'« artiste » quand un interprète est identifiable.
+    ///
+    /// 1. `performer.name`, sauf si la chaîne de rôles `performers` (ou, à
+    ///    défaut, l'égalité avec `composer.name`) le désigne comme auteur pur ;
+    /// 2. le premier `MainArtist` de la chaîne de rôles (rôle d'interprète
+    ///    prouvé, même s'il est aussi le compositeur — cas de l'auteur qui joue
+    ///    ses propres œuvres) ;
+    /// 3. `artist.name` de la piste puis `album.artist.name`, hors compositeur
+    ///    et hors « Various Artists » (qui n'apprend rien à l'auditeur) ;
+    /// 4. repli historique inchangé : `performer.name` puis `artist.name`.
+    fn artiste_interprete(item: &serde_json::Value) -> String {
+        let vide = |s: &&str| !s.trim().is_empty();
+        let compositeur = item["composer"]["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let performer = item["performer"]["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let roles = item["performers"].as_str().unwrap_or("");
+
+        if let Some(p) = performer {
+            let auteur_pur = match Self::roles_credites(roles, p) {
+                Some(credits) if !credits.is_empty() => {
+                    credits.iter().all(|r| Self::role_d_ecriture(r))
+                }
+                // Pas d'info de rôle exploitable : on ne l'écarte que si son nom
+                // est exactement celui du compositeur.
+                _ => compositeur == Some(p),
+            };
+            if !auteur_pur {
+                return p.into();
+            }
+        }
+        if let Some(main) = Self::main_artist_des_roles(roles) {
+            return main;
+        }
+        for candidat in [
+            item["artist"]["name"].as_str(),
+            item["album"]["artist"]["name"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        {
+            if !candidat.is_empty()
+                && compositeur != Some(candidat)
+                && !candidat.eq_ignore_ascii_case("various artists")
+            {
+                return candidat.into();
+            }
+        }
+        performer
+            .or_else(|| item["artist"]["name"].as_str().filter(vide))
+            .unwrap_or("")
+            .into()
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["performer"]["name"]
+            artist: Self::artiste_interprete(item),
+            composer: item["composer"]["name"]
                 .as_str()
-                .or_else(|| item["artist"]["name"].as_str())
-                .unwrap_or("")
-                .into(),
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(Into::into),
             album: album["title"].as_str().map(Into::into),
             album_id: album["id"]
                 .as_str()
@@ -1394,6 +1493,7 @@ impl StreamingService for QobuzService {
             .as_str()
             .map(String::from)
             .or_else(|| data["id"].as_u64().map(|id| id.to_string()));
+        let album_artist = data["artist"]["name"].as_str().map(String::from);
 
         let tracks = data["tracks"]["items"]
             .as_array()
@@ -1401,7 +1501,19 @@ impl StreamingService for QobuzService {
                 items
                     .iter()
                     .map(|item| {
-                        let mut t = Self::map_track(item);
+                        // Les items d'album/get n'ont pas de sous-objet "album" :
+                        // sans injection, artiste_interprete (#1407) ne voit pas
+                        // l'artiste d'album comme repli face au compositeur.
+                        let item_enrichi =
+                            match (&album_artist, item["album"]["artist"]["name"].as_str()) {
+                                (Some(nom), None) => {
+                                    let mut clone = item.clone();
+                                    clone["album"]["artist"]["name"] = nom.as_str().into();
+                                    Some(clone)
+                                }
+                                _ => None,
+                            };
+                        let mut t = Self::map_track(item_enrichi.as_ref().unwrap_or(item));
                         // Inject album-level metadata when the track lacks it
                         if t.album.is_none() {
                             t.album = album_title.clone();
@@ -2490,6 +2602,192 @@ mod tests {
         let q = track.quality.unwrap();
         assert_eq!(q.sample_rate, 44100);
         assert_eq!(q.bit_depth, 16);
+    }
+
+    // ── #1407 : « Lecture en cours » affichait le compositeur ─────────────
+
+    /// Le cas du fil forum : en classique, Qobuz met le compositeur dans
+    /// `performer`. La chaîne de rôles désigne l'interprète réel — c'est elle
+    /// qui doit gagner, et le compositeur rejoint son propre champ.
+    #[test]
+    fn le_compositeur_place_dans_performer_cede_a_l_interprete_des_roles() {
+        let json = json!({
+            "id": 1,
+            "title": "Nocturne No. 2",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+            "album": {"title": "Chopin: Nocturnes", "artist": {"name": "Martha Argerich"}},
+            "duration": 271,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Martha Argerich");
+        assert_eq!(track.composer.as_deref(), Some("Frédéric Chopin"));
+    }
+
+    /// Même sans objet `composer`, un performer crédité uniquement à
+    /// l'écriture dans la chaîne de rôles n'est pas l'interprète.
+    #[test]
+    fn un_performer_credite_auteur_seul_cede_au_main_artist_meme_sans_champ_composer() {
+        let json = json!({
+            "id": 2,
+            "title": "Main Title",
+            "performer": {"name": "John Williams"},
+            "performers": "John Williams, Composer, ComposerLyricist - Boston Pops Orchestra, Orchestra, MainArtist",
+            "album": {"title": "Star Wars"},
+            "duration": 300,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Boston Pops Orchestra");
+    }
+
+    /// Le compositeur qui joue ses propres œuvres EST l'interprète : le rôle
+    /// MainArtist/Piano dans la chaîne le prouve, il reste l'artiste affiché.
+    #[test]
+    fn le_compositeur_interprete_de_ses_oeuvres_reste_l_artiste() {
+        let json = json!({
+            "id": 3,
+            "title": "Nuvole Bianche",
+            "performer": {"name": "Ludovico Einaudi"},
+            "composer": {"name": "Ludovico Einaudi"},
+            "performers": "Ludovico Einaudi, Composer, MainArtist, Piano",
+            "album": {"title": "Una Mattina", "artist": {"name": "Various Artists"}},
+            "duration": 358,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Ludovico Einaudi");
+    }
+
+    /// Sans chaîne de rôles, l'égalité performer = compositeur suffit à
+    /// écarter le performer : l'artiste d'album (l'interprète) le remplace.
+    #[test]
+    fn sans_roles_le_performer_egal_au_compositeur_replie_sur_l_artiste_d_album() {
+        let json = json!({
+            "id": 4,
+            "title": "Violin Concerto in D",
+            "performer": {"name": "Jean Sibelius"},
+            "composer": {"name": "Jean Sibelius"},
+            "album": {"title": "Sibelius", "artist": {"name": "Hilary Hahn"}},
+            "duration": 512,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Hilary Hahn");
+        assert_eq!(track.composer.as_deref(), Some("Jean Sibelius"));
+    }
+
+    /// Quand AUCUN interprète distinct n'existe (l'album du compositeur, tout
+    /// le monde porte son nom), le repli historique garde le performer plutôt
+    /// que de rendre une chaîne vide — et jamais « Various Artists ».
+    #[test]
+    fn sans_interprete_distinct_le_performer_reste_plutot_que_vide_ou_various() {
+        let tout_chopin = json!({
+            "id": 5,
+            "title": "Prélude",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "artist": {"name": "Frédéric Chopin"},
+            "album": {"title": "Chopin", "artist": {"name": "Frédéric Chopin"}},
+            "duration": 100,
+        });
+        assert_eq!(
+            QobuzService::map_track(&tout_chopin).artist,
+            "Frédéric Chopin"
+        );
+
+        let compilation = json!({
+            "id": 6,
+            "title": "Prélude",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "album": {"title": "100 Classical Hits", "artist": {"name": "Various Artists"}},
+            "duration": 100,
+        });
+        assert_eq!(
+            QobuzService::map_track(&compilation).artist,
+            "Frédéric Chopin",
+            "« Various Artists » n'apprend rien : mieux vaut le repli historique"
+        );
+    }
+
+    /// Hors classique rien ne change : performer distinct du compositeur,
+    /// il reste l'artiste — le compositeur va dans son champ à lui.
+    #[test]
+    fn un_performer_distinct_du_compositeur_garde_la_main() {
+        let json = json!({
+            "id": 7,
+            "title": "Take Five",
+            "performer": {"name": "The Dave Brubeck Quartet"},
+            "composer": {"name": "Paul Desmond"},
+            "album": {"title": "Time Out"},
+            "duration": 324,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "The Dave Brubeck Quartet");
+        assert_eq!(track.composer.as_deref(), Some("Paul Desmond"));
+    }
+
+    /// La chaîne de rôles tolère un nom d'interprète contenant une virgule.
+    #[test]
+    fn un_nom_d_interprete_avec_virgule_est_reconnu_dans_les_roles() {
+        let roles = "Blood, Sweat & Tears, MainArtist - Steve Katz, Composer";
+        assert_eq!(
+            QobuzService::roles_credites(roles, "Blood, Sweat & Tears"),
+            Some(vec!["MainArtist"])
+        );
+    }
+
+    /// Les items d'album/get n'ont pas de sous-objet `album` : l'artiste
+    /// d'album (l'interprète, en tête de réponse) doit être injecté pour que
+    /// le compositeur placé dans `performer` ne gagne pas faute de repli.
+    #[tokio::test]
+    async fn get_album_tracks_replie_sur_l_artiste_d_album_face_au_compositeur() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/album/get",
+            get(|| async {
+                Json(json!({
+                    "id": "abc123",
+                    "title": "Bach: Suites pour violoncelle",
+                    "artist": {"name": "Ophélie Gaillard"},
+                    "image": {"large": "http://img.qobuz.com/bach.jpg"},
+                    "tracks": {"items": [
+                        {
+                            "id": 11,
+                            "title": "Suite No. 1: Prélude",
+                            "performer": {"name": "Johann Sebastian Bach"},
+                            "composer": {"name": "Johann Sebastian Bach"},
+                            "duration": 150,
+                        },
+                    ]},
+                }))
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+        let pistes = svc
+            .get_album_tracks("abc123")
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(pistes.len(), 1);
+        assert_eq!(
+            pistes[0].artist, "Ophélie Gaillard",
+            "l'interprète de l'album, pas le compositeur logé dans performer"
+        );
+        assert_eq!(pistes[0].composer.as_deref(), Some("Johann Sebastian Bach"));
+        assert_eq!(
+            pistes[0].album.as_deref(),
+            Some("Bach: Suites pour violoncelle")
+        );
     }
 
     #[test]

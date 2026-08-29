@@ -108,6 +108,7 @@ mod tests {
             disc_number: None,
             explicit: false,
             isrc: None,
+            composer: None,
             quality: None,
         }
     }
