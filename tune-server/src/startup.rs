@@ -1084,7 +1084,48 @@ fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
     }
 }
 
-/// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalZoneAction {
+    Create,
+    Reconnect,
+    Skip,
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn first_system_default_name<'a>(
+    devices: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Option<&'a str> {
+    devices
+        .into_iter()
+        .find_map(|(name, is_default)| is_default.then_some(name))
+}
+
+/// Décide quoi faire d'une sortie locale sans toucher à la base.
+///
+/// `is_system_default` ne doit être vrai que pour l'unique sortie sélectionnée
+/// par l'appelant parmi celles que le backend marque `is_default`. Cette
+/// sélection préalable empêche un backend défectueux qui en marquerait deux de
+/// recréer le défaut « une zone par périphérique ».
+pub(crate) fn local_zone_action(
+    zone_exists: bool,
+    auto_create: bool,
+    is_system_default: bool,
+) -> LocalZoneAction {
+    if zone_exists {
+        return LocalZoneAction::Reconnect;
+    }
+    if auto_create && is_system_default {
+        LocalZoneAction::Create
+    } else {
+        LocalZoneAction::Skip
+    }
+}
+
+/// Register local audio output devices (USB DAC, headphones, speakers).
+///
+/// Sur une base neuve, seule la sortie système reçoit automatiquement une
+/// zone. Les autres sorties restent enregistrées dans `OutputRegistry`, donc
+/// proposées par l'interface pour une création manuelle.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
@@ -1152,6 +1193,21 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        // Un backend est censé marquer une seule sortie par défaut. `find`
+        // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
+        let system_default_device_id = first_system_default_name(
+            devices
+                .iter()
+                .map(|dev| (dev.name.as_str(), dev.is_default)),
+        )
+        .map(|name| format!("local:{name}"));
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
@@ -1202,34 +1258,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 dev.name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Les trois autres chemins de decouverte — SSDP, mDNS et le chemin
-            // fournisseur — consultent tous `zone_auto_create` avant de creer.
-            // Celui-ci, le seul qui s'execute au DEMARRAGE du serveur, ne le
-            // consultait pas : une sortie audio locale se voyait donc attribuer
-            // une zone a chaque lancement, donc a chaque mise a jour, meme
-            // reglage decoche. Une zone deja existante n'est pas concernee
-            // (`get_or_create` la renvoie telle quelle) : on ne bloque que la
-            // creation, jamais la reconnexion.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(&device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            let zone_exists = zone_repo
+                .get_by_device_id(&device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action = local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_zone_auto_create_disabled_skipping"
+                    default = is_system_default,
+                    auto_create,
+                    "local_audio_zone_manual_creation_required"
                 );
                 continue;
             }
@@ -1612,6 +1654,73 @@ mod restore_zone_volumes_tests {
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");
+    }
+}
+
+#[cfg(test)]
+mod local_zone_creation_policy_tests {
+    use super::*;
+
+    /// #1770 — témoin exact d'une base neuve avec plusieurs sorties : une
+    /// sortie ordinaire ne devient pas une zone, même si l'auto-création est
+    /// laissée à sa valeur par défaut (`true`).
+    #[test]
+    fn fresh_install_creates_only_the_system_default_zone() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Un backend fautif peut marquer plusieurs sorties `is_default`. Tune en
+    /// choisit une seule au lieu de recréer le défaut en bloc.
+    #[test]
+    fn even_two_backend_defaults_select_only_one_system_device() {
+        let devices = [("Speakers", false), ("DAC A", true), ("DAC B", true)];
+        assert_eq!(
+            first_system_default_name(devices),
+            Some("DAC A"),
+            "la première sortie système est l'unique candidate"
+        );
+    }
+
+    /// Le réglage d'opt-out conserve son sens : même la sortie système ne doit
+    /// pas être imposée quand l'utilisateur a coupé l'auto-création.
+    #[test]
+    fn disabled_auto_creation_creates_no_default_zone() {
+        assert_eq!(local_zone_action(false, false, true), LocalZoneAction::Skip);
+    }
+
+    /// Le scénario ASIO → WASAPI de DEvir passe ici : un rescan peut découvrir
+    /// dix sorties mais seule la sortie système devient une zone. Un DAC qui
+    /// devient la sortie système reste donc immédiatement utilisable.
+    #[test]
+    fn hotplug_creates_the_system_zone_but_not_the_other_outputs() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Contre-épreuve installation existante : le nouveau contrat ne supprime
+    /// ni ne masque les zones déjà enregistrées. Démarrage ou hotplug, elles
+    /// reprennent le chemin `get_or_create` et sont remises en ligne.
+    #[test]
+    fn existing_non_default_zone_is_reconnected_in_both_phases() {
+        assert_eq!(
+            local_zone_action(true, false, false),
+            LocalZoneAction::Reconnect
+        );
+    }
+
+    /// Aucun repli silencieux vers « le premier périphérique » si le backend
+    /// ne sait pas identifier sa sortie système.
+    #[test]
+    fn no_backend_default_means_no_automatic_candidate() {
+        let devices = [("DAC A", false), ("DAC B", false)];
+        assert_eq!(first_system_default_name(devices), None);
     }
 }
 
