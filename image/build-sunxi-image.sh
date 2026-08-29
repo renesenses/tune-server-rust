@@ -23,6 +23,8 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 TUNE_VERSION="latest"
 BOARD="orangepi-zero2"
 UBOOT_BIN=""
@@ -541,11 +543,21 @@ PermitRootLogin no
 PasswordAuthentication yes
 EOF
 
+# The account remains locked in the published image. first-boot creates a
+# per-machine temporary password before sshd starts.
 chroot "$ROOTFS" bash -c "
     useradd -m -s /bin/bash -G sudo,plugdev tune
-    echo 'tune:tune' | chpasswd
     echo 'tune ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tune
 "
+
+install -D -m 0755 "${SCRIPT_DIR}/tune-os-password.sh" \
+    "${ROOTFS}/usr/local/sbin/tune-os-password"
+cat > "${ROOTFS}/etc/profile.d/tune-password-notice.sh" <<'EOF'
+if [ "${USER:-}" = tune ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n /usr/local/sbin/tune-os-password --acknowledge >/dev/null 2>&1 || true
+fi
+EOF
+chmod 0644 "${ROOTFS}/etc/profile.d/tune-password-notice.sh"
 
 # --- Install Tune ---
 # TUNE_TARBALL_PATH : archive déjà récupérée par l'appelant (la CI la télécharge
@@ -710,6 +722,27 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+cat > "${ROOTFS}/etc/systemd/system/tune-first-boot-password.service" <<EOF
+[Unit]
+Description=Tune OS First Boot SSH Password
+After=local-fs.target
+Before=ssh.service serial-getty@ttyS0.service
+ConditionPathExists=!/var/lib/tune-os/ssh-password-v2
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tune-os-password --first-boot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+mkdir -p "${ROOTFS}/etc/systemd/system/ssh.service.d"
+cat > "${ROOTFS}/etc/systemd/system/ssh.service.d/tune-password.conf" <<EOF
+[Unit]
+Requires=tune-first-boot-password.service
+After=tune-first-boot-password.service
+EOF
+
 # Ces cartes n'ont pas de RTC : sans NTP l'horloge demarre en 1970 puis se cale
 # sur un horodatage de build (constate : 116 jours dans le passe). apt refuse
 # alors les depots (« Release file is not valid yet »), la validation TLS
@@ -720,6 +753,7 @@ chroot "$ROOTFS" systemctl enable systemd-timesyncd
 
 chroot "$ROOTFS" systemctl enable tune.service
 chroot "$ROOTFS" systemctl enable tune-first-boot.service
+chroot "$ROOTFS" systemctl enable tune-first-boot-password.service
 chroot "$ROOTFS" systemctl enable tune-web80.socket
 chroot "$ROOTFS" systemctl enable NetworkManager
 chroot "$ROOTFS" systemctl enable avahi-daemon
@@ -739,7 +773,7 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
   Console:   série ttyS0 @ 115200
-  User:      tune / tune
+  SSH user:  tune (temporary password shown on the serial console at first boot)
 
 EOF
 
@@ -771,5 +805,5 @@ echo "  Image:  ${FINAL_IMG} ($(du -h "$FINAL_IMG" | cut -f1))"
 echo "  GZ:     ${FINAL_IMG}.gz ($(du -h "${FINAL_IMG}.gz" | cut -f1))"
 echo ""
 echo "  Flash:  sudo dd if=${FINAL_IMG} of=/dev/sdX bs=4M status=progress"
-echo "  Login:  tune / tune  (console série ttyS0 @ 115200)"
+echo "  Login:  tune / temporary password generated on first boot (serial console ttyS0 @ 115200)"
 echo "  Web:    http://tune.local"
