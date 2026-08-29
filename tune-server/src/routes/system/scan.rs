@@ -1708,6 +1708,25 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_favorites_reconcile_failed"),
             }
+            // Les albums masqués (#1391) suivent la même mécanique et la même
+            // garde `full_scan_ok` : re-rattachés par identité après un
+            // renouvellement de rowid, purgés seulement sur scan complet sain.
+            match tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(h) if h.changed() > 0 || h.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = h.scanned,
+                        relinked = h.relinked,
+                        deduplicated = h.deduplicated,
+                        deleted = h.deleted,
+                        unresolved = h.unresolved,
+                        "post_scan_hidden_albums_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
+            }
         }
 
         // Backfill embedded cover art for local albums still missing a cover.

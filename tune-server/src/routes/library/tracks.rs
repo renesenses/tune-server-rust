@@ -150,8 +150,10 @@ pub(super) async fn list_tracks(
             }
         }
     } else {
-        let total = repo.count().unwrap_or(0);
-        let items = match repo.list(limit, offset) {
+        // Même exclusion des albums masqués que le chemin facetté (#1391) :
+        // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
+        let total = repo.count_visible().unwrap_or(0);
+        let items = match repo.list_visible(limit, offset) {
             Ok(tracks) => tracks,
             Err(e) => {
                 tracing::error!(

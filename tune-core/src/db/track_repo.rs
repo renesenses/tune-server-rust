@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{Placeholders, any_of, favorite_condition, untagged_condition};
+use super::facet_filter::{
+    Placeholders, any_of, favorite_condition, hidden_tracks_excluded, untagged_condition,
+};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -226,6 +228,15 @@ pub mod sql {
         "SELECT COUNT(*) FROM tracks"
     }
 
+    /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
+    /// la liste qu'il pagine (#1391). `count()` reste le compte COMPLET.
+    pub fn count_visible() -> String {
+        format!(
+            "SELECT COUNT(*) FROM tracks t WHERE {}",
+            crate::db::facet_filter::hidden_tracks_excluded()
+        )
+    }
+
     pub fn list_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} ORDER BY t.id LIMIT {} OFFSET {}",
@@ -243,11 +254,15 @@ pub mod sql {
         )
     }
 
+    /// Vue « pistes de l'artiste » : les pistes d'un album masqué en sortent
+    /// aussi (#1391) — contrairement à `list_by_album`, qui reste ENTIER pour
+    /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
 
@@ -380,15 +395,19 @@ pub mod sql {
     }
 
     /// Engine-agnostic search.
+    /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas dans
+    /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
+    /// `tracks_fts` contiennent tout (#1391).
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {} LIMIT {}",
+            "{} WHERE ({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} LIMIT {}",
             select_track(),
             d.fts_where("tracks", "t", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
+            crate::db::facet_filter::hidden_tracks_excluded(),
             d.placeholder(6),
         )
     }
@@ -661,6 +680,38 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
+    /// ordre que [`Self::list`], moins les pistes d'albums masqués — le
+    /// miroir du prédicat que `list_filtered` pose toujours, sans quoi la vue
+    /// par défaut fuirait ce que la vue facettée cache (#1391). `list` reste
+    /// ENTIER pour la maintenance (export, résolutions internes).
+    pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
+        let sql = format!(
+            "{} WHERE {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
+            sql::select_track(),
+            hidden_tracks_excluded(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            },
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(2),
+                Engine::Postgres => PostgresDialect.placeholder(2),
+            }
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Compteur de la vue pistes : exclut comme [`Self::list_visible`].
+    pub fn count_visible(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(&sql::count_visible(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
     /// Filtered track listing with optional WHERE clauses.
     ///
     /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
@@ -914,6 +965,13 @@ impl TrackRepo {
             owned_params.push(SqlValue::Text(like.clone()));
             owned_params.push(SqlValue::Text(like));
         }
+
+        // Albums masqués (#1391) : leurs pistes sortent de la vue filtrée,
+        // TOUJOURS — ce prédicat n'est pas une facette (il n'entre pas dans
+        // `is_active`), c'est le socle de la vue. Le compteur juste en
+        // dessous partage `where_clause`, donc liste et total ne peuvent pas
+        // diverger.
+        conditions.push(hidden_tracks_excluded().to_string());
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1662,6 +1720,76 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// #1391 — les pistes d'un album masqué sortent de la vue pistes (les
+    /// deux chemins de `GET /library/tracks`), de la recherche et de la vue
+    /// artiste ; une piste SANS album reste visible ; `list_by_album` reste
+    /// ENTIER pour que l'album masqué demeure jouable.
+    #[test]
+    fn les_pistes_d_un_album_masque_sortent_des_vues() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Massive Attack".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("Mezzanine", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+
+        let mut cachee = Track::new("Teardrop".into());
+        cachee.album_id = Some(album_id);
+        cachee.artist_id = Some(artist_id);
+        cachee.file_path = Some("/music/Mezzanine/teardrop.flac".into());
+        let cachee_id = repo.create(&cachee).unwrap();
+
+        // Une piste sans album : le filtre ne doit PAS l'avaler (piège du
+        // `t.album_id` NULL).
+        let mut libre = Track::new("Sans album".into());
+        libre.artist_id = Some(artist_id);
+        libre.file_path = Some("/music/loose.flac".into());
+        let libre_id = repo.create(&libre).unwrap();
+
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(album_id)
+            .unwrap();
+
+        // Chemin non facetté.
+        let visibles = repo.list_visible(100, 0).unwrap();
+        assert_eq!(
+            visibles.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
+            vec![libre_id],
+            "seule la piste sans album reste visible"
+        );
+        assert_eq!(repo.count_visible().unwrap(), 1);
+        assert_eq!(repo.count().unwrap(), 2, "le compte COMPLET reste entier");
+
+        // Chemin facetté : même exclusion, et le total suit la liste.
+        let filtre = crate::db::facet_filter::TrackFilter {
+            artists: vec!["Massive Attack".into()],
+            ..Default::default()
+        };
+        let (pistes, total) = repo.list_filtered(&filtre, 100, 0).unwrap();
+        assert!(pistes.iter().all(|t| t.id != Some(cachee_id)));
+        assert_eq!(total, pistes.len() as i64);
+
+        // Recherche et vue artiste.
+        assert!(
+            repo.search("Teardrop", 10).unwrap().is_empty(),
+            "la recherche ne doit pas trahir la piste masquée"
+        );
+        assert!(
+            repo.list_by_artist(artist_id)
+                .unwrap()
+                .iter()
+                .all(|t| t.id != Some(cachee_id))
+        );
+
+        // Masqué n'est pas supprimé : l'album se joue toujours.
+        assert_eq!(repo.list_by_album(album_id).unwrap().len(), 1);
     }
 
     /// Forum #1312. A track filed under a folder-named album must be able to

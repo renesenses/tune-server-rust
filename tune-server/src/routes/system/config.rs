@@ -1381,6 +1381,12 @@ pub(super) async fn purge_orphan_tracks(
     .run(false)
     .unwrap_or_default();
 
+    // Même absence de clé étrangère, même règle pour les albums masqués
+    // (#1391) : re-rattacher ce qu'on peut, ne JAMAIS supprimer ici.
+    let masques = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+        .unwrap_or_default();
+
     tracing::warn!(
         cible = %cible,
         purgees,
@@ -1388,6 +1394,8 @@ pub(super) async fn purge_orphan_tracks(
         artistes_orphelins,
         favoris_rerattaches = favoris.relinked,
         favoris_non_resolus = favoris.unresolved,
+        masques_rerattaches = masques.relinked,
+        masques_non_resolus = masques.unresolved,
         "purge_orphelines_effectuee — suppression explicitement confirmée par l'utilisateur."
     );
 

@@ -184,6 +184,14 @@ pub fn router() -> Router<AppState> {
         )
         .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
+        // Masquage d'album (#1391). `/albums/hidden` AVANT `/albums/{id}` par
+        // hygiène de lecture — axum fait de toute façon primer le segment
+        // statique, comme pour `/albums/count` et `/albums/recent`.
+        .route("/albums/hidden", get(albums::list_hidden_albums))
+        .route(
+            "/albums/{id}/hide",
+            post(albums::hide_album).delete(albums::unhide_album),
+        )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))

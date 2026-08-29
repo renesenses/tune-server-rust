@@ -312,10 +312,21 @@ pub mod sql {
         "SELECT COUNT(*) FROM albums"
     }
 
+    /// Compteur de la GRILLE : même exclusion des albums masqués que
+    /// `list_filtered`, sinon le `total` de la pagination ment et la grille
+    /// saute ou duplique des pages (#1391).
+    pub fn count_visible() -> String {
+        format!(
+            "SELECT COUNT(*) FROM albums a WHERE {}",
+            crate::db::facet_filter::hidden_albums_excluded()
+        )
+    }
+
     pub fn list_recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} ORDER BY a.id DESC LIMIT {}",
+            "{} WHERE {} ORDER BY a.id DESC LIMIT {}",
             select_album(),
+            crate::db::facet_filter::hidden_albums_excluded(),
             d.placeholder(1)
         )
     }
@@ -337,9 +348,10 @@ pub mod sql {
 
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE a.artist_id = {} ORDER BY a.year ASC, LOWER(a.title) ASC",
+            "{} WHERE a.artist_id = {} AND {} ORDER BY a.year ASC, LOWER(a.title) ASC",
             select_album(),
-            d.placeholder(1)
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_albums_excluded()
         )
     }
 
@@ -371,9 +383,13 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND (a.musicbrainz_release_group_id IS NULL OR a.musicbrainz_release_group_id = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas
+    /// masqué » en ET — et ce filtre s'applique APRÈS la passe FTS : les
+    /// index `albums_fts` contiennent tout, les reconstruire à chaque
+    /// masquage serait le mauvais échange (#1391).
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE ({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({}))) LIMIT {}",
+            "{} WHERE (({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} LIMIT {}",
             select_album(),
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
@@ -381,6 +397,7 @@ pub mod sql {
             d.placeholder(4),
             d.placeholder(5),
             d.placeholder(6),
+            crate::db::facet_filter::hidden_albums_excluded(),
             d.placeholder(7)
         )
     }
@@ -1146,6 +1163,16 @@ impl AlbumRepo {
         }
     }
 
+    /// Compteur de pagination de la grille d'albums : exclut les masqués,
+    /// comme la liste qu'il pagine (#1391). `count()` reste le compte COMPLET
+    /// (stats, maintenance).
+    pub fn count_visible(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(&sql::count_visible(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
     pub fn count_with_bio(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
@@ -1285,9 +1312,14 @@ impl AlbumRepo {
         sort: &str,
         order: &str,
     ) -> Result<Vec<Album>, TuneError> {
-        self.list_filtered(limit, offset, sort, order, None, None, None)
+        // `include_hidden = true` : `list()`/`list_sorted` servent la
+        // MAINTENANCE (rattrapage de pochettes du scan, export complet), qui
+        // doit voir toute la bibliothèque, masqués compris. La grille passe
+        // par `list_filtered` et choisit.
+        self.list_filtered(limit, offset, sort, order, None, None, None, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn list_filtered(
         &self,
         limit: i64,
@@ -1299,6 +1331,10 @@ impl AlbumRepo {
         // `Some(true)` = seulement les compilations, `Some(false)` = tout sauf
         // elles, `None` = pas de filtre (#1957).
         compilation: Option<bool>,
+        // `false` (le défaut des routes) = les albums masqués sont exclus ;
+        // `true` = tout rendre, pour `?include_hidden=true` et les appels de
+        // maintenance (#1391).
+        include_hidden: bool,
     ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
@@ -1402,6 +1438,12 @@ impl AlbumRepo {
             Some(false) => wheres.push("COALESCE(a.is_compilation, 0) = 0".to_string()),
             None => {}
         }
+        // Albums masqués (#1391) : exclus par défaut. Le prédicat passe par
+        // `wheres` — jamais par le `replacen` de `base_select` plus bas, qui
+        // ne réécrit que la liste de colonnes.
+        if !include_hidden {
+            wheres.push(crate::db::facet_filter::hidden_albums_excluded().to_string());
+        }
 
         let where_clause = if wheres.is_empty() {
             String::new()
@@ -1490,13 +1532,15 @@ impl AlbumRepo {
         };
         let delimited_pattern = format!("%,{},%", genre.replace('%', "").replace('_', ""));
         let sql = format!(
-            "{} WHERE \
+            "{} WHERE (\
              LOWER(',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE LOWER({}) \
-             OR {} \
+             OR {}) \
+             AND {} \
              ORDER BY LOWER(a.title)",
             sql::select_album(),
             make_ph(1),
             json_contains,
+            crate::db::facet_filter::hidden_albums_excluded(),
         );
         let params: [&dyn ToSqlValue; 2] = [&delimited_pattern, &genre];
         let rows = self.db.query_many(&sql, &params)?;
@@ -2213,6 +2257,82 @@ mod tests {
         assert_eq!(results[0].title, "The Dark Side of the Moon");
     }
 
+    /// #1391 — un album masqué sort des vues de découverte (grille, compteur
+    /// de pagination, récents, artiste, genre, recherche), mais PAS de
+    /// `get()` : masqué n'est pas supprimé, il doit rester jouable et
+    /// démasquable. `?include_hidden=true` le fait réapparaître dans la
+    /// grille — le retour rétro-compatible.
+    #[test]
+    fn un_album_masque_sort_des_vues_mais_reste_accessible() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let hidden = crate::db::hidden_repo::HiddenRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo
+            .create(&Artist::new("Kraftwerk".into()))
+            .unwrap();
+        let mut visible = Album::new("Autobahn".into());
+        visible.artist_id = Some(aid);
+        visible.genre = Some("Electro".into());
+        repo.create(&visible).unwrap();
+        let mut cache = Album::new("Trans-Europe Express".into());
+        cache.artist_id = Some(aid);
+        cache.genre = Some("Electro".into());
+        let cache_id = repo.create(&cache).unwrap();
+
+        assert!(hidden.hide_album(cache_id).unwrap());
+
+        // Grille par défaut : exclu, et le total suit.
+        let grille = repo
+            .list_filtered(100, 0, "title", "asc", None, None, None, false)
+            .unwrap();
+        assert_eq!(
+            grille.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(),
+            vec!["Autobahn"]
+        );
+        assert_eq!(repo.count_visible().unwrap(), 1);
+        assert_eq!(repo.count().unwrap(), 2, "le compte COMPLET reste entier");
+
+        // `include_hidden` : le retour pour la vue de révision.
+        let tout = repo
+            .list_filtered(100, 0, "title", "asc", None, None, None, true)
+            .unwrap();
+        assert_eq!(tout.len(), 2);
+
+        // Récents, artiste, genre, recherche : exclu partout.
+        assert!(
+            repo.list_recent(10)
+                .unwrap()
+                .iter()
+                .all(|a| a.id != Some(cache_id))
+        );
+        assert!(
+            repo.list_by_artist(aid)
+                .unwrap()
+                .iter()
+                .all(|a| a.id != Some(cache_id))
+        );
+        assert!(
+            repo.list_by_genre("Electro")
+                .unwrap()
+                .iter()
+                .all(|a| a.id != Some(cache_id))
+        );
+        assert!(
+            repo.search("Trans-Europe", 10).unwrap().is_empty(),
+            "la recherche ne doit pas trahir l'album masqué"
+        );
+
+        // Masqué n'est pas supprimé : l'accès direct reste opérant.
+        assert!(repo.get(cache_id).unwrap().is_some());
+
+        // Réversible : tout revient.
+        assert!(hidden.unhide_album(cache_id).unwrap());
+        assert_eq!(repo.count_visible().unwrap(), 2);
+        assert_eq!(repo.search("Trans-Europe", 10).unwrap().len(), 1);
+    }
+
     #[test]
     fn get_by_musicbrainz_release_id() {
         let db = test_db();
@@ -2650,19 +2770,19 @@ mod tests {
         let titres = |v: Vec<Album>| -> Vec<String> { v.into_iter().map(|a| a.title).collect() };
 
         let seulement = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true))
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true), true)
                 .unwrap(),
         );
         assert_eq!(seulement, vec!["Jazz sur Seine".to_string()]);
 
         let sauf = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false))
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false), true)
                 .unwrap(),
         );
         assert_eq!(sauf, vec!["Kind of Blue".to_string()]);
 
         let tout = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, None)
+            repo.list_filtered(100, 0, "title", "asc", None, None, None, true)
                 .unwrap(),
         );
         assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
