@@ -53,6 +53,13 @@ pub struct QobuzService {
     /// n'a jamais existé. `featured_cache` y est défini, lu à deux endroits, et
     /// JAMAIS écrit. Ne pas recopier ce modèle.
     cache_editorial: Mutex<HashMap<String, EntreeCache>>,
+    /// Base d'API forcée, pour brancher les LECTURES sur un serveur simulé.
+    ///
+    /// `None` en production : l'ordre direct/proxy habituel s'applique. Seul
+    /// `api_get` la consulte — le login et les écritures gardent l'ordre de
+    /// production, de sorte qu'une base d'essai ne puisse jamais recevoir
+    /// d'identifiants.
+    base_forcee: Option<String>,
 }
 
 /// Une réponse éditoriale, et l'instant où elle a été obtenue.
@@ -192,6 +199,55 @@ fn remaining_page_offsets_bornees(
     (page_size..borne).step_by(page_size).collect()
 }
 
+/// Les quatre catégories que `/catalog/search` rend dans une même réponse.
+const CATEGORIES_RECHERCHE: [&str; 4] = ["tracks", "albums", "artists", "playlists"];
+
+/// Taille de page de `/catalog/search`.
+///
+/// Qobuz ne rend jamais plus de 50 éléments par catégorie et par requête, quel
+/// que soit le `limit` demandé : au-delà, il faut un `offset`, pas un plus
+/// grand `limit`.
+const TAILLE_PAGE_RECHERCHE: usize = 50;
+
+/// Plafond d'une recherche « Tous » (#2160).
+///
+/// « Tous » ne peut pas vouloir dire « tout le catalogue » : une requête
+/// courante annonce des dizaines de milliers de titres, soit des centaines
+/// d'allers-retours et une limitation Akamai assurée. 500 par catégorie — dix
+/// pages — reprend le plafond déjà retenu pour les sélections éditoriales
+/// (#1969).
+const PLAFOND_RECHERCHE: usize = 500;
+
+/// Combien d'éléments par catégorie une recherche doit réellement ramener.
+///
+/// `0` est le « Tous » du client, même convention que les facettes Oxygen. Et
+/// toute valeur est bornée : un client qui demanderait 100 000 ne doit pas se
+/// traduire en deux mille requêtes chez Qobuz.
+fn plafond_recherche(limite: usize) -> usize {
+    if limite == 0 {
+        PLAFOND_RECHERCHE
+    } else {
+        limite.min(PLAFOND_RECHERCHE)
+    }
+}
+
+/// Une recherche de ce volume demande-t-elle plusieurs pages ?
+fn recherche_paginee(limite: usize) -> bool {
+    plafond_recherche(limite) > TAILLE_PAGE_RECHERCHE
+}
+
+/// Décalages des pages restantes d'une recherche, après la première.
+///
+/// Une seule requête `/catalog/search` rend les quatre catégories : on ne
+/// pagine donc pas quatre fois, on pagine une fois jusqu'à ce que la catégorie
+/// la PLUS fournie soit épuisée ou que le plafond soit atteint. Les catégories
+/// déjà épuisées rendront simplement des pages vides, que la fusion ignore.
+fn offsets_recherche(comptes: &[usize], totaux: &[usize], plafond: usize) -> Vec<usize> {
+    let compte_max = comptes.iter().copied().max().unwrap_or(0);
+    let total_max = totaux.iter().copied().max().unwrap_or(0);
+    remaining_page_offsets_bornees(compte_max, total_max, TAILLE_PAGE_RECHERCHE, plafond)
+}
+
 /// Trace le résultat d'une écriture de favori chez Qobuz.
 ///
 /// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
@@ -242,6 +298,25 @@ impl QobuzService {
             needs_token_rewrite: false,
             session_expired: false,
             cache_editorial: Mutex::new(HashMap::new()),
+            base_forcee: None,
+        }
+    }
+
+    /// Même service, mais dont les LECTURES tapent sur `base` au lieu de
+    /// l'API Qobuz. Réservé aux essais : il n'existe aucun chemin de
+    /// production qui construise un service ainsi.
+    #[cfg(test)]
+    fn avec_base_forcee(base: impl Into<String>) -> Self {
+        let mut svc = Self::new(String::from("app-id-essai"), String::from("secret-essai"));
+        svc.base_forcee = Some(base.into());
+        svc
+    }
+
+    /// (primaire, secours) pour une LECTURE.
+    fn bases_de_lecture(&self) -> (&str, &str) {
+        match self.base_forcee {
+            Some(ref base) => (base.as_str(), base.as_str()),
+            None => endpoint_order(self.proxy_first),
         }
     }
 
@@ -279,7 +354,7 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let (primary, fallback) = self.bases_de_lecture();
         match self.api_get_at(primary, path, params).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
@@ -642,10 +717,119 @@ impl QobuzService {
     /// `/catalog/search` renvoie ses playlists dans la même forme que les
     /// sélections éditoriales, d'où le convertisseur partagé.
     fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
-        data["playlists"]["items"]
+        Self::elements(data, "playlists")
+            .iter()
+            .map(Self::map_featured_playlist)
+            .collect()
+    }
+
+    /// Le tableau `items` d'une catégorie, vide si la catégorie est absente.
+    fn elements<'a>(data: &'a serde_json::Value, categorie: &str) -> &'a [serde_json::Value] {
+        data[categorie]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Ce qu'une page rend pour une catégorie, et ce que Qobuz annonce en tout.
+    fn compte_et_total(data: &serde_json::Value, categorie: &str) -> (usize, usize) {
+        (
+            Self::elements(data, categorie).len(),
+            data[categorie]["total"].as_u64().unwrap_or(0) as usize,
+        )
+    }
+
+    /// Concatène les pages d'une recherche, dans l'ordre des décalages, et
+    /// borne CHAQUE catégorie au plafond demandé.
+    ///
+    /// Le plafond s'applique catégorie par catégorie, comme le demande #2160 :
+    /// « 200 » veut dire deux cents albums ET deux cents artistes ET deux
+    /// cents titres, pas deux cents éléments toutes catégories confondues.
+    /// Une catégorie épuisée avant les autres reste plus courte — on ne
+    /// complète pas, on ne tronque pas les autres pour autant.
+    fn fusionner_recherche(pages: &[serde_json::Value], plafond: usize) -> SearchResults {
+        let mut resultats = SearchResults {
+            tracks: Vec::new(),
+            albums: Vec::new(),
+            artists: Vec::new(),
+            playlists: Vec::new(),
+        };
+        for page in pages {
+            resultats
+                .tracks
+                .extend(Self::elements(page, "tracks").iter().map(Self::map_track));
+            resultats
+                .albums
+                .extend(Self::elements(page, "albums").iter().map(Self::map_album));
+            resultats
+                .artists
+                .extend(Self::elements(page, "artists").iter().map(Self::map_artist));
+            resultats.playlists.extend(Self::search_playlists(page));
+        }
+        resultats.tracks.truncate(plafond);
+        resultats.albums.truncate(plafond);
+        resultats.artists.truncate(plafond);
+        resultats.playlists.truncate(plafond);
+        resultats
+    }
+
+    /// Recherche en plusieurs pages : la première apprend les `total`, les
+    /// suivantes sont demandées par `offset` de 50 en 50.
+    ///
+    /// Avant #2160, `search` n'émettait qu'un seul `/catalog/search` avec le
+    /// `limit` demandé. Or Qobuz plafonne une page à 50 : demander 200 rendait
+    /// 50, et les 150 autres n'étaient jamais récupérés.
+    async fn search_paginee(
+        &self,
+        query: &str,
+        plafond: usize,
+    ) -> Result<SearchResults, TuneError> {
+        use futures_util::StreamExt;
+        const MAX_CONCURRENT_PAGES: usize = 4;
+
+        let base_params: [(&str, &str); 1] = [("query", query)];
+        let premiere = self
+            .api_get_page("/catalog/search", &base_params, 0, TAILLE_PAGE_RECHERCHE)
+            .await?;
+
+        let (comptes, totaux): (Vec<usize>, Vec<usize>) = CATEGORIES_RECHERCHE
+            .iter()
+            .map(|categorie| Self::compte_et_total(&premiere, categorie))
+            .unzip();
+        let offsets = offsets_recherche(&comptes, &totaux, plafond);
+        info!(
+            plafond,
+            pages = offsets.len() + 1,
+            totaux = ?totaux,
+            "qobuz_search_paginate"
+        );
+
+        let mut pages = vec![premiere];
+        if !offsets.is_empty() {
+            // `buffered` conserve l'ordre des pages : la liste fusionnée est
+            // celle qu'une boucle séquentielle aurait produite.
+            let suivantes: Vec<Result<serde_json::Value, String>> =
+                futures_util::stream::iter(offsets.into_iter().map(|offset| {
+                    let base_params = &base_params;
+                    async move {
+                        self.api_get_page(
+                            "/catalog/search",
+                            base_params,
+                            offset,
+                            TAILLE_PAGE_RECHERCHE,
+                        )
+                        .await
+                    }
+                }))
+                .buffered(MAX_CONCURRENT_PAGES)
+                .collect()
+                .await;
+            for page in suivantes {
+                pages.push(page?);
+            }
+        }
+
+        Ok(Self::fusionner_recherche(&pages, plafond))
     }
 
     /// Pochette d'une playlist Qobuz, quel que soit le champ qui la porte.
@@ -1110,33 +1294,25 @@ impl StreamingService for QobuzService {
         Ok(())
     }
 
+    /// `limit` est un nombre d'éléments PAR CATÉGORIE. `0` vaut « Tous »,
+    /// borné par `PLAFOND_RECHERCHE` (#2160). Jusqu'à 50, une seule requête —
+    /// exactement ce que faisait la recherche avant ; au-delà, on pagine.
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
+        let plafond = plafond_recherche(limit);
+        if recherche_paginee(limit) {
+            return self.search_paginee(query, plafond).await;
+        }
+
         let data = self
             .api_get(
                 "/catalog/search",
-                &[("query", query), ("limit", &limit.to_string())],
+                &[("query", query), ("limit", &plafond.to_string())],
             )
             .await?;
-
-        let tracks = data["tracks"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        let albums = data["albums"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_album).collect())
-            .unwrap_or_default();
-        let artists = data["artists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_artist).collect())
-            .unwrap_or_default();
-
-        Ok(SearchResults {
-            tracks,
-            albums,
-            artists,
-            playlists: Self::search_playlists(&data),
-        })
+        Ok(Self::fusionner_recherche(
+            std::slice::from_ref(&data),
+            plafond,
+        ))
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
@@ -3035,5 +3211,321 @@ mod tests {
         assert_eq!(pistes.len(), 2, "2 participations en cache, 2 servies");
         assert_eq!(pistes[0].title, "So What");
         assert_eq!(pistes[1].title, "Blue in Green");
+    }
+}
+
+/// Pagination de la recherche Qobuz (#2160).
+///
+/// Aucun de ces essais n'appelle l'API Qobuz : les décisions de pagination et
+/// la fusion sont des fonctions pures, et le seul aller-retour HTTP se fait
+/// contre un serveur simulé lié sur `127.0.0.1:0`.
+#[cfg(test)]
+mod tests_recherche_paginee {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+
+    #[test]
+    fn plafond_recherche_traduit_tous_et_borne_les_demandes_extravagantes() {
+        // Les quatre choix offerts par l'écran.
+        assert_eq!(plafond_recherche(50), 50);
+        assert_eq!(plafond_recherche(100), 100);
+        assert_eq!(plafond_recherche(200), 200);
+        // « Tous » : 0 est la convention du client, bornée ici.
+        assert_eq!(plafond_recherche(0), PLAFOND_RECHERCHE);
+        // Et un client qui demanderait n'importe quoi ne déclenche pas deux
+        // mille requêtes chez Qobuz.
+        assert_eq!(plafond_recherche(100_000), PLAFOND_RECHERCHE);
+        // Non-régression : les appels internes existants (recherche fédérée à
+        // 30, sonde de santé à 10, défaut de route à 20) restent inchangés.
+        assert_eq!(plafond_recherche(30), 30);
+        assert_eq!(plafond_recherche(20), 20);
+        assert_eq!(plafond_recherche(10), 10);
+    }
+
+    #[test]
+    fn seules_les_demandes_au_dela_d_une_page_paginent() {
+        assert!(!recherche_paginee(10));
+        assert!(!recherche_paginee(20));
+        assert!(!recherche_paginee(30));
+        assert!(!recherche_paginee(50), "50 tient dans une page Qobuz");
+        assert!(recherche_paginee(51));
+        assert!(recherche_paginee(100));
+        assert!(recherche_paginee(200));
+        assert!(recherche_paginee(0), "« Tous » pagine");
+    }
+
+    #[test]
+    fn offsets_recherche_couvre_exactement_le_volume_demande() {
+        // Première page pleine partout, Qobuz annonce beaucoup plus.
+        let comptes = [50, 50, 50, 50];
+        let totaux = [5000, 3000, 900, 120];
+        assert_eq!(offsets_recherche(&comptes, &totaux, 100), vec![50]);
+        assert_eq!(
+            offsets_recherche(&comptes, &totaux, 200),
+            vec![50, 100, 150]
+        );
+        assert_eq!(
+            offsets_recherche(&comptes, &totaux, PLAFOND_RECHERCHE).len(),
+            9,
+            "500 par catégorie = dix pages, dont une déjà chargée"
+        );
+    }
+
+    #[test]
+    fn offsets_recherche_s_arrete_a_la_categorie_la_plus_fournie() {
+        // Une seule requête sert les quatre catégories : c'est le plus gros
+        // `total` qui commande, pas le premier.
+        let comptes = [50, 7, 0, 0];
+        let totaux = [60, 7, 0, 0];
+        assert_eq!(offsets_recherche(&comptes, &totaux, 500), vec![50]);
+    }
+
+    #[test]
+    fn offsets_recherche_ne_pagine_pas_derriere_une_premiere_page_incomplete() {
+        // Page incomplète = Qobuz n'a plus rien, quel que soit le plafond.
+        assert!(offsets_recherche(&[12, 3, 0, 0], &[12, 3, 0, 0], 500).is_empty());
+        assert!(offsets_recherche(&[0, 0, 0, 0], &[0, 0, 0, 0], 500).is_empty());
+    }
+
+    /// Une page de recherche : `n` éléments par catégorie, numérotés à partir
+    /// de `depart`, et le `total` que Qobuz annonce.
+    fn page(depart: usize, n: usize, total: usize) -> serde_json::Value {
+        let elements = |prefixe: &str| -> Vec<serde_json::Value> {
+            (depart..depart + n)
+                .map(|i| {
+                    json!({
+                        "id": i as u64,
+                        "title": format!("{prefixe}-{i}"),
+                        "name": format!("{prefixe}-{i}"),
+                    })
+                })
+                .collect()
+        };
+        json!({
+            "tracks": {"items": elements("piste"), "total": total},
+            "albums": {"items": elements("album"), "total": total},
+            "artists": {"items": elements("artiste"), "total": total},
+            "playlists": {"items": elements("liste"), "total": total},
+        })
+    }
+
+    #[test]
+    fn fusionner_recherche_concatene_les_pages_dans_l_ordre_recu() {
+        let pages = [page(0, 50, 200), page(50, 50, 200), page(100, 50, 200)];
+        let r = QobuzService::fusionner_recherche(&pages, 200);
+        assert_eq!(r.tracks.len(), 150);
+        assert_eq!(r.tracks[0].id, "0");
+        assert_eq!(r.tracks[49].id, "49");
+        assert_eq!(r.tracks[50].id, "50", "la 2e page suit la 1re, sans trou");
+        assert_eq!(r.tracks[149].id, "149");
+        assert_eq!(r.albums.len(), 150);
+        assert_eq!(r.artists.len(), 150);
+        assert_eq!(r.playlists.len(), 150);
+    }
+
+    #[test]
+    fn fusionner_recherche_borne_chaque_categorie_au_plafond() {
+        let pages = [page(0, 50, 500), page(50, 50, 500), page(100, 50, 500)];
+        let r = QobuzService::fusionner_recherche(&pages, 100);
+        assert_eq!(r.tracks.len(), 100, "100 demandés, 100 rendus");
+        assert_eq!(r.tracks[99].id, "99");
+        assert_eq!(r.albums.len(), 100);
+    }
+
+    #[test]
+    fn fusionner_recherche_ne_complete_pas_une_categorie_courte() {
+        // Le plafond est un maximum PAR catégorie, pas un quota : une
+        // catégorie épuisée reste courte, les autres ne sont pas tronquées.
+        let page_mixte = json!({
+            "tracks": {"items": (0..50).map(|i| json!({"id": i as u64, "title": "t"})).collect::<Vec<_>>(), "total": 50},
+            "artists": {"items": [{"id": 1, "name": "Miles Davis"}], "total": 1},
+        });
+        let r = QobuzService::fusionner_recherche(&[page_mixte], 200);
+        assert_eq!(r.tracks.len(), 50);
+        assert_eq!(r.artists.len(), 1);
+        assert!(r.albums.is_empty(), "catégorie absente = liste vide");
+        assert!(r.playlists.is_empty());
+    }
+
+    /// Serveur qui imite `/catalog/search` : il rend `limit` éléments par
+    /// catégorie à partir de `offset` — jamais au-delà du `total` annoncé — et
+    /// NOTE chaque décalage reçu, ce qui est la preuve cherchée.
+    async fn qobuz_simule(totaux: Carte<&'static str, usize>) -> (String, Arc<Mutex<Vec<usize>>>) {
+        qobuz_simule_interne(totaux, false).await
+    }
+
+    /// Comme `qobuz_simule`, mais chaque page repond d'autant plus vite que son
+    /// decalage est grand : les reponses arrivent donc dans l'ordre INVERSE de
+    /// celui ou elles ont ete demandees. Sans ce decalage artificiel, un
+    /// serveur local repond toujours dans l'ordre de la demande et un essai
+    /// d'ordre ne prouve rien.
+    async fn qobuz_simule_desordre(
+        totaux: Carte<&'static str, usize>,
+    ) -> (String, Arc<Mutex<Vec<usize>>>) {
+        qobuz_simule_interne(totaux, true).await
+    }
+
+    async fn qobuz_simule_interne(
+        totaux: Carte<&'static str, usize>,
+        desordre: bool,
+    ) -> (String, Arc<Mutex<Vec<usize>>>) {
+        use axum::extract::Query as ExtraitQuery;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let vus: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let vus_srv = vus.clone();
+        let totaux = Arc::new(totaux);
+
+        let app = Router::new().route(
+            "/catalog/search",
+            get(
+                move |ExtraitQuery(p): ExtraitQuery<Carte<String, String>>| {
+                    let vus = vus_srv.clone();
+                    let totaux = totaux.clone();
+                    async move {
+                        let offset: usize =
+                            p.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let limit: usize = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        vus.lock().expect("verrou d'essai").push(offset);
+                        if desordre {
+                            let attente = 400u64.saturating_sub(offset as u64);
+                            tokio::time::sleep(Duration::from_millis(attente)).await;
+                        }
+
+                        let mut corps = serde_json::Map::new();
+                        for (categorie, total) in totaux.iter() {
+                            let fin = (offset + limit).min(*total);
+                            let items: Vec<serde_json::Value> = (offset..fin)
+                                .map(|i| {
+                                    json!({
+                                        "id": i as u64,
+                                        "title": format!("{categorie}-{i}"),
+                                        "name": format!("{categorie}-{i}"),
+                                    })
+                                })
+                                .collect();
+                            corps.insert(
+                                (*categorie).to_string(),
+                                json!({"items": items, "total": *total}),
+                            );
+                        }
+                        Json(serde_json::Value::Object(corps))
+                    }
+                },
+            ),
+        );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), vus)
+    }
+
+    fn decalages(vus: &Arc<Mutex<Vec<usize>>>) -> Vec<usize> {
+        let mut v = vus.lock().expect("verrou d'essai").clone();
+        v.sort_unstable();
+        v
+    }
+
+    #[tokio::test]
+    async fn au_dela_de_cinquante_la_recherche_demande_les_pages_suivantes() {
+        let (base, vus) = qobuz_simule(Carte::from([
+            ("tracks", 200usize),
+            ("albums", 200),
+            ("artists", 200),
+            ("playlists", 200),
+        ]))
+        .await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc
+            .search("miles davis", 200)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![0, 50, 100, 150],
+            "quatre pages par offset — c'est le défaut de la #2160"
+        );
+        assert_eq!(r.tracks.len(), 200);
+        assert_eq!(r.albums.len(), 200);
+        assert_eq!(r.artists.len(), 200);
+        assert_eq!(r.tracks[0].id, "0");
+        assert_eq!(r.tracks[199].id, "199", "les pages arrivent dans l'ordre");
+    }
+
+    #[tokio::test]
+    async fn les_pages_sont_rangees_par_decalage_et_non_par_ordre_d_arrivee() {
+        // Le serveur rend ici la DERNIERE page en premier. Si les reponses
+        // etaient concatenees dans l'ordre ou elles arrivent, l'ecran
+        // afficherait le titre 150 en 51e position.
+        let (base, vus) = qobuz_simule_desordre(Carte::from([("tracks", 200usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc
+            .search("miles davis", 200)
+            .await
+            .expect("serveur simule");
+
+        assert_eq!(decalages(&vus), vec![0, 50, 100, 150]);
+        assert_eq!(r.tracks.len(), 200);
+        let ids: Vec<String> = r.tracks.iter().map(|t| t.id.clone()).collect();
+        let attendus: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "les pages lentes ne doublent pas les rapides"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_recherche_de_cinquante_tient_en_un_seul_aller_retour() {
+        // Non-régression : le comportement d'avant la #2160 pour tout ce qui
+        // demande une page ou moins.
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 200usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("miles davis", 50).await.expect("serveur simulé");
+
+        assert_eq!(decalages(&vus), vec![0], "une seule requête");
+        assert_eq!(r.tracks.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn tous_pagine_jusqu_au_plafond_documente_et_pas_au_dela() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("jazz", 0).await.expect("serveur simulé");
+
+        assert_eq!(r.tracks.len(), PLAFOND_RECHERCHE);
+        assert_eq!(
+            decalages(&vus).len(),
+            PLAFOND_RECHERCHE / TAILLE_PAGE_RECHERCHE,
+            "dix pages, pas cent : « Tous » est borné"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_pagination_s_arrete_quand_qobuz_n_a_plus_rien() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 60usize), ("albums", 10)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("obscur", 200).await.expect("serveur simulé");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![0, 50],
+            "200 demandés mais 60 existants : deux pages, pas quatre"
+        );
+        assert_eq!(r.tracks.len(), 60);
+        assert_eq!(r.albums.len(), 10);
     }
 }
