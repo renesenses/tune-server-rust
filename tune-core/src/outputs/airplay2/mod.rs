@@ -397,9 +397,7 @@ impl OutputTarget for Airplay2Output {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        // La reprise restera fausse tant que le daemon AirPlay 2 livré ne
-        // possède pas la commande `resume` (#2238).
-        OutputCapabilities::v1(true, false, false, true, true, false)
+        OutputCapabilities::v1(true, true, false, true, true, false)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -682,6 +680,9 @@ mod transport_tests {
     async fn play_pause_resume_commands_are_confirmed_by_the_daemon() {
         let output = output_for_test();
         let commands = install_fake_daemon(&output, false).await;
+
+        assert!(output.capabilities().can_pause);
+        assert!(output.capabilities().can_resume);
 
         output.play_media(&media_for_test()).await.unwrap();
         output.pause().await.unwrap();

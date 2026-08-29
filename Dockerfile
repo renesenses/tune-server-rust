@@ -49,7 +49,7 @@ RUN cargo install librespot --no-default-features --features "alsa-backend" \
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 airplay-daemon --locked \
+      --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
