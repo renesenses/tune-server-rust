@@ -4517,16 +4517,29 @@ impl PositionPoller {
                             status.position_ms,
                         )
                     } {
-                        // Only send SetNextAVTransportURI if gapless is enabled for this zone
+                        // Crossfade reuses the same bounded next-producer
+                        // staging as gapless. Unlike a renderer transition it
+                        // is local-only: the LocalOutput consumes both WAV
+                        // producers and overlaps their PCM tails/heads.
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
                             .ok()
                             .flatten()
                             .map(|z| z.gapless_enabled)
                             .unwrap_or(true);
-                        fsm_pin.gapless_enabled = gapless_enabled;
-                        fsm_pact.arm_gapless = gapless_enabled;
-                        if gapless_enabled {
+                        let crossfade_enabled = device_id.starts_with("local:")
+                            && !crate::audio::audiophile::zone_enabled(&self.db, zone_id)
+                            && crate::db::settings_repo::SettingsRepo::with_backend(
+                                self.db.clone(),
+                            )
+                            .get(&format!("crossfade_enabled:{zone_id}"))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|value| value == "true" || value == "1");
+                        let chained_transition = gapless_enabled || crossfade_enabled;
+                        fsm_pin.gapless_enabled = chained_transition;
+                        fsm_pact.arm_gapless = chained_transition;
+                        if chained_transition {
                             // Exclusive-mode local outputs (ASIO / WASAPI
                             // exclusive) can't chain internally. Detect that
                             // BEFORE prepare_gapless resolves the next URL —
@@ -4570,7 +4583,7 @@ impl PositionPoller {
                                 }
                             }
                         } else {
-                            debug!(zone_id, "gapless_disabled_for_zone");
+                            debug!(zone_id, "chained_transition_disabled_for_zone");
                         }
                     }
 

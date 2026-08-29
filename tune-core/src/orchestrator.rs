@@ -6863,6 +6863,20 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    let settings =
+                        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+                    let crossfade_enabled = settings
+                        .get(&format!("crossfade_enabled:{zone_id}"))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|value| value == "true" || value == "1");
+                    let crossfade_duration = settings
+                        .get(&format!("crossfade_duration:{zone_id}"))
+                        .ok()
+                        .flatten()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .unwrap_or(3.0);
+                    local_output.set_crossfade(crossfade_enabled, crossfade_duration);
                     // ReplayGain, applied by the output itself for a local DAC.
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be

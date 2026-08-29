@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
+    OutputCapabilities, OutputDspMetrics, OutputDspState, OutputSampleTransport,
+    OutputSignalPathStatus, OutputSignalReason, OutputStatus, OutputTarget, OutputVolumeState,
     TransportState,
 };
-#[cfg(any(target_os = "windows", test))]
-use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -870,6 +869,14 @@ pub struct LocalOutput {
     /// Pending next track for gapless playback.  Set by `set_next_media()`,
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    /// Vrai crossfade, local uniquement. La durée est exprimée en millisecondes
+    /// pour rester atomique et bornée par l'API (1 à 12 secondes).
+    ///
+    /// Le réglage ne touche jamais le volume du périphérique : la boucle PCM
+    /// retient la queue de la piste courante et la mélange avec la tête de la
+    /// suivante. PURE et le mode exclusif le désactivent explicitement.
+    crossfade_enabled: Arc<AtomicBool>,
+    crossfade_duration_ms: Arc<AtomicU64>,
     /// La boucle d'enchaînement du fil de lecture a-t-elle rendu les armes ?
     ///
     /// `supports_internal_gapless()` était une **capacité statique**
@@ -1049,6 +1056,26 @@ impl LocalOutput {
         self.volume.store(v, Ordering::SeqCst);
     }
 
+    /// Configure le recouvrement PCM pour la prochaine lecture locale.
+    ///
+    /// Les chemins exclusifs promettent un transport entier/bit-perfect et
+    /// possèdent des boucles de rendu séparées : ils refusent donc le mixage,
+    /// tout comme PURE. Le serveur expose cette indisponibilité au lieu de
+    /// laisser un interrupteur mentir.
+    pub fn set_crossfade(&self, enabled: bool, duration_s: f64) {
+        let available = self.supports_pcm_crossfade() && !self.pure_bypass.load(Ordering::Relaxed);
+        self.crossfade_enabled
+            .store(enabled && available, Ordering::SeqCst);
+        self.crossfade_duration_ms.store(
+            (duration_s.clamp(1.0, 12.0) * 1000.0).round() as u64,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn supports_pcm_crossfade(&self) -> bool {
+        !self.exclusive_mode
+    }
+
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         Self::with_options(device_name, exclusive_mode, "auto")
@@ -1097,6 +1124,8 @@ impl LocalOutput {
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
+            crossfade_enabled: Arc::new(AtomicBool::new(false)),
+            crossfade_duration_ms: Arc::new(AtomicU64::new(3000)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
             eq: Arc::new(std::sync::Mutex::new(None)),
             current_format: Arc::new(AtomicU32::new(0)),
@@ -1260,6 +1289,9 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+        if bypass {
+            self.crossfade_enabled.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Install (or clear with `None`) the headphone crossfeed processor for the
@@ -3315,7 +3347,6 @@ impl OutputTarget for LocalOutput {
             *slot = None;
         }
         let open_failure = self.open_failure.clone();
-        #[cfg(target_os = "windows")]
         let signal_path_status = self.signal_path_status.clone();
         let track_ended_naturally = self.track_ended_naturally.clone();
         let track_ended_generation = self.track_ended_generation.clone();
@@ -3352,6 +3383,13 @@ impl OutputTarget for LocalOutput {
         let rg_factor_ref = self.rg_factor.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
+        // Snapshot per-play: the route/orchestrator may change the preference
+        // for the next track, but a running overlap must keep one duration.
+        let crossfade_enabled = self.crossfade_enabled.load(Ordering::SeqCst)
+            && !exclusive_mode
+            && !pure_bypass.load(Ordering::Relaxed);
+        let crossfade_duration_s =
+            self.crossfade_duration_ms.load(Ordering::SeqCst) as f64 / 1000.0;
         let chain_exhausted_ref = self.chain_exhausted.clone();
         let uri_ref = self.current_uri.clone();
         let title_ref = self.track_title.clone();
@@ -5289,6 +5327,15 @@ impl OutputTarget for LocalOutput {
 
             let output_sr = actual_config.sample_rate;
             let output_ch = actual_config.channels;
+            let mut crossfade_tail = if crossfade_enabled {
+                crate::playback::crossfade::CrossfadeTail::new(
+                    crossfade_duration_s,
+                    output_sr,
+                    output_ch,
+                )
+            } else {
+                crate::playback::crossfade::CrossfadeTail::disabled()
+            };
 
             info!(
                 device = %device_name,
@@ -5297,6 +5344,8 @@ impl OutputTarget for LocalOutput {
                 input_ch = channels,
                 output_sr,
                 output_ch,
+                crossfade = crossfade_tail.is_enabled(),
+                crossfade_duration_s,
                 "local_audio_stream_config"
             );
 
@@ -5452,7 +5501,12 @@ impl OutputTarget for LocalOutput {
                         &mut resample_leftover,
                     );
                 }
-                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                let ready = if processed.dop {
+                    crossfade_tail.bypass_with(samples)
+                } else {
+                    crossfade_tail.push(samples)
+                };
+                feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent));
                 total_frames_fed += processed.source_frames;
             }
             let mut total_bytes_read: u64 = 0;
@@ -5618,8 +5672,13 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
+                let ready = if processed.dop {
+                    crossfade_tail.bypass_with(samples)
+                } else {
+                    crossfade_tail.push(samples)
+                };
                 let fed =
-                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                    feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent));
                 if !fed {
                     // Wedge: the render callback stopped draining the ring
                     // (dead stream after a USB DAC unplug on macOS, where no
@@ -5657,8 +5716,10 @@ impl OutputTarget for LocalOutput {
                 }
 
                 // Update position
-                let pos =
-                    (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
+                let decoded_ms = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                let held_ms = (crossfade_tail.len() as u64 * 1000)
+                    / (output_sr.max(1) as u64 * output_ch.max(1) as u64);
+                let pos = decoded_ms.saturating_sub(held_ms) + seek_offset;
                 position_ms.store(pos, Ordering::Relaxed);
             }
 
@@ -5842,7 +5903,8 @@ impl OutputTarget for LocalOutput {
                                 &mut resample_leftover,
                             );
                         }
-                        feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
+                        let ready = crossfade_tail.push(queue);
+                        feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent));
                     }
                 }
 
@@ -5862,13 +5924,8 @@ impl OutputTarget for LocalOutput {
                         &mut resample_leftover,
                     );
                     if !flushed.is_empty() {
-                        feed_ring_abortable(
-                            &ring,
-                            &flushed,
-                            &stop_rx,
-                            &paused,
-                            Some(&force_silent),
-                        );
+                        let ready = crossfade_tail.push(flushed);
+                        feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent));
                     }
                 }
 
@@ -5984,7 +6041,16 @@ impl OutputTarget for LocalOutput {
                 leftover.clear();
                 http_eof = false;
 
-                // Process initial PCM data from the header read
+                // Process enough of the next producer to cover the retained
+                // tail. The two buffers now coexist in memory before either is
+                // published: this is the actual two-producer overlap #2211
+                // requires, as opposed to two sequential device-volume ramps.
+                let previous_tail = crossfade_tail.drain();
+                let overlap_target = previous_tail.len();
+                let mut next_head = Vec::with_capacity(overlap_target);
+                let mut next_is_dop = false;
+
+                // Process initial PCM data from the header read.
                 let gapless_pcm = if new_data_offset < next_header.len() {
                     next_header[new_data_offset..].to_vec()
                 } else {
@@ -6014,13 +6080,115 @@ impl OutputTarget for LocalOutput {
                             &mut resample_leftover,
                         );
                     }
-                    feed_ring_abortable(&ring, &smp, &stop_rx, &paused, Some(&force_silent));
+                    next_is_dop |= processed.dop;
+                    next_head.extend(smp);
                     total_frames_fed += processed.source_frames;
                 }
 
                 // Main read loop for the gapless-chained track
                 let mut gapless_read_buf = vec![0u8; 65536];
+                while !next_is_dop && next_head.len() < overlap_target {
+                    match next_reader.read(&mut gapless_read_buf) {
+                        Ok(0) => {
+                            http_eof = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            total_bytes_read += n as u64;
+                            leftover.extend_from_slice(&gapless_read_buf[..n]);
+                            if (leftover.len() / frame_bytes) * frame_bytes == 0 {
+                                continue;
+                            }
+                            let Some(processed) = pcm_processor.process_pcm_chunk(
+                                &mut leftover,
+                                frame_bytes,
+                                bit_depth,
+                                channels,
+                                &mut pcm_kind,
+                            ) else {
+                                continue;
+                            };
+                            let mut smp = processed.samples;
+                            if needs_channel_adapt {
+                                smp = adapt_channels(&smp, channels, output_ch);
+                            }
+                            if needs_resample {
+                                smp = rubato_resample_chunk(
+                                    &mut resampler,
+                                    &smp,
+                                    output_ch,
+                                    false,
+                                    &mut resample_leftover,
+                                );
+                            }
+                            next_is_dop |= processed.dop;
+                            next_head.extend(smp);
+                            total_frames_fed += processed.source_frames;
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+                                http_eof = false;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_crossfade_head_read_error");
+                            http_eof = true;
+                            break;
+                        }
+                    }
+                }
+
+                let ready = if previous_tail.is_empty() {
+                    if next_is_dop {
+                        crossfade_tail.bypass_with(next_head)
+                    } else {
+                        crossfade_tail.push(next_head)
+                    }
+                } else if next_is_dop {
+                    // DoP is a DSD bitstream, not PCM. Preserve both tracks in
+                    // sequence and disable arithmetic for this transition.
+                    let mut unmixed = previous_tail;
+                    unmixed.extend(next_head);
+                    crossfade_tail.bypass_with(unmixed)
+                } else {
+                    let mixed = crate::playback::crossfade::equal_power_crossfade(
+                        &previous_tail,
+                        &next_head,
+                        output_ch,
+                    );
+                    let overlap_frames = mixed.overlap.len() / output_ch.max(1) as usize;
+                    info!(
+                        overlap_frames,
+                        duration_ms = overlap_frames as u64 * 1000 / output_sr.max(1) as u64,
+                        "local_audio_crossfade_overlap"
+                    );
+                    if let Ok(mut status) = signal_path_status.lock() {
+                        *status = Some(OutputSignalPathStatus {
+                            bit_perfect: false,
+                            sample_transport: OutputSampleTransport::Float,
+                            dsp: OutputDspState::Applied,
+                            volume: OutputVolumeState::Unity,
+                            reasons: vec![OutputSignalReason::DspApplied],
+                        });
+                    }
+                    let mut ready = mixed.tail_prefix;
+                    ready.extend(mixed.overlap);
+                    ready.extend(crossfade_tail.push(mixed.head_suffix));
+                    ready
+                };
+                if !feed_ring_abortable(&ring, &ready, &stop_rx, &paused, Some(&force_silent)) {
+                    http_eof = false;
+                    break;
+                }
+
                 loop {
+                    if http_eof {
+                        break;
+                    }
                     if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
                         break;
                     }
@@ -6072,9 +6240,14 @@ impl OutputTarget for LocalOutput {
                                     &mut resample_leftover,
                                 );
                             }
+                            let ready = if processed.dop {
+                                crossfade_tail.bypass_with(smp)
+                            } else {
+                                crossfade_tail.push(smp)
+                            };
                             let fed = feed_ring_abortable(
                                 &ring,
-                                &smp,
+                                &ready,
                                 &stop_rx,
                                 &paused,
                                 Some(&force_silent),
@@ -6090,9 +6263,11 @@ impl OutputTarget for LocalOutput {
                                 break;
                             }
                             total_frames_fed += processed.source_frames;
-                            let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
-                                as u64
-                                + seek_offset;
+                            let decoded_ms =
+                                (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                            let held_ms = (crossfade_tail.len() as u64 * 1000)
+                                / (output_sr.max(1) as u64 * output_ch.max(1) as u64);
+                            let pos = decoded_ms.saturating_sub(held_ms) + seek_offset;
                             position_ms.store(pos, Ordering::Relaxed);
                         }
                         Err(ref e)
@@ -6124,6 +6299,20 @@ impl OutputTarget for LocalOutput {
             // ---------------------------------------------------------------
             // End of gapless continuation
             // ---------------------------------------------------------------
+
+            // No compatible next producer remains. The retained tail belongs
+            // to the audible end of the final track and must be rendered
+            // unchanged; dropping it would turn an unavailable crossfade into
+            // a truncation of exactly the configured duration.
+            if http_eof
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
+                let final_tail = crossfade_tail.drain();
+                if !final_tail.is_empty() {
+                    feed_ring_abortable(&ring, &final_tail, &stop_rx, &paused, Some(&force_silent));
+                }
+            }
 
             // La boucle est finie : ce fil n'enchaînera plus rien, quelle qu'en
             // soit la raison (rien en réserve, HTTP en erreur, en-tête vide,

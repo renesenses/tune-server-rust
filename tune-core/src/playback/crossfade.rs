@@ -1,119 +1,121 @@
-use std::time::Duration;
+//! Sample-accurate crossfade primitives for the local PCM output.
+//!
+//! This module deliberately knows nothing about [`OutputTarget`](crate::outputs::OutputTarget)
+//! or device volume. A crossfade is part of the PCM signal path: changing a
+//! renderer or DAC's persistent volume is never an acceptable substitute.
 
-use tokio::sync::Mutex;
-use tracing::info;
+use std::collections::VecDeque;
+use std::f32::consts::FRAC_PI_2;
 
-use crate::outputs::OutputTarget;
-
-pub struct CrossfadeHandler {
-    pub enabled: bool,
-    pub duration_s: f64,
-    original_volume: Mutex<Option<f64>>,
-    fading: Mutex<bool>,
+/// Keeps the last `duration` worth of interleaved PCM out of the render ring.
+///
+/// Once the next producer is ready, that tail can be mixed with its head. If
+/// no compatible next producer arrives, [`drain`](Self::drain) returns the
+/// samples untouched, so enabling crossfade cannot truncate a final track.
+#[derive(Debug)]
+pub struct CrossfadeTail {
+    capacity_samples: usize,
+    samples: VecDeque<f32>,
 }
 
-impl CrossfadeHandler {
-    pub fn new(enabled: bool, duration_s: f64) -> Self {
+impl CrossfadeTail {
+    pub fn new(duration_s: f64, sample_rate: u32, channels: u16) -> Self {
+        let frames = (duration_s.max(0.0) * sample_rate as f64).round() as usize;
         Self {
-            enabled,
-            duration_s,
-            original_volume: Mutex::new(None),
-            fading: Mutex::new(false),
+            capacity_samples: frames.saturating_mul(channels.max(1) as usize),
+            samples: VecDeque::with_capacity(frames.saturating_mul(channels.max(1) as usize)),
         }
     }
 
-    pub async fn should_start_crossfade(
-        &self,
-        position_ms: i64,
-        duration_ms: i64,
-        is_radio: bool,
-    ) -> bool {
-        if !self.enabled || self.duration_s <= 0.0 || is_radio || duration_ms <= 0 {
-            return false;
-        }
-        let remaining_ms = duration_ms - position_ms;
-        let threshold_ms = (self.duration_s * 1000.0) as i64;
-        remaining_ms <= threshold_ms && remaining_ms > (threshold_ms - 500)
-    }
-
-    pub async fn start_fade_out(&self, output: &dyn OutputTarget) -> Result<(), String> {
-        {
-            let fading = self.fading.lock().await;
-            if *fading {
-                return Ok(());
-            }
-        }
-
-        let status = output.get_status().await?;
-        let current_vol = status.volume;
-        *self.original_volume.lock().await = Some(current_vol);
-        *self.fading.lock().await = true;
-
-        info!(
-            device = output.name(),
-            from_vol = current_vol,
-            duration_s = self.duration_s,
-            "crossfade_fade_out_start"
-        );
-
-        fade_volume(output, current_vol, 0.0, self.duration_s).await;
-        Ok(())
-    }
-
-    pub async fn finish_fade_in(&self, output: &dyn OutputTarget) -> Result<(), String> {
-        let target_vol = {
-            let mut orig = self.original_volume.lock().await;
-            match orig.take() {
-                Some(v) => v,
-                None => return Ok(()),
-            }
-        };
-
-        info!(
-            device = output.name(),
-            to_vol = target_vol,
-            duration_s = self.duration_s,
-            "crossfade_fade_in_start"
-        );
-
-        fade_volume(output, 0.0, target_vol, self.duration_s).await;
-        *self.fading.lock().await = false;
-
-        info!(
-            device = output.name(),
-            restored_volume = target_vol,
-            "crossfade_complete"
-        );
-        Ok(())
-    }
-
-    pub async fn cancel(&self, output: Option<&dyn OutputTarget>) {
-        *self.fading.lock().await = false;
-        let orig = self.original_volume.lock().await.take();
-        if let (Some(vol), Some(out)) = (orig, output) {
-            let _ = out.checked_set_volume(vol).await;
+    pub fn disabled() -> Self {
+        Self {
+            capacity_samples: 0,
+            samples: VecDeque::new(),
         }
     }
 
-    pub async fn is_fading(&self) -> bool {
-        *self.fading.lock().await
+    pub fn is_enabled(&self) -> bool {
+        self.capacity_samples > 0
+    }
+
+    /// Retain the newest tail and return older samples ready for the renderer.
+    pub fn push(&mut self, incoming: Vec<f32>) -> Vec<f32> {
+        if self.capacity_samples == 0 {
+            return incoming;
+        }
+        self.samples.extend(incoming);
+        let ready_len = self.samples.len().saturating_sub(self.capacity_samples);
+        self.samples.drain(..ready_len).collect()
+    }
+
+    /// Flush the retained tail and permanently bypass this transition when
+    /// the payload cannot be mixed (notably DoP, which is not PCM audio).
+    pub fn bypass_with(&mut self, incoming: Vec<f32>) -> Vec<f32> {
+        let mut ready = self.drain();
+        ready.extend(incoming);
+        self.capacity_samples = 0;
+        ready
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn drain(&mut self) -> Vec<f32> {
+        self.samples.drain(..).collect()
     }
 }
 
-async fn fade_volume(output: &dyn OutputTarget, from: f64, to: f64, duration_s: f64) {
-    if duration_s <= 0.0 {
-        let _ = output.checked_set_volume(to).await;
-        return;
-    }
-    let steps = ((duration_s * 10.0) as u64).max(1);
-    let step_delay = Duration::from_millis(((duration_s * 1000.0) / steps as f64) as u64);
-    for i in 0..=steps {
-        let t = i as f64 / steps as f64;
-        let vol = from + (to - from) * t;
-        if output.checked_set_volume(vol).await.is_err() {
-            break;
+/// Result of an equal-power overlap between two interleaved PCM producers.
+#[derive(Debug, PartialEq)]
+pub struct CrossfadeMix {
+    pub tail_prefix: Vec<f32>,
+    pub overlap: Vec<f32>,
+    pub head_suffix: Vec<f32>,
+}
+
+/// Mix the retained tail of the current track with the head of the next one.
+///
+/// The envelope is equal-power (`cos` / `sin`), evaluated once per frame and
+/// applied to every channel. The overlap contains exactly `min(tail, head)`
+/// complete frames; unmatched samples are returned without modification.
+pub fn equal_power_crossfade(tail: &[f32], head: &[f32], channels: u16) -> CrossfadeMix {
+    let channels = channels.max(1) as usize;
+    let tail_frames = tail.len() / channels;
+    let head_frames = head.len() / channels;
+    let overlap_frames = tail_frames.min(head_frames);
+    let tail_prefix_frames = tail_frames.saturating_sub(overlap_frames);
+    let tail_prefix_samples = tail_prefix_frames * channels;
+    let overlap_samples = overlap_frames * channels;
+
+    let mut overlap = Vec::with_capacity(overlap_samples);
+    for frame in 0..overlap_frames {
+        // Include both exact boundaries when at least two frames overlap.
+        let progress = if overlap_frames <= 1 {
+            0.5
+        } else {
+            frame as f32 / (overlap_frames - 1) as f32
+        };
+        let outgoing_gain = (progress * FRAC_PI_2).cos();
+        let incoming_gain = (progress * FRAC_PI_2).sin();
+        let tail_start = tail_prefix_samples + frame * channels;
+        let head_start = frame * channels;
+        for channel in 0..channels {
+            overlap.push(
+                tail[tail_start + channel] * outgoing_gain
+                    + head[head_start + channel] * incoming_gain,
+            );
         }
-        tokio::time::sleep(step_delay).await;
+    }
+
+    CrossfadeMix {
+        tail_prefix: tail[..tail_prefix_samples].to_vec(),
+        overlap,
+        head_suffix: head[overlap_samples..].to_vec(),
     }
 }
 
@@ -121,36 +123,46 @@ async fn fade_volume(output: &dyn OutputTarget, from: f64, to: f64, duration_s: 
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn should_not_crossfade_when_disabled() {
-        let cf = CrossfadeHandler::new(false, 5.0);
-        assert!(!cf.should_start_crossfade(170000, 180000, false).await);
+    #[test]
+    fn tail_never_drops_the_end_when_no_next_track_arrives() {
+        let mut tail = CrossfadeTail::new(1.0, 4, 1);
+        assert_eq!(tail.push(vec![1.0, 2.0, 3.0]), Vec::<f32>::new());
+        assert_eq!(tail.push(vec![4.0, 5.0]), vec![1.0]);
+        assert_eq!(tail.drain(), vec![2.0, 3.0, 4.0, 5.0]);
     }
 
-    #[tokio::test]
-    async fn should_not_crossfade_radio() {
-        let cf = CrossfadeHandler::new(true, 5.0);
-        assert!(!cf.should_start_crossfade(170000, 180000, true).await);
+    #[test]
+    fn disabled_tail_is_an_identity_operation() {
+        let mut tail = CrossfadeTail::disabled();
+        assert_eq!(tail.push(vec![0.25, -0.5]), vec![0.25, -0.5]);
+        assert!(tail.drain().is_empty());
     }
 
-    #[tokio::test]
-    async fn should_crossfade_in_window() {
-        let cf = CrossfadeHandler::new(true, 5.0);
-        // 4800ms remaining, threshold=5000ms, within 500ms window
-        assert!(cf.should_start_crossfade(175200, 180000, false).await);
+    /// #2211 — the capture contains both producers throughout the overlap,
+    /// begins exactly on producer A, ends exactly on producer B, and contains
+    /// the requested number of complete stereo frames.
+    #[test]
+    fn equal_power_capture_contains_both_tracks_and_exact_boundaries() {
+        let tail = vec![1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5];
+        let head = vec![0.25, -1.0, 0.25, -1.0, 0.25, -1.0, 0.25, -1.0];
+        let mixed = equal_power_crossfade(&tail, &head, 2);
+
+        assert!(mixed.tail_prefix.is_empty());
+        assert!(mixed.head_suffix.is_empty());
+        assert_eq!(mixed.overlap.len(), 8);
+        assert_eq!(&mixed.overlap[..2], &tail[..2]);
+        assert!((mixed.overlap[6] - head[6]).abs() < 1.0e-6);
+        assert!((mixed.overlap[7] - head[7]).abs() < 1.0e-6);
+        // An interior frame cannot equal either isolated producer.
+        assert_ne!(&mixed.overlap[2..4], &tail[2..4]);
+        assert_ne!(&mixed.overlap[2..4], &head[2..4]);
     }
 
-    #[tokio::test]
-    async fn should_not_crossfade_too_early() {
-        let cf = CrossfadeHandler::new(true, 5.0);
-        // 10s remaining, threshold=5s
-        assert!(!cf.should_start_crossfade(170000, 180000, false).await);
-    }
-
-    #[tokio::test]
-    async fn should_not_crossfade_past_window() {
-        let cf = CrossfadeHandler::new(true, 5.0);
-        // 4000ms remaining — past the 500ms detection window
-        assert!(!cf.should_start_crossfade(176000, 180000, false).await);
+    #[test]
+    fn a_short_next_track_preserves_the_unmatched_outgoing_prefix() {
+        let mixed = equal_power_crossfade(&[1.0, 2.0, 3.0, 4.0], &[9.0, 8.0], 1);
+        assert_eq!(mixed.tail_prefix, vec![1.0, 2.0]);
+        assert_eq!(mixed.overlap.len(), 2);
+        assert!(mixed.head_suffix.is_empty());
     }
 }

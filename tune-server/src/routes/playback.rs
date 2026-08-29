@@ -2574,10 +2574,37 @@ struct CrossfadeSettings {
     duration: Option<f64>,
 }
 
-/// Read the persisted crossfade settings for a zone.
-///
-/// Crossfade is not applied by the playback engine: report the capability as
-/// unavailable and never echo a stale persisted preference as if it were live.
+async fn crossfade_available(state: &AppState, zone_id: i64) -> bool {
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    let Some(zone) = zone else { return false };
+    if zone.output_type.as_deref().unwrap_or("local") != "local"
+        || tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id)
+    {
+        return false;
+    }
+    #[cfg(feature = "local-audio")]
+    {
+        let Some(device_id) = zone.output_device_id.as_deref() else {
+            return false;
+        };
+        let Some(output) = ({ state.outputs.lock().await.get(device_id) }) else {
+            return false;
+        };
+        let output = output.lock().await;
+        output
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            .is_some_and(|local| local.supports_pcm_crossfade())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    false
+}
+
+/// Read the persisted crossfade settings and the capability of the output
+/// actually attached to this zone.
 async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let requested_enabled = settings
@@ -2592,17 +2619,23 @@ async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) 
         .flatten()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(3.0);
+    let available = crossfade_available(&state, zone_id).await;
     Json(json!({
-        "available": false,
-        "enabled": false,
+        "available": available,
+        "enabled": available && requested_enabled,
         "requested_enabled": requested_enabled,
         "duration": duration,
+        "scope": "local_pcm",
+        "other_outputs": "sequential_track_transition",
     }))
 }
 
-fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
-    if body.enabled {
-        return Err("crossfade_unavailable");
+fn validate_crossfade_update(
+    body: &CrossfadeSettings,
+    available: bool,
+) -> Result<f64, &'static str> {
+    if body.enabled && !available {
+        return Err("crossfade_local_pcm_only");
     }
     Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
 }
@@ -2612,14 +2645,15 @@ async fn set_crossfade(
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
 ) -> impl IntoResponse {
-    let duration = match validate_crossfade_update(&body) {
+    let available = crossfade_available(&state, zone_id).await;
+    let duration = match validate_crossfade_update(&body, available) {
         Ok(duration) => duration,
         Err(code) => {
             return (
-                StatusCode::NOT_IMPLEMENTED,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({
                     "error": code,
-                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
+                    "message": "Le vrai fondu enchaîné est disponible uniquement sur une sortie locale PCM non exclusive et hors mode PURE. Cette sortie conserve une transition séquentielle.",
                 })),
             )
                 .into_response();
@@ -2627,7 +2661,10 @@ async fn set_crossfade(
     };
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
+    if let Err(error) = settings.set(
+        &format!("crossfade_enabled:{zone_id}"),
+        if body.enabled { "true" } else { "false" },
+    ) {
         error!(zone_id, %error, "crossfade_disable_persist_failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2646,11 +2683,28 @@ async fn set_crossfade(
         )
             .into_response();
     }
+    if body.enabled
+        && let Err(error) = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .update_gapless_enabled(zone_id, false)
+    {
+        // Fail closed: the two transition modes must never remain armed at
+        // once. Undo the preference we just wrote if the zone update failed.
+        let _ = settings.set(&format!("crossfade_enabled:{zone_id}"), "false");
+        error!(zone_id, %error, "crossfade_gapless_exclusion_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
     Json(json!({
         "zone_id": zone_id,
-        "available": false,
-        "crossfade_enabled": false,
+        "available": available,
+        "crossfade_enabled": body.enabled,
         "crossfade_duration": duration,
+        "scope": "local_pcm",
+        "applies_from": "next_track",
+        "gapless_enabled": false,
     }))
     .into_response()
 }
@@ -4175,23 +4229,31 @@ mod tests_contexte_de_lecture {
 }
 
 #[cfg(test)]
-mod tests_crossfade_indisponible {
+mod tests_crossfade_local_seulement {
     use super::{CrossfadeSettings, validate_crossfade_update};
 
-    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
-    /// n'en tient compte est un faux succès. L'activation doit échouer avant
-    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    /// #2211 — une sortie réseau/navigateur ne possède pas les deux PCM : elle
+    /// doit refuser l'activation au lieu de promettre le mixer local.
     #[test]
-    fn activer_le_faux_crossfade_est_refuse() {
+    fn activer_hors_sortie_locale_pcm_est_refuse() {
         let body = CrossfadeSettings {
             enabled: true,
             duration: Some(5.0),
         };
 
         assert_eq!(
-            validate_crossfade_update(&body),
-            Err("crossfade_unavailable")
+            validate_crossfade_update(&body, false),
+            Err("crossfade_local_pcm_only")
         );
+    }
+
+    #[test]
+    fn activer_sur_sortie_locale_pcm_est_accepte_et_borne() {
+        let body = CrossfadeSettings {
+            enabled: true,
+            duration: Some(99.0),
+        };
+        assert_eq!(validate_crossfade_update(&body, true), Ok(12.0));
     }
 
     #[test]
@@ -4205,7 +4267,7 @@ mod tests_crossfade_indisponible {
             duration: None,
         };
 
-        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
-        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
+        assert_eq!(validate_crossfade_update(&too_long, false), Ok(12.0));
+        assert_eq!(validate_crossfade_update(&default, false), Ok(3.0));
     }
 }
