@@ -14,9 +14,13 @@ const AMAZON_TUNE_API: &str = "https://music.amazon.com/api/";
 const AMAZON_CLIENT_ID: &str = "amzn1.application-oa2-client.music";
 const STREAM_URL_TTL: u64 = 600;
 
+#[derive(Clone)]
 struct CachedUrl {
     url: String,
     expires: Instant,
+    quality: String,
+    sample_rate: u32,
+    bit_depth: u16,
 }
 
 pub struct AmazonMusicService {
@@ -242,24 +246,34 @@ impl AmazonMusicService {
         }
     }
 
-    async fn get_cached_url(&self, track_id: &str) -> Option<String> {
+    async fn get_cached_url(&self, cache_key: &str) -> Option<CachedUrl> {
         let cache = self.url_cache.lock().await;
-        cache.get(track_id).and_then(|c| {
+        cache.get(cache_key).and_then(|c| {
             if c.expires > Instant::now() {
-                Some(c.url.clone())
+                Some(c.clone())
             } else {
                 None
             }
         })
     }
 
-    async fn cache_url(&self, track_id: &str, url: &str) {
+    async fn cache_url(
+        &self,
+        cache_key: &str,
+        url: &str,
+        quality: &str,
+        sample_rate: u32,
+        bit_depth: u16,
+    ) {
         let mut cache = self.url_cache.lock().await;
         cache.insert(
-            track_id.to_string(),
+            cache_key.to_string(),
             CachedUrl {
                 url: url.to_string(),
                 expires: Instant::now() + Duration::from_secs(STREAM_URL_TTL),
+                quality: quality.to_string(),
+                sample_rate,
+                bit_depth,
             },
         );
     }
@@ -397,25 +411,27 @@ impl StreamingService for AmazonMusicService {
     async fn get_track_url(
         &self,
         track_id: &str,
-        _quality: Option<&str>,
+        quality: Option<&str>,
     ) -> Result<StreamUrl, TuneError> {
-        if let Some(cached) = self.get_cached_url(track_id).await {
-            let (sr, bd) = if self.quality == "ULTRA_HD" {
-                (96000, 24)
-            } else {
-                (44100, 16)
-            };
+        let requested_quality = quality.unwrap_or(self.quality.as_str());
+        let cache_key = format!("{track_id}:{requested_quality}");
+        if let Some(cached) = self.get_cached_url(&cache_key).await {
             return Ok(StreamUrl {
-                url: cached,
-                mime_type: if self.quality == "SD" {
+                url: cached.url,
+                mime_type: if cached.quality == "SD" {
                     "audio/aac".into()
                 } else {
                     "audio/flac".into()
                 },
                 quality: StreamQuality {
-                    codec: if self.quality == "SD" { "AAC" } else { "FLAC" }.into(),
-                    sample_rate: sr,
-                    bit_depth: bd,
+                    codec: if cached.quality == "SD" {
+                        "AAC"
+                    } else {
+                        "FLAC"
+                    }
+                    .into(),
+                    sample_rate: cached.sample_rate,
+                    bit_depth: cached.bit_depth,
                     bitrate: None,
                     channels: 2,
                 },
@@ -425,7 +441,7 @@ impl StreamingService for AmazonMusicService {
 
         let body = json!({
             "trackId": track_id,
-            "quality": &self.quality,
+            "quality": requested_quality,
             "deviceId": &self.device_id,
         });
         let data = self.api_post("stream", &body).await?;
@@ -435,24 +451,47 @@ impl StreamingService for AmazonMusicService {
             .ok_or("no stream url")?
             .to_string();
 
-        self.cache_url(track_id, &url).await;
-
-        let (sr, bd) = if self.quality == "ULTRA_HD" {
-            (96000, 24)
+        let delivered_quality = data["quality"]
+            .as_str()
+            .or_else(|| data["audioQuality"].as_str())
+            .unwrap_or(requested_quality);
+        let default_sample_rate = if delivered_quality == "ULTRA_HD" {
+            96000
         } else {
-            (44100, 16)
+            44100
         };
+        let default_bit_depth = if delivered_quality == "ULTRA_HD" {
+            24
+        } else {
+            16
+        };
+        let sample_rate = data["sampleRate"]
+            .as_u64()
+            .map(|value| value as u32)
+            .unwrap_or(default_sample_rate);
+        let bit_depth = data["bitDepth"]
+            .as_u64()
+            .map(|value| value as u16)
+            .unwrap_or(default_bit_depth);
+        self.cache_url(&cache_key, &url, delivered_quality, sample_rate, bit_depth)
+            .await;
+
         Ok(StreamUrl {
             url,
-            mime_type: if self.quality == "SD" {
+            mime_type: if delivered_quality == "SD" {
                 "audio/aac".into()
             } else {
                 "audio/flac".into()
             },
             quality: StreamQuality {
-                codec: if self.quality == "SD" { "AAC" } else { "FLAC" }.into(),
-                sample_rate: sr,
-                bit_depth: bd,
+                codec: if delivered_quality == "SD" {
+                    "AAC"
+                } else {
+                    "FLAC"
+                }
+                .into(),
+                sample_rate,
+                bit_depth,
                 bitrate: None,
                 channels: 2,
             },

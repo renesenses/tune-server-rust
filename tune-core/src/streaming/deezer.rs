@@ -196,6 +196,16 @@ impl DeezerService {
         track_id: &str,
         max_fallbacks: u8,
     ) -> Result<String, String> {
+        self.get_full_stream_url_at_quality(track_id, max_fallbacks, &self.quality)
+            .await
+    }
+
+    pub async fn get_full_stream_url_at_quality(
+        &self,
+        track_id: &str,
+        max_fallbacks: u8,
+        quality: &str,
+    ) -> Result<String, String> {
         let mut current_id = track_id.to_string();
         for attempt in 0..=max_fallbacks {
             let result = self
@@ -206,8 +216,8 @@ impl DeezerService {
                 .await?;
             let token = result["TRACK_TOKEN"].as_str().ok_or("no TRACK_TOKEN")?;
             let license = self.license_token.as_ref().ok_or("no license_token")?;
-            let format_name = match self.quality.as_str() {
-                "FLAC" | "MP3_320" | "MP3_128" => self.quality.as_str(),
+            let format_name = match quality {
+                "FLAC" | "MP3_320" | "MP3_128" => quality,
                 _ => "FLAC",
             };
             let body = serde_json::json!({
@@ -538,11 +548,16 @@ impl StreamingService for DeezerService {
     async fn get_track_url(
         &self,
         track_id: &str,
-        _quality: Option<&str>,
+        quality: Option<&str>,
     ) -> Result<StreamUrl, TuneError> {
+        let requested_quality = match quality.unwrap_or(self.quality.as_str()) {
+            "FLAC" => "FLAC",
+            "MP3_320" | "MP3_128" => "MP3_320",
+            _ => self.quality.as_str(),
+        };
         // Path 1: local decrypt proxy (full quality, plain audio for DLNA)
         if let (Some(base), true) = (&self.proxy_base_url, self.has_full_streaming()) {
-            let ext = if self.quality == "FLAC" {
+            let ext = if requested_quality == "FLAC" {
                 "flac"
             } else {
                 "mp3"
@@ -568,9 +583,11 @@ impl StreamingService for DeezerService {
 
         // Path 2: direct encrypted URL (only for clients that decrypt)
         if self.has_full_streaming()
-            && let Ok(url) = self.get_full_stream_url(track_id, 0).await
+            && let Ok(url) = self
+                .get_full_stream_url_at_quality(track_id, 0, requested_quality)
+                .await
         {
-            let ext = if self.quality == "FLAC" {
+            let ext = if requested_quality == "FLAC" {
                 "flac"
             } else {
                 "mp3"
