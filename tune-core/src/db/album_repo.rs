@@ -3649,7 +3649,7 @@ mod tests {
                 .map(|_| {
                     let t0 = std::time::Instant::now();
                     let page = repo
-                        .list_filtered(2000, 6000, sort, "asc", None, None, None)
+                        .list_filtered(2000, 6000, sort, "asc", None, None, None, true)
                         .unwrap();
                     assert_eq!(page.len(), 2000);
                     t0.elapsed()
@@ -3682,7 +3682,7 @@ mod tests {
         for offset in [0i64, 22_000, 44_000] {
             let t0 = std::time::Instant::now();
             let page = repo
-                .list_filtered(2000, offset, "added_at", "asc", None, None, None)
+                .list_filtered(2000, offset, "added_at", "asc", None, None, None, true)
                 .unwrap();
             eprintln!(
                 "added_at offset={offset}: {} albums en {:?}",
@@ -3694,7 +3694,7 @@ mod tests {
         // Témoin : tri bon marché (id), même volume.
         let t0 = std::time::Instant::now();
         let page = repo
-            .list_filtered(2000, 0, "id", "asc", None, None, None)
+            .list_filtered(2000, 0, "id", "asc", None, None, None, true)
             .unwrap();
         eprintln!("id offset=0: {} albums en {:?}", page.len(), t0.elapsed());
     }
