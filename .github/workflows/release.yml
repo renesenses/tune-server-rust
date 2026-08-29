@@ -740,8 +740,42 @@ jobs:
           # 93 a 105 Gi libres. C'etait une anomalie d'image, pas un manque
           # structurel. On garde donc la seule chose qui ne coute rien et qui
           # aurait suffi a le diagnostiquer : la mesure, et l'alerte.
+          # `timeout` n'existe pas sur macOS : on borne a la main. Sans cela une
+          # commande reseau qui ne rend jamais la main tient le job jusqu'au
+          # delai de 75 minutes, sans une ligne de journal — c'est exactement ce
+          # qui a tue la v0.9.123 (36 minutes de silence apres `created: …dmg`).
+          avec_borne() {
+            local secondes="$1"; shift
+            "$@" & local pid=$!
+            ( sleep "$secondes"; kill -9 "$pid" 2>/dev/null ) & local chien=$!
+            wait "$pid"; local code=$?
+            kill "$chien" 2>/dev/null || true
+            return $code
+          }
+
+          # Nettoyage CONDITIONNEL. Mesure du 29/08 (v0.9.123) : la passe libere
+          # bien 51 Gi, mais elle coute 5 min 19 — et le runner avait deja 104 Gi
+          # libres. Payer cinq minutes pour de la place dont on n'a pas besoin n'a
+          # aucun sens. On ne nettoie donc QUE sous le seuil.
           libre=$(df -g / | awk 'NR==2 {print $4}')
           echo "Espace libre avant hdiutil : ${libre} Gi"
+          if [ "$libre" -lt 40 ]; then
+            echo "Sous 40 Gi — liberation des installations Xcode inutilisees."
+            xcode_actif="$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer##')"
+            echo "  Xcode actif (preserve) : ${xcode_actif:-inconnu}"
+            for c in /Applications/Xcode_*.app \
+                     /Library/Developer/CoreSimulator/Profiles/Runtimes \
+                     ~/Library/Developer/CoreSimulator \
+                     ~/Library/Developer/Xcode/DerivedData \
+                     ~/Library/Android; do
+              [ -e "$c" ] || continue
+              [ "$c" = "$xcode_actif" ] && { echo "  garde (actif) : $c"; continue; }
+              echo "  supprime : $c"
+              sudo rm -rf "$c" || true
+            done
+            libre=$(df -g / | awk 'NR==2 {print $4}')
+            echo "Espace libre apres : ${libre} Gi"
+          fi
           if [ "$libre" -lt 15 ]; then
             echo "::warning::moins de 15 Gi libres avant hdiutil — la creation du DMG risque d'echouer"
             df -h /
@@ -763,8 +797,23 @@ jobs:
             echo "::error::hdiutil create a echoue 3 fois — DMG non produit (voir l'espace disque ci-dessus)"
             exit 1
           fi
+          # C'est CE codesign qui a bloque la v0.9.123 : 36 minutes de silence
+          # entre `created: …dmg` et l'annulation du job. Il joint les serveurs
+          # d'Apple et n'a ni borne ni reprise, contrairement a celui de
+          # `Package (unix)`. On lui donne les deux.
           if [ -n "$APPLE_TEAM_ID" ]; then
-            codesign --force --sign "$IDENTITY" "$DMG_NAME"
+            signe=""
+            for i in 1 2 3 4 5; do
+              if avec_borne 180 codesign --force --sign "$IDENTITY" "$DMG_NAME"; then
+                signe="oui"; break
+              fi
+              echo "::warning::codesign du DMG a echoue ou depasse 180 s (essai $i/5) — nouvelle tentative dans $((i * 20)) s"
+              sleep $((i * 20))
+            done
+            if [ -z "$signe" ]; then
+              echo "::error::codesign du DMG a echoue 5 fois — serveurs Apple injoignables"
+              exit 1
+            fi
           fi
 
       # Le .tar.gz macOS n'a RIEN à voir avec la notarisation : il n'est pas
