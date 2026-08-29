@@ -39,6 +39,8 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
+#[path = "radios_recherche_distinction.rs"]
+mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]
 mod radios_validation_url;
 #[path = "rbac.rs"]

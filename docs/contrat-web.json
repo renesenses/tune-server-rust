@@ -1936,6 +1936,23 @@
       ]
     },
     {
+      "route": "/radios/search",
+      "methode": "GET",
+      "type": "RechercheRadios",
+      "liste": false,
+      "champs_obligatoires": [
+        "statut",
+        "code",
+        "portee",
+        "count",
+        "items",
+        "message"
+      ],
+      "champs_optionnels": [
+        "detail"
+      ]
+    },
+    {
       "route": "/radios{}",
       "methode": "GET",
       "type": "RadioStation",

@@ -255,6 +255,113 @@ struct SearchQuery {
     q: String,
 }
 
+// ---------------------------------------------------------------------------
+// Ce qu'a donné une recherche de station — et pourquoi la question se pose
+// ---------------------------------------------------------------------------
+
+/// Les trois issues d'une recherche dans le catalogue de stations.
+///
+/// La route rendait `Json(json!(repo.search(&q.q).unwrap_or_default()))` : un
+/// `[]` disait à la fois « aucune station de ce nom » et « la requête n'a pas
+/// abouti », puisque le `unwrap_or_default()` avalait l'erreur du dépôt. Deux
+/// situations, deux suites à donner, un seul corps de réponse pour les porter.
+///
+/// Ce n'est pas une hypothèse : le 21/08/2026 (fil forum 1506), Belkadi Yacine
+/// cherche « radio paradise », obtient une liste vide et ouvre un ticket
+/// « radio paradise ne fonctionne pas » ; Bilou, qui a la station dans SON
+/// catalogue pour l'y avoir mise, répond « fonctionne parfaitement chez moi ».
+/// Aucun des deux n'a tort, et rien à l'écran ne les départage (#2119).
+///
+/// Chaque variante porte un code stable — l'appelant programme contre le code,
+/// pas contre la prose — et un message traduit, dans la langue de l'interface,
+/// selon le même contrat que [`ProblemeUrlFlux`] plus haut dans ce fichier.
+///
+/// **Portée.** La recherche n'interroge que le catalogue LOCAL ; c'est un
+/// relevé, pas un choix pris ici. La réponse le dit désormais (`portee`), pour
+/// qu'« absente de ce Tune » ne se lise plus « inexistante ».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssueRecherche {
+    /// Le catalogue local connaît au moins une station correspondante.
+    Resultats,
+    /// Le catalogue local a répondu, et ne connaît aucune station de ce nom.
+    /// C'est un fait sur CE catalogue, pas sur la station.
+    Aucune,
+    /// La recherche n'a pas pu aboutir — dépôt injoignable, schéma absent,
+    /// requête refusée. On ne sait RIEN du catalogue, et surtout pas qu'il
+    /// serait vide.
+    Echec(String),
+}
+
+impl IssueRecherche {
+    /// Le statut porté par la réponse, lisible sans table de correspondance.
+    pub(crate) fn statut(&self) -> &'static str {
+        match self {
+            Self::Resultats => "resultats",
+            Self::Aucune => "aucun_resultat",
+            Self::Echec(_) => "echec",
+        }
+    }
+
+    /// Code stable, pour l'appelant qui programme contre l'API.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Resultats => "radio_recherche_resultats",
+            Self::Aucune => "radio_recherche_aucun_resultat",
+            Self::Echec(_) => "radio_recherche_echec",
+        }
+    }
+
+    /// Le statut HTTP : une recherche qui aboutit sur zéro station a réussi ;
+    /// une recherche qui n'aboutit pas est une panne, et doit se lire comme
+    /// telle même par un client qui ne regarde que le code de retour.
+    pub(crate) fn statut_http(&self) -> StatusCode {
+        match self {
+            Self::Resultats | Self::Aucune => StatusCode::OK,
+            Self::Echec(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Le message montré à l'utilisateur, ou `None` quand il y a des résultats
+    /// — la liste se suffit alors à elle-même.
+    pub(crate) fn message(&self, lang: &str) -> Option<String> {
+        match self {
+            Self::Resultats => None,
+            Self::Aucune => Some(crate::i18n::t(lang, "radio.recherche.aucunResultat")),
+            Self::Echec(_) => Some(crate::i18n::t(lang, "radio.recherche.echec")),
+        }
+    }
+}
+
+/// Le seul endroit interrogé par `/radios/search` aujourd'hui.
+///
+/// Nommé dans la réponse pour que « pas trouvé » soit qualifié. L'annuaire
+/// public de mozaiklabs.fr n'est joint qu'au démarrage, et seulement pour les
+/// logos ([`refresh_radio_logos`]) : l'étendre à la recherche est une décision
+/// produit, pas une omission de code (#2119).
+pub(crate) const PORTEE_RECHERCHE: &str = "catalogue_local";
+
+/// Le corps rendu par `/radios/search`, quelle que soit l'issue.
+///
+/// La forme ne change pas d'une issue à l'autre — `items` est toujours là,
+/// éventuellement vide — pour qu'un client n'ait pas à deviner la structure
+/// avant de savoir ce qui s'est passé.
+pub(crate) fn corps_recherche(issue: &IssueRecherche, items: &[RadioStation], lang: &str) -> Value {
+    let mut corps = json!({
+        "statut": issue.statut(),
+        "code": issue.code(),
+        "portee": PORTEE_RECHERCHE,
+        "count": items.len(),
+        "items": items,
+        "message": issue.message(lang),
+    });
+    if let IssueRecherche::Echec(detail) = issue {
+        // La cause technique, pour le journal et le rapport de bogue — jamais
+        // pour l'écran : le message traduit est là pour ça.
+        corps["detail"] = json!(detail);
+    }
+    corps
+}
+
 #[derive(Deserialize)]
 struct CreateRadio {
     name: String,
@@ -749,10 +856,34 @@ async fn play_radio(
     .into_response()
 }
 
-async fn search_radios(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
+/// Cherche une station dans le catalogue local, et DIT ce qui s'est passé.
+///
+/// Voir [`IssueRecherche`] pour le pourquoi : jusqu'ici, « aucune station de ce
+/// nom » et « la recherche a échoué » sortaient tous deux sous la forme d'un
+/// tableau vide (#2119).
+async fn search_radios(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Response {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.search(&q.q).unwrap_or_default();
-    Json(json!(items))
+    let (issue, items) = match repo.search(&q.q) {
+        Ok(items) if items.is_empty() => (IssueRecherche::Aucune, items),
+        Ok(items) => (IssueRecherche::Resultats, items),
+        Err(erreur) => {
+            // Tracé, parce qu'une recherche qui échoue en silence est
+            // exactement ce que ce correctif supprime côté client : elle ne
+            // doit pas non plus disparaître côté serveur.
+            tracing::warn!(query = %q.q, erreur = %erreur, "radio_search_failed");
+            (IssueRecherche::Echec(erreur), Vec::new())
+        }
+    };
+    (
+        issue.statut_http(),
+        Json(corps_recherche(&issue, &items, &lang)),
+    )
+        .into_response()
 }
 
 async fn list_favorites(State(state): State<AppState>) -> Json<Value> {

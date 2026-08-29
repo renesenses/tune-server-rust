@@ -186,6 +186,10 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ),
     ("/offline/status", "/api/v1/offline/status"),
     ("/onboarding/status", "/api/v1/onboarding/status"),
+    // La recherche de stations ne rend plus un tableau nu : son corps doit
+    // porter de quoi distinguer « aucune station de ce nom » d'une panne
+    // (#2119). `fip` touche le catalogue livré, donc l'issue « résultats ».
+    ("/radios/search", "/api/v1/radios/search?q=fip"),
     ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
     (
         "/streaming/youtube/auth/status",
@@ -210,7 +214,7 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
-async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
+async fn trente_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
