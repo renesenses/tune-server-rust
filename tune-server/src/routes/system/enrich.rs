@@ -387,52 +387,135 @@ fn now_utc_str() -> String {
 // POST /system/enrichment/run — trigger full enrichment run
 // ---------------------------------------------------------------------------
 
+/// Corps optionnel de `POST /system/enrichment/run`. Sans corps (ou sans
+/// `path`), la passe couvre toute la bibliothèque — contrat historique.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct EnrichmentRunBody {
+    /// Répertoire (sous une racine musicale) auquel limiter la passe (#1660).
+    pub(super) path: Option<String>,
+}
+
+/// Résout et valide le `path` demandé : normalisation, refus de toute
+/// composante `..`, et appartenance à une racine musicale configurée — même
+/// garde que le scan ciblé, mais en REFUS franc plutôt qu'en repli silencieux :
+/// ici un repli enrichirait toute la bibliothèque, exactement ce que
+/// l'utilisateur demandait d'éviter (#1660).
+fn resoudre_portee(
+    state: &AppState,
+    path: &str,
+) -> Result<tune_core::metadata::enrich_scope::EnrichScope, (StatusCode, Json<Value>)> {
+    let dir = tune_core::scanner::walker::normalize_path(path);
+    if dir.is_empty() || dir.split(['/', '\\']).any(|c| c == "..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_path", "path": path })),
+        ));
+    }
+    let music_dirs: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !music_dirs
+        .iter()
+        .any(|root| super::scan::sous_le_dossier(&dir, root))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "path_outside_music_dirs",
+                "path": dir,
+                "music_dirs": music_dirs,
+            })),
+        ));
+    }
+    Ok(tune_core::metadata::enrich_scope::EnrichScope::from_directory(&state.backend, &dir))
+}
+
 pub(super) async fn enrichment_run(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<EnrichmentRunBody>>,
 ) -> impl IntoResponse {
     let bio_lang = crate::i18n::lang_from_header(&headers);
+
+    // Portée par répertoire (#1660) — validée AVANT le gate de quota : un
+    // chemin invalide ne consomme rien.
+    let scope = match body
+        .and_then(|Json(b)| b.path)
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some(p) => match resoudre_portee(&state, &p) {
+            Ok(s) => Some(s),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+
     let is_premium = match gate_enrichment(&state).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
 
-    // Record the run timestamp
+    // Record the run timestamp — passe COMPLÈTE seulement : une passe limitée
+    // à un répertoire ne doit pas faire dire au panneau Métadonnées que toute
+    // la bibliothèque vient d'être traitée.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let now = now_utc_str();
-    settings.set("enrichment_last_run", &now).ok();
+    if scope.is_none() {
+        let now = now_utc_str();
+        settings.set("enrichment_last_run", &now).ok();
+    }
 
     // 1. Artwork enrichment
     let db1 = state.backend.clone();
     let cache_dir = crate::routes::library::artwork_cache_dir();
     let cache_dir2 = cache_dir.clone();
+    let scope1 = scope.clone();
     tokio::spawn(async move {
-        tune_core::library::artwork::batch_enrich_artwork(db1, cache_dir).await;
+        tune_core::library::artwork::batch_enrich_artwork_scoped(db1, cache_dir, scope1).await;
     });
 
     // 2. Artist MBID matching + artist artwork
     let mbid_db = state.backend.clone();
     let art_db = state.backend.clone();
     let art_cache = cache_dir2.clone();
+    let scope_mbid = scope.clone();
+    let scope_art = scope.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tune_core::metadata::matcher::batch_match_artist_mbids(mbid_db).await;
+        tune_core::metadata::matcher::batch_match_artist_mbids_scoped(mbid_db, scope_mbid).await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        tune_core::library::artwork::batch_enrich_artist_artwork(art_db, art_cache).await;
+        tune_core::library::artwork::batch_enrich_artist_artwork_scoped(
+            art_db, art_cache, scope_art,
+        )
+        .await;
     });
 
     // 3. Bio enrichment
     let bio_artist_db = state.backend.clone();
     let bio_album_db = state.backend.clone();
+    let scope_bio_artist = scope.clone();
+    let scope_bio_album = scope.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-        tune_core::metadata::bio_batch::batch_enrich_artist_bios(bio_artist_db, &bio_lang).await;
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios_scoped(
+            bio_artist_db,
+            &bio_lang,
+            scope_bio_artist,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tune_core::metadata::bio_batch::batch_enrich_album_bios(bio_album_db, &bio_lang).await;
+        tune_core::metadata::bio_batch::batch_enrich_album_bios_scoped(
+            bio_album_db,
+            &bio_lang,
+            scope_bio_album,
+        )
+        .await;
     });
 
     // 4. Extended file metadata
     let ext_db = state.backend.clone();
+    let scope_ext = scope.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let meta_repo =
@@ -447,6 +530,14 @@ pub(super) async fn enrichment_run(
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
                 let path = cols.get(1)?.as_string()?;
+                // Portée par répertoire (#1660) : les pistes hors du
+                // répertoire demandé ne sont pas candidates.
+                if scope_ext
+                    .as_ref()
+                    .is_some_and(|s| !s.contient_chemin(&path))
+                {
+                    return None;
+                }
                 Some((id, path))
             })
             .collect();
@@ -492,6 +583,11 @@ pub(super) async fn enrichment_run(
             "status": "enrichment_run_started",
             "premium": is_premium,
             "scope": if is_premium { "full_library" } else { "limited" },
+            // Portée par répertoire (#1660) — null quand la passe est complète.
+            "directory": scope.as_ref().map(|s| s.dir.clone()),
+            "directory_tracks": scope.as_ref().map(|s| s.track_count),
+            "directory_albums": scope.as_ref().map(|s| s.album_ids.len()),
+            "directory_artists": scope.as_ref().map(|s| s.artist_ids.len()),
         })),
     )
 }

@@ -430,14 +430,35 @@ pub async fn batch_enrich_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
 ) {
+    batch_enrich_artwork_scoped(db, cache_dir, None).await
+}
+
+/// Variante à portée (#1660) : ne retient comme candidats que les albums de la
+/// portée. `None` = passe complète, strictement identique à l'historique. Le
+/// filtre ne touche QUE la sélection — le reste de la passe est le même code.
+pub async fn batch_enrich_artwork_scoped(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+) {
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
-    let albums = match album_repo.list_without_cover() {
+    let mut albums = match album_repo.list_without_cover() {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artwork_list_failed");
             return;
         }
     };
+    if let Some(scope) = &scope {
+        let avant = albums.len();
+        albums.retain(|(id, ..)| scope.contient_album(*id));
+        info!(
+            dir = %scope.dir,
+            retained = albums.len(),
+            dropped = avant - albums.len(),
+            "batch_artwork_scope_applied"
+        );
+    }
 
     if albums.is_empty() {
         info!("batch_artwork_skip_all_have_covers");
@@ -1033,7 +1054,17 @@ pub async fn batch_enrich_artist_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
 ) {
-    batch_enrich_artist_artwork_inner(db, cache_dir, false).await
+    batch_enrich_artist_artwork_inner(db, cache_dir, false, None).await
+}
+
+/// Variante à portée (#1660) : seuls les artistes de la portée sont candidats
+/// (phases communautaire ET sources externes). `None` = passe complète.
+pub async fn batch_enrich_artist_artwork_scoped(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+) {
+    batch_enrich_artist_artwork_inner(db, cache_dir, false, scope).await
 }
 
 /// Force variant: re-fetch artwork for EVERY artist with an MBID, ignoring the
@@ -1044,13 +1075,14 @@ pub async fn batch_refetch_artist_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
 ) {
-    batch_enrich_artist_artwork_inner(db, cache_dir, true).await
+    batch_enrich_artist_artwork_inner(db, cache_dir, true, None).await
 }
 
 async fn batch_enrich_artist_artwork_inner(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
     force: bool,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
 ) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
     // Snapshot the global rate-limit counter so the result can report how many
@@ -1083,6 +1115,14 @@ async fn batch_enrich_artist_artwork_inner(
                     Some(id) => id,
                     None => continue,
                 };
+                // Portée par répertoire (#1660) : la passe communautaire ne
+                // pose rien sur un artiste hors du répertoire demandé.
+                if scope
+                    .as_ref()
+                    .is_some_and(|s| !s.contient_artiste(artist_id))
+                {
+                    continue;
+                }
                 let client = crate::http::client::builder()
                     .user_agent(MB_USER_AGENT)
                     .timeout(std::time::Duration::from_secs(15))
@@ -1190,6 +1230,20 @@ async fn batch_enrich_artist_artwork_inner(
         if added_no_mbid > 0 {
             info!(added_no_mbid, "batch_artist_artwork_no_mbid_included");
         }
+    }
+
+    // Portée par répertoire (#1660) : l'intersection se fait APRÈS toutes les
+    // additions ci-dessus (requeues cache manquant, sans-MBID), pour que la
+    // portée s'applique à la sélection complète des candidats.
+    if let Some(scope) = &scope {
+        let avant = artists.len();
+        artists.retain(|(id, ..)| scope.contient_artiste(*id));
+        info!(
+            dir = %scope.dir,
+            retained = artists.len(),
+            dropped = avant - artists.len(),
+            "batch_artist_artwork_scope_applied"
+        );
     }
 
     if artists.is_empty() {
