@@ -267,21 +267,36 @@ pub(super) async fn album_tracks(
     // absente du JSON — ce qui laisse le contrat inchangé pour les clients qui
     // ne la connaissent pas.
     let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
-    let grouping = TrackMetadataRepo::with_backend(state.backend.clone())
+    let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
+    let grouping = meta_repo
         .get_key_for_tracks("grouping", &track_ids)
         .unwrap_or_default();
 
-    Json(json!(attach_grouping(items, &grouping)))
+    // Dynamic Range par piste (#1388) : le tag `DYNAMIC RANGE` est lu au scan
+    // (#1806, `track_metadata['dr_track']`) mais n'était ressorti par aucune
+    // liste de pistes — seul l'agrégat album sortait sur la fiche (#1809).
+    // Même clé de sortie `dynamic_range` que sur l'album, même contrat :
+    // absente quand la piste n'a pas de tag, présente pour DR0 qui est une
+    // vraie mesure (celle d'un master saturé).
+    let dynamic_range = meta_repo
+        .get_key_for_tracks("dr_track", &track_ids)
+        .unwrap_or_default();
+
+    Json(json!(attach_track_tags(
+        items,
+        &[("grouping", &grouping), ("dynamic_range", &dynamic_range)]
+    )))
 }
 
-/// Recopie le tag GROUPING sur les pistes sérialisées d'un album.
+/// Recopie des tags étendus (`track_metadata`) sur les pistes sérialisées
+/// d'un album : GROUPING (#2130) et Dynamic Range (#1388).
 ///
-/// La clé n'est ajoutée que pour les pistes qui en portent réellement une
+/// Une clé n'est ajoutée que pour les pistes qui en portent réellement une
 /// (`get_key_for_tracks` a déjà écarté les valeurs vides) : une piste sans
-/// GROUPING sort exactement comme avant, sans champ supplémentaire.
-fn attach_grouping(
+/// tag sort exactement comme avant, sans champ supplémentaire.
+fn attach_track_tags(
     items: Vec<tune_core::db::models::Track>,
-    grouping: &std::collections::HashMap<i64, String>,
+    tags: &[(&str, &std::collections::HashMap<i64, String>)],
 ) -> Vec<Value> {
     items
         .into_iter()
@@ -289,8 +304,10 @@ fn attach_grouping(
             let track_id = t.id;
             let mut v = serde_json::to_value(&t).unwrap_or_default();
             if let (Some(track_id), Some(obj)) = (track_id, v.as_object_mut()) {
-                if let Some(g) = grouping.get(&track_id) {
-                    obj.insert("grouping".into(), json!(g));
+                for (key, map) in tags {
+                    if let Some(val) = map.get(&track_id) {
+                        obj.insert((*key).into(), json!(val));
+                    }
                 }
             }
             v
@@ -930,7 +947,7 @@ pub(super) async fn batch_update_albums(
 
 #[cfg(test)]
 mod tests_grouping {
-    use super::attach_grouping;
+    use super::attach_track_tags;
     use std::collections::HashMap;
     use tune_core::db::models::Track;
 
@@ -946,7 +963,7 @@ mod tests_grouping {
     #[test]
     fn attach_grouping_leaves_tracks_untouched_when_absent() {
         let items = vec![track(1, "I. Allegro"), track(2, "II. Adagio")];
-        let out = attach_grouping(items, &HashMap::new());
+        let out = attach_track_tags(items, &[("grouping", &HashMap::new())]);
         assert_eq!(out.len(), 2);
         for v in &out {
             assert!(
@@ -963,7 +980,7 @@ mod tests_grouping {
         let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
         let mut map = HashMap::new();
         map.insert(2i64, "Titres bonus".to_string());
-        let out = attach_grouping(items, &map);
+        let out = attach_track_tags(items, &[("grouping", &map)]);
         assert!(out[0].get("grouping").is_none());
         assert_eq!(out[1]["grouping"], "Titres bonus");
     }
@@ -974,7 +991,41 @@ mod tests_grouping {
         let items = vec![track(1, "I. Allegro")];
         let mut map = HashMap::new();
         map.insert(99i64, "Autre album".to_string());
-        let out = attach_grouping(items, &map);
+        let out = attach_track_tags(items, &[("grouping", &map)]);
         assert!(out[0].get("grouping").is_none());
+    }
+
+    /// DR par piste (#1388) : la valeur ressort sous `dynamic_range` sur la
+    /// bonne piste, et une piste taguée DR0 la garde — c'est une vraie mesure,
+    /// celle d'un master saturé, pas une absence.
+    #[test]
+    fn attach_dynamic_range_reports_value_and_keeps_dr0() {
+        let items = vec![track(1, "Loud"), track(2, "Untagged"), track(3, "Quiet")];
+        let mut dr = HashMap::new();
+        dr.insert(1i64, "0".to_string());
+        dr.insert(3i64, "14".to_string());
+        let out = attach_track_tags(items, &[("dynamic_range", &dr)]);
+        assert_eq!(out[0]["dynamic_range"], "0");
+        assert!(
+            out[1].get("dynamic_range").is_none(),
+            "une piste sans tag DR sort sans la clé, pas avec null"
+        );
+        assert_eq!(out[2]["dynamic_range"], "14");
+    }
+
+    /// GROUPING et DR cohabitent sans se contaminer : chaque clé n'apparaît
+    /// que sur les pistes qui la portent.
+    #[test]
+    fn attach_track_tags_keeps_keys_independent() {
+        let items = vec![track(1, "I. Allegro"), track(2, "Bonus")];
+        let mut grouping = HashMap::new();
+        grouping.insert(1i64, "Sonates".to_string());
+        let mut dr = HashMap::new();
+        dr.insert(2i64, "11".to_string());
+        let out = attach_track_tags(items, &[("grouping", &grouping), ("dynamic_range", &dr)]);
+        assert_eq!(out[0]["grouping"], "Sonates");
+        assert!(out[0].get("dynamic_range").is_none());
+        assert!(out[1].get("grouping").is_none());
+        assert_eq!(out[1]["dynamic_range"], "11");
     }
 }
