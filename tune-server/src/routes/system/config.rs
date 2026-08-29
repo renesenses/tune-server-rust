@@ -173,6 +173,35 @@ pub(super) async fn get_config(
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
+    // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
+    // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
+    // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
+    // serveur, pour que l'interface la lise au lieu de deviner.
+    //
+    // Repli propre : une valeur Windows persistée (bibliothèque migrée d'une
+    // machine Windows vers Linux) est ramenée à `auto` dans la RÉPONSE — pas
+    // en base : `select_host` joue déjà via le host par défaut pour toute
+    // valeur inconnue, l'affichage doit dire la même chose au lieu de laisser
+    // le sélecteur sur un choix qui n'existe plus.
+    #[cfg(feature = "local-audio")]
+    {
+        let persisted_supported = config
+            .get("local_audio_backend")
+            .and_then(|v| v.as_str())
+            .is_none_or(tune_core::outputs::local::backend_value_is_supported);
+        if !persisted_supported {
+            config.insert("local_audio_backend".to_string(), json!("auto"));
+        }
+        config.insert(
+            "supported_audio_backends".to_string(),
+            serde_json::to_value(tune_core::outputs::local::supported_backends())
+                .unwrap_or_else(|_| json!([])),
+        );
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        config.insert("supported_audio_backends".to_string(), json!([]));
+    }
     config
         .entry("server_version".to_string())
         .or_insert(json!(tune_core::version()));
