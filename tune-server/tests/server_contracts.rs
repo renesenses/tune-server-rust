@@ -55,6 +55,8 @@ mod smb_dialect_seam;
 mod support_relais_marquer_lu;
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
+#[path = "tranches_dynamic_range.rs"]
+mod tranches_dynamic_range;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "web_response_contracts.rs"]
