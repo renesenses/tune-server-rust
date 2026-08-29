@@ -362,13 +362,12 @@ pub(crate) fn roots_gone_empty(
 /// fait `replace('/', "\\")` sous `cfg(windows)`, et `track_repo.rs` le dit —
 /// « the server's `MAIN_SEPARATOR` is the separator stored in
 /// `tracks.file_path` », avec l'exemple `G:\Blues 2\%`.
+///
+/// L'implémentation vit désormais dans `tune_core::metadata::enrich_scope` :
+/// l'enrichissement par répertoire (#1660) a besoin du MÊME contrat, et deux
+/// copies de ce prédicat ont déjà divergé trois fois sur le séparateur (#2016).
 pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
-    let d = dossier.trim_end_matches(['/', '\\']);
-    if path == d {
-        return true;
-    }
-    path.strip_prefix(d)
-        .is_some_and(|reste| reste.starts_with('/') || reste.starts_with('\\'))
+    tune_core::metadata::enrich_scope::sous_le_dossier(path, dossier)
 }
 
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du

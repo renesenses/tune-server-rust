@@ -468,15 +468,35 @@ pub async fn batch_enrich_artist_bios(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     lang: &str,
 ) {
+    batch_enrich_artist_bios_scoped(db, lang, None).await
+}
+
+/// Variante à portée (#1660) : seuls les artistes du répertoire demandé sont
+/// candidats. `None` = passe complète, code identique.
+pub async fn batch_enrich_artist_bios_scoped(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    lang: &str,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+) {
     let lang = if lang.is_empty() { "fr" } else { lang };
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
-    let artists = match artist_repo.list_without_bio() {
+    let mut artists = match artist_repo.list_without_bio() {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artist_bio_list_failed");
             return;
         }
     };
+    if let Some(scope) = &scope {
+        let avant = artists.len();
+        artists.retain(|(id, ..)| scope.contient_artiste(*id));
+        info!(
+            dir = %scope.dir,
+            retained = artists.len(),
+            dropped = avant - artists.len(),
+            "batch_artist_bio_scope_applied"
+        );
+    }
 
     if artists.is_empty() {
         info!("batch_artist_bio_skip_all_have_bios");
@@ -568,15 +588,35 @@ pub async fn batch_enrich_album_bios(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     lang: &str,
 ) {
+    batch_enrich_album_bios_scoped(db, lang, None).await
+}
+
+/// Variante à portée (#1660) : seuls les albums du répertoire demandé sont
+/// candidats. `None` = passe complète, code identique.
+pub async fn batch_enrich_album_bios_scoped(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    lang: &str,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+) {
     let lang = if lang.is_empty() { "fr" } else { lang };
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
-    let albums = match album_repo.list_without_bio() {
+    let mut albums = match album_repo.list_without_bio() {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_album_bio_list_failed");
             return;
         }
     };
+    if let Some(scope) = &scope {
+        let avant = albums.len();
+        albums.retain(|(id, ..)| scope.contient_album(*id));
+        info!(
+            dir = %scope.dir,
+            retained = albums.len(),
+            dropped = avant - albums.len(),
+            "batch_album_bio_scope_applied"
+        );
+    }
 
     if albums.is_empty() {
         info!("batch_album_bio_skip_all_have_bios");
