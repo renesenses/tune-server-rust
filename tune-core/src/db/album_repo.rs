@@ -11,10 +11,10 @@ pub mod sql {
     use super::SqlDialect;
 
     /// ⚠️ L'ordre des colonnes EST le contrat de [`super::row_to_album`], qui
-    /// lit par index. `is_compilation` est en 24 et `added_at` — injecté par
-    /// `list_filtered` juste avant `FROM albums a` — se retrouve en 25 : toute
-    /// colonne ajoutée ici doit l'être AVANT `FROM`, et `row_to_album` mis à
-    /// jour dans le même mouvement.
+    /// lit par index. `is_compilation` est en 24 ; une éventuelle colonne 25
+    /// (`added_at`) reste tolérée par `row_to_album` : toute colonne ajoutée
+    /// ici doit l'être AVANT `FROM`, et `row_to_album` mis à jour dans le
+    /// même mouvement.
     pub fn select_album() -> &'static str {
         "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres, a.is_compilation FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
     }
@@ -1327,6 +1327,26 @@ impl AlbumRepo {
         self.list_filtered(limit, offset, sort, order, None, None, None, true)
     }
 
+    /// Date d'ajout de CHAQUE album, calculée en UNE passe sur `tracks` (jointure
+    /// groupée) et exposée sous l'alias `aa.added_at` (#1269).
+    ///
+    /// Type de la valeur : `file_first_seen.first_seen_at` is DOUBLE, but the
+    /// type of `tracks.file_mtime` on Postgres depends on the install vintage:
+    /// TEXT on some installs (bug #550 fixed that case), DOUBLE PRECISION on
+    /// others (.15) — schema drift between PG installs. A bare
+    /// COALESCE(double, text) is a hard error on the TEXT installs, and
+    /// NULLIF(double_col, '') is a hard error at *parse/analyze* time on the
+    /// DOUBLE installs ("invalid input syntax for type double precision"),
+    /// which made the sort return no albums on .15 (empty library → "black
+    /// screen" on the clients) — and added_at is the handler's default sort,
+    /// so every list was empty. Cast the column to TEXT first so the
+    /// expression is valid whichever type the column has; NULLIF guards
+    /// against empty strings. Valid on SQLite too (soft affinities).
+    pub(crate) const ADDED_AT_JOIN: &'static str = "LEFT JOIN (SELECT t.album_id, \
+                MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
+           FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
+           GROUP BY t.album_id) aa ON aa.album_id = a.id";
+
     #[allow(clippy::too_many_arguments)]
     pub fn list_filtered(
         &self,
@@ -1384,25 +1404,9 @@ impl AlbumRepo {
             // which only *looks* correct for the most-recently-added albums (their
             // ids happen to be the highest), hence the "only the first few albums
             // are sorted" report (Bilou, #1102).
-            "added_at" | "added_date" => format!(
-                // file_first_seen.first_seen_at is DOUBLE, but the type of
-                // tracks.file_mtime on Postgres depends on the install vintage:
-                // TEXT on some installs (bug #550 fixed that case), DOUBLE
-                // PRECISION on others (.15) — schema drift between PG installs.
-                // A bare COALESCE(double, text) is a hard error on the TEXT
-                // installs, and NULLIF(double_col, '') is a hard error at
-                // *parse/analyze* time on the DOUBLE installs ("invalid input
-                // syntax for type double precision"), which made the sort
-                // return no albums on .15 (empty library → "black screen" on
-                // the clients) — and added_at is the handler's default sort,
-                // so every list was empty. Cast the column to TEXT first so
-                // the expression is valid whichever type the column has;
-                // NULLIF guards against empty strings. Valid on SQLite too
-                // (soft affinities).
-                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) \
-                  FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
-                  WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
-            ),
+            // The timestamp itself comes from `ADDED_AT_JOIN`, computed ONCE
+            // for the whole page — see the comment on that constant (#1269).
+            "added_at" | "added_date" => format!("aa.added_at {dir} NULLS LAST, a.id {dir}"),
             _ => format!("a.id {dir}"),
         };
 
@@ -1463,20 +1467,32 @@ impl AlbumRepo {
         next_ph += 1;
         let offset_ph = make_ph(next_ph);
 
-        // Expose the added-at timestamp as a 25th column when sorting by it,
-        // so the client can render a chronological scrubber. Same expression
-        // as the ORDER BY — the planner evaluates the correlated subquery once.
-        let base_select = if matches!(sort, "added_at" | "added_date") {
-            sql::select_album().replacen(
-                " FROM albums a",
-                ", (SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))                    FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path                    WHERE t.album_id = a.id) AS added_at FROM albums a",
-                1,
+        // #1269 — deux temps, parce qu'une seule requête triait des lignes
+        // COMPLÈTES : 45 000 albums × 25 colonnes (dont `bio`, plusieurs Ko
+        // sur une bibliothèque enrichie) traversaient le trieur À CHAQUE page,
+        // et le tri par défaut (`added_at`) y ajoutait une sous-requête
+        // corrélée ré-évaluée par ligne. Les clients iOS/macOS chargent tout
+        // par pages de 2000 avec 15 s de timeout par requête : sur la
+        // bibliothèque de Megalo (~45 000 albums), la grille restait à
+        // 0 album (forum p.16).
+        //
+        // 1er temps : trier des lignes ÉTROITES — a.id et la clé de tri
+        // seulement — et borner en SQL (LIMIT/OFFSET).
+        let added_at_sort = matches!(sort, "added_at" | "added_date");
+        let id_select = if added_at_sort {
+            // `aa.added_at` vient de la jointure groupée `ADDED_AT_JOIN` —
+            // une seule passe sur tracks/file_first_seen, exposée en 2e
+            // colonne pour que le client puisse rendre sa frise chronologique.
+            format!(
+                "SELECT a.id, aa.added_at FROM albums a \
+                 LEFT JOIN artists ar ON a.artist_id = ar.id {}",
+                Self::ADDED_AT_JOIN
             )
         } else {
-            sql::select_album().to_string()
+            "SELECT a.id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id".to_string()
         };
         let sql = format!(
-            "{base_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
+            "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
         );
 
         bind_values.push(SqlValue::Int(limit));
@@ -1484,7 +1500,54 @@ impl AlbumRepo {
 
         let refs: Vec<&dyn ToSqlValue> = bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
         let rows = self.db.query_many(&sql, &refs)?;
-        Ok(rows.iter().map(row_to_album).collect())
+        let ordered_ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        let added_at_by_id: std::collections::HashMap<i64, f64> = if added_at_sort {
+            rows.iter()
+                .filter_map(|r| {
+                    Some((
+                        r.first().and_then(|v| v.as_i64())?,
+                        r.get(1).and_then(|v| v.as_f64())?,
+                    ))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        if ordered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2e temps : ne matérialiser QUE la page. Ids issus de la base (i64),
+        // inlinés sans placeholder — par tranches, pour rester sous la
+        // limite de longueur SQL de SQLite (1 Mo) même à `limit` géant.
+        let mut by_id: std::collections::HashMap<i64, Album> =
+            std::collections::HashMap::with_capacity(ordered_ids.len());
+        for chunk in ordered_ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("{} WHERE a.id IN ({id_list})", sql::select_album());
+            let rows = self.db.query_many(&sql, &[])?;
+            for row in &rows {
+                let album = row_to_album(row);
+                if let Some(id) = album.id {
+                    by_id.insert(id, album);
+                }
+            }
+        }
+        Ok(ordered_ids
+            .iter()
+            .filter_map(|id| {
+                let mut album = by_id.remove(id)?;
+                album.added_at = added_at_by_id.get(id).copied();
+                Some(album)
+            })
+            .collect())
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
@@ -1734,8 +1797,9 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
             .and_then(|v| v.as_i64())
             .map(|n| n != 0)
             .unwrap_or(false),
-        // Index 25: added_at — present only on the added-date sorted listing
-        // (list_filtered injects the column); None for every other query.
+        // Index 25: added_at — absent de la plupart des requêtes (None) ;
+        // le listing trié par date d'ajout le renseigne après coup, depuis
+        // sa première passe (#1269).
         added_at: cols.get(25).and_then(|v| v.as_f64()),
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
@@ -3530,5 +3594,128 @@ mod tests {
             .unwrap();
         assert_eq!(healed.id, created.id);
         assert_eq!(healed.artist_id, Some(real));
+    }
+
+    /// Semis en SQL brut par gros lots : les repos feraient des dizaines de
+    /// milliers de requêtes (#1269).
+    fn seed_grosse_bibliotheque(db: &SqliteDb, n_albums: usize, tracks_per_album: usize) {
+        // Une bio enrichie de ~2 Ko par album : c'est ce que transporte le
+        // tri quand la bibliothèque est passée par l'enrichissement.
+        let bio = "b".repeat(2000);
+        let mut sql = String::from("BEGIN;\n");
+        for i in 1..=1000usize {
+            sql.push_str(&format!(
+                "INSERT INTO artists (id, name) VALUES ({i}, 'artiste {i}');\n"
+            ));
+        }
+        db.execute_batch(&sql).unwrap();
+
+        let mut sql = String::with_capacity(1 << 24);
+        for a in 1..=n_albums {
+            let artist = a % 1000 + 1;
+            sql.push_str(&format!(
+                "INSERT INTO albums (id, title, artist_id, year, bio) VALUES ({a}, 'album {a}', {artist}, {}, '{bio}');\n",
+                1960 + (a % 60)
+            ));
+            if sql.len() > (1 << 22) {
+                db.execute_batch(&sql).unwrap();
+                sql.clear();
+            }
+        }
+        db.execute_batch(&sql).unwrap();
+
+        let mut sql = String::with_capacity(1 << 24);
+        let mut tid = 0usize;
+        for a in 1..=n_albums {
+            let artist = a % 1000 + 1;
+            for n in 1..=tracks_per_album {
+                tid += 1;
+                sql.push_str(&format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, track_number, file_path, file_mtime) \
+                     VALUES ({tid}, 'piste {n}', {a}, {artist}, {n}, '/musique/{a}/{n}.flac', {});\n",
+                    1_700_000_000.0 + (tid as f64)
+                ));
+                sql.push_str(&format!(
+                    "INSERT INTO file_first_seen (file_path, first_seen_at) \
+                     VALUES ('/musique/{a}/{n}.flac', {});\n",
+                    1_700_000_000.0 + ((n_albums - a) as f64)
+                ));
+            }
+            if sql.len() > (1 << 22) {
+                db.execute_batch(&sql).unwrap();
+                sql.clear();
+            }
+        }
+        sql.push_str("COMMIT;\n");
+        db.execute_batch(&sql).unwrap();
+    }
+
+    /// #1269 — contre-épreuve : une page du tri par défaut (`added_at`) doit
+    /// coûter du même ordre qu'une page du tri trivial (`id`), pas 8 fois
+    /// plus. Mesuré sur cette base (10 000 albums, bios de 2 Ko) : l'ancienne
+    /// forme — sous-requête corrélée ré-évaluée PAR LIGNE et lignes complètes
+    /// traînées dans le trieur à chaque page — coûtait 17,6× le tri trivial ;
+    /// la forme en deux temps (tri de lignes étroites, matérialisation de la
+    /// seule page) coûte 3,1×. Meilleure de 3 passes de chaque côté, pour
+    /// amortir le bruit d'une machine de CI chargée.
+    #[test]
+    fn le_tri_par_defaut_coute_comme_le_tri_trivial_1269() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        seed_grosse_bibliotheque(&db, 10_000, 2);
+
+        let chrono = |sort: &str| -> std::time::Duration {
+            (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let page = repo
+                        .list_filtered(2000, 6000, sort, "asc", None, None, None, true)
+                        .unwrap();
+                    assert_eq!(page.len(), 2000);
+                    t0.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+
+        let t_id = chrono("id");
+        let t_added = chrono("added_at");
+        eprintln!("contre-épreuve #1269 : id={t_id:?} added_at={t_added:?}");
+        assert!(
+            t_added < t_id.max(std::time::Duration::from_millis(5)) * 8,
+            "le tri added_at coûte {t_added:?} pour une page, contre {t_id:?} \
+             en tri id : la page re-trie ou re-scanne toute la bibliothèque (#1269)"
+        );
+    }
+
+    /// #1269 — mesure : bibliothèque de 45 000 albums, tri par défaut
+    /// (`added_at`). Lancé à la main (`--ignored --nocapture`), jamais en CI.
+    #[test]
+    #[ignore = "mesure #1269, lancement manuel"]
+    fn bench_added_at_45000_albums() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+
+        seed_grosse_bibliotheque(&db, 45_000, 4);
+
+        // Le client iOS charge TOUT par pages de 2000, tri par défaut.
+        for offset in [0i64, 22_000, 44_000] {
+            let t0 = std::time::Instant::now();
+            let page = repo
+                .list_filtered(2000, offset, "added_at", "asc", None, None, None, true)
+                .unwrap();
+            eprintln!(
+                "added_at offset={offset}: {} albums en {:?}",
+                page.len(),
+                t0.elapsed()
+            );
+            assert!(!page.is_empty());
+        }
+        // Témoin : tri bon marché (id), même volume.
+        let t0 = std::time::Instant::now();
+        let page = repo
+            .list_filtered(2000, 0, "id", "asc", None, None, None, true)
+            .unwrap();
+        eprintln!("id offset=0: {} albums en {:?}", page.len(), t0.elapsed());
     }
 }
