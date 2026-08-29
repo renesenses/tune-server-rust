@@ -657,6 +657,25 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
 /// seuils distincts, et Tune afficherait à la fois « aucun onglet ne reçoit le
 /// son » et une lecture en cours — c'est précisément le défaut signalé.
 const BROWSER_UNATTENDED_GRACE: std::time::Duration = tune_core::poller::DELAI_SILENCE_ETABLI;
+/// Combien de temps l'explication du silence survit à la lecture qui l'a
+/// produite.
+///
+/// `output_reach` décrit l'instant présent, et le bandeau qui le rend est le
+/// SEUL endroit où Tune dit pourquoi une zone navigateur ne sonne pas. Les
+/// deux ensemble s'annulaient : la valeur ne pouvait être
+/// `browser_unattended` qu'en lecture, or la lecture cesse exactement quand
+/// le défaut se manifeste — l'utilisateur arrête une zone muette, ou le
+/// poller l'abandonne au même seuil (`DELAI_SILENCE_ETABLI`, #2630). Le
+/// message s'effaçait au geste qu'il était censé prévenir : Pierre M l'a vu
+/// passer, n'a pas pu le relire, et l'a rapporté de travers — ce contresens
+/// a détourné l'instruction de #2571 pendant plusieurs échanges (#2588).
+///
+/// Deux minutes : de quoi lire deux phrases, aller chercher l'onglet nommé
+/// par le message, et le retrouver encore affiché en revenant. Borné dans
+/// l'autre sens pour qu'une zone laissée tranquille cesse d'accuser un onglet
+/// dont plus personne ne se soucie. Toute nouvelle lecture l'efface avant
+/// l'échéance : la question est rouverte, la réponse d'avant ne vaut plus.
+const BROWSER_UNATTENDED_RETENTION: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Où va réellement le son de cette zone, dit au client.
 ///
@@ -726,7 +745,26 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
     } else {
         false
     };
-    output_reach_of(zone, ps, pulled)
+    let reach = output_reach_of(zone, ps, pulled);
+    // Le serveur ne dit pas `browser_unattended` à un client sans en garder
+    // trace : c'est cette trace, et elle seule, qui permet au bandeau de
+    // survivre à l'arrêt de la lecture (#2588). Rafraîchie tant que le
+    // silence dure, levée dès que l'onglet tire enfin le flux. Écriture
+    // réservée à la zone navigateur EN LECTURE — le cas anormal — pour ne
+    // rien changer au coût de la liste des zones.
+    if let Some(zone_id) = zone.id
+        && zone.output_type.as_deref() == Some("browser")
+        && matches!(ps.state, PlayState::Playing)
+    {
+        let constate = reach == "browser_unattended";
+        if constate || ps.browser_unattended_at.is_some() {
+            state
+                .playback
+                .note_browser_unattended(zone_id, constate)
+                .await;
+        }
+    }
+    reach
 }
 
 /// La décision seule, sans I/O — c'est elle que les tests couvrent.
@@ -742,7 +780,18 @@ fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> 
     // Zone navigateur : la sortie, c'est l'onglet. On ne peut pas la
     // découvrir, seulement constater qu'elle consomme — ou non.
     if !matches!(ps.state, PlayState::Playing) {
-        return "ok";
+        // La lecture a cessé, mais pas forcément la question. Si le silence a
+        // été CONSTATÉ pendant cette lecture, on continue de le dire un temps
+        // borné : sans cela l'explication disparaissait à l'instant même de
+        // l'arrêt — celui où l'utilisateur réagit à l'absence de son (#2588).
+        return if ps
+            .browser_unattended_at
+            .is_some_and(|t| t.elapsed() < BROWSER_UNATTENDED_RETENTION)
+        {
+            "browser_unattended"
+        } else {
+            "ok"
+        };
     }
     // `last_play_started_at` est `#[serde(skip)]` : après une restauration
     // d'état il vaut `None`, et on ne conclut rien. Le sens du défaut est le
@@ -4524,6 +4573,62 @@ mod output_reach_tests {
         );
     }
 
+    /// #2588 — l'explication du silence survit à l'arrêt qui la provoquait.
+    ///
+    /// C'est LE défaut du ticket : le bandeau « aucun onglet ne reçoit le
+    /// son » est le seul endroit où Tune explique le silence d'une zone
+    /// navigateur, et il disparaissait à l'instant même où l'utilisateur
+    /// arrêtait la zone — c'est-à-dire au moment exact où il réagissait à
+    /// l'absence de son. Pierre M l'a vu passer sans pouvoir le relire.
+    #[test]
+    fn le_constat_de_silence_survit_a_larret() {
+        let zone = zone_with(Some("browser"), None);
+        let mut ps = browser_playing_since(Duration::from_secs(60));
+        ps.state = PlayState::Stopped;
+        ps.browser_unattended_at = Some(Instant::now());
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "browser_unattended",
+            "arrêtée juste après le constat, la zone doit encore dire pourquoi"
+        );
+    }
+    /// La rétention est bornée : une zone laissée tranquille cesse d'accuser.
+    #[test]
+    fn le_constat_de_silence_finit_par_se_taire() {
+        let zone = zone_with(Some("browser"), None);
+        let mut ps = browser_playing_since(Duration::from_secs(60));
+        ps.state = PlayState::Stopped;
+        ps.browser_unattended_at =
+            Instant::now().checked_sub(BROWSER_UNATTENDED_RETENTION + Duration::from_secs(1));
+        assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    }
+    /// Une zone à l'arrêt qui n'a jamais rien eu à expliquer se tait.
+    ///
+    /// Contre-épreuve de la précédente : sans ce cas, un `return
+    /// "browser_unattended"` inconditionnel passerait les deux autres.
+    #[test]
+    fn zone_a_larret_sans_constat_ne_dit_rien() {
+        let zone = zone_with(Some("browser"), None);
+        let mut ps = browser_playing_since(Duration::from_secs(60));
+        ps.state = PlayState::Stopped;
+        assert_eq!(
+            output_reach_of(&zone, &ps, false),
+            "ok",
+            "aucun silence constaté : rien à dire"
+        );
+    }
+    /// Le constat ne doit pas survivre à une lecture qui, elle, est reçue.
+    ///
+    /// `play()` efface la marque, et la vue la lève dès que l'onglet tire le
+    /// flux. Tant que la zone joue, c'est la consommation qui tranche — la
+    /// marque d'hier n'a pas voix au chapitre.
+    #[test]
+    fn une_lecture_recue_ignore_le_constat_precedent() {
+        let zone = zone_with(Some("browser"), None);
+        let mut ps = browser_playing_since(Duration::from_secs(60));
+        ps.browser_unattended_at = Some(Instant::now());
+        assert_eq!(output_reach_of(&zone, &ps, true), "ok");
+    }
     #[test]
     fn etat_restaure_ne_conclut_rien() {
         // `last_play_started_at` est `#[serde(skip)]` : après un redémarrage il
