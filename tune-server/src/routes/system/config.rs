@@ -246,6 +246,23 @@ pub(super) async fn get_config(
             .as_deref()
             .is_some_and(|s| !s.is_empty());
     config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
+    // Même contrat pour Radio France (#1026). L'écran Podcasts n'avait aucun
+    // moyen de savoir si la clé était posée : il APPELAIT
+    // /podcasts/radiofrance/shows et lisait le 400 « radiofrance_api_key not
+    // configured » comme réponse « non ». Une erreur serveur par ouverture de
+    // l'écran, sur toute machine sans clé — c'est-à-dire presque toutes. Le
+    // booléen dit la même chose sans échouer. Relu par le même chemin que
+    // `get_rf_api_key` (routes/podcasts.rs) pour que les deux ne divergent
+    // jamais : la clé vide compte pour absente.
+    let radiofrance_api_key_set = settings
+        .get("radiofrance_api_key")
+        .ok()
+        .flatten()
+        .is_some_and(|k| !k.is_empty());
+    config.insert(
+        "radiofrance_api_key_set".to_string(),
+        json!(radiofrance_api_key_set),
+    );
     // Appliance mode (Tune OS image): unlocks the host network settings UI.
     config.insert(
         "appliance".to_string(),
@@ -305,6 +322,10 @@ pub(super) async fn get_config(
     // license_key_masked and the streaming status store). Never expose them.
     config.remove("license_key");
     config.remove("discogs_token");
+    // La clé Radio France est un identifiant d'API, au même titre que le jeton
+    // Discogs : le dump verbatim ci-dessus la renvoyait en clair. Le client lit
+    // `radiofrance_api_key_set`, jamais la clé.
+    config.remove("radiofrance_api_key");
     if let Some(Value::Object(qobuz)) = config.get_mut("auth_tokens_qobuz") {
         for k in ["stored_password", "user_auth_token", "app_secret"] {
             if qobuz.contains_key(k) {

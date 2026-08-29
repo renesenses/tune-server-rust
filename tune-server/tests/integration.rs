@@ -914,6 +914,71 @@ async fn le_nom_annonce_aux_autres_serveurs_suit_le_nom_choisi() {
     );
 }
 
+// ── Radio France : déclarer la clé au lieu d'échouer (#1026) ──────
+// L'écran Podcasts n'avait qu'une façon d'apprendre l'absence de clé Radio
+// France : appeler /podcasts/radiofrance/shows et lire le 400
+// « radiofrance_api_key not configured » comme un « non ». Une erreur serveur
+// à chaque ouverture de l'écran, sur toute machine sans clé. /system/config
+// doit répondre à la question sans échouer — et sans jamais rendre la clé,
+// que le dump verbatim des réglages laissait sortir en clair.
+
+#[tokio::test]
+async fn la_configuration_declare_la_cle_radio_france_sans_la_livrer() {
+    let app = make_app();
+
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+    assert_eq!(
+        config
+            .get("radiofrance_api_key_set")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "sans clé, /system/config doit le DIRE : sans ce booléen l'écran \
+         Podcasts n'a que le 400 de /podcasts/radiofrance/shows pour l'apprendre"
+    );
+
+    // Le 400 existe bel et bien : c'est le sonder qui est fautif, pas la route.
+    let (status, _) = get(
+        &app,
+        "/api/v1/podcasts/radiofrance/shows?station=FRANCEINTER",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "sans clé la route Radio France refuse — c'est ce refus que le booléen \
+         doit rendre inutile à provoquer"
+    );
+
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "radiofrance_api_key": "cle-radio-france-1026" }),
+    )
+    .await;
+    assert!(status.is_success(), "écriture refusée : {status}");
+
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config
+            .get("radiofrance_api_key_set")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "clé posée : le booléen doit basculer, sinon la section Radio France \
+         reste masquée pour qui l'a configurée"
+    );
+    assert!(
+        config.get("radiofrance_api_key").is_none(),
+        "la clé Radio France ne doit jamais sortir de /system/config : \
+         c'est un identifiant d'API, au même titre que le jeton Discogs"
+    );
+    let rendu = serde_json::to_string(&config).unwrap();
+    assert!(
+        !rendu.contains("cle-radio-france-1026"),
+        "la clé apparaît quelque part dans la réponse : {rendu}"
+    );
+}
+
 // ── API JSON response guard tests ─────────────────────────────────
 // Prevents the bug class where API routes return HTML (web client
 // fallback) instead of JSON.
