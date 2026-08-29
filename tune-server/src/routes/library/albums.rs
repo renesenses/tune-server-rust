@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
-use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
@@ -35,6 +35,16 @@ pub(super) struct AlbumFilters {
     /// ou `false` : ils sont exclus — un client qui ignore le paramètre voit
     /// simplement l'album disparaître, sans rien changer chez lui.
     include_hidden: Option<bool>,
+    /// Tranche de Dynamic Range, bornes INCLUSES (#2144). Les deux sont
+    /// facultatives et indépendantes : `?dr_min=14` = « DR14 et au-dessus »,
+    /// `?dr_max=7` = « DR7 et en dessous », les deux = une tranche fermée.
+    /// Aucune des deux = aucun filtre, réponse identique à avant.
+    ///
+    /// Le serveur ne connaît PAS de tranches nommées : l'issue n'en fixe
+    /// aucune (voir `DrRange`). `GET /library/albums/filters` rend les valeurs
+    /// réellement présentes, à charge du client de dessiner ses pastilles.
+    dr_min: Option<i64>,
+    dr_max: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -69,12 +79,16 @@ pub(super) async fn list_albums(
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
     let include_hidden = p.include_hidden.unwrap_or(false);
+    let dr = DrRange::new(p.dr_min, p.dr_max);
     // Le total suit la même exclusion que la liste, sinon la grille pagine
-    // faux (#1391).
-    let total = if include_hidden {
-        repo.count().unwrap_or(0)
-    } else {
-        repo.count_visible().unwrap_or(0)
+    // faux (#1391) — et la même TRANCHE de DR, sinon elle pagine encore plus
+    // faux (#2144) : le tag DR n'existe que sur une poignée d'albums, un
+    // `total` de 45 000 sur une liste de douze donnerait des centaines de
+    // pages vides.
+    let total = match dr {
+        Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
+        None if include_hidden => repo.count().unwrap_or(0),
+        None => repo.count_visible().unwrap_or(0),
     };
     let items = match repo.list_filtered(
         limit,
@@ -85,6 +99,7 @@ pub(super) async fn list_albums(
         p.quality.as_deref(),
         p.compilation,
         include_hidden,
+        dr,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -258,8 +273,17 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.as_i64())
         .collect();
+    // Dynamic Range (#2144) : les valeurs RÉELLEMENT présentes, croissantes.
+    // C'est la matière des tranches, et la mesure que l'issue réclamait — un
+    // tableau vide dit qu'aucun album n'est tagué, et l'écran n'a alors aucune
+    // facette DR à proposer plutôt qu'une facette qui ne rendrait rien.
+    // La clé s'ajoute au JSON existant : un client qui l'ignore ne voit aucun
+    // changement.
+    let dynamic_ranges = AlbumRepo::with_backend(state.backend.clone())
+        .dynamic_range_values()
+        .unwrap_or_default();
     Ok(Json(
-        json!({ "formats": formats, "sample_rates": sample_rates }),
+        json!({ "formats": formats, "sample_rates": sample_rates, "dynamic_ranges": dynamic_ranges }),
     ))
 }
 

@@ -411,6 +411,43 @@ pub mod sql {
     }
 }
 
+/// Une tranche de Dynamic Range, bornes **incluses** (#2144).
+///
+/// # Pourquoi une tranche libre, et non une liste de tranches figées
+///
+/// L'issue ne fixe AUCUNE borne : MinimServer y est cité en modèle
+/// (« Minimserver permet ce tri de DR par range de DR », Patatorz, 15/08) mais
+/// ses bornes exactes n'ont jamais été relevées, et la couverture réelle des
+/// bibliothèques en tags DR n'a jamais été mesurée. Graver ici un découpage
+/// inventé le figerait dans le contrat HTTP, où il survivrait à la mesure qui
+/// le contredirait. Le serveur rend donc une tranche quelconque — tout
+/// découpage, y compris celui de MinimServer le jour où il sera relevé,
+/// s'exprime en `[min, max]` — et [`AlbumRepo::dynamic_range_values`] dit
+/// quelles valeurs existent vraiment pour que le client dessine ses pastilles
+/// sur des données, pas sur une hypothèse.
+///
+/// Une tranche est toujours RESTRICTIVE : un album sans tag DR n'en fait
+/// jamais partie, quelles que soient les bornes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrRange {
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+impl DrRange {
+    /// `None` quand aucune borne n'est donnée : **pas de filtre du tout**,
+    /// jamais un filtre qui laisserait tout passer ni un filtre vide (piège
+    /// n°1 de `facet_filter`). Une tranche à l'envers (`min > max`) est
+    /// conservée telle quelle et ne rend rien : c'est ce que l'appelant a
+    /// demandé, et le mentir en l'inversant cacherait un bug d'interface.
+    pub fn new(min: Option<i64>, max: Option<i64>) -> Option<Self> {
+        if min.is_none() && max.is_none() {
+            return None;
+        }
+        Some(Self { min, max })
+    }
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1324,7 +1361,7 @@ impl AlbumRepo {
         // MAINTENANCE (rattrapage de pochettes du scan, export complet), qui
         // doit voir toute la bibliothèque, masqués compris. La grille passe
         // par `list_filtered` et choisit.
-        self.list_filtered(limit, offset, sort, order, None, None, None, true)
+        self.list_filtered(limit, offset, sort, order, None, None, None, true, None)
     }
 
     /// Date d'ajout de CHAQUE album, calculée en UNE passe sur `tracks` (jointure
@@ -1347,6 +1384,138 @@ impl AlbumRepo {
            FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
            GROUP BY t.album_id) aa ON aa.album_id = a.id";
 
+    /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
+    /// passe, exposé sous l'alias `dr.dr` (#2144).
+    ///
+    /// Même forme que [`Self::ADDED_AT_JOIN`], et pour la même raison : une
+    /// sous-requête corrélée (`(SELECT … WHERE t.album_id = a.id)`) serait
+    /// ré-évaluée POUR CHAQUE LIGNE du tri, c'est-à-dire 45 000 fois sur la
+    /// bibliothèque de Megalo — exactement le coût que #1269 vient de retirer.
+    ///
+    /// Le tag vit en TEXT dans `track_metadata` (`dr_album`, écrit par le scan
+    /// depuis `ALBUM DYNAMIC RANGE`, #1806). `normalise_dr` retire déjà le
+    /// préfixe et les zéros de tête, mais il RECOPIE TEL QUEL tout ce qui n'est
+    /// pas une suite de chiffres (« DR12.5 », un commentaire, une valeur
+    /// tronquée) : sans garde, `CAST('DR12.5' AS INTEGER)` vaut 0 en SQLite —
+    /// un master saturé de plus, silencieusement — et **échoue durement** en
+    /// PostgreSQL (`invalid input syntax for type integer`), ce qui viderait la
+    /// grille entière. D'où le prédicat « que des chiffres », écrit dans le
+    /// dialecte de chaque moteur, AVANT le CAST.
+    ///
+    /// `LENGTH(tm.value) <= 3` pour la même raison, un cran plus loin : « que
+    /// des chiffres » n'empêche pas `99999999999999999999`, qui déborde
+    /// l'`INTEGER` de PostgreSQL (`out of range`) et ferait tomber la requête
+    /// entière — donc la grille — sur UN seul tag corrompu. Un DR se mesure
+    /// entre 0 et une vingtaine ; trois chiffres sont déjà très généreux.
+    ///
+    /// `MAX` plutôt qu'un `LIMIT 1` : le tag décrit l'album mais vit dans
+    /// chaque piste, donc n'importe laquelle répond — encore faut-il qu'elle
+    /// réponde TOUJOURS LA MÊME, sans quoi deux pages successives trieraient
+    /// le même album à deux places différentes.
+    pub(crate) fn dr_album_join(engine: Engine) -> String {
+        let only_digits = match engine {
+            // SQLite n'a pas de `~` ; GLOB est son motif sensible à la casse,
+            // et `[^0-9]` y est une classe de caractères niée.
+            Engine::Sqlite => "tm.value NOT GLOB '*[^0-9]*'",
+            Engine::Postgres => "tm.value ~ '^[0-9]+$'",
+        };
+        format!(
+            "LEFT JOIN (SELECT t.album_id AS album_id, MAX(CAST(tm.value AS INTEGER)) AS dr \
+               FROM track_metadata tm JOIN tracks t ON t.id = tm.track_id \
+              WHERE tm.key = 'dr_album' AND tm.value <> '' \
+                AND LENGTH(tm.value) <= 3 AND {only_digits} \
+              GROUP BY t.album_id) dr ON dr.album_id = a.id"
+        )
+    }
+
+    /// Prédicat « l'album porte un DR compris dans la tranche », posé sur
+    /// l'alias de [`Self::dr_album_join`]. Les bornes sont liées par
+    /// l'appelant, dans l'ordre où les marqueurs sont demandés.
+    fn dr_wheres(
+        range: DrRange,
+        make_ph: &dyn Fn(usize) -> String,
+        next_ph: &mut usize,
+        binds: &mut Vec<SqlValue>,
+    ) -> Vec<String> {
+        // `IS NOT NULL` explicite : un album sans tag NE DOIT PAS passer un
+        // filtre de tranche. Les comparaisons suivantes l'excluraient déjà
+        // (NULL >= 8 vaut NULL, donc pas vrai), mais une tranche ouverte des
+        // deux côtés n'en poserait aucune — et rendrait alors la bibliothèque
+        // entière au lieu des seuls albums tagués.
+        let mut out = vec!["dr.dr IS NOT NULL".to_string()];
+        if let Some(min) = range.min {
+            out.push(format!("dr.dr >= {}", make_ph(*next_ph)));
+            *next_ph += 1;
+            binds.push(SqlValue::Int(min));
+        }
+        if let Some(max) = range.max {
+            out.push(format!("dr.dr <= {}", make_ph(*next_ph)));
+            *next_ph += 1;
+            binds.push(SqlValue::Int(max));
+        }
+        out
+    }
+
+    /// Effectif de la tranche de DR demandée (#2144) — le `total` que la
+    /// grille pagine.
+    ///
+    /// Sans lui, `count_visible()` annoncerait toute la bibliothèque alors que
+    /// la liste ne rend que les albums tagués : la grille afficherait des
+    /// centaines de pages vides, puisque le DR n'est tagué que sur une part
+    /// infime des bibliothèques (Bertrand, 15/08 : « ça suppose que les tags
+    /// soient présents sur une part suffisante de la bibliothèque »).
+    pub fn count_in_dr_range(
+        &self,
+        range: DrRange,
+        include_hidden: bool,
+    ) -> Result<i64, TuneError> {
+        let engine = self.db.engine();
+        let make_ph = |i: usize| match engine {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let mut next_ph = 1usize;
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let mut wheres = Self::dr_wheres(range, &make_ph, &mut next_ph, &mut binds);
+        if !include_hidden {
+            wheres.push(crate::db::facet_filter::hidden_albums_excluded().to_string());
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM albums a {} WHERE {}",
+            Self::dr_album_join(engine),
+            wheres.join(" AND ")
+        );
+        let refs: Vec<&dyn ToSqlValue> = binds.iter().map(|v| v as &dyn ToSqlValue).collect();
+        Ok(self
+            .db
+            .query_one(&sql, &refs)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
+    }
+
+    /// Les valeurs de Dynamic Range RÉELLEMENT présentes dans la
+    /// bibliothèque, croissantes (#2144).
+    ///
+    /// C'est la matière des tranches : l'issue ne fixe aucune borne et les
+    /// bornes exactes de MinimServer, citées en modèle, n'ont jamais été
+    /// relevées. Le serveur n'en invente donc pas — il dit ce qu'il a, et le
+    /// client découpe. Une bibliothèque sans aucun tag rend une liste vide,
+    /// et l'écran n'affiche pas de facette plutôt qu'une facette morte.
+    pub fn dynamic_range_values(&self) -> Result<Vec<i64>, TuneError> {
+        let engine = self.db.engine();
+        let sql = format!(
+            "SELECT DISTINCT dr.dr FROM albums a {} WHERE dr.dr IS NOT NULL AND {} ORDER BY dr.dr",
+            Self::dr_album_join(engine),
+            crate::db::facet_filter::hidden_albums_excluded()
+        );
+        Ok(self
+            .db
+            .query_many(&sql, &[])?
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn list_filtered(
         &self,
@@ -1363,6 +1532,10 @@ impl AlbumRepo {
         // `true` = tout rendre, pour `?include_hidden=true` et les appels de
         // maintenance (#1391).
         include_hidden: bool,
+        // Tranche de Dynamic Range (#2144). `None` = pas de filtre, et alors
+        // AUCUNE jointure supplémentaire n'est ajoutée : le SQL du cas courant
+        // est exactement celui d'avant.
+        dr: Option<DrRange>,
     ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
@@ -1407,6 +1580,14 @@ impl AlbumRepo {
             // The timestamp itself comes from `ADDED_AT_JOIN`, computed ONCE
             // for the whole page — see the comment on that constant (#1269).
             "added_at" | "added_date" => format!("aa.added_at {dir} NULLS LAST, a.id {dir}"),
+            // Dynamic Range (#2144). `NULLS LAST` dans LES DEUX sens : un
+            // album sans tag n'a pas un DR bas, il n'en a pas — le ranger avec
+            // les masters saturés serait un mensonge, et le testeur qui trie
+            // par DR croissant tomberait d'abord sur les albums qu'il n'a pas
+            // tagués. Départage par titre pour que la pagination soit stable.
+            "dynamic_range" | "dr" => {
+                format!("dr.dr {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC")
+            }
             _ => format!("a.id {dir}"),
         };
 
@@ -1456,6 +1637,19 @@ impl AlbumRepo {
         if !include_hidden {
             wheres.push(crate::db::facet_filter::hidden_albums_excluded().to_string());
         }
+        // Tranche de DR (#2144) : les marqueurs se prennent ICI, avant ceux de
+        // LIMIT/OFFSET, sinon PostgreSQL décale toutes les valeurs liées (le
+        // `?` de SQLite, lui, ignore l'indice et masquerait le défaut — piège
+        // n°2 de `facet_filter`).
+        let dr_sort = matches!(sort, "dynamic_range" | "dr");
+        if let Some(range) = dr {
+            wheres.extend(Self::dr_wheres(
+                range,
+                &make_ph,
+                &mut next_ph,
+                &mut bind_values,
+            ));
+        }
 
         let where_clause = if wheres.is_empty() {
             String::new()
@@ -1479,17 +1673,25 @@ impl AlbumRepo {
         // 1er temps : trier des lignes ÉTROITES — a.id et la clé de tri
         // seulement — et borner en SQL (LIMIT/OFFSET).
         let added_at_sort = matches!(sort, "added_at" | "added_date");
-        let id_select = if added_at_sort {
+        let mut joins = "LEFT JOIN artists ar ON a.artist_id = ar.id".to_string();
+        if added_at_sort {
             // `aa.added_at` vient de la jointure groupée `ADDED_AT_JOIN` —
             // une seule passe sur tracks/file_first_seen, exposée en 2e
             // colonne pour que le client puisse rendre sa frise chronologique.
-            format!(
-                "SELECT a.id, aa.added_at FROM albums a \
-                 LEFT JOIN artists ar ON a.artist_id = ar.id {}",
-                Self::ADDED_AT_JOIN
-            )
+            joins.push(' ');
+            joins.push_str(Self::ADDED_AT_JOIN);
+        }
+        // La jointure DR n'est posée QUE si on trie ou filtre dessus : le
+        // listage par défaut garde le SQL — et le plan — de #1269 au caractère
+        // près.
+        if dr_sort || dr.is_some() {
+            joins.push(' ');
+            joins.push_str(&Self::dr_album_join(self.db.engine()));
+        }
+        let id_select = if added_at_sort {
+            format!("SELECT a.id, aa.added_at FROM albums a {joins}")
         } else {
-            "SELECT a.id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id".to_string()
+            format!("SELECT a.id FROM albums a {joins}")
         };
         let sql = format!(
             "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
@@ -2369,7 +2571,7 @@ mod tests {
 
         // Grille par défaut : exclu, et le total suit.
         let grille = repo
-            .list_filtered(100, 0, "title", "asc", None, None, None, false)
+            .list_filtered(100, 0, "title", "asc", None, None, None, false, None)
             .unwrap();
         assert_eq!(
             grille.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(),
@@ -2380,7 +2582,7 @@ mod tests {
 
         // `include_hidden` : le retour pour la vue de révision.
         let tout = repo
-            .list_filtered(100, 0, "title", "asc", None, None, None, true)
+            .list_filtered(100, 0, "title", "asc", None, None, None, true, None)
             .unwrap();
         assert_eq!(tout.len(), 2);
 
@@ -2854,19 +3056,19 @@ mod tests {
         let titres = |v: Vec<Album>| -> Vec<String> { v.into_iter().map(|a| a.title).collect() };
 
         let seulement = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true), true)
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(true), true, None)
                 .unwrap(),
         );
         assert_eq!(seulement, vec!["Jazz sur Seine".to_string()]);
 
         let sauf = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false), true)
+            repo.list_filtered(100, 0, "title", "asc", None, None, Some(false), true, None)
                 .unwrap(),
         );
         assert_eq!(sauf, vec!["Kind of Blue".to_string()]);
 
         let tout = titres(
-            repo.list_filtered(100, 0, "title", "asc", None, None, None, true)
+            repo.list_filtered(100, 0, "title", "asc", None, None, None, true, None)
                 .unwrap(),
         );
         assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
@@ -2994,6 +3196,320 @@ mod tests {
         // DR0 is a real measurement on a crushed master, not an absence.
         mrepo.set(id1, "dr_album", "0").unwrap();
         assert_eq!(arepo.dynamic_range(album_id).unwrap().as_deref(), Some("0"));
+    }
+
+    // ------------------------------------------------------------------
+    // #2144 — classer et filtrer les albums par tranches de Dynamic Range.
+    // ------------------------------------------------------------------
+
+    /// `test_db()` monte `CORE_SCHEMA` seul ; `track_metadata` arrive par
+    /// migration. Les tests de DR la créent donc à la main, comme
+    /// `dynamic_range_reads_the_tag_from_any_track_of_the_album`.
+    fn db_avec_track_metadata() -> SqliteDb {
+        let db = test_db();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata (
+                 track_id INTEGER NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (track_id, key)
+             );",
+        )
+        .unwrap();
+        db
+    }
+
+    /// Un album d'une piste, avec ou sans tag `dr_album`. La valeur est passée
+    /// TELLE QUELLE : c'est ainsi que le scan l'écrit, `normalise_dr` ne
+    /// garantissant rien de plus qu'un préfixe retiré.
+    fn album_avec_dr(db: &SqliteDb, titre: &str, dr: Option<&str>) -> i64 {
+        use crate::db::models::Track;
+        use crate::db::track_metadata_repo::TrackMetadataRepo;
+        use crate::db::track_repo::TrackRepo;
+
+        let album_id = AlbumRepo::new(db.clone())
+            .create(&Album::new(titre.to_string()))
+            .unwrap();
+        let mut t = Track::new(format!("{titre} — piste"));
+        t.album_id = Some(album_id);
+        t.file_path = Some(format!("/m/{titre}.flac"));
+        let tid = TrackRepo::new(db.clone()).create(&t).unwrap();
+        if let Some(v) = dr {
+            TrackMetadataRepo::new(db.clone())
+                .set(tid, "dr_album", v)
+                .unwrap();
+        }
+        album_id
+    }
+
+    fn titres(albums: &[Album]) -> Vec<&str> {
+        albums.iter().map(|a| a.title.as_str()).collect()
+    }
+
+    /// La bibliothèque d'essai des trois tests suivants : trois albums tagués,
+    /// un sans tag, un dont le tag n'est pas un nombre.
+    fn bibliotheque_dr() -> SqliteDb {
+        let db = db_avec_track_metadata();
+        album_avec_dr(&db, "Alpha", Some("6"));
+        album_avec_dr(&db, "Bravo", Some("14"));
+        album_avec_dr(&db, "Charlie", Some("9"));
+        album_avec_dr(&db, "Delta", None);
+        // `normalise_dr` recopie tel quel ce qui n'est pas une suite de
+        // chiffres : « DR12.5 » ressort « DR12.5 ». Sans garde, le CAST en
+        // ferait un 0 en SQLite et ferait ÉCHOUER la requête en PostgreSQL.
+        album_avec_dr(&db, "Echo", Some("DR12.5"));
+        db
+    }
+
+    /// #2144 — le tri numérique, et la place des albums non tagués.
+    ///
+    /// Le tag est stocké en TEXT : sans CAST, « 14 » se rangerait AVANT « 6 »
+    /// (comparaison de chaînes), ce que le commit 7cdc93ff annonçait déjà comme
+    /// le piège à traiter. Et un album sans tag n'a pas un DR bas : il n'en a
+    /// pas — il termine la liste dans LES DEUX sens.
+    #[test]
+    fn le_tri_par_dynamic_range_est_numerique_et_relegue_les_non_tagues_2144() {
+        let db = bibliotheque_dr();
+        let repo = AlbumRepo::new(db);
+
+        let asc = repo
+            .list_filtered(100, 0, "dynamic_range", "asc", None, None, None, true, None)
+            .unwrap();
+        assert_eq!(
+            titres(&asc),
+            vec!["Alpha", "Charlie", "Bravo", "Delta", "Echo"],
+            "6 < 9 < 14 (et non « 14 » < « 6 » comme le ferait une comparaison \
+             de chaînes), puis les sans-valeur par titre"
+        );
+
+        let desc = repo
+            .list_filtered(
+                100,
+                0,
+                "dynamic_range",
+                "desc",
+                None,
+                None,
+                None,
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            titres(&desc),
+            vec!["Bravo", "Charlie", "Alpha", "Delta", "Echo"],
+            "en DÉCROISSANT aussi les non tagués finissent — les remonter en \
+             tête reviendrait à leur prêter le DR le plus élevé"
+        );
+
+        // L'alias court, celui qu'un client abrégerait naturellement.
+        assert_eq!(
+            titres(
+                &repo
+                    .list_filtered(100, 0, "dr", "asc", None, None, None, true, None)
+                    .unwrap()
+            ),
+            vec!["Alpha", "Charlie", "Bravo", "Delta", "Echo"]
+        );
+    }
+
+    /// #2144 — la tranche. Bornes incluses, chacune facultative, et le
+    /// non-tagué n'y entre JAMAIS.
+    #[test]
+    fn la_tranche_de_dynamic_range_est_inclusive_et_exclut_les_non_tagues_2144() {
+        let db = bibliotheque_dr();
+        album_avec_dr(&db, "Zoulou", Some("0"));
+        let repo = AlbumRepo::new(db);
+
+        let tranche = |min, max| {
+            let r = DrRange::new(min, max).unwrap();
+            let page = repo
+                .list_filtered(
+                    100,
+                    0,
+                    "dynamic_range",
+                    "asc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    Some(r),
+                )
+                .unwrap();
+            // Le compteur de pagination doit compter EXACTEMENT la même chose
+            // que la liste, sinon la grille saute des pages (#1391, #1269).
+            assert_eq!(
+                repo.count_in_dr_range(r, true).unwrap(),
+                page.len() as i64,
+                "le total annoncé ne compte pas la même tranche que la liste"
+            );
+            titres(&page)
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(tranche(Some(8), Some(14)), vec!["Charlie", "Bravo"]);
+        assert_eq!(
+            tranche(Some(10), None),
+            vec!["Bravo"],
+            "tranche ouverte en haut"
+        );
+        assert_eq!(
+            tranche(None, Some(8)),
+            vec!["Zoulou", "Alpha"],
+            "tranche ouverte en bas — et DR0 est une vraie mesure, celle d'un \
+             master saturé, pas une absence"
+        );
+        assert_eq!(
+            tranche(Some(9), Some(9)),
+            vec!["Charlie"],
+            "bornes égales = une valeur unique, bornes INCLUSES"
+        );
+        assert!(
+            tranche(Some(20), Some(30)).is_empty(),
+            "une tranche vide rend zéro album, jamais la bibliothèque entière"
+        );
+        // Delta (sans tag) et Echo (tag non numérique) ne sortent d'AUCUNE
+        // tranche, si large soit-elle.
+        assert_eq!(
+            tranche(Some(0), Some(99)),
+            vec!["Zoulou", "Alpha", "Charlie", "Bravo"],
+            "seuls les albums porteurs d'un DR numérique entrent dans une tranche"
+        );
+
+        // Aucune borne = AUCUN filtre (piège n°1 de `facet_filter`), et non un
+        // filtre qui ne rendrait rien.
+        assert_eq!(DrRange::new(None, None), None);
+    }
+
+    /// #2144 — rétro-compatibilité : sans paramètre de DR, la requête est
+    /// EXACTEMENT celle d'avant.
+    ///
+    /// La preuve est structurelle et non déclarative : cette base n'a même pas
+    /// de table `track_metadata`. Si le listage par défaut posait la jointure
+    /// DR, il échouerait sur « no such table » ; il rend la bibliothèque.
+    #[test]
+    fn sans_parametre_de_dr_aucune_jointure_n_est_ajoutee_2144() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        repo.create(&Album::new("Amnesiac".into())).unwrap();
+        repo.create(&Album::new("Kid A".into())).unwrap();
+
+        for sort in ["title", "added_at", "year", "artist", "id"] {
+            let page = repo
+                .list_filtered(100, 0, sort, "asc", None, None, None, true, None)
+                .unwrap();
+            assert_eq!(page.len(), 2, "tri {sort} : la liste doit rester servie");
+        }
+    }
+
+    /// #2144 — les valeurs offertes aux tranches sont MESURÉES, pas inventées.
+    #[test]
+    fn les_valeurs_de_dynamic_range_disponibles_sont_celles_de_la_base_2144() {
+        let db = db_avec_track_metadata();
+        assert!(
+            AlbumRepo::new(db.clone())
+                .dynamic_range_values()
+                .unwrap()
+                .is_empty(),
+            "bibliothèque sans tag : aucune facette à proposer"
+        );
+
+        album_avec_dr(&db, "Alpha", Some("14"));
+        album_avec_dr(&db, "Bravo", Some("6"));
+        album_avec_dr(&db, "Charlie", Some("14"));
+        album_avec_dr(&db, "Delta", None);
+        album_avec_dr(&db, "Echo", Some("DR12.5"));
+        album_avec_dr(&db, "Foxtrot", Some("0"));
+        // Que des chiffres, et pourtant hors de portée d'un `INTEGER`
+        // PostgreSQL : un seul tag corrompu de cette forme ferait échouer la
+        // requête entière — donc remonterait une grille VIDE, pas une valeur
+        // fausse.
+        album_avec_dr(&db, "Golf", Some("99999999999999999999"));
+
+        assert_eq!(
+            AlbumRepo::new(db).dynamic_range_values().unwrap(),
+            vec![0, 6, 14],
+            "valeurs distinctes, croissantes ; le tag non numérique et le tag \
+             démesuré sont écartés, DR0 conservé"
+        );
+    }
+
+    /// #2144 — un album masqué (#1391) ne revient pas par la porte du DR :
+    /// ni dans la liste, ni dans le compteur, ni dans les facettes.
+    #[test]
+    fn le_filtre_dr_respecte_le_masquage_2144() {
+        let db = db_avec_track_metadata();
+        album_avec_dr(&db, "Visible", Some("12"));
+        let cache = album_avec_dr(&db, "Caché", Some("13"));
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(cache)
+            .unwrap();
+        let repo = AlbumRepo::new(db);
+        let r = DrRange::new(Some(10), Some(20)).unwrap();
+
+        let page = repo
+            .list_filtered(
+                100,
+                0,
+                "dynamic_range",
+                "asc",
+                None,
+                None,
+                None,
+                false,
+                Some(r),
+            )
+            .unwrap();
+        assert_eq!(titres(&page), vec!["Visible"]);
+        assert_eq!(repo.count_in_dr_range(r, false).unwrap(), 1);
+        assert_eq!(
+            repo.count_in_dr_range(r, true).unwrap(),
+            2,
+            "`include_hidden` rend le masqué à la vue de révision"
+        );
+        assert_eq!(repo.dynamic_range_values().unwrap(), vec![12]);
+    }
+
+    /// #2144 — le SQL doit être VALIDE SUR LES DEUX MOTEURS, et le rester.
+    ///
+    /// Deux pièges, chacun mortel sur un seul des deux :
+    /// * `GLOB` n'existe pas en PostgreSQL, `~` n'existe pas en SQLite ;
+    /// * `CAST('DR12.5' AS INTEGER)` vaut 0 en SQLite (faux silencieux) et
+    ///   ÉCHOUE en PostgreSQL (`invalid input syntax`) — la grille entière
+    ///   remonterait vide, comme en #1269 sur `.15`.
+    ///
+    /// Et la forme : une jointure GROUPÉE, jamais une sous-requête corrélée
+    /// sur `a.id`, qui serait ré-évaluée par ligne triée.
+    #[test]
+    fn la_jointure_dr_parle_les_deux_dialectes_et_reste_groupee_2144() {
+        let sqlite = AlbumRepo::dr_album_join(Engine::Sqlite);
+        let pg = AlbumRepo::dr_album_join(Engine::Postgres);
+
+        assert!(sqlite.contains("tm.value NOT GLOB '*[^0-9]*'"), "{sqlite}");
+        assert!(!sqlite.contains('~'), "`~` n'est pas du SQLite : {sqlite}");
+        assert!(pg.contains("tm.value ~ '^[0-9]+$'"), "{pg}");
+        assert!(
+            !pg.contains("GLOB"),
+            "`GLOB` n'est pas du PostgreSQL : {pg}"
+        );
+
+        for sql in [&sqlite, &pg] {
+            assert!(sql.contains("GROUP BY t.album_id"), "{sql}");
+            assert!(sql.contains("CAST(tm.value AS INTEGER)"), "{sql}");
+            assert!(
+                sql.contains("LENGTH(tm.value) <= 3"),
+                "sans borne de longueur, un tag « que des chiffres » mais \
+                 démesuré déborde l'INTEGER de PostgreSQL : {sql}"
+            );
+            let derivee = sql.split(") dr ON").next().unwrap();
+            assert!(
+                !derivee.contains("a."),
+                "la table dérivée ne doit RIEN corréler à l'album courant, \
+                 sinon elle est ré-évaluée par ligne (#1269) : {derivee}"
+            );
+        }
     }
 
     #[test]
@@ -3650,6 +4166,157 @@ mod tests {
         db.execute_batch(&sql).unwrap();
     }
 
+    /// Pose `track_metadata` et tague `1/pas` des albums, en SQL brut (#2144).
+    ///
+    /// Une part MINORITAIRE, délibérément : c'est l'état réel des
+    /// bibliothèques (« ça suppose que les tags soient présents sur une part
+    /// suffisante », Bertrand, 15/08 — jamais mesuré), et c'est le cas le plus
+    /// dur pour le tri, qui doit alors départager une majorité de NULL.
+    fn seed_tags_dr(db: &SqliteDb, n_albums: usize, tracks_per_album: usize, pas: usize) {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_metadata (
+                 track_id INTEGER NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (track_id, key)
+             );",
+        )
+        .unwrap();
+        // Même index que la migration 34 : sans lui la mesure serait plus
+        // favorable que la production ne le sera jamais.
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);",
+        )
+        .unwrap();
+        let mut sql = String::from("BEGIN;\n");
+        for a in (1..=n_albums).step_by(pas) {
+            // La 1re piste de l'album `a` porte l'identifiant (a-1)*tpa + 1.
+            let tid = (a - 1) * tracks_per_album + 1;
+            sql.push_str(&format!(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES ({tid}, 'dr_album', '{}');\n",
+                (a / pas) % 20
+            ));
+        }
+        sql.push_str("COMMIT;\n");
+        db.execute_batch(&sql).unwrap();
+    }
+
+    /// #2144 — contre-épreuve de coût : trier ou filtrer par DR doit coûter du
+    /// même ordre qu'une page du tri trivial, PAS un multiple.
+    ///
+    /// C'est la garde qui protège l'acquis de #1269 : le DR est lu dans
+    /// `track_metadata`, et la forme naïve — `(SELECT … WHERE t.album_id =
+    /// a.id)` dans l'ORDER BY — serait ré-évaluée pour CHACUNE des 45 000
+    /// lignes triées, exactement la sous-requête corrélée que #1269 vient de
+    /// retirer du tri par défaut. La jointure groupée ne la paie qu'une fois.
+    #[test]
+    fn trier_et_filtrer_par_dr_coute_comme_le_tri_trivial_2144() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        seed_grosse_bibliotheque(&db, 10_000, 2);
+        seed_tags_dr(&db, 10_000, 2, 10);
+
+        let chrono = |sort: &str, dr: Option<DrRange>, attendu: usize| -> std::time::Duration {
+            (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let page = repo
+                        .list_filtered(2000, 0, sort, "asc", None, None, None, true, dr)
+                        .unwrap();
+                    assert_eq!(page.len(), attendu);
+                    t0.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+
+        let t_id = chrono("id", None, 2000);
+        let t_dr = chrono("dynamic_range", None, 2000);
+        // 1000 albums tagués, DR = a % 20 : la moitié tombe au-dessus de 10.
+        let tranche = DrRange::new(Some(10), None);
+        let t_tranche = chrono("dynamic_range", tranche, 500);
+        eprintln!("contre-épreuve #2144 : id={t_id:?} tri_dr={t_dr:?} tranche_dr={t_tranche:?}");
+
+        let plafond = t_id.max(std::time::Duration::from_millis(5)) * 8;
+        assert!(
+            t_dr < plafond,
+            "le tri par DR coûte {t_dr:?} pour une page contre {t_id:?} en tri \
+             id : la page re-scanne `track_metadata` par ligne (#2144/#1269)"
+        );
+        assert!(
+            t_tranche < plafond,
+            "la tranche de DR coûte {t_tranche:?} contre {t_id:?} en tri id"
+        );
+    }
+
+    /// #2144 — mesure : 45 000 albums, tri et tranche de DR à trois offsets.
+    /// Lancée à la main (`--ignored --nocapture`), comme son aînée #1269.
+    #[test]
+    #[ignore = "mesure #2144, lancement manuel"]
+    fn bench_dynamic_range_45000_albums() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        seed_grosse_bibliotheque(&db, 45_000, 4);
+        seed_tags_dr(&db, 45_000, 4, 10);
+
+        for offset in [0i64, 22_000, 44_000] {
+            let t0 = std::time::Instant::now();
+            let page = repo
+                .list_filtered(
+                    2000,
+                    offset,
+                    "dynamic_range",
+                    "asc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap();
+            eprintln!(
+                "tri dynamic_range offset={offset}: {} albums en {:?}",
+                page.len(),
+                t0.elapsed()
+            );
+            assert!(!page.is_empty());
+        }
+        let r = DrRange::new(Some(10), Some(19)).unwrap();
+        for offset in [0i64, 1000] {
+            let t0 = std::time::Instant::now();
+            let page = repo
+                .list_filtered(
+                    2000,
+                    offset,
+                    "dynamic_range",
+                    "asc",
+                    None,
+                    None,
+                    None,
+                    true,
+                    Some(r),
+                )
+                .unwrap();
+            eprintln!(
+                "tranche DR10-19 offset={offset}: {} albums en {:?}",
+                page.len(),
+                t0.elapsed()
+            );
+        }
+        let t0 = std::time::Instant::now();
+        eprintln!(
+            "count_in_dr_range: {} en {:?}",
+            repo.count_in_dr_range(r, true).unwrap(),
+            t0.elapsed()
+        );
+        // Témoin : tri bon marché (id), même volume.
+        let t0 = std::time::Instant::now();
+        let page = repo
+            .list_filtered(2000, 0, "id", "asc", None, None, None, true, None)
+            .unwrap();
+        eprintln!("id offset=0: {} albums en {:?}", page.len(), t0.elapsed());
+    }
+
     /// #1269 — contre-épreuve : une page du tri par défaut (`added_at`) doit
     /// coûter du même ordre qu'une page du tri trivial (`id`), pas 8 fois
     /// plus. Mesuré sur cette base (10 000 albums, bios de 2 Ko) : l'ancienne
@@ -3669,7 +4336,7 @@ mod tests {
                 .map(|_| {
                     let t0 = std::time::Instant::now();
                     let page = repo
-                        .list_filtered(2000, 6000, sort, "asc", None, None, None, true)
+                        .list_filtered(2000, 6000, sort, "asc", None, None, None, true, None)
                         .unwrap();
                     assert_eq!(page.len(), 2000);
                     t0.elapsed()
@@ -3702,7 +4369,9 @@ mod tests {
         for offset in [0i64, 22_000, 44_000] {
             let t0 = std::time::Instant::now();
             let page = repo
-                .list_filtered(2000, offset, "added_at", "asc", None, None, None, true)
+                .list_filtered(
+                    2000, offset, "added_at", "asc", None, None, None, true, None,
+                )
                 .unwrap();
             eprintln!(
                 "added_at offset={offset}: {} albums en {:?}",
@@ -3714,7 +4383,7 @@ mod tests {
         // Témoin : tri bon marché (id), même volume.
         let t0 = std::time::Instant::now();
         let page = repo
-            .list_filtered(2000, 0, "id", "asc", None, None, None, true)
+            .list_filtered(2000, 0, "id", "asc", None, None, None, true, None)
             .unwrap();
         eprintln!("id offset=0: {} albums en {:?}", page.len(), t0.elapsed());
     }
