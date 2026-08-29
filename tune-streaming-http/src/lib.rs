@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
+use tune_core::favorites_sort::TriFavoris;
 use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
@@ -1009,9 +1010,34 @@ async fn lire_favoris(
     }
 }
 
+/// `sort` / `order` sur la liste des favoris d'un service (#2001).
+///
+/// Facultatifs : absents, la réponse est celle d'avant, dans l'ordre du
+/// service.
+#[derive(Deserialize)]
+struct TriQuery {
+    sort: Option<String>,
+    order: Option<String>,
+}
+
+/// Pose le tri demandé sur une réponse de favoris, **après** le cache.
+///
+/// Le cache de contenu utilisateur (#1621, PR #2818) mémorise la réponse brute
+/// du service sous la clé `(service, "favorites/{type}")`. Trier ici, sur la
+/// copie qui part au client, laisse cette clé intacte : quatre tris successifs
+/// se servent de la même entrée au lieu d'en fabriquer quatre, et aucune des
+/// douze purges n'a de raison de changer.
+fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
+    if let Some(tri) = TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        tune_core::favorites_sort::trier_liste_json(&mut donnees, tri);
+    }
+    donnees
+}
+
 async fn service_favorites(
     State(state): State<StreamingHttpState>,
     Path((service, fav_type)): Path<(String, String)>,
+    Query(tri): Query<TriQuery>,
 ) -> Response {
     let arc = match get_svc(&state, &service).await {
         Ok(s) => s,
@@ -1029,7 +1055,7 @@ async fn service_favorites(
     };
     let ressource = format!("favorites/{fav_type}");
     if let Some(donnees) = contenu_utilisateur_frais(&service, &ressource) {
-        return Json(donnees).into_response();
+        return Json(poser_le_tri(donnees, &tri)).into_response();
     }
     // Verrou de LECTURE pour l'aller : le client web demande les trois types
     // de favoris en parallèle (`Promise.all`), et le verrou d'écriture que ce
@@ -1042,8 +1068,10 @@ async fn service_favorites(
     };
     match result {
         Ok(data) => {
+            // Le cache reçoit la réponse BRUTE ; le tri ne porte que sur la
+            // copie rendue au client.
             memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-            Json(data).into_response()
+            Json(poser_le_tri(data, &tri)).into_response()
         }
         Err(ref e)
             if {
@@ -1066,7 +1094,7 @@ async fn service_favorites(
                 match lire_favoris(&**svc, &fav_type).await {
                     Ok(data) => {
                         memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-                        Json(data).into_response()
+                        Json(poser_le_tri(data, &tri)).into_response()
                     }
                     Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
@@ -1482,6 +1510,24 @@ mod tests_cache_utilisateur {
         StreamUrl,
     };
 
+    fn piste(id: &str, titre: &str, artiste: &str) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: artiste.to_string(),
+            album: None,
+            album_id: None,
+            duration_ms: 0,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            quality: None,
+            isrc: None,
+            composer: None,
+        }
+    }
+
     /// Un connecteur qui compte ses lectures amont et sait les ralentir.
     struct ServiceCompteur {
         nom: String,
@@ -1558,10 +1604,17 @@ mod tests_cache_utilisateur {
             tokio::time::sleep(self.delai).await;
             Ok(vec![])
         }
+        /// Trois pistes dans un ordre qu'aucun tri ne rend par hasard : le
+        /// service les donne « 10, 2, Zorro », l'ordre d'ajout que #2001
+        /// reproche.
         async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
             self.lit();
             tokio::time::sleep(self.delai).await;
-            Ok(vec![])
+            Ok(vec![
+                piste("t1", "Volume 10", "Éric Zimmer"),
+                piste("t2", "volume 2", "aaron Zed"),
+                piste("t3", "Zorro", "Erik Satie"),
+            ])
         }
         async fn add_favorite(&mut self, _f: &str, _i: &str) -> Result<(), TuneError> {
             Ok(())
@@ -1582,6 +1635,14 @@ mod tests_cache_utilisateur {
             Arc::new(Mutex::new(registre)),
             Arc::new(EventBus::new()),
         )
+    }
+
+    /// Aucun tri demandé — le cas de tous les appels d'avant #2001.
+    fn sans_tri() -> Query<TriQuery> {
+        Query(TriQuery {
+            sort: None,
+            order: None,
+        })
     }
 
     /// Lot 5 : dans le TTL, la deuxième lecture ne repart PAS vers le service.
@@ -1609,12 +1670,14 @@ mod tests_cache_utilisateur {
         let r = service_favorites(
             State(etat.clone()),
             Path((String::from("essai-ttl-relecture"), String::from("tracks"))),
+            sans_tri(),
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
         let r = service_favorites(
             State(etat),
             Path((String::from("essai-ttl-relecture"), String::from("tracks"))),
+            sans_tri(),
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -1721,14 +1784,17 @@ mod tests_cache_utilisateur {
             service_favorites(
                 State(etat.clone()),
                 Path((String::from("essai-parallele"), String::from("tracks"))),
+                sans_tri(),
             ),
             service_favorites(
                 State(etat.clone()),
                 Path((String::from("essai-parallele"), String::from("albums"))),
+                sans_tri(),
             ),
             service_favorites(
                 State(etat),
                 Path((String::from("essai-parallele"), String::from("artists"))),
+                sans_tri(),
             ),
         );
         let duree = depart.elapsed();
@@ -1741,6 +1807,81 @@ mod tests_cache_utilisateur {
             duree < Duration::from_millis(450),
             "trois lectures de 200 ms sous verrou de lecture doivent se \
              recouvrir (~200 ms), pas se suivre (600 ms). Mesure : {duree:?}"
+        );
+    }
+
+    /// Les identifiants des favoris rendus par la route, dans l'ordre.
+    async fn identifiants(
+        etat: &StreamingHttpState,
+        service: &str,
+        sort: Option<&str>,
+        order: Option<&str>,
+    ) -> Vec<String> {
+        let r = service_favorites(
+            State(etat.clone()),
+            Path((service.to_string(), String::from("tracks"))),
+            Query(TriQuery {
+                sort: sort.map(str::to_string),
+                order: order.map(str::to_string),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&octets).unwrap();
+        v["tracks"]
+            .as_array()
+            .expect("la reponse porte une liste `tracks`")
+            .iter()
+            .map(|t| t["source_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #2001 : le tri se pose APRÈS le cache de #1621/#2818.
+    ///
+    /// Deux choses à la fois, et c'est voulu : quatre tris différents ne font
+    /// qu'une seule lecture amont — la clé `(service, ressource)` ne porte pas
+    /// le tri — et la lecture SANS tri, faite en dernier, ressort l'ordre du
+    /// service : le cache a bien mémorisé la réponse brute, pas une réponse
+    /// déjà rangée.
+    #[tokio::test]
+    async fn le_tri_des_favoris_se_pose_apres_le_cache_sans_le_multiplier() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai("essai-tri-favoris", lectures.clone(), Duration::ZERO);
+        let svc = "essai-tri-favoris";
+
+        // « volume 2 » avant « Volume 10 » : tri naturel, casse ignoree.
+        assert_eq!(
+            identifiants(&etat, svc, Some("title"), Some("asc")).await,
+            ["t2", "t1", "t3"]
+        );
+        assert_eq!(
+            identifiants(&etat, svc, Some("title"), Some("desc")).await,
+            ["t3", "t1", "t2"]
+        );
+        // « Éric Zimmer » se range entre « aaron Zed » et « Erik Satie ».
+        assert_eq!(
+            identifiants(&etat, svc, Some("artist"), Some("asc")).await,
+            ["t2", "t1", "t3"]
+        );
+        // Une cle inconnue ne trie pas et ne casse rien.
+        assert_eq!(
+            identifiants(&etat, svc, Some("bpm"), Some("asc")).await,
+            ["t1", "t2", "t3"]
+        );
+        // Sans parametre : l'ordre du service, intact dans le cache.
+        assert_eq!(
+            identifiants(&etat, svc, None, None).await,
+            ["t1", "t2", "t3"]
+        );
+
+        assert_eq!(
+            lectures.load(Ordering::SeqCst),
+            1,
+            "cinq lectures, un seul aller au service : la cle du cache ne doit \
+             pas porter le tri"
         );
     }
 

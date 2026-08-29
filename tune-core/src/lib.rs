@@ -24,6 +24,7 @@ pub mod digest;
 pub mod discovery;
 pub mod event_bus;
 pub mod event_types;
+pub mod favorites_sort;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
