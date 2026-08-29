@@ -191,6 +191,34 @@ pub fn favorite_condition(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
+/// d'ALBUMS — alias `a`, celui de `AlbumRepo::sql::select_album()`.
+///
+/// Vit ici, à côté de [`favorite_condition`], et pour la même raison : c'est
+/// le littéral qu'on recopierait une fois de trop. La liste d'albums, son
+/// compteur de pagination et la recherche doivent exclure EXACTEMENT le même
+/// ensemble, sinon la grille pagine faux.
+///
+/// `hidden_items` référence l'album par rowid, réconcilié après chaque scan
+/// (`hidden_repo::reconcile`) — même mécanique que `favorites`. `profile_id`
+/// n'est volontairement PAS lu : le masquage est global (aucune vue
+/// bibliothèque ne connaît le profil aujourd'hui, cf. `active_profile.rs`).
+pub fn hidden_albums_excluded() -> &'static str {
+    "NOT EXISTS (SELECT 1 FROM hidden_items h \
+     WHERE h.item_type = 'album' AND h.item_id = a.id)"
+}
+
+/// Prédicat « la piste n'appartient PAS à un album masqué » (#1391), pour les
+/// requêtes de PISTES — alias `t`, celui de `TrackRepo::sql::select_track()`.
+///
+/// Une piste SANS album (`t.album_id` NULL) reste visible : le `NOT EXISTS`
+/// est vrai quand la sous-requête ne trouve rien, NULL compris — pas besoin
+/// du détour `COALESCE` qu'imposerait un `LEFT JOIN albums`.
+pub fn hidden_tracks_excluded() -> &'static str {
+    "NOT EXISTS (SELECT 1 FROM hidden_items h \
+     WHERE h.item_type = 'album' AND h.item_id = t.album_id)"
+}
+
 /// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
 /// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
 ///
@@ -431,6 +459,27 @@ mod tests {
         for hostile in ["", "id", "t.genre", "1=1", "genre; DROP TABLE tracks--"] {
             assert!(untagged_condition(hostile).is_none(), "{hostile:?}");
             assert!(favorite_condition(hostile).is_none(), "{hostile:?}");
+        }
+    }
+
+    /// #1391 — les deux prédicats de masquage sont des littéraux SANS
+    /// marqueur (ils n'avancent aucun compteur) et visent chacun l'alias de
+    /// SA famille de requêtes : `a` pour les albums, `t` pour les pistes. Une
+    /// piste sans album reste visible par construction (`NOT EXISTS` sur un
+    /// `album_id` NULL est vrai).
+    #[test]
+    fn les_predicats_de_masquage_visent_le_bon_alias() {
+        let a = hidden_albums_excluded();
+        assert!(a.contains("h.item_id = a.id"), "{a}");
+        let t = hidden_tracks_excluded();
+        assert!(t.contains("h.item_id = t.album_id"), "{t}");
+        for cond in [a, t] {
+            assert!(cond.starts_with("NOT EXISTS"), "{cond}");
+            assert!(cond.contains("h.item_type = 'album'"), "{cond}");
+            assert!(
+                !cond.contains('?') && !cond.contains('$'),
+                "littéral sans marqueur : {cond}"
+            );
         }
     }
 

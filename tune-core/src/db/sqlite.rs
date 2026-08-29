@@ -601,6 +601,21 @@ END;
 CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
     INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
 END;
+
+-- Albums masqués (#1391) — miroir de la migration SQLite 89, présent AUSSI ici
+-- pour que les requêtes bibliothèque (qui excluent les items masqués par
+-- défaut) tournent sur une base née de `init_schema` seul, comme les tests
+-- de repo. Voir la migration 89 pour la doctrine complète.
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
 ";
 
 #[cfg(test)]

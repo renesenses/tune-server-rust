@@ -31,6 +31,10 @@ pub(super) struct AlbumFilters {
     /// `?compilation=true` ne rend que les compilations, `false` que le reste,
     /// absent = tout (#1957).
     compilation: Option<bool>,
+    /// `?include_hidden=true` rend AUSSI les albums masqués (#1391). Absent
+    /// ou `false` : ils sont exclus — un client qui ignore le paramètre voit
+    /// simplement l'album disparaître, sans rien changer chez lui.
+    include_hidden: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +68,14 @@ pub(super) async fn list_albums(
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
-    let total = repo.count().unwrap_or(0);
+    let include_hidden = p.include_hidden.unwrap_or(false);
+    // Le total suit la même exclusion que la liste, sinon la grille pagine
+    // faux (#1391).
+    let total = if include_hidden {
+        repo.count().unwrap_or(0)
+    } else {
+        repo.count_visible().unwrap_or(0)
+    };
     let items = match repo.list_filtered(
         limit,
         offset,
@@ -73,6 +84,7 @@ pub(super) async fn list_albums(
         p.format.as_deref(),
         p.quality.as_deref(),
         p.compilation,
+        include_hidden,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -106,6 +118,48 @@ pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     Json(json!({ "count": count }))
+}
+
+/// `POST /library/albums/{id}/hide` — masque l'album (#1391).
+///
+/// Masquer n'est PAS supprimer : les fichiers restent intacts, `GET
+/// /albums/{id}`, ses pistes et la lecture restent opérants (files d'attente
+/// et playlists continuent de jouer) ; l'album sort des vues de découverte
+/// (grilles, pistes, recherche, facettes). Réversible par DELETE. Idempotent.
+pub(super) async fn hide_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.hide_album(id) {
+        Ok(true) => Ok(Json(json!({"album_id": id, "hidden": true}))),
+        Ok(false) => Err(AppError::not_found(format!("album {id} not found"))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `DELETE /library/albums/{id}/hide` — démasque. Idempotent : démasquer un
+/// album non masqué rend simplement `hidden: false`.
+pub(super) async fn unhide_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.unhide_album(id) {
+        Ok(_) => Ok(Json(json!({"album_id": id, "hidden": false}))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `GET /library/albums/hidden` — la liste de révision : tout ce qui est
+/// masqué, y compris les marqueurs momentanément orphelins (racine démontée),
+/// rendus avec l'instantané d'identité pour rester démasquables.
+pub(super) async fn list_hidden_albums(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    let items = repo.list_hidden_albums().map_err(AppError::internal)?;
+    Ok(Json(json!({"total": items.len(), "items": items})))
 }
 
 #[derive(Deserialize)]

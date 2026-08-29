@@ -6,6 +6,8 @@ pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
+/// Albums masqués (#1391) — marqueurs réconciliés, sur le modèle des favoris.
+pub mod hidden_repo;
 pub mod history_repo;
 pub mod metadata_proposal_repo;
 pub mod metadata_report_repo;

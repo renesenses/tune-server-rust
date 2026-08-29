@@ -73,6 +73,23 @@ pub(super) fn build_conditions(
     q: &FacetQuery,
     engine: Engine,
     exclude: &str,
+    collection_ids: Option<&[i64]>,
+) -> (Vec<String>, Vec<SqlValue>) {
+    let (mut conds, params) = build_facet_conditions(q, engine, exclude, collection_ids);
+    // Albums masqués (#1391) : leurs pistes sortent de TOUS les effectifs de
+    // facettes — le prédicat de SOCLE que `TrackRepo::list_filtered` pose de
+    // son côté. Sans lui, « Jazz (12) » compterait des pistes que la liste ne
+    // rend plus, précisément la divergence que ce fichier combat. Poussé en
+    // DERNIER et sans marqueur : la numérotation des facettes ne bouge pas.
+    conds.push(tune_core::db::facet_filter::hidden_tracks_excluded().to_string());
+    (conds, params)
+}
+
+/// Les prédicats des seules FACETTES — testés à l'identique, sans le socle.
+fn build_facet_conditions(
+    q: &FacetQuery,
+    engine: Engine,
+    exclude: &str,
     // Resolved album ids for the active `collection` selection (from settings
     // JSON — the handler resolves the name so this stays a pure SQL builder).
     collection_ids: Option<&[i64]>,
@@ -989,7 +1006,7 @@ mod tests {
     fn deux_valeurs_dans_une_facette_donnent_un_in_et_lient_dans_lordre() {
         let q = depuis("format=aiff&format=flac");
 
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER($1), LOWER($2))"]);
         assert_eq!(
             params.iter().map(texte).collect::<Vec<_>>(),
@@ -997,7 +1014,7 @@ mod tests {
         );
 
         // SQLite : même prédicat, marqueurs anonymes — l'ordre EST le lien.
-        let (conds, params) = build_conditions(&q, Engine::Sqlite, "", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Sqlite, "", None);
         assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER(?), LOWER(?))"]);
         assert_eq!(
             params.iter().map(texte).collect::<Vec<_>>(),
@@ -1011,7 +1028,7 @@ mod tests {
     #[test]
     fn ou_dans_une_facette_et_entre_facettes() {
         let q = depuis("format=aiff&format=flac&sample_rate=44100&sample_rate=96000");
-        let (conds, _) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds, _) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(conds.len(), 2, "deux facettes = deux conditions ET-ées");
         let where_clause = conds.join(" AND ");
         assert!(
@@ -1026,7 +1043,7 @@ mod tests {
         // Le genre teste DEUX colonnes (colonne + tableau JSON) : son OU doit
         // rester enfermé dans ses parenthèses.
         let q = depuis("genre=Jazz&genre=Blues&year=1971");
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds[0],
             "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
@@ -1075,7 +1092,7 @@ mod tests {
                    &q=so+what";
         let q = depuis(raw);
 
-        let (conds_pg, params_pg) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds_pg, params_pg) = build_facet_conditions(&q, Engine::Postgres, "", None);
         let where_pg = conds_pg.join(" AND ");
         let numeros: Vec<usize> = where_pg
             .match_indices('$')
@@ -1100,7 +1117,7 @@ mod tests {
             params_pg.len()
         );
 
-        let (conds_sq, params_sq) = build_conditions(&q, Engine::Sqlite, "", None);
+        let (conds_sq, params_sq) = build_facet_conditions(&q, Engine::Sqlite, "", None);
         let where_sq = conds_sq.join(" AND ");
         assert_eq!(
             where_sq.matches('?').count(),
@@ -1126,13 +1143,13 @@ mod tests {
     fn une_facette_sans_valeur_ne_produit_aucun_predicat() {
         for raw in ["", "format=&genre=&label=&year=", "limit=200&fields=format"] {
             for engine in [Engine::Sqlite, Engine::Postgres] {
-                let (conds, params) = build_conditions(&depuis(raw), engine, "", None);
+                let (conds, params) = build_facet_conditions(&depuis(raw), engine, "", None);
                 assert!(conds.is_empty(), "{raw:?} → {conds:?}");
                 assert!(params.is_empty(), "{raw:?} → {params:?}");
             }
         }
         // Et jamais de `IN ()` nulle part, quelle que soit la sélection.
-        let (conds, _) = build_conditions(
+        let (conds, _) = build_facet_conditions(
             &depuis("format=flac&genre=Jazz&rating=5"),
             Engine::Postgres,
             "",
@@ -1154,7 +1171,7 @@ mod tests {
     fn la_facette_comptee_sexclut_elle_meme_meme_en_multi() {
         let q = depuis("format=aiff&format=flac&genre=Jazz&genre=Blues");
 
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "format", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "format", None);
         let where_clause = conds.join(" AND ");
         assert!(
             !where_clause.contains("t.format"),
@@ -1170,7 +1187,7 @@ mod tests {
         assert_eq!(params.len(), 4);
 
         // Symétrique : en comptant le genre, c'est le format qui reste.
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "genre", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "genre", None);
         assert_eq!(conds, vec!["LOWER(t.format) IN (LOWER($1), LOWER($2))"]);
         assert_eq!(params.len(), 2);
     }
@@ -1181,7 +1198,7 @@ mod tests {
     #[test]
     fn une_seule_valeur_produit_le_sql_davant() {
         let q = depuis("genre=Jazz&format=flac&year=1971&label=ECM&rating=4");
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds,
             vec![
@@ -1212,7 +1229,7 @@ mod tests {
     /// disparaît sans rien laisser passer.
     #[test]
     fn les_vocabulaires_fermes_se_combinent_en_ou() {
-        let (conds, params) = build_conditions(
+        let (conds, params) = build_facet_conditions(
             &depuis("favorite=track&favorite=album&untagged=genre&untagged=cover"),
             Engine::Postgres,
             "",
@@ -1224,7 +1241,7 @@ mod tests {
         assert!(params.is_empty(), "ces prédicats ne lient aucune valeur");
 
         // Valeurs hors vocabulaire : aucun prédicat, et surtout pas un `1 = 1`.
-        let (conds, _) = build_conditions(
+        let (conds, _) = build_facet_conditions(
             &depuis("favorite=1&untagged=mbid"),
             Engine::Postgres,
             "",
@@ -1238,7 +1255,7 @@ mod tests {
     #[test]
     fn une_valeur_a_virgule_reste_une_seule_valeur() {
         let q = depuis("genre=Jazz%2C+Blues");
-        let (conds, params) = build_conditions(&q, Engine::Postgres, "", None);
+        let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds,
             vec!["(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)"]
