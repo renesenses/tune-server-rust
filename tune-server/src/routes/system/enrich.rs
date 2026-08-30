@@ -271,7 +271,15 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let total_artists = artist_repo.count().unwrap_or(0);
     let total_albums = album_repo.count().unwrap_or(0);
 
-    // Artists with bios
+    // Artists with bios — par soustraction, ce chiffre ne vaut que ce que vaut
+    // la requête retranchée.
+    //
+    // `list_without_bio` exigeait un identifiant MusicBrainz non vide : tout
+    // artiste sans MBID sortait de `v` et se retrouvait donc compté ICI, du
+    // côté des artistes « pourvus d'une biographie ». Avec 0,9 % de couverture
+    // MBID mesurée sur une bibliothèque réelle, le panneau annonçait ~99 % de
+    // biographies devant des fiches vides (#1311). La requête ne filtre plus
+    // sur le MBID ; ce calcul devient exact sans changer de forme.
     let artists_with_bio = artist_repo
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
@@ -324,6 +332,22 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     // Last enrichment run timestamp
     let last_run = settings.get("enrichment_last_run").ok().flatten();
 
+    // Le bilan des deux passes de biographies (#1311).
+    //
+    // `bio_batch` rangeait déjà ces deux clés à la fin de chaque passe, et
+    // **personne ne les relisait** : une recherche de `artist_bio_enrich_result`
+    // dans tout le dépôt ne rendait que la ligne de l'écriture. Le serveur
+    // savait donc dire pourquoi une passe était rentrée à vide, et ne le disait
+    // à personne — c'est le vrai défaut derrière « les bios ne sont pas
+    // disponibles » : pas un décompte faux, une absence de retour.
+    //
+    // Les voici, sous une clé qui leur est propre pour ne rien déplacer de ce
+    // que `stats` promet déjà.
+    let bio_last_run = json!({
+        "artists": bilan_bio(&settings, "artist_bio_enrich_result"),
+        "albums": bilan_bio(&settings, "album_bio_enrich_result"),
+    });
+
     Json(json!({
         "premium": is_premium,
         "daily_used": daily_used,
@@ -339,7 +363,24 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
             "albums_with_bio": albums_with_bio,
         },
         "last_run": last_run,
+        "bio_last_run": bio_last_run,
     }))
+}
+
+/// Le bilan de la dernière passe de biographies rangé sous `cle`, tel que
+/// `tune_core::metadata::bio_batch::bilan_de_passe` l'a écrit.
+///
+/// Rend `null` quand la clé est absente (aucune passe n'a encore tourné) ou
+/// quand sa valeur n'est pas du JSON lisible : un bilan illisible ne doit pas
+/// faire tomber tout le panneau d'enrichissement, qui porte aussi les
+/// décomptes de la bibliothèque.
+fn bilan_bio(settings: &SettingsRepo, cle: &str) -> Value {
+    settings
+        .get(cle)
+        .ok()
+        .flatten()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Helper to produce a JSON null for the daily_limit field on Premium.
