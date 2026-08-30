@@ -154,6 +154,7 @@ impl SpotifyService {
             explicit: item["explicit"].as_bool().unwrap_or(false),
             isrc: item["external_ids"]["isrc"].as_str().map(Into::into),
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OGG".into(),
                 sample_rate: 44100,

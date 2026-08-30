@@ -189,6 +189,7 @@ impl AmazonMusicService {
             explicit: data["explicit"].as_bool().unwrap_or(false),
             isrc: data["isrc"].as_str().map(Into::into),
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: if self.quality == "SD" {
                     "AAC".into()

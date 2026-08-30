@@ -340,6 +340,7 @@ mod tests {
             quality: None,
             isrc: None,
             composer: None,
+            artist_id: None,
         }
     }
 

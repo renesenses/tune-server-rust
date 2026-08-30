@@ -859,12 +859,51 @@ impl QobuzService {
             .into()
     }
 
+    /// L'identifiant Qobuz de l'artiste que `artiste_interprete` vient de
+    /// nommer — et de personne d'autre (#1361).
+    ///
+    /// La chaîne de priorité au-dessus rend un NOM, parfois extrait de la
+    /// chaîne de rôles `performers`, qui ne porte aucun identifiant. Rejouer la
+    /// chaîne pour en tirer un id produirait donc des désaccords silencieux :
+    /// le nom viendrait des rôles, l'id d'un nœud voisin, et le clic ouvrirait
+    /// la fiche de quelqu'un d'autre.
+    ///
+    /// On procède donc dans l'autre sens : on part du nom retenu et on ne
+    /// retient un identifiant que d'un nœud qui porte EXACTEMENT ce nom. Aucun
+    /// nœud ne correspond ⇒ `None`. C'est la même règle que pour `composer` :
+    /// une donnée qu'on ne peut pas prouver ne s'écrit pas.
+    fn identifiant_interprete(item: &serde_json::Value) -> Option<String> {
+        let nom = Self::artiste_interprete(item);
+        if nom.is_empty() {
+            return None;
+        }
+        [
+            &item["performer"],
+            &item["artist"],
+            &item["album"]["artist"],
+        ]
+        .into_iter()
+        .find_map(|noeud| {
+            (noeud["name"].as_str().map(str::trim) == Some(nom.as_str()))
+                .then(|| {
+                    noeud["id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| noeud["id"].as_u64().map(|id| id.to_string()))
+                })
+                .flatten()
+        })
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
             artist: Self::artiste_interprete(item),
+            // L'identifiant de CET artiste-là, pour que « Lecture en cours »
+            // puisse ouvrir sa fiche sans rechercher son nom (#1361).
+            artist_id: Self::identifiant_interprete(item),
             composer: item["composer"]["name"]
                 .as_str()
                 .map(str::trim)
@@ -1682,6 +1721,13 @@ impl StreamingService for QobuzService {
             .map(String::from)
             .or_else(|| data["id"].as_u64().map(|id| id.to_string()));
         let album_artist = data["artist"]["name"].as_str().map(String::from);
+        // Injecté avec le nom, sinon `identifiant_interprete` (#1361) ne
+        // trouverait rien à rattacher à un artiste d'album qui n'existe, dans
+        // ces items, que parce qu'on vient de l'y écrire.
+        let album_artist_id = data["artist"]["id"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| data["artist"]["id"].as_u64().map(|id| id.to_string()));
 
         let tracks = data["tracks"]["items"]
             .as_array()
@@ -1697,6 +1743,9 @@ impl StreamingService for QobuzService {
                                 (Some(nom), None) => {
                                     let mut clone = item.clone();
                                     clone["album"]["artist"]["name"] = nom.as_str().into();
+                                    if let Some(ref id) = album_artist_id {
+                                        clone["album"]["artist"]["id"] = id.as_str().into();
+                                    }
                                     Some(clone)
                                 }
                                 _ => None,
@@ -2908,6 +2957,138 @@ mod tests {
         let track = QobuzService::map_track(&json);
         assert_eq!(track.artist, "The Dave Brubeck Quartet");
         assert_eq!(track.composer.as_deref(), Some("Paul Desmond"));
+    }
+
+    // ── #1361 : l'identifiant de l'artiste affiché ────────────────────────
+
+    /// Le cas courant : l'artiste affiché est le `performer`, son identifiant
+    /// part avec lui. Sans ça, « Lecture en cours » ne pouvait ouvrir sa fiche
+    /// qu'en RECHERCHANT son nom.
+    #[test]
+    fn l_identifiant_du_performer_accompagne_son_nom() {
+        let json = json!({
+            "id": 12345,
+            "title": "Take Five",
+            "performer": {"id": 998, "name": "Dave Brubeck"},
+            "album": {"title": "Time Out", "id": 678},
+            "duration": 324,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Dave Brubeck");
+        assert_eq!(track.artist_id.as_deref(), Some("998"));
+        assert_eq!(track.album_id.as_deref(), Some("678"));
+    }
+
+    /// LE piège de #1407, transposé aux identifiants : Qobuz range le
+    /// compositeur dans `performer`, l'interprète gagne l'affichage — et
+    /// l'identifiant DOIT suivre l'affichage. Rendre `performer.id` ici
+    /// enverrait l'auditeur sur la fiche de Chopin en cliquant « Martha
+    /// Argerich ».
+    #[test]
+    fn l_identifiant_suit_l_interprete_affiche_et_non_le_compositeur() {
+        let json = json!({
+            "id": 1,
+            "title": "Nocturne No. 2",
+            "performer": {"id": 111, "name": "Frédéric Chopin"},
+            "composer": {"id": 111, "name": "Frédéric Chopin"},
+            "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+            "album": {"title": "Chopin: Nocturnes", "artist": {"id": 222, "name": "Martha Argerich"}},
+            "duration": 271,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Martha Argerich");
+        assert_eq!(
+            track.artist_id.as_deref(),
+            Some("222"),
+            "l'identifiant doit désigner l'artiste AFFICHÉ, pas le compositeur"
+        );
+    }
+
+    /// Quand le nom vient de la seule chaîne de rôles, aucun nœud ne le porte :
+    /// on rend `None`. Une absence se dit — deviner un identifiant voisin
+    /// serait exactement le défaut que le test précédent interdit.
+    #[test]
+    fn aucun_identifiant_quand_le_nom_ne_vient_d_aucun_noeud() {
+        let json = json!({
+            "id": 2,
+            "title": "Main Title",
+            "performer": {"id": 333, "name": "John Williams"},
+            "performers": "John Williams, Composer, ComposerLyricist - Boston Pops Orchestra, Orchestra, MainArtist",
+            "album": {"title": "Star Wars"},
+            "duration": 300,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Boston Pops Orchestra");
+        assert_eq!(
+            track.artist_id, None,
+            "aucun nœud ne porte ce nom : rendre 333 dirigerait vers John Williams"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE. La règle ne se vérifie pas cas par cas : dès
+    /// qu'un identifiant est rendu, un nœud du JSON doit porter à la fois cet
+    /// identifiant ET, mot pour mot, le nom affiché. Ce test rejoue la règle
+    /// sur toutes les formes rencontrées jusqu'ici ; toute évolution de la
+    /// chaîne de priorité (#1407) qui désaccorderait nom et identifiant le
+    /// fait tomber.
+    #[test]
+    fn tout_identifiant_rendu_appartient_au_nom_affiche() {
+        let cas = [
+            json!({
+                "id": 1, "title": "T",
+                "performer": {"id": 111, "name": "Frédéric Chopin"},
+                "composer": {"id": 111, "name": "Frédéric Chopin"},
+                "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+                "album": {"artist": {"id": 222, "name": "Martha Argerich"}},
+            }),
+            json!({
+                "id": 2, "title": "T",
+                "performer": {"id": 333, "name": "John Williams"},
+                "performers": "John Williams, Composer - Boston Pops Orchestra, Orchestra, MainArtist",
+                "album": {"title": "Star Wars"},
+            }),
+            json!({
+                "id": 3, "title": "T",
+                "performer": {"id": 444, "name": "Ludovico Einaudi"},
+                "composer": {"id": 444, "name": "Ludovico Einaudi"},
+                "performers": "Ludovico Einaudi, Composer, MainArtist, Piano",
+                "album": {"artist": {"id": 555, "name": "Various Artists"}},
+            }),
+            json!({
+                "id": 4, "title": "T",
+                "performer": {"id": 666, "name": "Jean Sibelius"},
+                "composer": {"id": 666, "name": "Jean Sibelius"},
+                "album": {"artist": {"id": 777, "name": "Hilary Hahn"}},
+            }),
+            json!({
+                "id": 5, "title": "T",
+                "artist": {"id": 888, "name": "The Cure"},
+                "album": {"artist": {"id": 999, "name": "The Cure"}},
+            }),
+            json!({"id": 6, "title": "T", "album": {"title": "Sans artiste"}}),
+        ];
+
+        for item in cas {
+            let piste = QobuzService::map_track(&item);
+            let Some(ref id) = piste.artist_id else {
+                continue;
+            };
+            let accorde = [
+                &item["performer"],
+                &item["artist"],
+                &item["album"]["artist"],
+            ]
+            .into_iter()
+            .any(|n| {
+                n["name"].as_str() == Some(piste.artist.as_str())
+                    && n["id"].as_u64().map(|v| v.to_string()).as_deref() == Some(id.as_str())
+            });
+            assert!(
+                accorde,
+                "artist_id={id} rendu pour « {} » sans nœud qui porte les deux",
+                piste.artist
+            );
+        }
     }
 
     /// La chaîne de rôles tolère un nom d'interprète contenant une virgule.
