@@ -163,6 +163,20 @@ pub struct DlnaOutput {
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
     position_extrapolee: AtomicBool,
+    /// Durée que TUNE connaît pour une URI donnée, depuis sa bibliothèque.
+    ///
+    /// Le mode silence n'a que l'évènement pour connaître la durée, et un
+    /// renderer qui ne pousse pas `CurrentTrackDuration` la laisserait à zéro —
+    /// une TROISIÈME dégradation, celle-là non annoncée. Or Tune connaît la
+    /// durée avant même d'envoyer l'URI : il n'a aucune raison de la demander
+    /// à l'appareil.
+    ///
+    /// **Appariée à son URI, jamais servie seule.** Une durée de la piste
+    /// précédente appliquée à la suivante ferait pire que zéro : elle
+    /// déclencherait la garde « position au-delà de la fin » du sondeur au
+    /// milieu du morceau. Le couple n'est donc utilisé que si l'URI en cours
+    /// est bien celle qu'il décrit.
+    duree_annoncee: tokio::sync::Mutex<Option<(String, u64)>>,
 }
 
 /// Au bout de combien de temps de contradiction entre l'état poussé et la
@@ -272,6 +286,7 @@ impl DlnaOutput {
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             position_extrapolee: AtomicBool::new(false),
+            duree_annoncee: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -399,6 +414,26 @@ impl DlnaOutput {
             avance,
             uri,
         };
+    }
+
+    /// Retient la durée que Tune connaît pour cette URI (voir
+    /// [`DlnaOutput::duree_annoncee`]).
+    async fn annoncer_duree(&self, url: &str, duration_ms: Option<u64>) {
+        if let Some(d) = duration_ms.filter(|d| *d > 0) {
+            *self.duree_annoncee.lock().await = Some((url.to_string(), d));
+        }
+    }
+
+    /// Durée connue pour l'URI en cours, si c'est bien celle qu'on a annoncée.
+    async fn duree_connue_pour(&self, uri: Option<&String>) -> Option<u64> {
+        let annoncee = self.duree_annoncee.lock().await;
+        let (url, d) = annoncee.as_ref()?;
+        match uri {
+            Some(u) if u == url => Some(*d),
+            // Sans URI en cours, on ne peut pas apparier : on préfère ne rien
+            // dire à dire la durée d'une autre piste.
+            _ => None,
+        }
     }
 
     /// Position extrapolée du mode « silence », et entretien de l'ancre.
@@ -1218,6 +1253,7 @@ impl OutputTarget for DlnaOutput {
         // pris avant que le renderer ait la piste ne décrirait rien.
         self.ancrer_position(0, true, Some(media.url.to_string()))
             .await;
+        self.annoncer_duree(media.url, media.duration_ms).await;
         self.subscribe_events().await;
         Ok(())
     }
@@ -1415,7 +1451,10 @@ impl OutputTarget for DlnaOutput {
             return Ok(OutputStatus {
                 state: etat,
                 position_ms,
-                duration_ms: evt_duree.unwrap_or(0),
+                duration_ms: match evt_duree {
+                    Some(d) => d,
+                    None => self.duree_connue_pour(evt_uri.as_ref()).await.unwrap_or(0),
+                },
                 volume,
                 muted: evt_muted.unwrap_or_else(|| self.muted.load(Ordering::Relaxed)),
                 current_uri: evt_uri,
@@ -1602,6 +1641,11 @@ impl OutputTarget for DlnaOutput {
             warn!(device = %self.name, response = %resp, "dlna_set_next_rejected");
             return Err(format!("SetNextAVTransportURI rejected: {resp}"));
         }
+        // Chemin SŒUR du `play_media` : en gapless, le renderer passe à la
+        // piste suivante tout seul et l'URI change sans repasser par là-bas.
+        // Sans cette ligne, le mode silence retomberait à zéro sur la durée dès
+        // la deuxième piste d'une file.
+        self.annoncer_duree(media.url, media.duration_ms).await;
         info!(device = %self.name, url = media.url, "dlna_set_next");
         Ok(())
     }

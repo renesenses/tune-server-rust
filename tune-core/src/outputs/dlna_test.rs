@@ -79,6 +79,8 @@ mod tests {
         /// différer volontairement de `transport_state`, celui qu'il rend en
         /// SOAP : c'est le renderer qui ment par évènement.
         etat_pousse: Arc<Mutex<String>>,
+        /// Le renderer n'émet PAS `CurrentTrackDuration` dans son `LastChange`.
+        duree_jamais_poussee: Arc<AtomicBool>,
         /// Quand c'est `Some`, `SetVolume` est REFUSÉ avec ce code UPnP.
         ///
         /// C'est la panne d'Eric (#1393, fil forum) : un renderer Diretta et un
@@ -122,6 +124,7 @@ mod tests {
                 renouvellement_refuse: Arc::new(AtomicBool::new(false)),
                 subscribe_count: Arc::new(AtomicU32::new(0)),
                 etat_pousse: Arc::new(Mutex::new("PLAYING".into())),
+                duree_jamais_poussee: Arc::new(AtomicBool::new(false)),
                 volume_refus_upnp: Arc::new(Mutex::new(None)),
             }
         }
@@ -135,8 +138,15 @@ mod tests {
     /// Le document `LastChange` d'`AVTransport` tel qu'un renderer l'envoie :
     /// un XML ÉCHAPPÉ dans le texte de la propriété, pas un XML imbriqué.
     fn propertyset_avtransport(etat: &str, uri: &str, duree: &str) -> String {
+        // Une durée vide = renderer qui n'émet PAS `CurrentTrackDuration`.
+        // La spec ne l'impose pas, et certains s'en dispensent.
+        let duree_xml = if duree.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<CurrentTrackDuration val="{duree}"/>"#)
+        };
         let interieur = format!(
-            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{etat}"/><CurrentTrackURI val="{uri}"/><CurrentTrackDuration val="{duree}"/></InstanceID></Event>"#
+            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{etat}"/><CurrentTrackURI val="{uri}"/>{duree_xml}</InstanceID></Event>"#
         );
         let echappe = interieur
             .replace('&', "&amp;")
@@ -202,6 +212,11 @@ mod tests {
         }
         if let Some(cb) = callback_de(&entetes) {
             let etat = state.etat_pousse.lock().await.clone();
+            let duree = if state.duree_jamais_poussee.load(Ordering::Relaxed) {
+                ""
+            } else {
+                "0:05:00"
+            };
             // Le `NOTIFY` initial part AVANT que la réponse au `SUBSCRIBE` ne
             // soit rendue — l'ordre le plus dur, et un ordre que GENA autorise :
             // rien n'oblige l'appareil à attendre que notre client ait fini de
@@ -213,7 +228,7 @@ mod tests {
             // course une fois sur deux et se dirait vert.
             notifier(
                 &cb,
-                propertyset_avtransport(&etat, "http://tune.test/piste.flac", "0:05:00"),
+                propertyset_avtransport(&etat, "http://tune.test/piste.flac", duree),
             )
             .await;
         }
@@ -1627,6 +1642,71 @@ mod tests {
         let statut = sortie.get_status().await.expect("get_status");
         assert_eq!(statut.state, TransportState::Playing);
         assert_eq!((statut.volume * 100.0).round() as u32, 42);
+        handle.abort();
+    }
+
+    /// Un renderer qui ne pousse PAS sa durée ne doit pas rendre le mode
+    /// silence aveugle sur ce point : Tune connaît la durée de la piste avant
+    /// même de lui envoyer l'URI.
+    ///
+    /// Sans ce repli, l'option opt-in dégraderait une TROISIÈME chose sans
+    /// l'annoncer — et une durée à zéro désarme la garde de fin de piste du
+    /// sondeur.
+    #[tokio::test]
+    async fn le_silence_tient_la_duree_que_tune_connait_quand_l_appareil_se_tait() {
+        let state = MockState::default();
+        state.duree_jamais_poussee.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        // L'URI ANNONCÉE par le renderer dans son évènement est celle-ci : le
+        // couple (URI, durée) ne sert que s'il s'apparie.
+        let url = "http://tune.test/piste.flac".to_string();
+        let mut media = media_locatelli(&url);
+        media.duration_ms = Some(487_560);
+        sortie.play_media(&media).await.expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            statut.duration_ms, 487_560,
+            "durée de la bibliothèque, faute d'une durée poussée"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            0,
+            "et sans aller la demander à l'appareil : le silence reste le silence"
+        );
+        handle.abort();
+    }
+
+    /// La durée d'une piste ne doit JAMAIS être servie pour une autre : elle
+    /// ferait sauter la garde « position au-delà de la fin » en plein morceau.
+    #[tokio::test]
+    async fn une_duree_annoncee_ne_vaut_que_pour_son_uri() {
+        let state = MockState::default();
+        state.duree_jamais_poussee.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        // On joue une piste dont l'URL n'est PAS celle que le renderer
+        // annoncera dans son évènement : l'appariement doit échouer.
+        let mut media = media_locatelli("http://tune.test/AUTRE-piste.flac");
+        media.duration_ms = Some(487_560);
+        sortie.play_media(&media).await.expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            statut.current_uri.as_deref(),
+            Some("http://tune.test/piste.flac"),
+            "c'est bien une AUTRE piste que le renderer dit tenir"
+        );
+        assert_eq!(
+            statut.duration_ms, 0,
+            "durée inconnue vaut mieux que la durée d'une autre piste"
+        );
         handle.abort();
     }
 }
