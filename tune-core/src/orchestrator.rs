@@ -473,6 +473,22 @@ fn spawn_paced_levels_forwarder(
                     // servi — elle tombe sous 2048 sur une fenêtre courte.
                     "sample_rate": raw.sample_rate,
                     "spectrum_fft_size": lvl.spectrum_fft_size,
+                    // Trames de signal RÉEL analysées, et résolution qui en
+                    // découle — champs ADDITIFS (#2866). `spectrum_fft_size`
+                    // seul MENTAIT sur la finesse : à 44,1 kHz une fenêtre de
+                    // 1764 trames est zéro-paddée à 2048, ce qui resserre les
+                    // raies à 21,5 Hz sans rien apprendre de plus que les
+                    // 25,0 Hz que porte le signal. Un client qui gradue son
+                    // axe doit lire `spectrum_resolution_hz`.
+                    "spectrum_frames": lvl.spectrum_frames,
+                    "spectrum_resolution_hz": lvl.spectrum_resolution_hz,
+                    // Bande par bande : l'analyse la sépare-t-elle de ses
+                    // voisines ? Les bandes du grave sont plus étroites que la
+                    // résolution — 20,0 à 24,8 Hz pour la première, soit 4,8 Hz
+                    // de large contre 25 Hz de résolution. Elles existent, mais
+                    // elles recopient la raie de leur voisine : un client
+                    // honnête ne leur pose pas de repère propre.
+                    "spectrum_resolved": &*lvl.spectrum_resolved,
                 }),
             );
             next_emit += window;
