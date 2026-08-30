@@ -2367,10 +2367,17 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// `wValidBitsPerSample` is used instead of the container size.
 ///
 /// The `bit_depth` returned is the *effective* bit depth for PCM
-/// interpretation:
-///   - PCM integer: `wBitsPerSample` (or `wValidBitsPerSample` for EXTENSIBLE)
+/// interpretation, et il est **toujours** l'un de `0`, `16`, `24`, `32` :
+///   - PCM entier : la largeur du CONTENEUR (`nBlockAlign / nChannels`),
+///     validée par [`pcm_container_bit_depth`] ; tout autre conteneur rend
+///     `None` et part au décodeur symphonia ;
 ///   - IEEE Float 32-bit: returns 0 as a sentinel so `pcm_bytes_to_f32`
 ///     uses the float path.
+///
+/// Cet ensemble fermé est un contrat, pas une commodité : `bytes_per_sample`,
+/// `frame_bytes` et toutes les conversions d'échantillons du fichier
+/// n'énumèrent que ces valeurs, et leurs branches par défaut se contredisent
+/// (bruit ici, silence là).
 /// Whether a failed header read should be retried rather than treated as a hard
 /// failure. When a gapless/next track's transcode session has just started, its
 /// WAV header isn't emitted yet, so the first reads return `TimedOut`/
@@ -2383,6 +2390,45 @@ fn header_read_should_retry(kind: std::io::ErrorKind) -> bool {
         kind,
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
     )
+}
+
+/// Profondeur PCM entière que le reste du fichier sait réellement décoder,
+/// déduite du CONTENEUR (`nBlockAlign / nChannels`) et non des bits annoncés.
+///
+/// Tout ce qui suit — `bytes_per_sample`, `frame_bytes`, l'alignement des
+/// trames, [`pcm_bytes_to_f32`], [`pcm_bytes_to_native_i32`],
+/// [`native_i32_to_pcm_bytes`], [`f32_to_native_i32`],
+/// [`NativePcmRing::pop_pcm_bytes`] — n'énumère que 16, 24 et 32 bits (plus le
+/// sentinelle 0 pour le flottant). Une profondeur en dehors de cet ensemble
+/// n'est donc pas « moins précise » : elle est **incohérente**, et de deux
+/// façons opposées selon le chemin.
+///
+/// - `pcm_bytes_to_f32` retombe sur la lecture 16 bits : elle consomme deux
+///   octets par échantillon là où l'appelant en a compté `bit_depth / 8`.
+///   Chaque trame est alors lue au mauvais décalage, et la sortie locale rend
+///   du **bruit blanc avec la musique derrière** — exactement le symptôme
+///   d'un désaccord de format sur une chaîne numérique.
+/// - `pcm_bytes_to_native_i32` et `f32_to_native_i32` rendent un `Vec` vide :
+///   le chemin exclusif Windows, lui, rend du **silence**.
+///
+/// Un conteneur nul (`nBlockAlign < nChannels`, en-tête corrompu) est le pire
+/// des cas : il produit `0`, qui est précisément le sentinelle « IEEE float
+/// 32 bits ». Du PCM entier serait alors réinterprété comme des flottants —
+/// du bruit à pleine échelle vers un amplificateur.
+///
+/// On refuse donc l'en-tête plutôt que de le mal décoder. `None` renvoie le
+/// flux au décodeur symphonia, ce que ce fichier fait déjà pour le flottant
+/// 64 bits qu'il ne sait pas porter non plus.
+fn pcm_container_bit_depth(block_align: u16, channels: u16) -> Option<u16> {
+    if channels == 0 {
+        return None;
+    }
+    match block_align / channels {
+        2 => Some(16),
+        3 => Some(24),
+        4 => Some(32),
+        _ => None,
+    }
 }
 
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
@@ -2415,19 +2461,21 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
             channels = u16::from_le_bytes([fmt[2], fmt[3]]);
             sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
             let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
-            let w_bits_per_sample = u16::from_le_bytes([fmt[14], fmt[15]]);
+            // `wBitsPerSample` n'est plus lu : c'est une ANNONCE, pas un pas
+            // d'avancement. Seul `nBlockAlign` dit ce que le flux fait
+            // réellement, et c'est lui que [`pcm_container_bit_depth`] valide.
 
             match format_tag {
                 WAVE_FORMAT_PCM => {
                     // Use nBlockAlign to determine the actual byte width per
                     // sample, which may differ from wBitsPerSample / 8 in
                     // edge cases (e.g. 20-bit in 24-bit container).
-                    if channels > 0 {
-                        let container_bytes = block_align / channels;
-                        bit_depth = (container_bytes * 8).min(32);
-                    } else {
-                        bit_depth = w_bits_per_sample;
-                    }
+                    //
+                    // `.min(32)` mentait sur le pas d'avancement : un conteneur
+                    // de 8 octets était annoncé 32 bits et lu à la moitié de sa
+                    // largeur, et un conteneur nul produisait le sentinelle
+                    // flottant. Voir [`pcm_container_bit_depth`].
+                    bit_depth = pcm_container_bit_depth(block_align, channels)?;
                 }
                 WAVE_FORMAT_IEEE_FLOAT => {
                     // Signal to pcm_bytes_to_f32 that the data is already
@@ -2488,24 +2536,29 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
                             // annoncée signale un en-tête incohérent, et on
                             // suit alors le conteneur, qui est ce que le flux
                             // fait réellement.
-                            if channels > 0 {
-                                let container_bytes = block_align / channels;
-                                debug_assert!(
-                                    valid_bits <= container_bytes * 8,
-                                    "wValidBitsPerSample > conteneur : en-tête incohérent"
-                                );
-                                bit_depth = match container_bytes {
-                                    0..=2 => 16,
-                                    3 => 24,
-                                    _ => 32,
-                                };
-                            } else {
-                                bit_depth = w_bits_per_sample;
-                            }
+                            //
+                            // Les bornes ouvertes `0..=2 => 16` et `_ => 32`
+                            // rattrapaient un conteneur absurde en ANNONÇANT un
+                            // pas que le flux ne fait pas : un conteneur d'un
+                            // octet lu par pas de deux, un conteneur de huit lu
+                            // par pas de quatre. L'alignement des trames est
+                            // faux dès le premier échantillon, et la sortie
+                            // locale rend du bruit. Un conteneur hors 2/3/4
+                            // octets n'est pas rattrapable ici : on rend `None`
+                            // et symphonia le décode.
+                            let container_bytes = block_align / channels.max(1);
+                            debug_assert!(
+                                valid_bits <= container_bytes * 8,
+                                "wValidBitsPerSample > conteneur : en-tête incohérent"
+                            );
+                            bit_depth = pcm_container_bit_depth(block_align, channels)?;
                         }
                     } else {
-                        // Truncated EXTENSIBLE — fall back to container size
-                        bit_depth = w_bits_per_sample;
+                        // Truncated EXTENSIBLE — fall back to container size.
+                        // `wBitsPerSample` n'est ici qu'une annonce : elle peut
+                        // valoir 20 ou 0, que rien en aval ne sait décoder.
+                        // C'est `nBlockAlign` qui dit ce que le flux fait.
+                        bit_depth = pcm_container_bit_depth(block_align, channels)?;
                     }
                 }
                 _ => {
@@ -8225,6 +8278,212 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes()[..bytes_per_sample]);
         }
         bytes
+    }
+
+    /// Construit un en-tête WAV canonique : `RIFF/WAVE`, un `fmt ` de
+    /// `fmt_chunk_size` octets, puis un `data` vide. `ext` porte
+    /// `(wValidBitsPerSample, sous-format)` quand le `fmt ` est assez long.
+    fn wav_header(
+        format_tag: u16,
+        channels: u16,
+        sample_rate: u32,
+        block_align: u16,
+        bits_per_sample: u16,
+        fmt_chunk_size: u32,
+        ext: Option<(u16, u16)>,
+    ) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&format_tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&sample_rate.to_le_bytes());
+        fmt.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits_per_sample.to_le_bytes());
+        if let Some((valid_bits, sub_format)) = ext {
+            fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+            fmt.extend_from_slice(&valid_bits.to_le_bytes());
+            fmt.extend_from_slice(&0x0000_0003u32.to_le_bytes()); // dwChannelMask
+            fmt.extend_from_slice(&sub_format.to_le_bytes());
+            fmt.extend_from_slice(&[0u8; 14]); // reste du GUID de sous-format
+        }
+        fmt.resize(fmt_chunk_size as usize, 0);
+
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36u32 + fmt_chunk_size).to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&fmt_chunk_size.to_le_bytes());
+        header.extend_from_slice(&fmt);
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.resize(header.len().max(44), 0);
+        header
+    }
+
+    /// Le pas d'avancement que le RESTE du fichier appliquera pour cette
+    /// profondeur : `bytes_per_sample` tel que la boucle d'alimentation le
+    /// calcule (`local.rs`, sentinelle 0 = flottant 32 bits).
+    fn declared_stride(bit_depth: u16) -> usize {
+        if bit_depth == 0 {
+            4
+        } else {
+            usize::from(bit_depth / 8)
+        }
+    }
+
+    /// Les profondeurs que l'analyseur d'en-tête est autorisé à rendre sont
+    /// exactement celles que le décodeur d'échantillons sait lire.
+    ///
+    /// Ce n'est pas un détail de forme. Une profondeur hors de cet ensemble se
+    /// propage jusqu'à l'ampli : `pcm_bytes_to_f32` retombe sur un pas de deux
+    /// octets là où l'appelant en a compté `bit_depth / 8`, et la sortie rend
+    /// du bruit blanc avec la musique derrière.
+    #[test]
+    fn un_en_tete_wav_ne_rend_que_des_profondeurs_que_le_decodeur_sait_lire() {
+        // Sous-format PCM / IEEE float des en-têtes EXTENSIBLE.
+        const SUB_PCM: u16 = 1;
+        const SUB_FLOAT: u16 = 3;
+
+        // --- Ce qui doit continuer de passer, à toutes les profondeurs ---
+        let acceptes: [(&str, Vec<u8>, u16); 6] = [
+            ("PCM 16", wav_header(1, 2, 44_100, 4, 16, 16, None), 16),
+            ("PCM 24", wav_header(1, 2, 96_000, 6, 24, 16, None), 24),
+            ("PCM 32", wav_header(1, 2, 192_000, 8, 32, 16, None), 32),
+            (
+                "IEEE float 32",
+                wav_header(3, 2, 44_100, 8, 32, 16, None),
+                0,
+            ),
+            (
+                "EXTENSIBLE 24 dans 32",
+                wav_header(0xFFFE, 2, 384_000, 8, 32, 40, Some((24, SUB_PCM))),
+                32,
+            ),
+            (
+                "EXTENSIBLE float 32",
+                wav_header(0xFFFE, 2, 44_100, 8, 32, 40, Some((32, SUB_FLOAT))),
+                0,
+            ),
+        ];
+        for (etiquette, header, attendu) in acceptes {
+            let parsed = parse_wav_header(&header)
+                .unwrap_or_else(|| panic!("{etiquette} : en-tête valide refusé"));
+            assert_eq!(parsed.2, attendu, "{etiquette} : mauvaise profondeur");
+            assert_eq!(parsed.0, 2, "{etiquette} : mauvais nombre de voies");
+        }
+
+        // --- Ce qui doit être REFUSÉ plutôt que mal décodé ---
+        //
+        // `block_align = 2` sur deux voies = un conteneur d'UN octet (WAV
+        // 8 bits, licite). L'ancien code rendait 8 : le pas annoncé valait un
+        // octet, la lecture en consommait deux.
+        //
+        // `block_align = 0` est le pire : l'ancien calcul rendait 0, qui est
+        // précisément le sentinelle « IEEE float 32 bits ». Du PCM entier
+        // aurait été réinterprété comme des flottants.
+        let refuses: [(&str, Vec<u8>); 6] = [
+            (
+                "PCM conteneur 1 octet",
+                wav_header(1, 2, 44_100, 2, 8, 16, None),
+            ),
+            (
+                "PCM conteneur nul",
+                wav_header(1, 2, 44_100, 0, 16, 16, None),
+            ),
+            (
+                "PCM conteneur 8 octets",
+                wav_header(1, 2, 44_100, 16, 64, 16, None),
+            ),
+            ("PCM zéro voie", wav_header(1, 0, 44_100, 4, 16, 16, None)),
+            (
+                "EXTENSIBLE conteneur 1 octet",
+                wav_header(0xFFFE, 2, 44_100, 2, 8, 40, Some((8, SUB_PCM))),
+            ),
+            (
+                "EXTENSIBLE conteneur 8 octets",
+                wav_header(0xFFFE, 2, 44_100, 16, 64, 40, Some((64, SUB_PCM))),
+            ),
+        ];
+        for (etiquette, header) in refuses {
+            assert!(
+                parse_wav_header(&header).is_none(),
+                "{etiquette} : en-tête indécodable accepté — le flux partira en bruit"
+            );
+        }
+
+        // Un EXTENSIBLE tronqué annonçait `wBitsPerSample` tel quel : 20 bits
+        // n'est décodé nulle part. C'est le conteneur qui fait foi.
+        let tronque = wav_header(0xFFFE, 2, 96_000, 6, 20, 18, None);
+        assert_eq!(
+            parse_wav_header(&tronque).map(|p| p.2),
+            Some(24),
+            "EXTENSIBLE tronqué : la profondeur doit suivre le conteneur"
+        );
+    }
+
+    /// Contre-épreuve de bout en bout : pour CHAQUE en-tête que l'analyseur
+    /// accepte, le décodeur d'échantillons doit consommer exactement le pas que
+    /// l'analyseur a annoncé.
+    ///
+    /// C'est l'invariant que la sortie locale suppose partout sans jamais le
+    /// vérifier — et sa violation est, littéralement, du bruit.
+    #[test]
+    fn le_decodeur_consomme_exactement_le_pas_annonce_par_l_en_tete() {
+        let candidats: [(&str, Vec<u8>); 9] = [
+            ("PCM 16", wav_header(1, 2, 44_100, 4, 16, 16, None)),
+            ("PCM 24", wav_header(1, 2, 96_000, 6, 24, 16, None)),
+            ("PCM 32", wav_header(1, 2, 192_000, 8, 32, 16, None)),
+            ("IEEE float 32", wav_header(3, 2, 44_100, 8, 32, 16, None)),
+            (
+                "EXTENSIBLE 24 dans 32",
+                wav_header(0xFFFE, 2, 384_000, 8, 32, 40, Some((24, 1))),
+            ),
+            (
+                "EXTENSIBLE float 32",
+                wav_header(0xFFFE, 2, 44_100, 8, 32, 40, Some((32, 3))),
+            ),
+            // Les trois pièges. S'ils sont acceptés, l'invariant doit tenir —
+            // et il ne tient pas, ce qui est tout l'objet du correctif.
+            (
+                "PCM conteneur 1 octet",
+                wav_header(1, 2, 44_100, 2, 8, 16, None),
+            ),
+            (
+                "PCM conteneur nul",
+                wav_header(1, 2, 44_100, 0, 16, 16, None),
+            ),
+            (
+                "EXTENSIBLE tronqué 20 bits",
+                wav_header(0xFFFE, 2, 96_000, 6, 20, 18, None),
+            ),
+        ];
+
+        for (etiquette, header) in candidats {
+            let Some((channels, _, bit_depth, _)) = parse_wav_header(&header) else {
+                continue; // refusé : il part au décodeur symphonia, pas au DAC.
+            };
+            let stride = declared_stride(bit_depth);
+            assert_ne!(stride, 0, "{etiquette} : pas d'avancement nul");
+            assert_ne!(
+                channels, 0,
+                "{etiquette} : zéro voie, trame de taille nulle"
+            );
+
+            // 64 trames d'octets non nuls, alignées sur le pas ANNONCÉ.
+            let frame_bytes = usize::from(channels) * stride;
+            let pcm: Vec<u8> = (0..frame_bytes * 64).map(|i| (i % 251 + 1) as u8).collect();
+            let samples = pcm_bytes_to_f32(&pcm, bit_depth);
+
+            assert_eq!(
+                samples.len() * stride,
+                pcm.len(),
+                "{etiquette} ({bit_depth} bits) : le décodeur consomme {} octets par échantillon \
+                 alors que l'en-tête en annonce {stride} — chaque trame est lue au mauvais \
+                 décalage, et la sortie locale rend du bruit",
+                pcm.len() as f64 / samples.len().max(1) as f64,
+            );
+        }
     }
 
     #[test]
