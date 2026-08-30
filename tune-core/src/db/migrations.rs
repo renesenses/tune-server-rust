@@ -1625,6 +1625,34 @@ WHERE name LIKE '%World%'
   AND rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"folk\"}]';
 ",
     },
+    Migration {
+        version: 94,
+        name: "listen_history_rang_dans_le_contexte",
+        // OU l'auditeur en etait dans l'objet qu'il avait demande.
+        //
+        // La migration 84 a pose CE QU'il avait demande (`context_type` /
+        // `context_id`). Il manquait le RANG : sans lui, « Continuer l'ecoute »
+        // peut rouvrir la bonne playlist, mais toujours a son debut. L'arbitrage
+        // rendu sur #2441 est « objet courant + position », pas l'instantane de
+        // la file entiere — pour un artiste ou un label, la file est batie par
+        // une requete qui change d'un jour a l'autre, « conserver l'ordre » n'y
+        // a aucun sens, et ecrire la file a chaque ecoute couterait un facteur
+        // dix sur le volume, pour une section d'accueil.
+        //
+        // NULL a deux sens, et un seul est « on ne sait pas » :
+        // * ligne anterieure a cette migration — inconnu, on rouvre au debut ;
+        // * ecoute en lecture ALEATOIRE — le rang est deliberement laisse vide.
+        //   Rejouer le meme tirage n'aurait pas de sens : on RE-TIRE. C'est la
+        //   seconde moitie de l'arbitrage, ecrite ici plutot que devinee a la
+        //   lecture, parce que l'etat « aleatoire » de la zone n'existe plus au
+        //   moment ou l'accueil s'affiche.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79 et 84, et
+        // l'ALTER planterait le runner en « duplicate column name » sur une
+        // base qui l'a deja.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2712,6 +2740,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // local ou une chaine de service de streaming.
     add_column_if_missing(db, "listen_history", "context_type", "TEXT");
     add_column_if_missing(db, "listen_history", "context_id", "TEXT");
+    // Rang de la piste dans cet objet (migration 94, #2441). NULL = inconnu
+    // (ligne d'avant la migration) OU tirage aleatoire, cas ou l'on RE-TIRE
+    // au lieu de rejouer le meme ordre.
+    add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -3155,6 +3187,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "resserrer_folk_dans_world_music",
         include_str!("../../migrations/postgres/045_resserrer_folk_dans_world_music.sql"),
     ),
+    // #2441 — le RANG dans l'objet demandé. La 037 avait posé CE QUE
+    // l'auditeur avait demandé ; sans le rang, « Continuer l'écoute » rouvre
+    // la bonne playlist mais toujours à sa première piste. NULL vaut aussi
+    // « on re-tire » : en lecture aléatoire, le rang n'est délibérément pas
+    // écrit.
+    (
+        46,
+        "listen_history_rang_dans_le_contexte",
+        include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3438,7 +3480,12 @@ mod tests {
                 rusqlite::params![SUR_MESURE],
             )
             .unwrap();
-            conn.execute("DELETE FROM _migrations WHERE version = 93", [])
+            // `>= 93` et non `= 93` : le runner repart de MAX(version), donc
+            // effacer la seule 93 ne la ferait PAS rejouer dès qu'une
+            // migration ultérieure existe — le test se serait tu en croyant
+            // prouver quelque chose. Il ne dépend plus de sa place dans la
+            // liste (#2441, migration 94).
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
                 .unwrap();
         }
         run_migrations(&db).unwrap();
@@ -3477,7 +3524,9 @@ mod tests {
                 rusqlite::params![LIVREE],
             )
             .unwrap();
-            conn.execute("DELETE FROM _migrations WHERE version = 93", [])
+            // Même raison qu'au-dessus : c'est le plancher MAX(version) qui
+            // décide de ce qui rejoue.
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
                 .unwrap();
         }
         run_migrations(&db).unwrap();

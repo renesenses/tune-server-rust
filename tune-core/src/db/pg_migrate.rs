@@ -447,7 +447,8 @@ CREATE TABLE IF NOT EXISTS listen_history (
     album_id TEXT,
     profile_id TEXT,
     context_type TEXT,
-    context_id TEXT
+    context_id TEXT,
+    context_position TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -880,6 +881,9 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
 -- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
+-- listen_history: ou l'auditeur en etait dans cet objet (SQLite migration v94,
+-- #2441). TEXT comme album_id / profile_id ici : ce schema porte tout en TEXT.
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';
