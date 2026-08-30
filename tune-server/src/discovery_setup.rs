@@ -8,7 +8,7 @@ use tune_core::discovery::renderer_identity::{
     IdentityVerdict, RendererIdentity, compare_at_same_location,
 };
 use tune_core::outputs::OutputRegistry;
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use tune_core::event_bus::EventBus;
 use tune_core::event_types::EventType;
@@ -26,7 +26,36 @@ use crate::state::AppState;
 /// token became `PORThttp`, the URL failed to parse, and every SOAP call died with
 /// `soap send: builder error` (Yves: no sound, UI stuck on "loading title"). This
 /// mirrors the MediaServer handling in `ssdp.rs`.
-fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
+/// Les deux services DLNA dont Tune sait lire les évènements : l'état du
+/// transport et le volume. Le `ConnectionManager` n'a rien à pousser qui nous
+/// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
+/// rien.
+pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
+/// du descripteur.
+///
+/// Passe par [`resolve_control_url`] pour la MÊME raison que les `controlURL` :
+/// une radio Frontier Silicon (Ruark, Stream 94i) publie des URL déjà absolues,
+/// que concaténer à `host:port` rendrait injoignables. Le piège avait déjà
+/// mordu sur les URL de contrôle ; le corriger d'un seul côté l'aurait
+/// simplement déplacé.
+pub(crate) fn urls_evenements_dlna(
+    host: &str,
+    port: u16,
+    brut: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    SERVICES_EVENEMENTS_DLNA
+        .iter()
+        .filter_map(|svc| {
+            brut.get(*svc)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| ((*svc).to_string(), resolve_control_url(host, port, p)))
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
     } else {
@@ -286,7 +315,7 @@ fn persist_known_renderer(
 pub fn spawn_ssdp_handler(
     state: &AppState,
     config: &TuneConfig,
-    oh_listener: Option<Arc<OpenHomeEventListener>>,
+    oh_listener: Option<Arc<UpnpEventListener>>,
 ) {
     let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
     {
@@ -525,7 +554,7 @@ async fn handle_ssdp_discovered(
     db: &Arc<dyn DbBackend>,
     config: &TuneConfig,
     event_bus: &Arc<tune_core::event_bus::EventBus>,
-    oh_listener: &Option<Arc<OpenHomeEventListener>>,
+    oh_listener: &Option<Arc<UpnpEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
     _license: &Arc<tune_core::license::LicenseManager>,
     seen_hosts: &mut std::collections::HashSet<String>,
@@ -646,6 +675,14 @@ async fn handle_ssdp_discovered(
                 );
             }
             let delay = crate::config::resolve_play_delay(db, config, &dev.id, &dev.name);
+            let evt_urls = dev
+                .capabilities
+                .get("event_sub_urls")
+                .and_then(|v| {
+                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
+                        .ok()
+                })
+                .unwrap_or_default();
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                 dev.name.clone(),
                 dev.id.clone(),
@@ -654,7 +691,12 @@ async fn handle_ssdp_discovered(
                 rc,
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                oh_listener.clone(),
+                urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id));
             let mut reg = outputs.lock().await;
             register_discovered_output(
                 &mut reg,
@@ -963,15 +1005,18 @@ pub async fn reregister_known_renderers(state: &AppState) {
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
 
-    // No OpenHome event listener here: the live SSDP handler's listener isn't
-    // reachable from AppState, and creating a second one would race it for the
-    // fixed :8890 bind at boot (`OpenHomeEventListener::new` falls back to an
-    // ephemeral port when 8890 is taken) — a subtle regression on the primary
-    // listener. DLNA renderers (the #1126 case, e.g. Cyrus Stream X2) ignore the
-    // listener entirely; an OpenHome renderer re-attached here gets its push
-    // events back on its next SSDP advertise (which re-registers it with the real
-    // listener) and polls its state until then.
-    let oh_listener: Option<Arc<OpenHomeEventListener>> = None;
+    // LE récepteur du processus, pas un second.
+    //
+    // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
+    // atteignable depuis `AppState`, et en créer un autre aurait couru contre
+    // lui pour le port fixe 8890 (`UpnpEventListener::new` retombe alors sur un
+    // port éphémère). L'argument tenait tant que DLNA ignorait les évènements ;
+    // depuis #2263 il ne les ignore plus, et un renderer récupéré ICI — le cas
+    // #1126, le Cyrus Stream X2 qui ne répond plus au multicast après un
+    // redémarrage — serait resté le seul à sonder à trois actions par seconde.
+    // `create_oh_listener` est mémoïsé : il rend le récepteur déjà en place, ou
+    // le crée si ce chemin arrive le premier.
+    let oh_listener: Option<Arc<UpnpEventListener>> = crate::startup::create_oh_listener().await;
 
     let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut recovered = 0usize;
@@ -3037,7 +3082,7 @@ mod retrait_serveur_multimedia {
 /// #1281 — dédoublonnage des identités SSDP d'un même appareil physique.
 #[cfg(test)]
 mod dedup_identites_ssdp_1281 {
-    use super::OpenHomeEventListener;
+    use super::UpnpEventListener;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
 
     /// Un renderer SSDP synthétique complet : les URLs de service suffisent à
@@ -3056,7 +3101,7 @@ mod dedup_identites_ssdp_1281 {
     /// donc pas masquer le défaut.
     async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
         let mut seen = std::collections::HashSet::new();
-        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
         super::handle_ssdp_discovered(
             dev,
             &state.outputs,
@@ -3151,7 +3196,7 @@ mod dedup_identites_ssdp_1281 {
 /// aucun des deux ne peut rester vert sur un correctif mort.
 #[cfg(test)]
 mod appareils_ignores_1280 {
-    use super::OpenHomeEventListener;
+    use super::UpnpEventListener;
     use tune_core::db::ignored_device_repo::{IgnoredDevice, IgnoredDeviceRepo};
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
 
@@ -3168,7 +3213,7 @@ mod appareils_ignores_1280 {
     /// deux scans réels.
     async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
         let mut seen = std::collections::HashSet::new();
-        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
         super::handle_ssdp_discovered(
             dev,
             &state.outputs,
