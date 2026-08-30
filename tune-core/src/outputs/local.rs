@@ -709,9 +709,25 @@ pub struct AudioDevice {
     pub is_default: bool,
     pub max_channels: u16,
     pub sample_rates: Vec<u32>,
+    /// `sample_rates` a-t-il été confronté au matériel ?
+    ///
+    /// Faux sur WASAPI, où cpal fabrique la liste sans rien demander au pilote
+    /// (#2862) : l'écran ne doit pas présenter ces cadences comme une capacité
+    /// constatée. Voir [`sample_rate_evidence`].
+    ///
+    /// `serde(default)` rend `true` : les enregistrements écrits avant ce champ
+    /// ne peuvent plus être requalifiés, et le champ n'est de toute façon
+    /// jamais persisté — il n'existe que sur le fil de `GET
+    /// /api/v1/devices/audio`.
+    #[serde(default = "sample_rates_measured_default")]
+    pub sample_rates_measured: bool,
     /// The audio backend this device was enumerated from.
     #[serde(default)]
     pub backend: String,
+}
+
+fn sample_rates_measured_default() -> bool {
+    true
 }
 
 /// Regroupe deux variantes Linux qui représentent le même nom de périphérique.
@@ -918,7 +934,13 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                                 );
                                 probe_device_fallback_caps(&device, &raw_name)
                             } else {
-                                // Enumerated caps are real → safe to collapse on.
+                                // Ces capacités viennent bien d'une énumération —
+                                // ce qui ne veut PAS dire qu'elles ont été
+                                // mesurées : sur WASAPI l'énumération est
+                                // fabriquée (#2862, voir `sample_rate_evidence`).
+                                // `caps_reliable` répond seulement « pas la
+                                // supposition de dernier recours », ce qui reste
+                                // vrai ici et suffit au dédoublonnage Linux.
                                 (max_ch, rates, true)
                             }
                         }
@@ -935,6 +957,9 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 // caps_reliable was only read by the removed (name, caps) collapse
                 // (Linux collapses by name; Windows/macOS now keep every device).
                 let _ = caps_reliable;
+                // Ce que vaut la liste qu'on s'apprête à publier. Sur WASAPI
+                // elle n'a jamais été confrontée au matériel (#2862).
+                let rates_evidence = sample_rate_evidence(&host_name);
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
                 // output repeatedly with varying caps, so collapse by NAME and
@@ -988,6 +1013,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     is_default,
                     max_channels,
                     sample_rates = ?sample_rates,
+                    sample_rates_measured = rates_evidence.is_measured(),
                     "local_audio_device_found"
                 );
 
@@ -997,6 +1023,7 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     is_default,
                     max_channels,
                     sample_rates,
+                    sample_rates_measured: rates_evidence.is_measured(),
                     backend: host_name.to_string(),
                 });
                 #[cfg(target_os = "linux")]
@@ -5398,6 +5425,9 @@ impl OutputTarget for LocalOutput {
 
             // ------- Open cpal device (shared mode) -------
             let host = select_host(&audio_backend);
+            // Nom de la VARIANTE cpal ("Wasapi", "Alsa", "Asio", "CoreAudio").
+            // `&'static str`, donc aucun emprunt sur `host`.
+            let host_id_name: &'static str = host.id().name();
             let Some((device, fell_back)) =
                 find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
             else {
@@ -5450,16 +5480,34 @@ impl OutputTarget for LocalOutput {
                     .filter(|c| c.sample_rate == sample_rate)
                 {
                     // Device SUPPORTS the source rate even though its current
-                    // default differs — open at the source rate for bit-perfect
-                    // output and to avoid an extreme realtime resample.  A DSD256
+                    // default differs — open at the source rate to avoid an
+                    // extreme realtime resample.  A DSD256
                     // file decodes to 352.8kHz; on a DAC left at 44.1kHz by the
                     // OS the old code resampled 352.8k→44.1k in real time, the
                     // sinc resampler underran and no sound came out (Cyrille,
                     // FiiO K3 which natively supports 352.8kHz, iFi Neo iDSD).
+                    //
+                    // « SUPPORTS » n'a pas la même valeur partout, et ce chemin
+                    // ne peut pas promettre le bit-perfect sur toutes les
+                    // plateformes (#2862). Le filtre ci-dessus est
+                    // TAUTOLOGIQUE quand l'énumération est fabriquée :
+                    // `find_matching_config` recopie la cadence demandée dans le
+                    // `StreamConfig` qu'il rend, donc `c.sample_rate ==
+                    // sample_rate` est vrai par construction dès qu'une plage
+                    // quelconque a été retenue. Sur WASAPI toutes les plages
+                    // sont retenues sans test, la branche est donc TOUJOURS
+                    // prise, `needs_resample` reste faux, rubato ne tourne
+                    // jamais, et c'est le moteur Windows qui convertit derrière
+                    // (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Sur ALSA / ASIO /
+                    // CoreAudio la plage vient d'une interrogation du pilote et
+                    // la branche dit bien ce qu'elle prétend.
+                    let rate_evidence = sample_rate_evidence(host_id_name);
                     info!(
                         source_sr = sample_rate,
                         device_default_sr = ?default_sr,
-                        "local_audio_open_at_source_rate_supported"
+                        backend = %host_id_name,
+                        rate_support_measured = rate_evidence.is_measured(),
+                        "local_audio_open_at_source_rate_reported_supported"
                     );
                     // macOS: cpal's CoreAudio backend does NOT switch the device's
                     // hardware nominal rate for output streams (see the note
@@ -7470,6 +7518,61 @@ fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u3
     }
 }
 
+/// Ce que vaut la liste de cadences qu'une sortie locale annonce.
+///
+/// `supported_output_configs()` de cpal n'a pas le même sens selon l'hôte :
+///
+/// - **ALSA** interroge le pilote cadence par cadence (`hw_params.test_rate`)
+///   et écarte celles qu'il refuse ;
+/// - **ASIO** fait de même (`driver.can_sample_rate`, `continue` si non) ;
+/// - **WASAPI** ne demande rien à personne. `is_format_supported` rend
+///   `Ok(true)` sans regarder le format — commentaire d'origine dans
+///   `cpal-0.17.3/src/host/wasapi/device.rs:192-200` : « Checking formats is
+///   not needed for shared mode with auto-conversion, therefore this check has
+///   been removed » — et `supported_formats()` déroule alors le produit
+///   cartésien des 21 `COMMON_SAMPLE_RATES` par les 7 formats d'échantillon.
+///   Chaque entrée est une plage ponctuelle (`min == max`), si bien que deux
+///   DAC Windows différents reçoivent exactement la MÊME liste de 147 entrées.
+///
+/// Tune ne peut pas corriger cpal. Il peut cesser de présenter cette liste
+/// comme une capacité constatée (#2862).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleRateEvidence {
+    /// Le pilote a été interrogé, cadence par cadence.
+    Measured,
+    /// Aucune confrontation au matériel : la liste est une supposition.
+    Unverified,
+}
+
+impl SampleRateEvidence {
+    /// Vrai seulement quand la liste vient d'une interrogation du pilote.
+    pub fn is_measured(self) -> bool {
+        matches!(self, Self::Measured)
+    }
+}
+
+/// L'énumération de cpal est-elle une MESURE, pour cet hôte ?
+///
+/// La plateforme est un **paramètre**, jamais un `cfg!` refermé dans le corps :
+/// sinon la décision Windows ne serait compilée que sous Windows, et aucun test
+/// joué sur Linux ne pourrait la contredire — l'angle mort de #1837 et #2056.
+/// Un seul appelant passe la valeur réelle de la machine.
+///
+/// `backend` est ce que rend `cpal::HostId::name()`, c'est-à-dire le nom de la
+/// **variante** (`"Wasapi"`, `"Alsa"`, `"Asio"`, `"CoreAudio"`) et non un
+/// libellé d'affichage : `name()` est un `stringify!` sur l'identifiant de
+/// variante. La comparaison est insensible à la casse pour ne pas dépendre de
+/// ce détail.
+pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
+    match backend.to_ascii_lowercase().as_str() {
+        "alsa" | "asio" | "coreaudio" | "jack" => SampleRateEvidence::Measured,
+        // « wasapi » : cpal ne teste rien (voir ci-dessus). Et tout hôte
+        // inconnu tombe ici volontairement — on ne prête pas une mesure à un
+        // backend dont on ignore ce qu'il fait.
+        _ => SampleRateEvidence::Unverified,
+    }
+}
+
 /// Find a cpal StreamConfig that matches the desired channels and sample rate.
 ///
 /// When `supported_output_configs()` fails (PipeWire ALSA compat), falls back
@@ -8494,6 +8597,7 @@ mod tests {
             is_default: false,
             max_channels: 2,
             sample_rates: vec![44_100, 48_000],
+            sample_rates_measured: true,
             backend: "ALSA".into(),
         };
 
@@ -8509,6 +8613,178 @@ mod tests {
         assert_eq!(retained.max_channels, 32);
         assert_eq!(retained.sample_rates.last(), Some(&384_000));
         assert!(retained.is_default);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2862 — les « cadences supportées » d'une zone Windows sont fabriquées.
+    //
+    // `is_format_supported` de cpal rend `Ok(true)` sans regarder le format sur
+    // l'hôte WASAPI. `supported_formats()` déroule donc le produit cartésien
+    // des 21 `COMMON_SAMPLE_RATES` par 7 formats, et deux DAC différents
+    // reçoivent la même liste. Tune ne peut pas corriger cpal ; il peut cesser
+    // de présenter cette liste comme une capacité constatée.
+    //
+    // Ces tests portent sur des fonctions PURES et sur la charge utile
+    // sérialisée : ils tournent sur Linux comme sur Windows. La plateforme est
+    // un paramètre de `sample_rate_evidence`, jamais un `cfg!` interne — sans
+    // quoi la décision Windows ne serait pas compilée ici et le test serait
+    // vert pour la mauvaise raison (#1837, #2056).
+    // -----------------------------------------------------------------------
+
+    /// Les hôtes cpal dont on sait ce que fait l'énumération.
+    const HOTES_CPAL_CONNUS: &[&str] = &["Alsa", "Asio", "CoreAudio", "Jack", "Wasapi"];
+
+    #[test]
+    fn wasapi_ne_presente_plus_ses_cadences_comme_mesurees() {
+        assert_eq!(
+            sample_rate_evidence("Wasapi"),
+            SampleRateEvidence::Unverified,
+            "cpal ne teste RIEN sur WASAPI : is_format_supported rend Ok(true) \
+             sans regarder le format, et supported_formats() fabrique les 21 \
+             cadences. Les annoncer comme mesurées, c'est affirmer ce que \
+             personne n'a vérifié (#2862)"
+        );
+
+        // Témoin anti-régression : les hôtes qui INTERROGENT réellement le
+        // pilote — ALSA par `hw_params.test_rate`, ASIO par
+        // `driver.can_sample_rate` — ne bougent pas d'un iota.
+        for hote in ["Alsa", "Asio", "CoreAudio", "Jack"] {
+            assert!(
+                sample_rate_evidence(hote).is_measured(),
+                "l'hôte « {hote} » confronte ses cadences au matériel : le \
+                 rétrograder en « non vérifié » ferait perdre à Linux et macOS \
+                 une information qu'ils avaient bel et bien"
+            );
+        }
+
+        // Un hôte qu'on ne connaît pas ne se voit pas PRÊTER une mesure.
+        assert!(
+            !sample_rate_evidence("UnHoteQuiNExistePasEncore").is_measured(),
+            "un backend inconnu doit tomber du côté « non vérifié » : on ne \
+             sait pas s'il interroge le pilote, donc on ne l'affirme pas"
+        );
+
+        // La casse du nom d'hôte n'est pas un contrat.
+        assert!(!sample_rate_evidence("WASAPI").is_measured());
+        assert!(sample_rate_evidence("alsa").is_measured());
+    }
+
+    /// La table est indexée sur `cpal::HostId::name()`, qui rend le nom de la
+    /// VARIANTE (`stringify!`) et non un libellé d'affichage. Si cpal renomme
+    /// une variante, la table devient muette et l'hôte retombe silencieusement
+    /// dans le cas « inconnu ». Ce test attrape ce glissement sur la machine
+    /// qui compile, quelle qu'elle soit.
+    #[test]
+    fn la_table_est_indexee_sur_le_vrai_nom_d_hote_cpal() {
+        // `HostTrait` vient du glob `use super::*` : la re-importer ici est
+        // refusee par le `#![deny(unused_imports)]` de la caisse.
+        let nom = cpal::default_host().id().name();
+        assert!(
+            HOTES_CPAL_CONNUS.contains(&nom),
+            "cpal rend « {nom} » comme nom d'hôte, absent de la table de \
+             sample_rate_evidence {HOTES_CPAL_CONNUS:?}. Tant qu'il n'y figure \
+             pas, cet hôte est classé « non vérifié » — ce qui est prudent mais \
+             faux s'il interroge le pilote"
+        );
+    }
+
+    /// Ce que la zone reçoit vraiment sur `GET /api/v1/devices/audio` : la
+    /// liste, et désormais ce qu'elle vaut. Sans ce champ, huit cadences
+    /// inventées et huit cadences constatées sont indiscernables sur le fil.
+    #[test]
+    fn la_charge_utile_dit_si_les_cadences_ont_ete_mesurees() {
+        let cadences = vec![
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        ];
+
+        let windows = AudioDevice {
+            name: "Haut-Parleurs".into(),
+            endpoint_id: String::new(),
+            is_default: true,
+            max_channels: 2,
+            sample_rates: cadences.clone(),
+            sample_rates_measured: sample_rate_evidence("Wasapi").is_measured(),
+            backend: "Wasapi".into(),
+        };
+        let json = serde_json::to_value(&windows).expect("AudioDevice sérialisable");
+        assert_eq!(
+            json["sample_rates_measured"],
+            serde_json::json!(false),
+            "la zone Windows annonce jusqu'à 384 kHz sans que rien ne l'ait \
+             vérifié : la charge utile doit le dire, sinon l'écran affirme une \
+             capacité qu'il ne connaît pas (#2862). Reçu : {json}"
+        );
+        assert_eq!(
+            json["sample_rates"],
+            serde_json::json!(cadences),
+            "la liste elle-même n'est pas amputée : on la qualifie, on ne la \
+             retire pas — la lecture continue de s'appuyer dessus"
+        );
+
+        // Témoin : Linux/macOS gardent exactement le sens qu'ils avaient.
+        let linux = AudioDevice {
+            backend: "Alsa".into(),
+            sample_rates_measured: sample_rate_evidence("Alsa").is_measured(),
+            ..windows.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&linux).expect("AudioDevice sérialisable")["sample_rates_measured"],
+            serde_json::json!(true),
+            "ALSA teste chaque cadence sur le pilote : rien ne doit changer là"
+        );
+
+        // Un enregistrement écrit avant ce champ reste lisible.
+        let ancien = serde_json::json!({
+            "name": "Haut-Parleurs",
+            "endpoint_id": "",
+            "is_default": true,
+            "max_channels": 2,
+            "sample_rates": [44_100, 48_000],
+            "backend": "Alsa",
+        });
+        let relu: AudioDevice =
+            serde_json::from_value(ancien).expect("le champ ajouté doit avoir un défaut serde");
+        assert!(relu.sample_rates_measured);
+    }
+
+    /// Un indice qui n'est pas BRANCHÉ ne vaut rien. Ce test lit le contenu du
+    /// fichier, comme les gardes voisines, pour attraper le seul retour en
+    /// arrière qui compte : quelqu'un qui recâble le champ sur une constante,
+    /// et l'API réannonce « mesuré » sur toutes les plateformes.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution : écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn l_indice_de_mesure_est_calcule_et_non_ecrit_en_dur() {
+        let source = include_str!("local.rs");
+
+        let champ_derive = ["sample_rates_measured: ", "rates_evidence.is_measured(),"].concat();
+        assert!(
+            source.contains(&champ_derive),
+            "le seul site qui construit un AudioDevice de production doit \
+             dériver `sample_rates_measured` de `sample_rate_evidence` ; écrit \
+             en dur, il redit « mesuré » sur WASAPI (#2862)"
+        );
+
+        let filtre_tautologique = [".filter(|c| c.sample_rate", " == sample_rate)"].concat();
+        let apres = source
+            .split_once(filtre_tautologique.as_str())
+            .expect("la branche « ouvrir à la cadence source » a disparu")
+            .1;
+        // Decoupe en CARACTERES : ce fichier est accentue, une coupe a
+        // l octet pres tomberait au milieu d un caractere et paniquerait.
+        let branche: String = apres.chars().take(4_000).collect();
+        let appel_indice = ["sample_rate_evidence(", "host_id_name)"].concat();
+        assert!(
+            branche.contains(&appel_indice),
+            "cette branche ouvre à la cadence source parce que le périphérique \
+             « la supporte ». Sur WASAPI le filtre est TAUTOLOGIQUE — \
+             find_matching_config recopie la cadence demandée — donc la branche \
+             est toujours prise, needs_resample reste faux et rubato ne tourne \
+             jamais. Elle doit au moins journaliser d'où vient cette \
+             supposition (#2862)"
+        );
     }
 
     /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une
