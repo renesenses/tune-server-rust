@@ -1,0 +1,191 @@
+name: Release controller
+
+run-name: Release controller v${{ inputs.version }}${{ inputs.dry_run && ' (dry-run)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version sans le prefixe v
+        required: true
+        default: 0.9.128
+        type: string
+      dry_run:
+        description: Verifier le train sans creer de tag
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-controller
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Verifier et taguer le train
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release' }}
+    env:
+      PLAN: .release/v${{ inputs.version }}.json
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      CONTROLLER_ENABLED: ${{ vars.RELEASE_CONTROLLER_ENABLED }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Valider et resoudre le manifeste
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::le controleur doit etre lance depuis main, pas $GITHUB_REF"
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version invalide: $VERSION"
+            exit 1
+          fi
+          test -f "$PLAN" || {
+            echo "::error::manifeste absent: $PLAN"
+            exit 1
+          }
+
+          jq -e --arg version "$VERSION" '
+            .version == $version and
+            (.ready | type == "boolean") and
+            (.components | keys | sort == ["os", "server", "universal", "web"]) and
+            .components.server.repository == "renesenses/tune-server-rust" and
+            .components.server.sha == "self" and
+            .components.server.tag == ("v" + $version) and
+            .components.web.repository == "renesenses/tune-web-client" and
+            (.components.web.sha | test("^[0-9a-f]{40}$")) and
+            .components.web.tag == ("v" + $version) and
+            .components.os.repository == "renesenses/tune-os" and
+            (.components.os.sha | test("^[0-9a-f]{40}$")) and
+            .components.os.tag == ("tune-os-rpi-v" + $version) and
+            .components.universal.repository == "renesenses/tune-server-universal" and
+            (.components.universal.sha | test("^[0-9a-f]{40}$")) and
+            .components.universal.tag == ("v" + $version)
+          ' "$PLAN" >/dev/null || {
+            echo "::error::manifeste invalide ou depot/tag non autorise"
+            exit 1
+          }
+
+          jq --arg server_sha "$GITHUB_SHA" \
+            '.components.server.sha = $server_sha' "$PLAN" \
+            > /tmp/release-manifest.json
+
+          while IFS=$'\t' read -r name repo sha tag; do
+            main_sha="$(gh api "repos/$repo/branches/main" --jq .commit.sha)"
+            merge_base="$(gh api "repos/$repo/compare/$sha...$main_sha" --jq .merge_base_commit.sha)"
+            if [ "$merge_base" != "$sha" ]; then
+              echo "::error::$name: $sha n'est pas atteignable depuis main ($main_sha)"
+              exit 1
+            fi
+            if [ "$name" = server ] && [ "$main_sha" != "$GITHUB_SHA" ]; then
+              echo "::error::main serveur a bouge: $main_sha au lieu de $GITHUB_SHA"
+              exit 1
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$name" "$repo" "$sha" "$tag"
+          done < <(jq -r '.components | to_entries[] | [.key, .value.repository, .value.sha, .value.tag] | @tsv' /tmp/release-manifest.json)
+
+          {
+            echo "## Train v$VERSION"
+            echo
+            echo '| composant | dépôt | SHA | tag |'
+            echo '|---|---|---|---|'
+            jq -r '.components | to_entries[] | "| \(.key) | `\(.value.repository)` | `\(.value.sha)` | `\(.value.tag)` |"' /tmp/release-manifest.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuser un controleur non arme
+        if: ${{ !inputs.dry_run }}
+        env:
+          CONTROLLER_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CONTROLLER_ENABLED" != true ]; then
+            echo "::error::RELEASE_CONTROLLER_ENABLED doit valoir true"
+            exit 1
+          fi
+          if [ -z "$CONTROLLER_TOKEN" ]; then
+            echo "::error::secret RELEASE_CONTROLLER_TOKEN absent"
+            exit 1
+          fi
+          jq -e '.ready == true' "$PLAN" >/dev/null || {
+            echo "::error::le manifeste est encore un candidat (ready=false)"
+            exit 1
+          }
+
+      - name: Creer les quatre tags
+        env:
+          GH_TOKEN: ${{ inputs.dry_run && github.token || secrets.RELEASE_CONTROLLER_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cible_tag() {
+            local repo="$1" tag="$2" objet type
+            objet="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)" || return 1
+            type="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.type)"
+            if [ "$type" = tag ]; then
+              gh api "repos/$repo/git/tags/$objet" --jq .object.sha
+            else
+              printf '%s\n' "$objet"
+            fi
+          }
+
+          assurer_tag() {
+            local name="$1" repo="$2" sha="$3" tag="$4" existant
+            if existant="$(cible_tag "$repo" "$tag")"; then
+              if [ "$existant" != "$sha" ]; then
+                echo "::error::$repo:$tag pointe sur $existant au lieu de $sha"
+                exit 1
+              fi
+              echo "$name: $tag existe deja sur $sha"
+              return
+            fi
+            if [ "$DRY_RUN" = true ]; then
+              echo "$name: creerait $tag sur $sha"
+              return
+            fi
+            gh api --method POST "repos/$repo/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
+            [ "$(cible_tag "$repo" "$tag")" = "$sha" ] || {
+              echo "::error::$repo:$tag n'est pas verifiable apres creation"
+              exit 1
+            }
+            echo "$name: $tag cree sur $sha"
+          }
+
+          # Le tag serveur est cree en dernier : lui seul peut declencher le train.
+          for name in web universal os server; do
+            IFS=$'\t' read -r repo sha tag < <(
+              jq -r --arg name "$name" \
+                '.components[$name] | [.repository, .sha, .tag] | @tsv' \
+                /tmp/release-manifest.json
+            )
+            if [ "$name" = server ]; then
+              main_sha="$(gh api "repos/$repo/branches/main" --jq .commit.sha)"
+              [ "$main_sha" = "$sha" ] || {
+                echo "::error::main serveur a bouge avant la pose du tag"
+                exit 1
+              }
+            fi
+            assurer_tag "$name" "$repo" "$sha" "$tag"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-v${{ inputs.version }}
+          path: /tmp/release-manifest.json
+          retention-days: 90

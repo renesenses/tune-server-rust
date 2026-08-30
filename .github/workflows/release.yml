@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -46,14 +45,22 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      - name: Lire le SHA web du manifeste
+        id: web
+        shell: bash
+        run: |
+          PLAN=".release/${GITHUB_REF_NAME}.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          # The web client mirrors the server's branch topology: RC tags
-          # (v*-rc*) build from tune-web-client's release/v0.9 (0.9.x); stable
-          # v0.8.x tags build from its main. Keeps the two version lines apart.
-          ref: ${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}
+          ref: ${{ steps.web.outputs.sha }}
+          path: .web-client
       - name: Verify web-client version matches release tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: .web-client
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           # Compare the base X.Y.Z only: a pre-release tag (v0.9.0-rc1) ships the
@@ -71,12 +78,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: .web-client/package-lock.json
       - run: npm ci
+        working-directory: .web-client
       - run: npm run build
+        working-directory: .web-client
       - uses: actions/upload-artifact@v4
         with:
           name: web-client
-          path: dist/
+          path: .web-client/dist/
           retention-days: 1
 
   build:
@@ -1212,7 +1222,7 @@ jobs:
   # au chargement sur un `needs` vers un job inexistant — et la release ne
   # serait jamais publiée.
   publish:
-    name: Publish release (drop the draft)
+    name: Stage release (keep the draft)
     needs: [build, release]
     if: >-
       always()
@@ -1222,10 +1232,14 @@ jobs:
     timeout-minutes: 15  # Publish release — <1 min
     permissions:
       contents: write
+    outputs:
+      promoted: ${{ steps.gate.outputs.promoted }}
+      version: ${{ steps.gate.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Vérifier que la release est complète, puis la publier
+      - name: Vérifier que la release staged est complète
+        id: gate
         run: |
           TAG="${GITHUB_REF_NAME}"
           # Ce qui est publié doit être vérifiable : SHA256SUMS est la
@@ -1236,15 +1250,62 @@ jobs:
             echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
             exit 1
           fi
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "Release $TAG publiée."
+          DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          [ "$DRAFT" = true ] || {
+            echo "::error::$TAG est déjà publique avant la promotion coordonnée"
+            exit 1
+          }
+          echo "promoted=false" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Release $TAG complète et conservée en brouillon."
+
+  stage-docker:
+    name: Stage Docker image
+    needs: publish
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  stage-os:
+    name: Stage Tune OS images
+    needs: publish
+    uses: ./.github/workflows/trigger-os-images.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  staging-complete:
+    name: Release staging complete
+    needs: [publish, stage-docker, stage-os]
+    if: >-
+      always()
+      && needs.publish.result == 'success'
+      && needs.stage-docker.result == 'success'
+      && needs.stage-os.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Attester la matrice staged
+        run: |
+          {
+            echo "## v${{ needs.publish.outputs.version }} entierement staged"
+            echo
+            echo "- GitHub Release serveur : draft"
+            echo "- Docker : staging-v${{ needs.publish.outputs.version }}"
+            echo "- Tune OS : trois images et leurs checksums sur une release draft"
+            echo "- aucun canal stable promu"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   homebrew:
     name: Update Homebrew tap
     needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Update Homebrew tap — <1 min
     steps:
@@ -1346,7 +1407,10 @@ jobs:
     # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
     needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 10  # Update mozaiklabs.fr/download — <1 min
     steps:
@@ -1379,7 +1443,10 @@ jobs:
     name: Trigger Android build (tune-server-flutter)
     needs: [publish]
     # Stable tags only — un client ne se construit pas sur une pre-release.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Trigger Android build — <1 min
     steps:

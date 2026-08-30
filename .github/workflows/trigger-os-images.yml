@@ -1,114 +1,149 @@
 name: Trigger OS image builds
 
-# When a Tune release is published, tell the downstream OS-image repos to bake
-# an ISO/image for that version (repository_dispatch → their build workflows).
-# Deliberately separate from release.yml so the release pipeline is untouched.
-#
-# Requires a fine-grained PAT with `contents: write` (or `repo`) on the target
-# repos, stored as the secret TUNE_OS_DISPATCH_TOKEN — the default GITHUB_TOKEN
-# cannot dispatch events to another repository. Without the secret the job just
-# warns and exits (never blocks a release; this workflow is independent of it).
-# Déclenché sur le PUSH DU TAG, surtout pas sur `release: published`.
-#
-# GitHub ne relance pas de workflow sur un événement produit par le
-# GITHUB_TOKEN — garde-fou anti-récursion. Or la release est créée par
-# release.yml (softprops/action-gh-release, GITHUB_TOKEN) : l'événement
-# `release: published` qui en découle n'a donc JAMAIS déclenché ce workflow.
-# Résultat : plus une seule image OS construite automatiquement depuis fin
-# juillet, et un dispatch manuel oublié à chaque release (0.9.54 → 0.9.59
-# livrées sans image, les dernières datant de la 0.9.53).
-#
-# Le push du tag, lui, vient d'un humain (git push origin vX.Y.Z) : il
-# déclenche normalement. Il arrive AVANT que les binaires ne soient publiés,
-# ce qui est sans conséquence — les builds d'image téléchargent la version
-# depuis l'API au moment de leur propre exécution (~15 min plus tard), et
-# `build-iso.yml` échoue clairement si l'asset n'est pas encore là, auquel cas
-# il suffit de relancer.
+# Outil de dispatch explicite vers Tune OS. La pose du tag ne lance plus ce
+# workflow en parallèle de Release : le futur orchestrateur l'appellera avec
+# une version exacte après validation des actifs obligatoires.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: "Tune version (X.Y.Z, sans v)"
+        required: true
+        type: string
+    secrets:
+      TUNE_OS_DISPATCH_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       version:
-        description: "Tune version (X.Y.Z, no leading v) — empty = the release tag"
-        required: false
-        default: ""
+        description: "Tune version (X.Y.Z, sans v)"
+        required: true
+        type: string
 
 jobs:
   dispatch:
     runs-on: ubuntu-latest
-    # Tags stables uniquement : une pré-release (vX.Y.Z-rcN) ne mérite pas une
-    # image de 1,2 Go, et la page /download ne sert que du stable. Même règle
-    # que le job homebrew de release.yml.
-    if: github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-rc')
+    timeout-minutes: 360
+    if: ${{ !contains(inputs.version, '-') }}
     steps:
-      # Le tag est poussé ~30 min AVANT que release.yml n'ait publié la release
-      # et ses binaires. Dispatcher tout de suite fait arriver le webhook des
-      # images OS chez mozaiklabs.fr AVANT que la ForumRelease de la version
-      # n'existe — les images sont alors ignorées et /download n'en propose
-      # aucune. Vécu en v0.9.60 : ISO à 08:29, RPi à 08:39, release serveur à
-      # 08:57, et deux images publiées sur GitHub que la page ne montrait pas.
-      #
-      # On attend donc que la release porte ses assets avant de dispatcher.
-      # Cela restaure l'ordre dont dépend le webhook, sans revenir à
-      # `release: published` — qui, lui, ne se déclenche jamais (la release est
-      # créée par le GITHUB_TOKEN, garde anti-récursion de GitHub).
-      #
-      # Les images sont saines même construites tôt : elles épinglent la version
-      # dans le kickstart et téléchargent le binaire à l'INSTALLATION. L'attente
-      # sert au rattachement sur /download, pas à la validité de l'image.
-      - name: Wait for the server release to carry its assets
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          # 3 h de marge. Le facteur limitant n'est pas la compilation — les
-          # sept cibles finissent en ~15 min — mais la NOTARISATION Apple, qui
-          # est un service tiers sans engagement de délai. Vécu en v0.9.61 :
-          # `Notarize DMG (macOS)` bloquée 1 h 41 sur aarch64-apple-darwin,
-          # 6 cibles vertes sur 7, et cette attente abandonnée à 45 min alors
-          # que la release finissait par sortir. Un plafond trop bas transforme
-          # une lenteur d'Apple en images OS manquantes.
-          #
-          # Le coût d'attendre est un runner ubuntu qui dort ; le coût
-          # d'abandonner est une release sans image sur /download, et personne
-          # ne pense au re-dispatch manuel. On attend donc largement.
-          for i in $(seq 1 360); do
-            N=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-                  --json assets -q '[.assets[]|select(.name|endswith(".tar.gz"))]|length' 2>/dev/null || echo 0)
-            if [ "${N:-0}" -ge 3 ]; then
-              echo "release $TAG prête ($N archives) après $((i*30))s"
-              exit 0
-            fi
-            sleep 30
-          done
-          echo "::error::$TAG n'a toujours pas ses assets après 3 h — dispatch annulé pour ne pas perdre le rattachement /download. Relancer ce workflow à la main une fois la release publiée."
-          exit 1
+      - uses: actions/checkout@v4
 
       - name: Resolve version
         id: v
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          V="${{ inputs.version }}"
-          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
-          test -n "$V"
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+          V="$RELEASE_VERSION"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::version invalide: $V"
+            exit 1
+          }
+          [ "$GITHUB_REF" = "refs/tags/v$V" ] || {
+            echo "::error::ce workflow doit etre lance sur refs/tags/v$V"
+            exit 1
+          }
+          PLAN=".release/v$V.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          OS_SHA="$(jq -r '.components.os.sha' "$PLAN")"
+          OS_TAG="$(jq -r '.components.os.tag' "$PLAN")"
+          [[ "$OS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA OS invalide"; exit 1; }
+          [ "$OS_TAG" = "tune-os-rpi-v$V" ] || { echo "::error::tag OS invalide"; exit 1; }
+          {
+            echo "version=$V"
+            echo "os_sha=$OS_SHA"
+            echo "os_tag=$OS_TAG"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch to OS-image repos
+      - name: Lire les checksums serveur attestes
+        id: sums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" --pattern SHA256SUMS --output /tmp/SHA256SUMS --clobber
+          checksum() {
+            local asset="$1"
+            awk -v wanted="$asset" '{ name=$2; sub(/^.*\//, "", name); if (name == wanted) print $1 }' /tmp/SHA256SUMS
+          }
+          X86="$(checksum "tune-server-v$VERSION-linux-x86_64.tar.gz")"
+          ARM="$(checksum "tune-server-v$VERSION-linux-aarch64.tar.gz")"
+          [[ "$X86" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum linux-x86_64 absent"; exit 1; }
+          [[ "$ARM" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum linux-aarch64 absent"; exit 1; }
+          echo "x86=$X86" >> "$GITHUB_OUTPUT"
+          echo "arm=$ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Creer ou verifier la release OS de staging
+        env:
+          TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+          OS_SHA: ${{ steps.v.outputs.os_sha }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+        run: |
+          set -euo pipefail
+          [ -n "$TOKEN" ] || { echo "::error::TUNE_OS_DISPATCH_TOKEN absent"; exit 1; }
+          TAG_SHA="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/git/ref/tags/$OS_TAG" --jq .object.sha)"
+          [ "$TAG_SHA" = "$OS_SHA" ] || { echo "::error::$OS_TAG pointe sur $TAG_SHA, attendu $OS_SHA"; exit 1; }
+          if RELEASE="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" 2>/dev/null)"; then
+            [ "$(jq -r .draft <<<"$RELEASE")" = true ] || { echo "::error::release OS deja publique"; exit 1; }
+          else
+            GH_TOKEN="$TOKEN" gh api --method POST repos/renesenses/tune-os/releases \
+              -f tag_name="$OS_TAG" -f target_commitish="$OS_SHA" \
+              -f name="Tune OS v${{ steps.v.outputs.version }}" -F draft=true >/dev/null
+          fi
+
+      - name: Dispatcher et attendre les trois builds OS
         env:
           TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
+          OS_SHA: ${{ steps.v.outputs.os_sha }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+          X86_SHA256: ${{ steps.sums.outputs.x86 }}
+          ARM_SHA256: ${{ steps.sums.outputs.arm }}
         run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::warning::TUNE_OS_DISPATCH_TOKEN not set — skipping OS-image dispatch (add the secret to enable auto ISO/image builds)."
-            exit 0
-          fi
-          # Add tune-os-rpi (and any future image repo) to this list once created.
-          for repo in tune-os; do
-            echo "→ repository_dispatch tune-release to renesenses/$repo for v$VERSION"
-            curl -fsS -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/renesenses/$repo/dispatches" \
-              -d "{\"event_type\":\"tune-release\",\"client_payload\":{\"version\":\"$VERSION\"}}"
-          done
+          set -euo pipefail
+          STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PAYLOAD="$(jq -n \
+            --arg version "$VERSION" --arg os_sha "$OS_SHA" --arg os_tag "$OS_TAG" \
+            --arg x86 "$X86_SHA256" --arg arm "$ARM_SHA256" \
+            '{event_type:"tune-release",client_payload:{version:$version,os_sha:$os_sha,os_tag:$os_tag,server_sha256_x86_64:$x86,server_sha256_aarch64:$arm}}')"
+          echo "→ repository_dispatch tune-release to renesenses/tune-os for v$VERSION"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/renesenses/tune-os/dispatches" \
+            -d "$PAYLOAD"
+
+          wait_workflow() {
+            local workflow="$1" status conclusion url
+            for _ in $(seq 1 700); do
+              IFS=$'\t' read -r status conclusion url < <(
+                GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/actions/workflows/$workflow/runs?event=repository_dispatch&per_page=20" \
+                  --jq ".workflow_runs | map(select(.created_at >= \"$STARTED_AT\")) | sort_by(.created_at) | last | [.status, (.conclusion // \"\"), .html_url] | @tsv"
+              )
+              if [ "$status" = completed ]; then
+                [ "$conclusion" = success ] || { echo "::error::$workflow: $conclusion ($url)"; return 1; }
+                echo "$workflow: success ($url)"
+                return 0
+              fi
+              sleep 30
+            done
+            echo "::error::$workflow n'a pas termine dans les 350 minutes"
+            return 1
+          }
+
+          wait_workflow build-iso.yml & P1=$!
+          wait_workflow build-rpi-image.yml & P2=$!
+          wait_workflow build-x86-image.yml & P3=$!
+          wait "$P1"; wait "$P2"; wait "$P3"
+
+      - name: Verifier la matrice OS staged
+        env:
+          TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+        run: |
+          set -euo pipefail
+          ASSETS="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq '.assets[].name')"
+          grep -Eq 'x86_64.*\.iso$' <<<"$ASSETS" || { echo "::error::ISO x86_64 absente"; exit 1; }
+          grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image x86_64 absente"; exit 1; }
+          grep -Eq 'aarch64.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image aarch64 absente"; exit 1; }
+          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 3 ] || { echo "::error::checksums OS incomplets"; exit 1; }

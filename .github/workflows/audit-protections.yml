@@ -1,0 +1,279 @@
+name: Audit des protections
+
+# Audit minimal du train de release (#2816, runbook GitHub Free de #2808).
+#
+# Deux règles de conduite, et elles priment sur la lisibilité du rapport :
+#
+#   1. Une absence d'accès n'est JAMAIS un succès. Manifeste absent, erreur
+#      d'API sur un dépôt public, règles illisibles : ROUGE. Un audit qui
+#      convertit « je n'ai pas pu regarder » en vert fabrique une assurance,
+#      ce qui est pire qu'un audit absent.
+#   2. Ce que GitHub Free n'expose pas est affiché « NON VÉRIFIÉ », jamais
+#      « conforme » et jamais « aucun tag ».
+#
+# Lancé à la main, avant le dry-run du contrôleur. Aucun service, aucune base,
+# aucune App, aucun secret : `github.token` et `jq` suffisent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version du train à auditer (ex. 0.9.128)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Protections, armement, manifeste
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auditer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          # Lues par le contexte `vars`, pas par l'API : la lecture d'une
+          # variable de dépôt par l'API exige une permission que
+          # `github.token` n'a pas. Une variable absente rend ici la chaîne
+          # vide — indistinguable d'un `false`, et c'est correct : dans les
+          # deux cas le contrôleur n'est PAS armé.
+          CONTROLEUR: ${{ vars.RELEASE_CONTROLLER_ENABLED }}
+          PROMOTION: ${{ vars.RELEASE_PROMOTION_ENABLED }}
+        run: |
+          set -uo pipefail
+          echec=0
+          dire() { printf '  %s\n' "$1"; }
+          ok()   { printf '  ✅ %s\n' "$1"; }
+          ko()   { printf '  ❌ %s\n' "$1"; echec=1; }
+          na()   { printf '  ⚠️  %s\n' "$1"; }
+
+          PUBLICS="tune-server-rust tune-web-client"
+          PRIVES="tune-os tune-server-universal"
+          TOUS="tune-server-rust tune-web-client tune-os tune-server-universal"
+
+          # Un dépôt est « accessible » si le jeton peut le lire. C'est la
+          # SEULE façon honnête de séparer « privé, hors de portée » de
+          # « public, et quelque chose ne va pas ».
+          accessible() { gh api "repos/renesenses/$1" --jq '.name' >/dev/null 2>&1; }
+          prive()      { case " $PRIVES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+          # Le CONTRAT du runbook, écrit ici pour être opposable. Vérifier la
+          # seule PRÉSENCE d'une règle `required_status_checks` ne dit rien :
+          # une règle présente avec les mauvais contextes rend vert, et c'est
+          # exactement ainsi qu'un check requis a pu manquer sans être vu.
+          contextes_exiges() {
+            case "$1/$2" in
+              tune-server-rust/main)
+                printf '%s\n' "release-gate" "Test (PostgreSQL)" "Issues déclarées corrigées" ;;
+              tune-server-rust/rc)
+                printf '%s\n' "Test" "Clippy" "Format" "Impact et garde-fous légers" \
+                              "Issues déclarées corrigées" "Security Audit" "FFI mobile (compilation)" ;;
+              tune-web-client/*)
+                printf '%s\n' "npm test" "Issues déclarées corrigées" ;;
+            esac
+          }
+
+          echo "=== 1. Règles effectives des branches (dépôts PUBLICS) ==="
+          # `rules/branches/<branche>` rend les règles EFFECTIVES **avec leurs
+          # paramètres**, et se lit avec un simple droit de lecture —
+          # contrairement à `branches/<b>/protection`, qui exige
+          # l'administration et rend 403.
+          # ⚠️ Il n'expose PAS les acteurs de contournement : une règle
+          # présente ne dit pas qu'elle s'applique aux administrateurs.
+          for d in $PUBLICS; do
+            echo "· renesenses/$d"
+            if ! accessible "$d"; then
+              ko "$d : dépôt PUBLIC inaccessible — l'audit ne peut pas conclure"
+              continue
+            fi
+            for br in main "rc/v$VERSION"; do
+              case "$br" in main) classe=main ;; *) classe=rc ;; esac
+              enc=$(printf '%s' "$br" | sed 's#/#%2F#g')
+              if ! r=$(gh api "repos/renesenses/$d/rules/branches/$enc" 2>/dev/null); then
+                ko "$br : lecture des règles IMPOSSIBLE"
+                continue
+              fi
+              if [ "$(echo "$r" | jq 'length')" -eq 0 ]; then
+                ko "$br : AUCUNE règle effective — la branche est nue"
+                continue
+              fi
+              dire "$br : $(echo "$r" | jq -r '[.[].type] | unique | join(", ")')"
+              for exig in deletion non_fast_forward pull_request required_status_checks; do
+                if echo "$r" | jq -e --arg t "$exig" 'any(.[]; .type == $t)' >/dev/null; then
+                  ok "$br : $exig"
+                else
+                  ko "$br : $exig MANQUANTE"
+                fi
+              done
+
+              # -- contenu de `pull_request` : méthode de fusion et fils résolus
+              p=$(echo "$r" | jq -c '[.[] | select(.type=="pull_request").parameters][0] // empty')
+              if [ -n "$p" ]; then
+                m=$(echo "$p" | jq -r '(.allowed_merge_methods // ["<absent>"]) | sort | join(",")')
+                if [ "$m" = "merge" ]; then
+                  ok "$br : fusion limitée au commit de fusion"
+                else
+                  ko "$br : méthodes de fusion autorisées = $m — le workflow exige le seul commit de fusion"
+                fi
+                [ "$(echo "$p" | jq -r '.required_review_thread_resolution')" = "true" ] \
+                  && ok "$br : conversations résolues exigées" \
+                  || ko "$br : conversations NON exigées comme résolues"
+              fi
+
+              # -- contenu de `required_status_checks` : les contextes du runbook
+              c=$(echo "$r" | jq -r '[.[] | select(.type=="required_status_checks")
+                                       | .parameters.required_status_checks[].context] | .[]' 2>/dev/null)
+              manquants=0
+              while IFS= read -r attendu; do
+                [ -z "$attendu" ] && continue
+                if printf '%s\n' "$c" | grep -Fxq "$attendu"; then
+                  ok "$br : contexte requis « $attendu »"
+                else
+                  ko "$br : contexte requis « $attendu » MANQUANT"
+                  manquants=$((manquants + 1))
+                fi
+              done < <(contextes_exiges "$d" "$classe")
+              [ "$manquants" -eq 0 ] && dire "$br : $(printf '%s\n' "$c" | grep -c .) contexte(s) requis au total"
+            done
+          done
+          na "Les acteurs de contournement ne sont pas lisibles ici : une règle listée n'est pas une règle opposable aux administrateurs."
+
+          echo "=== 2. Dépôts PRIVÉS — ce que GitHub Free ne permet pas ==="
+          for d in $PRIVES; do
+            na "renesenses/$d : règles de branche NON VÉRIFIÉES — dépôt privé, GitHub Free. Exception documentée : seuls JP et Bertrand fusionnent ou taguent."
+          done
+
+          echo "=== 3. Variables d'armement ==="
+          for couple in "RELEASE_CONTROLLER_ENABLED=$CONTROLEUR" "RELEASE_PROMOTION_ENABLED=$PROMOTION"; do
+            v=${couple%%=*}; val=${couple#*=}
+            case "$val" in
+              ""|false) ok "$v = ${val:-absente} — désarmé" ;;
+              *)        ko "$v = $val — le contrôleur est ARMÉ" ;;
+            esac
+          done
+
+          echo "=== 4. Aucun tag du train ne doit exister ==="
+          for d in $TOUS; do
+            if ! accessible "$d"; then
+              if prive "$d"; then
+                na "$d : tags NON VÉRIFIÉS — dépôt privé hors de portée du jeton. Ce n'est PAS « aucun tag »."
+              else
+                ko "$d : dépôt PUBLIC inaccessible — tags non vérifiables"
+              fi
+              continue
+            fi
+            if ! t=$(gh api "repos/renesenses/$d/git/matching-refs/tags" \
+                       --jq "[.[] | select(.ref | test(\"v$VERSION\$\"))] | length" 2>/dev/null); then
+              ko "$d : lecture des tags IMPOSSIBLE"
+              continue
+            fi
+            [ "$t" = "0" ] && ok "$d : aucun tag v$VERSION" || ko "$d : $t tag(s) v$VERSION DÉJÀ créé(s)"
+          done
+
+          echo "=== 5. Manifeste : les SHA gelés doivent être atteignables ==="
+          manifest=".release/v$VERSION.json"
+          if [ ! -f "$manifest" ]; then
+            ko "$manifest ABSENT de cette branche — le train n'a rien de gelé à vérifier"
+          elif ! jq -e '.components | type == "object"' "$manifest" >/dev/null 2>&1; then
+            ko "$manifest : pas d'objet .components — manifeste illisible"
+          else
+            # `.ready // "absent"` mentirait : en jq, `//` traite `false`
+            # comme vide, et un manifeste NON prêt s'afficherait « absent ».
+            pret=$(jq -r 'if has("ready") then (.ready | tostring) else "absent" end' "$manifest")
+            dire "ready = $pret"
+            # La sévérité d'un SHA en retard dépend de `ready` :
+            #   false   → la préparation est en cours, l'écart est normal ;
+            #   true    → le manifeste se déclare prêt à taguer, et il gèle
+            #             autre chose que la tête : BLOQUANT.
+            if [ "$pret" = "true" ]; then
+              dire "manifeste déclaré PRÊT : un SHA en retard est bloquant"
+            else
+              dire "manifeste en préparation : un SHA en retard est un avertissement"
+            fi
+            n=0
+            # `< <(...)` et non `| while` : le pipe exécuterait la boucle dans
+            # un sous-shell, et `echec` y mourrait avec lui. Aucune erreur ne
+            # remonterait — la boucle rendrait toujours vert.
+            while IFS=$'\t' read -r nom repo sha; do
+              n=$((n + 1))
+              if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+                ko "$nom : SHA absent du manifeste"
+                continue
+              fi
+              if [ "$sha" = "self" ]; then
+                # Le serveur est le dépôt courant : son SHA est la tête de la
+                # rc par construction, et c'est le contrôleur qui l'épingle au
+                # moment du tag. Ce qui se vérifie ICI, c'est que « self »
+                # désigne bien CE dépôt.
+                if [ "$repo" = "$GITHUB_REPOSITORY" ]; then
+                  ok "$nom : self = $repo @ $(git rev-parse --short HEAD)"
+                else
+                  ko "$nom : self déclaré sur $repo, or nous sommes sur $GITHUB_REPOSITORY"
+                fi
+                continue
+              fi
+              court=$(printf '%.8s' "$sha")
+              if ! accessible "${repo#renesenses/}"; then
+                if prive "${repo#renesenses/}"; then
+                  na "$nom : $court NON VÉRIFIÉ — $repo est privé et hors de portée du jeton."
+                else
+                  ko "$nom : $repo PUBLIC inaccessible — $court non vérifiable"
+                fi
+                continue
+              fi
+              # La référence est la LIGNE DU TRAIN, pas `main` : une `rc/*`
+              # est en avance sur son `main` par construction, et exiger
+              # l'ascendance depuis `main` rendrait cet audit rouge avant
+              # chaque train. Un audit rouge en permanence finit ignoré —
+              # même issue qu'un vert creux. Repli sur `main` si la `rc`
+              # n'existe pas encore.
+              ref="rc/v$VERSION"
+              if ! gh api "repos/$repo/branches/$(printf '%s' "$ref" | sed 's#/#%2F#g')" \
+                     --jq '.name' >/dev/null 2>&1; then
+                ref=main
+                na "$nom : $repo n'a pas de branche $ref — comparaison faite depuis main"
+              fi
+              enc=$(printf '%s' "$ref" | sed 's#/#%2F#g')
+              if ! st=$(gh api "repos/$repo/compare/$enc...$sha" --jq '.status' 2>/dev/null); then
+                ko "$nom : $court INTROUVABLE dans $repo (ou comparaison refusée)"
+                continue
+              fi
+              case "$st" in
+                identical)
+                  ok "$nom : $court = tête de $repo@$ref" ;;
+                behind)
+                  # Le SHA est bien sur la ligne, mais la ligne a AVANCÉ
+                  # depuis le gel. Ce qui a été fusionné après ne partira pas.
+                  d=$(gh api "repos/$repo/compare/$enc...$sha" --jq '.behind_by' 2>/dev/null || echo '?')
+                  msg="$nom : $court est sur $repo@$ref mais en retard de $d commit(s) — le manifeste ne gèle PAS la tête actuelle"
+                  if [ "$pret" = "true" ]; then
+                    ko "$msg (ready=true : BLOQUANT)"
+                  else
+                    na "$msg (ready=false : avertissement)"
+                  fi ;;
+                *)
+                  ko "$nom : $court N'EST PAS sur $repo@$ref ($st)" ;;
+              esac
+            done < <(
+              jq -r '.components | to_entries[]
+                     | [.key, (.value.repository // ""), (.value.sha // "")] | @tsv' "$manifest"
+            )
+            [ "$n" -eq 0 ] && ko "aucun composant lu dans $manifest" || dire "$n composant(s) examiné(s)"
+          fi
+
+          echo
+          if [ "$echec" -eq 0 ]; then
+            echo "Audit vert — pour ce qu'il a PU regarder."
+            echo "⚠️  Rappel : les deux dépôts privés n'ont pas été vérifiés, et les"
+            echo "    contournements d'administrateur ne sont pas lisibles par cette API."
+          else
+            echo "Audit ROUGE — voir les ❌ ci-dessus."
+          fi
+          exit "$echec"

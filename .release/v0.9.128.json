@@ -1,0 +1,26 @@
+{
+  "version": "0.9.128",
+  "ready": true,
+  "components": {
+    "server": {
+      "repository": "renesenses/tune-server-rust",
+      "sha": "self",
+      "tag": "v0.9.128"
+    },
+    "web": {
+      "repository": "renesenses/tune-web-client",
+      "sha": "36c2ee99b4ad4a330ae167b376018794e2680e2d",
+      "tag": "v0.9.128"
+    },
+    "os": {
+      "repository": "renesenses/tune-os",
+      "sha": "f07aa2928a6cef5df277c49484eba7731f526d30",
+      "tag": "tune-os-rpi-v0.9.128"
+    },
+    "universal": {
+      "repository": "renesenses/tune-server-universal",
+      "sha": "7484d20f9614384436035436b992f0c04fe4a0b9",
+      "tag": "v0.9.128"
+    }
+  }
+}
