@@ -495,13 +495,9 @@ jobs:
         with:
           denyWarnings: true
           # Avis « unmaintained » sans correctif disponible, chacun justifie
-          # dans .cargo/audit.toml : paste et instant, tous deux transitifs et
-          # hors du chemin d'execution.
-          #
-          # RUSTSEC-2026-0150 (audiopus_sys) a quitte cette liste : la
-          # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
-          # (#2251). Il n'y a plus d'avis a taire.
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+          # dans .cargo/audit.toml : paste et instant (transitifs, hors chemin
+          # d'execution), audiopus_sys (arbitrage ouvert, cf #2251).
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0150
 
   ffi:
     name: FFI mobile (compilation)

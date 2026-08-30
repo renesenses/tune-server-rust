@@ -26,24 +26,6 @@
 # à l'identique en local (`cross build --target aarch64-unknown-linux-musl`).
 # La cible **gnu** est volontairement laissée telle quelle : elle lie libopus en
 # dynamique depuis toujours et fonctionne (Docker bookworm, images Tune OS RPi).
-#
-# ## Depuis #2251 : ces deux variables sont INERTES
-#
-# `audiopus_sys` a été remplacé par `opusic-sys 0.7.5`, dont le `build.rs` ne
-# lit ni `LIBOPUS_STATIC` ni `LIBOPUS_NO_PKG`. Il n'en a pas besoin : en mode
-# `bundled` (celui par défaut, et le nôtre) il construit la libopus 1.6.1
-# embarquée et émet TOUJOURS `cargo:rustc-link-lib=static=opus`, sans jamais
-# sonder `pkg-config`. Le piège hôte/cible de #1288 n'a donc plus d'objet — il
-# venait d'un `cfg!` évalué pour l'hôte, et il n'y a plus de `cfg!` du tout.
-#
-# Conséquence à connaître : la cible **gnu** ne lie plus libopus en dynamique.
-# Toutes les cibles emportent maintenant la même libopus 1.6.1 statique — une
-# dépendance d'exécution de moins pour l'image Docker et les images Tune OS.
-#
-# Les deux lignes sont conservées telles quelles, et non supprimées : elles ne
-# coûtent rien (personne ne les lit) et la cible musl n'a PAS été reconstruite
-# lors de ce changement. À retirer une fois qu'un
-# `cross build --target aarch64-unknown-linux-musl` aura réellement été passé.
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
     "LIBOPUS_STATIC=1",

@@ -1102,7 +1102,7 @@ pub fn decode_to_pcm(
         || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
     {
         // symphonia demuxes the container (mkv/ogg features) but has no Opus
-        // decoder, so the packets are fed to libopus via the `opus` crate. This gives
+        // decoder, so the packets are fed to libopus via audiopus. This gives
         // native Opus playback and restores YouTube→DLNA sound (forum #940).
         decode_opus_to_pcm(file_path, None, None, seek_s, max_duration_s)
     } else {
@@ -1148,7 +1148,7 @@ fn ogg_stream_is_opus(file_path: &str) -> bool {
 ///
 /// symphonia demuxes the WebM/Ogg container (the `mkv`/`ogg` features) but has
 /// no Opus codec, so we pull the raw Opus packets and decode them with libopus
-/// (the `opus` crate). Opus is always 48 kHz internally; we return native 48 kHz / 16
+/// (audiopus). Opus is always 48 kHz internally; we return native 48 kHz / 16
 /// bit and let the caller's encoder follow that rate. This gives native .opus /
 /// Ogg-Opus playback and restores YouTube→DLNA audio (forum #940 and the
 /// Opus/Ogg-Vorbis support request): before this, Opus streams decoded to
@@ -1170,7 +1170,10 @@ fn decode_opus_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    use opus::{Channels, Decoder as OpusDecoder};
+    use audiopus::{
+        Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder,
+        packet::Packet as OpusPacket,
+    };
 
     let file = File::open(file_path).map_err(|e| format!("open opus: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -1226,8 +1229,8 @@ fn decode_opus_to_pcm(
         0
     };
 
-    let mut decoder =
-        OpusDecoder::new(48_000, channels_enum).map_err(|e| format!("opus decoder init: {e}"))?;
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, channels_enum)
+        .map_err(|e| format!("opus decoder init: {e}"))?;
 
     // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
     let mut out_buf = vec![0i16; 5760 * ch];
@@ -1278,7 +1281,7 @@ fn decode_opus_to_pcm(
                     );
                     break;
                 }
-                let Ok(dec) = OpusDecoder::new(48_000, channels_enum) else {
+                let Ok(dec) = OpusDecoder::new(SampleRate::Hz48000, channels_enum) else {
                     break;
                 };
                 decoder = dec;
@@ -1307,16 +1310,15 @@ fn decode_opus_to_pcm(
             }
             None => packet.pts.get(),
         };
-        // `opus::Decoder::decode` prend les octets du paquet tels quels et rend
-        // le nombre d'échantillons PAR CANAL — même contrat que l'`audiopus`
-        // qu'il remplace (#2251). Les enveloppes `Packet` / `MutSignals`
-        // d'`audiopus` ne faisaient que valider « paquet non vide » et « tampon
-        // de sortie dimensionnable » : le premier est déjà garanti par le
-        // `packet.data.is_empty()` ci-dessus, le second par `out_buf`, alloué à
-        // 5760 échantillons par canal (la plus grande trame Opus @ 48 kHz).
-        // Un paquet illisible reste ignoré plutôt que fatal : un Ogg concaténé
-        // peut porter des pages parasites à la jonction de deux flux.
-        let n = match decoder.decode(&packet.data, &mut out_buf, false) {
+        let opus_pkt = match OpusPacket::try_from(&packet.data[..]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let sig = match MutSignals::try_from(&mut out_buf[..]) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("opus output buffer: {e}")),
+        };
+        let n = match decoder.decode(Some(opus_pkt), sig, false) {
             Ok(n) => n,
             Err(_) => continue,
         };
@@ -1571,7 +1573,7 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Opus (native .opus / Ogg-Opus, or Opus-in-WebM) has no symphonia codec —
-    // it is decoded with libopus (the `opus` crate) via decode_to_pcm, then streamed as
+    // it is decoded with libopus (audiopus) via decode_to_pcm, then streamed as
     // chunks. Before this the streaming path fed Opus to symphonia's
     // make_audio_decoder, which failed → the stream produced no audio and (for
     // local files) looped every ~2 s. `.ogg`/`.oga` is sniffed: OpusHead → here,
@@ -3732,8 +3734,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     ///
     /// `decode_opus` ci-dessus contrôle le contenant : cadence, canaux, durée,
     /// « pas tout à zéro ». Rien n'y contrôle le **contenu**. Or c'est
-    /// exactement là que se cachait le risque du remplacement d'`audiopus_sys`
-    /// (abandonnée, RUSTSEC-2026-0150) par `opus`/`opusic-sys` : un remplaçant
+    /// exactement là que se cache le risque d'`audiopus_sys` : la crate est
+    /// abandonnée (RUSTSEC-2026-0150) et devra être remplacée ; un remplaçant
     /// qui compile et rend le bon nombre d'échantillons du mauvais son
     /// passerait toute la suite actuelle sans un rouge.
     ///
@@ -3744,21 +3746,19 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// bit-à-bit d'une libopus à l'autre (RFC 8251), une empreinte spectrale
     /// tolérante l'est.
     ///
-    /// ⚠ Les bornes absolues ci-dessous restent larges (±20 %) à dessein :
-    /// elles sont là pour attraper un gain divisé ou doublé, pas pour
-    /// départager deux libopus conformes. Ce sont les grandeurs **relatives**
-    /// — rapport gauche/droite, dominance spectrale, nombre de trames — qui
-    /// portent la discrimination fine.
+    /// ⚠ La libopus réellement liée **varie selon la machine** :
+    /// `audiopus_sys` sonde `pkg-config` avant de retomber sur sa copie
+    /// embarquée (figée sur xiph `7b05f44`, mars 2021). Un Mac de
+    /// développement avec Homebrew lie la 1.6.1, un runner CI Linux la
+    /// version du système ou la copie embarquée. Les bornes absolues
+    /// ci-dessous sont donc larges (±20 %) : elles sont là pour attraper un
+    /// gain divisé ou doublé, pas pour départager deux libopus conformes. Ce
+    /// sont les grandeurs **relatives** — rapport gauche/droite, dominance
+    /// spectrale, nombre de trames — qui portent la discrimination fine.
     ///
-    /// Cette largeur a servi : elle a laissé passer sans retouche le passage
-    /// d'`audiopus_sys 0.2.2` (qui sondait `pkg-config` avant de retomber sur
-    /// sa copie embarquée figée sur xiph `7b05f44`, mars 2021, donc une
-    /// libopus différente d'une machine à l'autre) à `opusic-sys 0.7.5`, qui
-    /// embarque la 1.6.1 et la lie toujours en statique — même libopus
-    /// partout, désormais.
-    ///
-    /// Valeurs observées : 96 960 trames, rms G = 2877,6, rms D = 1442,1,
-    /// crête = 4140, dominante 440 Hz.
+    /// Valeurs observées sur `audiopus 0.3.0-rc.0` / `audiopus_sys 0.2.2`
+    /// (libopus 1.6.1 via Homebrew) : 96 960 trames, rms G = 2877,6,
+    /// rms D = 1442,1, crête = 4140, dominante 440 Hz.
     #[test]
     fn decode_opus_fixture_garde_le_profil_du_signal() {
         use crate::audio::opus_ogg::{channel_f64, goertzel_power, rms};

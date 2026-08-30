@@ -17,13 +17,7 @@ ignore = [
     # instant 0.1 — unmaintained (RUSTSEC-2024-0384), superseded by web-time.
     # Transitive only. No vulnerability; a native build never hits its wasm path.
     "RUSTSEC-2024-0384",
-    # RETIRÉ (#2251) — audiopus_sys 0.2.2 / RUSTSEC-2026-0150 : la dépendance
-    # n'existe plus. `tune-core` passe désormais par `opus 0.4.0` (liaison sûre)
-    # au-dessus d'`opusic-sys 0.7.5`, qui embarque libopus 1.6.1 ; les deux sont
-    # maintenus. Le commentaire d'origine est conservé ci-dessous, en historique
-    # de ce qui a été payé pour vivre avec la crate abandonnée :
-    #
-    # « audiopus_sys 0.2.2 — unmaintained (RUSTSEC-2026-0150). Tiré par audiopus,
+    # audiopus_sys 0.2.2 — unmaintained (RUSTSEC-2026-0150). Tiré par audiopus,
     # lui-même dépendance de tune-ffi et tune-karaoke. C'est une crate `-sys` de
     # liaison vers libopus : elle n'a pas de code d'exécution propre, et aucune
     # vulnérabilité n'est signalée — seulement l'absence de mainteneur.
@@ -44,8 +38,8 @@ ignore = [
     # arbitrage ouvert — options et coûts dans #2251.
     #
     # Cette liste doit rester identique à celle de `.cargo/audit.toml` et à
-    # l'entrée `ignore:` du job `audit` de `.github/workflows/ci.yml`. »
-    #
+    # l'entrée `ignore:` du job `audit` de `.github/workflows/ci.yml`.
+    "RUSTSEC-2026-0150",
     # NOTE: the wasmtime advisories RUSTSEC-2026-0222/0223 were resolved by the
     # bump to wasmtime 47.0.3 and are no longer ignored.
 ]

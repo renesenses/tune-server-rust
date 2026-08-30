@@ -26,12 +26,6 @@
 //! Contre-epreuve faite a l'ecriture : en retirant RUSTSEC-2026-0150 de
 //! `.cargo/audit.toml`, `cargo audit` rend « error: 1 denied warning found! »
 //! et sort en 1.
-//!
-//! Suite : RUSTSEC-2026-0150 a depuis quitte les trois listes, non par
-//! exception mais parce que la dependance a disparu — `audiopus`/`audiopus_sys`
-//! remplaces par `opus`/`opusic-sys`, maintenus (#2251). Ce test-ci n'en est
-//! pas affecte : il compare les listes entre elles, quel qu'en soit le
-//! contenu.
 
 use std::collections::BTreeSet;
 use std::fs;
