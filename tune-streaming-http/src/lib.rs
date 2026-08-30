@@ -281,6 +281,9 @@ macro_rules! with_svc_mut {
 struct SearchQuery {
     q: String,
     limit: Option<usize>,
+    /// Curseur, en éléments et PAR CATÉGORIE (#2160). Absent = première page,
+    /// ce que tous les clients antérieurs envoient.
+    offset: Option<usize>,
 }
 
 pub fn router<S>() -> Router<S>
@@ -392,13 +395,30 @@ where
 /// de le borner — la recherche Qobuz pagine et s'arrête au plafond documenté
 /// dans `qobuz.rs` (#2160). Absent, la valeur reste 20, ce que les clients
 /// antérieurs obtenaient déjà.
+///
+/// `?offset=` est le curseur d'un « Charger plus » : le rang, par catégorie, du
+/// premier élément voulu. Absent = 0.
+///
+/// La réponse ajoute `offset`, `totals`, `has_more` et `truncated` À CÔTÉ des
+/// quatre clés existantes — un client antérieur lit `.albums` comme avant.
+/// `truncated` est ce qui empêche de prendre un « Tous » borné à 500 pour un
+/// catalogue épuisé.
+///
+/// **Pas de cache ici, et c'est délibéré.** Le cache de 120 s des listes
+/// utilisateur (#2818) est indexé par `(service, ressource)` : une clé de
+/// recherche devrait porter la requête, la limite ET le décalage, soit une
+/// entrée par frappe de clavier et par page. On ne mémorise donc rien, comme
+/// avant.
 async fn service_search(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(20);
-    with_svc!(&state, &service, |svc| svc.search(&q.q, limit).await)
+    let offset = q.offset.unwrap_or(0);
+    with_svc!(&state, &service, |svc| svc
+        .search_page(&q.q, limit, offset)
+        .await)
 }
 
 async fn service_albums(
@@ -1506,8 +1526,8 @@ mod tests_cache_utilisateur {
     use tune_core::TuneError;
     use tune_core::db::sqlite::SqliteDb;
     use tune_core::streaming::traits::{
-        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
-        StreamUrl,
+        AuthStatus, SearchPage, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist,
+        StreamTrack, StreamUrl,
     };
 
     fn piste(id: &str, titre: &str, artiste: &str) -> StreamTrack {
@@ -1528,11 +1548,16 @@ mod tests_cache_utilisateur {
         }
     }
 
+    /// Ce que la route a passé à `search_page` : (requête, limite, décalage).
+    /// #2160 — sert de témoin au module `tests_route_recherche`.
+    pub(super) type RecherchesVues = Arc<std::sync::Mutex<Vec<(String, usize, usize)>>>;
+
     /// Un connecteur qui compte ses lectures amont et sait les ralentir.
-    struct ServiceCompteur {
-        nom: String,
-        lectures: Arc<AtomicUsize>,
-        delai: Duration,
+    pub(super) struct ServiceCompteur {
+        pub(super) nom: String,
+        pub(super) lectures: Arc<AtomicUsize>,
+        pub(super) delai: Duration,
+        pub(super) recherches: RecherchesVues,
     }
 
     impl ServiceCompteur {
@@ -1567,6 +1592,25 @@ mod tests_cache_utilisateur {
         }
         async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
             Err("hors sujet".into())
+        }
+        /// Note ce que la route a réellement transmis, puis rend une page vide.
+        async fn search_page(
+            &self,
+            query: &str,
+            limit: usize,
+            offset: usize,
+        ) -> Result<SearchPage, TuneError> {
+            self.recherches.lock().expect("verrou d'essai").push((
+                query.to_string(),
+                limit,
+                offset,
+            ));
+            Ok(SearchPage::page_unique(SearchResults {
+                tracks: vec![],
+                albums: vec![],
+                artists: vec![],
+                playlists: vec![],
+            }))
         }
         async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
             Err("hors sujet".into())
@@ -1622,6 +1666,15 @@ mod tests_cache_utilisateur {
     }
 
     fn etat_essai(nom: &str, lectures: Arc<AtomicUsize>, delai: Duration) -> StreamingHttpState {
+        etat_essai_complet(nom, lectures, delai, RecherchesVues::default())
+    }
+
+    pub(super) fn etat_essai_complet(
+        nom: &str,
+        lectures: Arc<AtomicUsize>,
+        delai: Duration,
+        recherches: RecherchesVues,
+    ) -> StreamingHttpState {
         let backend: Arc<dyn DbBackend> =
             Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
         let mut registre = ServiceRegistry::new();
@@ -1629,6 +1682,7 @@ mod tests_cache_utilisateur {
             nom: nom.to_string(),
             lectures,
             delai,
+            recherches,
         }));
         StreamingHttpState::new(
             backend,
@@ -1905,5 +1959,96 @@ mod tests_cache_utilisateur {
             contenu_utilisateur_frais("essai-purge-logout", "playlists").is_none(),
             "apres logout, aucune liste de l'ancien compte ne doit rester servable"
         );
+    }
+}
+
+/// #2160 — le curseur et la taille de page de la recherche traversent la route.
+///
+/// La #2754 a livré la pagination interne du connecteur Qobuz ; ce module
+/// vérifie l'autre moitié serveur : que `?limit=` et `?offset=` arrivent bien
+/// jusqu'au service, et que leur absence rend exactement ce que rendaient les
+/// clients d'avant.
+#[cfg(test)]
+mod tests_route_recherche {
+    use super::tests_cache_utilisateur::{RecherchesVues, etat_essai_complet};
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn requete(q: &str, limit: Option<usize>, offset: Option<usize>) -> Query<SearchQuery> {
+        Query(SearchQuery {
+            q: q.to_string(),
+            limit,
+            offset,
+        })
+    }
+
+    async fn appelle(
+        nom: &str,
+        requete: Query<SearchQuery>,
+    ) -> (StatusCode, Vec<(String, usize, usize)>) {
+        let vues = RecherchesVues::default();
+        let etat = etat_essai_complet(
+            nom,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+            vues.clone(),
+        );
+        let r = service_search(State(etat), Path(nom.to_string()), requete).await;
+        let statut = r.status();
+        let notees = vues.lock().expect("verrou d'essai").clone();
+        (statut, notees)
+    }
+
+    #[tokio::test]
+    async fn le_decalage_de_la_requete_arrive_au_service() {
+        let (statut, vues) = appelle(
+            "essai-recherche-offset",
+            requete("somebody", Some(200), Some(400)),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(
+            vues,
+            vec![(String::from("somebody"), 200, 400)],
+            "`?limit=` et `?offset=` doivent parvenir intacts au connecteur"
+        );
+    }
+
+    /// Non-régression : la requête que tous les clients installés envoient.
+    #[tokio::test]
+    async fn sans_parametres_la_route_garde_ses_valeurs_d_avant() {
+        let (statut, vues) =
+            appelle("essai-recherche-defaut", requete("somebody", None, None)).await;
+
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(
+            vues,
+            vec![(String::from("somebody"), 20, 0)],
+            "défaut inchangé : 20 par catégorie, première page"
+        );
+    }
+
+    /// « Tous » reste `limit=0` — la convention des facettes Oxygen, déjà
+    /// bornée par le connecteur.
+    #[tokio::test]
+    async fn tous_passe_par_limit_zero() {
+        let (_, vues) = appelle("essai-recherche-tous", requete("jazz", Some(0), None)).await;
+        assert_eq!(vues, vec![(String::from("jazz"), 0, 0)]);
+    }
+
+    /// La recherche n'entre PAS dans le cache des listes utilisateur (#2818) :
+    /// sa clé devrait porter la requête, la limite et le décalage, soit une
+    /// entrée par frappe et par page.
+    #[tokio::test]
+    async fn la_recherche_ne_peuple_pas_le_cache_des_listes_utilisateur() {
+        let nom = "essai-recherche-sans-cache";
+        let (_, _) = appelle(nom, requete("somebody", Some(50), None)).await;
+        for ressource in ["playlists", "albums", "tracks", "artists", "search"] {
+            assert!(
+                contenu_utilisateur_frais(nom, ressource).is_none(),
+                "la recherche ne doit rien mémoriser sous `{ressource}`"
+            );
+        }
     }
 }
