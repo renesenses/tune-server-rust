@@ -123,8 +123,12 @@ pub(crate) async fn write_tags_to_files(
             let _label = row.get(10).and_then(|v| v.as_string());
             let comment = row.get(11).and_then(|v| v.as_string());
 
-            // Check file exists
-            if !std::path::Path::new(&file_path).exists() {
+            // Le fichier est-il là ? Pas `exists()` sur le chemin de la base :
+            // il est en NFC et le disque peut porter le nom en NFD, auquel cas
+            // la piste était comptée « sautée » alors qu'elle est présente
+            // (#1865). `tag_writer` résout de son côté ; ce pré-contrôle doit
+            // résoudre pareil, sinon il écarte avant même de l'appeler.
+            if tune_core::library::local_path::resolve_local_path(&file_path).is_missing() {
                 debug!(track_id, file_path = %file_path, "write_tags_file_not_found");
                 skipped += 1;
                 continue;

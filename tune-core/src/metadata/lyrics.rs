@@ -11,6 +11,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// La graphie que le disque accepte pour un chemin lu en base, ou — si aucune
+/// ne répond — le chemin stocké tel quel.
+///
+/// Le repli sur le stocké n'est pas un pis-aller : quand le fichier audio est
+/// absent (partage démonté), le comportement d'avant #1865 est exactement le
+/// bon — on cherche le `.lrc` sous le nom qu'on connaît, et on ne le trouve
+/// pas. Aucun appelant ne régresse.
+fn graphie_sur_disque(audio_path: &str) -> String {
+    crate::library::local_path::resolve_local_path(audio_path)
+        .found()
+        .unwrap_or_else(|| audio_path.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LrcLine {
     pub time_ms: u64,
@@ -96,8 +109,15 @@ pub fn find_sidecar_lrc(audio_path: &str) -> Option<String> {
 /// couverture doit pouvoir dire « cette piste a des paroles, et les voici »,
 /// pas seulement « oui ». Lecture seule : n'écrit jamais dans les dossiers de
 /// musique de l'utilisateur.
+///
+/// ⚠️ Le chemin reçu vient de `tracks.file_path`, donc en NFC ; le disque peut
+/// porter le nom en NFD. Le `.lrc` voisin, lui, a été posé à côté du fichier
+/// **tel qu'il est sur le disque** — c'est de la graphie réelle qu'il faut
+/// dériver la souche, sinon lecteur et écrivain regardent deux noms différents
+/// et le fichier de paroles devient invisible (#1865).
 pub fn sidecar_lrc_path(audio_path: &str) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(audio_path);
+    let reel = graphie_sur_disque(audio_path);
+    let path = std::path::Path::new(reel.as_str());
     for ext in ["lrc", "LRC"] {
         let candidate = path.with_extension(ext);
         if candidate.exists() {
@@ -111,13 +131,16 @@ pub fn sidecar_lrc_path(audio_path: &str) -> Option<std::path::PathBuf> {
 /// Vorbis comments…) via lofty — same mechanics as the scanner's
 /// `read_extended_metadata`, restricted to the lyrics item and skipping
 /// cover art to keep memory flat.
+///
+/// Même précaution que [`sidecar_lrc_path`] : `Probe::open` reçoit la graphie
+/// du disque, pas celle de la base (#1865).
 pub fn read_embedded_lyrics(audio_path: &str) -> Option<String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::TaggedFileExt;
     use lofty::probe::Probe;
     use lofty::tag::ItemKey;
 
-    let tagged = Probe::open(audio_path)
+    let tagged = Probe::open(graphie_sur_disque(audio_path))
         .and_then(|p| {
             p.options(
                 ParseOptions::new()
@@ -211,6 +234,12 @@ pub fn write_sidecar_lrc(
     if !has_lrc_timestamps(lrc) {
         return Err(SidecarWriteError::NotLrc);
     }
+    // La souche du `.lrc` se prend sur la graphie du DISQUE, pas sur celle de
+    // la base : c'est à côté du fichier réel qu'il faut le poser, et c'est
+    // sous ce nom-là que `sidecar_lrc_path` ira le relire (#1865). Un
+    // `is_file()` sur le chemin stocké rendait `MissingAudioFile` pour un
+    // fichier présent, et la passe le comptait en « rien à écrire ».
+    let audio_path = &graphie_sur_disque(audio_path);
     if !std::path::Path::new(audio_path).is_file() {
         return Err(SidecarWriteError::MissingAudioFile);
     }
@@ -446,5 +475,90 @@ mod tests {
         );
         assert_eq!(sidecar_lrc_write_path("/"), None);
         assert_eq!(sidecar_lrc_write_path(""), None);
+    }
+
+    // ------------------------------------------------------------------
+    // #1865 — le `.lrc` se pose et se relit à côté du fichier tel qu'il est
+    // SUR LE DISQUE. Écrire d'après la graphie de la base et relire d'après
+    // la graphie de la base marcherait « en apparence » ; la vraie exigence
+    // est que les deux tombent sur le fichier réel, sinon Tune sème un
+    // fichier de paroles que rien ne retrouve.
+    // ------------------------------------------------------------------
+
+    /// Ce que la base tient : `é` précomposé, U+00E9.
+    const EN_BASE_NFC: &str = "07 - Id\u{00e9}e.flac";
+    /// Ce que macOS pose sur le disque : `e` + U+0301. À l'œil, c'est le même
+    /// nom. En octets, non.
+    const SUR_DISQUE_NFD: &str = "07 - Ide\u{0301}e.flac";
+
+    /// Si un éditeur ou un filtre `git` re-normalise le source, les deux
+    /// constantes deviennent égales et tout ce qui suit devient vert sans
+    /// rien prouver. Ce test-ci le dirait.
+    #[test]
+    fn les_deux_graphies_du_couple_lrc_sont_distinctes() {
+        assert_ne!(EN_BASE_NFC, SUR_DISQUE_NFD);
+    }
+
+    #[test]
+    fn le_lrc_se_pose_et_se_relit_a_cote_du_fichier_decompose() {
+        let nfc = EN_BASE_NFC;
+        let dir = tempfile::tempdir().unwrap();
+        let sur_disque = dir.path().join(SUR_DISQUE_NFD);
+        std::fs::write(&sur_disque, b"pas vraiment du flac").unwrap();
+
+        let en_base = dir.path().join(nfc);
+        assert!(
+            !en_base.exists(),
+            "le systeme de fichiers replie les graphies : le cas #1865 n'est pas reproduit"
+        );
+
+        let lrc = "[00:12.00]une ligne\n";
+        let ecrit = write_sidecar_lrc(en_base.to_str().unwrap(), lrc)
+            .expect("le .lrc aurait du etre ecrit a cote du fichier reel");
+
+        // Posé à côté du fichier RÉEL, pas à côté d'un nom qui n'existe pas.
+        assert_eq!(ecrit.parent(), Some(dir.path()));
+        assert!(ecrit.exists());
+
+        // Et relu depuis la graphie de la base — c'est tout l'enjeu du couple.
+        assert_eq!(
+            sidecar_lrc_path(en_base.to_str().unwrap()).as_deref(),
+            Some(ecrit.as_path())
+        );
+        assert_eq!(
+            find_sidecar_lrc(en_base.to_str().unwrap()).as_deref(),
+            Some(lrc)
+        );
+    }
+
+    /// Témoin anti-régression : chemin purement ASCII, une seule graphie
+    /// possible. Marchait avant, doit marcher après.
+    #[test]
+    fn temoin_ascii_le_lrc_se_pose_et_se_relit() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("07 - Idea.flac");
+        std::fs::write(&audio, b"pas vraiment du flac").unwrap();
+
+        let lrc = "[00:12.00]une ligne\n";
+        let ecrit = write_sidecar_lrc(audio.to_str().unwrap(), lrc).unwrap();
+
+        assert_eq!(ecrit, dir.path().join("07 - Idea.lrc"));
+        assert_eq!(
+            find_sidecar_lrc(audio.to_str().unwrap()).as_deref(),
+            Some(lrc)
+        );
+    }
+
+    /// Et le garde-fou tient : un fichier audio qu'aucune graphie ne trouve
+    /// refuse toujours l'écriture, plutôt que de semer un `.lrc` orphelin.
+    #[test]
+    fn audio_introuvable_refuse_toujours_le_lrc() {
+        let dir = tempfile::tempdir().unwrap();
+        let nulle_part = dir.path().join("Rie\u{0301}n.flac");
+        let r = write_sidecar_lrc(nulle_part.to_str().unwrap(), "[00:12.00]x\n");
+        assert!(
+            matches!(r, Err(SidecarWriteError::MissingAudioFile)),
+            "{r:?}"
+        );
     }
 }
