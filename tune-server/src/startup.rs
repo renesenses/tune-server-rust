@@ -341,7 +341,12 @@ const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
 /// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
 /// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
 /// ne saurait pas où sa passe s'est arrêtée.
-fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+/// `pub(crate)` parce que le démarrage n'est plus le seul déclencheur : la fin
+/// d'une passe d'images d'artistes qui s'est arrêtée sans écrire son `done`
+/// applique la MÊME réécriture, tout de suite, sans attendre un redémarrage
+/// (`routes::library::artwork::FinDePasseArtistes`, #2073). Deux règles
+/// séparées auraient divergé au premier champ neutralisé.
+pub(crate) fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
     let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
         Ok(v) => v,
         Err(_) => {
