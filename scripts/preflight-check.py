@@ -51,6 +51,17 @@ P0_VERIFICATION_PENDING_LABEL = "release:verification-pending"
 # seulement dans le journal, que personne ne deroule.
 P0_FIELD_BLOCKED_LABEL = "bloque:terrain"
 
+# Known people may use more than one clone or process, but these two addresses
+# must never cross owners. Keep this deliberately narrow: the release gate is
+# meant to reject the mixed pairs that have already forged attribution, not to
+# turn every future contributor into an allow-list entry.
+MIXED_IDENTITY_PAIRS = {
+    ("bertrand", "jp@robbe.net"),
+    ("renesenses", "jp@robbe.net"),
+    ("jean-philippe robbe", "renesenses@gmail.com"),
+    ("jprobbe", "renesenses@gmail.com"),
+}
+
 
 @dataclass
 class CheckResult:
@@ -132,6 +143,125 @@ def check_version_bump(tag: str) -> CheckResult:
         True,
         f"tag {tag_tuple} >= Cargo.toml {cur_tuple}",
     )
+
+
+def check_identity_contract(
+    identities: list[tuple[str, str, str]], name: str
+) -> CheckResult:
+    """Reject known name/email mixtures without imposing a contributor allow-list."""
+    mixed = [
+        f"{role}={person} <{email}>"
+        for role, person, email in identities
+        if (person.strip().casefold(), email.strip().casefold())
+        in MIXED_IDENTITY_PAIRS
+    ]
+    rendered = "; ".join(
+        f"{role}={person} <{email}>" for role, person, email in identities
+    )
+    if mixed:
+        return CheckResult(
+            name,
+            False,
+            "mixed Git identity: " + "; ".join(mixed),
+        )
+    return CheckResult(name, True, rendered)
+
+
+def check_release_commit_identity() -> CheckResult:
+    """Validate the author and committer stored on the commit being released."""
+    revision = os.environ.get("GITHUB_SHA") or "HEAD"
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce",
+                revision,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CheckResult("release_identity", False, f"cannot read Git identity: {exc}")
+    fields = proc.stdout.rstrip("\n").split("\x00")
+    if proc.returncode != 0 or len(fields) != 4:
+        detail = proc.stderr.strip() or "unexpected git show output"
+        return CheckResult("release_identity", False, detail)
+    return check_identity_contract(
+        [("author", fields[0], fields[1]), ("committer", fields[2], fields[3])],
+        "release_identity",
+    )
+
+
+def _parse_git_var_identity(value: str) -> Optional[tuple[str, str]]:
+    """Parse `git var GIT_*_IDENT` without depending on its timestamp."""
+    match = re.match(r"^(.*) <([^<>]+)> \d+ [+-]\d{4}$", value.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def check_planned_git_identity() -> CheckResult:
+    """Validate the identities Git would use for the next local commit."""
+    identities: list[tuple[str, str, str]] = []
+    for role, variable in [
+        ("author", "GIT_AUTHOR_IDENT"),
+        ("committer", "GIT_COMMITTER_IDENT"),
+    ]:
+        try:
+            proc = subprocess.run(
+                ["git", "var", variable],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return CheckResult("planned_identity", False, f"cannot run git var: {exc}")
+        parsed = _parse_git_var_identity(proc.stdout) if proc.returncode == 0 else None
+        if parsed is None:
+            detail = proc.stderr.strip() or f"cannot parse {variable}"
+            return CheckResult("planned_identity", False, detail)
+        identities.append((role, parsed[0], parsed[1]))
+    return check_identity_contract(identities, "planned_identity")
+
+
+def self_test_identity_contract() -> None:
+    valid = check_identity_contract(
+        [
+            ("author", "Jean-Philippe ROBBE", "jp@robbe.net"),
+            ("committer", "Bertrand", "renesenses@gmail.com"),
+        ],
+        "test",
+    )
+    assert valid.passed, valid
+
+    forged_author = check_identity_contract(
+        [("author", "Bertrand", "jp@robbe.net")], "test"
+    )
+    assert not forged_author.passed, forged_author
+    assert "Bertrand <jp@robbe.net>" in forged_author.detail
+
+    forged_committer = check_identity_contract(
+        [("committer", "Jean-Philippe ROBBE", "renesenses@gmail.com")], "test"
+    )
+    assert not forged_committer.passed, forged_committer
+
+    # Unknown contributors remain valid: this is a consistency guard, not an
+    # allow-list that silently bars a new maintainer from making a release.
+    unknown = check_identity_contract(
+        [("author", "Nouvelle Mainteneuse", "maintainer@example.org")], "test"
+    )
+    assert unknown.passed, unknown
+
+    assert _parse_git_var_identity("Bertrand <renesenses@gmail.com> 1 +0200") == (
+        "Bertrand",
+        "renesenses@gmail.com",
+    )
+    assert _parse_git_var_identity("invalid") is None
 
 
 def classify_open_p0_issues(
@@ -608,6 +738,11 @@ def main() -> int:
         help="run local counter-examples without GitHub or cargo",
     )
     ap.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="validate the author/committer Git would use for the next commit",
+    )
+    ap.add_argument(
         "--skip",
         default="",
         help="comma-separated check names to skip (advanced, use sparingly)",
@@ -621,10 +756,16 @@ def main() -> int:
 
     if args.self_test:
         self_test_p0_classification()
-        print("preflight P0 classification self-test: PASS")
+        self_test_identity_contract()
+        print("preflight self-tests: PASS")
         return 0
+    if args.identity_only:
+        result = check_planned_git_identity()
+        marker = "PASS" if result.passed else "FAIL"
+        print(f"[{marker}] {result.name} — {result.detail}")
+        return 0 if result.passed else 1
     if not args.version:
-        ap.error("--version is required unless --self-test is used")
+        ap.error("--version is required unless --self-test or --identity-only is used")
 
     tag = args.version
     if not tag.startswith("v"):
@@ -645,6 +786,7 @@ def main() -> int:
 
     run("semver", lambda: check_semver(tag))
     run("version_bump", lambda: check_version_bump(tag))
+    run("release_identity", check_release_commit_identity)
     run("no_p0_issues", lambda: check_no_p0_issues(repo, token))
     run("no_release_todos", check_no_release_todos)
     run("cahier_de_recette", lambda: check_cahier_de_recette(tag))

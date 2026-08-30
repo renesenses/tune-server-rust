@@ -22,6 +22,38 @@
 //! n'est pas touché : il reste NFC, sinon la déduplication du scan repart en
 //! vrille.
 //!
+//! # Trois graphies ne suffisent pas : la normalisation est PAR COMPOSANT
+//!
+//! Normaliser le chemin **entier** suppose que le disque tient tout le chemin
+//! dans une seule forme. C'est faux — et le repli global de #1865 laisse donc
+//! un reliquat. Mesure sur `.18` le 29/08/2026, sur les **12** pistes qui
+//! portent le témoin de report `audio_embed_path_unresolved` (celui que #1865
+//! pose au lieu de marquer « analysée ») : **les 12 fichiers sont bel et bien
+//! sur le disque**, **aucun** n'est retrouvé par l'une des trois graphies
+//! globales, et **3** portent un nom qui n'est ni NFC ni NFD. Reportées à
+//! chaque passe, elles ne seraient jamais analysées. La normalisation change
+//! d'un composant à l'autre, voire à l'intérieur d'un composant :
+//!
+//! ```text
+//! stocké : …/Adrian Quesada/Boleros Psicodélicos/03 - Ídolo.flac
+//! disque :   répertoire en NFC          fichier en NFD
+//!   → NFD global décompose AUSSI le répertoire → ENOENT sur le répertoire
+//!   → NFC global recompose AUSSI le fichier    → ENOENT sur le fichier
+//!
+//! stocké : …/Aşk/09 - Güzelliğin On Para Etmez.flac
+//! disque : ü précomposé (U+00FC) MAIS ğ décomposé (g + U+0306)
+//!   → le nom sur le disque n'est NI NFC NI NFD : aucune normalisation
+//!     globale de la chaîne stockée ne peut le produire.
+//! ```
+//!
+//! D'où [`resolve_local_path`] et son **dernier recours** : descendre le
+//! chemin composant par composant et, quand un composant manque, lire le
+//! répertoire parent et comparer les noms **repliés en NFC** — la comparaison
+//! est normalisée, la chaîne rendue reste celle du disque. Ce recours ne
+//! s'engage qu'après l'échec des trois candidats bon marché ET seulement sur
+//! un chemin non-ASCII : un chemin ASCII n'a qu'une graphie, un `read_dir` n'y
+//! trouverait jamais rien de plus qu'un `exists()` (#1837).
+//!
 //! # Absent n'est pas illisible
 //!
 //! [`LocalPath::Missing`] ne dit pas « ce fichier n'existe plus », il dit
@@ -96,13 +128,120 @@ impl LocalPath {
 /// version normalisée. C'est le point 2 de l'en-tête de module : ce que
 /// l'appelant passera à `open()` a déjà été validé par un `exists()`.
 pub fn resolve_local_path(stored: &str) -> LocalPath {
-    match local_path_candidates(stored)
+    if let Some(p) = local_path_candidates(stored)
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
     {
-        Some(p) => LocalPath::Found(p),
-        None => LocalPath::Missing,
+        return LocalPath::Found(p);
     }
+    // Dernier recours : les trois graphies globales ne couvrent pas une
+    // normalisation qui change d'un composant à l'autre (#1837).
+    if merite_un_parcours(stored) {
+        if let Some(p) = resolve_par_composant(stored) {
+            return LocalPath::Found(p);
+        }
+    }
+    LocalPath::Missing
+}
+
+/// Le parcours du disque vaut-il d'être payé pour ce chemin ?
+///
+/// Fonction à part, et pure, pour que le garde-fou soit **vérifiable** : sans
+/// elle on ne pourrait tester que le résultat (`Missing` dans les deux cas) et
+/// jamais le coût, qui est tout l'enjeu. Un `read_dir` par composant, sur
+/// chaque fichier d'un partage démonté, à chaque passe, se paierait cher pour
+/// rien.
+///
+/// Deux refus :
+/// - **chemin ASCII** — une seule graphie Unicode possible, `exists()` a déjà
+///   répondu, un `read_dir` ne trouverait rien de plus ;
+/// - **chemin relatif** — la descente part de la racine, elle n'a pas de point
+///   de départ ici (et les passes de fond ne manipulent que de l'absolu).
+fn merite_un_parcours(stored: &str) -> bool {
+    !stored.is_ascii() && stored.starts_with('/')
+}
+
+/// Nombre d'entrées lues au plus dans un répertoire pendant la descente.
+///
+/// Un plafond, pas une heuristique : sans lui, un répertoire de cent mille
+/// fichiers se paierait entièrement à chaque piste introuvable. Au-delà, on
+/// abandonne la descente plutôt que de rendre un résultat tiré d'une lecture
+/// tronquée — [`LocalPath::Missing`] fait différer la piste, il ne la fige pas.
+const MAX_ENTREES_PARCOURUES: usize = 50_000;
+
+/// Descente composant par composant, comparaison repliée en NFC.
+///
+/// Rend l'orthographe **du disque**, jamais une normalisation fabriquée : à
+/// chaque niveau, la chaîne retenue est celle que `read_dir` a rendue.
+///
+/// Rend `None` dès qu'un niveau est ambigu — deux entrées distinctes octet à
+/// octet peuvent très bien se replier sur le même NFC (un disque peut porter
+/// `Ídolo` en NFC *et* en NFD côte à côte). Deviner laquelle des deux porte le
+/// bon contenu serait pire que de différer.
+fn resolve_par_composant(stored: &str) -> Option<String> {
+    // Chemins absolus seulement : la descente part d'une racine connue, et les
+    // passes de fond ne manipulent que des chemins absolus.
+    let reste = stored.strip_prefix('/')?;
+    let mut courant = String::from("/");
+    for composant in reste.split('/') {
+        if composant.is_empty() {
+            continue;
+        }
+        let tel_quel = joindre(&courant, composant);
+        if std::path::Path::new(&tel_quel).exists() {
+            courant = tel_quel;
+            continue;
+        }
+        courant = joindre(&courant, &entree_equivalente(&courant, composant)?);
+    }
+    Some(courant)
+}
+
+/// Concaténation sans doubler le séparateur quand le préfixe est la racine.
+fn joindre(prefixe: &str, composant: &str) -> String {
+    if prefixe.ends_with('/') {
+        format!("{prefixe}{composant}")
+    } else {
+        format!("{prefixe}/{composant}")
+    }
+}
+
+/// L'unique entrée de `repertoire` dont le nom se replie sur le même NFC que
+/// `cherche`. `None` s'il n'y en a aucune, plusieurs, ou si le répertoire
+/// dépasse [`MAX_ENTREES_PARCOURUES`].
+fn entree_equivalente(repertoire: &str, cherche: &str) -> Option<String> {
+    entree_equivalente_plafonnee(repertoire, cherche, MAX_ENTREES_PARCOURUES)
+}
+
+/// [`entree_equivalente`] avec le plafond en paramètre.
+///
+/// Le plafond est un paramètre — et non la constante lue sur place — pour que
+/// l'abandon soit **vérifiable sans fabriquer cinquante mille fichiers**. Sans
+/// cela on ne pourrait tester que le cas nominal, et le seul comportement qui
+/// compte ici — abandonner plutôt que répondre sur une lecture tronquée —
+/// resterait sur parole.
+fn entree_equivalente_plafonnee(repertoire: &str, cherche: &str, plafond: usize) -> Option<String> {
+    let cible = cherche.nfc().collect::<String>();
+    let mut trouve: Option<String> = None;
+    let mut lues = 0usize;
+    for entree in std::fs::read_dir(repertoire).ok()? {
+        lues += 1;
+        if lues > plafond {
+            return None;
+        }
+        let Ok(entree) = entree else { continue };
+        let nom = entree.file_name();
+        let Some(nom) = nom.to_str() else { continue };
+        if nom.nfc().collect::<String>() != cible {
+            continue;
+        }
+        if trouve.is_some() {
+            // Ambiguïté : deux graphies coexistent. On préfère différer.
+            return None;
+        }
+        trouve = Some(nom.to_string());
+    }
+    trouve
 }
 
 /// Variante `Option` de [`resolve_local_path`], pour les appelants qui n'ont
@@ -312,5 +451,233 @@ mod tests {
         assert!(deferral_stamp(maintenant) > seuil);
         // Un report plus vieux que la fenetre repasse candidat.
         assert!(deferral_stamp(maintenant - PATH_RETRY_AFTER_SECS - 1) < seuil);
+    }
+
+    // ------------------------------------------------------------------
+    // #1837 — normalisation MIXTE : les trois graphies globales ne suffisent
+    // pas. Les deux cas ci-dessous sont copiés des 12 pistes de .18 qui, le
+    // 29/08/2026, existaient bel et bien sur le disque et qu'AUCUN des trois
+    // candidats ne retrouvait.
+    // ------------------------------------------------------------------
+
+    /// Lit le fichier rendu et vérifie qu'il porte bien le contenu attendu.
+    ///
+    /// Passer par le CONTENU et pas par l'égalité de chaînes est délibéré :
+    /// sur un système qui normalise de lui-même (APFS) les deux graphies
+    /// désignent le même inœud, sur ext4 non. Le contenu tranche dans les deux
+    /// cas, et c'est bien le fichier — pas l'orthographe — qui nous intéresse.
+    fn doit_ouvrir(stored: &str, attendu: &[u8]) {
+        match resolve_local_path(stored) {
+            LocalPath::Found(trouve) => {
+                let lu = std::fs::read(&trouve)
+                    .unwrap_or_else(|e| panic!("graphie rendue inouvrable {trouve:?}: {e}"));
+                assert_eq!(lu, attendu, "graphie rendue {trouve:?} : mauvais fichier");
+            }
+            LocalPath::Missing => {
+                panic!("le fichier existe sur le disque, {stored:?} doit le retrouver")
+            }
+        }
+    }
+
+    #[test]
+    fn un_repertoire_nfc_et_un_fichier_nfd_sont_retrouves() {
+        // Le cas « Boleros Psicodélicos / Ídolo » de .18 : le répertoire est
+        // resté en NFC, le fichier est en NFD. La normalisation GLOBALE échoue
+        // des deux côtés — NFD casse le répertoire, NFC casse le fichier.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dossier_nfc = "Boleros Psicod\u{00e9}licos";
+        let fichier_nfd = "03 - I\u{0301}dolo.flac";
+        let fichier_nfc = "03 - \u{00cd}dolo.flac";
+
+        let dossier = tmp.path().join(dossier_nfc);
+        std::fs::create_dir(&dossier).unwrap();
+        std::fs::write(dossier.join(fichier_nfd), b"idolo").unwrap();
+
+        let stored = dossier.join(fichier_nfc).to_string_lossy().to_string();
+
+        // Contre-épreuve du test : aucun des trois candidats ne doit exister,
+        // sans quoi le test passerait sans jamais emprunter le nouveau chemin.
+        assert!(
+            !local_path_candidates(&stored)
+                .iter()
+                .any(|c| std::path::Path::new(c).exists()),
+            "les trois graphies globales ne doivent RIEN trouver ici"
+        );
+
+        doit_ouvrir(&stored, b"idolo");
+    }
+
+    #[test]
+    fn un_composant_ni_nfc_ni_nfd_est_retrouve() {
+        // Le cas « Güzelliğin » de .18 : dans le MÊME nom, le tréma est
+        // précomposé (U+00FC) et la brève est décomposée (g + U+0306). Ce nom
+        // n'est ni NFC ni NFD : aucune normalisation de la chaîne stockée ne
+        // peut le produire, seule une comparaison repliée le reconnaît.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sur_disque = "09 - G\u{00fc}zelli\u{0067}\u{0306}in.flac";
+        let stocke = "09 - G\u{00fc}zelli\u{011f}in.flac";
+
+        // Le disque porte bien une forme bâtarde, sinon le test ne prouve rien.
+        assert_ne!(sur_disque.nfc().collect::<String>(), sur_disque);
+        assert_ne!(sur_disque.nfd().collect::<String>(), sur_disque);
+
+        std::fs::write(tmp.path().join(sur_disque), b"guzel").unwrap();
+        let stored = tmp.path().join(stocke).to_string_lossy().to_string();
+
+        assert!(
+            !local_path_candidates(&stored)
+                .iter()
+                .any(|c| std::path::Path::new(c).exists()),
+            "les trois graphies globales ne doivent RIEN trouver ici"
+        );
+
+        doit_ouvrir(&stored, b"guzel");
+    }
+
+    /// Les huit graphies Unicode de `Núñéz` : chaque marque peut être
+    /// précomposée ou décomposée, indépendamment des autres. Elles se replient
+    /// toutes sur le même NFC et sont toutes distinctes octet à octet.
+    fn graphies_de_nunez() -> Vec<String> {
+        let mut out = Vec::new();
+        for u in ["\u{00fa}", "u\u{0301}"] {
+            for n in ["\u{00f1}", "n\u{0303}"] {
+                for e in ["\u{00e9}", "e\u{0301}"] {
+                    out.push(format!("N{u}{n}{e}z.flac"));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn les_huit_graphies_sont_distinctes_et_equivalentes() {
+        // Contre-épreuve du matériel de test : si l'outillage avait recomposé
+        // les littéraux, le test d'ambiguïté ci-dessous ne prouverait rien.
+        let g = graphies_de_nunez();
+        assert_eq!(g.len(), 8);
+        let uniques: std::collections::BTreeSet<_> = g.iter().collect();
+        assert_eq!(uniques.len(), 8, "les huit graphies doivent differer");
+        for x in &g {
+            assert_eq!(
+                x.nfc().collect::<String>(),
+                g[0],
+                "toutes doivent se replier sur le meme NFC"
+            );
+        }
+    }
+
+    #[test]
+    fn deux_graphies_equivalentes_cote_a_cote_rendent_missing_plutot_quun_choix() {
+        // Un disque peut porter DEUX orthographes du même nom. Rendre l'une au
+        // hasard, c'est ouvrir peut-être le mauvais fichier. `Missing` fait
+        // différer la piste — elle repassera — au lieu de la figer sur une
+        // supposition.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let g = graphies_de_nunez();
+        let stocke = &g[3];
+        let nfc = stocke.nfc().collect::<String>();
+        let nfd = stocke.nfd().collect::<String>();
+
+        // Les deux entrées écrites doivent être invisibles aux TROIS candidats
+        // bon marché, sinon le parcours ne serait jamais engagé et l'ambiguïté
+        // jamais atteinte.
+        let paire: Vec<&String> = g
+            .iter()
+            .filter(|x| **x != *stocke && **x != nfc && **x != nfd)
+            .take(2)
+            .collect();
+        assert_eq!(paire.len(), 2);
+        for (i, nom) in paire.iter().enumerate() {
+            std::fs::write(tmp.path().join(nom), format!("contenu{i}")).unwrap();
+        }
+
+        let stored = tmp.path().join(stocke).to_string_lossy().to_string();
+        assert!(
+            !local_path_candidates(&stored)
+                .iter()
+                .any(|c| std::path::Path::new(c).exists()),
+            "les trois graphies globales ne doivent RIEN trouver ici"
+        );
+        // Le parcours, lui, trouve DEUX candidates : il doit refuser de choisir.
+        assert_eq!(
+            resolve_local_path(&stored),
+            LocalPath::Missing,
+            "deux graphies equivalentes : aucune ne doit etre choisie au hasard"
+        );
+
+        // Et la preuve que le refus vient bien de l'ambiguïté, pas d'un
+        // parcours qui ne trouverait jamais rien : une seule entrée suffit.
+        std::fs::remove_file(tmp.path().join(paire[1])).unwrap();
+        match resolve_local_path(&stored) {
+            LocalPath::Found(p) => assert_eq!(std::fs::read(p).unwrap(), b"contenu0"),
+            LocalPath::Missing => panic!("une seule graphie reste : elle doit etre rendue"),
+        }
+    }
+
+    #[test]
+    fn le_parcours_nest_engage_que_sur_un_chemin_absolu_et_accentue() {
+        // Le garde-fou de coût, vérifié sur la décision elle-même et pas sur
+        // son résultat : `Missing` sortirait de toute façon, ce qu'on veut
+        // prouver c'est qu'aucun `read_dir` n'est payé.
+        assert!(merite_un_parcours("/music/Bj\u{00f6}rk/01.flac"));
+        assert!(
+            !merite_un_parcours("/music/Gramophone/01.flac"),
+            "ASCII : une seule graphie possible, le disque n'a rien de plus a dire"
+        );
+        assert!(
+            !merite_un_parcours("Bj\u{00f6}rk/01.flac"),
+            "relatif : la descente n'a pas de racine d'ou partir"
+        );
+    }
+
+    #[test]
+    fn un_chemin_ascii_absent_reste_missing() {
+        // Le garde-fou de coût : un chemin ASCII n'a qu'une seule graphie
+        // Unicode, un `read_dir` n'y trouverait jamais ce qu'`exists()` n'a pas
+        // trouvé. Il ne doit donc pas être payé — et surtout pas à chaque
+        // passe, sur chaque fichier d'un partage démonté.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp
+            .path()
+            .join("Gramophone")
+            .join("01.flac")
+            .to_string_lossy()
+            .to_string();
+        assert!(absent.is_ascii(), "le cas testé doit rester ASCII");
+        assert_eq!(resolve_local_path(&absent), LocalPath::Missing);
+    }
+
+    #[test]
+    fn un_chemin_relatif_reste_missing() {
+        // `resolve_par_composant` descend depuis la racine ; un chemin relatif
+        // n'a pas de point de départ et doit sortir sans toucher au disque.
+        assert_eq!(
+            resolve_local_path("Bj\u{00f6}rk/01.flac"),
+            LocalPath::Missing
+        );
+    }
+
+    #[test]
+    fn un_repertoire_plus_grand_que_le_plafond_fait_abandonner() {
+        // Le plafond n'est pas décoratif : au-delà, on ABANDONNE la descente
+        // au lieu de répondre sur une lecture tronquée. Le vérifier suppose de
+        // pouvoir choisir le plafond — d'où le paramètre.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let racine = tmp.path().to_string_lossy().to_string();
+        let sur_disque = "Bjo\u{0308}rk.flac";
+        let cherche = "Bj\u{00f6}rk.flac";
+        for i in 0..5 {
+            std::fs::write(tmp.path().join(format!("bourrage{i}.flac")), b"x").unwrap();
+        }
+        std::fs::write(tmp.path().join(sur_disque), b"bjork").unwrap();
+
+        // Plafond large : l'entrée équivalente est trouvée.
+        assert_eq!(
+            entree_equivalente_plafonnee(&racine, cherche, 50),
+            Some(sur_disque.to_string())
+        );
+        // Plafond dépassé : abandon, quelle que soit la place de l'entrée dans
+        // l'ordre — non déterministe — rendu par `read_dir`.
+        assert_eq!(entree_equivalente_plafonnee(&racine, cherche, 3), None);
     }
 }

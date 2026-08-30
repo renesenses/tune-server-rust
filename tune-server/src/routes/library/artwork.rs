@@ -418,6 +418,20 @@ pub(super) fn compter_artistes_sans_image(
     }
 }
 
+/// Libellé affiché à côté du compteur d'avancement, d'après la passe en cours.
+///
+/// La passe par nom (Discogs / Last.fm) tombait dans le cas par défaut et
+/// s'annonçait « MusicBrainz » — la seule des trois qui n'interroge justement
+/// pas MusicBrainz. Le nom de la passe vient de `tune-core`, pas d'une chaîne
+/// recopiée ici.
+pub(super) fn libelle_phase(phase: Option<&str>) -> &'static str {
+    match phase {
+        Some("images") => "Images",
+        Some(p) if p == tune_core::library::artwork::PHASE_PAR_NOM => "Discogs / Last.fm",
+        _ => "MusicBrainz",
+    }
+}
+
 pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -483,10 +497,7 @@ pub(super) async fn batch_enrich_artist_artwork(
                 }
                 let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
                 let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
-                let detail = match v.get("phase").and_then(|s| s.as_str()) {
-                    Some("images") => "Images",
-                    _ => "MusicBrainz",
-                };
+                let detail = libelle_phase(v.get("phase").and_then(|s| s.as_str()));
                 bg_tasks.update_progress("artist_artwork", processed, total, detail);
             }
         });
@@ -913,5 +924,30 @@ mod tests_service_pochette {
                 .unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chaque passe doit s'annoncer sous son propre nom. La passe par nom
+    /// n'appelle pas MusicBrainz : l'afficher ainsi désigne le mauvais service
+    /// quand la recherche échoue (#2227, #2257).
+    #[test]
+    fn chaque_passe_porte_son_propre_libelle() {
+        assert_eq!(libelle_phase(Some("mbid")), "MusicBrainz");
+        assert_eq!(libelle_phase(Some("images")), "Images");
+        assert_eq!(
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            "Discogs / Last.fm"
+        );
+        assert_ne!(
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            "MusicBrainz",
+            "la passe par nom n'interroge pas MusicBrainz"
+        );
+        // Une passe inconnue garde le repli historique.
+        assert_eq!(libelle_phase(None), "MusicBrainz");
     }
 }

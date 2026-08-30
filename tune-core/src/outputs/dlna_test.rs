@@ -38,6 +38,21 @@ mod tests {
         media_info_fige: Arc<Mutex<bool>>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
+        /// « Salon » (#2581) : ce renderer refuse `Play` avec le code UPnP 701
+        /// « Transition not available » quand il ne tient AUCUN média.
+        salon_701_sans_media: Arc<Mutex<bool>>,
+        /// « Salon » (#2581) : il refuse aussi les `n` premiers `Play` — il
+        /// charge encore l'URI, et se déclare TRANSITIONING pendant ce temps.
+        refus_701_restants: Arc<Mutex<u32>>,
+        /// « Salon » (#2581) : un `Stop` lui fait OUBLIER son média. C'est le
+        /// piège du barème aveugle : le Stop du premier réessai le prive du
+        /// média, et tout `Play` suivant est un 701 de plus.
+        stop_oublie_le_media: Arc<Mutex<bool>>,
+        /// « Salon » (#2581) : le prochain `SetAVTransportURI` accepté est
+        /// aussitôt perdu — une seule fois.
+        oublie_le_media_une_fois: Arc<Mutex<bool>>,
+        /// Nombre de `Play` REFUSÉS avec un 701.
+        play_refus_701: Arc<AtomicU32>,
     }
 
     impl Default for MockState {
@@ -57,6 +72,11 @@ mod tests {
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
+                salon_701_sans_media: Arc::new(Mutex::new(false)),
+                refus_701_restants: Arc::new(Mutex::new(0)),
+                stop_oublie_le_media: Arc::new(Mutex::new(false)),
+                oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
+                play_refus_701: Arc::new(AtomicU32::new(0)),
             }
         }
     }
@@ -90,6 +110,12 @@ mod tests {
         )
     }
 
+    /// La faute SOAP EXACTE relevée dans le journal de FabienM (#2581),
+    /// rendue comme un vrai renderer la rend : statut HTTP 500 AVEC corps.
+    fn soap_701() -> String {
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>Transition not available</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+    }
+
     async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
         use axum::response::IntoResponse;
         let action = extract_action(&body);
@@ -107,9 +133,43 @@ mod tests {
                 if !*state.media_info_fige.lock().await {
                     *state.current_uri.lock().await = uri;
                 }
+                // « Salon » (#2581) : média accepté puis aussitôt perdu.
+                {
+                    let mut oubli = state.oublie_le_media_une_fois.lock().await;
+                    if *oubli {
+                        *oubli = false;
+                        state.current_uri.lock().await.clear();
+                        *state.transport_state.lock().await = "NO_MEDIA_PRESENT".into();
+                    }
+                }
                 soap_ok("SetAVTransportURI", "").into_response()
             }
             "Play" => {
+                // « Salon » (#2581) : sans média, la transition est impossible.
+                if *state.salon_701_sans_media.lock().await
+                    && state.current_uri.lock().await.is_empty()
+                {
+                    state.play_refus_701.fetch_add(1, Ordering::Relaxed);
+                    *state.transport_state.lock().await = "NO_MEDIA_PRESENT".into();
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
+                        .into_response();
+                }
+                // « Salon » (#2581) : il charge encore l'URI.
+                let charge_encore = {
+                    let mut restants = state.refus_701_restants.lock().await;
+                    if *restants > 0 {
+                        *restants -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if charge_encore {
+                    state.play_refus_701.fetch_add(1, Ordering::Relaxed);
+                    *state.transport_state.lock().await = "TRANSITIONING".into();
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
+                        .into_response();
+                }
                 state.play_count.fetch_add(1, Ordering::Relaxed);
                 *state.transport_state.lock().await = "PLAYING".into();
                 soap_ok("Play", "").into_response()
@@ -125,6 +185,11 @@ mod tests {
                 state.stop_count.fetch_add(1, Ordering::Relaxed);
                 if !*state.stop_exige_pause.lock().await {
                     *state.transport_state.lock().await = "STOPPED".into();
+                    // « Salon » (#2581) : ce Stop lui fait oublier son média.
+                    if *state.stop_oublie_le_media.lock().await {
+                        state.current_uri.lock().await.clear();
+                        *state.transport_state.lock().await = "NO_MEDIA_PRESENT".into();
+                    }
                 }
                 // Acquitté dans TOUS les cas — c'est le comportement observé.
                 soap_ok("Stop", "").into_response()
@@ -722,6 +787,99 @@ mod tests {
             connexions.load(Ordering::SeqCst),
             2,
             "il faut exactement une seconde tentative, sur une connexion neuve"
+        );
+        handle.abort();
+    }
+
+    /// LA scène du journal de FabienM (#2581), rejouée de bout en bout.
+    ///
+    /// Le renderer « Salon » refuse le premier `Play` avec un 701 — il charge
+    /// encore l'URI — et un `Stop` lui fait oublier son média. L'ancien barème
+    /// envoyait justement un Stop au premier réessai : le média disparaissait,
+    /// les quatre `Play` suivants étaient quatre 701 de plus, la zone était
+    /// arrêtée après 36 s. Lire `GetTransportInfo` avant de rejouer suffit à
+    /// ne PAS envoyer ce Stop : le renderer finit de charger et joue.
+    #[tokio::test]
+    async fn un_701_de_chargement_ne_declenche_plus_le_stop_qui_tue_le_media() {
+        let state = MockState::default();
+        *state.salon_701_sans_media.lock().await = true;
+        *state.refus_701_restants.lock().await = 1;
+        *state.stop_oublie_le_media.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.74:8085/stream/salon-chargement.flac";
+        output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("Never Let Me Down Again"),
+                ..Default::default()
+            })
+            .await
+            .expect("le renderer chargeait, il fallait le laisser finir");
+
+        assert_eq!(
+            state.play_refus_701.load(Ordering::Relaxed),
+            1,
+            "un seul 701 : le suivant devait passer"
+        );
+        assert_eq!(
+            state.play_count.load(Ordering::Relaxed),
+            1,
+            "exactement un Play accepté"
+        );
+        assert_eq!(
+            state.stop_count.load(Ordering::Relaxed),
+            1,
+            "un seul Stop — celui d'ouverture. Le barème n'en a PAS ajouté : c'est ce Stop-là qui privait le renderer de son média"
+        );
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "le renderer doit finir sur NOTRE flux"
+        );
+        handle.abort();
+    }
+
+    /// L'autre bras du 701 : le renderer ne tient PLUS de média. Aucun délai
+    /// n'y peut rien — sans réarmement de l'URI, chaque `Play` est un 701 de
+    /// plus, ce que les cinq tentatives du journal ont démontré. Le journal
+    /// prouve aussi le remède : dès qu'un `SetAVTransportURI` est rejoué, la
+    /// même piste part du premier coup.
+    #[tokio::test]
+    async fn un_701_sans_media_rearme_l_uri_et_la_piste_part() {
+        let state = MockState::default();
+        *state.salon_701_sans_media.lock().await = true;
+        // Le SetAVTransportURI d'ouverture est accepté… puis perdu.
+        *state.oublie_le_media_une_fois.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.74:8085/stream/salon-sans-media.flac";
+        output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("Never Let Me Down Again"),
+                ..Default::default()
+            })
+            .await
+            .expect("l'URI réarmée, la piste doit partir");
+
+        assert_eq!(
+            state.play_refus_701.load(Ordering::Relaxed),
+            1,
+            "un seul 701 : le réarmement devait suffire"
+        );
+        assert!(
+            state.set_uri_corps.lock().await.len() >= 2,
+            "l'URI devait être REPOSÉE, pas seulement redemandée en Play"
+        );
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "le renderer doit finir sur NOTRE flux"
         );
         handle.abort();
     }

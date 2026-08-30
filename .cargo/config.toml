@@ -18,19 +18,30 @@ rustflags = ["-C", "target-feature=+crt-static"]
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
-# Opus decoding: audiopus_sys 0.2.2 builds a *vendored* libopus from source
-# via CMake. That bundled libopus ships a CMakeLists.txt with an old
-# `cmake_minimum_required`, and CMake 4.x (on the macOS/Windows GitHub runners
-# and on modern dev machines) removed compatibility with CMake < 3.5, aborting
-# the configure step with:
+# CMake < 3.5 compatibility shim.
+#
+# CMake 4.x (macOS/Windows GitHub runners, modern dev machines) removed
+# compatibility with projects declaring `cmake_minimum_required` below 3.5,
+# aborting the configure step with:
 #
 #   CMake Error: Compatibility with CMake < 3.5 has been removed from CMake.
 #
-# CMake reads `CMAKE_POLICY_VERSION_MINIMUM` from the environment as the default
-# policy version, which restores the pre-4.x behaviour without patching the
-# vendored sources. Setting it here (rather than in one CI step) makes every
-# build — PR CI, release matrix, and local dev — link libopus the same way.
-# Linux runners still ship CMake 3.x so they were unaffected, but this is
-# harmless there.
+# `CMAKE_POLICY_VERSION_MINIMUM` is read from the environment as a *floor* on
+# the policy version: a project declaring a HIGHER minimum keeps its own, so
+# this only ever rescues the projects that declare a lower one.
+#
+# ## Pourquoi c'est toujours là après #2251
+#
+# Ce réglage était posé pour la libopus embarquée d'`audiopus_sys 0.2.2`, dont
+# le `CMakeLists.txt` déclarait un minimum antérieur à 3.5. Cette crate a été
+# remplacée par `opus` / `opusic-sys`, dont la libopus 1.6.1 déclare
+# `cmake_minimum_required(VERSION 3.16)` : pour libopus, la variable est
+# désormais **sans effet**.
+#
+# Elle reste néanmoins ici, car libopus n'est pas la seule dépendance native
+# construite par CMake dans ce dépôt (le `Dockerfile` installe `cmake`/`clang`
+# pour librespot et airplay-daemon). La retirer serait un changement à la
+# portée non mesurée, sans bénéfice : sur un projet qui déclare déjà ≥ 3.5 elle
+# ne fait rien.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -47,6 +47,58 @@ fn ph(engine: Engine, idx: usize) -> String {
     }
 }
 
+/// Rapproche une ligne d'historique (`lh`) de son album (`a`).
+///
+/// Le titre SEUL ne designe pas un album : un « Live » de Police et un
+/// « Live » de Pulp portent le meme titre et se retrouvaient comptes pour un
+/// seul disque — un album jamais ecoute remontait dans « Continuer l'ecoute »,
+/// et le compteur d'avancement additionnait les pistes des deux (#2731,
+/// Tades, fil 1600).
+///
+/// L'identifiant fait foi quand il est ecrit. Il ne l'est PAS toujours :
+/// `record_listen` le tire de la piste locale, donc toute ecoute en flux
+/// (track_id absent) et toute ligne anterieure a la migration
+/// `add_listen_history_source_id_album_id` l'ont a NULL. Joindre sur le seul
+/// `album_id` viderait la section pour ces gens-la ; d'ou le repli sur
+/// titre ET artiste.
+///
+/// Une ligne sans artiste reste rattachee au titre seul : on ne sait pas
+/// departager, et perdre l'entree serait pire que la garder.
+///
+/// Le sous-select sur `artists` evite de dependre de l'ordre des jointures —
+/// `ar` n'existe pas encore quand cette condition est evaluee, et le
+/// GROUP BY de PostgreSQL n'accepte pas qu'on enveloppe `albums` dans une
+/// table derivee (la dependance fonctionnelle ne vaut que pour la cle
+/// primaire d'une vraie table).
+const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
+     OR (lh.album_id IS NULL AND lh.album_title = a.title \
+         AND (lh.artist_name IS NULL \
+              OR lh.artist_name = (SELECT ar_hist.name FROM artists ar_hist \
+                                   WHERE ar_hist.id = a.artist_id))))";
+
+/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
+/// celui de l'album. Partage entre les recommandations et les « top mixes »,
+/// qui prenaient tous deux le genre d'un album homonyme (#2731).
+///
+/// ATTENTION : telle quelle, cette requete ECHOUE sur les deux moteurs —
+/// `WHERE genre IS NOT NULL` est ambigu entre `t.genre` et `a.genre`, et
+/// l'erreur est avalee par le `unwrap_or_default` des appelants. La jointure
+/// est corrigee ici pour le jour ou la requete sera reveillee ; la reveiller
+/// releve d'un arbitrage produit (cf. le test
+/// `les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre`), pas du
+/// defaut d'homonymie.
+fn sql_top_genres() -> String {
+    format!(
+        "SELECT genre, COUNT(*) as cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) as genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
+               WHERE genre IS NOT NULL AND genre != '') \
+         GROUP BY genre ORDER BY cnt DESC LIMIT 5"
+    )
+}
+
 /// Aggregated home page: returns all sections in a single response.
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // No zone filter for the aggregated home page — show all zones.
@@ -151,7 +203,7 @@ fn fetch_continue_listening(
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
         FROM listen_history lh \
-        JOIN albums a ON lh.album_title = a.title \
+        JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
         WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
         {zone_filter}\
@@ -180,6 +232,139 @@ fn fetch_continue_listening(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests_homonymes {
+    use super::*;
+
+    /// Les deux disques de Tades : un « Live » de Police et un « Live » de
+    /// Pulp, meme titre au caractere pres, cinq pistes chacun.
+    /// Rend `(id du Live de Police, id du Live de Pulp)`.
+    fn deux_live(state: &AppState, genre: Option<&str>) -> (i64, i64) {
+        let b = &state.backend;
+        let poser = |artiste: &str| -> i64 {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            let artiste_id = b.last_insert_rowid();
+            b.execute(
+                "INSERT INTO albums (title, artist_id, track_count, genre) \
+                 VALUES ('Live', ?1, 5, ?2)",
+                &[&artiste_id as &dyn ToSqlValue, &genre as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let police = poser("The Police");
+        let pulp = poser("Pulp");
+        (police, pulp)
+    }
+
+    fn ecoute(state: &AppState, titre: &str, artiste: Option<&str>, album_id: Option<i64>) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES (?1, ?2, 'Live', ?3, '2026-08-28T22:45:00Z')",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Le defaut de Tades (#2731, fil 1600) : ecouter le « Live » de Pulp
+    /// faisait remonter celui de Police, et le compteur d'avancement
+    /// additionnait les pistes des deux.
+    #[test]
+    fn le_live_de_pulp_ne_fait_pas_remonter_celui_de_police() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        ecoute(&state, "Disco 2000", Some("Pulp"), Some(pulp));
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+        assert_eq!(
+            items[0]["listened_tracks"].as_i64(),
+            Some(2),
+            "le compteur ne doit compter que les pistes de CET album"
+        );
+        assert_ne!(items[0]["album_id"].as_i64(), Some(police));
+    }
+
+    /// `record_listen` ne connait l'album que par la piste locale : une ecoute
+    /// en flux (`track_id` absent) et toute ligne anterieure a la migration
+    /// `add_listen_history_source_id_album_id` ont `album_id` a NULL. Joindre
+    /// sur le seul identifiant VIDERAIT la section pour ces gens-la — le repli
+    /// titre + artiste doit tenir.
+    #[test]
+    fn une_ecoute_sans_album_id_reste_rattachee_par_titre_et_artiste() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+    }
+
+    /// Sans artiste NI identifiant on ne sait pas departager : la ligne reste
+    /// rattachee au titre seul. Perdre l'entree serait pire que la garder.
+    #[test]
+    fn une_ecoute_sans_artiste_ni_identifiant_n_est_pas_perdue() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        deux_live(&state, None);
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(!items.is_empty(), "la section ne doit pas se vider");
+    }
+
+    /// Constat de bordure, releve en voulant eprouver le meme defaut du cote
+    /// des recommandations : `sql_top_genres` ne rend RIEN, sur les deux
+    /// moteurs. `WHERE genre IS NOT NULL` se heurte a `t.genre` et `a.genre`
+    /// — « ambiguous column name: genre » — et l'erreur est avalee par le
+    /// `unwrap_or_default` de l'appelant. « A decouvrir » tire donc toujours
+    /// au hasard, et « top mixes » est toujours vide.
+    ///
+    /// Consequence pour #2731 : la jointure corrigee dans `sql_top_genres` et
+    /// le `NOT EXISTS` des recommandations sont ecrits juste, mais aucun test
+    /// ne peut les atteindre tant que cette requete ne s'execute pas. Reveiller
+    /// la requete change ce que l'accueil AFFICHE (le hasard cede la place aux
+    /// albums d'un genre, qui peuvent etre zero) : c'est un arbitrage produit,
+    /// pas le defaut de Tades. Il est laisse hors de ce correctif, et ce test
+    /// le fige pour qu'on ne le decouvre pas deux fois.
+    #[test]
+    fn les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, Some("Rock"));
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+
+        assert!(
+            state.backend.query_many(&sql_top_genres(), &[]).is_err(),
+            "si cette requete se met a repondre, les deux jointures corrigees \
+             deviennent testables — et « A decouvrir » cesse d'etre aleatoire"
+        );
+    }
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
@@ -257,16 +442,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     // Find top genres from listen history
     let top_genres: Vec<String> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
+        .query_many(&sql_top_genres(), &[])
         .unwrap_or_default()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
@@ -312,7 +488,8 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
          WHERE a.genre IN ({genre_placeholders}) \
-           AND a.title NOT IN (SELECT DISTINCT album_title FROM listen_history WHERE album_title IS NOT NULL) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE {HISTORIQUE_VERS_ALBUM}) \
          ORDER BY RANDOM() \
          LIMIT {limit_ph}"
     );
@@ -353,16 +530,7 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
+        .query_many(&sql_top_genres(), &[])
         .unwrap_or_default()
         .into_iter()
         .filter_map(|cols| {

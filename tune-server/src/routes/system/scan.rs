@@ -578,6 +578,78 @@ pub(super) async fn trigger_scan(
     }
 }
 
+/// Ce qu'il est advenu de l'enrichissement automatique lancé après un scan.
+///
+/// Cette passe est le SEUL chemin qui remplit `artists.image_path` tout seul,
+/// et elle est doublement conditionnée : le réglage `enrich_on_scan`, et
+/// `Feature::AutoEnrichment`, réservée au Premium (`tune-core/src/license.rs`,
+/// `all_premium()`). Quand elle ne part pas, elle ne laissait qu'une ligne
+/// `info` au journal — si bien qu'une installation sans licence scanne, ne voit
+/// jamais apparaître une seule vignette d'artiste, et n'a **aucun moyen** de
+/// savoir que la passe n'a pas eu lieu (#2507, Reivax66, TuneOS Fedora sans
+/// licence : « les vignettes des artistes ne s'affichent pas »).
+///
+/// Le rapport de fin de scan porte donc le motif, exactement pour la raison qui
+/// avait fait ajouter `purge_refused` : *un refus qui ne vit que dans les logs
+/// n'existe pas pour l'utilisateur*.
+///
+/// Ce type ne DÉCIDE d'aucune règle d'offre — il ne fait que nommer celle que
+/// le code applique déjà. Le bouton manuel « Enrichir les images artistes »
+/// (`POST /library/artwork/enrich-artists`) ne passe pas par ici et n'est,
+/// lui, soumis à aucune licence ; ce n'est pas à ce type de le changer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuiteDuScan {
+    /// La passe a été lancée.
+    Demarree,
+    /// `enrich_on_scan = false` : l'utilisateur l'a éteinte dans les Réglages.
+    EteinteParReglage,
+    /// Offre gratuite : `Feature::AutoEnrichment` n'est pas accordée.
+    ReserveeAuPremium,
+}
+
+impl SuiteDuScan {
+    /// Les deux conditions, dans l'ordre où le code les applique.
+    ///
+    /// Le manque de licence l'emporte sur le réglage éteint : c'est le refus
+    /// que l'utilisateur ne peut PAS lever depuis les Réglages, donc le seul
+    /// qui mérite d'être annoncé en premier. Annoncer « vous l'avez éteinte »
+    /// à un compte gratuit l'enverrait rallumer un interrupteur qui ne change
+    /// rien.
+    pub(crate) fn decider(enrich_on_scan: bool, sous_licence: bool) -> Self {
+        match (sous_licence, enrich_on_scan) {
+            (false, _) => Self::ReserveeAuPremium,
+            (true, false) => Self::EteinteParReglage,
+            (true, true) => Self::Demarree,
+        }
+    }
+
+    /// La passe part-elle ?
+    pub(crate) fn demarree(self) -> bool {
+        matches!(self, Self::Demarree)
+    }
+
+    /// Code stable du motif, `None` quand la passe part. C'est ce que lisent
+    /// le client et le journal ; il ne doit pas changer sans changer les deux.
+    pub(crate) fn motif(self) -> Option<&'static str> {
+        match self {
+            Self::Demarree => None,
+            Self::EteinteParReglage => Some("disabled_by_setting"),
+            Self::ReserveeAuPremium => Some("premium_required"),
+        }
+    }
+
+    /// Le bloc publié dans les trois rapports de fin de scan.
+    ///
+    /// Construit UNE fois et inséré trois fois : les trois `json!` sont des
+    /// copies manuelles qui ont déjà divergé deux fois (#2012, #2146), et une
+    /// clé posée dans deux d'entre eux sur trois ne casse aucune compilation.
+    pub(crate) fn rapport(self) -> Value {
+        json!({
+            "started": self.demarree(),
+            "skipped_reason": self.motif(),
+        })
+    }
+}
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -634,11 +706,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
         .flatten()
         .map(|v| v != "false")
         .unwrap_or(true);
-    let auto_enrich_allowed = enrich_on_scan
-        && state
-            .license
-            .check_feature(tune_core::license::Feature::AutoEnrichment)
-            .await;
+    // La licence est interrogée MÊME quand le réglage vaut `false` : sans cela
+    // le rapport ne saurait pas dire si le compte est Premium, et l'utilisateur
+    // qui rallume le réglage ne découvrirait le second refus qu'au scan suivant.
+    let enrichissement_sous_licence = state
+        .license
+        .check_feature(tune_core::license::Feature::AutoEnrichment)
+        .await;
+    let suite_du_scan = SuiteDuScan::decider(enrich_on_scan, enrichissement_sous_licence);
     tokio::spawn(async move {
         // Le droit reste détenu jusqu'à la fin RÉELLE de la tâche, y compris si
         // spawn_blocking panique. Le Drop du jeton libère alors la génération.
@@ -1755,6 +1830,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     "db_insert_failed": db_insert_failed,
                     "db_update_failed": db_update_failed,
                     "artwork_extracted": artwork_extracted,
+                    "auto_enrichment": suite_du_scan.rapport(),
                     "failed_paths": scan_stats.failed_paths,
                 })
                 .to_string(),
@@ -1788,6 +1864,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 "db_insert_failed": db_insert_failed,
                 "db_update_failed": db_update_failed,
                 "artwork_extracted": artwork_extracted,
+                "auto_enrichment": suite_du_scan.rapport(),
                 "failed_paths": scan_stats.failed_paths,
             }),
         );
@@ -1822,6 +1899,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
+            "auto_enrichment": suite_du_scan.rapport(),
             "failed_paths": scan_stats.failed_paths,
             // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
             // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
@@ -1841,7 +1919,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }
 
         // Auto enrichment after scan: Premium only
-        if auto_enrich_allowed {
+        if suite_du_scan.demarree() {
             let enrich_db = db.clone();
             let artist_cache_dir = cache_dir.clone();
             let artist_mbid_db = db.clone();
@@ -1867,6 +1945,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
         } else {
             tracing::info!(
                 enrich_on_scan,
+                licensed = enrichissement_sous_licence,
+                motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
         }
@@ -3621,6 +3701,128 @@ mod scan_scheduler_cablage_tests {
             "spawn_scan_scheduler doit être appelé depuis background.rs, en lui \
              passant `config.auto_scan` — sans cet appel, la bascule « scan \
              planifié » est sans effet (#2469)"
+        );
+    }
+}
+
+/// Le sort de l'enrichissement automatique d'après scan (#2507).
+///
+/// Reivax66 installe TuneOS Fedora **sans licence**, scanne, et la grille
+/// Artistes n'affiche que des initiales. Les deux conditions de la passe —
+/// `enrich_on_scan` et `Feature::AutoEnrichment` (Premium) — sont appliquées
+/// depuis toujours ; ce qui manquait, c'est de le DIRE ailleurs qu'au journal.
+#[cfg(test)]
+mod suite_du_scan_apres_scan {
+    use super::SuiteDuScan;
+
+    #[test]
+    fn sans_licence_le_motif_est_premium_meme_reglage_allume() {
+        let suite = SuiteDuScan::decider(true, false);
+        assert!(!suite.demarree());
+        assert_eq!(suite.motif(), Some("premium_required"));
+    }
+
+    /// Le cas exact du ticket : réglage à sa valeur par défaut (allumé), pas
+    /// de licence. Le rapport doit porter le motif, pas un simple `false`.
+    #[test]
+    fn le_rapport_publie_started_et_le_motif() {
+        let rapport = SuiteDuScan::decider(true, false).rapport();
+        assert_eq!(rapport["started"], serde_json::json!(false));
+        assert_eq!(
+            rapport["skipped_reason"],
+            serde_json::json!("premium_required")
+        );
+    }
+
+    /// Premium et réglage éteint : c'est un choix de l'utilisateur, et il doit
+    /// se distinguer du refus d'offre — sinon on envoie un abonné Premium
+    /// acheter ce qu'il a déjà.
+    #[test]
+    fn premium_mais_reglage_eteint_est_un_motif_distinct() {
+        let suite = SuiteDuScan::decider(false, true);
+        assert!(!suite.demarree());
+        assert_eq!(suite.motif(), Some("disabled_by_setting"));
+    }
+
+    /// Les deux refus à la fois : le manque de licence l'emporte, parce que
+    /// c'est le seul que les Réglages ne peuvent pas lever.
+    #[test]
+    fn sans_licence_et_reglage_eteint_le_manque_de_licence_lemporte() {
+        assert_eq!(
+            SuiteDuScan::decider(false, false).motif(),
+            Some("premium_required")
+        );
+    }
+
+    /// Contrôle positif : sans lui, un `decider` qui rendrait TOUJOURS un
+    /// refus passerait les quatre tests ci-dessus.
+    #[test]
+    fn premium_et_reglage_allume_la_passe_part_sans_motif() {
+        let suite = SuiteDuScan::decider(true, true);
+        assert!(suite.demarree());
+        assert_eq!(suite.motif(), None);
+        assert_eq!(suite.rapport()["started"], serde_json::json!(true));
+        assert_eq!(suite.rapport()["skipped_reason"], serde_json::Value::Null);
+    }
+}
+
+/// La clé doit être dans les TROIS rapports de fin de scan complet.
+///
+/// `scan_result` (lu par `/scan/status`), `library.scan.completed` (le bandeau
+/// de fin de scan) et le fichier de `/scan/report` sont trois `json!` recopiés
+/// à la main. Ils ont déjà divergé deux fois — `skipped_unsupported_by_ext`
+/// (#2012) puis `removed` (#2146) — et une clé posée dans deux d'entre eux sur
+/// trois ne casse aucune compilation : elle manque simplement chez un
+/// consommateur, en silence. Même garde que
+/// `rapport_de_scan_publie_la_purge`, sur la clé de #2507.
+#[cfg(test)]
+mod rapport_de_scan_publie_le_sort_de_lenrichissement {
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// La clé, sous sa forme littérale exacte. `auto_enrichment` tout court
+    /// apparaît aussi dans le nom de l'événement de journal
+    /// (`auto_enrichment_after_scan_skipped`) : chercher le mot nu ferait
+    /// passer le test sans qu'aucun rapport ne publie quoi que ce soit.
+    const CLE: &str = "\"auto_enrichment\": suite_du_scan.rapport(),";
+    /// Dernière clé commune aux trois rapports, et postérieure à celle-ci :
+    /// borne la portion de texte examinée.
+    const MARQUEUR: &str = "\"failed_paths\": scan_stats.failed_paths,";
+
+    #[test]
+    fn les_trois_rapports_du_scan_complet_publient_la_cle() {
+        let chemin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/routes/system/scan.rs");
+        let texte = fs::read_to_string(&chemin)
+            .unwrap_or_else(|e| panic!("lecture de {} : {e}", chemin.display()));
+        let mut examines = 0usize;
+        let mut depuis = 0usize;
+        while let Some(rel) = texte[depuis..].find(MARQUEUR) {
+            let fin = depuis + rel;
+            examines += 1;
+            let debut = texte[..fin]
+                .rfind("json!(")
+                .expect("un rapport doit être construit par un json!(");
+            let corps = texte[debut..fin]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                corps.contains(CLE),
+                "rapport n° {examines} : {CLE} manque.\nSans cette clé, une \
+                 installation sans licence scanne, ne voit aucune vignette \
+                 d'artiste, et rien ne lui dit que la passe n'a pas eu lieu \
+                 (#2507)."
+            );
+            depuis = fin + MARQUEUR.len();
+        }
+        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
+        // test en n'examinant RIEN. Trois, c'est `scan_result`,
+        // `library.scan.completed` et le fichier de `/scan/report`.
+        assert_eq!(
+            examines, 3,
+            "trois rapports attendus, {examines} trouvé(s) — le marqueur \
+             {MARQUEUR} a dû être renommé, ou un exemplaire ajouté/supprimé"
         );
     }
 }
