@@ -771,6 +771,20 @@ pub(crate) struct ChiffresDeFinDeScan<'a> {
     pub(crate) skipped_by_ext: &'a std::collections::HashMap<String, usize>,
     /// Motif lisible associé à chaque compteur ci-dessus.
     pub(crate) skipped_reasons: &'a std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers écartés, une liste par motif (#2050).
+    ///
+    /// Les compteurs disent COMBIEN, jamais LESQUELS. Le testeur qui demande
+    /// « la liste des fichiers ignorés » ne peut aujourd'hui l'obtenir pour
+    /// aucun des trois motifs : `skipped_unsupported` n'existe qu'en décompte
+    /// par extension, `skipped_no_metadata` n'existe qu'en `warn!` un fichier
+    /// à la fois, et `skipped_duplicate` n'existe qu'en `debug!` — donc nulle
+    /// part, au niveau de journalisation livré.
+    ///
+    /// Plafonnées à [`tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES`] :
+    /// un échantillon nominatif, adossé à des compteurs exhaustifs.
+    pub(crate) skipped_unsupported_paths: &'a [String],
+    pub(crate) skipped_no_metadata_paths: &'a [String],
+    pub(crate) skipped_duplicate_paths: &'a [String],
 }
 
 impl ChiffresDeFinDeScan<'_> {
@@ -828,7 +842,32 @@ impl ChiffresDeFinDeScan<'_> {
         // Motif lisible associé à chaque compteur. Additif pour les clients
         // existants qui ne connaissent que `skipped_unsupported_by_ext`.
         rapport["skipped_unsupported_reasons"] = json!(self.skipped_reasons);
+        // La liste demandée (#2050). Elle sort par le FICHIER seulement, pour
+        // la même raison que l'inventaire des formats : ce sont des chemins de
+        // l'utilisateur, et le bus d'événements les diffuserait à tous les
+        // clients connectés à chaque fin de scan.
+        rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
+        rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
+        rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // Dire que la liste est un échantillon, plutôt que de laisser croire
+        // qu'elle est complète : une liste muette de 500 entrées face à
+        // 40 000 fichiers écartés se lit comme un rapport faux.
+        rapport["skipped_paths_truncated"] = json!(self.chemins_tronques());
         rapport
+    }
+
+    /// Au moins une liste de chemins a-t-elle atteint son plafond ?
+    ///
+    /// Comparer aux compteurs ne marcherait pas : `skipped_unsupported` ne
+    /// compte que les fichiers écartés dans la boucle d'import, alors que la
+    /// liste fusionne aussi ceux que le PARCOURS a écartés sans jamais les
+    /// faire entrer dans la boucle. Le plafond, lui, est la même constante des
+    /// deux côtés.
+    fn chemins_tronques(&self) -> bool {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        self.skipped_unsupported_paths.len() >= PLAFOND
+            || self.skipped_no_metadata_paths.len() >= PLAFOND
+            || self.skipped_duplicate_paths.len() >= PLAFOND
     }
 }
 
@@ -1029,6 +1068,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let error_dirs = list_result.error_dirs;
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
+        let mut skipped_unsupported_paths = list_result.skipped_paths;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -1196,6 +1236,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
         let mut skipped_unsupported = 0i64;
+        // Les CHEMINS, en regard des compteurs ci-dessus (#2050). Plafonnés :
+        // voir `PLAFOND_CHEMINS_ECARTES`.
+        let mut skipped_no_metadata_paths: Vec<String> = Vec::new();
+        let mut skipped_duplicate_paths: Vec<String> = Vec::new();
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -1280,6 +1324,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         // file made the progress bar stop short of 100%.
                         skipped += 1;
                         skipped_no_metadata += 1;
+                        // Le chemin ne vivait que dans ce `warn!` : hors de
+                        // portée de qui lit le rapport (#2050).
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_no_metadata_paths,
+                            sf.path.clone(),
+                        );
                         continue;
                     }
 
@@ -1335,6 +1385,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
                                 );
                                 skipped += 1;
                                 skipped_duplicate += 1;
+                                // Ce chemin n'était journalisé qu'en `debug!` :
+                                // invisible au niveau livré, donc introuvable
+                                // même en fouillant les journaux (#2050).
+                                tune_core::scanner::walker::pousser_chemin_ecarte(
+                                    &mut skipped_duplicate_paths,
+                                    format!("{} (identique à {})", sf.path, existing_path),
+                                );
                                 continue;
                             }
                             if !candidates.is_empty() {
@@ -1498,6 +1555,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
             *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
         }
         skipped_reasons.extend(scan_stats.unsupported_reasons.clone());
+        // Même fusion pour les chemins que pour les décomptes : les deux
+        // sources d'« écarté faute de décodeur » aboutissent à une seule liste
+        // (#2050). Le plafond s'applique aussi à la fusion.
+        for chemin in &scan_stats.unsupported_paths {
+            tune_core::scanner::walker::pousser_chemin_ecarte(
+                &mut skipped_unsupported_paths,
+                chemin.clone(),
+            );
+        }
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
@@ -2045,6 +2111,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
             auto_enrichment: suite_du_scan.rapport(),
             skipped_by_ext: &skipped_by_ext,
             skipped_reasons: &skipped_reasons,
+            skipped_unsupported_paths: &skipped_unsupported_paths,
+            skipped_no_metadata_paths: &skipped_no_metadata_paths,
+            skipped_duplicate_paths: &skipped_duplicate_paths,
         };
         let rapport_scan = chiffres.rapport();
 
@@ -3360,6 +3429,14 @@ mod rapport_de_fin_de_scan {
             "mpc".to_string(),
             "format non pris en charge".to_string(),
         )])));
+        let non_lus: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/album.mpc (format non pris en charge)".to_string(),
+        ]));
+        let sans_metadonnees: &[String] =
+            Box::leak(Box::new(["/Volumes/musique/muet.wav".to_string()]));
+        let doublons: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)".to_string(),
+        ]));
         ChiffresDeFinDeScan {
             total_discovered: 1_651,
             missing_dirs: missing,
@@ -3385,6 +3462,9 @@ mod rapport_de_fin_de_scan {
             auto_enrichment: SuiteDuScan::decider(true, true).rapport(),
             skipped_by_ext: par_ext,
             skipped_reasons: motifs,
+            skipped_unsupported_paths: non_lus,
+            skipped_no_metadata_paths: sans_metadonnees,
+            skipped_duplicate_paths: doublons,
         }
     }
 
@@ -3440,8 +3520,19 @@ mod rapport_de_fin_de_scan {
             .collect();
         assert_eq!(
             ajouts,
-            vec!["skipped_unsupported_by_ext", "skipped_unsupported_reasons"],
-            "seul l'inventaire des formats non lus (#1763) doit distinguer /scan/report"
+            // Ordre alphabétique : c'est celui des clés d'un objet
+            // `serde_json`, pas celui où on les a écrites.
+            vec![
+                "skipped_duplicate_paths",
+                "skipped_no_metadata_paths",
+                "skipped_paths_truncated",
+                "skipped_unsupported_by_ext",
+                "skipped_unsupported_paths",
+                "skipped_unsupported_reasons",
+            ],
+            "seuls l'inventaire des formats non lus (#1763) et la liste nominative des \
+             fichiers écartés (#2050) doivent distinguer /scan/report — les chemins de \
+             l'utilisateur ne partent pas sur le bus, qui est diffusé à tous les clients"
         );
     }
 
@@ -3499,6 +3590,126 @@ mod rapport_de_fin_de_scan {
             r["skipped_unsupported_reasons"],
             serde_json::json!({"mpc": "format non pris en charge"})
         );
+        // La liste demandée (#2050) : LESQUELS, pas seulement COMBIEN. Trois
+        // listes distinctes — un rapport qui rangerait les doublons sous les
+        // formats non lus passerait inaperçu si elles se ressemblaient.
+        assert_eq!(
+            r["skipped_unsupported_paths"],
+            serde_json::json!(["/Volumes/musique/album.mpc (format non pris en charge)"])
+        );
+        assert_eq!(
+            r["skipped_no_metadata_paths"],
+            serde_json::json!(["/Volumes/musique/muet.wav"])
+        );
+        assert_eq!(
+            r["skipped_duplicate_paths"],
+            serde_json::json!([
+                "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)"
+            ])
+        );
+        // Trois listes d'un élément : rien n'est tronqué, et le rapport le dit.
+        assert_eq!(r["skipped_paths_truncated"], serde_json::json!(false));
+    }
+
+    /// Le rapport DIT qu'il est tronqué quand il l'est (#2050).
+    ///
+    /// Sans ce drapeau, un rapport qui nomme 500 fichiers écartés sur 40 000
+    /// se lit comme la liste complète : l'utilisateur conclut que sa
+    /// bibliothèque va bien, et referme le seul outil qui pouvait le
+    /// détromper. Sa contre-épreuve est dans le test précédent, où trois
+    /// listes d'un élément publient `false`.
+    #[test]
+    fn une_liste_au_plafond_est_annoncee_comme_tronquee() {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        let stats = stats_de_scan();
+        let mut c = chiffres(&stats);
+
+        let pleine: Vec<String> = (0..PLAFOND).map(|i| format!("/musique/{i}.mpc")).collect();
+        let pleine: &[String] = Box::leak(Box::new(pleine));
+        c.skipped_unsupported_paths = pleine;
+
+        let r = c.rapport_du_fichier();
+        assert_eq!(
+            r["skipped_paths_truncated"],
+            serde_json::json!(true),
+            "une liste arrivée au plafond doit être annoncée comme un échantillon"
+        );
+        assert_eq!(
+            r["skipped_unsupported_paths"]
+                .as_array()
+                .expect("un tableau")
+                .len(),
+            PLAFOND,
+            "le plafond borne la liste publiée"
+        );
+        // Les décomptes, eux, restent exhaustifs : c'est ce qui rend
+        // l'échantillon lisible.
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+    }
+
+    /// Les DEUX scans publient la même liste de fichiers écartés (#2050).
+    ///
+    /// Le scan manuel (`ChiffresDeFinDeScan::rapport_du_fichier`) et le scan
+    /// automatique (`auto_scan.rs`) écrivent le MÊME fichier
+    /// `<db>-scan-report.json`, lu par le même `GET /scan/report`. Une clé
+    /// posée d'un seul côté rend la réponse dépendante de QUEL scan a tourné
+    /// en dernier — l'utilisateur voit sa liste disparaître au redémarrage
+    /// suivant, sans rien avoir changé.
+    ///
+    /// C'est exactement le mode d'échec de #2012, et il ne casse aucune
+    /// compilation : d'où ce garde-fou textuel, le seul qui puisse voir une
+    /// clé manquante dans un `json!` voisin.
+    #[test]
+    fn les_deux_scans_publient_les_memes_listes_de_fichiers_ecartes() {
+        /// Sous leur forme littérale de clé JSON. Chercher le mot nu
+        /// attraperait le nom de la variable Rust et passerait sans qu'aucune
+        /// clé ne soit publiée.
+        const CLES: [&str; 4] = [
+            "\"skipped_unsupported_paths\"",
+            "\"skipped_no_metadata_paths\"",
+            "\"skipped_duplicate_paths\"",
+            "\"skipped_paths_truncated\"",
+        ];
+
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
+            // Commentaires ôtés : raconter l'histoire du défaut ne doit pas
+            // suffire à faire passer le test.
+            let code = texte
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for cle in CLES {
+                assert!(
+                    code.contains(cle),
+                    "{fichier} ne publie pas {cle} — le rapport de /scan/report \
+                     dépendrait alors de quel scan l'a écrit en dernier (#2050)"
+                );
+            }
+        }
+    }
+
+    /// Les trois motifs sont pourvus, pas un seul (#2050).
+    ///
+    /// « Un chemin corrigé, les autres nus » est le défaut qui revient : le
+    /// scan écarte pour trois motifs distincts, et n'en instrumenter qu'un
+    /// laisse l'utilisateur devant une liste qui ne contient pas son fichier,
+    /// sans lui dire que deux autres listes existaient.
+    #[test]
+    fn les_trois_motifs_d_ecart_ont_chacun_leur_liste() {
+        let stats = stats_de_scan();
+        let r = chiffres(&stats).rapport_du_fichier();
+        for cle in [
+            "skipped_unsupported_paths",
+            "skipped_no_metadata_paths",
+            "skipped_duplicate_paths",
+        ] {
+            let liste = r[cle].as_array().unwrap_or_else(|| panic!("{cle} absente"));
+            assert!(!liste.is_empty(), "{cle} est publiée mais toujours vide");
+        }
     }
 
     /// Il ne reste qu'UNE construction manuscrite : celle du scan automatique.

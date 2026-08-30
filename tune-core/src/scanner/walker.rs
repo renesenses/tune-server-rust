@@ -253,6 +253,29 @@ pub struct ScannedFile {
     pub mtime: u64,
 }
 
+/// Combien de chemins écartés une liste du rapport de scan retient au plus.
+///
+/// Le rapport doit répondre « lesquels ? », pas « tous » : une bibliothèque
+/// dont 40 000 fichiers `.cue` sont écartés produirait sinon un rapport de
+/// plusieurs mégaoctets, relu à chaque `GET /scan/report`. Les compteurs
+/// (`skipped_unsupported`, `skipped_no_metadata`, `skipped_duplicate`,
+/// `skipped_unsupported_by_ext`) restent, eux, exhaustifs : le plafond borne
+/// l'échantillon nominatif, jamais le décompte.
+pub const PLAFOND_CHEMINS_ECARTES: usize = 500;
+
+/// Ajoute un chemin écarté tant que la liste n'a pas atteint son plafond.
+///
+/// Une seule définition pour les six endroits qui écartent un fichier — deux
+/// dans ce parcours, deux dans la phase de métadonnées, deux dans les boucles
+/// d'import. Le motif « un chemin corrigé, les autres nus » est la façon dont
+/// ce rapport a déjà divergé trois fois (#2012) ; un plafond recopié à la main
+/// six fois divergerait de la même manière.
+pub fn pousser_chemin_ecarte(liste: &mut Vec<String>, chemin: impl Into<String>) {
+    if liste.len() < PLAFOND_CHEMINS_ECARTES {
+        liste.push(chemin.into());
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ScanStats {
     pub total_files: usize,
@@ -263,6 +286,14 @@ pub struct ScanStats {
     pub failed_paths: Vec<String>,
     pub unsupported_by_ext: std::collections::HashMap<String, usize>,
     pub unsupported_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers dont le format a été reconnu à la lecture mais
+    /// n'est pas décodable, plafonnés par [`PLAFOND_CHEMINS_ECARTES`].
+    ///
+    /// `unsupported_by_ext` dit « 280 fichiers `.mpc` » ; seul ceci dit
+    /// LESQUELS. C'est la question posée par le testeur (#2050) et celle qui
+    /// manque pour instruire « des fichiers présents dans l'explorateur sont
+    /// absents de Tune » (#2365, #2802).
+    pub unsupported_paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -427,6 +458,12 @@ pub struct ListAudioResult {
     pub skipped_by_ext: std::collections::HashMap<String, usize>,
     /// Motif stable associé à chaque clé de `skipped_by_ext`.
     pub skipped_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS écartés par ce parcours, plafonnés par
+    /// [`PLAFOND_CHEMINS_ECARTES`] et suffixés de leur motif.
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis jetait le chemin (#2050).
+    pub skipped_paths: Vec<String>,
 }
 
 impl ListAudioResult {
@@ -520,6 +557,7 @@ pub fn list_audio_files_avec_progression(
         std::collections::HashMap::new();
     let mut skipped_reasons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut skipped_paths: Vec<String> = Vec::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -677,6 +715,13 @@ pub fn list_audio_files_avec_progression(
                             *skipped_by_ext
                                 .entry(unsupported.report_key.clone())
                                 .or_insert(0) += 1;
+                            // Le chemin, pas seulement le décompte : « 280
+                            // fichiers .mpc » ne dit pas lesquels, et c'est
+                            // lesquels que le testeur demande (#2050).
+                            pousser_chemin_ecarte(
+                                &mut skipped_paths,
+                                format!("{} ({})", path.display(), unsupported.reason),
+                            );
                             skipped_reasons
                                 .entry(unsupported.report_key)
                                 .or_insert_with(|| unsupported.reason.to_string());
@@ -791,6 +836,7 @@ pub fn list_audio_files_avec_progression(
         missing_dir_reasons,
         skipped_by_ext,
         skipped_reasons,
+        skipped_paths,
     }
 }
 
@@ -924,10 +970,19 @@ pub fn scan_files_parallel(
         .collect();
     let mut unsupported_by_ext = std::collections::HashMap::new();
     let mut unsupported_reasons = std::collections::HashMap::new();
-    for unsupported in results.iter().filter_map(|file| file.unsupported.as_ref()) {
+    let mut unsupported_paths: Vec<String> = Vec::new();
+    for file in results.iter() {
+        let Some(unsupported) = file.unsupported.as_ref() else {
+            continue;
+        };
         *unsupported_by_ext
             .entry(unsupported.report_key.clone())
             .or_insert(0) += 1;
+        // Le chemin était disponible ici depuis toujours, et jeté (#2050).
+        pousser_chemin_ecarte(
+            &mut unsupported_paths,
+            format!("{} ({})", file.path, unsupported.reason),
+        );
         unsupported_reasons
             .entry(unsupported.report_key.clone())
             .or_insert_with(|| unsupported.reason.to_string());
@@ -944,6 +999,7 @@ pub fn scan_files_parallel(
         failed_paths,
         unsupported_by_ext,
         unsupported_reasons,
+        unsupported_paths,
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -1120,11 +1176,20 @@ pub fn scan_files_batched(
             .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
-        for unsupported in batch.iter().filter_map(|file| file.unsupported.as_ref()) {
+        for file in batch.iter() {
+            let Some(unsupported) = file.unsupported.as_ref() else {
+                continue;
+            };
             *aggregate
                 .unsupported_by_ext
                 .entry(unsupported.report_key.clone())
                 .or_insert(0) += 1;
+            // Sœur de la variante par lot ci-dessus : c'est ce chemin-là que
+            // l'un des deux aurait oublié (#2050).
+            pousser_chemin_ecarte(
+                &mut aggregate.unsupported_paths,
+                format!("{} ({})", file.path, unsupported.reason),
+            );
             aggregate
                 .unsupported_reasons
                 .entry(unsupported.report_key.clone())
@@ -1351,6 +1416,78 @@ mod tests {
                 .is_some_and(|reason| reason.contains("aucun décodeur"))
         );
         assert!(!result.skipped_by_ext.contains_key("jpg"));
+    }
+
+    /// Le parcours retient LESQUELS, pas seulement COMBIEN (#2050).
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis faisait `continue` — le
+    /// chemin n'était écrit nulle part, ni en journal ni en rapport. Le
+    /// décompte « 280 fichiers .mpc » ne permet pas de retrouver un album.
+    #[test]
+    fn le_parcours_nomme_les_fichiers_ecartes_pas_seulement_leur_nombre() {
+        // Chemin suffixé de la clé de tâche : deux agents ont déjà détruit
+        // mutuellement leurs fixtures sous un nom commun.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_chemins_ecartes_i2050");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["album.wma", "sacd.dst", "temoin.flac", "cover.jpg"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("album.wma"),
+            "le chemin du .wma écarté doit figurer dans le rapport, pas seulement \
+             son décompte — c'est la demande de #2050.\nListe obtenue :\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("sacd.dst"),
+            "le .dst écarté doit être nommé lui aussi : un seul motif instrumenté \
+             sur deux laisse l'utilisateur devant une liste incomplète\n{ecartes}"
+        );
+        // Le motif accompagne le chemin : « pourquoi » sans « lequel » ne
+        // servait à rien, « lequel » sans « pourquoi » ne sert pas plus.
+        assert!(
+            ecartes.contains("aucun décodeur"),
+            "chaque chemin doit porter son motif\n{ecartes}"
+        );
+        // Contre-épreuve : le bruit d'une bibliothèque ne doit pas noyer la
+        // liste. Une pochette n'est pas un fichier « ignoré ».
+        assert!(
+            !ecartes.contains("cover.jpg"),
+            "les fichiers non audio n'ont rien à faire dans la liste\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Le plafond borne la liste, et le compteur reste exhaustif (#2050).
+    #[test]
+    fn le_plafond_borne_la_liste_sans_borner_le_compte() {
+        let mut liste = Vec::new();
+        for i in 0..(PLAFOND_CHEMINS_ECARTES + 25) {
+            pousser_chemin_ecarte(&mut liste, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(
+            liste.len(),
+            PLAFOND_CHEMINS_ECARTES,
+            "sans plafond, une bibliothèque de 40 000 fichiers écartés produirait \
+             un rapport de plusieurs mégaoctets relu à chaque /scan/report"
+        );
+        // Contre-épreuve : en deçà du plafond, RIEN n'est perdu.
+        let mut courte = Vec::new();
+        for i in 0..3 {
+            pousser_chemin_ecarte(&mut courte, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(courte.len(), 3);
+        assert_eq!(courte[0], "/musique/0.mpc");
     }
 
     #[test]
