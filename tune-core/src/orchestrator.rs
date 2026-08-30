@@ -116,9 +116,26 @@ async fn transcode_source_to_file(
     let mut pcm_bytes = decoded.pcm_bytes();
     let mut actual_bd = decoded.bit_depth;
 
-    // 1a. Reduce bit depth to the negotiated target when the source is deeper
-    // (e.g. 24-bit ALAC/FLAC → 16-bit LPCM for a 16-bit-only DLNA renderer).
-    if target_bd < actual_bd {
+    // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
+    //
+    // Cette étape ne descendait que (`target_bd < actual_bd`). Une cible plus
+    // PROFONDE que la source était donc ignorée en silence : le fichier écrit
+    // gardait la largeur de la source, tandis que `StreamInfo` — et par lui le
+    // `<res bitsPerSample>` du DIDL, puis le choix du profil `DLNA.ORG_PN` —
+    // annonçait la cible. Un renderer qui suit ce qu'on lui déclare lit alors
+    // des échantillons de deux octets à un pas de trois : la famille #1137,
+    // celle qui rend du silence ou du bruit sans jamais rien dire. C'est ce que
+    // fait `dlna_wav24` dès que la base annonce la source plus profonde qu'elle
+    // n'est — le réglage « Forcer le WAV » de Yves (#1437).
+    //
+    // `container_bit_depth` borne d'abord la cible à ce que la chaîne sait
+    // ÉCRIRE : 16, 24 ou 32. Une source de 20 bits — légale en ALAC, en FLAC,
+    // en AIFF et en WavPack — donnait `out_bd = 20` (`cap_output_bit_depth` ne
+    // borne qu'à 16..24), et le transcodage échouait APRÈS le décodage complet :
+    // `encode_wav` rend « unsupported bit depth: 20 », `pcm_to_i32` la même chose
+    // pour le FLAC. La piste ne démarrait jamais.
+    let target_bd = crate::audio::decode::container_bit_depth(target_bd);
+    if target_bd != actual_bd {
         pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, target_bd);
         actual_bd = target_bd;
     }
@@ -4291,6 +4308,17 @@ impl PlaybackOrchestrator {
             } else {
                 cap_output_bit_depth(bit_depth)
             };
+            // La profondeur ANNONCÉE doit être une profondeur QU'ON SAIT ÉCRIRE.
+            //
+            // `out_bd` part dans `StreamInfo`, donc dans le `<res bitsPerSample>`
+            // du DIDL et dans le choix du profil `DLNA.ORG_PN` : c'est le contrat
+            // passé au renderer. Or deux branches le laissent sortir de
+            // {16, 24, 32} — `cap_output_bit_depth` ne borne qu'à 16..24, et
+            // `dlna_wav24` prend `bit_depth_wire.min(24)`. Une source de 20 bits,
+            // légale en ALAC comme en FLAC, annonçait donc 20 bits, que rien en
+            // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
+            // au décodage : aucun bit perdu (#1437).
+            let out_bd = crate::audio::decode::container_bit_depth(out_bd);
             let out_mime = if oaat_needs_wav || local_needs_wav {
                 "audio/wav".to_string()
             } else {
@@ -6688,10 +6716,19 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
+        // Même règle que le bras transcodage : ce qu'on ANNONCE doit être une
+        // largeur que la chaîne sait ÉCRIRE.
+        //
+        // `bd.max(16).min(24)` est la troisième écriture à la main de
+        // `cap_output_bit_depth` — la fonction créée précisément pour qu'on
+        // cesse de la réécrire (#1610) — et elle en a le même angle mort :
+        // 17..23 passent intacts, et ni `encode_wav` ni `pcm_to_i32` ne savent
+        // les écrire. Un prefetch d'une source de 20 bits partait donc vers un
+        // encodeur qui la refuse (#1437).
         let out_bd = if is_local_stream {
             32
         } else {
-            bd.max(16).min(24)
+            crate::audio::decode::container_bit_depth(cap_output_bit_depth(bd))
         };
 
         // For DLNA/network outputs, encode prefetched PCM to a file.
@@ -14845,5 +14882,183 @@ mod stop_scope_tests {
         let a_arreter =
             PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
         assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
+    }
+}
+
+/// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
+/// doivent être le même nombre (#1437).
+///
+/// `transcode_source_to_file` ne descendait que la profondeur (`target_bd <
+/// actual_bd`) et ne la montait jamais, et personne ne bornait la cible aux
+/// trois largeurs que la chaîne sait écrire. Deux défauts, deux symptômes
+/// distincts, mesurés ici sur un vrai fichier ALAC produit par l'encodeur du
+/// dépôt :
+///
+/// - cible plus PROFONDE que la source (`dlna_wav24` sur une piste que la base
+///   annonce 24 bits alors qu'elle en fait 16) : le fichier restait à la
+///   largeur de la source pendant que le DIDL annonçait la cible — deux octets
+///   par échantillon lus à un pas de trois, la famille #1137 ;
+/// - cible ININSCRIPTIBLE (20 bits, légal en ALAC/FLAC/AIFF/WavPack et rendu
+///   tel quel par `cap_output_bit_depth`) : `encode_wav` refusait après le
+///   décodage complet, la piste ne démarrait jamais.
+#[cfg(test)]
+mod profondeur_annoncee_egale_profondeur_ecrite {
+    use super::transcode_source_to_file;
+    use crate::audio::alac_encoder::encode_alac_m4a;
+
+    const TRAMES: usize = 8_000;
+    const CANAUX: u16 = 2;
+    const CADENCE: u32 = 96_000;
+
+    fn signal(amplitude: i32) -> Vec<i32> {
+        let mut v = Vec::with_capacity(TRAMES * CANAUX as usize);
+        for i in 0..TRAMES {
+            let s = ((i as f64 * 0.05).sin() * amplitude as f64) as i32;
+            for _ in 0..CANAUX {
+                v.push(s);
+            }
+        }
+        v
+    }
+
+    /// Un dossier par test ET par processus : plusieurs agents travaillent sur
+    /// la même machine de compilation.
+    fn dossier(nom: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tune-i1437-{nom}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&d).expect("dossier de test");
+        d
+    }
+
+    fn source_alac(dossier: &std::path::Path, profondeur: u16) -> String {
+        let amplitude = if profondeur >= 24 { 4_000_000 } else { 20_000 };
+        let m4a = encode_alac_m4a(&signal(amplitude), profondeur, CANAUX, CADENCE)
+            .expect("encodage ALAC de la source");
+        let chemin = dossier.join(format!("source-{profondeur}.m4a"));
+        std::fs::write(&chemin, &m4a).expect("écriture de la source");
+        chemin.to_string_lossy().to_string()
+    }
+
+    /// `(profondeur annoncée par l'en-tête, octets du chunk data)`.
+    fn entete_wav(chemin: &str) -> (u16, u32) {
+        let w = std::fs::read(chemin).expect("relecture du WAV");
+        assert!(w.len() > 44, "WAV tronqué : {} octets", w.len());
+        assert_eq!(&w[0..4], b"RIFF");
+        (
+            u16::from_le_bytes([w[34], w[35]]),
+            u32::from_le_bytes([w[40], w[41], w[42], w[43]]),
+        )
+    }
+
+    /// Le flux est-il AUDIBLE ? Un `Vec` de zéros passerait toutes les
+    /// vérifications de format ci-dessus.
+    fn niveau_non_nul(chemin: &str, profondeur: u16) -> bool {
+        let w = std::fs::read(chemin).expect("relecture du WAV");
+        let pas = (profondeur / 8) as usize;
+        w[44..]
+            .chunks_exact(pas)
+            .any(|c| c.iter().any(|&o| o != 0 && o != 0xFF))
+    }
+
+    #[tokio::test]
+    async fn la_cible_est_toujours_une_largeur_que_la_chaine_sait_ecrire() {
+        let d = dossier("cible");
+        let src = source_alac(&d, 24);
+
+        // Les quatre cas sont joués JUSQU'AU BOUT avant de conclure : le
+        // premier `panic!` masquerait les suivants, et les deux défauts que ce
+        // test couvre ne tombent pas sur la même cible.
+        let mut anomalies: Vec<String> = Vec::new();
+
+        // (profondeur demandée par l'orchestrateur, profondeur attendue)
+        for (demande, attendu) in [(16u16, 16u16), (20, 24), (24, 24), (32, 32)] {
+            let dest = d.join(format!("sortie-{demande}.wav"));
+            let dest_s = dest.to_string_lossy().to_string();
+            match transcode_source_to_file(
+                src.clone(),
+                CADENCE,
+                CANAUX,
+                demande,
+                "wav".to_string(),
+                None,
+                None,
+                None,
+                dest_s.clone(),
+            )
+            .await
+            {
+                Err(e) => anomalies.push(format!(
+                    "cible {demande} bits : le transcodage ÉCHOUE — {e}"
+                )),
+                Ok((_taille, _pcm, ecrite)) => {
+                    if ecrite != attendu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : profondeur rendue {ecrite}, attendu {attendu}"
+                        ));
+                    }
+                    let (entete, data) = entete_wav(&dest_s);
+                    if entete != attendu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : l'en-tête WAV annonce {entete}, attendu {attendu}"
+                        ));
+                    }
+                    let voulu = TRAMES * CANAUX as usize * (attendu as usize / 8);
+                    if data as usize != voulu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : chunk data de {data} octets, attendu {voulu}"
+                        ));
+                    }
+                    if !niveau_non_nul(&dest_s, entete) {
+                        anomalies.push(format!(
+                            "cible {demande} bits : le flux écrit est SILENCIEUX"
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(
+            anomalies.is_empty(),
+            "la profondeur annoncée n'est pas celle qui est écrite :\n  {}",
+            anomalies.join("\n  ")
+        );
+    }
+
+    /// Témoin anti-régression : le seul chemin que les testeurs écoutent
+    /// aujourd'hui — « Forcer le WAV 16 bits » sur une zone DLNA — ne bouge
+    /// pas d'un octet, que la source soit 16 ou 24 bits.
+    #[tokio::test]
+    async fn le_forcage_wav16_reste_identique() {
+        let d = dossier("temoin");
+        for (profondeur_source, octets_attendus) in [(16u16, 2usize), (24, 2)] {
+            let src = source_alac(&d, profondeur_source);
+            let dest = d.join(format!("wav16-{profondeur_source}.wav"));
+            let dest_s = dest.to_string_lossy().to_string();
+            let (_t, _p, ecrite) = transcode_source_to_file(
+                src,
+                CADENCE,
+                CANAUX,
+                16,
+                "wav".to_string(),
+                None,
+                None,
+                None,
+                dest_s.clone(),
+            )
+            .await
+            .expect("transcodage WAV 16 bits");
+            assert_eq!(ecrite, 16, "source {profondeur_source} bits → WAV 16 bits");
+            let (entete, data) = entete_wav(&dest_s);
+            assert_eq!(entete, 16);
+            assert_eq!(data as usize, TRAMES * CANAUX as usize * octets_attendus);
+            assert!(
+                niveau_non_nul(&dest_s, 16),
+                "source {profondeur_source} bits : le WAV 16 bits est SILENCIEUX"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -111,7 +111,13 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 /// et la largeur annoncée redevient celle des octets réellement écrits — c'est
 /// ce désaccord-là qui faisait lire des trames de 32 bits dans des octets de
 /// 16 (#2157).
-fn container_bit_depth(bd: u16) -> u16 {
+///
+/// La même règle vaut pour la profondeur **de sortie** négociée par
+/// l'orchestrateur : `encode_wav`, `pcm_to_i32` (FLAC) et `convert_pcm_bit_depth`
+/// n'écrivent que 16, 24 ou 32 bits. Une cible hors de cet ensemble n'est pas
+/// « approximative », elle est ININSCRIPTIBLE — voir `transcode_source_to_file`
+/// (#1437).
+pub(crate) fn container_bit_depth(bd: u16) -> u16 {
     match bd {
         0..=16 => 16,
         17..=24 => 24,
