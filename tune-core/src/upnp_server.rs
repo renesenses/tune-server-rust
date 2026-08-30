@@ -522,17 +522,18 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title";
 /// L'action `Search` de ContentDirectory.
 ///
 /// Portee volontairement etroite, et annoncee comme telle : on sait rendre
-/// **les pistes**. C'est ce que demandent les clients d'indexation, et c'est
-/// la seule chose qu'on puisse servir sans inventer un moteur de criteres
-/// complet — un `SearchCriteria` peut porter des expressions booleennes
-/// arbitraires que personne ici ne sait evaluer.
+/// **ce que `browse_*` publie deja** — pistes, radios, artistes, albums,
+/// genres. C'est ce que demandent les clients d'indexation et les menus des
+/// lecteurs reseau, et c'est tout ce qu'on puisse servir sans inventer un
+/// moteur de criteres complet : un `SearchCriteria` peut porter des
+/// expressions booleennes arbitraires que personne ici ne sait evaluer.
 ///
-/// Un critere qui ne vise pas des pistes rend une liste VIDE plutot qu'une
-/// faute : un client qui cherche des images ou des videos doit lire « rien de
-/// tel ici », pas « ce serveur est casse ».
+/// Un critere qui ne vise aucune classe publiee rend une liste VIDE plutot
+/// qu'une faute : un client qui cherche des images ou des videos doit lire
+/// « rien de tel ici », pas « ce serveur est casse ».
 ///
-/// La pagination est celle de `browse_all_tracks`, deja eprouvee — le client
-/// redemande par tranches, exactement comme sur le conteneur « All Tracks ».
+/// La pagination des pistes est celle de `browse_all_tracks`, deja eprouvee —
+/// le client redemande par tranches, exactement comme sur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
     if !sort_criteria.trim().is_empty() {
@@ -547,8 +548,8 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     };
     let base_url = state.base_url();
 
-    let didl = if criteres.classe_correspond {
-        match search_tracks_in_container(
+    let didl = match criteres.cible {
+        Some(CibleRecherche::Pistes) => match search_tracks_in_container(
             state,
             &container_id,
             start,
@@ -558,9 +559,21 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
         ) {
             Some(result) => result,
             None => return soap_fault(710, "No such container"),
+        },
+        Some(cible) => {
+            match search_containers_in_container(
+                state,
+                cible,
+                &container_id,
+                start,
+                count,
+                &criteres.titres,
+            ) {
+                Some(result) => result,
+                None => return soap_fault(710, "No such container"),
+            }
         }
-    } else {
-        empty_didl()
+        None => empty_didl(),
     };
 
     format!(
@@ -581,39 +594,146 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     )
 }
 
-/// Évalue le sous-ensemble de SearchCriteria réellement annoncé.
+/// La rubrique qu'un `SearchCriteria` vise, une fois réduite à ce que Tune
+/// publie réellement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CibleRecherche {
+    Pistes,
+    Radios,
+    Artistes,
+    Albums,
+    Genres,
+}
+
+impl CibleRecherche {
+    /// Le conteneur racine où cette rubrique se parcourt. C'est, avec la
+    /// racine « 0 », la seule portée où une recherche de cette classe a un
+    /// sens : chercher des artistes DANS un album ne rend rien.
+    fn conteneur_racine(self) -> &'static str {
+        match self {
+            CibleRecherche::Pistes => "tracks",
+            CibleRecherche::Radios => "radios",
+            CibleRecherche::Artistes => "artists",
+            CibleRecherche::Albums => "albums",
+            CibleRecherche::Genres => "genres",
+        }
+    }
+}
+
+/// Les classes DIDL que Tune publie RÉELLEMENT, avec les ancêtres qu'un
+/// `derivedfrom` a le droit de nommer pour les atteindre.
 ///
-/// Tune annonce uniquement `upnp:class`. Toute expression qui mentionne un
-/// autre champ ou combine plusieurs prédicats reçoit le SOAP 708 prévu par
-/// ContentDirectory, au lieu de rendre mensongèrement toute la bibliothèque.
+/// `Search` ne peut rendre que ce qui existe : cette table est la liste
+/// exhaustive, et c'est elle qui dit quelle rubrique une expression vise.
+/// Les cinq entrées correspondent une à une aux `browse_*` : `browse_all_tracks`,
+/// `browse_radios`, `browse_artists`, `browse_albums`, `browse_genres`.
 ///
-/// Le booléen indique si la classe fixe de nos éléments
-/// (`object.item.audioItem.musicTrack`) satisfait le prédicat. `*` reste le
-/// raccourci d'indexation historique vers toutes les pistes.
-fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
+/// Les ancêtres sont volontairement PROCHES. `object.item`, `object.container`
+/// ou `object` balaieraient tout, et c'est exactement le garde que tient le
+/// test `une_recherche_d_images_ou_de_videos_ne_rend_rien` : sans lui,
+/// « object.item.imageItem » passerait par la clause `object.item` et rendrait
+/// toute la discothèque à un client qui cherche des photos.
+const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 5] = [
+    (
+        CibleRecherche::Pistes,
+        "object.item.audioitem.musictrack",
+        &["object.item.audioitem"],
+    ),
+    (
+        CibleRecherche::Radios,
+        "object.item.audioitem.audiobroadcast",
+        &["object.item.audioitem"],
+    ),
+    (
+        CibleRecherche::Artistes,
+        "object.container.person.musicartist",
+        &["object.container.person"],
+    ),
+    (
+        CibleRecherche::Albums,
+        "object.container.album.musicalbum",
+        &["object.container.album"],
+    ),
+    (
+        CibleRecherche::Genres,
+        "object.container.genre.musicgenre",
+        &["object.container.genre"],
+    ),
+];
+
+/// Un prédicat `upnp:class` appliqué à UNE classe publiée.
+fn predicat_de_classe(op: &str, valeur: &str, classe: &str, ancetres: &[&str]) -> Result<bool, ()> {
+    match op {
+        "=" => Ok(classe == valeur),
+        "!=" => Ok(classe != valeur),
+        "contains" => Ok(classe.contains(valeur)),
+        "doesnotcontain" => Ok(!classe.contains(valeur)),
+        "derivedfrom" => Ok(valeur == classe || ancetres.iter().any(|a| *a == valeur)),
+        _ => Err(()),
+    }
+}
+
+/// Évalue le sous-ensemble de SearchCriteria réellement annoncé, et rend les
+/// rubriques que le prédicat laisse passer.
+///
+/// Tune annonce `upnp:class` et `dc:title`. Toute expression qui mentionne un
+/// autre champ reçoit le SOAP 708 prévu par ContentDirectory, au lieu de
+/// rendre mensongèrement toute la bibliothèque.
+///
+/// `*` reste le raccourci d'indexation historique — il laisse passer tout ce
+/// qu'on publie, et [`cible_unique`] le ramène aux pistes.
+fn cibles_du_predicat(criteria: &str) -> Result<Vec<CibleRecherche>, ()> {
     let c = criteria.trim();
     if c == "*" {
-        return Ok(true);
+        return Ok(CLASSES_PUBLIEES
+            .iter()
+            .map(|(cible, _, _)| *cible)
+            .collect());
     }
     let parts: Vec<&str> = c.split_whitespace().collect();
     if parts.len() != 3 || !parts[0].eq_ignore_ascii_case("upnp:class") {
         return Err(());
     }
-    let value = parts[2]
+    let valeur = parts[2]
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .ok_or(())?
         .to_ascii_lowercase();
-    let track_class = "object.item.audioitem.musictrack";
-    match parts[1].to_ascii_lowercase().as_str() {
-        "=" => Ok(track_class == value),
-        "!=" => Ok(track_class != value),
-        "contains" => Ok(track_class.contains(&value)),
-        "doesnotcontain" => Ok(!track_class.contains(&value)),
-        "derivedfrom" => Ok((value == "object.item.audioitem" || value == track_class)
-            && (track_class == value || track_class.starts_with(&(value + ".")))),
-        _ => Err(()),
+    let op = parts[1].to_ascii_lowercase();
+    let mut retenues = Vec::new();
+    for (cible, classe, ancetres) in CLASSES_PUBLIEES {
+        if predicat_de_classe(&op, &valeur, classe, ancetres)? {
+            retenues.push(cible);
+        }
     }
+    Ok(retenues)
+}
+
+/// Une expression de classe peut laisser passer PLUSIEURS rubriques :
+/// `derivedfrom "object.item.audioItem"` vise à la fois les pistes et les
+/// radios. La règle est choisie pour ne rien changer à ce qui marchait — les
+/// pistes l'emportent, parce que c'est le parcours d'indexation historique
+/// (#1516) et qu'il doit rendre exactement la même chose qu'avant.
+///
+/// Sinon une rubrique unique est servie. Une ambiguïté entre plusieurs
+/// rubriques non-pistes rend une liste vide plutôt qu'un mélange qu'aucun
+/// point de contrôle ne saurait paginer.
+fn cible_unique(cibles: &[CibleRecherche]) -> Option<CibleRecherche> {
+    if cibles.contains(&CibleRecherche::Pistes) {
+        return Some(CibleRecherche::Pistes);
+    }
+    match cibles {
+        [seule] => Some(*seule),
+        _ => None,
+    }
+}
+
+/// Le prédicat vu du seul point de vue des PISTES.
+///
+/// Forme historique conservée : c'est elle qui porte l'invariant de #2312 —
+/// n'annoncer que ce qu'on évalue — et les tests qui le tiennent.
+fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
+    Ok(cibles_du_predicat(criteria)?.contains(&CibleRecherche::Pistes))
 }
 
 /// Un predicat sur `dc:title`.
@@ -688,8 +808,9 @@ fn sans_accents_minuscule(s: &str) -> String {
 /// Ce qu'un `SearchCriteria` demande, une fois reduit a ce qu'on sait faire.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CriteresRecherche {
-    /// La classe fixe de nos elements satisfait-elle les predicats de classe ?
-    pub(crate) classe_correspond: bool,
+    /// La rubrique visee, ou `None` si aucune classe publiee ne convient —
+    /// une recherche de photos, par exemple, rend une liste vide.
+    pub(crate) cible: Option<CibleRecherche>,
     pub(crate) titres: Vec<PredicatTitre>,
 }
 
@@ -707,7 +828,7 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
     let c = criteria.trim();
     if c == "*" {
         return Ok(CriteresRecherche {
-            classe_correspond: true,
+            cible: Some(CibleRecherche::Pistes),
             titres: Vec::new(),
         });
     }
@@ -715,13 +836,18 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
         return Err(());
     }
 
-    let mut classe_correspond = true;
+    // On part de TOUT ce qu'on publie, et chaque predicat de classe restreint.
+    // La conjonction se lit donc comme une intersection, ce qu'elle est.
+    let mut cibles: Vec<CibleRecherche> = CLASSES_PUBLIEES
+        .iter()
+        .map(|(cible, _, _)| *cible)
+        .collect();
     let mut titres = Vec::new();
     for predicat in decouper_conjonction(c)? {
         let (champ, op, valeur) = decouper_predicat(&predicat)?;
         if champ.eq_ignore_ascii_case("upnp:class") {
-            classe_correspond &=
-                evaluate_supported_class_criteria(&format!("{champ} {op} \"{valeur}\""))?;
+            let retenues = cibles_du_predicat(&format!("{champ} {op} \"{valeur}\""))?;
+            cibles.retain(|cible| retenues.contains(cible));
         } else if champ.eq_ignore_ascii_case("dc:title") {
             let op = match op.to_ascii_lowercase().as_str() {
                 "contains" => OpTitre::Contient,
@@ -736,7 +862,7 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
         }
     }
     Ok(CriteresRecherche {
-        classe_correspond,
+        cible: cible_unique(&cibles),
         titres,
     })
 }
@@ -874,6 +1000,134 @@ fn search_tracks_in_container(
         }
         _ => None,
     }
+}
+
+/// Assez large pour une bibliotheque reelle (2 222 albums sur la
+/// bibliotheque de reference), assez borne pour qu'un `Search` ne batisse
+/// jamais un DIDL de plusieurs megaoctets en memoire. Meme regle et meme
+/// ordre de grandeur que `candidats_par_titre` pour les pistes.
+const MAX_CANDIDATS_CONTENEURS: i64 = 10_000;
+
+/// Les rubriques NON-pistes d'un `Search` : artistes, albums, genres, radios.
+///
+/// C'est le trou que decrit le fil forum #1439 (#1777, Jean Valjean, Marantz
+/// ND8006, releve du 30/08/2026) : le meme serveur montre ses conteneurs
+/// PLEINS par « Parcourir les dossiers » — le chemin `Browse` — et VIDES par
+/// les entrees Artistes / Albums / Genres / Radios du menu de l'appareil, qui
+/// passent par `Search`. Seule « Titres » repondait, parce que `Search` ne
+/// connaissait qu'une classe, `object.item.audioItem.musicTrack` : toute
+/// expression visant un conteneur retombait sur un DIDL vide, sans faute ni
+/// trace. Les rubriques existent pourtant deja — ce sont celles de `browse_*`,
+/// et ce sont leurs emetteurs DIDL qui servent ici.
+///
+/// La lecture est BORNEE puis paginee en memoire, parce qu'un predicat de
+/// titre doit s'appliquer AVANT la page — sinon deux pages successives ne
+/// porteraient pas sur le meme ensemble. `TotalMatches` reflete donc ce qui a
+/// ete retenu, comme pour `candidats_par_titre`.
+fn search_containers_in_container(
+    state: &UpnpState,
+    cible: CibleRecherche,
+    container_id: &str,
+    start: u64,
+    count: u64,
+    titres: &[PredicatTitre],
+) -> Option<DidlResult> {
+    // Chercher des artistes DANS un album n'a pas de sens : la liste est vide,
+    // elle n'est pas fautive. Seul un identifiant qu'on ne publie nulle part
+    // merite le 710 — c'est la meme distinction que fait `search_tracks_in_container`
+    // entre ses branches connues et son bras par defaut.
+    if container_id != "0" && container_id != cible.conteneur_racine() {
+        return if conteneur_publie(container_id) {
+            Some(empty_didl())
+        } else {
+            None
+        };
+    }
+    let base_url = state.base_url();
+    match cible {
+        // Traitees par `search_tracks_in_container`, qui pagine en base.
+        CibleRecherche::Pistes => None,
+        CibleRecherche::Artistes => {
+            let artistes = ArtistRepo::with_backend(state.backend.clone())
+                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .unwrap_or_default();
+            let retenus = retenir_par_titre(artistes, titres, |a| a.name.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            Some(didl_artistes(&page, "artists", total))
+        }
+        CibleRecherche::Albums => {
+            let albums = AlbumRepo::with_backend(state.backend.clone())
+                .list(MAX_CANDIDATS_CONTENEURS, 0)
+                .unwrap_or_default();
+            let retenus = retenir_par_titre(albums, titres, |a| a.title.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            let mut didl = didl_albums_under(&page, "albums", &base_url);
+            didl.total = total;
+            Some(didl)
+        }
+        CibleRecherche::Genres => {
+            let genres = lire_genres(state);
+            let retenus = retenir_par_titre(genres, titres, |g| g.as_str());
+            let (page, total) = paginer(retenus, start, count);
+            let mut didl = didl_genres(&page);
+            didl.total = total;
+            Some(didl)
+        }
+        CibleRecherche::Radios => {
+            let stations = RadioRepo::with_backend(state.backend.clone())
+                .list()
+                .unwrap_or_default();
+            let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
+            let (page, total) = paginer(retenues, start, count);
+            let mut didl = didl_radios(&page, &base_url);
+            didl.total = total;
+            Some(didl)
+        }
+    }
+}
+
+/// Les identifiants de conteneur que le serveur publie — la racine, les
+/// rubriques de [`ROOT_CONTAINERS`] et leurs enfants navigables. La liste doit
+/// suivre `browse_direct_children` : un conteneur qu'on sait ouvrir doit se
+/// laisser interroger, meme pour rendre une liste vide.
+fn conteneur_publie(id: &str) -> bool {
+    id == "0"
+        || ROOT_CONTAINERS.iter().any(|(racine, _, _)| *racine == id)
+        || ["artist/", "album/", "genre/", "year/", "playlist/"]
+            .iter()
+            .any(|prefixe| id.starts_with(prefixe))
+}
+
+/// Applique les predicats `dc:title` au nom visible d'objets non-pistes.
+///
+/// Le nom visible est celui que le DIDL met dans `<dc:title>` : le nom de
+/// l'artiste, le titre de l'album, le nom du genre ou de la station. Chercher
+/// sur autre chose rendrait deux resultats differents selon la rubrique.
+fn retenir_par_titre<T>(
+    items: Vec<T>,
+    titres: &[PredicatTitre],
+    nom: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    if titres.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| titres.iter().all(|p| p.satisfait(nom(item))))
+        .collect()
+}
+
+/// La page demandee et le total retenu. Meme borne de page que les pistes :
+/// rendre moins que demande est permis, c'est `TotalMatches` qui dit la
+/// taille reelle et un point de controle correct pagine a partir de la.
+fn paginer<T>(items: Vec<T>, start: u64, count: u64) -> (Vec<T>, u64) {
+    const MAX_PAGE: usize = 500;
+    let total = items.len();
+    let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let demande = usize::try_from(count).unwrap_or(usize::MAX).min(MAX_PAGE);
+    let fin = debut.saturating_add(demande).min(total);
+    let page = items.into_iter().skip(debut).take(fin - debut).collect();
+    (page, total as u64)
 }
 
 /// Toute la bibliotheque ne passe pas en memoire : on demande d'abord a la
@@ -1656,13 +1910,18 @@ fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0) as u64;
     let artists = repo.list(count as i64, start as i64).unwrap_or_default();
+    didl_artistes(&artists, "artists", total)
+}
 
+/// Le DIDL d'une liste d'artistes. `Browse` et `Search` passent tous deux par
+/// ici : deux vues d'un meme artiste doivent dire exactement la meme chose.
+fn didl_artistes(artists: &[crate::db::models::Artist], parent_id: &str, total: u64) -> DidlResult {
     let mut inner = String::new();
-    for artist in &artists {
+    for artist in artists {
         let id = format!("artist/{}", artist.id.unwrap_or(0));
         inner.push_str(&didl_container(
             &id,
-            "artists",
+            parent_id,
             &artist.name,
             "object.container.person.musicArtist",
             None,
@@ -1681,39 +1940,12 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let total = repo.count().unwrap_or(0) as u64;
     let albums = repo.list(count as i64, start as i64).unwrap_or_default();
 
-    let mut inner = String::new();
-    for album in &albums {
-        let id = format!("album/{}", album.id.unwrap_or(0));
-        let child_count = album.track_count.map(|c| c as u64);
-        let mut extra = String::new();
-        if let Some(ref artist_name) = album.artist_name {
-            extra.push_str(&format!(
-                "<dc:creator>{}</dc:creator>",
-                quick_xml::escape::escape(artist_name)
-            ));
-        }
-        if let Some(ref cover) = album.cover_path {
-            let url = artwork_url(&state.base_url(), cover);
-            extra.push_str(&format!(
-                "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                quick_xml::escape::escape(&url)
-            ));
-        }
-        inner.push_str(&didl_container_ext(
-            &id,
-            "albums",
-            &album.title,
-            "object.container.album.musicAlbum",
-            child_count,
-            &extra,
-        ));
-    }
-
-    DidlResult {
-        xml: didl_wrap(&inner),
-        total,
-        returned: albums.len() as u64,
-    }
+    // `didl_albums_under` emet exactement ce conteneur — createur, pochette,
+    // nombre de pistes. Seul le total differe : ici c'est la table entiere,
+    // pas la page, pour que le point de controle sache qu'il reste des pages.
+    let mut didl = didl_albums_under(&albums, "albums", &state.base_url());
+    didl.total = total;
+    didl
 }
 
 /// Toute la bibliothèque à plat, paginée.
@@ -1773,6 +2005,32 @@ fn browse_all_tracks(state: &UpnpState, start: u64, count: u64, base_url: &str) 
 }
 
 fn browse_genres(state: &UpnpState) -> DidlResult {
+    didl_genres(&lire_genres(state))
+}
+
+/// Le DIDL d'une liste de genres. `Browse` et `Search` passent par ici.
+fn didl_genres(genres: &[String]) -> DidlResult {
+    let mut inner = String::new();
+    for genre in genres {
+        let id = format!("genre/{}", urlencoding::encode(genre));
+        inner.push_str(&didl_container(
+            &id,
+            "genres",
+            genre,
+            "object.container.genre.musicGenre",
+            None,
+        ));
+    }
+
+    let total = genres.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
+}
+
+fn lire_genres(state: &UpnpState) -> Vec<String> {
     // Fetch distinct genres from the albums table.
     //
     // `COLLATE NOCASE` is SQLite-only — PostgreSQL rejects it — so the sort is
@@ -1795,25 +2053,7 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
         .iter()
         .filter_map(|row| row.first().and_then(|v| v.as_string()))
         .collect();
-
-    let mut inner = String::new();
-    for genre in &genres {
-        let id = format!("genre/{}", urlencoding::encode(genre));
-        inner.push_str(&didl_container(
-            &id,
-            "genres",
-            genre,
-            "object.container.genre.musicGenre",
-            None,
-        ));
-    }
-
-    let total = genres.len() as u64;
-    DidlResult {
-        xml: didl_wrap(&inner),
-        total,
-        returned: total,
-    }
+    genres
 }
 
 /// Les albums d'un genre.
@@ -1920,13 +2160,16 @@ fn didl_albums_under(
 fn browse_radios(state: &UpnpState) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
-    let base = state.base_url();
+    didl_radios(&stations, &state.base_url())
+}
 
+/// Le DIDL d'une liste de stations. `Browse` et `Search` passent par ici.
+fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
     let mut inner = String::new();
-    for station in &stations {
+    for station in stations {
         let id = format!("radio/{}", station.id.unwrap_or(0));
         let mut res = String::new();
-        let url = radio_audio_url(&base, station.id.unwrap_or(0));
+        let url = radio_audio_url(base, station.id.unwrap_or(0));
         res.push_str(&format!(
             "<res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>",
             url = quick_xml::escape::escape(&url),
@@ -3737,7 +3980,7 @@ mod ssdp_msearch_tests {
     #[test]
     fn un_predicat_de_titre_est_reconnu() {
         let c = evaluer_criteres("dc:title contains \"Kind of Blue\"").unwrap();
-        assert!(c.classe_correspond);
+        assert_eq!(c.cible, Some(CibleRecherche::Pistes));
         assert_eq!(
             c.titres,
             vec![PredicatTitre {
@@ -3753,7 +3996,7 @@ mod ssdp_msearch_tests {
             "upnp:class derivedfrom \"object.item.audioItem\" and dc:title contains \"So What\"",
         )
         .unwrap();
-        assert!(c.classe_correspond);
+        assert_eq!(c.cible, Some(CibleRecherche::Pistes));
         assert_eq!(c.titres.len(), 1);
         assert_eq!(c.titres[0].valeur, "So What");
     }
@@ -3765,6 +4008,181 @@ mod ssdp_msearch_tests {
         let c = evaluer_criteres("dc:title contains \"Peaches and Cream\"").unwrap();
         assert_eq!(c.titres.len(), 1);
         assert_eq!(c.titres[0].valeur, "Peaches and Cream");
+    }
+
+    // --- Le menu d'un lecteur reseau passe par Search (#1777, fil 1439) ---
+
+    /// L'etat du releve du 30/08/2026 : un artiste, deux albums donc deux
+    /// genres, une station de radio. De quoi remplir les quatre rubriques que
+    /// le ND8006 voit vides.
+    fn state_du_releve_nd8006() -> UpnpState {
+        use crate::db::radio_repo::RadioStation;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let artiste_id = ArtistRepo::with_backend(backend.clone())
+            .create(&crate::db::models::Artist::new("Miles Davis".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let mut kind_of_blue = crate::db::models::Album::new("Kind of Blue".into());
+        kind_of_blue.genre = Some("Jazz".into());
+        kind_of_blue.artist_id = Some(artiste_id);
+        albums.create(&kind_of_blue).unwrap();
+        let mut the_wall = crate::db::models::Album::new("The Wall".into());
+        the_wall.genre = Some("Rock".into());
+        albums.create(&the_wall).unwrap();
+        RadioRepo::with_backend(backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "FIP HiFi".into(),
+                url: "https://icecast.example/fip-hifi.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: true,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// Le defaut du fil forum #1439, tenu sur les quatre rubriques a la fois.
+    ///
+    /// Jean Valjean voit, dans la MEME session sur son Marantz ND8006 :
+    /// « Parcourir les dossiers » plein — Artists, Albums, Genres, jusqu'aux
+    /// morceaux — et les entrees Artistes / Albums / Genres / Radios du menu
+    /// de l'appareil vides. Le premier chemin est `Browse`, le second
+    /// `Search`. Les deux sont ici cote a cote : ce que l'un montre, l'autre
+    /// doit le trouver.
+    #[test]
+    fn le_menu_du_lecteur_voit_les_memes_rubriques_que_le_parcours_de_dossiers() {
+        let state = state_du_releve_nd8006();
+        for (classe, conteneur, attendu) in [
+            (
+                "object.container.person.musicArtist",
+                "artists",
+                "Miles Davis",
+            ),
+            (
+                "object.container.album.musicAlbum",
+                "albums",
+                "Kind of Blue",
+            ),
+            ("object.container.genre.musicGenre", "genres", "Jazz"),
+            ("object.item.audioItem.audioBroadcast", "radios", "FIP HiFi"),
+        ] {
+            let parcours = browse_direct_children(&state, conteneur, 0, 100);
+            assert!(
+                parcours.xml.contains(attendu),
+                "« Parcourir les dossiers » ne montre deja pas {attendu} dans {conteneur} : {}",
+                parcours.xml
+            );
+
+            let reponse = search_action_response(
+                &state,
+                &soap_search(
+                    "0",
+                    &format!("upnp:class derivedfrom &quot;{classe}&quot;"),
+                    0,
+                    100,
+                ),
+            );
+            assert!(
+                reponse.contains("<u:SearchResponse"),
+                "{classe} : {reponse}"
+            );
+            assert!(
+                reponse.contains(attendu),
+                "le menu du lecteur lit « liste vide » pour {classe} : {reponse}"
+            );
+            assert!(
+                !reponse.contains("<NumberReturned>0</NumberReturned>"),
+                "{classe} : {reponse}"
+            );
+        }
+    }
+
+    /// Le garde de non-regression du parcours d'indexation (#1516).
+    ///
+    /// `derivedfrom "object.item.audioItem"` laisse desormais passer DEUX
+    /// classes — pistes et radios. La regle est que les pistes l'emportent :
+    /// un client qui indexe doit recevoir exactement ce qu'il recevait avant,
+    /// sinon reparer une rubrique en casserait une autre.
+    #[test]
+    fn l_indexation_vise_toujours_les_pistes_et_rien_d_autre() {
+        for c in ["*", "upnp:class derivedfrom \"object.item.audioItem\""] {
+            assert_eq!(
+                evaluer_criteres(c).unwrap().cible,
+                Some(CibleRecherche::Pistes),
+                "{c}"
+            );
+        }
+    }
+
+    /// Une classe qu'on ne publie pas, ou une expression qui en vise
+    /// plusieurs, rend une liste VIDE — jamais une faute, et jamais un
+    /// melange qu'aucun point de controle ne saurait paginer.
+    #[test]
+    fn une_classe_inconnue_ou_ambigue_rend_une_liste_vide() {
+        for critere in [
+            "upnp:class derivedfrom \"object.item.imageItem\"",
+            "upnp:class != \"object.item.audioItem.musicTrack\"",
+        ] {
+            assert_eq!(evaluer_criteres(critere).unwrap().cible, None, "{critere}");
+        }
+    }
+
+    /// Un predicat de titre doit mordre sur les conteneurs comme il mord sur
+    /// les pistes : sinon `Search` rendrait toute la rubrique en laissant
+    /// croire qu'il a cherche — la faute exacte de #2312.
+    #[test]
+    fn un_predicat_de_titre_filtre_aussi_les_conteneurs() {
+        let state = state_du_releve_nd8006();
+        let reponse = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                "upnp:class derivedfrom &quot;object.container.album.musicAlbum&quot; \
+                 and dc:title contains &quot;Kind&quot;",
+                0,
+                100,
+            ),
+        );
+        assert!(reponse.contains("Kind of Blue"), "{reponse}");
+        assert!(!reponse.contains("The Wall"), "{reponse}");
+        assert!(
+            reponse.contains("<NumberReturned>1</NumberReturned>"),
+            "{reponse}"
+        );
+    }
+
+    /// Chercher des artistes DANS un album n'a pas de sens : la liste est
+    /// vide, elle n'est pas fautive. Seul un identifiant qu'on ne publie
+    /// nulle part merite le 710 — la meme distinction que pour les pistes.
+    #[test]
+    fn chercher_une_rubrique_hors_de_sa_portee_rend_une_liste_vide() {
+        let state = state_du_releve_nd8006();
+        let artiste = "upnp:class derivedfrom &quot;object.container.person.musicArtist&quot;";
+
+        let dans_un_album =
+            search_action_response(&state, &soap_search("album/1", artiste, 0, 100));
+        assert!(
+            dans_un_album.contains("<NumberReturned>0</NumberReturned>"),
+            "{dans_un_album}"
+        );
+        assert!(!dans_un_album.contains("<errorCode>"), "{dans_un_album}");
+
+        let inconnu = search_action_response(&state, &soap_search("chose/42", artiste, 0, 100));
+        assert!(inconnu.contains("<errorCode>710</errorCode>"), "{inconnu}");
     }
 
     /// Ce qu'on ne sait pas evaluer doit etre REFUSE, pas approxime : c'est
