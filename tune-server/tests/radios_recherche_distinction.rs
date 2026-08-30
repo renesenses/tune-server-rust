@@ -19,12 +19,15 @@
 //! SON catalogue pour l'y avoir ajoutée, répond « fonctionne parfaitement chez
 //! moi ». Deux verdicts opposés le même jour, aucun des deux faux.
 //!
-//! Les essais tiennent quatre propriétés, dans cet ordre :
+//! Les essais tiennent cinq propriétés, dans cet ordre :
 //!
 //! 1. une station présente se trouve, et le corps le DIT (pas seulement par la
 //!    longueur de `items`) ;
-//! 2. la requête du ticket rend « aucun résultat », avec le geste de secours à
+//! 2. une station ABSENTE rend « aucun résultat », avec le geste de secours à
 //!    l'écran — c'est la voie 3 de l'issue, « au minimum, le dire » ;
+//! 2 bis. et la requête du ticket, elle, TROUVE désormais : le catalogue livré
+//!    a cessé d'être français-seulement (migration 90, voie 1 de l'issue,
+//!    tranchée le 29/08 — peupler le semis depuis notre annuaire) ;
 //! 3. une recherche qui n'aboutit pas rend une PANNE, et non un catalogue
 //!    vide ;
 //! 4. **la contre-épreuve** : les deux issues précédentes ne partagent NI le
@@ -77,6 +80,37 @@ fn urlencoding_minimal(s: &str) -> String {
     s.replace('%', "%25").replace(' ', "%20")
 }
 
+/// Une requête qui ne peut RIEN rendre, aujourd'hui ni demain.
+///
+/// Ces essais tenaient cette place avec « radio paradise », et la PR qui les a
+/// écrits l'avait annoncé : *« si le catalogue livré gagne un jour Radio
+/// Paradise, cet essai deviendra rouge : c'est voulu. Il faudra alors changer
+/// la requête, pas l'assertion »*. C'est fait — le semis de l'annuaire
+/// (migration 90, #2119) livre désormais deux Radio Paradise, et `q=paradise`
+/// rend trois lignes sur un serveur neuf.
+///
+/// La propriété tenue ici n'a jamais été « Radio Paradise est absente » mais
+/// « une station absente rend `aucun_resultat` ». On la tient donc avec un
+/// jeton qu'aucun enrichissement futur du catalogue ne peut faire exister,
+/// pour que le prochain semis ne repasse pas ces essais au rouge.
+const REQUETE_SANS_REPONSE: &str = "zzz-aucune-station-de-ce-nom";
+
+/// Le catalogue livré n'est PAS vide.
+///
+/// Sans ce garde-fou, « aucun résultat » serait vrai pour une raison qui n'a
+/// rien à voir — un semis cassé, des migrations non jouées — et les essais
+/// ci-dessous seraient verts sans rien prouver.
+fn le_catalogue_est_peuple(state: &tune_server::state::AppState) {
+    let stations = RadioRepo::with_backend(state.backend.clone())
+        .list()
+        .expect("le catalogue doit être lisible");
+    assert!(
+        stations.len() >= 49,
+        "catalogue livré à {} stations : « aucun résultat » ne prouverait rien",
+        stations.len()
+    );
+}
+
 fn semer_station(state: &tune_server::state::AppState, nom: &str, url: &str) -> i64 {
     RadioRepo::with_backend(state.backend.clone())
         .create(&RadioStation {
@@ -116,13 +150,16 @@ fn casser_le_catalogue(state: &tune_server::state::AppState) {
 #[tokio::test]
 async fn une_station_du_catalogue_se_trouve_et_le_statut_le_dit() {
     let (app, state) = app_et_etat();
+    // Une station que le semis ne peut pas fournir : depuis la migration 90,
+    // chercher « paradise » sur un serveur neuf rend les Radio Paradise du
+    // catalogue livré, et le `count == 1` d'ici ne mesurerait plus rien.
     semer_station(
         &state,
-        "Radio Paradise Rock Mix",
-        "http://stream.radioparadise.com/rock-flacm",
+        "Radio Temoin Contre-Epreuve",
+        "http://exemple.invalid/temoin",
     );
 
-    let (status, corps) = chercher(&app, "paradise").await;
+    let (status, corps) = chercher(&app, "temoin").await;
 
     assert_eq!(status, StatusCode::OK, "corps = {corps}");
     assert_eq!(corps["statut"], "resultats", "corps = {corps}");
@@ -137,7 +174,7 @@ async fn une_station_du_catalogue_se_trouve_et_le_statut_le_dit() {
         "corps = {corps}"
     );
     assert_eq!(
-        corps["items"][0]["name"], "Radio Paradise Rock Mix",
+        corps["items"][0]["name"], "Radio Temoin Contre-Epreuve",
         "corps = {corps}"
     );
     // Rien à dire quand la liste parle d'elle-même : un message ici ferait
@@ -149,18 +186,19 @@ async fn une_station_du_catalogue_se_trouve_et_le_statut_le_dit() {
 // 2. La requête du ticket : « aucun résultat », dit comme tel
 // ---------------------------------------------------------------------------
 
-/// Reproduit la mesure du ticket sur un serveur neuf.
+/// Une station absente du catalogue rend « aucun résultat », dit comme tel.
 ///
-/// Si le catalogue livré gagne un jour Radio Paradise (voie 1 de l'issue,
-/// encore à trancher), cet essai deviendra rouge : c'est voulu. Il faudra
-/// alors changer la requête, pas l'assertion — la propriété tenue ici est
-/// « une station absente rend `aucun_resultat` », pas « Radio Paradise est
-/// absente ».
+/// L'essai portait la requête du ticket, « radio paradise ». Le catalogue
+/// livré la contient depuis la migration 90 (#2119) — voie 1 de l'issue,
+/// tranchée le 29/08 : peupler le semis depuis notre annuaire. On tient donc
+/// la même propriété avec [`REQUETE_SANS_REPONSE`], et la requête du ticket
+/// sert désormais de contre-épreuve juste en dessous.
 #[tokio::test]
 async fn la_requete_du_ticket_rend_aucun_resultat_et_le_geste_de_secours() {
-    let (app, _state) = app_et_etat();
+    let (app, state) = app_et_etat();
+    le_catalogue_est_peuple(&state);
 
-    let (status, corps) = chercher(&app, "radio paradise").await;
+    let (status, corps) = chercher(&app, REQUETE_SANS_REPONSE).await;
 
     // Une recherche qui aboutit sur zéro station a RÉUSSI.
     assert_eq!(status, StatusCode::OK, "corps = {corps}");
@@ -182,6 +220,71 @@ async fn la_requete_du_ticket_rend_aucun_resultat_et_le_geste_de_secours() {
     // Et la réponse qualifie sa portée : « absente de CE catalogue » n'est pas
     // « inexistante ».
     assert_eq!(corps["portee"], "catalogue_local", "corps = {corps}");
+}
+
+/// CONTRE-ÉPREUVE de #2119 : la requête exacte du ticket rend maintenant des
+/// résultats sur un serveur neuf.
+///
+/// Le 21/08/2026, Belkadi Yacine tape « radio paradise » sur .18 et voit une
+/// liste vide (fil forum 1506). Rien dans le produit ne pouvait la lui rendre :
+/// le catalogue livré tenait 24 stations, toutes françaises, alors que NOTRE
+/// annuaire en servait 51 — téléchargé à chaque démarrage, et jeté sauf les
+/// logos. Cet essai mesure la même requête au même endroit, par HTTP, sur une
+/// base neuve.
+///
+/// Il est le pendant exact de l'essai ci-dessus : si le semis de l'annuaire
+/// disparaissait, celui-ci deviendrait rouge et l'autre resterait vert.
+#[tokio::test]
+async fn la_requete_du_ticket_trouve_desormais_radio_paradise() {
+    let (app, state) = app_et_etat();
+    le_catalogue_est_peuple(&state);
+
+    let (status, corps) = chercher(&app, "radio paradise").await;
+
+    assert_eq!(status, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["statut"], "resultats", "corps = {corps}");
+    assert!(
+        corps["count"].as_u64().unwrap_or(0) >= 2,
+        "le catalogue livré ne rend que {} Radio Paradise : {corps}",
+        corps["count"]
+    );
+    // Les deux canaux que Bilou citait au fil 1506, en FLAC avec métadonnées.
+    let urls: Vec<&str> = corps["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        // `stream_url` : c'est le nom SÉRIALISÉ du champ (`RadioStation`,
+        // `#[serde(rename = "stream_url")]`) — lire `url` rendrait toujours
+        // une liste vide, donc une preuve fabriquée.
+        .filter_map(|i| i["stream_url"].as_str())
+        .collect();
+    assert!(
+        urls.contains(&"http://stream.radioparadise.com/flacm"),
+        "le mix principal manque : {urls:?}"
+    );
+    assert!(
+        urls.contains(&"http://stream.radioparadise.com/rock-flacm"),
+        "le fil rock manque : {urls:?}"
+    );
+}
+
+/// Et le catalogue livré n'est plus français-seulement — le SECOND symptôme du
+/// ticket, mesuré lui aussi par la recherche : `q=Royaume-Uni` ne pouvait rien
+/// rendre sur un catalogue dont les 24 stations portaient toutes `France`.
+#[tokio::test]
+async fn le_catalogue_livre_repond_sur_un_pays_etranger() {
+    let (app, state) = app_et_etat();
+    le_catalogue_est_peuple(&state);
+
+    for pays in ["Royaume-Uni", "Suisse", "Japon"] {
+        let (status, corps) = chercher(&app, pays).await;
+        assert_eq!(status, StatusCode::OK, "corps = {corps}");
+        assert_eq!(corps["statut"], "resultats", "{pays} : corps = {corps}");
+        assert!(
+            corps["count"].as_u64().unwrap_or(0) >= 1,
+            "{pays} : aucune station, corps = {corps}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +341,8 @@ async fn aucun_resultat_et_panne_different_sur_les_trois_canaux_lisibles() {
     let (app_casse, etat_casse) = app_et_etat();
     casser_le_catalogue(&etat_casse);
 
-    let (statut_aucun, corps_aucun) = chercher(&app_sain, "paradise").await;
-    let (statut_panne, corps_panne) = chercher(&app_casse, "paradise").await;
+    let (statut_aucun, corps_aucun) = chercher(&app_sain, REQUETE_SANS_REPONSE).await;
+    let (statut_panne, corps_panne) = chercher(&app_casse, REQUETE_SANS_REPONSE).await;
 
     assert_ne!(
         statut_aucun, statut_panne,
@@ -271,8 +374,8 @@ async fn aucun_resultat_et_panne_different_sur_les_trois_canaux_lisibles() {
 async fn le_message_daucun_resultat_suit_la_langue_demandee() {
     let (app, _state) = app_et_etat();
 
-    let (_, en_fr) = chercher_dans_la_langue(&app, "paradise", "fr-FR,fr;q=0.9").await;
-    let (_, en_en) = chercher_dans_la_langue(&app, "paradise", "en-GB,en;q=0.9").await;
+    let (_, en_fr) = chercher_dans_la_langue(&app, REQUETE_SANS_REPONSE, "fr-FR,fr;q=0.9").await;
+    let (_, en_en) = chercher_dans_la_langue(&app, REQUETE_SANS_REPONSE, "en-GB,en;q=0.9").await;
 
     let fr = en_fr["message"].as_str().expect("message fr absent");
     let en = en_en["message"].as_str().expect("message en absent");
@@ -308,8 +411,8 @@ async fn la_portee_est_annoncee_sur_les_trois_issues() {
 
     for (nom, corps) in [
         ("resultats", chercher(&app_sain, "fip rock").await.1),
-        ("aucun", chercher(&app_sain, "paradise").await.1),
-        ("panne", chercher(&app_casse, "paradise").await.1),
+        ("aucun", chercher(&app_sain, REQUETE_SANS_REPONSE).await.1),
+        ("panne", chercher(&app_casse, REQUETE_SANS_REPONSE).await.1),
     ] {
         assert_eq!(
             corps["portee"], "catalogue_local",

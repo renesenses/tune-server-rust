@@ -1470,6 +1470,29 @@ CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item
     },
     Migration {
         version: 90,
+        name: "semis_radios_annuaire_mozaiklabs",
+        // Le catalogue livré cesse d'être français-seulement (#2119).
+        //
+        // Le semis d'origine (migration 33) pose 24 stations, toutes
+        // `country = 'France'`. Pendant ce temps NOTRE annuaire —
+        // `https://mozaiklabs.fr/api/v1/radios` — en sert 51, de huit pays, et
+        // le serveur le TÉLÉCHARGE DÉJÀ à chaque démarrage… pour n'en garder
+        // que les logos (`refresh_radio_logos`). Une station ajoutée à
+        // l'annuaire n'apparaissait donc dans le Tune de personne, et une
+        // recherche « paradise » ne pouvait structurellement rien rendre.
+        //
+        // Cette migration pose les 25 stations de l'annuaire qui manquaient au
+        // catalogue. Le texte SQL est FIGÉ dans le dépôt et non relevé au
+        // démarrage : une migration ne doit jamais dépendre du réseau. Le
+        // fichier porte en tête le relevé, le sondage des flux et les règles
+        // d'écart — c'est là qu'il faut lire le détail, pas ici.
+        //
+        // Le même fichier est `include_str!` par la migration PostgreSQL 042 :
+        // un seul texte pour les deux bases, donc aucune divergence possible.
+        up: include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_08_30.sql"),
+    },
+    Migration {
+        version: 91,
         name: "album_distinct_pairs",
         // « Ces deux albums ne sont PAS des doublons » (#1276, Megalo,
         // forum-hifi.fr #41831 p.13 : « Tune me trouve des albums doublons
@@ -3010,14 +3033,25 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "hidden_items",
         include_str!("../../migrations/postgres/041_hidden_items.sql"),
     ),
+    // Jumelle de la migration SQLite 90 : le catalogue de radios cesse d'être
+    // français-seulement (#2119). LE MÊME FICHIER que la migration SQLite —
+    // pas une copie : le SQL du semis est volontairement portable
+    // (`INSERT ... SELECT ... WHERE NOT EXISTS`), et deux fichiers jumeaux
+    // finiraient par diverger. Sans cette entrée, tout le parc PostgreSQL —
+    // .15, .18, Docker — resterait aux 24 stations françaises.
+    (
+        42,
+        "semis_radios_annuaire_mozaiklabs",
+        include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_08_30.sql"),
+    ),
     // « Ces deux albums ne sont pas des doublons » (#1276). Jumelle de la
-    // migration SQLite 90 — mêmes deux listes séparées : sans cette entrée,
+    // migration SQLite 91 — mêmes deux listes séparées : sans cette entrée,
     // la table manquerait à tout le parc PostgreSQL et les deux routes de
     // rapprochement d'albums y rendraient une erreur SQL.
     (
-        42,
+        43,
         "album_distinct_pairs",
-        include_str!("../../migrations/postgres/042_album_distinct_pairs.sql"),
+        include_str!("../../migrations/postgres/043_album_distinct_pairs.sql"),
     ),
 ];
 
@@ -3923,7 +3957,7 @@ mod tests {
             out
         }
 
-        let semees: Vec<String> = seed
+        let mut semees: Vec<String> = seed
             .up
             .lines()
             .filter(|l| {
@@ -3937,6 +3971,32 @@ mod tests {
             "seulement {} URL relevées dans le semis — le relevé s'est cassé",
             semees.len()
         );
+
+        // Le SECOND semis, celui de l'annuaire (migration 90, #2119). Il pose
+        // 25 stations de plus, dont trois que la migration 86 a dû repointer :
+        // s'il reprenait une adresse morte, une installation neuve la
+        // recevrait puis la perdrait — exactement le défaut que ce test garde.
+        // Sa forme est portable (`INSERT ... SELECT ... WHERE NOT EXISTS`), et
+        // l'URL réellement posée est celle de la garde.
+        let annuaire = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "semis_radios_annuaire_mozaiklabs")
+            .expect("le semis de l'annuaire a disparu");
+        let depuis_annuaire: Vec<String> = annuaire
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = ")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().next())
+            .collect();
+        assert!(
+            depuis_annuaire.len() >= 25,
+            "seulement {} URL relevées dans le semis de l'annuaire — le relevé s'est cassé",
+            depuis_annuaire.len()
+        );
+        semees.extend(depuis_annuaire);
         for url in &semees {
             assert!(
                 url.starts_with("http"),
@@ -3960,6 +4020,99 @@ mod tests {
                     m.name
                 );
             }
+        }
+
+        // Même règle pour les REPOINTAGES. La migration 86 remplace l'adresse
+        // de trois stations dont le flux est mort ; elle ne s'applique qu'aux
+        // bases déjà semées, pas aux lignes posées APRÈS elle. Un semis qui
+        // reprendrait l'ancienne adresse livrerait une station muette à toute
+        // installation neuve, sans que rien ne la rattrape jamais.
+        for m in MIGRATIONS.iter() {
+            for line in m.up.lines() {
+                let line = line.trim();
+                if !line.starts_with("UPDATE radio_stations SET url = ") {
+                    continue;
+                }
+                let litteraux = litteraux_sql(line);
+                let (Some(_neuve), Some(ancienne)) = (litteraux.first(), litteraux.get(1)) else {
+                    continue;
+                };
+                assert!(
+                    !semees.iter().any(|s| s == ancienne),
+                    "la migration {} ({}) repointe {ancienne}, que le semis pose encore",
+                    m.version,
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// #2119 — le catalogue LIVRÉ n'est plus français-seulement.
+    ///
+    /// Contre-épreuve permanente : elle se lit sur la table après migrations,
+    /// pas sur le texte du semis. Vider le fichier de l'annuaire, oublier
+    /// d'enregistrer la migration 90, ou la faire arracher par une migration
+    /// ultérieure font tomber ce test — trois façons de reproduire le défaut
+    /// sans s'en apercevoir.
+    #[test]
+    fn le_catalogue_livre_couvre_plusieurs_pays() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, country FROM radio_stations")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // 24 (semis d'origine) + 25 (annuaire) = 49. Plancher, pas égalité :
+        // ajouter une station vérifiée ne doit pas casser le test.
+        assert!(
+            stations.len() >= 49,
+            "le catalogue livré est retombé à {} stations",
+            stations.len()
+        );
+
+        let pays: std::collections::BTreeSet<&str> =
+            stations.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            pays.len() >= 8,
+            "le catalogue livré ne couvre que {} pays : {pays:?}",
+            pays.len()
+        );
+        // Le symptôme exact du ticket : tout était `France`.
+        let hors_france = stations.iter().filter(|(_, p)| p != "France").count();
+        assert!(
+            hors_france >= 17,
+            "seulement {hors_france} stations hors de France dans le catalogue livré"
+        );
+
+        // Et la station par laquelle le ticket est arrivé (Belkadi Yacine puis
+        // Bilou, fil forum 1506) : une recherche « paradise » ne rendait rien
+        // parce que le catalogue ne la contenait pas.
+        assert!(
+            stations
+                .iter()
+                .any(|(n, _)| n.to_lowercase().contains("paradise")),
+            "Radio Paradise manque toujours au catalogue livré"
+        );
+
+        // Le vocabulaire de `country` est celui du semis d'origine, en
+        // français : mélanger « France » et « FR » dans la même colonne rendrait
+        // la recherche par pays (`radio_repo::search`) et toute facette
+        // illisibles.
+        for (name, country) in &stations {
+            assert!(
+                country.len() > 2,
+                "station « {name} » : pays donné en code ISO (« {country} ») alors que le \
+                 catalogue livré l'écrit en toutes lettres"
+            );
         }
     }
 
@@ -4002,14 +4155,21 @@ mod tests {
             .unwrap()
         };
 
-        // Une bibliothèque neuve ne porte aucune de ces URL : elles viennent
-        // de l'annuaire, jamais du semis.
+        // Une bibliothèque neuve ne porte aucune des URL MORTES : ni le semis
+        // d'origine (33) ni celui de l'annuaire (90) ne les posent — c'est
+        // précisément ce que garde `le_semis_ne_pose_rien_qu_une_migration_supprime`.
         for (morte, _) in REMPLACEES {
             assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
         }
         for morte in RETIREES {
             assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
         }
+
+        // Les URL de REMPLACEMENT, elles, sont désormais semées par la
+        // migration 90 (#2119) : ces trois stations font partie du catalogue
+        // livré, avec l'adresse vérifiée. On mesure donc en DELTA à partir de
+        // ce plancher, sans quoi ce test comparerait à un passé révolu.
+        let plancher: Vec<i64> = REMPLACEES.iter().map(|(_, v)| compter(v)).collect();
 
         // Bibliothèque existante : l'utilisateur les a ajoutées depuis
         // l'annuaire, avec le nom et le drapeau favori que le bouton pose.
@@ -4055,11 +4215,11 @@ mod tests {
             conn.execute_batch(m.up).unwrap();
         }
 
-        for (morte, vivante) in REMPLACEES {
+        for (i, (morte, vivante)) in REMPLACEES.iter().enumerate() {
             assert_eq!(compter(morte), 0, "l'URL morte {morte} est restée");
             assert_eq!(
                 compter(vivante),
-                1,
+                plancher[i] + 1,
                 "l'URL de remplacement {vivante} n'a pas été posée"
             );
         }
@@ -4071,9 +4231,12 @@ mod tests {
         // recrée pas : seule l'adresse change.
         {
             let conn = db.connection().lock().unwrap();
+            // `name = 'depuis-annuaire'` désigne LA ligne de la fixture : la
+            // station homonyme semée par la migration 90 porte la même adresse
+            // et n'a évidemment pas le drapeau favori de l'utilisateur.
             let favori: i64 = conn
                 .query_row(
-                    "SELECT is_favorite FROM radio_stations WHERE url = ?1",
+                    "SELECT is_favorite FROM radio_stations WHERE url = ?1 AND name = 'depuis-annuaire'",
                     ["https://ais-sa8.cdnstream1.com/3630_128.mp3"],
                     |r| r.get(0),
                 )
@@ -4337,7 +4500,12 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 40, "latest PG migration must be 40");
+        // 42 : la 41 (`hidden_items`, #1391) était déjà enregistrée sans que
+        // cette ligne soit remontée — ce test ne tourne que dans le job PG,
+        // qui n'exécute pas `-p tune-core`. On la remonte donc de 40 à 42 d'un
+        // coup, en constatant les DEUX ajouts.
+        // 43 : `album_distinct_pairs` (#1276), jumelle de la SQLite 91.
+        assert_eq!(pg_latest_version(), 43, "latest PG migration must be 43");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

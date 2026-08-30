@@ -65,6 +65,8 @@ mod tests_orphelins;
 mod tranches_dynamic_range;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
+#[path = "volume_db_contrat.rs"]
+mod volume_db_contrat;
 #[path = "web_response_contracts.rs"]
 mod web_response_contracts;
 #[path = "workflows_bornes.rs"]

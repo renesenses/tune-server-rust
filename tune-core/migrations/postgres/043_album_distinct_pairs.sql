@@ -1,7 +1,7 @@
 -- album_distinct_pairs : « ces deux albums ne sont PAS des doublons »
 -- (#1276, Megalo — forum-hifi.fr #41831 p.13).
 --
--- Jumelle PostgreSQL de la migration SQLite 90. Les deux listes sont
+-- Jumelle PostgreSQL de la migration SQLite 91. Les deux listes sont
 -- SEPAREES : écrite d'un seul côté, la table manquerait à tout le parc
 -- PostgreSQL (.15, .18, Docker) et les deux routes qui la nomment
 -- (`/library/albums/grouped`, `/library/albums/merge-duplicates`) y

@@ -9,6 +9,7 @@ pub mod api_analytics;
 pub mod audio;
 pub mod bandcamp_veille;
 pub mod bug_report;
+pub mod cadence;
 pub mod cloud;
 pub mod collaborative;
 pub mod config;

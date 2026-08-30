@@ -32,7 +32,16 @@ pub struct CreateZone {
 #[derive(Deserialize)]
 struct UpdateVolume {
     /// Accepts both 0.0-1.0 (float from web client) and 0-100 (integer legacy).
-    volume: f64,
+    ///
+    /// `Option` depuis #1274 : une requête qui ne parle qu'en dB n'a pas à
+    /// porter ce champ. `tune-remote` et `tune-widget` continuent de
+    /// l'envoyer, le premier en 0..1 et le second en 0..100 — l'heuristique
+    /// historique les départage et n'est pas touchée.
+    volume: Option<f64>,
+    /// Atténuation demandée en dB (≤ 0 ; `0` = pleine échelle). Exclusif avec
+    /// `volume`. Ce champ ne connaît PAS l'ambiguïté 0..1 / 0..100 : un dB est
+    /// un dB (#1274).
+    volume_db: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +70,13 @@ where
 struct PatchZone {
     name: Option<String>,
     volume: Option<i32>,
+    /// Volume demandé en dB (≤ 0 ; `0` = 100 %). Exclusif avec `volume`.
+    ///
+    /// #1274 — `volume` est un ENTIER 0..100 : entre deux crans, l'écart va de
+    /// 0,09 dB en haut d'échelle à 6 dB entre 1 % et 2 %. Ce champ contourne
+    /// cette quantification à l'écriture ; la valeur est passée telle quelle à
+    /// l'orchestrateur, qui la garde en `f64`.
+    volume_db: Option<f64>,
     muted: Option<bool>,
     output_device_id: Option<String>,
     output_type: Option<String>,
@@ -1951,13 +1967,16 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             // zone et apres chaque evenement de lecture.
             obj.insert("shuffle".into(), json!(ps.shuffle));
             obj.insert("repeat".into(), json!(ps.repeat));
-            obj.insert(
-                "volume".into(),
-                json!(if ps.volume > 0.0 {
+            // #1274 — `volume` (linéaire, 0..1) et `volume_db` (atténuation en
+            // dB, `null` = silence) sortent ensemble du même nombre. Le champ
+            // dB est ADDITIF : aucun client déployé ne perd `volume`.
+            tune_core::audio::volume_scale::inserer_volume(
+                obj,
+                if ps.volume > 0.0 {
                     ps.volume
                 } else {
                     z.volume as f64 / 100.0
-                }),
+                },
             );
             let renderer_label = z
                 .output_device_id
@@ -2139,7 +2158,9 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 // c'est elle qui doit lui apprendre un aleatoire deja actif.
                 obj.insert("shuffle".into(), json!(ps.shuffle));
                 obj.insert("repeat".into(), json!(ps.repeat));
-                obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
+                // #1274 — même paire qu'au-dessus, depuis la même source :
+                // ici la colonne `zones.volume`, arrondie au pour-cent.
+                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume as f64 / 100.0);
                 let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
@@ -2399,6 +2420,29 @@ async fn patch_zone(
     {
         return refus_de_valeur(id, "volume", &vol.to_string(), "hors de 0..100");
     }
+    // #1274 — `volume` et `volume_db` sont exclusifs, et la validation du dB
+    // vit dans `volume_scale`. Ce PATCH ne peut pas déléguer complètement :
+    // son champ historique est un entier 0..100, il doit donc le ramener sur
+    // 0..1 lui-même. Le refus, lui, est rendu sous la forme que le reste du
+    // handler emploie.
+    let volume_demande = match tune_core::audio::volume_scale::demande_lineaire(
+        body.volume.map(f64::from).map(|v| v / 100.0),
+        body.volume_db,
+    ) {
+        Ok(v) => Some(v),
+        // Aucun des deux champs n'est présent : ce PATCH ne parle pas de
+        // volume, et c'est le cas le plus courant.
+        Err(_) if body.volume.is_none() && body.volume_db.is_none() => None,
+        Err(motif) => {
+            let recu = match (body.volume, body.volume_db) {
+                (Some(v), Some(db)) => format!("volume={v} volume_db={db}"),
+                (_, Some(db)) => db.to_string(),
+                (Some(v), _) => v.to_string(),
+                _ => String::new(),
+            };
+            return refus_de_valeur(id, "volume_db", &recu, motif);
+        }
+    };
     if let Some(ref device_id) = body.output_device_id
         && device_id.trim().is_empty()
     {
@@ -2439,10 +2483,14 @@ async fn patch_zone(
         .output_device_id
         .as_deref()
         .or(zone_before.output_device_id.as_deref());
-    if let Some(volume) = body.volume
+    // #1274 — `volume_demande` porte déjà la valeur linéaire, qu'elle vienne
+    // du pour-cent entier ou des dB. L'orchestrateur la reçoit en `f64` et la
+    // garde telle quelle dans l'état de lecture et vers le device ; seule la
+    // persistance en base l'arrondit encore au pour-cent (colonne `INTEGER`).
+    if let Some(volume) = volume_demande
         && let Err(error) = state
             .orchestrator
-            .set_volume(id, f64::from(volume) / 100.0, command_device_id)
+            .set_volume(id, volume, command_device_id)
             .await
     {
         return crate::routes::playback::output_command_error_response(error);
@@ -3440,10 +3488,20 @@ async fn update_volume(
     Json(body): Json<UpdateVolume>,
 ) -> impl IntoResponse {
     // Normalise: web client sends 0.0–1.0, legacy clients may send 0–100.
-    let volume_f = if body.volume > 1.0 {
-        body.volume / 100.0
-    } else {
-        body.volume
+    let lineaire = body.volume.map(|v| if v > 1.0 { v / 100.0 } else { v });
+    // #1274 — l'arbitrage `volume` / `volume_db` et la conversion des dB
+    // vivent dans `volume_scale`, pas ici. Cette route ne fait que ramener sa
+    // convention historique sur 0..1 avant de la lui passer.
+    let volume_f = match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db)
+    {
+        Ok(v) => v,
+        Err(motif) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_volume", "message": motif })),
+            )
+                .into_response();
+        }
     };
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);

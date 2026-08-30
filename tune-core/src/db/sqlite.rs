@@ -618,9 +618,9 @@ CREATE TABLE IF NOT EXISTS hidden_items (
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
 
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
--- migration SQLite 90, présent AUSSI ici pour que le rapprochement d'albums
+-- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums
 -- (grouped / merge-duplicates) tourne sur une base née de `init_schema` seul,
--- comme les tests de repo. Voir la migration 90 pour la doctrine complète.
+-- comme les tests de repo. Voir la migration 91 pour la doctrine complète.
 CREATE TABLE IF NOT EXISTS album_distinct_pairs (
     profile_id INTEGER NOT NULL DEFAULT 1,
     album_a_id INTEGER NOT NULL,

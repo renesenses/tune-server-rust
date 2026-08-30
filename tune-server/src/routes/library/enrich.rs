@@ -15,6 +15,16 @@ const MUSICBRAINZ_API: &str = "https://musicbrainz.org/ws/2";
 const MB_USER_AGENT: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
 const MB_RATE_LIMIT_MS: u64 = 1100;
 
+/// La charge utile de `library.enrich.progress`, et rien d'autre.
+///
+/// `SettingsView.svelte` n'en lit que deux champs — `processed` et `total` —
+/// qu'il pousse dans `batchEnrichCurrent` / `batchEnrichTotal`. Sortie ici pour
+/// que le contrat inter-depots soit verifiable sans monter toute la route
+/// (#2870).
+fn charge_avancement_enrichissement(enriched: i32, total: usize) -> Value {
+    json!({ "processed": enriched, "total": total })
+}
+
 /// POST /library/enrich-all
 ///
 /// Enriches tracks with metadata from MusicBrainz. Finds tracks with
@@ -120,6 +130,29 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 .ok();
         }
 
+        // Meme chose sur le FIL, et pour la meme raison (#2870).
+        //
+        // `SettingsView.svelte` ecoute `library.enrich.progress` depuis la v0.8
+        // et n'a jamais rien recu : sa barre ne bougeait qu'au rythme du sondage
+        // HTTP, toutes les 10 s, et seulement tant que l'ecran restait ouvert.
+        // On annonce le total des qu'il est connu — sinon la barre reste sur
+        // « 0/0 » le temps du premier aller-retour MusicBrainz.
+        //
+        // `processed` porte le compte ENRICHI, pas le compte examine : c'est ce
+        // que rend `/library/enrich-all/status` sous le nom `enriched`, et les
+        // deux sources alimentent le MEME compteur cote client. Deux definitions
+        // feraient sauter le chiffre a chaque bascule.
+        let mut cadence = tune_core::cadence::Cadence::avancement();
+        let annonce = |cadence: &mut tune_core::cadence::Cadence, enriched: i32| {
+            if cadence.autorise() {
+                event_bus.emit_typed(
+                    tune_core::event_types::EventType::EnrichProgress,
+                    charge_avancement_enrichissement(enriched, total),
+                );
+            }
+        };
+        annonce(&mut cadence, 0);
+
         // Build a dedicated HTTP client with proper UA for MusicBrainz
         let mb_client = tune_core::http::client::builder()
             .timeout(Duration::from_secs(15))
@@ -135,6 +168,12 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
             std::collections::HashSet::new();
 
         for row in &track_rows {
+            // En TETE de boucle, pas en queue : le corps sort par `continue` des
+            // qu'une recherche MusicBrainz ne rend rien, et une bibliotheque
+            // entiere peut sortir par la. Annonce en queue, la barre serait
+            // restee muette pendant toute la passe.
+            annonce(&mut cadence, enriched);
+
             let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             let title = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
             let artist = row.get(2).and_then(|v| v.as_string());
@@ -602,4 +641,45 @@ fn pick_best_genre(tags_value: &Value) -> Option<String> {
         })
         .max_by_key(|(_, count)| *count)
         .map(|(name, _)| tune_core::metadata::normalize_genre(&name))
+}
+
+#[cfg(test)]
+mod tests_avancement_enrichissement {
+    use super::*;
+
+    /// Contrat INTER-DEPOTS (#2870). `SettingsView.svelte` fait :
+    ///
+    /// ```js
+    /// } else if (event.type === 'library.enrich.progress') {
+    ///   batchEnrichRunning = true;
+    ///   batchEnrichCurrent = event.data.processed ?? 0;
+    ///   batchEnrichTotal   = event.data.total ?? 0;
+    /// }
+    /// ```
+    ///
+    /// Renommer un de ces deux champs, c'est refaire afficher « 0 / 0 » — le
+    /// defaut Fabien-5 que le sondage HTTP avait deja subi une fois, faute
+    /// d'avoir lu le client.
+    #[test]
+    fn la_charge_porte_exactement_processed_et_total() {
+        let charge = charge_avancement_enrichissement(37, 1651);
+        assert_eq!(charge["processed"], 37);
+        assert_eq!(charge["total"], 1651);
+        assert_eq!(
+            charge.as_object().map(|o| o.len()),
+            Some(2),
+            "pas un champ de plus : le client n'en lit que deux"
+        );
+    }
+
+    /// Le compte annonce est celui qu'annonce DEJA `/library/enrich-all/status`
+    /// sous le nom `enriched`. Les deux sources alimentent le meme compteur cote
+    /// client (le sondage a 10 s et le fil) : deux definitions le feraient
+    /// sauter en arriere a chaque bascule.
+    #[test]
+    fn processed_est_le_compte_enrichi_pas_le_compte_examine() {
+        // 5 pistes enrichies sur 100 candidates : on annonce 5, pas le rang de
+        // la piste courante.
+        assert_eq!(charge_avancement_enrichissement(5, 100)["processed"], 5);
+    }
 }
