@@ -2572,8 +2572,6 @@ impl PositionPoller {
                             || np.artist_name != meta.artist
                             || np.cover_path != pochette;
                         if title_changed {
-                            let title_for_icy = meta.title.clone();
-                            let artist_for_icy = meta.artist.clone();
                             let new_np = crate::playback::NowPlaying {
                                 track_id: None,
                                 title: meta.title,
@@ -2586,21 +2584,29 @@ impl PositionPoller {
                                 stream_id: np.stream_id.clone(),
                                 ..Default::default()
                             };
-                            self.playback.update_now_playing(zone_id, new_np).await;
-                            // Le renderer, lui, ne lit pas le
-                            // now-playing : il reçoit des blocs ICY
-                            // dans le flux. On publie donc aussi le
-                            // titre là où le gestionnaire de flux
-                            // saura le relire, sinon l'appareil
-                            // reste figé sur le morceau qui passait
-                            // à sa connexion.
+                            // Le renderer, lui, ne lit pas le now-playing : il
+                            // reçoit des blocs ICY dans le flux. On publie donc
+                            // titre ET pochette là où le gestionnaire de flux
+                            // saura les relire, sinon l'appareil reste figé sur
+                            // le morceau qui passait à sa connexion (#2161).
+                            //
+                            // On lit ces trois valeurs SUR `new_np`, et non sur
+                            // des copies prises plus haut : ce sont exactement
+                            // celles que l'interface Tune va recevoir. Trois
+                            // variables `*_for_icy` parallèles pouvaient diverger
+                            // du now-playing sans qu'aucune épreuve ne le voie —
+                            // et c'est cette classe d'écart silencieux entre le
+                            // producteur et le consommateur qui a produit ce
+                            // ticket. Ici, l'écart n'est plus représentable.
                             if let Some(sid) = np.stream_id.as_deref() {
                                 crate::http::streamer::publish_radio_now(
                                     sid,
-                                    artist_for_icy,
-                                    title_for_icy,
+                                    new_np.artist_name.clone(),
+                                    new_np.title.clone(),
+                                    new_np.cover_path.clone(),
                                 );
                             }
+                            self.playback.update_now_playing(zone_id, new_np).await;
                             debug!(zone_id, station = %station_name, "radio_metadata_updated");
                         }
                     }

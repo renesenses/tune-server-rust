@@ -198,6 +198,11 @@ pub struct DidlBuilder {
     /// protocolInfo flags and never emit `size=`/`duration=` in `<res>`.
     live_stream: bool,
     byte_seekable: bool,
+    /// Émettre `sampleFrequency` / `bitsPerSample` / `nrAudioChannels` dans
+    /// `<res>`. Faux pour le DIDL réduit, qui doit tenir sous un segment TCP
+    /// mais a QUAND MÊME besoin de la fréquence et de la profondeur pour
+    /// choisir le bon profil DLNA (voir [`Self::sans_attributs_audio`]).
+    emettre_attributs_audio: bool,
 }
 
 impl DidlBuilder {
@@ -223,7 +228,24 @@ impl DidlBuilder {
             parent_id: "0".to_string(),
             live_stream: false,
             byte_seekable: true,
+            emettre_attributs_audio: true,
         }
+    }
+
+    /// Renseigner la fréquence et la profondeur SANS les écrire dans `<res>`.
+    ///
+    /// Le profil DLNA annoncé dans le `protocolInfo` dépend des deux
+    /// (`dlna_flags_for_mime_bd_sr` : au-delà de 16 bits ou de 48 kHz, un WAV
+    /// n'est plus du `PN=LPCM`, et l'annoncer quand même fait jouer du SILENCE
+    /// — #1137, #1458). Les ATTRIBUTS, eux, coûtent des octets, et le DIDL
+    /// réduit existe précisément pour tenir sous un segment TCP.
+    ///
+    /// Les deux besoins ne sont pas contradictoires : on garde les valeurs pour
+    /// décider du profil, on n'écrit pas les attributs. Le `protocolInfo` ne
+    /// grossit pas non plus — la variante sans `PN` est plus COURTE.
+    pub fn sans_attributs_audio(mut self) -> Self {
+        self.emettre_attributs_audio = false;
+        self
     }
 
     /// Mark this item as an infinite live stream (internet radio).
@@ -466,16 +488,19 @@ impl DidlBuilder {
 
         let sr_attr = self
             .sample_rate
+            .filter(|_| self.emettre_attributs_audio)
             .map(|sr| format!(" sampleFrequency=\"{sr}\""))
             .unwrap_or_default();
 
         let bd_attr = self
             .bit_depth
+            .filter(|_| self.emettre_attributs_audio)
             .map(|bd| format!(" bitsPerSample=\"{bd}\""))
             .unwrap_or_default();
 
         let ch_attr = self
             .channels
+            .filter(|_| self.emettre_attributs_audio)
             .map(|ch| format!(" nrAudioChannels=\"{ch}\""))
             .unwrap_or_default();
 

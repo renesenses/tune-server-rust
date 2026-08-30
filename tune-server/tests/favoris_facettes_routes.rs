@@ -352,3 +352,151 @@ async fn aucune_route_de_la_famille_favoris_ne_disparait_en_silence() {
         );
     }
 }
+
+// --- #2001 : « aucun tri ni réordonnancement, l'ordre d'ajout est subi » ---
+//
+// Le client web sait trier depuis la v0.9.96, mais dans son propre code : le
+// serveur, lui, rendait toujours l'ordre d'ajout, donc les clients Flutter,
+// Swift, le widget et l'UPnP restaient sans recours. Ces tests vérifient la
+// jonction là où elle peut casser sans bruit : que `sort`/`order` traversent
+// bien l'extracteur `Query` jusqu'au dépôt, et que leur ABSENCE ne change rien.
+
+/// Trois favoris de service dont les titres ne se rangent pas comme leur ordre
+/// d'ajout, et dont les artistes départagent accents et casse.
+async fn trois_favoris_de_service(app: &axum::Router) {
+    let items: [(&str, &str, &str); 3] = [
+        ("s1", "Volume 10", "Éric Zimmer"),
+        ("s2", "volume 2", "aaron Zed"),
+        ("s3", "Zorro", "Erik Satie"),
+    ];
+    for (id, titre, artiste) in items {
+        let (status, _) = post(
+            app,
+            "/api/v1/profiles/1/favorites/streaming/add",
+            json!({
+                "item_type": "track",
+                "service": "qobuz",
+                "service_id": id,
+                "title": titre,
+                "artist": artiste,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "l'ajout de {id} a échoué");
+    }
+}
+
+fn identifiants(corps: &Value) -> Vec<String> {
+    corps
+        .as_array()
+        .expect("la route rend une liste")
+        .iter()
+        .map(|f| f["service_id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn le_tri_demande_traverse_la_route_des_favoris_de_service() {
+    let app = app();
+    trois_favoris_de_service(&app).await;
+
+    let (status, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track&sort=title&order=asc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // « volume 2 » avant « Volume 10 » : le tri est naturel, pas lexical.
+    assert_eq!(identifiants(&corps), ["s2", "s1", "s3"]);
+
+    let (_, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track&sort=title&order=desc",
+    )
+    .await;
+    assert_eq!(identifiants(&corps), ["s3", "s1", "s2"]);
+
+    // « Éric Zimmer » se range entre « aaron Zed » et « Erik Satie » : les
+    // accents suivent leur lettre, ils ne finissent pas la liste.
+    let (_, corps) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track&sort=artist",
+    )
+    .await;
+    assert_eq!(identifiants(&corps), ["s2", "s1", "s3"]);
+}
+
+/// Rétro-compatibilité : sans `sort`, la route rend la même chose qu'avant —
+/// et un `sort` inconnu ne fait pas d'erreur, il ne trie simplement pas.
+#[tokio::test]
+async fn sans_parametre_de_tri_la_route_des_favoris_ne_change_pas() {
+    let app = app();
+    trois_favoris_de_service(&app).await;
+
+    let (status, sans) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sans = identifiants(&sans);
+    assert_eq!(sans.len(), 3);
+
+    let (status, inconnu) = get(
+        &app,
+        "/api/v1/profiles/1/favorites/streaming?item_type=track&sort=bpm&order=asc",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "une clé de tri inconnue ne doit pas casser une route de lecture"
+    );
+    assert_eq!(
+        identifiants(&inconnu),
+        sans,
+        "une clé inconnue doit laisser l'ordre d'avant"
+    );
+}
+
+/// La route des favoris LOCAUX accepte les mêmes paramètres et garde la forme
+/// de sa réponse : `sort` n'ajoute aucun champ au JSON.
+#[tokio::test]
+async fn la_route_des_favoris_locaux_accepte_le_tri_sans_changer_sa_reponse() {
+    let app = app();
+    for item_id in [7, 8, 9] {
+        let (status, _) = post(
+            &app,
+            "/api/v1/profiles/1/favorites/add",
+            json!({"item_type": "track", "item_id": item_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, sans) = get(&app, "/api/v1/profiles/1/favorites?item_type=track").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, trie) = get(
+        &app,
+        "/api/v1/profiles/1/favorites?item_type=track&sort=title&order=asc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let cles = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_array().unwrap()[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        cles(&sans),
+        cles(&trie),
+        "l'instantané d'identité sert au tri, il ne doit PAS fuir dans la réponse"
+    );
+    assert_eq!(trie.as_array().unwrap().len(), 3);
+}

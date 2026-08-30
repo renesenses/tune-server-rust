@@ -339,6 +339,8 @@ mod tests {
             explicit: false,
             quality: None,
             isrc: None,
+            composer: None,
+            artist_id: None,
         }
     }
 

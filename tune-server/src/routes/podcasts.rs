@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -397,12 +397,37 @@ fn get_rf_api_key(state: &AppState) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
+/// L'absence de clé n'est pas une requête fautive : c'est un état de
+/// configuration du serveur. Répondre `400 bad_request` faisait passer
+/// l'ouverture de l'écran Podcasts pour une erreur (#1026) et ne laissait au
+/// client qu'un message technique anglais citant un nom de variable.
+///
+/// Ici : `412 Precondition Failed` (même statut que Discogs et setlist.fm
+/// pour leurs clés absentes), un code stable pour qui programme contre
+/// l'API, le nom exact du réglage qui active la source, et un message dans
+/// la langue de l'interface. Les clients déployés, qui ne testent que
+/// `res.ok`, retombent comme avant sur la liste éditoriale sans clé.
+fn rf_cle_absente(headers: &HeaderMap) -> axum::response::Response {
+    let lang = crate::i18n::lang_from_header(headers);
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(json!({
+            "error": "radiofrance_cle_absente",
+            "message": crate::i18n::t(&lang, "podcasts.radiofrance.cleAbsente"),
+            "setting": "radiofrance_api_key",
+        })),
+    )
+        .into_response()
+}
+
 async fn rf_shows(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<RfShowsQuery>,
-) -> Result<Json<Value>, AppError> {
-    let api_key = get_rf_api_key(&state)
-        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+) -> Result<axum::response::Response, AppError> {
+    let Some(api_key) = get_rf_api_key(&state) else {
+        return Ok(rf_cle_absente(&headers));
+    };
     let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
     let code = q.station.as_deref().unwrap_or("FRANCEINTER");
     let station = RfStation::from_code(code)
@@ -410,7 +435,8 @@ async fn rf_shows(
     match api.list_shows(station).await {
         Ok(shows) => Ok(Json(
             json!({"station": station.label(), "count": shows.len(), "shows": shows}),
-        )),
+        )
+        .into_response()),
         Err(e) => {
             warn!(station = code, error = %e, "rf_shows_failed");
             Err(AppError::internal(e))
@@ -420,15 +446,17 @@ async fn rf_shows(
 
 async fn rf_search_shows(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<RfSearchQuery>,
-) -> Result<Json<Value>, AppError> {
-    let api_key = get_rf_api_key(&state)
-        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+) -> Result<axum::response::Response, AppError> {
+    let Some(api_key) = get_rf_api_key(&state) else {
+        return Ok(rf_cle_absente(&headers));
+    };
     let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
     match api.search_shows(&q.q).await {
-        Ok(shows) => Ok(Json(
-            json!({"query": q.q, "count": shows.len(), "shows": shows}),
-        )),
+        Ok(shows) => {
+            Ok(Json(json!({"query": q.q, "count": shows.len(), "shows": shows})).into_response())
+        }
         Err(e) => {
             warn!(query = %q.q, error = %e, "rf_search_failed");
             Err(AppError::internal(e))
@@ -438,15 +466,18 @@ async fn rf_search_shows(
 
 async fn rf_episodes(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<RfEpisodesQuery>,
-) -> Result<Json<Value>, AppError> {
-    let api_key = get_rf_api_key(&state)
-        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+) -> Result<axum::response::Response, AppError> {
+    let Some(api_key) = get_rf_api_key(&state) else {
+        return Ok(rf_cle_absente(&headers));
+    };
     let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
     match api.get_episodes(&q.show_url, q.limit as u32).await {
         Ok(episodes) => Ok(Json(
             json!({"show_url": q.show_url, "count": episodes.len(), "episodes": episodes}),
-        )),
+        )
+        .into_response()),
         Err(e) => {
             warn!(show = %q.show_url, error = %e, "rf_episodes_failed");
             Err(AppError::internal(e))

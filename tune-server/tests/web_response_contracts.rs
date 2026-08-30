@@ -223,6 +223,10 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ),
     ("/offline/status", "/api/v1/offline/status"),
     ("/onboarding/status", "/api/v1/onboarding/status"),
+    // La recherche de stations ne rend plus un tableau nu : son corps doit
+    // porter de quoi distinguer « aucune station de ce nom » d'une panne
+    // (#2119). `fip` touche le catalogue livré, donc l'issue « résultats ».
+    ("/radios/search", "/api/v1/radios/search?q=fip"),
     ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
     (
         "/streaming/youtube/auth/status",

@@ -448,6 +448,13 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 if location.is_empty() || outputs.contains(&d.id) {
                     continue;
                 }
+                // #1280 — appareil que l'utilisateur a fait taire : ce lot de
+                // démarrage enregistrait la sortie sans rien demander, donc
+                // l'appareil revenait proposé à chaque redémarrage.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_appareil_ignore");
+                    continue;
+                }
                 if let Ok(desc) =
                     tune_core::discovery::xml_parser::fetch_device_description(location).await
                 {
@@ -487,6 +494,12 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // (Fabien: "Salon: AIRPLAY" zone came back after update).
                 if zone_repo.is_device_hidden(&d.id) {
                     info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_hidden_skipping");
+                    continue;
+                }
+                // #1280 — appareil ignoré : aucune zone, sous aucune de ses
+                // identités.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_appareil_ignore");
                     continue;
                 }
 

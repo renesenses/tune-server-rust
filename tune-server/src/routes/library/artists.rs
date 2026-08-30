@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -68,13 +68,15 @@ pub(super) async fn artist_bio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let lang = q.lang.as_deref().unwrap_or("fr");
+    let lang = langue_demandee(q.lang.as_deref(), &headers);
+    let lang = lang.as_str();
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -138,6 +140,33 @@ pub(super) async fn artist_bio(
         }
         _ => repli_sur_la_bio_stockee(&artist.name, artist.bio.as_deref(), prov),
     }
+}
+
+/// Quelle langue la requête demande-t-elle, pour les deux routes « bio » ?
+///
+/// Précédence, dans cet ordre :
+/// 1. le paramètre `?lang=` explicite — un appel qui nomme sa langue gagne ;
+/// 2. l'en-tête `Accept-Language`, via [`crate::i18n::lang_from_header`], la
+///    MÊME lecture que `browse.rs` et `system/enrich.rs` ;
+/// 3. `fr`, repli déjà porté par `lang_from_header`.
+///
+/// Sans l'étape 2, les deux routes repliaient droit sur `"fr"` (#1849) : le
+/// client web n'envoie `?lang=` sur aucune des deux, il transmet sa locale par
+/// l'en-tête sur CHAQUE requête (`tune-web-client/src/lib/api.ts`). Un
+/// utilisateur en interface anglaise obtenait donc `lang = "fr"`,
+/// `langue_convient(Some("fr"), "fr")` était vrai, et la bio française lui
+/// était resservie — le garde-fou de langue livré au-dessus n'ayant jamais
+/// l'occasion de jouer.
+///
+/// Un `?lang=` vide (`?lang=`) est traité comme absent : il ne nomme aucune
+/// langue, et le laisser passer donnerait `lang = ""`, qui ne convient à
+/// aucune bio estampillée et déclencherait un appel réseau pour rien.
+pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> String {
+    param
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::i18n::lang_from_header(headers))
 }
 
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?
@@ -365,10 +394,12 @@ pub(super) async fn artist_image_upload(
             .into_response();
     };
     let cache_dir = artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("artist-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444) : sous
+    // `artwork_hash("artist-{id}")`, remplacer l'image gardait la même URL
+    // servie `immutable` — l'ancienne image restait affichée. Voir le
+    // commentaire complet dans `artwork.rs::upload_album_artwork`.
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),

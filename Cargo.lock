@@ -5467,6 +5467,7 @@ name = "tune-streaming-http"
 version = "0.9.126"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "bytes",
  "futures-util",

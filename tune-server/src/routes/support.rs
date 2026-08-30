@@ -7,12 +7,12 @@
 
 use axum::RequestExt;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use tune_core::cloud::support;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -61,12 +61,15 @@ struct ReplyBody {
     body: String,
 }
 
-async fn list(State(state): State<AppState>) -> Response {
+async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    finish(support::list_tickets(&state.http_client, &auth).await)
+    finish(
+        support::list_tickets(&state.http_client, &auth).await,
+        &headers,
+    )
 }
 
 /// Crée un ticket. Un seul endpoint pour deux formats : `application/json`
@@ -85,15 +88,25 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         .map(|s| s.starts_with("multipart/form-data"))
         .unwrap_or(false);
 
+    // Les en-têtes sont copiés AVANT l'extraction du corps, qui consomme la
+    // requête : sans eux, `Accept-Language` serait perdu et un 429 repartirait
+    // en français quelle que soit la langue de l'interface (#2178).
+    let headers = req.headers().clone();
+
     if is_multipart {
-        create_multipart(state, auth, req).await
+        create_multipart(state, auth, req, headers).await
     } else {
-        create_json(state, auth, req).await
+        create_json(state, auth, req, headers).await
     }
 }
 
 /// Chemin JSON historique — ticket sans pièce jointe.
-async fn create_json(state: AppState, auth: support::SupportAuth, req: Request) -> Response {
+async fn create_json(
+    state: AppState,
+    auth: support::SupportAuth,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
     let payload = match req.extract::<Json<CreateBody>, _>().await {
         Ok(Json(p)) => p,
         Err(rej) => return rej.into_response(),
@@ -107,13 +120,19 @@ async fn create_json(state: AppState, auth: support::SupportAuth, req: Request) 
             payload.category.as_deref(),
         )
         .await,
+        &headers,
     )
 }
 
 /// Chemin multipart — ticket avec pièces jointes. Valide nombre, taille et type
 /// AVANT de relayer à mozaiklabs (message d'erreur clair sinon), puis transmet
 /// le multipart tel quel avec la clé de licence / le token premium.
-async fn create_multipart(state: AppState, auth: support::SupportAuth, req: Request) -> Response {
+async fn create_multipart(
+    state: AppState,
+    auth: support::SupportAuth,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
     let mut multipart = match req.extract::<Multipart, _>().await {
         Ok(m) => m,
         Err(rej) => return rej.into_response(),
@@ -196,7 +215,10 @@ async fn create_multipart(state: AppState, auth: support::SupportAuth, req: Requ
         );
     }
 
-    finish(support::create_ticket_multipart(&state.http_client, &auth, fields, files).await)
+    finish(
+        support::create_ticket_multipart(&state.http_client, &auth, fields, files).await,
+        &headers,
+    )
 }
 
 /// 400 Bad Request avec un code machine + un message FR lisible par l'UI.
@@ -293,18 +315,171 @@ mod tests {
         // …et rester au-dessus du DefaultBodyLimit global (50 Mo).
         assert!(MAX_TOTAL_BYTES > 50 * 1024 * 1024);
     }
+
+    // -----------------------------------------------------------------------
+    // Le 429 du relais support : un message exploitable, dans la bonne langue,
+    // et jamais un délai inventé (#2178).
+    // -----------------------------------------------------------------------
+
+    fn accept_language(tag: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT_LANGUAGE, tag.parse().unwrap());
+        h
+    }
+
+    /// Corps tel que `tune_core::cloud::support::build_result` le produit sur un
+    /// 429 : le texte anglais du limiteur Laravel, plus le motif et le délai
+    /// posés par le relais.
+    fn corps_429(retry_after: Option<u64>) -> Value {
+        let mut v = json!({ "message": "Too Many Attempts.", "error": "rate_limited" });
+        if let Some(secs) = retry_after {
+            v["retry_after"] = json!(secs);
+        }
+        v
+    }
+
+    async fn reponse(
+        status: u16,
+        body: Value,
+        headers: &HeaderMap,
+    ) -> (StatusCode, Value, Option<String>) {
+        let resp = finish(Err((status, body)), headers);
+        let code = resp.status();
+        let retry = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap().to_string());
+        let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (code, serde_json::from_slice(&octets).unwrap(), retry)
+    }
+
+    #[test]
+    fn minutes_a_attendre_arrondit_au_superieur_sans_jamais_zero() {
+        // Jamais zéro : « réessaie dans 0 min » renverrait l'utilisateur trop
+        // tôt, donc sur un nouveau 429.
+        assert_eq!(minutes_a_attendre(1), 1);
+        assert_eq!(minutes_a_attendre(59), 1);
+        assert_eq!(minutes_a_attendre(60), 1);
+        assert_eq!(minutes_a_attendre(61), 2);
+        assert_eq!(minutes_a_attendre(3540), 59);
+    }
+
+    #[tokio::test]
+    async fn un_429_porte_un_message_localise_et_le_delai() {
+        let (code, body, retry) = reponse(429, corps_429(Some(90)), &accept_language("fr")).await;
+
+        assert_eq!(
+            code,
+            StatusCode::TOO_MANY_REQUESTS,
+            "le statut ne change pas"
+        );
+        // Le défaut d'origine : le seul texte disponible était anglais et
+        // technique. Il ne doit plus être ce que le client affiche.
+        assert_ne!(body["message"], json!("Too Many Attempts."));
+        let message = body["message"].as_str().expect("un message texte");
+        assert!(
+            message.contains("2 min"),
+            "le délai doit être dit à l'utilisateur : {message}"
+        );
+        assert!(
+            !message.contains("{minutes}"),
+            "l'interpolation n'a pas eu lieu : {message}"
+        );
+        // Le contrat machine et le délai exact survivent.
+        assert_eq!(body["error"], json!("rate_limited"));
+        assert_eq!(body["retry_after"], json!(90));
+        assert_eq!(retry.as_deref(), Some("90"));
+        // Le texte amont est déplacé, pas perdu.
+        assert_eq!(body["upstream_message"], json!("Too Many Attempts."));
+    }
+
+    #[tokio::test]
+    async fn un_429_suit_la_langue_de_l_interface() {
+        let (_, fr, _) = reponse(429, corps_429(Some(60)), &accept_language("fr")).await;
+        let (_, en, _) =
+            reponse(429, corps_429(Some(60)), &accept_language("en-US,en;q=0.9")).await;
+        let (_, de, _) = reponse(429, corps_429(Some(60)), &accept_language("de")).await;
+
+        assert_ne!(fr["message"], en["message"]);
+        assert_ne!(fr["message"], de["message"]);
+        // Sans en-tête, français — la langue par défaut de l'application.
+        let (_, defaut, _) = reponse(429, corps_429(Some(60)), &HeaderMap::new()).await;
+        assert_eq!(defaut["message"], fr["message"]);
+    }
+
+    #[tokio::test]
+    async fn un_429_sans_delai_ne_l_invente_pas() {
+        let (code, body, retry) = reponse(429, corps_429(None), &accept_language("fr")).await;
+
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        let message = body["message"].as_str().expect("un message texte");
+        // Le message nomme la cause — c'est ce qui manquait — mais ne chiffre
+        // aucune attente que mozaiklabs n'a pas annoncée.
+        assert_ne!(message, "Too Many Attempts.");
+        assert!(
+            !message.chars().any(|c| c.is_ascii_digit()),
+            "aucun délai ne doit être fabriqué : {message}"
+        );
+        assert!(body.get("retry_after").is_none());
+        assert_eq!(retry, None, "pas d'en-tête Retry-After sans délai connu");
+    }
+
+    #[tokio::test]
+    async fn les_dix_langues_disent_la_limite() {
+        for lang in crate::i18n::SUPPORTED {
+            let (_, avec, _) = reponse(429, corps_429(Some(120)), &accept_language(lang)).await;
+            let message = avec["message"].as_str().unwrap();
+            assert_ne!(
+                message, "support.tropDeRequetesDelai",
+                "traduction manquante pour {lang}"
+            );
+            assert!(message.contains('2'), "délai absent en {lang} : {message}");
+            assert!(!message.contains("{minutes}"), "{lang} : {message}");
+
+            let (_, sans, _) = reponse(429, corps_429(None), &accept_language(lang)).await;
+            assert_ne!(
+                sans["message"].as_str().unwrap(),
+                "support.tropDeRequetes",
+                "traduction manquante pour {lang}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn les_autres_statuts_gardent_leur_texte() {
+        // 403 premium refusé : mozaiklabs a déjà écrit un message français
+        // exploitable, on n'y touche pas.
+        let amont = json!({
+            "error": "premium_required",
+            "message": "Le support prioritaire est réservé à Tune Premium",
+        });
+        let (code, body, _) = reponse(403, amont.clone(), &accept_language("fr")).await;
+
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body, amont, "corps modifié hors 429 : {body}");
+    }
 }
 
-async fn detail(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+async fn detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    finish(support::get_ticket(&state.http_client, &auth, id).await)
+    finish(
+        support::get_ticket(&state.http_client, &auth, id).await,
+        &headers,
+    )
 }
 
 async fn reply(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(payload): Json<ReplyBody>,
 ) -> Response {
@@ -312,17 +487,27 @@ async fn reply(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    finish(support::reply(&state.http_client, &auth, id, &payload.body).await)
+    finish(
+        support::reply(&state.http_client, &auth, id, &payload.body).await,
+        &headers,
+    )
 }
 
 /// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
 /// jamais d'une clé de licence fournie par la page.
-async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+async fn mark_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    finish(support::mark_read(&state.http_client, &auth, id).await)
+    finish(
+        support::mark_read(&state.http_client, &auth, id).await,
+        &headers,
+    )
 }
 
 /// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
@@ -362,17 +547,68 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
         .into_response())
 }
 
+/// Minutes à attendre, déduites des secondes annoncées par mozaiklabs.
+///
+/// L'arrondi se fait vers le HAUT, et jamais à zéro : renvoyer l'utilisateur
+/// « dans 0 min » le ferait revenir trop tôt et reprendre un 429. Le délai
+/// exact en secondes n'est pas perdu pour autant — il reste dans le corps
+/// (`retry_after`) et dans l'en-tête `Retry-After`, pour qui programme.
+fn minutes_a_attendre(secondes: u64) -> u64 {
+    secondes.div_ceil(60).max(1)
+}
+
+/// Remplace le texte d'un 429 par un message localisé et exploitable.
+///
+/// Le limiteur de Laravel ne sait dire qu'une chose, en anglais et sans
+/// contexte : `{"message":"Too Many Attempts."}`. Un client qui affiche
+/// `message` montrait donc ce texte-là, et celui qui ne le lit pas retombait
+/// sur son message générique — « Une erreur est survenue (429) », qui ne dit ni
+/// ce qui s'est passé ni quand réessayer (#2178).
+///
+/// On écrit ici, dans la langue de l'interface (`Accept-Language`, comme la
+/// porte des clés Radio France), ce que le serveur sait réellement : la limite
+/// vient du service distant, et — quand mozaiklabs l'annonce — le délai avant
+/// nouvelle tentative. **Aucun délai n'est inventé** : sans en-tête
+/// exploitable, le message le tait au lieu de le supposer.
+///
+/// Le texte amont n'est pas perdu : il est déplacé sous `upstream_message`,
+/// pour le SAV et pour le diagnostic. Le code machine `error` (posé par
+/// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
+/// contre `rate_limited` gardent leur contrat.
+fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
+    let lang = crate::i18n::lang_from_header(headers);
+    let message = match retry_after {
+        Some(secondes) => crate::i18n::t(&lang, "support.tropDeRequetesDelai")
+            .replace("{minutes}", &minutes_a_attendre(secondes).to_string()),
+        None => crate::i18n::t(&lang, "support.tropDeRequetes"),
+    };
+
+    // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(amont) = obj.insert("message".to_string(), json!(message)) {
+        obj.entry("upstream_message").or_insert(amont);
+    }
+}
+
 /// Traduit le `SupportResult` en réponse HTTP, en préservant le status renvoyé
 /// par mozaiklabs (401/403/422…).
 ///
 /// Sur un 429, `tune_core::cloud::support` a déjà déposé `retry_after` dans le
 /// corps ; on le réémet aussi en en-tête `Retry-After`, forme standard que
-/// lisent les clients non web (#2178).
-fn finish(result: support::SupportResult) -> Response {
+/// lisent les clients non web, et on remplace le texte anglais du limiteur par
+/// un message localisé (voir [`localiser_limite`]). Le **statut reste 429** :
+/// il est juste, et les clients déployés le reçoivent déjà — seul le corps
+/// change (#2178).
+fn finish(result: support::SupportResult, headers: &HeaderMap) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err((status, value)) => {
-            let retry_after = value.get("retry_after").and_then(serde_json::Value::as_u64);
+        Err((status, mut value)) => {
+            let retry_after = value.get("retry_after").and_then(Value::as_u64);
+            if status == 429 {
+                localiser_limite(&mut value, headers, retry_after);
+            }
             let mut resp = (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 Json(value),

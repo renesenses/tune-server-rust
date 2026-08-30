@@ -184,6 +184,21 @@ pub fn router() -> Router<AppState> {
         )
         .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
+        // Masquage d'album (#1391). `/albums/hidden` AVANT `/albums/{id}` par
+        // hygiène de lecture — axum fait de toute façon primer le segment
+        // statique, comme pour `/albums/count` et `/albums/recent`.
+        .route("/albums/hidden", get(albums::list_hidden_albums))
+        .route(
+            "/albums/{id}/hide",
+            post(albums::hide_album).delete(albums::unhide_album),
+        )
+        // « Ces deux albums ne sont pas des doublons » (#1276). Même hygiène
+        // que `/albums/hidden` : le segment statique d'abord.
+        .route("/albums/distinct", get(albums::list_distinct_pairs))
+        .route(
+            "/albums/{id}/distinct/{other_id}",
+            post(albums::declare_albums_distinct).delete(albums::revoke_albums_distinct),
+        )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))

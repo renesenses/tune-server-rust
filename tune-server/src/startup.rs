@@ -511,6 +511,45 @@ fn reconcile_favorites(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "favorites_reconcile_failed"),
     }
+    // Les albums masqués (#1391) suivent la MÊME mécanique d'instantané et
+    // les mêmes règles de re-rattachement : au démarrage on ne supprime
+    // jamais un marqueur introuvable — un volume pas encore monté peut encore
+    // ramener l'album, et un album masqué qui réapparaîtrait visible est
+    // précisément le bug que la table évite.
+    match tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "hidden_albums_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "hidden_albums_reconcile_failed"),
+    }
+    // Les paires « ces deux albums ne sont pas des doublons » (#1276) suivent
+    // la MÊME mécanique et la même règle : au démarrage on ne supprime jamais
+    // une paire introuvable. Perdre l'arbitrage rouvrirait la fusion
+    // destructrice de `merge-duplicates`, qui SUPPRIME la ligne perdante.
+    match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "album_distinct_pairs_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "album_distinct_pairs_reconcile_failed"),
+    }
 }
 
 fn cleanup_orphan_queues(state: &AppState) {
