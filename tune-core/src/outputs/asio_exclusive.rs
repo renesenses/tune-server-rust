@@ -69,6 +69,24 @@ pub fn try_with_asio_device_lock<R>(f: impl FnOnce() -> R) -> Option<R> {
     }
 }
 
+/// `true` while an exclusive playback session owns the single-instance ASIO
+/// driver (including the settle window in `Drop`).
+///
+/// The side-effect-free companion of [`try_with_asio_device_lock`], for callers
+/// that must decide whether they may touch the driver at all — the generic
+/// device enumeration in `local.rs` cannot hold the lock around its own probe
+/// without also serialising the non-ASIO hosts it may end up opening.
+///
+/// A poisoned lock reports "free": a prior holder panicked, no stream owns the
+/// driver, and refusing to enumerate for the rest of the session would be worse
+/// than probing it.
+pub fn asio_device_is_busy() -> bool {
+    matches!(
+        ASIO_DEVICE_LOCK.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
 /// Base time given to the ASIO driver to fully release the hardware after a
 /// stream is torn down, before the device lock is released and the next open
 /// runs.
