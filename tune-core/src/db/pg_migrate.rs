@@ -532,7 +532,7 @@ CREATE TABLE IF NOT EXISTS hidden_items (
     PRIMARY KEY (profile_id, item_type, item_id)
 );
 
--- Appareils ignorés (#1280). Tout en TEXT — comme la migration 042, qui
+-- Appareils ignorés (#1280). Tout en TEXT — comme la migration 043, qui
 -- déclare exactement les mêmes colonnes : rien à rattraper après la copie,
 -- contrairement à `hidden_items` et `favorite_facets`.
 CREATE TABLE IF NOT EXISTS ignored_devices (

@@ -617,9 +617,9 @@ CREATE TABLE IF NOT EXISTS hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
 
--- Appareils ignorés (#1280) — miroir de la migration SQLite 90, présent AUSSI
+-- Appareils ignorés (#1280) — miroir de la migration SQLite 91, présent AUSSI
 -- ici pour que la découverte tourne sur une base née de `init_schema` seul
--- (tests de repo). Voir la migration 90 pour la doctrine complète.
+-- (tests de repo). Voir la migration 91 pour la doctrine complète.
 CREATE TABLE IF NOT EXISTS ignored_devices (
     device_id TEXT PRIMARY KEY,
     mac TEXT NOT NULL DEFAULT '',

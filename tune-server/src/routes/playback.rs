@@ -199,6 +199,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
         "output_device_id": zone_db.as_ref().and_then(|z| z.output_device_id.as_ref()),
         "volume": zone_state.volume,
+        // #1274 — lecture en dB du volume rendu juste au-dessus, jamais d'une
+        // autre source : les deux champs doivent toujours dire la meme chose.
+        "volume_db": tune_core::audio::volume_scale::linear_to_db(zone_state.volume),
         "state": zone_state.state,
         "current_track": zone_state.now_playing.as_ref().map(|np| json!({
             "id": np.track_id,
@@ -463,7 +466,16 @@ struct SeekRequest {
 
 #[derive(Deserialize)]
 struct VolumeRequest {
-    volume: f64,
+    /// Volume linéaire 0..1, le champ historique. `Option` depuis #1274 pour
+    /// laisser passer une requête qui ne parle qu'en dB — les clients
+    /// déployés, eux, l'envoient toujours et ne changent pas de comportement.
+    volume: Option<f64>,
+    /// Atténuation demandée en dB (≤ 0 ; `0` = 100 %). Exclusif avec `volume`.
+    ///
+    /// C'est le réglage que réclame #1274 : un curseur au pour-cent ne permet
+    /// pas de viser −18 dB, et l'écart entre deux crans varie de 0,09 dB en
+    /// haut d'échelle à 6 dB en bas.
+    volume_db: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -651,6 +663,19 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
                     .insert("stream_url_remote".into(), json!(distant));
             }
         }
+    }
+    // #1274 — cette charge utile est la sérialisation brute de
+    // `PlaybackState`, qui ne porte que le volume linéaire ; le dB s'ajoute
+    // ici, à partir de ce même nombre. `/zones/{id}/status` est la surface que
+    // les clients interrogent en boucle : l'oublier obligerait chacun à
+    // recalculer, c'est-à-dire à diverger.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "volume_db".into(),
+            json!(tune_core::audio::volume_scale::linear_to_db(
+                zone_state.volume
+            )),
+        );
     }
     Json(v)
 }
@@ -1769,13 +1794,28 @@ async fn set_volume(
     // web ne protège de rien — un autre client, une télécommande ou un appel
     // direct passeraient à côté. La valeur *effective* est renvoyée, ce qui
     // fait remonter le curseur au lieu de le laisser mentir.
-    let volume =
-        tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, body.volume as f32)
-            as f64;
-    if (volume - body.volume).abs() > f64::EPSILON {
+    //
+    // #1274 — la demande peut arriver en linéaire (`volume`) ou en dB
+    // (`volume_db`), jamais dans les deux. La conversion est faite dans
+    // `volume_scale`, une seule fois pour tout le serveur ; ici on ne fait
+    // que traduire un refus en 400 plutôt que de choisir un volume à la place
+    // de l'utilisateur.
+    let demande =
+        match tune_core::audio::volume_scale::demande_lineaire(body.volume, body.volume_db) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_volume", "message": motif })),
+                )
+                    .into_response();
+            }
+        };
+    let volume = tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, demande);
+    if (volume - demande).abs() > f64::EPSILON {
         tracing::debug!(
             zone_id,
-            requested = body.volume,
+            requested = demande,
             applied = volume,
             "volume_forced_by_audiophile_lock"
         );
@@ -1786,7 +1826,15 @@ async fn set_volume(
         .set_volume(zone_id, volume, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "volume": volume })).into_response(),
+        // #1274 — la réponse rend la valeur EFFECTIVE dans les deux unités.
+        // Un client qui règle en dB doit pouvoir constater ce qu'il a obtenu
+        // sans refaire le calcul, et surtout constater quand le verrou PURE
+        // l'a remonté à 100 % : `volume_db` vaudra alors 0.
+        Ok(()) => Json(json!({
+            "volume": volume,
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+        }))
+        .into_response(),
         Err(error) => output_command_error_response(error),
     }
 }

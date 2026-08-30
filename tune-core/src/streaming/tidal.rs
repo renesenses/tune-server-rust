@@ -778,19 +778,24 @@ impl TidalService {
             _ => (44100, 16),
         };
 
+        // Le NŒUD de l'artiste, choisi une seule fois : le nom et l'identifiant
+        // en sortent ensemble, donc ils ne peuvent pas se contredire (#1361).
+        // Les tirer de deux replis indépendants aurait laissé passer le cas —
+        // rare mais silencieux — d'un nom pris dans `artists[0]` et d'un id pris
+        // dans `artist`.
+        let noeud_artiste = if item["artist"]["name"].as_str().is_some() {
+            &item["artist"]
+        } else {
+            item["artists"]
+                .as_array()
+                .and_then(|a| a.first())
+                .unwrap_or(&item["artist"])
+        };
+
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["artist"]["name"]
-                .as_str()
-                .or_else(|| {
-                    item["artists"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|a| a["name"].as_str())
-                })
-                .unwrap_or("")
-                .into(),
+            artist: noeud_artiste["name"].as_str().unwrap_or("").into(),
             album: item["album"]["title"].as_str().map(Into::into),
             album_id: item["album"]["id"].as_u64().map(|id| id.to_string()),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
@@ -805,6 +810,9 @@ impl TidalService {
             explicit: item["explicit"].as_bool().unwrap_or(false),
             isrc: item["isrc"].as_str().map(Into::into),
             composer: None,
+            // Même nœud que le nom : l'identifiant rendu appartient à l'artiste
+            // affiché, jamais à un autre (#1361).
+            artist_id: noeud_artiste["id"].as_u64().map(|id| id.to_string()),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate,

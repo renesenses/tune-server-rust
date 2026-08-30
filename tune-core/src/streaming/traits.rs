@@ -29,6 +29,28 @@ pub struct StreamTrack {
     /// que les résultats sérialisés antérieurs se chargent encore.
     #[serde(default)]
     pub composer: Option<String>,
+    /// Identifiant, SUR LE SERVICE, de l'artiste nommé par `artist` — jamais
+    /// d'un autre.
+    ///
+    /// `album_id` existait déjà ; son pendant artiste, non. Une piste Qobuz en
+    /// « Lecture en cours » n'offrait donc aucun moyen d'ouvrir la fiche de
+    /// l'artiste autrement qu'en RECHERCHANT son nom, c'est-à-dire en devinant
+    /// — le geste que #1284 avait déjà condamné pour l'album (« Entreat »
+    /// ouvrait la page de The Cure). Cyrille Moutia le redemande depuis le
+    /// 30/06 (#1361) : titre d'album et nom d'artiste cliquables.
+    ///
+    /// Prendre l'artiste de l'ALBUM à la place n'est pas un repli acceptable :
+    /// en classique il désigne couramment le compositeur quand la piste, elle,
+    /// affiche l'interprète (#1407). Un identifiant qui ne correspond pas au
+    /// nom affiché envoie l'auditeur sur la mauvaise fiche.
+    ///
+    /// `None` quand le service ne le donne pas, ou quand le nom retenu ne vient
+    /// d'aucun nœud porteur d'identifiant (Qobuz : nom extrait de la chaîne de
+    /// rôles `performers`). Une absence se dit ; elle ne s'invente pas.
+    /// `#[serde(default)]` comme `isrc` et `composer` : les résultats
+    /// sérialisés antérieurs se chargent encore.
+    #[serde(default)]
+    pub artist_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -497,6 +519,7 @@ mod tests {
             explicit: false,
             isrc: Some("USSM19900001".into()),
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: 96000,

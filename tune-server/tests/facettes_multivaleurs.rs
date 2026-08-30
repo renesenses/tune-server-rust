@@ -514,6 +514,35 @@ fn bibliotheque_contrat_facettes() -> axum::Router {
           bit_depth, source, genre, composer, year, label) VALUES \
          (91004, 'SansTags', NULL, NULL, '/contrat/sans-tags.flac', 1000, 'flac', \
           44100, 16, 'local', NULL, NULL, NULL, NULL)",
+        // Casse DIFFÉRENTE de « Jazz »/« flac » : sans elle, désaccorder
+        // `in_list_ci` en `in_list` d'un seul côté ne changeait RIEN et le
+        // garde-fou restait vert (#1864).
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91005, 'PisteD', 92001, 93001, '/contrat/d.flac', 1000, 'FLAC', 96000, \
+          24, 'local', 'JAZZ', 'Bach', 1959, 'ECM')",
+        // Genre MULTIVALUÉ dans la colonne JSON `genres`, et volontairement
+        // « Jazzy » : le motif juste (`%\"Jazz\"%`) ne le prend pas, un motif
+        // relâché (`%Jazz%`) le prendrait — c'est ce qui rend la divergence
+        // détectable.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91006, 'PisteE', NULL, NULL, '/contrat/e.aiff', 1000, 'aiff', 48000, \
+          24, 'local', NULL, '[\"Jazzy\"]', NULL, NULL, NULL)",
+        // Titre ACCENTUÉ : la liste passe par `unaccent()`, le compteur doit
+        // en faire autant, sinon `q=cafe` compte sans cette piste.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, composer, year, label) VALUES \
+         (91007, 'Café Bleu', 92002, 93002, '/contrat/f.wav', 1000, 'wav', 44100, \
+          16, 'local', 'Rock', 'Ravel', 1960, 'BlueNote')",
+        // Collection INTELLIGENTE : elle ne résout AUCUN album, seulement des
+        // pistes. Le compteur qui n'en connaissait que les collections
+        // manuelles posait `1 = 0` et vidait tout le rail (#1864).
+        "INSERT INTO smart_collections (name, rules, match_mode) VALUES \
+         ('CollectionSmart', '[{\"field\":\"artist_name\",\"op\":\"=\",\"value\":\"ArtisteB\"}]', 'all')",
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'release_country', 'FR')",
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'mood', 'Calme')",
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'source_media', 'CD')",
@@ -555,29 +584,8 @@ fn bibliotheque_contrat_facettes() -> axum::Router {
 #[tokio::test]
 async fn chaque_effectif_de_facette_est_tenu_par_la_liste_filtree() {
     let app = bibliotheque_contrat_facettes();
-    // `source` est le nom public de la facette issue de la métadonnée
-    // `source_media`; la clé de filtre reste explicitement `source_media`.
-    let cas = [
-        ("genre", "genre"),
-        ("label", "label"),
-        ("composer", "composer"),
-        ("year", "year"),
-        ("artist", "artist"),
-        ("format", "format"),
-        ("sample_rate", "sample_rate"),
-        ("bit_depth", "bit_depth"),
-        ("country", "country"),
-        ("mood", "mood"),
-        ("source", "source_media"),
-        ("rating", "rating"),
-        ("collection", "collection"),
-        ("original_year", "original_year"),
-        ("favorite", "favorite"),
-        ("playlist", "playlist"),
-        ("untagged", "untagged"),
-    ];
 
-    for (champ, cle) in cas {
+    for (champ, cle) in FACETTES {
         // La facette comptée s'auto-exclut. Un filtre croisé la force à
         // emprunter aussi le chemin cumulatif ; pour `format`, on croise par
         // genre afin de ne pas filtrer la facette avant son propre comptage.
@@ -615,5 +623,161 @@ async fn chaque_effectif_de_facette_est_tenu_par_la_liste_filtree() {
                 total(&pistes)
             );
         }
+    }
+}
+
+/// Les 17 facettes du rail, avec la clé de filtre qui leur correspond dans la
+/// chaîne de requête. `source` est le nom public de la métadonnée
+/// `source_media` ; la clé de filtre reste explicitement `source_media`.
+const FACETTES: [(&str, &str); 17] = [
+    ("genre", "genre"),
+    ("label", "label"),
+    ("composer", "composer"),
+    ("year", "year"),
+    ("artist", "artist"),
+    ("format", "format"),
+    ("sample_rate", "sample_rate"),
+    ("bit_depth", "bit_depth"),
+    ("country", "country"),
+    ("mood", "mood"),
+    ("source", "source_media"),
+    ("rating", "rating"),
+    ("collection", "collection"),
+    ("original_year", "original_year"),
+    ("favorite", "favorite"),
+    ("playlist", "playlist"),
+    ("untagged", "untagged"),
+];
+
+/// Somme des effectifs annoncés pour une facette MONOVALUÉE et toujours
+/// renseignée : elle vaut donc le nombre de pistes du jeu courant.
+fn somme_effectifs(rail: &Value, champ: &str) -> i64 {
+    rail.get(champ)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("facette témoin {champ} absente : {rail}"))
+        .iter()
+        .map(|e| {
+            e.get("count")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| panic!("effectif absent : {e}"))
+        })
+        .sum()
+}
+
+/// #1864 — le garde-fou qui MORD.
+///
+/// `chaque_effectif_de_facette_est_tenu_par_la_liste_filtree` ne croisait
+/// qu'UNE facette (`format`, ou `genre` quand c'est `format` qu'on compte), et
+/// la facette comptée s'auto-exclut : les QUINZE autres prédicats du compteur
+/// n'étaient donc jamais construits pendant le test. Contre-épreuve mesurée le
+/// 30/08 : trois désaccords posés sur le seul compteur — colonne
+/// (`t.sample_rate` → `t.bit_depth`), casse (`in_list_ci` → `in_list`), motif
+/// multivalué (`%"g"%` → `%g%`) — le laissaient VERT tous les trois.
+///
+/// Ici, chaque facette est mise en position de FILTRE, et l'on compare le rail
+/// qu'elle produit à la liste qu'elle rend. Le témoin est une facette
+/// monovaluée et toujours renseignée, dont la somme des effectifs vaut donc
+/// exactement le nombre de pistes retenues : désaccorder un prédicat d'un seul
+/// côté déplace l'une des deux mesures et pas l'autre.
+#[tokio::test]
+async fn filtrer_par_une_facette_narrow_le_rail_comme_la_liste() {
+    let app = bibliotheque_contrat_facettes();
+
+    for (champ, cle) in FACETTES {
+        // Le témoin ne doit pas être la facette qu'on met en position de
+        // filtre : elle s'auto-exclurait et le prédicat testé disparaîtrait.
+        let temoin = if champ == "format" {
+            "bit_depth"
+        } else {
+            "format"
+        };
+        let (status, facettes) = get(
+            &app,
+            &format!("/api/v1/library/facets?fields={champ}&limit=0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "facette {champ}");
+        let valeurs = facettes
+            .get(champ)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("facette {champ} absente : {facettes}"));
+        assert!(
+            !valeurs.is_empty(),
+            "la fixture doit exercer la facette {champ}"
+        );
+
+        for entree in valeurs {
+            let valeur = entree
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("valeur absente pour {champ}: {entree}"));
+            let encodee = urlencoding::encode(valeur);
+
+            let (status, rail) = get(
+                &app,
+                &format!("/api/v1/library/facets?fields={temoin}&limit=0&{cle}={encodee}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "rail sous {cle}={valeur}");
+            let compte = somme_effectifs(&rail, temoin);
+
+            let (status, pistes) = get(
+                &app,
+                &format!("/api/v1/library/tracks?limit=1000&{cle}={encodee}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "liste sous {cle}={valeur}");
+            let rendu = total(&pistes);
+
+            assert_eq!(
+                compte, rendu,
+                "sous {cle}={valeur}, le rail « {temoin} » totalise {compte} \
+                 mais la liste rend {rendu}"
+            );
+            assert!(
+                rendu > 0,
+                "la fixture doit rendre au moins une piste sous {cle}={valeur}"
+            );
+        }
+    }
+}
+
+/// #1864 — la recherche libre `q` narrow AUSSI les effectifs du rail, et elle
+/// s'écrit elle aussi deux fois.
+///
+/// Le compteur l'écrivait sans `unaccent()` là où `TrackRepo::list_filtered`
+/// l'écrivait avec : `q=cafe` comptait sans « Café Bleu », mais la liste le
+/// rendait. Aucune facette n'exerçait ce prédicat, donc rien ne le tenait.
+#[tokio::test]
+async fn la_recherche_libre_narrow_le_rail_comme_la_liste() {
+    let app = bibliotheque_contrat_facettes();
+
+    for recherche in ["cafe", "café", "CAFE", "Bleu"] {
+        let encodee = urlencoding::encode(recherche);
+        let (status, rail) = get(
+            &app,
+            &format!("/api/v1/library/facets?fields=format&limit=0&q={encodee}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "rail q={recherche}");
+        let compte = somme_effectifs(&rail, "format");
+
+        let (status, pistes) = get(
+            &app,
+            &format!("/api/v1/library/tracks?limit=1000&q={encodee}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "liste q={recherche}");
+        let rendu = total(&pistes);
+
+        assert_eq!(
+            compte, rendu,
+            "sous q={recherche}, le rail « format » totalise {compte} \
+             mais la liste rend {rendu}"
+        );
+        assert!(
+            rendu > 0,
+            "« Café Bleu » doit répondre à q={recherche} des DEUX côtés"
+        );
     }
 }

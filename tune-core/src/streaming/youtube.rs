@@ -1195,6 +1195,7 @@ impl YouTubeService {
             explicit: false,
             isrc: None,
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1330,6 +1331,7 @@ impl YouTubeService {
             explicit: item["isExplicit"].as_bool().unwrap_or(false),
             isrc: None,
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1524,6 +1526,7 @@ impl YouTubeService {
                         explicit: false,
                         isrc: None,
                         composer: None,
+                        artist_id: None,
                         quality: None,
                     });
                 }
@@ -1553,6 +1556,7 @@ impl YouTubeService {
                                 explicit: false,
                                 isrc: None,
                                 composer: None,
+                                artist_id: None,
                                 quality: None,
                             });
                         }
@@ -1647,6 +1651,7 @@ impl YouTubeService {
                             explicit: false,
                             isrc: None,
                             composer: None,
+                            artist_id: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -1852,6 +1857,7 @@ impl YouTubeService {
                 explicit: false,
                 isrc: None,
                 composer: None,
+                artist_id: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -1967,6 +1973,7 @@ impl YouTubeService {
                             explicit: false,
                             isrc: None,
                             composer: None,
+                            artist_id: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -2274,6 +2281,7 @@ impl YouTubeService {
                 explicit: false,
                 isrc: None,
                 composer: None,
+                artist_id: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -2647,6 +2655,7 @@ impl StreamingService for YouTubeService {
             explicit: false,
             isrc: None,
             composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
