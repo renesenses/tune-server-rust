@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -255,7 +256,11 @@ fn fetch_continue_listening(
     let sql = home_queries::continue_listening_albums_deduits(engine, &zone_filter);
     let marge = marge_de_contextes(limit);
     let params: [&dyn ToSqlValue; 1] = [&marge];
-    for cols in state.backend.query_many(&sql, &params).unwrap_or_default() {
+    for cols in state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+    {
         let album_id = cols.first().and_then(|v| v.as_i64()).unwrap_or(0);
         if deja.contains(&album_id) {
             continue;
@@ -333,7 +338,10 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
          LIMIT {p1}"
     );
     let params: [&dyn ToSqlValue; 1] = [&marge];
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
 
     // Deux lignes d'un meme contexte peuvent porter la MEME `listened_at` (la
     // seconde est a la seconde pres) : la jointure sur le MAX les rend toutes
@@ -512,7 +520,7 @@ fn resoudre_albums(
     state
         .backend
         .query_many(&sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|cols| {
             let id = cols.first().and_then(|v| v.as_i64())?;
@@ -562,7 +570,7 @@ fn resoudre_par_id(
     state
         .backend
         .query_many(&sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|cols| {
             let id = cols.first().and_then(|v| v.as_i64())?;
@@ -1360,7 +1368,10 @@ fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppE
     let seven_days_ago = chrono_epoch_seven_days_ago();
     let sql = home_queries::recently_added(engine);
     let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
     Ok(rows
         .iter()
         .map(|cols| {
@@ -1408,7 +1419,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     let top_genres: Vec<String> = state
         .backend
         .query_many(&sql_top_genres(), &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -1422,7 +1433,10 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
                    ORDER BY RANDOM() LIMIT {p1}"
         );
         let params: [&dyn ToSqlValue; 1] = [&limit];
-        let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+        let rows = state
+            .backend
+            .query_many(&sql, &params)
+            .ou_defaut_journalise();
         return Ok(rows
             .iter()
             .map(|cols| {
@@ -1470,7 +1484,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     let rows = state
         .backend
         .query_many(&sql, &param_refs)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     Ok(rows
         .iter()
         .map(|cols| {
@@ -1496,7 +1510,7 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     let top_genres: Vec<(String, i64)> = state
         .backend
         .query_many(&sql_top_genres(), &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
             let genre = cols.first()?.as_string()?;
@@ -1524,7 +1538,7 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             let tracks: Vec<Value> = state
                 .backend
                 .query_many(&tracks_sql, &params)
-                .unwrap_or_default()
+                .ou_defaut_journalise()
                 .iter()
                 .map(|cols| {
                     json!({
@@ -1596,7 +1610,7 @@ async fn new_in_library(
     let items: Vec<Value> = state
         .backend
         .query_many(&sql, &params)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({
@@ -1705,7 +1719,7 @@ async fn other_versions(
     // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
     // chacun des trois clients).
     let mut groupes: Vec<Value> = Vec::new();
-    for cols in state.backend.query_many(&sql, &[]).unwrap_or_default() {
+    for cols in state.backend.query_many(&sql, &[]).ou_defaut_journalise() {
         let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
         let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
@@ -1750,7 +1764,7 @@ async fn other_versions(
     let recentes: Vec<(String, String, String)> = state
         .backend
         .query_many(&sql_recentes, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
             Some((
@@ -1883,7 +1897,7 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
              ORDER BY last_played DESC LIMIT 10",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({

@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -1468,7 +1469,7 @@ fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
             "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
             let id = r.first()?.as_i64()?;

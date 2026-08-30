@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -1374,7 +1375,7 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
     tokio::spawn(async move {
         let albums: Vec<i64> = backend
             .query_many("SELECT id FROM albums", &[])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|row| row.first().and_then(|v| v.as_i64()))
             .collect();

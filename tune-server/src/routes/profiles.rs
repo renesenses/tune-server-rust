@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -398,7 +399,11 @@ async fn list_facet_favorites(
     Query(q): Query<FacetsQuery>,
 ) -> Json<Value> {
     let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
-    let items = repo.list(id, q.facet.as_deref()).unwrap_or_default();
+    // Site nommé par la #2861 : une panne de base rendait `200 []`, que le
+    // client ne distingue pas d'une liste de favoris vide. La réponse reste la
+    // même — retirer ses favoris à quelqu'un parce qu'une requête a échoué
+    // serait pire —, mais l'échec laisse désormais une trace.
+    let items = repo.list(id, q.facet.as_deref()).ou_defaut_journalise();
     Json(json!(items))
 }
 
@@ -521,7 +526,7 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
             ),
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -540,7 +545,7 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
             ),
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -597,7 +602,7 @@ async fn profile_history(
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {

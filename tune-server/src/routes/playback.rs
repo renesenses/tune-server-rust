@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -3013,7 +3014,7 @@ async fn get_alarms(
     let rows = state
         .backend
         .query_many(&sql, &[&zone_id as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {

@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -1420,7 +1421,7 @@ async fn create_playlist_from_favorites(
             "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|r| {
             (

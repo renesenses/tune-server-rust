@@ -11,6 +11,7 @@
 //! courante, en réutilisant `facets::build_conditions` : les cartes comptent
 //! donc exactement ce que le rail annonce.
 
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde_json::{Value, json};
@@ -97,7 +98,7 @@ pub(super) async fn albums_detailed(
     let items: Vec<Value> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
