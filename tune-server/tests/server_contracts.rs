@@ -9,6 +9,8 @@ mod annonce_forum_bornes;
 mod auth_security;
 #[path = "bios_langue_album.rs"]
 mod bios_langue_album;
+#[path = "bios_langue_entete.rs"]
+mod bios_langue_entete;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]

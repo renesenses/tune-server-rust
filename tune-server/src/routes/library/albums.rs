@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -479,13 +479,17 @@ pub(super) async fn album_bio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let lang = q.lang.as_deref().unwrap_or("fr");
+    // Même précédence que la route artiste : `?lang=` explicite, puis
+    // `Accept-Language`, puis `fr`. Cf. `super::artists::langue_demandee`.
+    let lang = super::artists::langue_demandee(q.lang.as_deref(), &headers);
+    let lang = lang.as_str();
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
