@@ -1,3 +1,4 @@
+pub mod activite;
 pub mod album_folder;
 pub mod compilation;
 pub mod cue;
