@@ -752,7 +752,28 @@ pub(super) struct BrowseDirsQuery {
     path: Option<String>,
 }
 
-pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value> {
+/// Explorateur de dossiers servi par le serveur (#1275) — la moitié serveur du
+/// sélecteur de dossiers des réglages Bibliothèque.
+///
+/// C'est une route de LECTURE DU SYSTÈME DE FICHIERS de la machine serveur.
+/// Elle porte donc deux gardes, et pas une :
+///
+/// 1. **Le rôle.** `RequireAdmin`, comme la route d'écriture qu'elle alimente
+///    (`POST /system/music-dirs`). Elle en était dépourvue : n'importe quel
+///    porteur de jeton — y compris un compte créé par `/auth/register`, qui
+///    est public et ne crée que des non-administrateurs — pouvait énumérer le
+///    disque, alors que le geste qu'elle prépare, lui, exige admin.
+/// 2. **Le périmètre.** Le rôle ne suffit pas : sur une installation par
+///    défaut `auth_enabled` est absent, `RequireAdmin` laisse donc passer, et
+///    la route redevient anonyme sur le réseau local. Les arbres système sont
+///    refusés indépendamment de l'authentification — voir
+///    [`super::explorateur`] pour le périmètre retenu et sa justification.
+pub(super) async fn browse_dirs(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
     let base = q.path.unwrap_or_else(|| {
         if cfg!(target_os = "windows") {
             "C:\\".into()
@@ -761,10 +782,38 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
         }
     });
 
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base, "error": refus.libelle(),
+            })),
+        );
+    }
+
     let base_path = std::path::Path::new(&base);
     if !base_path.exists() || !base_path.is_dir() {
-        return Json(
-            json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+        // Un seul et même refus pour « n'existe pas » et « existe mais n'est
+        // pas un dossier » : les distinguer donnerait de quoi sonder la
+        // présence d'un fichier sans jamais le lire.
+        return (
+            StatusCode::OK,
+            Json(
+                json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+            ),
+        );
+    }
+    // Le texte du chemin est irréprochable ; sa CIBLE peut ne pas l'être — un
+    // lien symbolique posé dans une racine de bibliothèque suffit.
+    if !explorateur::la_cible_reste_dans_le_perimetre(base_path) {
+        tracing::warn!(path = %base, "browse_dirs_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
         );
     }
 
@@ -785,7 +834,10 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
                 }));
             }
         }
-        return Json(json!({ "dirs": dirs, "parent": null, "current": base }));
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
+        );
     }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
@@ -799,6 +851,23 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             if name.starts_with('.')
                 || name == "$RECYCLE.BIN"
                 || name == "System Volume Information"
+            {
+                continue;
+            }
+            // Les arbres système disparaissent aussi de la LISTE, pas seulement
+            // de la navigation : les énumérer les nomme, et nommer `/root` ou
+            // `C:\ProgramData` sur une machine de réseau local est déjà la
+            // moitié d'une reconnaissance. Le filtre passe avant le sondage
+            // `has_children`, qui sinon irait lire `/proc` et `/sys`.
+            let texte = path.to_string_lossy();
+            if explorateur::dans_un_arbre_systeme(&texte) {
+                continue;
+            }
+            // Un lien symbolique ne coûte une forme canonique que s'il en est
+            // un : la calculer pour chaque entrée d'une racine réseau serait
+            // payer un aller-retour par dossier.
+            if entry.file_type().is_ok_and(|t| t.is_symlink())
+                && !explorateur::la_cible_reste_dans_le_perimetre(&path)
             {
                 continue;
             }
@@ -821,11 +890,14 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
 
-    Json(json!({
-        "dirs": dirs,
-        "parent": parent,
-        "current": base_path.to_string_lossy(),
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "dirs": dirs,
+            "parent": parent,
+            "current": base_path.to_string_lossy(),
+        })),
+    )
 }
 
 #[derive(Deserialize)]
