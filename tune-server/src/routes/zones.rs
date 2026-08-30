@@ -157,6 +157,25 @@ struct PatchZone {
     /// `zone_{id}_upnp_renderer` ; défaut off. L'activation réveille
     /// l'annonceur SSDP pour une annonce immédiate.
     upnp_renderer: Option<bool>,
+    /// « Silence UPnP » : ne plus rien demander du tout au renderer DLNA
+    /// pendant la lecture (#2263). Persisté en setting
+    /// `zone_{id}_upnp_silence` ; défaut off, STRICTEMENT opt-in.
+    ///
+    /// Par défaut, une zone DLNA abonnée aux évènements coûte déjà UNE action
+    /// SOAP par seconde au lieu de trois — l'état, le volume et la coupure
+    /// arrivent poussés, seule la position est encore mesurée. Cette option
+    /// supprime cette dernière mesure et fait tomber le trafic à zéro.
+    ///
+    /// **Elle dégrade deux choses, et les deux se lisent dans
+    /// `GET /api/devices/{id}/status` :**
+    /// * la position devient une ESTIMATION (dernière position connue +
+    ///   horloge murale), plus une valeur lue sur l'appareil ;
+    /// * un déplacement fait sur la FAÇADE de l'appareil (télécommande,
+    ///   molette) n'est vu qu'au prochain évènement du renderer.
+    ///
+    /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
+    /// sondage complet plutôt que de servir un état inventé.
+    upnp_silence: Option<bool>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -234,6 +253,25 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_renderer".into(), json!(upnp_renderer));
+    // #2263 — « silence UPnP ». L'interrupteur ne part JAMAIS seul : ce qu'il
+    // coûte part avec lui, pour qu'un client ne puisse pas le présenter comme
+    // une simple économie. Les deux effets sont nommés en clair ; un client qui
+    // ne lit que le booléen affiche au moins l'interrupteur au bon état.
+    let upnp_silence = settings
+        .get(&crate::config::cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    obj.insert("upnp_silence".into(), json!(upnp_silence));
+    obj.insert(
+        "upnp_silence_effets".into(),
+        json!({
+            "position_estimee": upnp_silence,
+            "deplacement_facade_differe": upnp_silence,
+            "texte": "Le serveur ne demande plus rien au lecteur réseau : la position affichée est estimée, et une avance faite sur l'appareil lui-même n'apparaît qu'au prochain changement qu'il signale."
+        }),
+    );
     // Sortie mono (#2362). Lue telle qu'elle est PERSISTÉE, sans la garde PURE :
     // c'est l'état de l'interrupteur que le client doit afficher. Ce que le
     // signal subit RÉELLEMENT est dit par le chemin du signal, qui applique la
@@ -2868,6 +2906,39 @@ async fn patch_zone(
         // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
         crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
     }
+    // Silence UPnP (#2263) → setting zone_{id}_upnp_silence. Même forme que
+    // `upnp_renderer` : clé supprimée à la désactivation.
+    if let Some(enabled) = body.upnp_silence {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = crate::config::cle_silence_upnp(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("upnp_silence", enabled, r);
+        // Appliqué en DIRECT à la sortie déjà enregistrée : persister ne suffit
+        // pas, sans cela cocher la case en écoutant ne changerait rien avant la
+        // piste suivante — même piège que le `dlna_play_delay_ms` ci-dessus.
+        if let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id) {
+            let output = { state.outputs.lock().await.get(&device_id) };
+            if let Some(output) = output {
+                let guard = output.lock().await;
+                if let Some(dlna) = guard.as_any().downcast_ref::<DlnaOutput>() {
+                    dlna.set_upnp_silence(enabled);
+                    // Ce que l'utilisateur vient d'accepter, écrit noir sur
+                    // blanc dans le journal : l'option n'est pas muette.
+                    info!(
+                        zone = id,
+                        device = %device_id,
+                        silence = enabled,
+                        abonnable = dlna.peut_s_abonner(),
+                        "zone_silence_upnp — position estimée et déplacement façade différé quand armé"
+                    );
+                }
+            }
+        }
+    }
     // Sortie mono (#2362) → setting zone_{id}_mono_downmix. Même forme que
     // `upnp_renderer` juste au-dessus : la clé est supprimée à la désactivation
     // plutôt qu'écrite à « false », pour que l'absence de clé et le défaut
@@ -2971,6 +3042,18 @@ fn renderer_settings_snapshot(state: &AppState, zone_id: i64) -> serde_json::Map
     let delay = repo.get_dlna_play_delay_ms(zone_id);
     if delay > 0 {
         out.insert("dlna_play_delay_ms".into(), json!(delay));
+    }
+    // #2263 — même famille que `dlna_play_delay_ms` : un réglage qu'on garde
+    // parce que CET appareil-là le demande. Absent du relevé tant qu'il est au
+    // défaut, comme tous ses voisins ici.
+    if settings
+        .get(&crate::config::cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+    {
+        out.insert("upnp_silence".into(), json!(true));
     }
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
@@ -3571,6 +3654,13 @@ async fn register_dlna_output_from_device(
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
         let delay =
             crate::config::resolve_play_delay(&state.backend, &state.config, &dev.id, &dev.name);
+        let evt_urls = dev
+            .capabilities
+            .get("event_sub_urls")
+            .and_then(|v| {
+                serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+            })
+            .unwrap_or_default();
         let dlna = DlnaOutput::new(
             dev.name.clone(),
             dev.id.clone(),
@@ -3579,7 +3669,12 @@ async fn register_dlna_output_from_device(
             rc,
             cm_url,
         )
-        .with_play_delay(delay);
+        .with_play_delay(delay)
+        .with_upnp_events(
+            crate::startup::create_oh_listener().await,
+            crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
+        )
+        .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &dev.id));
         let mut outputs = state.outputs.lock().await;
         outputs.register(Box::new(dlna));
         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
@@ -3614,7 +3709,18 @@ async fn register_dlna_output_from_device(
                             format!("{base}{rc_path}"),
                             cm_path,
                         )
-                        .with_play_delay(delay);
+                        .with_play_delay(delay)
+                        .with_upnp_events(
+                            crate::startup::create_oh_listener().await,
+                            crate::discovery_setup::urls_evenements_dlna(
+                                &dev.host,
+                                dev.port,
+                                &desc.event_sub_urls(),
+                            ),
+                        )
+                        .with_upnp_silence(
+                            crate::config::resolve_upnp_silence(&state.backend, &dev.id),
+                        );
                         let mut outputs = state.outputs.lock().await;
                         outputs.register(Box::new(dlna));
                         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_via_description");

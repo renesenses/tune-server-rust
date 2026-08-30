@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use axum::Router;
     use axum::extract::State;
@@ -53,6 +53,32 @@ mod tests {
         oublie_le_media_une_fois: Arc<Mutex<bool>>,
         /// Nombre de `Play` REFUSÉS avec un 701.
         play_refus_701: Arc<AtomicU32>,
+        /// Nombre TOTAL d'actions SOAP reçues, tous services confondus.
+        ///
+        /// L'instrument de mesure de #2263 : le sondeur passe par `get_status`
+        /// une fois par seconde et par zone pendant toute la lecture, et ce
+        /// compteur dit combien d'actions cela coûte VRAIMENT au renderer.
+        /// Annoncer une réduction sans le lire serait une promesse.
+        actions_soap: Arc<AtomicU32>,
+        /// Position rendue par `GetPositionInfo`, en ms.
+        position_ms: Arc<AtomicU32>,
+        /// La position avance-t-elle d'une seconde à chaque `GetPositionInfo` ?
+        /// Un renderer figé (position immobile alors qu'il se dit en lecture)
+        /// est le cas que la contre-vérification doit rattraper.
+        position_avance: Arc<AtomicBool>,
+        /// Le renderer REFUSE les `SUBSCRIBE` : c'est le repli qu'on veut
+        /// pouvoir prouver, pas seulement décrire.
+        abonnement_refuse: Arc<AtomicBool>,
+        /// Le renderer refuse tout RENOUVELLEMENT (le premier `SUBSCRIBE`
+        /// passe, les suivants sont rejetés) — un appareil redémarré qui ne
+        /// connaît plus le SID.
+        renouvellement_refuse: Arc<AtomicBool>,
+        /// Nombre de `SUBSCRIBE` reçus.
+        subscribe_count: Arc<AtomicU32>,
+        /// `TransportState` que le renderer POUSSE dans son `LastChange`. Peut
+        /// différer volontairement de `transport_state`, celui qu'il rend en
+        /// SOAP : c'est le renderer qui ment par évènement.
+        etat_pousse: Arc<Mutex<String>>,
         /// Quand c'est `Some`, `SetVolume` est REFUSÉ avec ce code UPnP.
         ///
         /// C'est la panne d'Eric (#1393, fil forum) : un renderer Diretta et un
@@ -85,9 +111,127 @@ mod tests {
                 stop_oublie_le_media: Arc::new(Mutex::new(false)),
                 oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
                 play_refus_701: Arc::new(AtomicU32::new(0)),
+                actions_soap: Arc::new(AtomicU32::new(0)),
+                position_ms: Arc::new(AtomicU32::new(90_000)),
+                // Position IMMOBILE par défaut : c'est ce que le renderer
+                // bouchonné rendait avant #2263, et les tests écrits contre lui
+                // le supposent. Chaque test qui veut un appareil qui avance
+                // vraiment l'arme explicitement.
+                position_avance: Arc::new(AtomicBool::new(false)),
+                abonnement_refuse: Arc::new(AtomicBool::new(false)),
+                renouvellement_refuse: Arc::new(AtomicBool::new(false)),
+                subscribe_count: Arc::new(AtomicU32::new(0)),
+                etat_pousse: Arc::new(Mutex::new("PLAYING".into())),
                 volume_refus_upnp: Arc::new(Mutex::new(None)),
             }
         }
+    }
+
+    fn hms(ms: u32) -> String {
+        let s = ms / 1000;
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+
+    /// Le document `LastChange` d'`AVTransport` tel qu'un renderer l'envoie :
+    /// un XML ÉCHAPPÉ dans le texte de la propriété, pas un XML imbriqué.
+    fn propertyset_avtransport(etat: &str, uri: &str, duree: &str) -> String {
+        let interieur = format!(
+            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/"><InstanceID val="0"><TransportState val="{etat}"/><CurrentTrackURI val="{uri}"/><CurrentTrackDuration val="{duree}"/></InstanceID></Event>"#
+        );
+        let echappe = interieur
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            r#"<?xml version="1.0"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>{echappe}</LastChange></e:property></e:propertyset>"#
+        )
+    }
+
+    /// Idem pour `RenderingControl`, avec ses trois voies — la voie `Master`
+    /// n'est pas la dernière du document, exprès.
+    fn propertyset_renderingcontrol(volume: u32, muet: u32) -> String {
+        let interieur = format!(
+            r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/"><InstanceID val="0"><Volume channel="Master" val="{volume}"/><Mute channel="Master" val="{muet}"/><Volume channel="LF" val="11"/><Volume channel="RF" val="99"/></InstanceID></Event>"#
+        );
+        let echappe = interieur
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        format!(
+            r#"<?xml version="1.0"?><e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>{echappe}</LastChange></e:property></e:propertyset>"#
+        )
+    }
+
+    /// Envoie un `NOTIFY` GENA à l'adresse de rappel, comme le ferait
+    /// l'appareil juste après avoir accepté l'abonnement.
+    async fn notifier(callback: &str, corps: String) {
+        let Ok(method) = reqwest::Method::from_bytes(b"NOTIFY") else {
+            return;
+        };
+        let client = crate::http::client::builder().build().unwrap_or_default();
+        let _ = client
+            .request(method, callback)
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("Content-Type", "text/xml")
+            .body(corps)
+            .send()
+            .await;
+    }
+
+    fn callback_de(entetes: &axum::http::HeaderMap) -> Option<String> {
+        entetes
+            .get("CALLBACK")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches(['<', '>']).to_string())
+    }
+
+    /// `eventSubURL` d'`AVTransport` du renderer bouchonné.
+    async fn abonnement_avtransport(
+        State(state): State<MockState>,
+        entetes: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let n = state.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        if state.abonnement_refuse.load(Ordering::Relaxed)
+            || (n > 0 && state.renouvellement_refuse.load(Ordering::Relaxed))
+        {
+            return (axum::http::StatusCode::PRECONDITION_FAILED, "").into_response();
+        }
+        if let Some(cb) = callback_de(&entetes) {
+            let etat = state.etat_pousse.lock().await.clone();
+            // Le `NOTIFY` initial part AVANT que la réponse au `SUBSCRIBE` ne
+            // soit rendue — l'ordre le plus dur, et un ordre que GENA autorise :
+            // rien n'oblige l'appareil à attendre que notre client ait fini de
+            // lire sa réponse. C'est l'ordre qui perdait l'état initial tant
+            // que le gestionnaire de rappel était enregistré après coup, et
+            // comme `AVTransport` n'émet plus rien tant que rien ne change,
+            // l'abonnement restait muet pour toujours. Le laisser en tâche
+            // détachée rendrait ce test complice du bogue : il gagnerait la
+            // course une fois sur deux et se dirait vert.
+            notifier(
+                &cb,
+                propertyset_avtransport(&etat, "http://tune.test/piste.flac", "0:05:00"),
+            )
+            .await;
+        }
+        ([("SID", "uuid:mock-av"), ("TIMEOUT", "Second-300")], "").into_response()
+    }
+
+    async fn abonnement_renderingcontrol(
+        State(state): State<MockState>,
+        entetes: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if state.abonnement_refuse.load(Ordering::Relaxed) {
+            return (axum::http::StatusCode::PRECONDITION_FAILED, "").into_response();
+        }
+        if let Some(cb) = callback_de(&entetes) {
+            notifier(&cb, propertyset_renderingcontrol(42, 0)).await;
+        }
+        ([("SID", "uuid:mock-rc"), ("TIMEOUT", "Second-300")], "").into_response()
     }
 
     fn extract_action(body: &str) -> String {
@@ -139,6 +283,7 @@ mod tests {
     async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
         use axum::response::IntoResponse;
         let action = extract_action(&body);
+        state.actions_soap.fetch_add(1, Ordering::Relaxed);
         match action.as_str() {
             "SetAVTransportURI" => {
                 state.set_uri_corps.lock().await.push(body.clone());
@@ -247,11 +392,25 @@ mod tests {
                 )
                 .into_response()
             }
-            "GetPositionInfo" => soap_ok(
-                "GetPositionInfo",
-                "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>0:01:30</RelTime><AbsTime>0:01:30</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>",
-            )
-            .into_response(),
+            "GetPositionInfo" => {
+                // La position avance d'une seconde par relevé, comme sur un
+                // appareil qui joue. Un renderer FIGÉ (`position_avance` à
+                // faux) rend deux fois la même : c'est ce cas-là que la
+                // contre-vérification de l'état poussé doit rattraper.
+                let ms = if state.position_avance.load(Ordering::Relaxed) {
+                    state.position_ms.fetch_add(1000, Ordering::Relaxed) + 1000
+                } else {
+                    state.position_ms.load(Ordering::Relaxed)
+                };
+                let t = hms(ms);
+                soap_ok(
+                    "GetPositionInfo",
+                    &format!(
+                        "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>{t}</RelTime><AbsTime>{t}</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
+                    ),
+                )
+                .into_response()
+            }
             _ => soap_ok(&action, "").into_response(),
         }
     }
@@ -259,6 +418,7 @@ mod tests {
     async fn rc_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
         use axum::response::IntoResponse;
         let action = extract_action(&body);
+        state.actions_soap.fetch_add(1, Ordering::Relaxed);
         match action.as_str() {
             "SetVolume" => {
                 // Compté AVANT le refus : la commande a bien été émise, c'est
@@ -294,6 +454,16 @@ mod tests {
         let app = Router::new()
             .route("/AVTransport", post(av_handler))
             .route("/RenderingControl", post(rc_handler))
+            // `SUBSCRIBE` n'est pas une méthode HTTP standard : `any` est la
+            // seule façon de l'atteindre depuis axum.
+            .route(
+                "/AVTransport/event",
+                axum::routing::any(abonnement_avtransport),
+            )
+            .route(
+                "/RenderingControl/event",
+                axum::routing::any(abonnement_renderingcontrol),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1097,6 +1267,366 @@ mod tests {
             url,
             "le renderer doit finir sur NOTRE flux"
         );
+        handle.abort();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2263 — Évènements GENA sur le chemin DLNA, et « silence UPnP »
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le même renderer, mais abonnable : ses `eventSubURL` sont branchées et
+    /// un VRAI récepteur GENA écoute derrière.
+    async fn dlna_abonnable(base: &str, silence: bool) -> DlnaOutput {
+        let listener = crate::outputs::oh_events::UpnpEventListener::new("127.0.0.1".into())
+            .await
+            .expect("récepteur GENA");
+        let mut urls = std::collections::HashMap::new();
+        urls.insert(
+            "avtransport".to_string(),
+            format!("{base}/AVTransport/event"),
+        );
+        urls.insert(
+            "renderingcontrol".to_string(),
+            format!("{base}/RenderingControl/event"),
+        );
+        make_dlna(base)
+            .with_upnp_events(Some(std::sync::Arc::new(listener)), urls)
+            .with_upnp_silence(silence)
+    }
+
+    /// Attend que l'abonnement soit ÉTABLI, avec une échéance, et échoue fort
+    /// s'il ne l'est pas.
+    ///
+    /// Ce n'est pas une temporisation d'espoir : ce qui suit ne mesure quoi que
+    /// ce soit qu'à cette condition, alors la condition est posée en assertion.
+    /// Un test d'abonnement qui « mord un tour sur deux » est un test qui
+    /// compte AVANT que l'abonnement existe — ici c'est impossible.
+    async fn attendre_abonnement(sortie: &DlnaOutput, attendu: bool) {
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let etat = sortie.etat_evenements().await;
+            if etat.abonne == attendu {
+                return;
+            }
+            if std::time::Instant::now() >= echeance {
+                panic!(
+                    "abonnement GENA attendu = {attendu}, obtenu {} après 5 s",
+                    etat.abonne
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Attend que le renderer ait livré son état initial COMPLET — celui du
+    /// transport (AVTransport) *et* celui du volume (RenderingControl).
+    ///
+    /// Deux abonnements, deux `NOTIFY` indépendants : `is_live()` est vrai dès
+    /// le premier arrivé. Compter les actions à ce moment-là donnerait tantôt
+    /// dix, tantôt onze — un `GetVolume` de plus tant que RenderingControl n'a
+    /// pas parlé. Ce n'est pas une gigue à masquer, c'est une PRÉCONDITION de
+    /// la mesure : on l'attend, et on échoue fort si elle ne vient pas.
+    async fn attendre_etat_initial_complet(sortie: &DlnaOutput) {
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = sortie.get_status().await.expect("get_status");
+            if (s.volume * 100.0).round() as u32 == 42 && s.state == TransportState::Playing {
+                return;
+            }
+            if std::time::Instant::now() >= echeance {
+                panic!("état initial poussé incomplet après 5 s : {s:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Combien d'actions SOAP coûtent DIX relevés d'état — soit dix tours du
+    /// sondeur, soit dix secondes de lecture à la cadence actuelle.
+    async fn actions_pour_dix_releves(sortie: &DlnaOutput, compteur: &Arc<AtomicU32>) -> u32 {
+        compteur.store(0, Ordering::Relaxed);
+        for _ in 0..10 {
+            sortie.get_status().await.expect("get_status");
+        }
+        compteur.load(Ordering::Relaxed)
+    }
+
+    /// Le barème d'AVANT : trois actions par relevé, trente pour dix tours.
+    ///
+    /// C'est la contre-épreuve des deux tests suivants — sans elle, « on est
+    /// passé à dix » ne se compare à rien. Et c'est aussi la preuve du repli :
+    /// ce renderer-ci REFUSE l'abonnement, et la lecture n'en sait rien.
+    #[tokio::test]
+    async fn un_renderer_qui_refuse_l_abonnement_garde_les_trois_actions() {
+        let state = MockState::default();
+        state.abonnement_refuse.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, false).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 30,
+            "abonnement refusé : le relevé doit rester à GetPositionInfo + GetTransportInfo + GetVolume"
+        );
+        handle.abort();
+    }
+
+    /// Défaut, abonnement tenu : UNE action par relevé au lieu de trois.
+    ///
+    /// L'état, le volume et la coupure arrivent poussés ; seule la position
+    /// reste mesurée, parce qu'aucun renderer ne la pousse de façon fiable.
+    #[tokio::test]
+    async fn les_evenements_ramenent_le_releve_a_une_seule_action() {
+        let state = MockState::default();
+        state.position_avance.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+        attendre_etat_initial_complet(&sortie).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 10,
+            "abonnement tenu : seul GetPositionInfo doit rester (mesuré : {actions})"
+        );
+
+        // Et ce qui arrive par évènement est JUSTE, pas seulement bon marché.
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing, "état poussé");
+        assert_eq!(
+            (statut.volume * 100.0).round() as u32,
+            42,
+            "volume de la voie Master, pas celui de LF (11) ni de RF (99)"
+        );
+        assert!(!statut.muted, "Mute=0 poussé par RenderingControl");
+        let etat = sortie.etat_evenements().await;
+        assert!(etat.abonne);
+        assert!(
+            !etat.position_extrapolee,
+            "hors mode silence la position doit rester MESURÉE"
+        );
+        handle.abort();
+    }
+
+    /// « Silence UPnP » : plus AUCUNE action pendant la lecture.
+    #[tokio::test]
+    async fn le_silence_upnp_ne_coute_plus_aucune_action() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 0,
+            "silence UPnP : le renderer ne doit plus rien recevoir (mesuré : {actions})"
+        );
+
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing);
+        assert_eq!(statut.duration_ms, 300_000, "durée poussée par LastChange");
+        assert_eq!(
+            statut.current_uri.as_deref(),
+            Some("http://tune.test/piste.flac")
+        );
+        // Le prix, et il est DIT : la position n'est plus une mesure.
+        assert!(
+            sortie.etat_evenements().await.position_extrapolee,
+            "le mode silence doit s'annoncer comme extrapolant la position"
+        );
+        handle.abort();
+    }
+
+    /// Le silence n'est jamais un aveuglement : sans abonnement tenu, l'option
+    /// armée ne change rien et la sortie sonde comme avant.
+    ///
+    /// Contre-épreuve du garde : si `get_status` se contentait de regarder
+    /// l'interrupteur, ce test rendrait 0 action et un état inventé.
+    #[tokio::test]
+    async fn le_silence_arme_sans_abonnement_sonde_quand_meme() {
+        let state = MockState::default();
+        state.abonnement_refuse.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, false).await;
+
+        let actions = actions_pour_dix_releves(&sortie, &state.actions_soap).await;
+        assert_eq!(
+            actions, 30,
+            "option armée mais abonnement absent : repli COMPLET sur le sondage"
+        );
+        assert!(!sortie.etat_evenements().await.position_extrapolee);
+        handle.abort();
+    }
+
+    /// La position extrapolée avance avec l'horloge, et le déplacement fait
+    /// PAR Tune la recale tout de suite.
+    #[tokio::test]
+    async fn la_position_extrapolee_avance_et_le_seek_la_recale() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, true).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+
+        let debut = sortie.get_status().await.expect("get_status").position_ms;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let apres = sortie.get_status().await.expect("get_status").position_ms;
+        assert!(
+            apres >= debut + 300,
+            "la position extrapolée doit suivre l'horloge : {debut} → {apres}"
+        );
+
+        sortie.seek(120_000).await.expect("seek");
+        let recale = sortie.get_status().await.expect("get_status").position_ms;
+        assert!(
+            (120_000..121_000).contains(&recale),
+            "un déplacement passé par Tune recale l'ancre tout de suite : {recale}"
+        );
+        handle.abort();
+    }
+
+    /// Le renderer se dit en lecture par évènement, mais sa position ne bouge
+    /// plus : au bout de deux secondes, Tune va trancher à la source.
+    ///
+    /// C'est la garde qui tient la promesse « pas moins juste qu'avant » : un
+    /// appareil qui accepte l'abonnement puis se tait n'a pas le droit de
+    /// figer la file indéfiniment.
+    #[tokio::test]
+    async fn un_etat_pousse_que_la_position_dement_est_arbitre_en_soap() {
+        let state = MockState::default();
+        state.position_avance.store(true, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+        attendre_abonnement(&sortie, true).await;
+        attendre_etat_initial_complet(&sortie).await;
+
+        // L'appareil s'est ARRÊTÉ, et son évènement dit toujours « PLAYING ».
+        state.position_avance.store(false, Ordering::Relaxed);
+        *state.transport_state.lock().await = "STOPPED".into();
+
+        // Premier relevé contradictoire : on n'en conclut rien, un tour où la
+        // position n'a pas bougé n'est pas une preuve.
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let tot = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            tot.state,
+            TransportState::Playing,
+            "trop tôt pour douter : l'état poussé tient encore"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            1,
+            "aucune action de plus tant que la contradiction ne dure pas"
+        );
+
+        // Passé le délai, on va lire l'état à la source. L'attente est PLUS
+        // LONGUE que le seuil, jamais une course contre lui.
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        state.actions_soap.store(0, Ordering::Relaxed);
+        let tard = sortie.get_status().await.expect("get_status");
+        assert_eq!(
+            tard.state,
+            TransportState::Stopped,
+            "la contradiction dure : c'est le transport qui tranche"
+        );
+        assert_eq!(
+            state.actions_soap.load(Ordering::Relaxed),
+            2,
+            "l'arbitrage coûte UN GetTransportInfo de plus, et seulement là"
+        );
+        handle.abort();
+    }
+
+    /// Un renouvellement REFUSÉ (l'appareil a redémarré, il ne connaît plus le
+    /// SID) doit couper l'abonnement, pas laisser servir un état gelé.
+    #[tokio::test]
+    async fn un_renouvellement_refuse_rend_l_abonnement_mort() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+
+        let etat = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::outputs::oh_events::EventState::default(),
+        ));
+        let listener = crate::outputs::oh_events::UpnpEventListener::new("127.0.0.1".into())
+            .await
+            .expect("récepteur");
+        let id = listener
+            .subscribe(&format!("{base}/AVTransport/event"), etat.clone())
+            .await
+            .expect("abonnement accepté");
+        assert!(etat.lock().await.alive, "abonnement tenu après SUBSCRIBE");
+
+        state.renouvellement_refuse.store(true, Ordering::Relaxed);
+        listener.renouveler_maintenant().await;
+        assert!(
+            !etat.lock().await.alive,
+            "un 412 au renouvellement doit tuer l'abonnement, pas passer pour un succès"
+        );
+
+        listener.unsubscribe(&id).await;
+        handle.abort();
+    }
+
+    /// L'état initial arrive AVANT la réponse au `SUBSCRIBE`, et il doit être
+    /// retenu quand même.
+    ///
+    /// Le renderer bouchonné émet son `NOTIFY` avant de répondre — l'ordre que
+    /// tout appareil rapide peut produire. Enregistrer le gestionnaire de
+    /// rappel après coup jetait cet état-là en silence, et `AVTransport`
+    /// n'émettant plus rien tant que rien ne change, l'abonnement restait muet
+    /// jusqu'à la piste suivante : abonné pour l'ordinateur, inutile en fait.
+    #[tokio::test]
+    async fn l_etat_initial_arrive_avant_la_reponse_au_subscribe_et_tient() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let sortie = dlna_abonnable(&base, false).await;
+
+        sortie
+            .play_media(&media_locatelli(&format!("{base}/flux.flac")))
+            .await
+            .expect("play");
+
+        // Aucune attente : dès le retour de `play_media`, les deux `NOTIFY`
+        // initiaux sont derrière nous — le renderer les a émis avant de
+        // répondre. Ce qui suit tombe donc à faux si l'un d'eux a été perdu.
+        let etat = sortie.etat_evenements().await;
+        assert!(
+            etat.abonne,
+            "l'état poussé avant la réponse au SUBSCRIBE doit être retenu"
+        );
+        let statut = sortie.get_status().await.expect("get_status");
+        assert_eq!(statut.state, TransportState::Playing);
+        assert_eq!((statut.volume * 100.0).round() as u32, 42);
         handle.abort();
     }
 }
