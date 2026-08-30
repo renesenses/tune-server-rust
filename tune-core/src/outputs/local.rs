@@ -1017,6 +1017,22 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
+    ///
+    /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
+    /// les DEUX voies stéréo, **en dernier** — après l'égaliseur, le convolveur
+    /// et le crossfeed, qui ont tous besoin de leur contexte stéréo pour
+    /// travailler. La duplication tombe donc juste avant l'adaptation au
+    /// périphérique, et le contrat du DAC (deux canaux) ne change pas.
+    ///
+    /// Défaut `false` : sans geste de l'utilisateur, le comportement est
+    /// strictement celui d'avant. Posé par piste par l'orchestrateur, comme
+    /// `pure_bypass` et `crossfeed`, et rafraîchissable en vol
+    /// (`refresh_zone_mono_downmix`).
+    ///
+    /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
+    /// signal » affiche l'étape « Mono » et le verdict tombe.
+    mono_downmix: Arc<AtomicBool>,
     /// True while the PCM currently flowing through this output is a **DoP**
     /// (DSD over PCM) payload, as detected on the bytes themselves by
     /// [`is_dop_pcm`].
@@ -1191,6 +1207,7 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            mono_downmix: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -1348,6 +1365,23 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// Armer (ou désarmer) le repli mono de la zone qui joue sur cette sortie
+    /// (#2362). Posé par l'orchestrateur, exactement comme `set_pure_bypass`.
+    ///
+    /// Un simple `store` suffit et se fait aussi bien en début de piste qu'en
+    /// pleine lecture : contrairement au crossfeed ou à l'égaliseur, le repli
+    /// n'a AUCUN état à emporter — pas de ligne à retard, pas d'historique de
+    /// biquad. Il n'y a donc pas de `replace_..._live` séparé, et la bascule
+    /// ne peut pas claquer.
+    pub fn set_mono_downmix(&self, mono: bool) {
+        self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// Le repli mono est-il armé sur cette sortie ?
+    pub fn has_mono_downmix(&self) -> bool {
+        self.mono_downmix.load(Ordering::Relaxed)
     }
 
     /// Install (or clear with `None`) the headphone crossfeed processor for the
@@ -2354,6 +2388,7 @@ struct LocalPcmProcessor<'a> {
     convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -2401,6 +2436,7 @@ impl LocalPcmProcessor<'_> {
             self.convolver,
             self.crossfeed,
             self.pure_bypass,
+            self.mono_downmix,
             channels,
             dop,
         );
@@ -2513,6 +2549,7 @@ fn prepare_windows_exclusive_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -2529,6 +2566,7 @@ fn prepare_windows_exclusive_pcm(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
         channels,
         false,
     );
@@ -2564,6 +2602,7 @@ fn feed_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &RingBuf,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2582,6 +2621,7 @@ fn feed_windows_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?
     else {
         // The raw bytes remain staged until the first 24-bit probe reaches a
@@ -2643,6 +2683,7 @@ fn feed_windows_native_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &NativePcmRing,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2663,6 +2704,7 @@ fn feed_windows_native_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?;
 
     *must_classify_24_bit = false;
@@ -2693,6 +2735,7 @@ fn feed_selected_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: WindowsExclusiveRingRef<'_>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2711,6 +2754,7 @@ fn feed_selected_windows_exclusive_leftover(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             ring,
             stop_rx,
             paused,
@@ -2727,6 +2771,7 @@ fn feed_selected_windows_exclusive_leftover(
                 convolver,
                 crossfeed,
                 pure_bypass,
+                mono_downmix,
                 ring,
                 stop_rx,
                 paused,
@@ -2855,6 +2900,7 @@ fn flush_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
@@ -2879,6 +2925,13 @@ fn flush_local_dsp(
     {
         c.process_interleaved(&mut queue);
     }
+    // Même ordre que `apply_local_dsp` : sans ceci la queue du convolveur
+    // sortirait en stéréo pendant que le corps de la piste sort en mono, et
+    // l'auditeur à une seule enceinte entendrait la fin de chaque piste
+    // s'appauvrir (#2362).
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(&mut queue);
+    }
     queue
 }
 
@@ -2888,6 +2941,7 @@ fn apply_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) {
@@ -2912,6 +2966,14 @@ fn apply_local_dsp(
                 c.process_interleaved(samples);
             }
         }
+    }
+    // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
+    // besoin de leur contexte stéréo — le crossfeed travaille sur la
+    // DIFFÉRENCE des voies et n'aurait plus rien à traiter après la somme, le
+    // convolveur applique une IR par canal, l'égaliseur des gains par canal.
+    // La duplication tombe donc juste avant l'adaptation au périphérique.
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(samples);
     }
 }
 
@@ -3034,11 +3096,17 @@ fn local_dsp_is_identity(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> bool {
     if pure_bypass.load(Ordering::Relaxed) {
         return true;
     }
-    eq.lock().is_ok_and(|guard| guard.is_none())
+    // Le repli mono compte comme les autres (#2362) : il RÉÉCRIT chaque
+    // échantillon. Sans lui ici, le producteur Windows prendrait la branche
+    // « octets source conservés » et le repli ne serait jamais appliqué — le
+    // réglage serait accepté et resterait sans effet.
+    !mono_downmix.load(Ordering::Relaxed)
+        && eq.lock().is_ok_and(|guard| guard.is_none())
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }
@@ -3049,6 +3117,7 @@ fn local_dsp_runtime_state(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     dop: bool,
 ) -> OutputDspState {
     if dop {
@@ -3056,6 +3125,12 @@ fn local_dsp_runtime_state(
     }
     if pure_bypass.load(Ordering::Relaxed) {
         return OutputDspState::BypassedPure;
+    }
+    // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
+    // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
+    // chaque échantillon est réécrit (#2362, famille de #1548/#1559/#1627).
+    if mono_downmix.load(Ordering::Relaxed) {
+        return OutputDspState::Applied;
     }
     let (Ok(eq), Ok(convolver), Ok(crossfeed)) = (eq.lock(), convolver.lock(), crossfeed.lock())
     else {
@@ -3085,13 +3160,14 @@ fn windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let sample_transport = if native_transport {
         OutputSampleTransport::NativeInteger
     } else {
         OutputSampleTransport::Float
     };
-    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, dop);
+    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, mono_downmix, dop);
     let volume = if dop {
         OutputVolumeState::BypassedDop
     } else if volume_units == 1000 {
@@ -3134,6 +3210,7 @@ fn publish_windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let mut status = windows_signal_path_status(
         native_transport,
@@ -3143,6 +3220,7 @@ fn publish_windows_signal_path_status(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     );
     // Le verdict du producteur est autoritaire : il a choisi la branche raw
     // ou flottante pour CE buffer. La lecture des verrous ci-dessus décrit
@@ -3184,6 +3262,7 @@ fn prepare_windows_native_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -3192,7 +3271,8 @@ fn prepare_windows_native_pcm(
 
     let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
     let bit_perfect = dop
-        || (volume_units == 1000 && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass));
+        || (volume_units == 1000
+            && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix));
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
@@ -3203,6 +3283,7 @@ fn prepare_windows_native_pcm(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             channels,
             false,
         );
@@ -3430,6 +3511,7 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Les deux composantes du volume effectif, pour pouvoir le recalculer
@@ -3731,6 +3813,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     dec_ch,
                     false,
                 );
@@ -3739,7 +3822,14 @@ impl OutputTarget for LocalOutput {
                 // DSP, la queue du convolveur peut donc etre ajoutee ici — elle
                 // suivra la meme adaptation de canaux et le meme
                 // reechantillonnage que le reste (#2209).
-                let queue = flush_local_dsp(&convolver, &crossfeed, &pure_bypass, dec_ch, false);
+                let queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    &mono_downmix,
+                    dec_ch,
+                    false,
+                );
                 samples.extend_from_slice(&queue);
 
                 // Adapt channels and resample if needed (using rubato
@@ -3964,6 +4054,7 @@ impl OutputTarget for LocalOutput {
                     convolver: &convolver,
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
+                    mono_downmix: &mono_downmix,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -4062,6 +4153,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -4223,6 +4315,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     selected_ring,
                     &stop_rx,
                     &paused,
@@ -4250,6 +4343,7 @@ impl OutputTarget for LocalOutput {
                             &convolver,
                             &crossfeed,
                             &pure_bypass,
+                            &mono_downmix,
                         );
                         bit_perfect_state = Some(runtime.bit_perfect);
                         info!(
@@ -4462,6 +4556,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         selected_ring,
                         &stop_rx,
                         &paused,
@@ -4489,6 +4584,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                             );
                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4571,6 +4667,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -4748,6 +4845,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 &ring,
                                 &stop_rx,
                                 &paused,
@@ -4777,6 +4875,7 @@ impl OutputTarget for LocalOutput {
                                     &convolver,
                                     &crossfeed,
                                     &pure_bypass,
+                                    &mono_downmix,
                                 );
                                 if bit_perfect_state != Some(runtime.bit_perfect) {
                                     bit_perfect_state = Some(runtime.bit_perfect);
@@ -4830,6 +4929,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                                 &ring,
                                                 &stop_rx,
                                                 &paused,
@@ -4862,6 +4962,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                             );
                                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4926,6 +5027,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 channels,
                                 false,
                             );
@@ -5490,6 +5592,7 @@ impl OutputTarget for LocalOutput {
                 convolver: &convolver,
                 crossfeed: &crossfeed,
                 pure_bypass: &pure_bypass,
+                mono_downmix: &mono_downmix,
                 dop_active: &dop_active,
                 volume: &volume,
                 user_volume: &user_volume_ref,
@@ -5914,6 +6017,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         prev_ch,
                         dop_active.load(Ordering::Relaxed),
                     );
@@ -6251,6 +6355,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -7340,6 +7445,7 @@ mod tests {
             &sortie.convolver,
             &sortie.crossfeed,
             &sortie.pure_bypass,
+            &sortie.mono_downmix,
             2,
             false,
         );
@@ -7349,6 +7455,107 @@ mod tests {
             .expect("un EQ actif doit exposer ses compteurs");
         assert_eq!(metrics.eq_non_finite_samples, 1);
         assert_eq!(metrics.eq_overs, 0);
+    }
+
+    // ---- #2362 : sortie mono sur la chaîne locale ---------------------------
+
+    /// Fait traverser la chaîne DSP locale RÉELLE à un tampon, sans égaliseur,
+    /// sans convolveur, sans crossfeed : seul le repli mono peut donc en
+    /// changer le contenu.
+    fn chaine_locale_nue(mono: bool, pure: bool, dop: bool, pcm: &mut Vec<f32>) {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_mono_downmix(mono);
+        sortie.set_pure_bypass(pure);
+        apply_local_dsp(
+            pcm,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            2,
+            dop,
+        );
+    }
+
+    /// Armé, le repli somme réellement les deux voies DANS la chaîne locale.
+    ///
+    /// La deuxième trame est la mutation discriminante : elle ne porte du
+    /// signal QUE sur la voie droite. Un « mono » qui garderait la voie gauche
+    /// — le piège nommé au point 2 de #2362 — rendrait `0.0` et laisserait
+    /// Nicolas Tardif, dont l'unique enceinte est câblée à gauche, aussi sourd
+    /// qu'avant à tout ce qui est panné à droite.
+    #[test]
+    fn le_repli_mono_somme_les_deux_voies_dans_la_chaine_locale() {
+        let mut pcm = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        chaine_locale_nue(true, false, false, &mut pcm);
+        assert_eq!(pcm, vec![0.4, 0.4, 0.4, 0.4, 1.0, 1.0]);
+    }
+
+    /// CONTRE-ÉPREUVE — désarmé (le défaut), la chaîne est l'identité BIT À
+    /// BIT. C'est l'engagement de l'issue : « comportement actuel strictement
+    /// inchangé » tant que personne ne coche.
+    #[test]
+    fn sans_repli_la_chaine_locale_est_identite_bit_a_bit() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(false, false, false, &mut pcm);
+        assert_eq!(
+            pcm.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            origine.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PURE court-circuite le repli comme il court-circuite l'égaliseur et le
+    /// crossfeed. `zone_mono_downmix` rend déjà `false` en PURE, mais la garde
+    /// de la chaîne doit tenir seule : c'est elle qui promet le bit-perfect.
+    #[test]
+    fn le_mode_pure_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, true, false, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// DoP n'est pas de l'audio : sommer ses voies détruirait le marqueur et le
+    /// DAC se TAIRAIT (famille de #1408). La garde existante doit couvrir le
+    /// repli comme elle couvre les trois autres traitements.
+    #[test]
+    fn le_dop_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, false, true, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// Le verdict d'exécution doit NOMMER le repli. Sans ceci, le producteur
+    /// entier de Windows prendrait la branche « octets source conservés » : le
+    /// réglage serait accepté, la case cochée, et le son inchangé.
+    #[test]
+    fn le_repli_mono_casse_l_identite_et_marque_le_dsp_comme_applique() {
+        let eq = std::sync::Mutex::new(None);
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(true);
+
+        assert!(!local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Applied
+        );
+
+        // Témoin : le même état, repli désarmé, reste une identité inactive.
+        mono.store(false, Ordering::Relaxed);
+        assert!(local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Inactive
+        );
     }
 
     fn stereo_sine_8k(frames: usize) -> Vec<f32> {
@@ -7388,11 +7595,27 @@ mod tests {
         // Une piste d'exactement un bloc, en stéréo.
         let piste: Vec<f32> = (0..bloc * 2).map(|i| (i as f32 + 1.0) / 16.0).collect();
         let mut tampon = piste.clone();
-        apply_local_dsp(&mut tampon, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut tampon,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Le buffer rendu est le silence d'amorçage : c'est la latence, et
         // c'est exactement ce que l'ancien code ne rendait jamais visible.
-        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2, false);
+        let queue = flush_local_dsp(
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         let mut restitue = tampon.clone();
         restitue.extend_from_slice(&queue);
@@ -7458,14 +7681,32 @@ mod tests {
 
         // Première piste : un bloc bien reconnaissable, jamais drainé.
         let mut piste1 = vec![1.0f32; bloc * 2];
-        apply_local_dsp(&mut piste1, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste1,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Frontière.
         reset_local_dsp(&convolver);
 
         // Seconde piste : du silence. Rien de la première ne doit en sortir.
         let mut piste2 = vec![0.0f32; bloc * 2];
-        apply_local_dsp(&mut piste2, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste2,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         for (i, v) in piste2.iter().enumerate() {
             assert!(
                 v.abs() < 1e-6,
@@ -7483,7 +7724,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         // On saute les 512 premières trames (établissement du filtre).
         let after = rms(&samples[1024..]);
 
@@ -7505,7 +7755,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7520,7 +7779,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7552,7 +7820,16 @@ mod tests {
             })
             .collect();
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            1,
+            false,
+        );
         let after = rms(&samples[1024..]);
         assert!(20.0 * (after / before).log10() < -8.0);
     }
@@ -7595,6 +7872,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &AtomicBool::new(pure),
+            &AtomicBool::new(false),
         )
     }
 
@@ -7655,6 +7933,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
+            &AtomicBool::new(false),
             &AtomicBool::new(false),
         );
 
@@ -8045,7 +8324,17 @@ mod tests {
             let crossfeed = std::sync::Mutex::new(None);
             let pure = AtomicBool::new(false);
             let prepared = prepare_windows_native_pcm(
-                &source, bit_depth, 2, true, false, 1000, &eq, &convolver, &crossfeed, &pure,
+                &source,
+                bit_depth,
+                2,
+                true,
+                false,
+                1000,
+                &eq,
+                &convolver,
+                &crossfeed,
+                &pure,
+                &AtomicBool::new(false),
             )
             .expect("fenêtre PCM complète");
             assert!(prepared.bit_perfect);
@@ -8067,7 +8356,17 @@ mod tests {
         ));
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 250, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            250,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("DoP complet");
         assert!(prepared.dop);
@@ -8089,7 +8388,17 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 500, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            500,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("PCM complet");
         assert!(!prepared.dop);
@@ -8116,6 +8425,7 @@ mod tests {
             &convolver,
             &crossfeed,
             &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(pending, Ok(None)));
         assert_eq!(ring.available(), 0);
@@ -8123,7 +8433,15 @@ mod tests {
         // Once the byte window is conclusive, rejection happens at the last
         // preparation boundary — still before conversion, DSP and ring feed.
         let rejected = prepare_windows_exclusive_pcm(
-            &fixture, 24, 2, true, &eq, &convolver, &crossfeed, &pure,
+            &fixture,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(
             rejected,
@@ -8175,10 +8493,19 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
 
-        let prepared =
-            prepare_windows_exclusive_pcm(&pcm, 24, 2, true, &eq, &convolver, &crossfeed, &pure)
-                .expect("PCM ordinaire accepté")
-                .expect("fenêtre de détection complète");
+        let prepared = prepare_windows_exclusive_pcm(
+            &pcm,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+        )
+        .expect("PCM ordinaire accepté")
+        .expect("fenêtre de détection complète");
 
         let ring = RingBuf::new(prepared.len());
         assert_eq!(ring.push(&prepared), prepared.len());
@@ -8274,6 +8601,7 @@ mod tests {
         let baseline_convolver = std::sync::Mutex::new(None);
         let baseline_crossfeed = std::sync::Mutex::new(None);
         let baseline_pure = AtomicBool::new(false);
+        let baseline_mono = AtomicBool::new(false);
         let baseline_dop = AtomicBool::new(false);
         let baseline_volume = AtomicU32::new(500);
         let baseline_user = AtomicU32::new(500);
@@ -8283,6 +8611,7 @@ mod tests {
             convolver: &baseline_convolver,
             crossfeed: &baseline_crossfeed,
             pure_bypass: &baseline_pure,
+            mono_downmix: &baseline_mono,
             dop_active: &baseline_dop,
             volume: &baseline_volume,
             user_volume: &baseline_user,
@@ -8299,6 +8628,7 @@ mod tests {
         let split_convolver = std::sync::Mutex::new(None);
         let split_crossfeed = std::sync::Mutex::new(None);
         let split_pure = AtomicBool::new(false);
+        let split_mono = AtomicBool::new(false);
         let split_dop = AtomicBool::new(false);
         let split_volume = AtomicU32::new(500);
         let split_user = AtomicU32::new(500);
@@ -8308,6 +8638,7 @@ mod tests {
             convolver: &split_convolver,
             crossfeed: &split_crossfeed,
             pure_bypass: &split_pure,
+            mono_downmix: &split_mono,
             dop_active: &split_dop,
             volume: &split_volume,
             user_volume: &split_user,
@@ -8340,6 +8671,7 @@ mod tests {
             crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
         ));
         let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(false);
         let dop_active = AtomicBool::new(false);
         let volume = AtomicU32::new(400);
         let user = AtomicU32::new(500);
@@ -8349,6 +8681,7 @@ mod tests {
             convolver: &convolver,
             crossfeed: &crossfeed,
             pure_bypass: &pure,
+            mono_downmix: &mono,
             dop_active: &dop_active,
             volume: &volume,
             user_volume: &user,
@@ -8406,7 +8739,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, true);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            true,
+        );
         assert_eq!(samples, before);
     }
 
@@ -8421,7 +8763,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
     }
 
