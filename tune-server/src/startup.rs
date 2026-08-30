@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -989,18 +989,36 @@ async fn restore_oaat_groups(state: &AppState) {
 #[cfg(not(feature = "oaat"))]
 async fn restore_oaat_groups(_state: &AppState) {}
 
-/// Create the OpenHome event listener (shared between SSDP handler and outputs).
-pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
-    let server_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into());
-    match OpenHomeEventListener::new(server_ip).await {
-        Ok(l) => Some(Arc::new(l)),
-        Err(e) => {
-            tracing::warn!(error = %e, "oh_event_listener_init_failed");
-            None
-        }
-    }
+/// LE récepteur GENA du processus. Créé une seule fois, quel que soit l'appelant.
+///
+/// La mémoïsation n'est pas un raffinement : elle lève l'obstacle qui privait
+/// d'évènements tout renderer récupéré au redémarrage (#1126). Ce chemin-là
+/// n'atteignait pas le récepteur du gestionnaire SSDP depuis `AppState`, et en
+/// créer un second aurait couru contre lui pour le port fixe 8890 —
+/// [`UpnpEventListener::new`] retombant alors sur un port éphémère, au
+/// détriment du premier. Une cellule unique rend le même récepteur aux deux, et
+/// la course disparaît au lieu d'être contournée (#2263).
+static RECEPTEUR_EVENEMENTS: tokio::sync::OnceCell<Option<Arc<UpnpEventListener>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Create the UPnP (GENA) event listener, shared between the SSDP handler,
+/// the restart-recovery path and the outputs. Idempotent.
+pub async fn create_oh_listener() -> Option<Arc<UpnpEventListener>> {
+    RECEPTEUR_EVENEMENTS
+        .get_or_init(|| async {
+            let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            match UpnpEventListener::new(server_ip).await {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }
 
 /// Persist music_dirs and discogs_token from config/env into the settings DB.

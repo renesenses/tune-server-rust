@@ -181,6 +181,53 @@ use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
 
+/// Ce que l'auditeur avait demandé, et où il en était — les trois champs que
+/// « Continuer l'écoute » a besoin de retrouver pour ROUVRIR cet objet à la
+/// bonne place (#2441, FabienM fil 1557).
+///
+/// Regroupés plutôt qu'ajoutés un à un aux douze paramètres de `record_listen`
+/// : ils ne se lisent qu'ensemble, et le rang seul ne veut rien dire sans
+/// l'objet auquel il se rapporte.
+///
+/// C'est délibérément « objet courant + position », PAS l'instantané de la
+/// file : pour un artiste ou un label, la file est bâtie par une requête qui
+/// change d'un jour à l'autre — « conserver l'ordre » n'y aurait aucun sens —
+/// et écrire la file entière à chaque écoute coûterait un facteur dix sur le
+/// volume de `listen_history`, pour alimenter une section d'accueil.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContexteEcoute<'a> {
+    /// `track`, `album`, `playlist`, `artist` ou `label`. `None` quand
+    /// l'appelant n'a rien déclaré — une absence, jamais une déduction.
+    pub nature: Option<&'a str>,
+    /// L'identifiant de cet objet, dans le référentiel de sa source.
+    pub id: Option<&'a str>,
+    /// Le rang de la piste dans cet objet. `None` en lecture ALÉATOIRE : voir
+    /// `rang_a_retenir`.
+    pub rang: Option<i64>,
+}
+
+/// Le rang qu'il faut écrire dans `listen_history`, sachant l'état de la zone.
+///
+/// Toute la subtilité est le tirage aléatoire. En lecture séquentielle, le
+/// rang est ce qui permet de reprendre la playlist à la piste 7. En lecture
+/// aléatoire, il ne désigne plus rien de reproductible : la permutation
+/// (`shuffle_order`) est régénérée à chaque activation, donc « position 7 »
+/// dans le tirage d'hier tombera sur une autre piste demain. L'arbitrage rendu
+/// sur #2441 est de RE-TIRER plutôt que de faire semblant de rejouer le même
+/// tirage — ce que cette fonction inscrit à l'écriture, faute de quoi il
+/// faudrait redevenir l'état « aléatoire » de la zone au moment où l'accueil
+/// s'affiche, ce qui n'existe plus.
+///
+/// Un `None` en base se relit donc « rouvre au début », que ce soit parce
+/// qu'on re-tire ou parce que la ligne est antérieure à la migration 94.
+pub fn rang_a_retenir(shuffle: bool, queue_position: i64) -> Option<i64> {
+    if shuffle || queue_position < 0 {
+        None
+    } else {
+        Some(queue_position)
+    }
+}
+
 /// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
 ///
 /// « Forcer le WAV » (`dlna_lpcm` / `dlna_wav24`) existe pour contourner le
@@ -2447,6 +2494,10 @@ impl PlaybackOrchestrator {
             // sans y toucher.
             let etat = self.playback.get_state(req.zone_id).await;
             let session_profile_id = etat.session_profile_id;
+            // Le rang vient de la file de la zone, PAS du contexte : c'est la
+            // position reellement atteinte, avance automatique comprise. En
+            // aleatoire il reste vide — on re-tirera (#2441).
+            let rang = rang_a_retenir(etat.shuffle, etat.queue_position);
             let context = (etat.session_context_type, etat.session_context_id);
             self.record_listen(
                 &resolved.title,
@@ -2465,8 +2516,11 @@ impl PlaybackOrchestrator {
                 req.zone_id,
                 cover_path.as_deref(),
                 session_profile_id,
-                context.0.as_deref(),
-                context.1.as_deref(),
+                ContexteEcoute {
+                    nature: context.0.as_deref(),
+                    id: context.1.as_deref(),
+                    rang,
+                },
             );
         }
 
@@ -8117,8 +8171,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
-        context_type: Option<&str>,
-        context_id: Option<&str>,
+        contexte: ContexteEcoute<'_>,
     ) {
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
@@ -8145,8 +8198,9 @@ impl PlaybackOrchestrator {
             // etablit que cette information n'etait ecrite NULLE PART — la
             // section « Continuer l'ecoute » ne pouvait donc que repartir de
             // la table `albums`.
-            context_type: context_type.map(Into::into),
-            context_id: context_id.map(Into::into),
+            context_type: contexte.nature.map(Into::into),
+            context_id: contexte.id.map(Into::into),
+            context_position: contexte.rang,
         })
         .ok();
 
@@ -8254,8 +8308,11 @@ impl PlaybackOrchestrator {
                 zone_id,
                 attente.cover_path.as_deref(),
                 etat.session_profile_id,
-                etat.session_context_type.as_deref(),
-                etat.session_context_id.as_deref(),
+                ContexteEcoute {
+                    nature: etat.session_context_type.as_deref(),
+                    id: etat.session_context_id.as_deref(),
+                    rang: rang_a_retenir(etat.shuffle, etat.queue_position),
+                },
             );
         }
 
@@ -13208,8 +13265,11 @@ mod tests {
             zone_id,
             None,
             Some(7),
-            Some("playlist"),
-            Some("12"),
+            crate::orchestrator::ContexteEcoute {
+                nature: Some("playlist"),
+                id: Some("12"),
+                rang: Some(4),
+            },
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -13234,7 +13294,48 @@ mod tests {
         // voulu faire l'auditeur ».
         assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
         assert_eq!(history[0].context_id.as_deref(), Some("12"));
+        // Migration 94 — le RANG, sans lequel on rouvrirait la bonne playlist
+        // a sa premiere piste.
+        assert_eq!(history[0].context_position, Some(4));
         assert_eq!(history[0].source, "local");
+    }
+
+    /// #2441 — la moitie « re-tirage » de l'arbitrage, ecrite a l'ECRITURE.
+    ///
+    /// En lecture sequentielle le rang est ce qui permet de reprendre la
+    /// playlist a la piste 7. En lecture ALEATOIRE il ne designe plus rien de
+    /// reproductible : `shuffle_order` est une permutation regeneree a chaque
+    /// activation, donc « position 7 » du tirage d'hier tombera sur une autre
+    /// piste demain. On re-tire, donc on n'ecrit pas de rang.
+    ///
+    /// CONTRE-EPREUVE : remplacer le corps de `rang_a_retenir` par
+    /// `Some(queue_position)` rend ce test ROUGE sur le premier cas — et la
+    /// section rouvrirait la playlist a une piste tiree au hasard hier, en
+    /// pretendant reprendre ou l'auditeur en etait.
+    #[test]
+    fn le_rang_reste_vide_en_lecture_aleatoire() {
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(true, 7),
+            None,
+            "en aleatoire le rang n'est pas reproductible : on RE-TIRE"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, 7),
+            Some(7),
+            "en lecture sequentielle, le rang est precisement ce qu'il faut \
+             retenir pour reprendre ou l'auditeur en etait"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, 0),
+            Some(0),
+            "la premiere piste est un rang comme un autre, pas une absence"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, -1),
+            None,
+            "position sentinelle d'une zone qui n'a pas commence : rien a \
+             retenir"
+        );
     }
 
     // ------------------------------------------------------------------

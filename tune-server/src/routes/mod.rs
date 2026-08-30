@@ -88,7 +88,6 @@ pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod versions;
-pub mod visualizer;
 pub mod voice;
 pub mod widget;
 pub mod ws;
@@ -366,7 +365,6 @@ pub fn router_with_plugins(
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
         .nest("/outputs", airplay_pairing::router())
-        .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
         .nest("/siri", siri::router())

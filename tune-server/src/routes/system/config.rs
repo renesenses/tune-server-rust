@@ -156,6 +156,14 @@ pub(super) async fn get_config(
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        // Plafond de la lecture aléatoire (#2901) : combien de pistes
+        // « tout lire en aléatoire » enfile au maximum. Réglage audio
+        // comme les trois ci-dessus, même mécanisme (settings + PATCH),
+        // défaut 500 — la valeur que #2228 avait figée dans le code.
+        (
+            tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY,
+            json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_DEFAULT),
+        ),
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
@@ -182,6 +190,41 @@ pub(super) async fn get_config(
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
+
+    // Le plafond de la lecture aléatoire, tel qu'il s'APPLIQUERA (#2901).
+    //
+    // `PATCH /config` persiste sans valider : `0`, `-1` ou `99999` peuvent
+    // se trouver en base. `shuffle_all` les ramène dans les bornes à la
+    // lecture ; l'affichage doit dire la MÊME chose, sinon l'utilisateur lit
+    // un chiffre que le serveur n'honore pas. Même repli propre que
+    // `local_audio_backend` juste en dessous : corrigé dans la RÉPONSE, pas
+    // en base — on ne réécrit pas le choix de l'utilisateur derrière son dos.
+    let plafond_effectif = tune_core::playback::queue::resolve_shuffle_max_tracks(
+        config
+            .get(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY)
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            })
+            .as_deref(),
+    );
+    config.insert(
+        tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY.to_string(),
+        json!(plafond_effectif),
+    );
+    // Les bornes elles-mêmes ne sont pas un réglage : ce sont les valeurs
+    // que le contrôle doit respecter. On les publie pour que le client web
+    // n'ait pas à les écrire en dur, exactement comme `supported_audio_backends`
+    // plus bas (#1268) — le client avait codé ses trois backends à la main et
+    // les proposait sur des plateformes qui ne les avaient pas.
+    config.insert(
+        "shuffle_max_tracks_min".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_FLOOR),
+    );
+    config.insert(
+        "shuffle_max_tracks_max".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
+    );
     // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
     // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
     // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
