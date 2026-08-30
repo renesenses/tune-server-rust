@@ -107,15 +107,22 @@ jobs:
           echo "::group::control"
           dpkg-deb --info "$DEB"
           echo "::endgroup::"
+          # La liste est écrite dans un fichier avant d'être filtrée : un
+          # `dpkg-deb --contents | grep -q` ferme le tube dès la première
+          # correspondance, tar prend un SIGPIPE, et `pipefail` fait échouer
+          # l'étape alors que le paquet est parfaitement valide.
+          dpkg-deb --contents "$DEB" > contents.txt
           echo "::group::contenu"
-          dpkg-deb --contents "$DEB"
+          cat contents.txt
           echo "::endgroup::"
           # Garde : un paquet sans binaire, sans unité systemd ou sans client
           # web s'installe très bien et ne sert à rien. On refuse ici.
           for required in ./opt/tune/tune-server ./opt/tune/web/index.html \
                           ./lib/systemd/system/tune-server.service \
                           ./etc/default/tune-server ./usr/bin/tune-server; do
-            dpkg-deb --contents "$DEB" | grep -q " ${required}\( ->\)\?$" \
+            # Le chemin est suivi soit d'une fin de ligne, soit de la cible du
+            # lien symbolique (`./usr/bin/tune-server -> /opt/tune/tune-server`).
+            grep -qE " ${required}( ->.*)?\$" contents.txt \
               || { echo "::error::absent du paquet : ${required}"; exit 1; }
           done
 
