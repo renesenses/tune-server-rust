@@ -298,6 +298,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let error_dirs = list_result.error_dirs;
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
+        let mut skipped_unsupported_paths = list_result.skipped_paths;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -408,6 +409,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_duplicate = 0u64;
         let mut skipped_no_metadata = 0u64;
         let mut skipped_unsupported = 0u64;
+        // Les CHEMINS, en regard des compteurs ci-dessus (#2050). Sœurs de
+        // celles du scan manuel : les deux boucles écartent pour les mêmes
+        // trois motifs, et doivent le dire de la même façon.
+        let mut skipped_no_metadata_paths: Vec<String> = Vec::new();
+        let mut skipped_duplicate_paths: Vec<String> = Vec::new();
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -461,6 +467,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         // file made the progress bar stop short of 100%.
                         skipped += 1;
                         skipped_no_metadata += 1;
+                        // Le chemin ne vivait que dans ce `warn!` (#2050).
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_no_metadata_paths,
+                            sf.path.clone(),
+                        );
                         continue;
                     }
 
@@ -511,6 +522,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                             );
                             skipped += 1;
                             skipped_duplicate += 1;
+                            // Journalise en `debug!` seulement : invisible au
+                            // niveau livré, donc introuvable (#2050).
+                            tune_core::scanner::walker::pousser_chemin_ecarte(
+                                &mut skipped_duplicate_paths,
+                                format!("{} (identique à {})", sf.path, existing_path),
+                            );
                             continue;
                         }
                         if !candidates.is_empty() {
@@ -622,6 +639,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
         }
         skipped_reasons.extend(stats.unsupported_reasons.clone());
+        // Même fusion que pour les décomptes : les deux sources d'« écarté
+        // faute de décodeur » aboutissent à une seule liste (#2050).
+        for chemin in &stats.unsupported_paths {
+            tune_core::scanner::walker::pousser_chemin_ecarte(
+                &mut skipped_unsupported_paths,
+                chemin.clone(),
+            );
+        }
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted();
@@ -919,10 +944,29 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unsupported_reasons": skipped_reasons,
         });
 
+        // La liste demandée (#2050) — mêmes clés que le scan manuel, sans quoi
+        // le rapport dépendrait de QUEL scan l'a produit. Comme dans
+        // `ChiffresDeFinDeScan::rapport_du_fichier`, elle ne sort QUE par le
+        // fichier : ce sont des chemins de l'utilisateur, et
+        // `library.scan.completed` est diffusé à tous les clients connectés.
+        let mut report_fichier = report.clone();
+        report_fichier["skipped_unsupported_paths"] = serde_json::json!(skipped_unsupported_paths);
+        report_fichier["skipped_no_metadata_paths"] = serde_json::json!(skipped_no_metadata_paths);
+        report_fichier["skipped_duplicate_paths"] = serde_json::json!(skipped_duplicate_paths);
+        report_fichier["skipped_paths_truncated"] = serde_json::json!(
+            [
+                skipped_unsupported_paths.len(),
+                skipped_no_metadata_paths.len(),
+                skipped_duplicate_paths.len(),
+            ]
+            .iter()
+            .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)
+        );
+
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
-        if let Ok(json) = serde_json::to_string_pretty(&report) {
+        if let Ok(json) = serde_json::to_string_pretty(&report_fichier) {
             std::fs::write(&report_path, json).ok();
         }
 
