@@ -113,6 +113,32 @@ struct CheckFavoritesBody {
     item_ids: Vec<i64>,
 }
 
+/// Ordre manuel d'un onglet de favoris locaux (#2001, piste 2).
+///
+/// `item_ids` est la liste **complète et ordonnée** de l'onglet : ce que le
+/// client voit à l'écran, de haut en bas, après le glisser-déposer. Le serveur
+/// numérote 1..n et renvoie en fin d'ordre tout favori de l'onglet absent de la
+/// liste — voir `ProfileRepo::reorder_favorites` pour les trois garanties.
+#[derive(Deserialize)]
+struct ReorderFavorites {
+    item_type: String,
+    item_ids: Vec<i64>,
+}
+
+/// Un favori de service désigné par sa clé — `(service, service_id)` — puisque
+/// ces éléments n'ont pas d'`item_id` entier.
+#[derive(Deserialize)]
+struct StreamingFavoriteRef {
+    service: String,
+    service_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReorderStreamingFavorites {
+    item_type: String,
+    items: Vec<StreamingFavoriteRef>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_profiles).post(create_profile))
@@ -129,6 +155,9 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
+        // Ordre manuel des favoris locaux (#2001, piste 2) : le geste de Tades,
+        // qui a essayé de déplacer ses favoris à la souris et n'a rien trouvé.
+        .route("/{id}/favorites/reorder", post(reorder_favorites))
         .route("/{id}/favorites/streaming", get(list_streaming_favorites))
         .route(
             "/{id}/favorites/streaming/add",
@@ -137,6 +166,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{id}/favorites/streaming/remove",
             post(remove_streaming_favorite),
+        )
+        .route(
+            "/{id}/favorites/streaming/reorder",
+            post(reorder_streaming_favorites),
         )
         // Favoris de facette (label, et demain genre/format/année) — #2442.
         .route("/{id}/favorites/facets", get(list_facet_favorites))
@@ -340,6 +373,25 @@ async fn remove_favorite(
     }
 }
 
+/// `POST /profiles/{id}/favorites/reorder` — pose l'ordre manuel d'un onglet
+/// (#2001, piste 2). Se relit ensuite par `GET …/favorites?sort=manual`.
+///
+/// Rend `{"ok": true, "ordered": n}`, où `n` est le nombre de favoris
+/// effectivement rangés : un identifiant que le profil n'a pas en favori est
+/// ignoré sans erreur, donc `n` plus petit que la liste envoyée signale au
+/// client que sa vue était périmée.
+async fn reorder_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ReorderFavorites>,
+) -> impl IntoResponse {
+    let repo = ProfileRepo::with_backend(state.backend.clone());
+    match repo.reorder_favorites(id, &body.item_type, &body.item_ids) {
+        Ok(n) => (StatusCode::OK, Json(json!({"ok": true, "ordered": n}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 // --- Streaming favorites (Tidal/Qobuz/… items, stored separately from the
 // integer-keyed local `favorites`) ---
 
@@ -386,6 +438,31 @@ async fn remove_streaming_favorite(
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.remove(id, &body.item_type, &body.service, &body.service_id) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+/// `POST /profiles/{id}/favorites/streaming/reorder` — jumelle de
+/// `reorder_favorites` pour les favoris de service **enregistrés chez Tune**.
+///
+/// ⚠️ Ne concerne PAS `/api/v1/streaming/{service}/favorites/{type}`, qui lit
+/// les favoris directement chez Qobuz/Tidal : Tune ne possède pas ces lignes,
+/// le service en renvoie un jeu différent à chaque resynchronisation, et leur
+/// donner un rang durable demanderait une table de correspondance — arbitrage
+/// non rendu (#2001).
+async fn reorder_streaming_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ReorderStreamingFavorites>,
+) -> impl IntoResponse {
+    let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
+    let items: Vec<(String, String)> = body
+        .items
+        .into_iter()
+        .map(|r| (r.service, r.service_id))
+        .collect();
+    match repo.reorder(id, &body.item_type, &items) {
+        Ok(n) => (StatusCode::OK, Json(json!({"ok": true, "ordered": n}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }

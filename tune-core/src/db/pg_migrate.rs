@@ -516,6 +516,7 @@ CREATE TABLE IF NOT EXISTS favorites (
     item_name TEXT,
     item_artist TEXT,
     item_path TEXT,
+    position TEXT,
     UNIQUE(profile_id, item_type, item_id)
 );
 -- Instantané d'identité des favoris (SQLite v66 / PG 017) : nécessaire ici
@@ -524,6 +525,12 @@ CREATE TABLE IF NOT EXISTS favorites (
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
+-- Rang manuel (#2001 piste 2, SQLite 95 / PG 047). TEXT comme le reste de ce
+-- schéma miroir : la copie SQLite→PostgreSQL lie chaque valeur en texte et
+-- PostgreSQL n'a pas de cast implicite texte→entier à l'INSERT. `as_i64`
+-- reconvertit à la relecture, et le rang est comparé en Rust — donc jamais par
+-- un ORDER BY qui mettrait « 10 » avant « 2 » ici et pas sur SQLite.
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS position TEXT;
 
 -- Albums masqués (#1391). Tout en TEXT comme le reste de ce schéma (la copie
 -- lie chaque valeur en texte) ; la migration 041 ramène `profile_id` et
@@ -578,8 +585,14 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
     album TEXT,
     cover_url TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    position TEXT,
     UNIQUE(profile_id, item_type, service, service_id)
 );
+-- Rattrapage de la bascule : une base créée par une version antérieure de ce
+-- schéma a la table SANS `position`, et le `CREATE TABLE IF NOT EXISTS`
+-- ci-dessus ne la corrige pas. Même raison que les trois colonnes d'identité de
+-- `favorites` juste au-dessus (#2111).
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT;
 
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
