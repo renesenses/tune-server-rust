@@ -343,6 +343,54 @@ async fn fetch_icy_metadata(stream_url: &str) -> Option<IcyMetadata> {
     parse_icy_string(&raw, station)
 }
 
+/// Lire un champ `Nom='valeur'` d'un bloc ICY.
+///
+/// Le bloc est une suite de `Cle='valeur';`. On cherche la clé suivie de `='`
+/// et l'on s'arrête au premier `';` — c'est déjà ce que faisait l'extraction du
+/// titre, extraite ici pour servir les DEUX champs plutôt qu'un seul.
+fn champ_icy<'a>(bloc: &'a str, cle: &str) -> Option<&'a str> {
+    let ouvrant = format!("{cle}='");
+    let debut = bloc.find(&ouvrant)?;
+    let apres = &bloc[debut + ouvrant.len()..];
+    let fin = apres.find("';")?;
+    Some(&apres[..fin])
+}
+
+/// La pochette qu'une station publie dans `StreamUrl`, quand c'en est une.
+///
+/// `StreamUrl` est le champ « adresse liée au flux » du protocole ICY, et il
+/// est **polymorphe** — exactement comme `visual` chez Radio France : certaines
+/// stations y mettent l'accueil de leur site, d'autres l'illustration du titre
+/// en cours. Servir une page HTML à une balise `<img>` afficherait une image
+/// cassée là où le logo de la station faisait l'affaire. On ne retient donc
+/// qu'une adresse absolue dont le **chemin** se termine par une extension
+/// d'image ; tout le reste retombe sur le repli déjà en place.
+///
+/// Ce n'est pas une supposition sur le protocole, c'est une mesure — et Tune
+/// écrit lui-même la pochette dans ce champ depuis #2161
+/// (`tune-stream-http`, `StreamUrl='…'`) pour l'écran des lecteurs réseau.
+/// Il l'écrivait sans jamais la relire.
+fn pochette_de_stream_url(v: Option<&str>) -> Option<String> {
+    let brut = v?.trim();
+    let url = url_de_pochette(Some(brut))?;
+
+    // Le chemin seul décide : `?size=512` ou `#x` ne changent pas la nature du
+    // fichier, et les laisser dans la comparaison ferait rater les stations qui
+    // versionnent leur illustration par une chaîne de requête.
+    let chemin = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&url)
+        .to_ascii_lowercase();
+
+    const EXTENSIONS: [&str; 7] = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"];
+    if EXTENSIONS.iter().any(|ext| chemin.ends_with(ext)) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
 /// Parse the ICY metadata string.
 ///
 /// Typical format: `StreamTitle='Artist - Title';StreamUrl='';`
@@ -350,10 +398,7 @@ fn parse_icy_string(raw: &str, station: Option<String>) -> Option<IcyMetadata> {
     let trimmed = raw.trim_end_matches('\0');
 
     // Extract StreamTitle value
-    let title_start = trimmed.find("StreamTitle='")?;
-    let after = &trimmed[title_start + "StreamTitle='".len()..];
-    let title_end = after.find("';")?;
-    let stream_title = &after[..title_end];
+    let stream_title = champ_icy(trimmed, "StreamTitle")?;
 
     if stream_title.is_empty() {
         return None;
@@ -373,10 +418,18 @@ fn parse_icy_string(raw: &str, station: Option<String>) -> Option<IcyMetadata> {
         title,
         artist,
         station,
-        // Un flux ICY brut ne transporte pas de pochette. Chercher celle du
-        // titre par artiste + titre serait un autre chantier, et faillible :
-        // le logo de la station reste préférable à une pochette fausse.
-        cover_url: None,
+        // La troisième sœur du `match` d'aiguillage : Radio France et Radio
+        // Paradise rendaient une pochette, ce repli — celui qui sert TOUTES les
+        // autres stations — rendait `None` en affirmant qu'ICY n'en transporte
+        // pas. Mesuré le 30/08/2026, premier bloc du flux :
+        //
+        //   stream.radioparadise.com/mp3-192  → StreamUrl='http://img.radioparadise.com/covers/l/10580.jpg'
+        //   ice1.somafm.com/groovesalad-128-mp3 → StreamUrl='https://somafm.com/logos/512/groovesalad512.jpg'
+        //   ice2.somafm.com/dronezone-128-mp3   → StreamUrl='https://somafm.com/logos/512/dronezone512.png'
+        //
+        // On ne CHERCHE toujours rien : c'est la station qui publie l'adresse,
+        // dans le champ où Tune lui-même écrit la sienne (#2161).
+        cover_url: pochette_de_stream_url(champ_icy(trimmed, "StreamUrl")),
     })
 }
 
@@ -405,6 +458,83 @@ mod tests {
     fn parse_icy_empty() {
         let raw = "StreamTitle='';StreamUrl='';";
         assert!(parse_icy_string(raw, None).is_none());
+    }
+
+    /// Regression #2065 — la pochette d'un flux ICY brut.
+    ///
+    /// `fetch_radio_metadata` aiguille vers trois analyseurs. Radio France et
+    /// Radio Paradise ont reçu `cover_url` en v0.9.97 ; le repli ICY — celui
+    /// qui sert **toutes les autres stations** — est resté à `None`, sur
+    /// l'affirmation qu'ICY ne transporte pas d'image. Mesuré le 30/08/2026,
+    /// premier bloc de métadonnées du flux : Radio Paradise y publie la
+    /// pochette du morceau EN COURS, à l'adresse même que rend son API.
+    #[test]
+    fn le_bloc_icy_livre_la_pochette_quand_la_station_la_publie() {
+        let raw = "StreamTitle='Amadou & Mariam - Ce N'est Pas Bon';\
+                   StreamUrl='http://img.radioparadise.com/covers/l/10580.jpg';";
+        let meta = parse_icy_string(raw, Some("Radio Paradise".into())).unwrap();
+        assert_eq!(
+            meta.cover_url.as_deref(),
+            Some("http://img.radioparadise.com/covers/l/10580.jpg"),
+            "la pochette publiée par la station doit sortir de l'analyseur ICY"
+        );
+    }
+
+    /// SomaFM (mesuré le 30/08/2026) : `.png`, et une URL en `https`. Deux
+    /// stations, deux extensions — l'analyseur ne doit privilégier ni l'une ni
+    /// l'autre. La chaîne de requête ne décide pas non plus : c'est le CHEMIN
+    /// qui dit si c'est une image.
+    #[test]
+    fn la_pochette_icy_accepte_les_extensions_et_ignore_la_chaine_de_requete() {
+        assert_eq!(
+            pochette_de_stream_url(Some("https://somafm.com/logos/512/dronezone512.png")),
+            Some("https://somafm.com/logos/512/dronezone512.png".to_string())
+        );
+        assert_eq!(
+            pochette_de_stream_url(Some("https://cdn.exemple.fr/art/1234.JPEG?size=512")),
+            Some("https://cdn.exemple.fr/art/1234.JPEG?size=512".to_string())
+        );
+        assert_eq!(
+            pochette_de_stream_url(Some("  https://cdn.exemple.fr/a.webp  ")),
+            Some("https://cdn.exemple.fr/a.webp".to_string())
+        );
+    }
+
+    /// `StreamUrl` est polymorphe, comme `visual` chez Radio France : beaucoup
+    /// de stations y mettent l'accueil de leur site. Le servir à une balise
+    /// `<img>` afficherait une image cassée là où le logo de la station faisait
+    /// l'affaire — et une image cassée est PIRE que l'absence, parce qu'elle
+    /// remplace un repli qui, lui, fonctionnait.
+    #[test]
+    fn une_adresse_qui_n_est_pas_une_image_ne_devient_pas_une_pochette() {
+        for adresse in [
+            "https://www.walmradio.com",
+            "http://somafm.com/groovesalad/",
+            "https://exemple.fr/page.html",
+            "1059fabb-9a51-4f2b-8f3d-2c7c1a0b9e44",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                pochette_de_stream_url(Some(adresse)),
+                None,
+                "« {adresse} » n'est pas une image et ne doit pas devenir une pochette"
+            );
+        }
+        assert_eq!(pochette_de_stream_url(None), None);
+    }
+
+    /// Le cas majoritaire reste `StreamUrl=''` : rien ne doit changer pour ces
+    /// stations-là, le repli sur le logo doit continuer de jouer.
+    #[test]
+    fn un_streamurl_vide_ou_absent_laisse_la_pochette_au_repli() {
+        let vide = parse_icy_string("StreamTitle='Miles Davis - So What';StreamUrl='';", None)
+            .expect("titre lisible");
+        assert_eq!(vide.cover_url, None);
+
+        let absent =
+            parse_icy_string("StreamTitle='Miles Davis - So What';", None).expect("titre lisible");
+        assert_eq!(absent.cover_url, None);
     }
 
     #[test]
@@ -593,8 +723,14 @@ mod tests {
         );
     }
 
-    /// Un flux ICY brut ne transporte aucune pochette : le champ doit rester
-    /// vide plutôt que d'aller en chercher une par ressemblance.
+    /// Sans `StreamUrl`, aucune pochette : on n'en cherche pas par
+    /// ressemblance, et le repli sur le logo de la station reste seul en jeu.
+    ///
+    /// L'intitulé d'origine disait « un flux ICY brut ne transporte aucune
+    /// pochette ». C'est faux, et mesuré comme tel le 30/08/2026 (#2065) :
+    /// Radio Paradise et SomaFM publient une image dans `StreamUrl`. Ce que
+    /// cette épreuve garde, c'est le cas — majoritaire — où le champ est
+    /// absent.
     #[test]
     fn licy_brut_ne_promet_aucune_pochette() {
         let m = parse_icy_string("StreamTitle='Kings Of Leon - Pistol of fire';", None)
