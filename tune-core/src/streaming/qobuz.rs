@@ -248,6 +248,34 @@ fn remaining_page_offsets_bornees(
     (page_size..borne).step_by(page_size).collect()
 }
 
+/// Taille de page des endpoints de DÉTAIL (`/album/get`, `/playlist/get`,
+/// `/playlist/getUserPlaylists`) — et leur plafond dur.
+///
+/// **Mesuré contre l'API réelle le 30/08/2026** (#2867), `app_id` public :
+///
+/// | requête | `tracks.limit` rendu | items rendus |
+/// |---|---|---|
+/// | `/album/get?album_id=0825646254385` (sans `limit`) | 500 | 500 sur 1119 |
+/// | `/album/get?…&limit=1000` | **500** | 500 sur 1119 |
+/// | `/playlist/get?…&extra=tracks` (sans `limit`) | 50 | 50 sur 125 |
+/// | `/playlist/get?…&extra=tracks&limit=1000` | **500** | 125 sur 125 |
+///
+/// Deux conclusions, et elles commandent le correctif : le défaut de
+/// `/album/get` est 500 — pas 50 —, **et un `limit` plus grand est ramené à
+/// 500 par Qobuz**. Demander « tout » d'un seul coup est donc impossible :
+/// au-delà de 500 éléments il faut un `offset`, exactement comme
+/// `/catalog/search` au-delà de 50 ([`TAILLE_PAGE_RECHERCHE`]).
+const TAILLE_PAGE_DETAIL: usize = 500;
+
+/// Plafond de pistes ramenées pour UN conteneur (album ou playlist).
+///
+/// Le plus gros album du catalogue mesuré — l'intégrale studio de Maria Callas
+/// — porte 1119 pistes, soit trois pages. 5000 laisse quatre fois cette marge
+/// tout en bornant un `total` aberrant à dix allers-retours. Quand il mord, il
+/// le DIT (`qobuz_detail_tronque`) : le défaut corrigé ici est précisément
+/// d'avoir coupé en silence.
+const PLAFOND_ELEMENTS_DETAIL: usize = 5000;
+
 /// Les quatre catégories que `/catalog/search` rend dans une même réponse.
 const CATEGORIES_RECHERCHE: [&str; 4] = ["tracks", "albums", "artists", "playlists"];
 
@@ -623,8 +651,12 @@ impl QobuzService {
             debug!(album_id, "qobuz_album_cache_hit");
             return Ok(donnees);
         }
+        // `detail_pagine` et non `api_get` : sans `limit`, Qobuz rend 500
+        // pistes et s'arrête là (#2867). Une intégrale — 1119 pistes chez
+        // Callas — perdait tout ce qui suivait, et la vue comme la lecture
+        // « tout l'album » s'arrêtaient au 500e sans que rien ne le dise.
         let donnees = self
-            .api_get("/album/get", &[("album_id", album_id)])
+            .detail_pagine("/album/get", &[("album_id", album_id)], "tracks")
             .await?;
         self.memoriser_album(album_id, donnees.clone());
         Ok(donnees)
@@ -703,6 +735,98 @@ impl QobuzService {
             .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default())
+    }
+
+    /// Un endpoint de DÉTAIL, complété de ses pages suivantes (#2867).
+    ///
+    /// Différence avec [`Self::api_get_all_pages_bornee`], qui ne rend que le
+    /// tableau d'items : ici on rend la **réponse entière** de la première
+    /// page, dont `data[cle]["items"]` a été rallongé des pages suivantes. Les
+    /// appelants de `/album/get` lisent le haut du document — `title`,
+    /// `artist`, `image`, `genre`, `label`, `tracks_count` — et un tableau nu
+    /// le leur retirerait.
+    ///
+    /// Le contrat rendu est donc celui d'AVANT, à ceci près que `items` est
+    /// désormais complet : `detail_album` peut continuer de mettre en cache la
+    /// réponse telle quelle, et `get_album_tracks` de la lire sans rien
+    /// changer.
+    ///
+    /// La taille de page est [`TAILLE_PAGE_DETAIL`] et non les 50 de
+    /// `api_get_all_pages_bornee` : Qobuz sert ces endpoints par 500, et
+    /// pagineront par 50 coûterait dix fois plus d'allers-retours pour le même
+    /// résultat. Les pages suivantes partent CONCURREMMENT, comme pour les
+    /// favoris, et `buffered` en préserve l'ordre — l'ordre des pistes d'un
+    /// album n'est pas décoratif.
+    async fn detail_pagine(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        cle: &str,
+    ) -> Result<serde_json::Value, String> {
+        use futures_util::StreamExt;
+        const MAX_PAGES_CONCURRENTES: usize = 4;
+
+        let mut data = self
+            .api_get_page(path, base_params, 0, TAILLE_PAGE_DETAIL)
+            .await?;
+        let compte = data[cle]["items"].as_array().map(Vec::len).unwrap_or(0);
+        let total = data[cle]["total"].as_u64().unwrap_or(0) as usize;
+
+        let offsets = remaining_page_offsets_bornees(
+            compte,
+            total,
+            TAILLE_PAGE_DETAIL,
+            PLAFOND_ELEMENTS_DETAIL,
+        );
+
+        // Combien d'éléments les pages prévues peuvent au mieux rapporter. Si
+        // Qobuz en annonce davantage, on coupe — soit parce que le plafond
+        // mord, soit parce que l'amont sert des pages plus courtes qu'il ne
+        // l'annonce. Dans les deux cas on le DIT : couper en silence est le
+        // défaut que cette fonction corrige.
+        let prevu = compte + offsets.len() * TAILLE_PAGE_DETAIL;
+        if total > prevu {
+            warn!(path, cle, compte, prevu, total, "qobuz_detail_tronque");
+        }
+
+        if offsets.is_empty() {
+            return Ok(data);
+        }
+
+        debug!(
+            path,
+            cle,
+            total,
+            pages = offsets.len() + 1,
+            "qobuz_detail_pagine"
+        );
+
+        let pages: Vec<Result<Vec<serde_json::Value>, String>> =
+            futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
+                let page = self
+                    .api_get_page(path, base_params, offset, TAILLE_PAGE_DETAIL)
+                    .await?;
+                Ok(page[cle]["items"].as_array().cloned().unwrap_or_default())
+            }))
+            .buffered(MAX_PAGES_CONCURRENTES)
+            .collect()
+            .await;
+
+        let mut suite: Vec<serde_json::Value> = Vec::new();
+        for page in pages {
+            suite.extend(page?);
+        }
+
+        // Écrit dans le document rendu, à la place même où la première page
+        // avait posé ses items : l'appelant ne voit qu'une réponse complète.
+        if let Some(items) = data
+            .get_mut(cle)
+            .and_then(|n| n.get_mut("items"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            items.extend(suite);
+        }
+        Ok(data)
     }
 
     async fn api_get_all_pages(
@@ -945,6 +1069,20 @@ impl QobuzService {
         })
     }
 
+    /// La pochette d'un nœud Qobuz portant un objet `image` : la grande,
+    /// sinon la petite.
+    ///
+    /// `get_album_tracks` avait ce repli, `map_track` et `map_album` non
+    /// (#2867). Un album dont Qobuz ne sert que `image.small` arrivait donc
+    /// sans pochette dans les listes et les résultats de recherche, alors que
+    /// la vue album en avait une — la même donnée, deux verdicts.
+    fn pochette(noeud: &serde_json::Value) -> Option<String> {
+        noeud["image"]["large"]
+            .as_str()
+            .or_else(|| noeud["image"]["small"].as_str())
+            .map(str::to_string)
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
@@ -965,7 +1103,7 @@ impl QobuzService {
                 .map(Into::into)
                 .or_else(|| album["id"].as_u64().map(|id| id.to_string())),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
-            cover_path: album["image"]["large"].as_str().map(Into::into),
+            cover_path: Self::pochette(album),
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
@@ -996,7 +1134,7 @@ impl QobuzService {
             title: item["title"].as_str().unwrap_or("").into(),
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
-            cover_path: item["image"]["large"].as_str().map(Into::into),
+            cover_path: Self::pochette(item),
             year: item["released_at"]
                 .as_u64()
                 .map(|ts| 1970 + (ts / 31_536_000) as u32)
@@ -1762,10 +1900,7 @@ impl StreamingService for QobuzService {
         // "album" sub-object.  Extract the album-level title, image and
         // id so we can inject them into each mapped track.
         let album_title = data["title"].as_str().map(String::from);
-        let album_cover = data["image"]["large"]
-            .as_str()
-            .or_else(|| data["image"]["small"].as_str())
-            .map(String::from);
+        let album_cover = Self::pochette(&data);
         let album_id_val = data["id"]
             .as_str()
             .map(String::from)
@@ -1844,14 +1979,15 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        // La JUMELLE de `/album/get` (#2867). Le `limit=500` écrit ici n'était
+        // pas une marge confortable : c'est le PLAFOND DUR de Qobuz, mesuré —
+        // `limit=1000` en rend 500. Une playlist de plus de 500 titres était
+        // donc coupée aussi, simplement plus haut.
         let data = self
-            .api_get(
+            .detail_pagine(
                 "/playlist/get",
-                &[
-                    ("playlist_id", playlist_id),
-                    ("extra", "tracks"),
-                    ("limit", "500"),
-                ],
+                &[("playlist_id", playlist_id), ("extra", "tracks")],
+                "tracks",
             )
             .await?;
         let tracks = data["tracks"]["items"]
@@ -2236,8 +2372,12 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        // Troisième jumelle (#2867) : même `limit=500` sans `offset`. Le cas
+        // est plus rare qu'un coffret, mais il existe — un compte de longue
+        // date dépasse le demi-millier de playlists — et la correction ne
+        // coûte rien : sans page suivante, c'est exactement l'appel d'avant.
         let data = self
-            .api_get("/playlist/getUserPlaylists", &[("limit", "500")])
+            .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
             .await?;
         let playlists = data["playlists"]["items"]
             .as_array()
@@ -2416,14 +2556,14 @@ impl StreamingService for QobuzService {
         playlist_id: &str,
         track_ids: &[String],
     ) -> Result<usize, TuneError> {
+        // Paginé comme `get_playlist_tracks` (#2867) : au-delà de 500 titres,
+        // le `playlist_track_id` d'un titre situé plus loin n'était jamais
+        // résolu — la suppression rendait 0 sans rien dire.
         let data = self
-            .api_get(
+            .detail_pagine(
                 "/playlist/get",
-                &[
-                    ("playlist_id", playlist_id),
-                    ("extra", "tracks"),
-                    ("limit", "500"),
-                ],
+                &[("playlist_id", playlist_id), ("extra", "tracks")],
+                "tracks",
             )
             .await?;
         let wanted: std::collections::HashSet<&str> =
@@ -4713,6 +4853,251 @@ mod tests_souscription_playlist {
         assert!(
             recus.lock().expect("verrou d'essai").is_empty(),
             "aucune requête ne doit partir sans jeton utilisateur"
+        );
+    }
+}
+
+/// Les albums longs arrivent ENTIERS (#2867).
+///
+/// Aucun de ces essais ne touche l'API Qobuz : ils parlent à un serveur simulé
+/// lié sur `127.0.0.1:0` qui reproduit le contrat MESURÉ le 30/08/2026 —
+/// `limit` absent vaut 500, `limit` demandé au-delà de 500 est ramené à 500,
+/// `offset` est honoré. La preuve porte donc sur la requête CONSTRUITE et sur
+/// l'assemblage des pages, jamais sur l'amont réel.
+#[cfg(test)]
+mod tests_pagination_detail {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+
+    /// Les couples `(limit, offset)` reçus par le simulé, dans l'ordre d'arrivée.
+    type Journal = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+
+    /// Ce que Qobuz fait de la `limit` demandée — mesuré, pas supposé.
+    ///
+    /// Absente : 500. Au-delà de 500 : **ramenée à 500**. C'est ce plafond qui
+    /// rend la pagination obligatoire ; sans lui, un simple `limit=2000`
+    /// suffirait et le correctif n'aurait pas lieu d'être.
+    fn limite_effective(demandee: Option<&String>) -> usize {
+        demandee
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(TAILLE_PAGE_DETAIL)
+            .min(TAILLE_PAGE_DETAIL)
+    }
+
+    /// Une page d'un conteneur de `total` pistes, sous la clé `cle`.
+    fn page(cle: &str, total: usize, limit: usize, offset: usize) -> serde_json::Value {
+        let fin = (offset + limit).min(total);
+        let items: Vec<serde_json::Value> = (offset..fin)
+            .map(|i| json!({"id": i, "title": format!("piste-{i}"), "duration": 100}))
+            .collect();
+        json!({
+            "id": "boite",
+            "title": "L'intégrale",
+            "name": "L'intégrale",
+            "artist": {"id": 9, "name": "Maria Callas"},
+            "image": {"large": "http://img.qobuz.test/a.jpg"},
+            "tracks_count": total,
+            cle: {"limit": limit, "offset": offset, "total": total, "items": items},
+        })
+    }
+
+    /// Un Qobuz simulé qui pagine `/album/get` et `/playlist/get` comme le vrai.
+    async fn qobuz_simule(total: usize) -> (String, Journal) {
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+
+        let route = |cle: &'static str, journal: Journal| {
+            get(move |Query(q): Query<Carte<String, String>>| {
+                let journal = journal.clone();
+                async move {
+                    journal
+                        .lock()
+                        .expect("verrou d'essai")
+                        .push((q.get("limit").cloned(), q.get("offset").cloned()));
+                    let limit = limite_effective(q.get("limit"));
+                    let offset = q
+                        .get("offset")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    Json(page(cle, total, limit, offset))
+                }
+            })
+        };
+
+        let app = Router::new()
+            .route("/album/get", route("tracks", journal.clone()))
+            .route("/playlist/get", route("tracks", journal.clone()));
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), journal)
+    }
+
+    /// LE défaut de la #2867, sur le plus gros album mesuré du catalogue :
+    /// l'intégrale studio de Maria Callas, 1119 pistes.
+    ///
+    /// Avant le correctif, `/album/get` partait sans `limit` : Qobuz en rendait
+    /// 500 et se taisait sur les 619 autres.
+    #[tokio::test]
+    async fn un_album_de_1119_pistes_arrive_entier() {
+        let (base, journal) = qobuz_simule(1119).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let pistes = svc.get_album_tracks("boite").await.expect("serveur simulé");
+
+        assert_eq!(
+            pistes.len(),
+            1119,
+            "1119 pistes annoncées, 1119 servies — avant le correctif : 500"
+        );
+        // L'ordre n'est pas décoratif : c'est celui de l'œuvre.
+        assert_eq!(pistes[0].title, "piste-0");
+        assert_eq!(pistes[499].title, "piste-499");
+        assert_eq!(pistes[500].title, "piste-500", "la 2e page suit la 1re");
+        assert_eq!(pistes[1118].title, "piste-1118");
+
+        let vues = journal.lock().expect("verrou d'essai").clone();
+        assert_eq!(vues.len(), 3, "500 + 500 + 119 = trois pages");
+        let offsets: Vec<Option<String>> = vues.iter().map(|(_, o)| o.clone()).collect();
+        assert_eq!(
+            offsets,
+            vec![Some("0".into()), Some("500".into()), Some("1000".into())]
+        );
+    }
+
+    /// Le défaut LITTÉRAL du ticket : « ne passe aucune limite ». Même sur un
+    /// album court, la requête doit porter `limit` — c'est elle qui rend le
+    /// comportement déterministe au lieu de dépendre d'un défaut d'API.
+    #[tokio::test]
+    async fn la_requete_porte_une_limite_explicite() {
+        let (base, journal) = qobuz_simule(12).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        svc.get_album_tracks("boite").await.expect("serveur simulé");
+
+        let vues = journal.lock().expect("verrou d'essai").clone();
+        assert_eq!(
+            vues[0].0.as_deref(),
+            Some("500"),
+            "aucune limite passée = le défaut de la #2867"
+        );
+        assert_eq!(vues[0].1.as_deref(), Some("0"));
+    }
+
+    /// TÉMOIN anti-régression : un album court rend exactement ce qu'il rendait
+    /// avant, en UNE requête. Le correctif ne doit rien coûter au cas courant.
+    #[tokio::test]
+    async fn un_album_court_rend_la_meme_chose_en_une_requete() {
+        let (base, journal) = qobuz_simule(12).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let pistes = svc.get_album_tracks("boite").await.expect("serveur simulé");
+
+        assert_eq!(pistes.len(), 12);
+        assert_eq!(pistes[0].title, "piste-0");
+        assert_eq!(pistes[11].title, "piste-11");
+        assert_eq!(
+            pistes[0].album.as_deref(),
+            Some("L'intégrale"),
+            "les métadonnées du haut du document survivent à la pagination"
+        );
+        assert_eq!(pistes[0].artist, "Maria Callas");
+        assert_eq!(
+            journal.lock().expect("verrou d'essai").len(),
+            1,
+            "une page suffit : pas d'aller-retour de plus qu'avant"
+        );
+    }
+
+    /// La JUMELLE : `/playlist/get` portait `limit=500` — le plafond dur, pas
+    /// une marge. Au-delà, la playlist était coupée elle aussi.
+    #[tokio::test]
+    async fn une_playlist_de_1200_titres_arrive_entiere() {
+        let (base, journal) = qobuz_simule(1200).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let pistes = svc.get_playlist_tracks("7").await.expect("serveur simulé");
+
+        assert_eq!(pistes.len(), 1200, "avant le correctif : 500");
+        assert_eq!(pistes[1199].title, "piste-1199");
+        assert_eq!(journal.lock().expect("verrou d'essai").len(), 3);
+    }
+
+    /// Le second point du ticket : `map_album` et `map_track` n'avaient pas le
+    /// repli `image.small` que `get_album_tracks` possédait. Une pochette
+    /// absente en grande taille ne retombait pas sur la petite.
+    #[test]
+    fn la_pochette_retombe_sur_la_petite_taille() {
+        let sans_grande = json!({
+            "id": 1,
+            "title": "Rarissime",
+            "artist": {"name": "X"},
+            "image": {"small": "http://img.qobuz.test/petite.jpg"},
+        });
+        assert_eq!(
+            QobuzService::map_album(&sans_grande).cover_path.as_deref(),
+            Some("http://img.qobuz.test/petite.jpg"),
+            "map_album ignorait image.small (#2867)"
+        );
+
+        let piste = json!({
+            "id": 2,
+            "title": "T",
+            "album": {"title": "A", "image": {"small": "http://img.qobuz.test/petite.jpg"}},
+        });
+        assert_eq!(
+            QobuzService::map_track(&piste).cover_path.as_deref(),
+            Some("http://img.qobuz.test/petite.jpg"),
+            "map_track ignorait image.small (#2867)"
+        );
+
+        // Et la grande reste prioritaire quand elle est là.
+        let les_deux = json!({
+            "id": 3,
+            "title": "B",
+            "artist": {"name": "X"},
+            "image": {"large": "http://img.qobuz.test/grande.jpg",
+                      "small": "http://img.qobuz.test/petite.jpg"},
+        });
+        assert_eq!(
+            QobuzService::map_album(&les_deux).cover_path.as_deref(),
+            Some("http://img.qobuz.test/grande.jpg")
+        );
+    }
+
+    /// Le plafond existe pour qu'un `total` aberrant ne déclenche pas des
+    /// centaines d'allers-retours — et il ne coupe jamais un album réel.
+    #[test]
+    fn le_plafond_borne_sans_jamais_toucher_un_album_reel() {
+        // Callas, 1119 pistes : deux pages après la première, aucune perte.
+        assert_eq!(
+            remaining_page_offsets_bornees(500, 1119, TAILLE_PAGE_DETAIL, PLAFOND_ELEMENTS_DETAIL),
+            vec![500, 1000]
+        );
+        // Un total aberrant est borné à dix pages, pas à l'infini.
+        assert_eq!(
+            remaining_page_offsets_bornees(
+                500,
+                999_999,
+                TAILLE_PAGE_DETAIL,
+                PLAFOND_ELEMENTS_DETAIL
+            )
+            .len(),
+            9
+        );
+        // Un album court ne demande aucune page de plus.
+        assert!(
+            remaining_page_offsets_bornees(12, 12, TAILLE_PAGE_DETAIL, PLAFOND_ELEMENTS_DETAIL)
+                .is_empty()
         );
     }
 }
