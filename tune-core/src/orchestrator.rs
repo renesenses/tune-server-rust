@@ -1022,7 +1022,7 @@ pub(crate) fn command_may_have_landed(err: &str) -> bool {
 /// que le MIME exact qu'ils publient. Aucun MIME PCM ne porte ces trois
 /// lettres, donc la reconnaissance ne peut pas mordre à côté — un FLAC servi à
 /// la même zone n'est jamais confondu avec un DSD.
-fn est_dsd_brut(mime_type: &str) -> bool {
+pub fn est_dsd_brut(mime_type: &str) -> bool {
     let m = mime_type.to_ascii_lowercase();
     m.contains("dsd") || m.contains("dsf") || m.contains("dff")
 }
@@ -1216,7 +1216,7 @@ pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) ->
 
 /// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel
 /// que le scan l'a écrit.
-pub(crate) fn est_source_dsd(format: Option<&str>) -> bool {
+pub fn est_source_dsd(format: Option<&str>) -> bool {
     format.is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"))
 }
 
