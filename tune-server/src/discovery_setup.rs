@@ -42,23 +42,51 @@ fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
 /// Register a discovered output and notify controllers as one operation. Zone
 /// creation is deliberately independent: hidden devices and devices for which
 /// automatic zone creation is disabled must still appear in Settings > Network.
+///
+/// `annonce` dit LEQUEL des deux noms part sur le fil. Une re-resolution mDNS
+/// d'un appareil deja connu n'est pas une decouverte : elle passait pourtant
+/// sous `device.discovered`, et `MdnsEvent::DeviceUpdated` restait purement
+/// interne — `OnboardingView.svelte` ecoute pourtant `device.updated` par son
+/// nom (#2870). La charge utile est la meme dans les deux cas : le client ne la
+/// lit pas, il recharge sa liste.
+///
+/// Les deux `emit_typed` NOMMENT leur variante en toutes lettres, plutot que de
+/// relayer un `EventType` recu en parametre : c'est ce qui rend l'emission
+/// visible a un `git grep` — et au garde-fou de `event_types.rs`, qui exige de
+/// trouver le nom en PREMIER argument d'un `emit`.
 fn register_discovered_output(
     registry: &mut OutputRegistry,
     output: Box<dyn tune_core::outputs::OutputTarget>,
     event_bus: &EventBus,
     dev: &tune_core::discovery::device::DiscoveredDevice,
     device_type: &str,
+    annonce: AnnonceAppareil,
 ) {
     registry.register(output);
-    event_bus.emit_typed(
-        EventType::DeviceDiscovered,
-        serde_json::json!({
-            "device_id": &dev.id,
-            "name": &dev.name,
-            "device_type": device_type,
-            "host": &dev.host,
-        }),
-    );
+    let charge = serde_json::json!({
+        "device_id": &dev.id,
+        "name": &dev.name,
+        "device_type": device_type,
+        "host": &dev.host,
+    });
+    match annonce {
+        AnnonceAppareil::Decouverte => {
+            event_bus.emit_typed(EventType::DeviceDiscovered, charge);
+        }
+        AnnonceAppareil::MiseAJour => {
+            event_bus.emit_typed(EventType::DeviceUpdated, charge);
+        }
+    }
+}
+
+/// L'appareil qu'on enregistre est-il NOUVEAU, ou deja connu et simplement
+/// re-resolu ?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnonceAppareil {
+    /// Premiere apparition — `device.discovered`.
+    Decouverte,
+    /// Deja vu, informations rafraichies — `device.updated`.
+    MiseAJour,
 }
 
 /// Registre des serveurs multimédia, tel que le porte `AppState`.
@@ -546,7 +574,14 @@ async fn handle_ssdp_discovered(
             evt_urls,
         );
         let mut reg = outputs.lock().await;
-        register_discovered_output(&mut reg, Box::new(oh), event_bus, dev, "openhome");
+        register_discovered_output(
+            &mut reg,
+            Box::new(oh),
+            event_bus,
+            dev,
+            "openhome",
+            AnnonceAppareil::Decouverte,
+        );
         registered = true;
         info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
     } else {
@@ -591,7 +626,14 @@ async fn handle_ssdp_discovered(
             )
             .with_play_delay(delay);
             let mut reg = outputs.lock().await;
-            register_discovered_output(&mut reg, Box::new(dlna), event_bus, dev, "dlna");
+            register_discovered_output(
+                &mut reg,
+                Box::new(dlna),
+                event_bus,
+                dev,
+                "dlna",
+                AnnonceAppareil::Decouverte,
+            );
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
@@ -1050,6 +1092,14 @@ pub fn spawn_mdns_handler(
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
         while let Some(event) = mdns_rx.recv().await {
+            // Les deux cas suivent le MEME chemin (enregistrement de la sortie,
+            // reconnexion ou creation de zone) : seul le NOM annonce au client
+            // differe. On le retient avant le `match`, qui consomme l'evenement.
+            let annonce = if matches!(event, MdnsEvent::DeviceUpdated(_)) {
+                AnnonceAppareil::MiseAJour
+            } else {
+                AnnonceAppareil::Decouverte
+            };
             match event {
                 MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
                     // Set when an AirPlay 2 device falls back to the legacy
@@ -1186,6 +1236,7 @@ pub fn spawn_mdns_handler(
                             &event_bus,
                             &dev,
                             output_type_str,
+                            annonce,
                         );
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
@@ -1987,8 +2038,8 @@ fn refus_nommes(instantane: &serde_json::Value) -> Vec<(String, String, String)>
 #[cfg(test)]
 mod tests {
     use super::{
-        find_cross_protocol_zone_conflict, may_reanchor, refus_nommes, register_discovered_output,
-        resolve_control_url, statut_du_fournisseur,
+        AnnonceAppareil, find_cross_protocol_zone_conflict, may_reanchor, refus_nommes,
+        register_discovered_output, resolve_control_url, statut_du_fournisseur,
     };
     use tune_core::db::zone_repo::Zone;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
@@ -2039,7 +2090,14 @@ mod tests {
         );
         let mut registry = tune_core::outputs::OutputRegistry::new();
 
-        register_discovered_output(&mut registry, Box::new(output), &bus, &dev, "chromecast");
+        register_discovered_output(
+            &mut registry,
+            Box::new(output),
+            &bus,
+            &dev,
+            "chromecast",
+            AnnonceAppareil::Decouverte,
+        );
 
         let event = events.recv().await.expect("device event");
         assert!(registry.contains("cast-living-room"));
@@ -2052,6 +2110,63 @@ mod tests {
                 "device_type": "chromecast",
                 "host": "192.0.2.42",
             })
+        );
+    }
+
+    /// #2870 : une RE-RESOLUTION mDNS d'un appareil deja connu doit partir sous
+    /// `device.updated`, pas sous `device.discovered`.
+    ///
+    /// `MdnsEvent::DeviceUpdated` existait — c'est lui qui porte la reparation
+    /// d'adresse IPv6→IPv4 des enceintes AirPlay — mais il restait INTERNE :
+    /// les deux cas tombaient dans la meme branche et annoncaient une
+    /// decouverte. `OnboardingView.svelte` ecoute pourtant `device.updated` par
+    /// son nom, et aucun serveur ne l'a jamais emis.
+    ///
+    /// La charge utile est la MEME dans les deux sens : le client ne la lit pas,
+    /// il recharge sa liste — et c'est le seul contrat qu'il faut tenir.
+    #[tokio::test]
+    async fn une_re_resolution_annonce_device_updated_et_pas_discovered() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let dev = DiscoveredDevice::new(
+            "airplay-192.0.2.7-7000".into(),
+            "Phantom SALON".into(),
+            OutputType::Airplay,
+            "192.0.2.7".into(),
+            7000,
+        );
+        let output = tune_core::outputs::chromecast::ChromecastOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            dev.port,
+        );
+        let mut registry = tune_core::outputs::OutputRegistry::new();
+
+        register_discovered_output(
+            &mut registry,
+            Box::new(output),
+            &bus,
+            &dev,
+            "airplay",
+            AnnonceAppareil::MiseAJour,
+        );
+
+        let event = events.recv().await.expect("device event");
+        assert_eq!(
+            event.event_type, "device.updated",
+            "une mise a jour annoncee comme une decouverte, c'est le defaut #2870"
+        );
+        assert_ne!(event.event_type, "device.discovered");
+        assert_eq!(
+            event.data,
+            serde_json::json!({
+                "device_id": "airplay-192.0.2.7-7000",
+                "name": "Phantom SALON",
+                "device_type": "airplay",
+                "host": "192.0.2.7",
+            }),
+            "meme contrat de charge utile que device.discovered"
         );
     }
 
