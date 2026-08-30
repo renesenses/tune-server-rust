@@ -432,6 +432,31 @@ fn resoudre_portee(
     Ok(tune_core::metadata::enrich_scope::EnrichScope::from_directory(&state.backend, &dir))
 }
 
+/// Attend que TOUTES les passes d'une exécution soient retombées, puis annonce
+/// la fin une fois et une seule.
+///
+/// Le nom de l'événement est un contrat INTER-DÉPÔTS : c'est le client qui
+/// écoutait `library.enrich.completed` en premier. Il passe donc par
+/// `EventType::EnrichComplete`, verrouillé par `as_str_matches_wire_contract`
+/// dans `tune-core/src/event_types.rs` — jamais par une chaîne libre.
+///
+/// Une passe qui panique ne retient PAS l'annonce : les autres ont travaillé,
+/// la bibliothèque a bougé, et l'écran doit relire ses compteurs de toute
+/// façon. C'est pourquoi le résultat du `await` est délibérément ignoré.
+async fn annoncer_fin_de_passe(
+    taches: Vec<tokio::task::JoinHandle<()>>,
+    event_bus: std::sync::Arc<tune_core::event_bus::EventBus>,
+    charge: Value,
+) {
+    for tache in taches {
+        if let Err(e) = tache.await {
+            tracing::warn!(error = %e, "enrichment_run_passe_interrompue");
+        }
+    }
+    event_bus.emit_typed(tune_core::event_types::EventType::EnrichComplete, charge);
+    tracing::info!("enrichment_run_completed_event_emitted");
+}
+
 pub(super) async fn enrichment_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -471,7 +496,7 @@ pub(super) async fn enrichment_run(
     let cache_dir = crate::routes::library::artwork_cache_dir();
     let cache_dir2 = cache_dir.clone();
     let scope1 = scope.clone();
-    tokio::spawn(async move {
+    let tache_pochettes = tokio::spawn(async move {
         tune_core::library::artwork::batch_enrich_artwork_scoped(db1, cache_dir, scope1).await;
     });
 
@@ -481,7 +506,7 @@ pub(super) async fn enrichment_run(
     let art_cache = cache_dir2.clone();
     let scope_mbid = scope.clone();
     let scope_art = scope.clone();
-    tokio::spawn(async move {
+    let tache_artistes = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         tune_core::metadata::matcher::batch_match_artist_mbids_scoped(mbid_db, scope_mbid).await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -496,7 +521,7 @@ pub(super) async fn enrichment_run(
     let bio_album_db = state.backend.clone();
     let scope_bio_artist = scope.clone();
     let scope_bio_album = scope.clone();
-    tokio::spawn(async move {
+    let tache_bios = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         tune_core::metadata::bio_batch::batch_enrich_artist_bios_scoped(
             bio_artist_db,
@@ -516,7 +541,7 @@ pub(super) async fn enrichment_run(
     // 4. Extended file metadata
     let ext_db = state.backend.clone();
     let scope_ext = scope.clone();
-    tokio::spawn(async move {
+    let tache_metadonnees = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let meta_repo =
             tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(ext_db.clone());
@@ -575,6 +600,34 @@ pub(super) async fn enrichment_run(
             }
         }
         tracing::info!(total, enriched, "enrichment_run_extended_metadata_complete");
+    });
+
+    // 5. Point d'achèvement UNIQUE de la passe (#2259).
+    //
+    // Les quatre passes ci-dessus tournent en parallèle et ne rendent aucun
+    // compte : la route répondait 202 puis n'émettait plus rien, alors que le
+    // client écoute `library.enrich.completed` depuis la v0.8
+    // (`MetadataView.svelte`, `SettingsView.svelte`). #2543 a réparé l'AUTRE
+    // chemin d'enrichissement (`/library/enrich-all`) et a laissé celui-ci de
+    // côté, faute justement d'un instant « c'est fini » : deux tâches
+    // concurrentes, aucun point de jonction. Ce superviseur est ce point —
+    // une seule source de vérité, sur le modèle du rapport de fin de scan
+    // (#2827), plutôt qu'une émission par passe qui ferait clignoter l'écran
+    // quatre fois et annoncerait « terminé » trois fois trop tôt.
+    let bus_fin = state.event_bus.clone();
+    let repertoire = scope.as_ref().map(|s| s.dir.clone());
+    tokio::spawn(async move {
+        annoncer_fin_de_passe(
+            vec![
+                tache_pochettes,
+                tache_artistes,
+                tache_bios,
+                tache_metadonnees,
+            ],
+            bus_fin,
+            json!({ "directory": repertoire }),
+        )
+        .await;
     });
 
     (
@@ -731,4 +784,97 @@ fn cleanup_orphan_artwork(
         tracing::info!(deleted, "orphan_artwork_cleaned");
     }
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Le motif que ce correctif ferme : `/system/enrichment/run` lance quatre
+    /// passes en parallèle et le client attend `library.enrich.completed`.
+    /// L'annonce doit tomber APRÈS la dernière passe — une annonce anticipée
+    /// ferait relire des compteurs encore inchangés, c'est-à-dire exactement le
+    /// symptôme de #2259 sous une autre forme.
+    #[tokio::test]
+    async fn la_fin_de_passe_est_annoncee_apres_la_derniere_tache() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+        let faites = Arc::new(AtomicUsize::new(0));
+
+        // Des durées volontairement désordonnées : la plus longue n'est pas la
+        // dernière lancée, donc un `await` oublié se voit.
+        let taches = [40u64, 10, 60, 20]
+            .into_iter()
+            .map(|ms| {
+                let faites = faites.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    faites.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Le compteur se relève À L'INSTANT de la réception, jamais après coup.
+        // Lu après le retour de la fonction il vaudrait 4 même si l'annonce
+        // était partie en premier : c'est exactement ce qu'a montré la
+        // contre-épreuve, où déplacer l'émission avant la jonction laissait le
+        // test au vert. Un guetteur concurrent est le seul montage qui date
+        // l'annonce par rapport aux passes.
+        let temoin = faites.clone();
+        let guetteur = tokio::spawn(async move {
+            let ev = rx
+                .recv()
+                .await
+                .expect("aucun evenement de fin de passe emis");
+            let a_l_annonce = temoin.load(Ordering::SeqCst);
+            let encore = rx.try_recv().is_ok();
+            (ev.event_type, a_l_annonce, encore)
+        });
+
+        annoncer_fin_de_passe(taches, bus.clone(), json!({ "directory": null })).await;
+
+        let (nom, faites_a_l_annonce, encore) = guetteur.await.unwrap();
+        assert_eq!(
+            nom, "library.enrich.completed",
+            "nom attendu par MetadataView.svelte et SettingsView.svelte"
+        );
+        assert_eq!(
+            faites_a_l_annonce, 4,
+            "annonce emise avant la fin des quatre passes"
+        );
+        assert!(!encore, "la fin de passe s'annonce une seule fois");
+    }
+
+    /// Une passe qui panique ne doit pas laisser l'écran figé pour toujours :
+    /// les autres ont travaillé, la bibliothèque a bougé.
+    #[tokio::test]
+    async fn une_passe_qui_panique_ne_retient_pas_l_annonce() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        let taches = vec![
+            tokio::spawn(async { panic!("passe en echec") }),
+            tokio::spawn(async {}),
+        ];
+
+        annoncer_fin_de_passe(taches, bus.clone(), json!({ "directory": null })).await;
+
+        let ev = rx.try_recv().expect("une panique a supprime l'annonce");
+        assert_eq!(ev.event_type, "library.enrich.completed");
+    }
+
+    /// La portée par répertoire (#1660) voyage dans la charge : un client qui a
+    /// demandé un dossier doit pouvoir ne rafraîchir que lui.
+    #[tokio::test]
+    async fn la_portee_voyage_dans_la_charge() {
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+
+        annoncer_fin_de_passe(vec![], bus.clone(), json!({ "directory": "/music/Jazz" })).await;
+
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.data["directory"].as_str(), Some("/music/Jazz"));
+    }
 }
