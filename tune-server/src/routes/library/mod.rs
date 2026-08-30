@@ -192,6 +192,13 @@ pub fn router() -> Router<AppState> {
             "/albums/{id}/hide",
             post(albums::hide_album).delete(albums::unhide_album),
         )
+        // « Ces deux albums ne sont pas des doublons » (#1276). Même hygiène
+        // que `/albums/hidden` : le segment statique d'abord.
+        .route("/albums/distinct", get(albums::list_distinct_pairs))
+        .route(
+            "/albums/{id}/distinct/{other_id}",
+            post(albums::declare_albums_distinct).delete(albums::revoke_albums_distinct),
+        )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))

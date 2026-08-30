@@ -305,9 +305,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             .output_device_id
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+        let audio_backend_pref = state.display_audio_backend();
         #[cfg(feature = "local-audio")]
-        let audio_backend =
-            tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+        let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
         let wire = match zone_state
@@ -329,6 +329,18 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
+        // #1395 — même raison que pour `signal_path` ci-dessus : c'est CETTE
+        // réponse que `playAndSync` rend à la première piste. Sans le champ
+        // ici, la divergence « réglé ASIO / joué en WASAPI » n'apparaîtrait
+        // qu'à partir de la seconde (forum #1012, Bilou — déjà lui).
+        if let Some(status) = crate::routes::zones::local_backend_status_value(
+            zone.output_type.as_deref(),
+            &audio_backend_pref,
+        ) {
+            v.as_object_mut()
+                .unwrap()
+                .insert("audio_backend_status".into(), status);
+        }
         v.as_object_mut()
             .unwrap()
             .insert("resolving".into(), json!(zone_state.resolving));

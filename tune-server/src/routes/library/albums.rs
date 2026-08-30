@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
+use tune_core::db::album_distinct_repo::{AlbumDistinctRepo, DistinctPairSet};
 use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
@@ -632,6 +633,77 @@ pub(super) async fn album_similar(
     }
 }
 
+/// `POST /library/albums/{id}/distinct/{other_id}` — « ces deux albums ne sont
+/// pas des doublons » (#1276).
+///
+/// L'arbitrage vaut pour les DEUX chemins qui rapprochent des albums :
+/// `GET /library/albums/grouped` cesse de signaler la paire, et
+/// `POST /library/albums/merge-duplicates` refuse de la fusionner. Il est
+/// persisté par identité (titre + artiste des deux côtés) et réconcilié aux
+/// mêmes ancrages que les masquages : il survit au rescan, au déplacement de
+/// racine et à la mort/renaissance d'une ligne `albums`.
+///
+/// Idempotent, et insensible à l'ordre des deux ids.
+pub(super) async fn declare_albums_distinct(
+    State(state): State<AppState>,
+    Path((id, other_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    match repo.declarer_distincts(id, other_id) {
+        Ok(true) => Ok(Json(
+            json!({"album_a_id": id.min(other_id), "album_b_id": id.max(other_id), "distinct": true}),
+        )),
+        Ok(false) if id == other_id => Err(AppError::bad_request(
+            "un album n'est pas un doublon de lui-même",
+        )),
+        Ok(false) => Err(AppError::not_found(format!(
+            "album {id} ou {other_id} not found"
+        ))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `DELETE /library/albums/{id}/distinct/{other_id}` — révoque l'arbitrage :
+/// la paire redevient candidate au rapprochement. Idempotent.
+pub(super) async fn revoke_albums_distinct(
+    State(state): State<AppState>,
+    Path((id, other_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    match repo.revoquer(id, other_id) {
+        Ok(_) => Ok(Json(
+            json!({"album_a_id": id.min(other_id), "album_b_id": id.max(other_id), "distinct": false}),
+        )),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `GET /library/albums/distinct` — la liste de révision : toutes les paires
+/// arbitrées, y compris celles momentanément orphelines (racine démontée),
+/// rendues avec leur instantané d'identité pour rester révocables.
+pub(super) async fn list_distinct_pairs(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumDistinctRepo::with_backend(state.backend.clone());
+    let items = repo.lister().map_err(AppError::internal)?;
+    Ok(Json(json!({"total": items.len(), "items": items})))
+}
+
+/// Les paires que l'utilisateur a déclarées distinctes (#1276), chargées en
+/// UNE requête pour interrogation en mémoire.
+///
+/// Un échec de lecture rend l'ensemble VIDE, donc le comportement d'avant
+/// #1276 : le rapprochement continue de fonctionner. Le sens inverse (tout
+/// bloquer) transformerait une base en défaut en fonctionnalité muette.
+fn paires_distinctes(state: &AppState) -> DistinctPairSet {
+    AlbumDistinctRepo::with_backend(state.backend.clone())
+        .charger_ensemble()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "album_distinct_pairs_load_failed");
+            DistinctPairSet::default()
+        })
+}
+
 pub(super) async fn merge_duplicate_albums_route(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
@@ -666,7 +738,14 @@ pub(super) async fn merge_duplicate_albums_route(
         })
         .collect();
 
+    // #1276 : l'utilisateur a pu déclarer que deux de ces albums sont des
+    // releases DIFFÉRENTES. Une requête, un `HashSet` — le coût par candidat
+    // reste nul, et aucun `LOWER` n'est ajouté à ce chemin (#2848 y a mesuré
+    // ×4000 pour un `LOWER` non indexé).
+    let distinctes = paires_distinctes(&state);
+
     let mut deleted = 0i64;
+    let mut protegees = 0i64;
     for (_title, ids_str) in &dupes {
         let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
         if ids.len() < 2 {
@@ -691,20 +770,33 @@ pub(super) async fn merge_duplicate_albums_route(
         let update_sql = format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}");
         let delete_sql = format!("DELETE FROM albums WHERE id = {p1}");
         for &aid in &ids {
-            if aid != best_id {
-                state
-                    .backend
-                    .execute(
-                        &update_sql,
-                        &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
-                    )
-                    .ok();
-                state
-                    .backend
-                    .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
-                    .ok();
-                deleted += 1;
+            if aid == best_id {
+                continue;
             }
+            // L'arbitrage de l'utilisateur prime sur le rapprochement par
+            // titre : la fusion SUPPRIME la ligne perdante, elle ne se répare
+            // pas. Un album protégé reste simplement à part (#1276).
+            if distinctes.contains(best_id, aid) {
+                protegees += 1;
+                tracing::info!(
+                    conserve = best_id,
+                    protege = aid,
+                    "album_merge_ignoree_paire_declaree_distincte"
+                );
+                continue;
+            }
+            state
+                .backend
+                .execute(
+                    &update_sql,
+                    &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                )
+                .ok();
+            state
+                .backend
+                .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
+                .ok();
+            deleted += 1;
         }
     }
     state
@@ -713,7 +805,7 @@ pub(super) async fn merge_duplicate_albums_route(
             "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
         )
         .ok();
-    Ok(Json(json!({ "merged": deleted })))
+    Ok(Json(json!({ "merged": deleted, "protected": protegees })))
 }
 
 const VARIANT_PATTERNS: &[&str] = &[
@@ -744,23 +836,59 @@ fn strip_variant_suffix(title: &str) -> String {
     title.to_string()
 }
 
+/// Écarte du groupe les variantes que l'utilisateur a déclarées distinctes de
+/// l'original (#1276), et rend `None` si le groupe n'a plus de variante — il
+/// ne signale alors plus rien.
+///
+/// La comparaison se fait contre l'ORIGINAL du groupe, celui que l'écran
+/// propose de garder. Un groupe de trois où une seule paire est arbitrée garde
+/// donc les deux autres membres rapprochés : on retire la paire nommée, on
+/// n'invente pas de nouveau rapprochement.
+fn variantes_retenues<'a, I>(
+    original: &Album,
+    variantes: I,
+    distinctes: &DistinctPairSet,
+) -> Option<Vec<&'a Album>>
+where
+    I: IntoIterator<Item = &'a Album>,
+{
+    let retenues: Vec<&Album> = match original.id {
+        Some(oid) if !distinctes.is_empty() => variantes
+            .into_iter()
+            .filter(|a| a.id.is_none_or(|vid| !distinctes.contains(oid, vid)))
+            .collect(),
+        _ => variantes.into_iter().collect(),
+    };
+    if retenues.is_empty() {
+        None
+    } else {
+        Some(retenues)
+    }
+}
+
 pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
+
+    // #1276 : les paires que l'utilisateur a déclarées « pas des doublons ».
+    // Chargées en UNE requête, interrogées en mémoire — aucun coût par
+    // candidat, aucun `LOWER` ajouté au rapprochement.
+    let distinctes = paires_distinctes(&state);
 
     // Group by MusicBrainz release group ID
     let mbid_groups = repo.list_release_groups().unwrap_or_default();
 
     let mut groups: Vec<Value> = mbid_groups
         .iter()
-        .map(|(gid, albums)| {
+        .filter_map(|(gid, albums)| {
             let original = &albums[0];
-            json!({
+            let variants = variantes_retenues(original, &albums[1..], &distinctes)?;
+            Some(json!({
                 "group_id": gid,
                 "method": "musicbrainz",
                 "original": original.to_json(),
-                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
-                "count": albums.len(),
-            })
+                "variants": variants.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": variants.len() + 1,
+            }))
         })
         .collect();
 
@@ -785,12 +913,20 @@ pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json
 
     for (base_title, albums) in &title_map {
         if albums.len() > 1 {
+            // Même arbitrage que pour les groupes MusicBrainz (#1276) : une
+            // variante déclarée distincte de l'original sort du groupe, et un
+            // groupe vidé de ses variantes n'est plus signalé du tout.
+            let Some(variants) =
+                variantes_retenues(albums[0], albums[1..].iter().copied(), &distinctes)
+            else {
+                continue;
+            };
             groups.push(json!({
                 "group_id": base_title,
                 "method": "title_similarity",
                 "original": albums[0].to_json(),
-                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
-                "count": albums.len(),
+                "variants": variants.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": variants.len() + 1,
             }));
         }
     }

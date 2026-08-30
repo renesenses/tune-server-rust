@@ -1,3 +1,6 @@
+/// « Ces deux albums ne sont pas des doublons » (#1276) — paires arbitrées par
+/// l'utilisateur, réconciliées sur le modèle des favoris et des masquages.
+pub mod album_distinct_repo;
 pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;

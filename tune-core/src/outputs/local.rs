@@ -144,28 +144,32 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
                     let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
-                    if device_count > 0 {
+                    let (active, fallback) = asio_outcome(Some(device_count));
+                    if fallback.is_none() {
                         info!(
                             backend = "asio",
                             devices = device_count,
                             "local_audio_host_selected"
                         );
-                        note_observed_backend("ASIO");
+                        note_observed_backend(active, fallback);
                         return host;
                     }
                     warn!(
+                        fallback_reason = LocalBackendFallback::AsioNoDevices.code(),
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
                 Err(e) => {
+                    let (active, fallback) = asio_outcome(None);
                     warn!(
                         error = %e,
+                        fallback_reason = LocalBackendFallback::AsioHostUnavailable.code(),
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
             },
@@ -176,12 +180,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // (the canonical name; the older TUNE_AUDIO_BACKEND is still
                 // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
         }
@@ -189,13 +193,21 @@ pub fn select_host(backend: &str) -> cpal::Host {
 
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
-        let _ = &backend_lower;
-        if backend_lower == "asio" {
+        // Le membre de la famille qui n'enregistrait RIEN. Un binaire Windows
+        // construit sans la feature `asio`, ou une bibliothèque migrée sur un
+        // serveur Linux/macOS avec `local_audio_backend=asio` déjà persisté,
+        // ouvrait le host par défaut sans laisser la moindre trace côté API :
+        // le sélecteur continuait d'afficher ASIO, la lecture sortait ailleurs,
+        // et le seul indice vivait dans une ligne WARN.
+        let (active, fallback) = unsupported_outcome(&backend_lower);
+        if let Some(reason) = fallback {
             warn!(
+                fallback_reason = reason.code(),
                 "local_audio_asio_requested_but_not_available — \
                  ASIO requires Windows and the `asio` cargo feature"
             );
         }
+        note_observed_backend(active, fallback);
         cpal::default_host()
     }
 }
@@ -209,19 +221,158 @@ pub fn select_host(backend: &str) -> cpal::Host {
 /// rien ne remontait cette bascule : l'interface continuait d'annoncer le
 /// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
 /// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
-static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+static OBSERVED_BACKEND: std::sync::RwLock<Option<ObservedBackend>> = std::sync::RwLock::new(None);
 
-/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+/// Ce que le dernier `select_host` a réellement ouvert, et pourquoi il n'a pas
+/// pu honorer la demande quand c'est le cas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedBackend {
+    name: &'static str,
+    fallback_reason: Option<LocalBackendFallback>,
+}
+
+/// Pourquoi la sortie locale ne tourne pas sur le backend demandé.
 ///
-/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
-/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
-/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
-/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
-/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
-#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
-fn note_observed_backend(name: &'static str) {
+/// #1395 — le nom du backend actif ne suffit pas. Bilou règle sa zone « Ce PC /
+/// Hauts Parleurs » sur ASIO, la lecture sort en WASAPI, et la seule trace du
+/// basculement est une ligne `local_audio_asio_no_devices` dans le journal : il
+/// a fallu qu'il poste une capture de ses logs sur le forum pour que quiconque
+/// sache pourquoi. Le motif existe côté serveur ; il n'était simplement remonté
+/// nulle part.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les traduit),
+/// sur le modèle de `runtime_reasons` du chemin du signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalBackendFallback {
+    /// L'hôte ASIO s'ouvre mais n'expose **aucune** sortie. Cas de Bilou : un
+    /// pilote ASIO ne s'ouvre que dans un seul processus, donc une autre
+    /// application qui le tient le fait disparaître de l'énumération.
+    AsioNoDevices,
+    /// L'hôte ASIO ne s'ouvre pas du tout — pilote absent ou non enregistré.
+    AsioHostUnavailable,
+    /// ASIO a été demandé sur un binaire qui ne peut pas l'honorer : hors
+    /// Windows, ou Windows compilé sans la feature `asio`. Connu à la
+    /// compilation, donc affirmable sans avoir ouvert le moindre périphérique.
+    AsioUnsupportedBuild,
+}
+
+impl LocalBackendFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => "asio_no_devices",
+            Self::AsioHostUnavailable => "asio_host_unavailable",
+            Self::AsioUnsupportedBuild => "asio_unsupported_build",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français (`runtime_signal_reason_detail`).
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => {
+                "ASIO demandé : pilote présent mais aucune sortie exposée \
+                 (une autre application le tient peut-être) — repli WASAPI"
+            }
+            Self::AsioHostUnavailable => {
+                "ASIO demandé : pilote ASIO introuvable ou non ouvrable — repli WASAPI"
+            }
+            Self::AsioUnsupportedBuild => {
+                "ASIO demandé : cette version du serveur n'embarque pas ASIO — \
+                 sortie par le backend natif de la plateforme"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 3] = [
+        Self::AsioNoDevices,
+        Self::AsioHostUnavailable,
+        Self::AsioUnsupportedBuild,
+    ];
+}
+
+/// Ce que la sortie locale fait vraiment, à côté de ce qu'on lui a demandé.
+///
+/// Additif : `active` reprend exactement ce que rend [`active_backend_name`],
+/// les deux autres champs sont nouveaux. Un client qui ne les lit pas voit le
+/// même écran qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalBackendStatus {
+    /// Backend réellement ouvert : `"ASIO"`, `"WASAPI"`, `"CoreAudio"`, `"ALSA"`.
+    pub active: &'static str,
+    /// Ce que le réglage demandait, normalisé en minuscules (`"asio"`, `"auto"`…).
+    pub requested: String,
+    /// `true` dès que l'actif ne correspond pas au demandé.
+    pub fell_back: bool,
+    /// Pourquoi, quand le serveur le sait. `None` = aucun repli constaté.
+    pub fallback_reason: Option<LocalBackendFallback>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
+    pub fallback_detail: Option<&'static str>,
+}
+
+/// Enregistre le backend réellement ouvert, et le motif du repli s'il y en a un.
+/// Appelé par `select_host` seul, sur **toutes** les cibles.
+fn note_observed_backend(name: &'static str, fallback_reason: Option<LocalBackendFallback>) {
     if let Ok(mut slot) = OBSERVED_BACKEND.write() {
-        *slot = Some(name);
+        *slot = Some(ObservedBackend {
+            name,
+            fallback_reason,
+        });
+    }
+}
+
+/// Issue d'une demande `asio` sur une cible qui embarque ASIO.
+///
+/// `asio_devices` : `None` = l'hôte ASIO ne s'ouvre pas ; `Some(0)` = il
+/// s'ouvre mais n'expose aucune sortie ; `Some(n > 0)` = ASIO joue.
+///
+/// Isolée de cpal exprès : la branche appelante vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et ne peut être
+/// exécutée ni sur macOS ni sur Linux. La décision, elle, se joue partout.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn asio_outcome(asio_devices: Option<usize>) -> (&'static str, Option<LocalBackendFallback>) {
+    match asio_devices {
+        Some(n) if n > 0 => ("ASIO", None),
+        Some(_) => ("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+        None => ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable)),
+    }
+}
+
+/// Issue d'une demande sur une cible qui n'embarque **pas** ASIO.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn unsupported_outcome(requested_lower: &str) -> (&'static str, Option<LocalBackendFallback>) {
+    let active = platform_default_backend_name();
+    if requested_lower == "asio" {
+        (active, Some(LocalBackendFallback::AsioUnsupportedBuild))
+    } else {
+        (active, None)
+    }
+}
+
+/// Le backend qu'ouvre `cpal::default_host()` sur cette plateforme.
+///
+/// Sur Windows+ASIO, seul [`unsupported_outcome`] — lui-même inerte sur cette
+/// cible — s'en sert : d'où le `dead_code` autorisé plutôt qu'un `cfg` de plus.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn platform_default_backend_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "WASAPI"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "CoreAudio"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ALSA"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "default"
     }
 }
 
@@ -230,7 +381,24 @@ fn note_observed_backend(name: &'static str) {
 /// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
 /// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
-    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+    backend_display_name(
+        OBSERVED_BACKEND
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .map(|o| o.name),
+        backend,
+    )
+}
+
+/// Ce que la sortie locale fait, ce qu'on lui a demandé, et l'écart s'il existe.
+///
+/// C'est la réponse à #1395 : `active_backend_name` disait déjà la vérité sur le
+/// backend, mais un utilisateur qui lit « WASAPI » alors qu'il a réglé « ASIO »
+/// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
+/// serveur a basculé — ni pourquoi.
+pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
+    backend_status(OBSERVED_BACKEND.read().ok().and_then(|g| *g), requested)
 }
 
 /// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
@@ -243,30 +411,50 @@ fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'stat
     {
         match backend.to_lowercase().as_str() {
             "asio" => "ASIO",
-            "wasapi" => "WASAPI",
-            "auto" => "WASAPI",
             _ => "WASAPI",
         }
     }
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
         let _ = backend;
-        #[cfg(target_os = "windows")]
-        {
-            "WASAPI"
-        }
-        #[cfg(target_os = "macos")]
-        {
-            "CoreAudio"
-        }
-        #[cfg(target_os = "linux")]
-        {
-            "ALSA"
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            "default"
-        }
+        platform_default_backend_name()
+    }
+}
+
+/// Même isolement pour le statut complet : aucune lecture de l'état global,
+/// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+fn backend_status(observed: Option<ObservedBackend>, requested: &str) -> LocalBackendStatus {
+    let requested_lower = requested.to_lowercase();
+    let active = backend_display_name(observed.map(|o| o.name), requested);
+
+    let fallback_reason = match observed {
+        // Une OBSERVATION est autoritaire, y compris quand elle ne porte aucun
+        // motif : `select_host` a ouvert un périphérique et sait ce qu'il a
+        // ouvert. Retomber sur la déduction ici rajouterait un motif à un
+        // backend qui joue — la faute exactement inverse de celle qu'on
+        // corrige, et c'est ce test qui l'a attrapée.
+        Some(o) => o.fallback_reason,
+        // Sans observation, un seul motif est affirmable, parce qu'il est
+        // décidé à la COMPILATION : un binaire sans ASIO ne pourra jamais
+        // honorer « asio ». On n'en devine aucun autre.
+        None => (requested_lower == "asio" && !asio_available())
+            .then_some(LocalBackendFallback::AsioUnsupportedBuild),
+    };
+
+    // L'écart se voit sans motif : un réglage sur « asio » et un actif
+    // « WASAPI » suffisent à le dire, même quand la cause n'est pas connue
+    // (réglage changé, flux pas encore rouvert).
+    let fell_back = fallback_reason.is_some()
+        || !(requested_lower == "auto"
+            || requested_lower.is_empty()
+            || requested_lower.eq_ignore_ascii_case(active));
+
+    LocalBackendStatus {
+        active,
+        requested: requested_lower,
+        fell_back,
+        fallback_reason,
+        fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
     }
 }
 
@@ -9483,6 +9671,302 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+/// #1395 — le motif du repli, pas seulement son résultat.
+///
+/// Toutes les fonctions éprouvées ici sont **pures** et compilées sur toutes les
+/// cibles : la branche ASIO de `select_host` vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et n'est exécutable ni
+/// sur macOS, ni sur Linux, ni en CI. Sortir la décision de cpal est ce qui rend
+/// la FAMILLE entière testable ailleurs que sur la machine du testeur.
+#[cfg(test)]
+mod backend_fallback_tests {
+    use super::{
+        LocalBackendFallback, ObservedBackend, asio_available, asio_outcome, backend_status,
+        platform_default_backend_name, unsupported_outcome,
+    };
+
+    fn observed(
+        name: &'static str,
+        reason: Option<LocalBackendFallback>,
+    ) -> Option<ObservedBackend> {
+        Some(ObservedBackend {
+            name,
+            fallback_reason: reason,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // La famille, membre par membre — jamais un seul représentant.
+    // ------------------------------------------------------------------
+
+    /// Contre-épreuve PERMANENTE (leçon #1864) : chaque motif déclaré doit être
+    /// réellement PRODUIT par l'une des deux fonctions de décision. Un motif
+    /// ajouté à l'énumération sans être câblé dans `select_host` fait tomber ce
+    /// test — c'est exactement le défaut où 15 prédicats sur 17 n'étaient
+    /// jamais construits pendant leur propre test.
+    #[test]
+    fn chaque_motif_declare_est_reellement_produit() {
+        let mut produits: Vec<LocalBackendFallback> = Vec::new();
+        // Toutes les issues possibles du sondage ASIO.
+        for probe in [None, Some(0usize), Some(1usize), Some(7usize)] {
+            if let (_, Some(reason)) = asio_outcome(probe) {
+                produits.push(reason);
+            }
+        }
+        // Toutes les demandes possibles sur une cible sans ASIO.
+        for requested in ["asio", "auto", "wasapi", "", "n'importe quoi"] {
+            if let (_, Some(reason)) = unsupported_outcome(requested) {
+                produits.push(reason);
+            }
+        }
+
+        for motif in LocalBackendFallback::ALL {
+            assert!(
+                produits.contains(&motif),
+                "le motif {motif:?} est déclaré mais AUCUN chemin de décision ne le construit — \
+                 il ne gardera jamais rien"
+            );
+        }
+    }
+
+    /// Les trois motifs doivent rester distincts, non vides, en `snake_case`,
+    /// et nommer ASIO : ce sont eux que le client reçoit et traduit.
+    #[test]
+    fn tous_les_motifs_ont_un_code_et_un_texte_utilisables() {
+        let mut codes: Vec<&str> = Vec::new();
+        for motif in LocalBackendFallback::ALL {
+            let code = motif.code();
+            assert!(!code.is_empty(), "{motif:?} : code vide");
+            assert!(
+                code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{motif:?} : code non snake_case ({code})"
+            );
+            assert!(
+                code.starts_with("asio_"),
+                "{motif:?} : le code doit nommer le backend demandé ({code})"
+            );
+            assert!(!codes.contains(&code), "code dupliqué : {code}");
+            codes.push(code);
+
+            let detail = motif.detail();
+            assert!(!detail.is_empty(), "{motif:?} : détail vide");
+            assert!(
+                detail.contains("ASIO"),
+                "{motif:?} : le détail ne dit pas ce qui a été demandé ({detail})"
+            );
+        }
+        assert_eq!(codes.len(), LocalBackendFallback::ALL.len());
+    }
+
+    /// Le contrat JSON, pour la famille entière : `serde` doit rendre
+    /// exactement `code()`. Un renommage de variante casserait le client sans
+    /// ce test.
+    #[test]
+    fn la_serialisation_json_suit_le_code_pour_chaque_motif() {
+        for motif in LocalBackendFallback::ALL {
+            let json = serde_json::to_string(&motif).expect("sérialisation");
+            assert_eq!(
+                json,
+                format!("\"{}\"", motif.code()),
+                "{motif:?} : la charge utile ne porte pas son code stable"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Les décisions, cas par cas.
+    // ------------------------------------------------------------------
+
+    /// LE cas Bilou (réponse forum 5217, 10/08, v0.9.65) : hôte ASIO ouvert,
+    /// zéro sortie exposée, repli WASAPI. Le journal le disait déjà
+    /// (`local_audio_asio_no_devices`) ; l'API se taisait.
+    #[test]
+    fn asio_ouvert_sans_peripherique_replie_en_nommant_la_cause() {
+        assert_eq!(
+            asio_outcome(Some(0)),
+            ("WASAPI", Some(LocalBackendFallback::AsioNoDevices))
+        );
+    }
+
+    /// L'autre membre : l'hôte ne s'ouvre pas du tout. Motif DIFFÉRENT — c'est
+    /// tout l'intérêt, Bertrand avait dû demander deux fois à Bilou laquelle
+    /// des deux lignes il voyait.
+    #[test]
+    fn hote_asio_inouvrable_donne_un_motif_distinct() {
+        assert_eq!(
+            asio_outcome(None),
+            ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable))
+        );
+        assert_ne!(
+            LocalBackendFallback::AsioHostUnavailable.code(),
+            LocalBackendFallback::AsioNoDevices.code()
+        );
+    }
+
+    /// Et le cas qui marche : aucun repli, aucun motif. On n'annonce pas une
+    /// panne quand il n'y en a pas.
+    #[test]
+    fn asio_qui_joue_ne_declare_aucun_repli() {
+        assert_eq!(asio_outcome(Some(1)), ("ASIO", None));
+        assert_eq!(asio_outcome(Some(9)), ("ASIO", None));
+    }
+
+    /// Le membre qui n'enregistrait RIEN avant ce correctif : un binaire sans
+    /// ASIO. Il ne pouvait pas honorer la demande, et ne le disait nulle part.
+    #[test]
+    fn binaire_sans_asio_nomme_la_cause() {
+        assert_eq!(
+            unsupported_outcome("asio"),
+            (
+                platform_default_backend_name(),
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            )
+        );
+    }
+
+    /// Contre-épreuve : sur la même cible, une demande qui n'est PAS ASIO ne
+    /// doit produire aucun motif. Plusieurs membres mutés, pas un seul.
+    #[test]
+    fn binaire_sans_asio_ne_crie_pas_sur_les_autres_demandes() {
+        for requested in ["auto", "wasapi", "", "valeur inconnue"] {
+            assert_eq!(
+                unsupported_outcome(requested),
+                (platform_default_backend_name(), None),
+                "demande « {requested} » : motif inventé"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L'arbitrage complet.
+    // ------------------------------------------------------------------
+
+    /// Le statut rendu à l'API dit les trois choses : ce qui tourne, ce qui
+    /// était demandé, et pourquoi ça diffère.
+    #[test]
+    fn le_statut_porte_lactif_le_demande_et_la_cause() {
+        let s = backend_status(
+            observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            "ASIO",
+        );
+        assert_eq!(s.active, "WASAPI");
+        assert_eq!(s.requested, "asio");
+        assert!(s.fell_back);
+        assert_eq!(s.fallback_reason, Some(LocalBackendFallback::AsioNoDevices));
+        assert_eq!(
+            s.fallback_detail,
+            Some(LocalBackendFallback::AsioNoDevices.detail())
+        );
+    }
+
+    /// Contre-épreuve : ASIO qui joue vraiment ne doit produire ni repli ni
+    /// motif. Le garde-fou doit savoir se taire.
+    #[test]
+    fn asio_honore_ne_declare_ni_repli_ni_motif() {
+        let s = backend_status(observed("ASIO", None), "asio");
+        assert_eq!(s.active, "ASIO");
+        assert!(!s.fell_back, "repli annoncé alors qu'ASIO joue");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.fallback_detail, None);
+    }
+
+    /// Contre-épreuve, sur plusieurs membres : les demandes honorées par le
+    /// backend natif de la plateforme ne déclarent rien non plus.
+    #[test]
+    fn les_demandes_honorees_ne_declarent_rien() {
+        let natif = platform_default_backend_name();
+        let natif_minuscules = natif.to_lowercase();
+        for requested in ["auto", "", natif, natif_minuscules.as_str()] {
+            let s = backend_status(observed(natif, None), requested);
+            assert!(
+                !s.fell_back,
+                "demande « {requested} » sur {natif} : repli annoncé à tort"
+            );
+            assert_eq!(s.fallback_reason, None);
+        }
+    }
+
+    /// Sans aucune observation, un seul motif est affirmable — celui qui se
+    /// décide à la COMPILATION. Sur une cible sans ASIO il doit sortir ; sur
+    /// une cible avec ASIO il ne doit surtout pas être inventé.
+    #[test]
+    fn sans_observation_seul_le_motif_de_compilation_est_affirme() {
+        let s = backend_status(None, "asio");
+        if asio_available() {
+            assert_eq!(
+                s.fallback_reason, None,
+                "motif inventé sur une cible qui embarque ASIO"
+            );
+        } else {
+            assert_eq!(
+                s.fallback_reason,
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            );
+            assert!(s.fell_back);
+        }
+    }
+
+    /// Une observation contredit toujours la déduction de compilation : si un
+    /// jour ASIO s'ouvre, plus aucun motif ne doit traîner.
+    #[test]
+    fn lobservation_prime_sur_la_deduction() {
+        let s = backend_status(observed("ASIO", None), "asio");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.active, "ASIO");
+    }
+
+    /// Le VERROU de branchement, pour la seule branche que PERSONNE ne peut
+    /// compiler ici.
+    ///
+    /// La branche `#[cfg(all(target_os = "windows", feature = "asio"))]` de
+    /// `select_host` ne se compile qu'avec le SDK Steinberg et Visual Studio :
+    /// ni ce Mac, ni la machine de compilation Linux ne peuvent la toucher —
+    /// seul le job `windows-latest` de la CI y arrive. Les tests ci-dessus
+    /// éprouvent donc la DÉCISION (`asio_outcome`), pas son BRANCHEMENT. Sans
+    /// ce garde, on pourrait supprimer un `note_observed_backend` dans cette
+    /// branche et tout resterait vert sur trois plateformes sur quatre.
+    ///
+    /// Même procédé que `contrat_des_retours_anticipes` côté serveur : on lit
+    /// la source, faute de pouvoir l'exécuter.
+    #[test]
+    fn chaque_sortie_de_select_host_enregistre_le_backend_ouvert() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
+            .expect("local.rs doit être lisible depuis la racine du crate");
+        let debut = src
+            .find("pub fn select_host(")
+            .expect("select_host introuvable");
+        let fin = src[debut..]
+            .find("static OBSERVED_BACKEND")
+            .map(|i| debut + i)
+            .expect("le corps de select_host doit précéder OBSERVED_BACKEND");
+        let corps = &src[debut..fin];
+
+        // Une sortie = un host rendu. Chacune doit avoir dit LEQUEL avant de
+        // le rendre, sinon l'API annonce de nouveau le backend demandé.
+        let sorties =
+            corps.matches("cpal::default_host()").count() + corps.matches("return host;").count();
+        let enregistrements = corps.matches("note_observed_backend(").count();
+        assert_eq!(
+            enregistrements, sorties,
+            "select_host rend {sorties} host(s) mais n'enregistre que {enregistrements} backend(s) : \
+             un chemin repart sans dire ce qu'il a ouvert (c'est exactement le défaut de #1395)"
+        );
+
+        // Et la décision doit rester celle qu'on éprouve plus haut, pas une
+        // règle réécrite en ligne dans la branche non compilable.
+        for attendu in [
+            "asio_outcome(Some(device_count))",
+            "asio_outcome(None)",
+            "unsupported_outcome(&backend_lower)",
+        ] {
+            assert!(
+                corps.contains(attendu),
+                "select_host ne passe plus par « {attendu} » — la décision testée n'est plus celle jouée"
+            );
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 -- ignored_devices : « ignorer cet appareil » pour qu'il cesse d'être proposé
 -- (#1280, Alex Campbell puis Patatorz).
 --
--- Jumelle PostgreSQL de la migration SQLite 91. Les deux listes sont
+-- Jumelle PostgreSQL de la migration SQLite 92. Les deux listes sont
 -- SEPAREES : écrite d'un seul côté, la table manquerait à tout le parc
 -- PostgreSQL (.15, .18, Docker) et chaque annonce de découverte y rendrait
 -- une erreur SQL, puisque le garde-fou la nomme.

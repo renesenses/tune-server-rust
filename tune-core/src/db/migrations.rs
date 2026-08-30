@@ -1493,6 +1493,57 @@ CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item
     },
     Migration {
         version: 91,
+        name: "album_distinct_pairs",
+        // « Ces deux albums ne sont PAS des doublons » (#1276, Megalo,
+        // forum-hifi.fr #41831 p.13 : « Tune me trouve des albums doublons
+        // alors que ce sont des releases différentes »).
+        //
+        // Deux chemins rapprochent des albums, et l'issue vise les deux :
+        // `GET /library/albums/grouped` (l'alerte) et
+        // `POST /library/albums/merge-duplicates` (la fusion, qui SUPPRIME la
+        // ligne perdante — le seul des deux qui ne se répare pas).
+        //
+        // Pourquoi une TABLE DE PAIRES sans clé étrangère, et pas une colonne
+        // sur `albums` : une ligne `albums` est supprimée en routine — purge
+        // post-scan, `delete_orphans`, fusion de doublons, « vider la
+        // bibliothèque ». Un couple d'ids nu mourrait au premier déplacement
+        // de racine, et l'arbitrage de l'utilisateur avec. C'est mot pour mot
+        // le défaut déjà payé par `favorites` (#1248) puis évité par
+        // `hidden_items` (#1391).
+        //
+        // On reprend donc la même mécanique : instantané d'identité figé DES
+        // DEUX CÔTÉS (`a_name`/`a_artist`, `b_name`/`b_artist`) et
+        // réconciliation aux cinq mêmes ancrages
+        // (`album_distinct_repo::reconcile`), via le MÊME
+        // `find_album_by_identity` que les favoris et les masquages.
+        //
+        // La paire est rangée en (min, max) par le repo : « A n'est pas un
+        // doublon de B » ne dépend pas de l'ordre, et sans normalisation la
+        // clé primaire laisserait entrer deux fois le même arbitrage.
+        //
+        // PAS DE COLONNE `id` : la clé naturelle (profil, album bas, album
+        // haut) EST la clé primaire — même choix que `favorite_facets` (85),
+        // `task_runs` (88) et `hidden_items` (89), pour éviter la divergence
+        // AUTOINCREMENT / BIGSERIAL de la bascule SQLite → PostgreSQL (#1706).
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS album_distinct_pairs (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    album_a_id INTEGER NOT NULL,
+    album_b_id INTEGER NOT NULL,
+    a_name TEXT,
+    a_artist TEXT,
+    b_name TEXT,
+    b_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_album_distinct_pairs_b ON album_distinct_pairs(album_b_id);
+",
+    },
+    Migration {
+        version: 92,
         name: "ignored_devices",
         // « Ignorer cet appareil » (#1280, Alex Campbell puis Patatorz) : faire
         // taire un APPAREIL, pas chasser ses zones une par une.
@@ -3039,14 +3090,23 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "semis_radios_annuaire_mozaiklabs",
         include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_08_30.sql"),
     ),
-    // Appareils ignorés (#1280). Jumelle de la migration SQLite 91 — les deux
+    // « Ces deux albums ne sont pas des doublons » (#1276). Jumelle de la
+    // migration SQLite 91 — mêmes deux listes séparées : sans cette entrée,
+    // la table manquerait à tout le parc PostgreSQL et les deux routes de
+    // rapprochement d'albums y rendraient une erreur SQL.
+    (
+        43,
+        "album_distinct_pairs",
+        include_str!("../../migrations/postgres/043_album_distinct_pairs.sql"),
+    ),
+    // Appareils ignorés (#1280). Jumelle de la migration SQLite 92 — les deux
     // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à tout
     // le parc PostgreSQL (.15, .18, Docker) et « ignorer cet appareil » y
     // rendrait une erreur SQL.
     (
-        43,
+        44,
         "ignored_devices",
-        include_str!("../../migrations/postgres/043_ignored_devices.sql"),
+        include_str!("../../migrations/postgres/044_ignored_devices.sql"),
     ),
 ];
 
@@ -4499,11 +4559,13 @@ mod tests {
         // cette ligne soit remontée — ce test ne tourne que dans le job PG,
         // qui n'exécute pas `-p tune-core`. On la remonte donc de 40 à 42 d'un
         // coup, en constatant les DEUX ajouts.
-        // 43 : `ignored_devices` (#1280). Le numéro 42 était pris par le semis
-        // de radios (#2119), fusionné pendant que cette branche passait ses
-        // portes — d'où le renumérotage, fait AVANT qu'aucune base ne voie
-        // l'ancien numéro.
-        assert_eq!(pg_latest_version(), 43, "latest PG migration must be 43");
+        // 43 : `album_distinct_pairs` (#1276), jumelle de la SQLite 91.
+        // 44 : `ignored_devices` (#1280), jumelle de la SQLite 92. Les numéros
+        // 42 puis 43 ont été pris tour à tour par le semis de radios (#2119)
+        // et par `album_distinct_pairs` (#1276), tous deux fusionnés pendant
+        // que cette branche passait ses portes — d'où le renumérotage, fait
+        // AVANT qu'aucune base ne voie l'ancien numéro.
+        assert_eq!(pg_latest_version(), 44, "latest PG migration must be 44");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

@@ -77,6 +77,32 @@ struct Identity {
     path: String,
 }
 
+/// Identité vivante (titre, artiste) d'un album, ou `None` s'il n'existe plus.
+///
+/// Écrite une seule fois pour les trois tables de marqueurs sans clé
+/// étrangère — favoris, albums masqués (`hidden_repo`), paires déclarées
+/// distinctes (`album_distinct_repo`) : c'est le pendant en lecture de
+/// [`find_album_by_identity`], et le recopier a déjà produit des divergences
+/// (#2848).
+pub(crate) fn album_live_identity(
+    db: &dyn DbBackend,
+    album_id: i64,
+) -> Result<Option<(String, String)>, String> {
+    let params: [&dyn ToSqlValue; 1] = [&album_id];
+    Ok(db
+        .query_one(
+            "SELECT a.title, COALESCE(ar.name, '') FROM albums a \
+             LEFT JOIN artists ar ON ar.id = a.artist_id WHERE a.id = ?",
+            &params,
+        )?
+        .map(|cols| {
+            (
+                cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+            )
+        }))
+}
+
 /// Retrouve l'album VIVANT correspondant à une identité (titre, artiste).
 ///
 /// Règles de re-rattachement identiques pour les favoris et pour les albums

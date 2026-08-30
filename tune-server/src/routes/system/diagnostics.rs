@@ -188,7 +188,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // Audio outputs
     let audio_backend_pref = &state.display_audio_backend();
-    let (audio_outputs, audio_backend_name, asio_avail) = {
+    let (audio_outputs, audio_backend_name, asio_avail, audio_backend_status) = {
         #[cfg(feature = "local-audio")]
         {
             let devs: Vec<String> =
@@ -198,12 +198,21 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
                     .collect();
             let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
             let asio = tune_core::outputs::local::asio_available();
-            (devs, name, asio)
+            // #1395 — le rapport de diagnostic est ce que le testeur colle sur
+            // le forum. Il portait le backend ACTIF sans jamais dire lequel
+            // avait été DEMANDÉ ni pourquoi il n'avait pas été honoré : c'est
+            // une capture de journal qu'il a fallu réclamer à Bilou pour
+            // apprendre que son pilote ASIO n'exposait aucune sortie.
+            let status = serde_json::to_value(tune_core::outputs::local::active_backend_status(
+                audio_backend_pref,
+            ))
+            .unwrap_or(serde_json::Value::Null);
+            (devs, name, asio, status)
         }
         #[cfg(not(feature = "local-audio"))]
         {
             let _ = audio_backend_pref;
-            (Vec::<String>::new(), "none", false)
+            (Vec::<String>::new(), "none", false, serde_json::Value::Null)
         }
     };
 
@@ -253,6 +262,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
+        // #1395 — `audio_backend` dit ce qui TOURNE ; il ne disait pas ce qui
+        // avait été DEMANDÉ, ni pourquoi les deux diffèrent. `null` sans
+        // sortie locale compilée.
+        "audio_backend_status": audio_backend_status,
         "asio_available": asio_avail,
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.

@@ -863,6 +863,37 @@ pub fn build_signal_path_pub(
     build_signal_path(ps, zone, backend, renderer_label, audio_backend, wire)
 }
 
+/// #1395 — sur la ZONE, dire quel backend de sortie locale tourne vraiment,
+/// lequel était demandé, et pourquoi ils diffèrent.
+///
+/// Le chemin du signal nomme déjà le backend ACTIF dans son étape Transport
+/// (« ASIO (exclusive) », « WASAPI »…), et il dit vrai depuis #1414. Ce qui
+/// manquait, c'est le terme de comparaison : Bilou règle « Ce PC / Hauts
+/// Parleurs » sur ASIO, lit « WASAPI », et ne peut pas savoir si son réglage
+/// n'a pas pris ou si le serveur a basculé. Le motif du basculement existait
+/// — `local_audio_asio_no_devices` — mais seulement dans le journal ; il a
+/// fallu qu'il en poste une capture pour que le fil avance.
+///
+/// `None` pour toute zone qui n'est pas une sortie locale : un renderer DLNA
+/// ou Chromecast n'a rien à voir avec ASIO, et lui accrocher un motif de repli
+/// serait exactement l'annonce fantôme que #2053 et #1315 ont déjà coûtée.
+/// `None` aussi quand la sortie locale n'est pas compilée.
+#[cfg(feature = "local-audio")]
+pub fn local_backend_status_value(output_type: Option<&str>, requested: &str) -> Option<Value> {
+    // Même convention que `build_signal_path` : une zone sans `output_type`
+    // est une sortie locale.
+    if output_type.unwrap_or("local") != "local" {
+        return None;
+    }
+    serde_json::to_value(tune_core::outputs::local::active_backend_status(requested)).ok()
+}
+
+/// Variante sans sortie locale compilée : il n'y a aucun backend à décrire.
+#[cfg(not(feature = "local-audio"))]
+pub fn local_backend_status_value(_output_type: Option<&str>, _requested: &str) -> Option<Value> {
+    None
+}
+
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
 ///
@@ -1916,9 +1947,9 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             .ok()
             .flatten()
             .and_then(|s| s.parse().ok());
+    let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
-    let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+    let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let mut result = Vec::new();
@@ -1999,6 +2030,13 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 wire.as_ref(),
             );
             obj.insert("signal_path".into(), json!(signal_path));
+            // #1395 — quel backend local tourne VRAIMENT sur cette zone, face à
+            // celui qui est réglé. Absent des zones non locales.
+            if let Some(status) =
+                local_backend_status_value(z.output_type.as_deref(), &audio_backend_pref)
+            {
+                obj.insert("audio_backend_status".into(), status);
+            }
             // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
             obj.insert("resolving".into(), json!(ps.resolving));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
@@ -2123,9 +2161,9 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
 
 async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::with_backend(state.backend.clone());
+    let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
-    let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+    let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     match repo.get(id) {
@@ -2185,6 +2223,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     wire.as_ref(),
                 );
                 obj.insert("signal_path".into(), json!(signal_path));
+                // #1395 — voir la note au site jumeau (`list_zones`).
+                if let Some(status) =
+                    local_backend_status_value(zone.output_type.as_deref(), &audio_backend_pref)
+                {
+                    obj.insert("audio_backend_status".into(), status);
+                }
                 // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
                 obj.insert("resolving".into(), json!(ps.resolving));
                 // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
@@ -6427,5 +6471,129 @@ mod contrat_des_retours_anticipes {
             1,
             "toujours une seule zone pour l'appareil physique"
         );
+    }
+}
+
+/// #1395 — le backend de sortie locale réellement actif, et le motif du repli,
+/// doivent arriver jusqu'au client.
+#[cfg(test)]
+mod backend_local_annonce_tests {
+    use super::local_backend_status_value;
+
+    /// La famille des types de sortie, mutée en entier : seule une zone locale
+    /// porte le champ. Annoncer un repli ASIO sur un renderer DLNA serait
+    /// l'annonce fantôme que #2053 et #1315 ont déjà coûtée.
+    #[test]
+    fn seule_une_zone_locale_porte_le_statut() {
+        // Une zone sans `output_type` est locale — même convention que
+        // `build_signal_path`. Sans sortie locale compilée il n'y a AUCUN
+        // backend à décrire, et le champ doit rester absent partout : c'est la
+        // moitié du contrat qui vaut dans les deux constructions.
+        #[cfg(feature = "local-audio")]
+        for local in [None, Some("local")] {
+            assert!(
+                local_backend_status_value(local, "asio").is_some(),
+                "zone locale ({local:?}) : statut absent"
+            );
+        }
+        #[cfg(not(feature = "local-audio"))]
+        for local in [None, Some("local")] {
+            assert!(
+                local_backend_status_value(local, "asio").is_none(),
+                "zone locale ({local:?}) : statut annoncé sans sortie locale compilée"
+            );
+        }
+        for distant in [
+            "dlna",
+            "chromecast",
+            "bluos",
+            "airplay",
+            "browser",
+            "oaat",
+            "squeezebox",
+        ] {
+            assert!(
+                local_backend_status_value(Some(distant), "asio").is_none(),
+                "zone « {distant} » : statut de backend LOCAL annoncé à tort"
+            );
+        }
+    }
+
+    /// Le contrat de la charge utile : les cinq champs, nommés, pour que le
+    /// client puisse dire « vous avez demandé X, Y tourne, parce que Z ».
+    #[cfg(feature = "local-audio")]
+    #[test]
+    fn le_statut_porte_le_demande_a_cote_de_lactif() {
+        let v = local_backend_status_value(Some("local"), "ASIO").expect("zone locale");
+        for champ in [
+            "active",
+            "requested",
+            "fell_back",
+            "fallback_reason",
+            "fallback_detail",
+        ] {
+            assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
+        }
+        assert_eq!(
+            v["requested"], "asio",
+            "le demandé doit être rendu normalisé, pas déduit"
+        );
+        assert!(
+            v["active"].as_str().is_some_and(|s| !s.is_empty()),
+            "l'actif doit être nommé : {v}"
+        );
+    }
+
+    /// Le VERROU de branchement : la fonction peut être parfaite et n'être
+    /// appelée nulle part. Les quatre charges utiles qui portent une zone
+    /// doivent toutes s'en servir — c'est la leçon de #1864, où quinze
+    /// prédicats sur dix-sept n'étaient jamais construits pendant leur test.
+    #[test]
+    fn les_quatre_charges_utiles_de_zone_appellent_le_contrat() {
+        // Source normalisée : on retire tous les blancs, pour que le test
+        // survive à un passage de rustfmt qui recasserait les lignes.
+        fn sans_blancs(fichier: &str) -> String {
+            std::fs::read_to_string(std::path::Path::new(fichier))
+                .unwrap_or_else(|e| panic!("{fichier} doit être lisible : {e}"))
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        }
+
+        // Les QUATRE sites, un par charge utile qui décrit une zone. Chacun
+        // est nommé par l'appel exact qu'il doit contenir.
+        for (fichier, appel, quoi) in [
+            (
+                "src/routes/zones.rs",
+                "local_backend_status_value(z.output_type.as_deref(),&audio_backend_pref",
+                "GET /zones",
+            ),
+            (
+                "src/routes/zones.rs",
+                "local_backend_status_value(zone.output_type.as_deref(),&audio_backend_pref",
+                "GET /zones/{id}",
+            ),
+            (
+                "src/routes/ws.rs",
+                "local_backend_status_value(z.output_type.as_deref(),&audio_backend_pref",
+                "instantané WebSocket",
+            ),
+            (
+                "src/routes/playback.rs",
+                "local_backend_status_value(zone.output_type.as_deref(),&audio_backend_pref",
+                "play / next / previous / resume",
+            ),
+        ] {
+            let src = sans_blancs(fichier);
+            assert!(
+                src.contains(appel),
+                "{quoi} ({fichier}) n'appelle plus local_backend_status_value — \
+                 la zone repart sans dire quel backend tourne vraiment"
+            );
+            assert!(
+                src.contains("\"audio_backend_status\""),
+                "{quoi} ({fichier}) : le champ audio_backend_status a disparu de la charge utile"
+            );
+        }
     }
 }

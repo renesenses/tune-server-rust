@@ -1238,9 +1238,18 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
                 v
             })
             .collect();
+        // #1395 — l'écran qui porte le sélecteur de backend est le premier
+        // endroit où l'écart doit se lire : Bilou choisit ASIO ici, la lecture
+        // sort en WASAPI, et rien ne le lui dit. `backend` (l'actif) ne suffit
+        // pas — sans le demandé à côté, il ne peut pas savoir si c'est son
+        // réglage qui n'a pas pris ou le serveur qui a basculé.
+        //
+        // Additif : `backend` garde exactement sa valeur d'avant.
+        let backend_status = tune_core::outputs::local::active_backend_status(backend);
         Json(json!({
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),
+            "backend_status": backend_status,
             "asio_available": tune_core::outputs::local::asio_available(),
             // #1268 — la liste des backends que le sélecteur peut proposer,
             // filtrée par la plateforme du SERVEUR. Le client l'écrivait en
@@ -1255,6 +1264,7 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         Json(json!({
             "devices": [],
             "backend": "none",
+            "backend_status": Value::Null,
             "asio_available": false,
             "supported_backends": [],
         }))
