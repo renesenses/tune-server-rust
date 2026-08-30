@@ -53,6 +53,15 @@ pub struct QobuzService {
     /// n'a jamais existé. `featured_cache` y est défini, lu à deux endroits, et
     /// JAMAIS écrit. Ne pas recopier ce modèle.
     cache_editorial: Mutex<HashMap<String, EntreeCache>>,
+    /// Réponses de `/album/get`, par identifiant d'album.
+    ///
+    /// Cache SÉPARÉ de l'éditorial, et non une clé de plus dedans, pour deux
+    /// raisons qui tiennent toutes les deux au volume : le détail d'un album
+    /// porte sa liste de pistes complète — un ordre de grandeur au-dessus
+    /// d'une liste de genres — et `retirer_les_chevrons_dementis` relit le
+    /// cache éditorial par la clé. Y verser les albums d'une navigation en
+    /// chasserait les démentis de genre qu'il est le seul à porter.
+    cache_album: Mutex<HashMap<String, EntreeCache>>,
     /// Base d'API forcée, pour brancher les LECTURES sur un serveur simulé.
     ///
     /// `None` en production : l'ordre direct/proxy habituel s'applique. Seul
@@ -77,6 +86,23 @@ const TTL_EDITORIAL: Duration = Duration::from_secs(1800);
 /// la page découverte ; ce plafond n'existe que pour qu'un cache oublié ne
 /// grossisse pas indéfiniment.
 const MAX_ENTREES_CACHE: usize = 64;
+
+/// Durée de vie du détail d'album en cache.
+///
+/// Cinq minutes, et non les trente de l'éditorial : ce cache n'existe pas pour
+/// épargner du réseau à la journée, mais pour qu'UNE ouverture d'album ne
+/// paie qu'UN aller-retour au lieu de quatre (#2190). Cinq minutes couvrent
+/// largement l'ouverture, la lecture qui suit, et un aller-retour dans la
+/// vue ; au-delà, rien ne justifie de garder une liste de pistes en mémoire.
+const TTL_ALBUM: Duration = Duration::from_secs(300);
+
+/// Nombre d'albums gardés en mémoire.
+///
+/// Ce plafond est TENU, contrairement à [`MAX_ENTREES_CACHE`] qui ne purge que
+/// les entrées expirées et peut donc croître si elles sont toutes fraîches.
+/// Une liste de pistes pèse, et une navigation d'une heure traverse facilement
+/// des centaines d'albums : ici on évince la plus ancienne.
+const MAX_ALBUMS_CACHE: usize = 32;
 
 /// (primary, fallback) API bases for the given endpoint order.
 ///
@@ -298,6 +324,7 @@ impl QobuzService {
             needs_token_rewrite: false,
             session_expired: false,
             cache_editorial: Mutex::new(HashMap::new()),
+            cache_album: Mutex::new(HashMap::new()),
             base_forcee: None,
         }
     }
@@ -501,6 +528,82 @@ impl QobuzService {
         let donnees = self.api_get(path, params).await?;
         self.cache_set(cle, donnees.clone());
         Ok(donnees)
+    }
+
+    /// La réponse de `/album/get` pour cet album — une seule fois par album.
+    ///
+    /// **Le défaut que ceci corrige (#2190).** Ouvrir un album déclenche
+    /// jusqu'à QUATRE requêtes HTTP côté client — `/albums/{id}`,
+    /// `/albums/{id}/tracks`, `/albums/{id}/context`, `/albums/{id}/label` —
+    /// et chacune repartait chercher auprès de Qobuz **exactement la même**
+    /// réponse `/album/get?album_id={id}`. La lecture qui suit en ajoutait une
+    /// cinquième (`playback.rs` refait `get_album_tracks`). Cinq allers-retours
+    /// pour une donnée, sur un service dont un aller-retour coûte des
+    /// centaines de millisecondes : c'est le « slow to load » d'Alex Campbell.
+    ///
+    /// **Pourquoi c'est cachable.** Tout ce que nous lisons de cette réponse
+    /// est du CATALOGUE : `map_album` (titre, artiste, pochette, année,
+    /// qualité), `map_track` (titre, interprète, ISRC, numéro de piste),
+    /// `get_album_context` (genre, label), `get_album_label` (label). **Aucun
+    /// champ propre au compte n'est consulté** — ni `favorited_at`, ni
+    /// `purchasable`, ni `streamable`. Contrairement aux favoris ou aux
+    /// playlists de l'utilisateur, resservir cette réponse ne peut donc pas
+    /// faire réapparaître ce qu'il vient de retirer. Si un jour un mappeur se
+    /// met à lire un champ dépendant du compte, ce cache devra sauter — c'est
+    /// la seule condition, et elle est ici pour être relue.
+    async fn detail_album(&self, album_id: &str) -> Result<serde_json::Value, String> {
+        if let Some(donnees) = self.album_en_cache(album_id) {
+            debug!(album_id, "qobuz_album_cache_hit");
+            return Ok(donnees);
+        }
+        let donnees = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
+        self.memoriser_album(album_id, donnees.clone());
+        Ok(donnees)
+    }
+
+    /// Le détail d'album mémorisé s'il est encore frais, sinon rien.
+    fn album_en_cache(&self, album_id: &str) -> Option<serde_json::Value> {
+        let cache = self.cache_album.lock().ok()?;
+        cache.get(album_id).and_then(|e| {
+            if e.cree.elapsed() < TTL_ALBUM {
+                Some(e.donnees.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Mémorise un détail d'album, en tenant le plafond.
+    ///
+    /// On retire d'abord les périmés ; s'il n'en restait aucun, on évince la
+    /// plus ANCIENNE entrée. Se contenter de la purge des périmés — ce que
+    /// fait `cache_set` — laisserait la table croître sans borne pendant une
+    /// navigation soutenue, chaque entrée portant une liste de pistes.
+    fn memoriser_album(&self, album_id: &str, donnees: serde_json::Value) {
+        let Ok(mut cache) = self.cache_album.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_ALBUMS_CACHE {
+            cache.retain(|_, e| e.cree.elapsed() < TTL_ALBUM);
+        }
+        if cache.len() >= MAX_ALBUMS_CACHE {
+            if let Some(plus_ancienne) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.cree)
+                .map(|(cle, _)| cle.clone())
+            {
+                cache.remove(&plus_ancienne);
+            }
+        }
+        cache.insert(
+            album_id.to_string(),
+            EntreeCache {
+                donnees,
+                cree: Instant::now(),
+            },
+        );
     }
 
     /// Une collection de titres rattachée à un artiste, lue sous la clé qui
@@ -1470,16 +1573,12 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
-        let data = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let data = self.detail_album(album_id).await?;
         Ok(Self::map_album(&data))
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let data = self.detail_album(album_id).await?;
         // Qobuz album/get returns album metadata at the top level while
         // individual track items inside tracks.items do NOT carry an
         // "album" sub-object.  Extract the album-level title, image and
@@ -1680,9 +1779,7 @@ impl StreamingService for QobuzService {
 
     async fn get_album_label(&self, album_id: &str) -> Result<LabelInfo, TuneError> {
         // Resolve the album's label (id + name come straight from album/get).
-        let album = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let album = self.detail_album(album_id).await?;
         let label_id = album["label"]["id"]
             .as_u64()
             .map(|id| id.to_string())
@@ -1896,9 +1993,7 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_album_context(&self, album_id: &str) -> Result<AlbumContext, TuneError> {
-        let album = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let album = self.detail_album(album_id).await?;
         Ok(AlbumContext {
             genre_id: album["genre"]["id"]
                 .as_u64()
@@ -3509,6 +3604,161 @@ mod tests {
         assert_eq!(pistes.len(), 2, "2 participations en cache, 2 servies");
         assert_eq!(pistes[0].title, "So What");
         assert_eq!(pistes[1].title, "Blue in Green");
+    }
+}
+
+/// Ouverture d'un album : un seul aller-retour amont, pas quatre (#2190).
+///
+/// Aucun de ces essais ne touche l'API Qobuz : ils parlent à un serveur simulé
+/// lié sur `127.0.0.1:0`, qui COMPTE les `/album/get` qu'il reçoit. C'est ce
+/// compteur qui est la mesure — la durée en découle.
+#[cfg(test)]
+mod tests_cache_album {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Un Qobuz simulé qui rend un album complet et compte ses `/album/get`.
+    ///
+    /// `latence` simule le coût réel d'un aller-retour vers Qobuz : c'est lui
+    /// qu'on paie quatre fois quand rien n'est partagé.
+    async fn qobuz_album_simule(latence: Duration) -> (String, Arc<AtomicUsize>) {
+        let appels = Arc::new(AtomicUsize::new(0));
+        let compteur = appels.clone();
+
+        let app = Router::new()
+            .route(
+                "/album/get",
+                get(move |Query(q): Query<Carte<String, String>>| {
+                    let compteur = compteur.clone();
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        if !latence.is_zero() {
+                            tokio::time::sleep(latence).await;
+                        }
+                        let id = q.get("album_id").cloned().unwrap_or_default();
+                        Json(json!({
+                            "id": id,
+                            "title": format!("album-{id}"),
+                            "artist": {"name": "Ella Fitzgerald"},
+                            "image": {"large": "http://img.qobuz.test/a.jpg"},
+                            "genre": {"id": 64, "name": "Jazz"},
+                            "label": {"id": 7, "name": "Verve"},
+                            "tracks_count": 1,
+                            "tracks": {"items": [
+                                {"id": 11, "title": "Summertime", "duration": 200}
+                            ]},
+                        }))
+                    }
+                }),
+            )
+            // `get_album_label` pagine ensuite le catalogue du label ; il n'est
+            // pas le sujet ici, donc le simulé le rend vide en une page.
+            .route(
+                "/label/get",
+                get(|| async { Json(json!({"albums": {"items": [], "total": 0}})) }),
+            );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels)
+    }
+
+    /// LE défaut de la #2190. Le client demande quatre choses à l'ouverture
+    /// d'un album ; le serveur repartait quatre fois chercher la MÊME réponse.
+    #[tokio::test]
+    async fn une_ouverture_d_album_ne_paie_qu_un_aller_retour() {
+        let (base, appels) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let album = svc.get_album("42").await.expect("serveur simulé");
+        let pistes = svc.get_album_tracks("42").await.expect("serveur simulé");
+        let contexte = svc.get_album_context("42").await.expect("serveur simulé");
+        let label = svc.get_album_label("42").await.expect("serveur simulé");
+
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "quatre routes, une seule lecture amont — c'est le défaut de la #2190"
+        );
+
+        // Et les quatre réponses restent justes : le cache ne dégrade rien.
+        assert_eq!(album.title, "album-42");
+        assert_eq!(album.artist, "Ella Fitzgerald");
+        assert_eq!(pistes.len(), 1);
+        assert_eq!(pistes[0].title, "Summertime");
+        assert_eq!(contexte.genre_name.as_deref(), Some("Jazz"));
+        assert_eq!(contexte.label_name.as_deref(), Some("Verve"));
+        assert_eq!(label.name, "Verve");
+    }
+
+    /// Le cache est par album : deux albums ne peuvent pas se confondre.
+    #[tokio::test]
+    async fn deux_albums_distincts_gardent_chacun_leur_reponse() {
+        let (base, appels) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let premier = svc.get_album("1").await.expect("serveur simulé");
+        let second = svc.get_album("2").await.expect("serveur simulé");
+        let relecture = svc.get_album("1").await.expect("serveur simulé");
+
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            2,
+            "deux albums = deux lectures ; la relecture du premier est servie du cache"
+        );
+        assert_eq!(premier.title, "album-1");
+        assert_eq!(second.title, "album-2");
+        assert_eq!(relecture.title, "album-1", "pas de confusion entre albums");
+    }
+
+    /// La mesure, sur une latence amont réaliste : l'ouverture ne paie plus
+    /// qu'UN aller-retour, pas la somme de trois.
+    #[tokio::test]
+    async fn l_ouverture_ne_paie_plus_qu_une_latence_amont() {
+        const LATENCE: Duration = Duration::from_millis(200);
+        let (base, appels) = qobuz_album_simule(LATENCE).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let debut = Instant::now();
+        svc.get_album("7").await.expect("serveur simulé");
+        svc.get_album_tracks("7").await.expect("serveur simulé");
+        svc.get_album_context("7").await.expect("serveur simulé");
+        let ecoule = debut.elapsed();
+
+        assert_eq!(appels.load(Ordering::SeqCst), 1);
+        assert!(
+            ecoule < LATENCE * 2,
+            "l'ouverture a pris {ecoule:?} ; avant le correctif elle payait 3 × {LATENCE:?}"
+        );
+    }
+
+    /// Une navigation longue ne doit pas faire enfler la mémoire : chaque
+    /// entrée porte une liste de pistes complète.
+    #[tokio::test]
+    async fn le_cache_d_albums_tient_son_plafond() {
+        let (base, _) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        for i in 0..(MAX_ALBUMS_CACHE + 8) {
+            svc.get_album(&i.to_string()).await.expect("serveur simulé");
+        }
+
+        let gardes = svc.cache_album.lock().expect("verrou d'essai").len();
+        assert!(
+            gardes <= MAX_ALBUMS_CACHE,
+            "{gardes} albums gardés pour un plafond de {MAX_ALBUMS_CACHE}"
+        );
     }
 }
 
