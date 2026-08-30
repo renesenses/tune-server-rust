@@ -45,22 +45,48 @@ impl SupportAuth {
     }
 }
 
+/// Un ticket tel que le client web l'a composé.
+///
+/// `logs` et `system` sont **le diagnostic** : le markdown produit par
+/// `/system/bug-report/markdown` et la fiche système. mozaiklabs matérialise
+/// `logs` en pièce jointe `diagnostic.md` à la création du ticket. Sans eux,
+/// le ticket arrive sans journal alors que le client a coché « joindre les
+/// journaux » et annonce l'envoi réussi.
+#[derive(Default)]
+pub struct NewTicket {
+    pub subject: String,
+    pub body: String,
+    pub category: Option<String>,
+    pub zone: Option<String>,
+    pub system: Option<Value>,
+    pub logs: Option<String>,
+}
+
+/// Corps JSON envoyé à mozaiklabs pour l'ouverture d'un ticket.
+///
+/// Extrait de [`create_ticket`] pour être vérifiable sans réseau : c'est
+/// exactement ici que `logs` et `system` étaient perdus.
+fn ticket_payload(ticket: &NewTicket) -> Value {
+    json!({
+        "subject": ticket.subject,
+        "body": ticket.body,
+        "category": ticket.category,
+        "zone": ticket.zone,
+        "system": ticket.system,
+        "logs": ticket.logs,
+        "tune_version": crate::version(),
+        "platform": std::env::consts::OS,
+    })
+}
+
 /// Ouvre un ticket. Injecte automatiquement la version de Tune et l'OS —
 /// le SAV voit la config sans la demander.
 pub async fn create_ticket(
     http_client: &reqwest::Client,
     auth: &SupportAuth,
-    subject: &str,
-    body: &str,
-    category: Option<&str>,
+    ticket: &NewTicket,
 ) -> SupportResult {
-    let payload = json!({
-        "subject": subject,
-        "body": body,
-        "category": category,
-        "tune_version": crate::version(),
-        "platform": std::env::consts::OS,
-    });
+    let payload = ticket_payload(ticket);
 
     let resp = auth
         .apply(http_client.post(SUPPORT_API))
@@ -442,5 +468,58 @@ mod tests {
     fn un_2xx_reste_un_succes() {
         let value = build_result(201, r#"{"ticket":{"id":7}}"#, None).expect("2xx = succès");
         assert_eq!(value["ticket"]["id"], json!(7));
+    }
+
+    /// Le chemin JSON — celui d'un ticket SANS pièce jointe manuelle, c'est-à-dire
+    /// la majorité — laissait tomber `logs` et `system`. Le client les envoie,
+    /// mozaiklabs sait les recevoir (`StoreSupportTicketRequest`) et matérialise
+    /// `logs` en pièce jointe `diagnostic.md` ; seul ce corps-ci ne les portait
+    /// pas, et l'envoi rendait quand même un 201 « ticket ouvert ».
+    ///
+    /// Mesuré en production le 2026-08-29 : 39 tickets sur 62 sans le moindre
+    /// journal — exactement ceux qui n'avaient aucune pièce jointe manuelle,
+    /// donc exactement ceux passés par ici.
+    #[test]
+    fn le_corps_json_porte_le_diagnostic() {
+        let ticket = NewTicket {
+            subject: "Coupure DLNA".into(),
+            body: "Le salon s'arrête au bout de dix secondes.".into(),
+            category: Some("bug".into()),
+            zone: Some("Salon".into()),
+            system: Some(json!({ "os": "linux", "zones": 3 })),
+            logs: Some("# Tune Bug Report\n\nERROR dlna_stall".into()),
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert_eq!(
+            payload["logs"], "# Tune Bug Report\n\nERROR dlna_stall",
+            "le diagnostic doit partir avec le ticket"
+        );
+        assert_eq!(payload["system"]["os"], "linux");
+        assert_eq!(payload["zone"], "Salon");
+        assert_eq!(payload["subject"], "Coupure DLNA");
+        assert_eq!(payload["category"], "bug");
+        // Version et OS restent injectées par le serveur, jamais par le client.
+        assert_eq!(payload["tune_version"], crate::version());
+        assert_eq!(payload["platform"], std::env::consts::OS);
+    }
+
+    /// Case décochée, ou serveur sans journal accessible : les champs partent à
+    /// `null`, ce que les règles `nullable` de mozaiklabs acceptent — pas de 422.
+    #[test]
+    fn un_ticket_sans_diagnostic_reste_valide() {
+        let ticket = NewTicket {
+            subject: "Question".into(),
+            body: "Comment activer le DSD ?".into(),
+            ..Default::default()
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert!(payload["logs"].is_null());
+        assert!(payload["system"].is_null());
+        assert!(payload["category"].is_null());
+        assert!(payload["zone"].is_null());
     }
 }
