@@ -187,7 +187,15 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-metadata", post(enrich::enrich_extended_metadata))
         .route("/enrichment/status", get(enrich::enrichment_status))
         .route("/enrichment/run", post(enrich::enrichment_run))
-        .route("/database/import", post(database::database_import))
+        // La limite globale (50 Mo) coupait l'import bien avant le handler :
+        // l'export d'une bibliothèque ordinaire pèse 256 Mo. Cf #2849 et
+        // `database::IMPORT_DB_BODY_LIMIT`.
+        .route(
+            "/database/import",
+            post(database::database_import).layer(axum::extract::DefaultBodyLimit::max(
+                database::IMPORT_DB_BODY_LIMIT,
+            )),
+        )
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
         .route(
