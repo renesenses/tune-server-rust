@@ -1,0 +1,135 @@
+{
+  "$schema": "./release-policy.schema.json",
+  "schema_version": 1,
+  "policy_version": "1.0.0",
+  "mode": "migration_freeze",
+  "repositories": [
+    {"id":"server","slug":"renesenses/tune-server-rust","default_branch":"main","policy_path":".github/release-policy.json","agents_path":"AGENTS.md","claude_path":"CLAUDE.md"},
+    {"id":"web","slug":"renesenses/tune-web-client","default_branch":"main","policy_path":".github/release-policy.json","agents_path":"AGENTS.md","claude_path":"CLAUDE.md"},
+    {"id":"os","slug":"renesenses/tune-os","default_branch":"main","policy_path":".github/release-policy.json","agents_path":"AGENTS.md","claude_path":"CLAUDE.md"},
+    {"id":"universal","slug":"renesenses/tune-server-universal","default_branch":"main","policy_path":".github/release-policy.json","agents_path":"AGENTS.md","claude_path":"CLAUDE.md"}
+  ],
+  "branch_classes": {
+    "fix": "^fix/.+$",
+    "feat": "^feat/.+$",
+    "restore": "^restore/.+$",
+    "batch": "^batch/.+$",
+    "rc": "^rc/v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$",
+    "main": "^main$"
+  },
+  "checks": {
+    "policy-gate": {"scope":"all_prs_and_promotions"},
+    "issue-references": {"scope":"all_prs"},
+    "format-static": {"scope":"changed_components"},
+    "unit-targeted": {"scope":"changed_components"},
+    "minimal-build": {"scope":"changed_components"},
+    "release-gate": {"scope":"promotions"},
+    "sqlite-workspace": {"scope":"promotions"},
+    "postgresql": {"scope":"promotions"},
+    "shipped-features": {"scope":"promotions"},
+    "audio-embedding": {"scope":"promotions"},
+    "ffi-android": {"scope":"promotions"},
+    "windows-asio": {"scope":"promotions"},
+    "macos-runtime": {"scope":"promotions"},
+    "web-contract": {"scope":"promotions"},
+    "web-build": {"scope":"promotions"},
+    "security-audit": {"scope":"all_prs_and_promotions"},
+    "preflight": {"scope":"promotions"},
+    "immutable-manifest": {"scope":"promotions"},
+    "tree-attestation": {"scope":"promotions"},
+    "os-first-boot": {"scope":"promotions"}
+  },
+  "ci_profiles": {
+    "quick": {"checks":["policy-gate","issue-references","format-static","unit-targeted","minimal-build","security-audit"]},
+    "full": {"checks":["policy-gate","issue-references","release-gate","sqlite-workspace","postgresql","shipped-features","audio-embedding","ffi-android","windows-asio","macos-runtime","web-contract","web-build","security-audit","preflight","immutable-manifest","tree-attestation","os-first-boot"]}
+  },
+  "roles": {
+    "fix_agent": {
+      "actors": ["openai","anthropic","human"],
+      "allow": ["acquire_lease","push_work_branch","open_pull_request"],
+      "deny": ["direct_push_protected","merge_pull_request","bump_release_version","create_release_tag","publish_release","edit_protections"]
+    },
+    "integrator": {
+      "actors": ["human","github_actions"],
+      "allow": ["merge_unit_pull_request","open_promotion_pull_request"],
+      "deny": ["create_release_tag","publish_release","edit_protections"]
+    },
+    "release_controller": {
+      "actors": ["github_actions"],
+      "allow": ["create_release_tag","stage_artifacts","promote_public_channels"],
+      "deny": ["author_product_change","bypass_required_checks"]
+    },
+    "release_admin": {
+      "actors": ["human"],
+      "allow": ["approve_protected_environment","audited_break_glass"],
+      "deny": ["silent_bypass"]
+    }
+  },
+  "transitions": [
+    {
+      "id": "unit_to_integration",
+      "head": ["fix","feat","restore"],
+      "base": ["batch","rc"],
+      "roles": ["fix_agent"],
+      "ci_profile": "quick",
+      "required_checks": ["policy-gate","issue-references"],
+      "forbidden_changes": ["release_version","release_tag","public_channel"],
+      "requires_lease": true
+    },
+    {
+      "id": "integration_to_main",
+      "head": ["batch","rc"],
+      "base": ["main"],
+      "roles": ["integrator"],
+      "ci_profile": "full",
+      "required_checks": ["policy-gate","release-gate","immutable-manifest","tree-attestation"],
+      "forbidden_changes": ["post_gate_tree_change","floating_component_ref"],
+      "requires_lease": true
+    }
+  ],
+  "changes": {
+    "ci_full_patterns": [".github/**","AGENTS.md","CLAUDE.md","scripts/*release*","scripts/*policy*","scripts/*lease*","Cargo.toml","Cargo.lock","package.json","package-lock.json"],
+    "unit_pr_forbidden_patterns": ["Cargo.toml::workspace.package.version","package.json::version","package-lock.json::version","refs/tags/v*"]
+  },
+  "agents": {
+    "providers": {
+      "openai": {"adapter":"AGENTS.md","role":"fix_agent"},
+      "anthropic": {"adapter":"CLAUDE.md","role":"fix_agent"}
+    },
+    "overrides": {
+      "paths": ["AGENTS.override.md","CLAUDE.local.md",".claude/rules/**","$CODEX_HOME/AGENTS.md","$CODEX_HOME/AGENTS.override.md"],
+      "effect": "tighten_only",
+      "managed_runners_fail_on_widening": true
+    },
+    "lease": {
+      "version": 1,
+      "lock_label_prefix": "verrou:issue-",
+      "visible_label": "en-cours",
+      "required_fields": ["provider","run_id","issue","branch","base_sha","acquired_at","expires_at","heartbeat_at"],
+      "max_ttl_minutes": 480,
+      "handoff_requires_comment": true,
+      "concurrent_acquire": "fail_closed"
+    }
+  },
+  "release": {
+    "manifest_components": ["server","web","os","universal"],
+    "required_component_fields": ["git_sha","immutable_url","sha256"],
+    "forbidden_floating_refs": ["main","master","latest","releases/latest"],
+    "tagging": {
+      "source_branch": "main",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$",
+      "automatic_only": true,
+      "role": "release_controller",
+      "requires_checks": ["release-gate","tree-attestation","immutable-manifest"]
+    },
+    "publishing": {
+      "build_before_promote": true,
+      "idempotent_retry_without_new_tag": true,
+      "stable_channels": ["github_release","docker_version","docker_latest","homebrew","android","tune_os"]
+    }
+  },
+  "ownership": {
+    "owners": ["@renesenses"],
+    "protected_paths": [".github/release-policy.json",".github/release-policy.schema.json",".github/release-policy.sha256",".github/workflows/**",".github/CODEOWNERS","AGENTS.md","CLAUDE.md","scripts/*release*","scripts/*policy*","scripts/*lease*"]
+  }
+}

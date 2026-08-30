@@ -1,5 +1,13 @@
 # Release operations — runbook
 
+RELEASE_RUNBOOK_STATUS: legacy-disabled
+
+> [!CAUTION]
+> Procédure historique désactivée pendant la migration #2808. Ne pas exécuter
+> les commandes de bump, tag, publication ou resynchronisation décrites
+> ci-dessous. La politique canonique est `.github/release-policy.json` ; les
+> releases restent gelées jusqu'à l'activation du release controller #2815.
+
 How to ship a release with the autonomy tooling shipped in v0.8.28.
 Every step is meant to be runnable by a single maintainer without
 coordination, and to be reversible if something goes wrong.

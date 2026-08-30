@@ -1,0 +1,11 @@
+# Les propriétaires sont définis par la politique canonique.
+/.github/release-policy.json @renesenses
+/.github/release-policy.schema.json @renesenses
+/.github/release-policy.sha256 @renesenses
+/.github/workflows/ @renesenses
+/.github/CODEOWNERS @renesenses
+/AGENTS.md @renesenses
+/CLAUDE.md @renesenses
+/scripts/*release* @renesenses
+/scripts/*policy* @renesenses
+/scripts/*lease* @renesenses

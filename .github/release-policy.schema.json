@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/renesenses/tune-server-rust/blob/main/.github/release-policy.schema.json",
+  "title": "Tune release policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema","schema_version","policy_version","mode","repositories","branch_classes","checks","ci_profiles","roles","transitions","changes","agents","release","ownership"],
+  "properties": {
+    "$schema": {"const":"./release-policy.schema.json"},
+    "schema_version": {"const":1},
+    "policy_version": {"type":"string","pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "mode": {"enum":["migration_freeze","enforced"]},
+    "repositories": {"type":"array","minItems":4,"uniqueItems":true,"items":{"$ref":"#/$defs/repository"}},
+    "branch_classes": {"type":"object","additionalProperties":{"type":"string","minLength":1},"required":["fix","batch","rc","main"]},
+    "checks": {"type":"object","minProperties":1,"additionalProperties":{"$ref":"#/$defs/check"}},
+    "ci_profiles": {
+      "type":"object","additionalProperties":false,"required":["quick","full"],
+      "properties":{"quick":{"$ref":"#/$defs/profile"},"full":{"$ref":"#/$defs/profile"}}
+    },
+    "roles": {"type":"object","minProperties":1,"additionalProperties":{"$ref":"#/$defs/role"}},
+    "transitions": {"type":"array","minItems":2,"items":{"$ref":"#/$defs/transition"}},
+    "changes": {"type":"object"},
+    "agents": {"type":"object"},
+    "release": {"type":"object"},
+    "ownership": {"type":"object"}
+  },
+  "$defs": {
+    "repository": {
+      "type":"object","additionalProperties":false,
+      "required":["id","slug","default_branch","policy_path","agents_path","claude_path"],
+      "properties": {
+        "id":{"enum":["server","web","os","universal"]},
+        "slug":{"type":"string","pattern":"^renesenses/.+$"},
+        "default_branch":{"const":"main"},
+        "policy_path":{"const":".github/release-policy.json"},
+        "agents_path":{"const":"AGENTS.md"},
+        "claude_path":{"const":"CLAUDE.md"}
+      }
+    },
+    "check": {
+      "type":"object","additionalProperties":false,"required":["scope"],
+      "properties":{"scope":{"enum":["all_prs","all_prs_and_promotions","changed_components","promotions"]}}
+    },
+    "profile": {
+      "type":"object","additionalProperties":false,"required":["checks"],
+      "properties":{"checks":{"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true}}
+    },
+    "role": {
+      "type":"object","additionalProperties":false,"required":["actors","allow","deny"],
+      "properties": {
+        "actors":{"type":"array","items":{"enum":["openai","anthropic","human","github_actions"]},"uniqueItems":true},
+        "allow":{"type":"array","items":{"type":"string"},"uniqueItems":true},
+        "deny":{"type":"array","items":{"type":"string"},"uniqueItems":true}
+      }
+    },
+    "transition": {
+      "type":"object","additionalProperties":false,
+      "required":["id","head","base","roles","ci_profile","required_checks","forbidden_changes","requires_lease"],
+      "properties": {
+        "id":{"enum":["unit_to_integration","integration_to_main"]},
+        "head":{"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true},
+        "base":{"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true},
+        "roles":{"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true},
+        "ci_profile":{"enum":["quick","full"]},
+        "required_checks":{"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true},
+        "forbidden_changes":{"type":"array","items":{"type":"string"},"uniqueItems":true},
+        "requires_lease":{"const":true}
+      }
+    }
+  }
+}
