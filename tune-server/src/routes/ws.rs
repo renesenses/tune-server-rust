@@ -128,6 +128,10 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
                 tune_core::playback::PlayState::Stopped => "stopped",
             },
             "volume": ps.volume,
+            // #1274 — le WebSocket est la surface que le client relit en
+            // continu ; le priver du dB obligerait a un GET REST pour un
+            // nombre qu'on tient deja. `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(ps.volume),
             "muted": ps.muted,
             "shuffle": ps.shuffle,
             "repeat": ps.repeat,
