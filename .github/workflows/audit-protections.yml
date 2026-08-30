@@ -171,13 +171,33 @@ jobs:
                 fi
                 continue
               fi
-              if ! st=$(gh api "repos/$repo/compare/main...$sha" --jq '.status' 2>/dev/null); then
+              # La référence est la LIGNE DU TRAIN, pas `main` : une `rc/*`
+              # est en avance sur son `main` par construction, et exiger
+              # l'ascendance depuis `main` rendrait cet audit rouge avant
+              # chaque train. Un audit rouge en permanence finit ignoré —
+              # même issue qu'un vert creux. Repli sur `main` si la `rc`
+              # n'existe pas encore.
+              ref="rc/v$VERSION"
+              if ! gh api "repos/$repo/branches/$(printf '%s' "$ref" | sed 's#/#%2F#g')" \
+                     --jq '.name' >/dev/null 2>&1; then
+                ref=main
+                na "$nom : $repo n'a pas de branche $ref — comparaison faite depuis main"
+              fi
+              enc=$(printf '%s' "$ref" | sed 's#/#%2F#g')
+              if ! st=$(gh api "repos/$repo/compare/$enc...$sha" --jq '.status' 2>/dev/null); then
                 ko "$nom : $court INTROUVABLE dans $repo (ou comparaison refusée)"
                 continue
               fi
               case "$st" in
-                identical|behind) ok "$nom : $court atteignable depuis $repo@main ($st)" ;;
-                *)                ko "$nom : $court N'EST PAS atteignable depuis $repo@main ($st)" ;;
+                identical)
+                  ok "$nom : $court = tête de $repo@$ref" ;;
+                behind)
+                  # Le SHA est bien sur la ligne, mais la ligne a AVANCÉ
+                  # depuis le gel. Ce qui a été fusionné après ne partira pas.
+                  d=$(gh api "repos/$repo/compare/$enc...$sha" --jq '.behind_by' 2>/dev/null || echo '?')
+                  na "$nom : $court est sur $repo@$ref mais en retard de $d commit(s) — le manifeste ne gèle PAS la tête actuelle" ;;
+                *)
+                  ko "$nom : $court N'EST PAS sur $repo@$ref ($st)" ;;
               esac
             done < <(
               jq -r '.components | to_entries[]
