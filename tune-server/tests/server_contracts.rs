@@ -23,6 +23,8 @@ mod enrich_artiste_langue_entete;
 mod enrichissement_repertoire;
 #[path = "etiquettes_types_et_playlists.rs"]
 mod etiquettes_types_et_playlists;
+#[path = "explorateur_dossiers.rs"]
+mod explorateur_dossiers;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
 #[path = "favoris_facettes_routes.rs"]
