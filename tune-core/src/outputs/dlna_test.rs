@@ -53,6 +53,14 @@ mod tests {
         oublie_le_media_une_fois: Arc<Mutex<bool>>,
         /// Nombre de `Play` REFUSÉS avec un 701.
         play_refus_701: Arc<AtomicU32>,
+        /// Quand c'est `Some`, `SetVolume` est REFUSÉ avec ce code UPnP.
+        ///
+        /// C'est la panne d'Eric (#1393, fil forum) : un renderer Diretta et un
+        /// PC vu comme zone DLNA n'appliquaient pas le volume. Un renderer
+        /// logiciel sans RenderingControl complet répond `602 Optional Action
+        /// Not Implemented` — statut HTTP 500 AVEC corps, la forme qu'un vrai
+        /// appareil rend et que `soap_action` restitue telle quelle.
+        volume_refus_upnp: Arc<Mutex<Option<(u16, &'static str)>>>,
     }
 
     impl Default for MockState {
@@ -77,6 +85,7 @@ mod tests {
                 stop_oublie_le_media: Arc::new(Mutex::new(false)),
                 oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
                 play_refus_701: Arc::new(AtomicU32::new(0)),
+                volume_refus_upnp: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -114,6 +123,17 @@ mod tests {
     /// rendue comme un vrai renderer la rend : statut HTTP 500 AVEC corps.
     fn soap_701() -> String {
         r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>Transition not available</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+    }
+
+    /// Une faute SOAP UPnP quelconque, à la forme exacte de `soap_701()`.
+    ///
+    /// Sert le refus de `SetVolume` (#1393) : `602 Optional Action Not
+    /// Implemented` est ce que rend un renderer logiciel dont le
+    /// RenderingControl est décoratif — le « PC vu comme zone DLNA » d'Eric.
+    fn soap_fault_upnp(code: u16, description: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode><errorDescription>{description}</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
+        )
     }
 
     async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
@@ -236,23 +256,37 @@ mod tests {
         }
     }
 
-    async fn rc_handler(State(state): State<MockState>, body: String) -> String {
+    async fn rc_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
+        use axum::response::IntoResponse;
         let action = extract_action(&body);
         match action.as_str() {
             "SetVolume" => {
+                // Compté AVANT le refus : la commande a bien été émise, c'est
+                // la réponse qui dit non. Sans ce compteur, un test vert ne
+                // distinguerait pas « refusé par l'appareil » de « jamais
+                // envoyé ».
                 state.volume_count.fetch_add(1, Ordering::Relaxed);
-                soap_ok("SetVolume", "")
+                if let Some((code, description)) = *state.volume_refus_upnp.lock().await {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        soap_fault_upnp(code, description),
+                    )
+                        .into_response();
+                }
+                soap_ok("SetVolume", "").into_response()
             }
-            "GetVolume" => soap_ok("GetVolume", "<CurrentVolume>50</CurrentVolume>"),
-            "SetMute" => soap_ok("SetMute", ""),
+            "GetVolume" => {
+                soap_ok("GetVolume", "<CurrentVolume>50</CurrentVolume>").into_response()
+            }
+            "SetMute" => soap_ok("SetMute", "").into_response(),
             // Répond « coupé » exprès : si `get_status` interrogeait encore le
             // renderer, le statut rendu porterait `muted = true` et les tests
             // de #2263 le verraient.
             "GetMute" => {
                 state.get_mute_count.fetch_add(1, Ordering::Relaxed);
-                soap_ok("GetMute", "<CurrentMute>1</CurrentMute>")
+                soap_ok("GetMute", "<CurrentMute>1</CurrentMute>").into_response()
             }
-            _ => soap_ok(&action, ""),
+            _ => soap_ok(&action, "").into_response(),
         }
     }
 
@@ -672,6 +706,79 @@ mod tests {
 
         output.set_volume(0.75).await.unwrap();
         assert_eq!(state.volume_count.load(Ordering::Relaxed), 1);
+        handle.abort();
+    }
+
+    /// #1393 — un `SetVolume` REFUSÉ par le renderer doit remonter en erreur.
+    ///
+    /// Eric (fil forum, Windows 0.9.61) : « le volume ne fait rien » vers un
+    /// renderer Diretta et vers un PC vu comme zone DLNA. Trois couches se
+    /// mettaient d'accord sur un changement qui n'avait pas eu lieu — la sortie
+    /// lisait la faute UPnP, écrivait un WARN, et rendait `Ok(())` ; le curseur
+    /// bougeait, la valeur tenait en base, et le son ne changeait pas.
+    ///
+    /// Corrigé par #1417. Rien ne l'empêchait de revenir : les tests de
+    /// l'orchestrateur couvrent le contrat AU-DESSUS (un backend qui refuse ne
+    /// modifie ni mémoire ni base — `un_backend_qui_refuse_ne_modifie_ni_
+    /// memoire_ni_base`), et `dlna_set_volume` ne couvre que le succès. Ramener
+    /// ce `Ok(())` les laisserait TOUS verts, et Eric n'entendrait toujours
+    /// rien.
+    ///
+    /// Les deux moitiés sont dans le même test, et c'est délibéré : la seconde
+    /// est la contre-épreuve permanente de la première. Sans elle, un mock
+    /// devenu injoignable, un port fermé, un `set_volume` qui échouerait pour
+    /// n'importe quelle autre raison rendraient le premier `unwrap_err()` vert
+    /// sans rien prouver.
+    #[tokio::test]
+    async fn un_volume_refuse_par_le_renderer_remonte_en_erreur() {
+        // 1) Le renderer refuse : 602 « Optional Action Not Implemented »,
+        //    statut HTTP 500 AVEC corps — ce que rend un RenderingControl
+        //    décoratif.
+        let refus = MockState::default();
+        *refus.volume_refus_upnp.lock().await = Some((602, "Optional Action Not Implemented"));
+        let (base, handle) = start_mock(refus.clone()).await;
+        let output = make_dlna(&base);
+
+        let erreur = output
+            .set_volume(0.75)
+            .await
+            .expect_err("un renderer qui répond UPnPError ne doit JAMAIS donner Ok(())");
+
+        // La commande a bien été ÉMISE : l'échec vient de la réponse, pas d'un
+        // abandon en amont.
+        assert_eq!(
+            refus.volume_count.load(Ordering::Relaxed),
+            1,
+            "le SetVolume doit partir avant d'être refusé"
+        );
+        // Le message est celui que l'auditeur lit, pas une trace de transport :
+        // il nomme l'appareil et dit quoi faire.
+        assert!(
+            erreur.contains("Mock Renderer"),
+            "le message doit nommer l'appareil : {erreur}"
+        );
+        assert!(
+            erreur.contains("sur l'appareil"),
+            "le message doit dire où régler le volume : {erreur}"
+        );
+        assert!(
+            !erreur.contains("soap send") && !erreur.contains("soap read"),
+            "un refus n'est pas une panne de transport : {erreur}"
+        );
+        handle.abort();
+
+        // 2) CONTRE-ÉPREUVE. Même harnais, même appel, refus retiré : le
+        //    résultat doit être `Ok`. C'est ce qui prouve que la moitié
+        //    ci-dessus échoue à cause du refus injecté, et de rien d'autre.
+        let temoin = MockState::default();
+        let (base, handle) = start_mock(temoin.clone()).await;
+        let output = make_dlna(&base);
+
+        output
+            .set_volume(0.75)
+            .await
+            .expect("sans refus injecté, le même appel doit réussir");
+        assert_eq!(temoin.volume_count.load(Ordering::Relaxed), 1);
         handle.abort();
     }
 

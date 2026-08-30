@@ -1375,6 +1375,34 @@ fn build_signal_path(
     // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
     // qui ne peut pas exister (#1315).
     let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
+    // Un égaliseur ARMÉ n'atteint pas un flux DSD servi BRUT hors sortie
+    // locale, et l'orchestrateur s'en abstient DÉLIBÉRÉMENT : convertir du DSD
+    // natif en PCM pour y passer un EQ serait une dégradation décidée à la
+    // place de l'auditeur. Les deux gardes sont explicites côté audio —
+    // `pull_output_needs_dsp_transcode` rend `false` sur `AudioFormat::Dsd`,
+    // et `eq_forces_transcode` est gardé par `!dsd_passthrough`.
+    //
+    // Le panneau, lui, annonçait l'étape DSP sur la seule foi du RÉGLAGE en
+    // base (`configured_dsp_enabled`) : un traitement qui n'a pas lieu, plus
+    // un verdict bit-perfect qu'il faisait tomber alors que le fil est intact.
+    // C'est la faute de #1315 et #2053 — ne pas annoncer ce qui n'a pas lieu —
+    // et c'est le versant visible du signalement d'Eric (#1393, renderer
+    // Diretta et PC vu comme zone DLNA) : des réglages sans effet, et rien qui
+    // le dise.
+    //
+    // `is_network_output` n'est PAS la bonne borne : une sortie PULL hors
+    // dépôt (`diretta`) va chercher le .dsf elle-même sans être « réseau » au
+    // sens de ce fichier, et c'est justement la zone du signalement. Le fil
+    // est CONSTATÉ (`wire_carries_raw_dsd`), pas déduit.
+    //
+    // La sortie LOCALE est exclue : elle a sa sonde d'exécution, qui dit déjà
+    // « DSP contourné pour DoP » quand c'est le cas, et qui est plus juste que
+    // toute déduction faite ici.
+    let dsd_brut_hors_sortie_locale =
+        is_dsd && output_type != "local" && wire_carries_raw_dsd(wire);
+    // « Armé » et « appliqué » ne sont pas la même chose.
+    let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
+    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
     // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
     // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
     // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
@@ -1566,9 +1594,12 @@ fn build_signal_path(
     // identiques réécrit chaque échantillon. Une zone qui l'active n'est PAS
     // bit-perfect, et le panneau doit le dire — c'est exactement la promesse
     // que #1548/#1559 (EQ) et #1627 (ReplayGain) avaient laissé mentir.
+    // `dsp_applique`, et non `dsp_enabled` : un EQ armé qu'un flux DSD brut
+    // met hors de portée ne touche AUCUN échantillon. Le faire tomber le
+    // verdict serait mentir dans l'autre sens (#1393).
     let bit_perfect = is_lossless
         && transport_bit_perfect
-        && !dsp_enabled
+        && !dsp_applique
         && !resampling_active
         && replaygain_step.is_none()
         && mono_downmix_step.is_none();
@@ -1769,7 +1800,23 @@ fn build_signal_path(
                 "metrics": dsp_metrics.clone(),
             }));
         }
-    } else if dsp_enabled {
+    } else if dsp_contourne_par_le_dsd {
+        // DIRE le contournement plutôt que de le taire. L'auditeur a un
+        // égaliseur ARMÉ et n'entend rien changer : c'est exactement ce qu'Eric
+        // a signalé (#1393). Faire disparaître l'étape le laisserait devant le
+        // même curseur inerte, sans explication ; l'annoncer « actif » serait
+        // le mensonge que #1315 et #2053 ont déjà coûté. On dit donc les deux
+        // choses : il y a un DSP, et il ne s'applique pas ici.
+        //
+        // `bit_perfect: true` — le fil porte le DSD tel quel, rien n'y a
+        // touché. Même convention que « DSP contourné pour DoP », que la sonde
+        // de la sortie locale publie déjà.
+        steps.push(json!({
+            "name": "DSP",
+            "description": "DSP contourné (DSD natif servi brut)",
+            "bit_perfect": true,
+        }));
+    } else if dsp_applique {
         steps.push(json!({
             "name": "DSP",
             "description": eq_step_description.as_deref().unwrap_or("EQ/DSP active"),
@@ -4075,6 +4122,153 @@ mod signal_path_tests {
 
     /// #2212 — le chemin du signal nomme le pré-gain qui prévient les overs,
     /// et ne présente plus l'ancien saturateur implicite comme une protection.
+    /// Une zone servie par une sortie PULL hors dépôt — le cas `diretta`.
+    fn diretta_zone() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create("Diretta", Some("diretta"), Some("diretta-1"))
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    /// Un égaliseur ARMÉ sur la zone, écrit là où le chemin audio le lit.
+    fn armer_l_eq(backend: &Arc<dyn DbBackend>, zone_id: i64) {
+        let profile = tune_core::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![tune_core::audio::eq::EqBandSpec {
+                gain: 6.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        SettingsRepo::with_backend(backend.clone())
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&profile).unwrap(),
+            )
+            .unwrap();
+    }
+
+    /// Source DSD128 en lecture, avec une session vivante.
+    fn dsd_playing() -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Locatelli".into(),
+                format: Some("dsf".into()),
+                sample_rate: Some(5_644_800),
+                bit_depth: Some(1),
+                stream_id: Some("sid-dsd".into()),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// #1393 — le panneau annonçait un égaliseur qui n'a PAS lieu.
+    ///
+    /// Eric (fil forum, Windows 0.9.61) : « l'égaliseur ne fait rien » sur un
+    /// renderer Diretta et sur un PC vu comme zone DLNA. Le versant audible du
+    /// cas PCM a été corrigé par #1430 (`pull_output_needs_dsp_transcode` force
+    /// le chemin transcodé pour une sortie pull). Ce même correctif s'ABSTIENT
+    /// délibérément sur le DSD natif — convertir un flux DSD en PCM pour y
+    /// passer un EQ serait une dégradation décidée à la place de l'auditeur.
+    ///
+    /// Le chemin du signal, lui, ne connaissait pas cette abstention : il lisait
+    /// `configured_dsp_enabled` — le RÉGLAGE en base — et affichait « EQ actif »
+    /// pour un traitement qui n'existe pas, en faisant au passage tomber le
+    /// verdict bit-perfect d'un fil que personne n'a touché. C'est la faute de
+    /// #1315 et #2053 : ne pas annoncer ce qui n'a pas lieu.
+    ///
+    /// L'étape n'est pas SUPPRIMÉE : la faire disparaître laisserait l'auditeur
+    /// devant le même curseur inerte, sans explication. Elle dit ce qui est.
+    #[test]
+    fn un_eq_arme_sur_du_dsd_brut_est_annonce_contourne_et_non_applique() {
+        let (backend, zone) = diretta_zone();
+        armer_l_eq(&backend, zone.id.unwrap());
+
+        // Le fil porte le .dsf tel quel : c'est CONSTATÉ, pas déduit.
+        let sp = build_signal_path(
+            &dsd_playing(),
+            &zone,
+            &backend,
+            Some("Diretta Host"),
+            "",
+            Some(&wire("dsf", 5_644_800, 1)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "DSP").as_deref(),
+            Some("DSP contourné (DSD natif servi brut)"),
+            "un EQ que l'orchestrateur n'applique pas ne doit pas être annoncé actif"
+        );
+        let etape_dsp = sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "DSP")
+            .unwrap();
+        assert_eq!(
+            etape_dsp["bit_perfect"].as_bool(),
+            Some(true),
+            "rien n'a touché le flux : l'étape ne doit pas se déclarer dégradante"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE de l'essai ci-dessus, et elle est PERMANENTE.
+    ///
+    /// Même zone `diretta`, même égaliseur armé, seul le FIL change : du FLAC au
+    /// lieu du DSD brut. Là, `pull_output_needs_dsp_transcode` force bien le
+    /// transcodage et l'EQ est réellement appliqué — le panneau doit donc
+    /// l'annoncer actif, et le verdict bit-perfect doit tomber.
+    ///
+    /// Sans cette moitié, une garde trop large — « ne jamais annoncer le DSP
+    /// hors sortie locale » — laisserait la première verte tout en rendant le
+    /// panneau muet sur le cas d'Eric qui, lui, est bel et bien traité.
+    #[test]
+    fn le_meme_eq_sur_un_fil_pcm_reste_annonce_applique() {
+        let (backend, zone) = diretta_zone();
+        armer_l_eq(&backend, zone.id.unwrap());
+
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Locatelli".into(),
+                format: Some("flac".into()),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+                stream_id: Some("sid-pcm".into()),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("Diretta Host"),
+            "",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        let dsp = step_desc(&sp, "DSP").expect("l'étape DSP doit rester présente sur du PCM");
+        assert!(
+            dsp.starts_with("EQ actif"),
+            "sur un fil PCM l'EQ est réellement appliqué : {dsp}"
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    }
+
     #[test]
     fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
         let (backend, zone) = dlna_zone();
