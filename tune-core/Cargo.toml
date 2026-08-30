@@ -137,6 +137,13 @@ path = "tests/terminologie_eq.rs"
 name = "journal_descriptif_illisible"
 path = "tests/journal_descriptif_illisible.rs"
 
+# Meme famille, meme raison (#2890) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il tient les deux bords du journal d insertion par lot — le lot
+# nominal est muet au niveau livre, l echec d insertion reste dit.
+[[test]]
+name = "journal_insertion_par_lot"
+path = "tests/journal_insertion_par_lot.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
