@@ -53,6 +53,8 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "playlists_ecritures_partielles.rs"]
 mod playlists_ecritures_partielles;
+#[path = "playlists_pistes_de_service.rs"]
+mod playlists_pistes_de_service;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
 #[path = "radios_recherche_distinction.rs"]
