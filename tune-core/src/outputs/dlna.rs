@@ -409,7 +409,7 @@ impl DlnaOutput {
     /// 2. l'URI a changé → nouvelle piste, on repart de zéro ;
     /// 3. l'état a basculé (lecture ⇄ pause/arrêt) → on replie le temps déjà
     ///    couru dans l'ancre avant de changer de régime.
-    async fn position_extrapolee(
+    async fn extrapoler_position(
         &self,
         etat: TransportState,
         uri: Option<&String>,
@@ -1397,7 +1397,7 @@ impl OutputTarget for DlnaOutput {
             // ── Silence UPnP : zéro action ────────────────────────────────
             let etat = evt_etat.unwrap_or(TransportState::Stopped);
             let position_ms = self
-                .position_extrapolee(etat, evt_uri.as_ref(), evt_position)
+                .extrapoler_position(etat, evt_uri.as_ref(), evt_position)
                 .await;
             self.position_extrapolee.store(true, Ordering::Relaxed);
             let volume = match evt_volume {
