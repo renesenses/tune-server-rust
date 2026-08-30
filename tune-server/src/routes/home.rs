@@ -62,19 +62,61 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// `album_id` viderait la section pour ces gens-la ; d'ou le repli sur
 /// titre ET artiste.
 ///
-/// Une ligne sans artiste reste rattachee au titre seul : on ne sait pas
-/// departager, et perdre l'entree serait pire que la garder.
+/// Le repli suit la regle de `find_album_by_identity`
+/// (`tune-core/src/db/favorites_reconcile.rs`), deja partagee par les favoris
+/// et par les albums masques (#1391 / PR #2817) — pas une seconde regle de
+/// rapprochement inventee ici, la meme, a une reserve pres (la casse, voir
+/// plus bas) :
+/// * artiste connu — NULL **et** chaine vide valent « inconnu », comme
+///   `artist.is_empty()` la-bas : titre + artiste, l'artiste absent de
+///   l'album valant chaine vide ;
+/// * artiste inconnu : titre seul, et UNIQUEMENT s'il ne designe qu'un
+///   album. Un titre partage par deux disques ne rattache plus rien —
+///   c'est le cas de Tades par l'autre porte, et la doctrine de
+///   `find_album_by_identity` (« AUCUN repli titre seul » quand ca peut
+///   designer l'homonyme d'un autre artiste).
+///
+/// RESERVE MESUREE — la casse reste significative ici, alors que
+/// `find_album_by_identity` compare en `LOWER`. Transposer le `LOWER` dans
+/// CETTE jointure coute la section : mesure sur 45 000 albums / 5 000 lignes
+/// d'historique (dont 20 % sans `album_id`), meme machine, meme jeu de
+/// donnees, `fetch_continue_listening` seul :
+///
+/// ```text
+///   titre compare tel quel   :    19 ms
+///   LOWER(...) des deux cotes : 83 662 ms
+/// ```
+///
+/// Quatre mille fois plus cher, sur le chemin de l'accueil. La cause est
+/// l'index : `idx_albums_title ON albums(title COLLATE NOCASE)` sert la
+/// comparaison directe, aucun index ne sert `LOWER(title)`. Le rendre
+/// gratuit demanderait un index d'expression AUX QUATRE endroits du schema
+/// (CORE_SCHEMA, migration SQLite, PG_FULL_SCHEMA, migration PG) — et
+/// PostgreSQL, lui, n'a pas d'equivalent de `COLLATE NOCASE` a portee de
+/// main. Hors du perimetre de #2731 : c'est un chantier de schema, pas la
+/// confusion de deux albums. Le test
+/// `la_casse_separe_encore_une_ecoute_de_son_album` fige la limite pour
+/// qu'on ne la redecouvre pas une troisieme fois.
 ///
 /// Le sous-select sur `artists` evite de dependre de l'ordre des jointures —
 /// `ar` n'existe pas encore quand cette condition est evaluee, et le
 /// GROUP BY de PostgreSQL n'accepte pas qu'on enveloppe `albums` dans une
 /// table derivee (la dependance fonctionnelle ne vaut que pour la cle
 /// primaire d'une vraie table).
+///
+/// Cout : les deux sous-selects ne sont atteints QUE par les lignes a
+/// `album_id` NULL dont le titre d'album tombe deja juste ; le chemin
+/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus.
 const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
      OR (lh.album_id IS NULL AND lh.album_title = a.title \
-         AND (lh.artist_name IS NULL \
-              OR lh.artist_name = (SELECT ar_hist.name FROM artists ar_hist \
-                                   WHERE ar_hist.id = a.artist_id))))";
+         AND ((COALESCE(lh.artist_name, '') <> '' \
+               AND lh.artist_name \
+                   = (SELECT ar_hist.name FROM artists ar_hist \
+                      WHERE ar_hist.id = a.artist_id)) \
+              OR (COALESCE(lh.artist_name, '') = '' \
+                  AND NOT EXISTS (SELECT 1 FROM albums a_hom \
+                                  WHERE a_hom.title = a.title \
+                                    AND a_hom.id <> a.id)))))";
 
 /// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
 /// celui de l'album. Partage entre les recommandations et les « top mixes »,
@@ -324,10 +366,43 @@ mod tests_homonymes {
         assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
     }
 
-    /// Sans artiste NI identifiant on ne sait pas departager : la ligne reste
-    /// rattachee au titre seul. Perdre l'entree serait pire que la garder.
+    /// Sans artiste NI identifiant, un titre qui ne designe QU'UN album reste
+    /// rattache : perdre l'entree serait pire que la garder. C'est la seconde
+    /// branche de `find_album_by_identity` — titre seul, mais non ambigu.
     #[test]
     fn une_ecoute_sans_artiste_ni_identifiant_n_est_pas_perdue() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            1,
+            "la section ne doit pas se vider : {items:?}"
+        );
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// Sans artiste NI identifiant, un titre PARTAGE par deux disques ne
+    /// designe rien. Le rattacher aux deux, c'est le defaut de Tades par
+    /// l'autre porte : le « Live » de Police remontait sans avoir ete joue.
+    /// `find_album_by_identity` refuse ce repli depuis #1391 (« ok » de daoud
+    /// vs « OK » de Talvin Singh) ; la section s'aligne.
+    #[test]
+    fn une_ecoute_sans_artiste_sur_un_titre_ambigu_ne_rattache_rien() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         deux_live(&state, None);
         ecoute(&state, "Piste inconnue", None, None);
@@ -336,7 +411,78 @@ mod tests_homonymes {
             panic!("la requete doit repondre")
         };
 
-        assert!(!items.is_empty(), "la section ne doit pas se vider");
+        assert!(
+            items.is_empty(),
+            "un titre partage par deux albums ne designe aucun des deux : {items:?}"
+        );
+    }
+
+    /// Une chaine vide n'est pas un artiste. Traitee comme une valeur, elle ne
+    /// s'egalait a rien : l'album disparaissait de la section au lieu de
+    /// retomber sur le titre seul. `find_album_by_identity` teste
+    /// `artist.is_empty()`, pas la nullite.
+    #[test]
+    fn un_artiste_vide_vaut_artiste_inconnu() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", Some(""), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// LIMITE FIGEE, pas un comportement souhaite. `record_listen` ecrit le
+    /// titre d'album tel que le fournisseur de flux le rend ; `albums` le
+    /// porte tel que le scanner l'a lu des etiquettes. Les favoris
+    /// rapprochent « Live » et « LIVE » depuis #1391 ; cette section, non —
+    /// elle compare octet a octet et perd l'ecoute.
+    ///
+    /// Ce n'est pas un oubli : le `LOWER` a ete ecrit, puis MESURE. Sur
+    /// 45 000 albums et 5 000 lignes d'historique, `fetch_continue_listening`
+    /// passe de **19 ms a 83 662 ms** — l'index
+    /// `idx_albums_title ON albums(title COLLATE NOCASE)` ne sert plus la
+    /// comparaison. Le rendre gratuit demande un index d'expression aux
+    /// quatre endroits du schema, et PostgreSQL n'a pas de `COLLATE NOCASE`.
+    /// C'est un chantier de schema, pas la confusion de deux albums (#2731).
+    ///
+    /// Si ce test se met a echouer, c'est que quelqu'un a rendu la casse
+    /// indifferente : verifier d'abord qu'il a paye l'index, sinon l'accueil
+    /// met une minute et demie a s'afficher.
+    #[test]
+    fn la_casse_separe_encore_une_ecoute_de_son_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, _pulp) = deux_live(&state, None);
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
+                 VALUES ('Common People', 'pulp', 'LIVE', '2026-08-28T22:45:00Z')",
+                &[],
+            )
+            .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "limite connue : « LIVE » ne rejoint pas « Live » — voir le cout \
+             mesure sur HISTORIQUE_VERS_ALBUM avant de changer ceci : {items:?}"
+        );
     }
 
     /// Constat de bordure, releve en voulant eprouver le meme defaut du cote
