@@ -214,3 +214,35 @@ fn le_greffon_declare_son_module() {
 
     assert_eq!(greffon.required_feature(), Some(Feature::Concerts));
 }
+
+/// La route de localisation est gardée comme la lecture, et par le MÊME code.
+///
+/// Une seconde route ajoutée sans son portillon est l'erreur classique : la
+/// lecture refuse, l'écriture passe, et un compte gratuit peut poser sa commune
+/// sur un service qu'il n'a pas.
+#[tokio::test]
+async fn la_route_de_localisation_est_gardee_elle_aussi() {
+    let state = new_state();
+    let app = app_avec_concerts(&state).await;
+
+    let reponse = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/ext/concerts/location")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"city":"Dijon","country":"FR","scope":"country"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reponse.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "poser sa commune est un geste du module : il se refuse comme la lecture"
+    );
+}

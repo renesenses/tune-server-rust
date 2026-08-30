@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -179,9 +179,28 @@ async fn acces(license: &Option<Arc<LicenseManager>>) -> Acces {
     }
 }
 
+/// Le refus d'offre, dans la forme EXACTE de `require_premium` côté hôte.
+///
+/// Déclaré une fois et partagé par les deux routes : deux corps rédigés
+/// séparément finissent par diverger, et l'écran devrait alors apprendre deux
+/// formes de refus — donc en oublier une. `estRefusPremium` (tune-web-client)
+/// reconnaît celle-ci comme un refus d'offre, pas comme une panne.
+fn refus_premium() -> axum::response::Response {
+    (
+        axum::http::StatusCode::PAYMENT_REQUIRED,
+        Json(json!({
+            "error": "premium_required",
+            "feature": Feature::Concerts.display_name(),
+            "upgrade_url": "https://mozaiklabs.fr/pricing",
+        })),
+    )
+        .into_response()
+}
+
 pub fn router(backend: Arc<dyn DbBackend>, license: Option<Arc<LicenseManager>>) -> Router<()> {
     Router::new()
         .route("/upcoming", get(concerts_a_venir))
+        .route("/location", post(poser_localisation))
         .with_state(EtatConcerts { backend, license })
 }
 
@@ -196,21 +215,7 @@ async fn concerts_a_venir(
 ) -> axum::response::Response {
     match acces(&etat.license).await {
         Acces::Complet => {}
-        // Même corps que `require_premium` de l'hôte : le client sait déjà
-        // reconnaître ce refus comme un refus d'offre et non comme une panne
-        // (`estRefusPremium`, tune-web-client). Un corps de plus aurait obligé
-        // l'écran à apprendre une deuxième forme, donc à en oublier une.
-        Acces::Refuse => {
-            return (
-                axum::http::StatusCode::PAYMENT_REQUIRED,
-                Json(json!({
-                    "error": "premium_required",
-                    "feature": Feature::Concerts.display_name(),
-                    "upgrade_url": "https://mozaiklabs.fr/pricing",
-                })),
-            )
-                .into_response();
-        }
+        Acces::Refuse => return refus_premium(),
     }
 
     let instance_id = SettingsRepo::with_backend(etat.backend.clone())
@@ -236,7 +241,7 @@ async fn concerts_a_venir(
     };
 
     match recuperer_concerts(&client, &instance_id).await {
-        Ok(concerts) => Json(json!({"concerts": concerts})).into_response(),
+        Ok(corps) => Json(corps).into_response(),
         Err(e) => {
             warn!(error = %e, "concerts_fetch_failed");
             Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response()
@@ -411,7 +416,7 @@ pub async fn synchroniser_abonnements(
 pub async fn recuperer_concerts(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<Value>, String> {
+) -> Result<Value, String> {
     let resp = http_client
         .get(format!("{CONCERTS_API}/upcoming"))
         .query(&[("instance_id", instance_id)])
@@ -424,10 +429,97 @@ pub async fn recuperer_concerts(
         return Err(format!("concerts: HTTP {}", resp.status()));
     }
 
+    // Le corps entier remonte, pas seulement `concerts` : depuis
+    // site-mozaiklabs#186 le cloud rend aussi le périmètre appliqué (`scope`,
+    // `radius_km`, `city`). Sans ces champs, l'écran affiche « 3 concerts »
+    // sans pouvoir dire « à moins de 100 km de Dijon » — ni proposer
+    // d'élargir quand la liste est courte, ce qui est le geste utile.
     let data: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-    let concerts = data["concerts"].as_array().cloned().unwrap_or_default();
-    info!(count = concerts.len(), "upcoming_concerts_fetched");
-    Ok(concerts)
+    let nombre = data["concerts"].as_array().map(|c| c.len()).unwrap_or(0);
+    info!(count = nombre, "upcoming_concerts_fetched");
+    Ok(data)
+}
+
+/// Enregistre la commune SAISIE par l'utilisateur, et le périmètre voulu.
+///
+/// ⚠️ Le greffon ne devine JAMAIS où habite quelqu'un. Le serveur connaît
+/// pourtant des coordonnées — le cloud en déduit de l'adresse IP au battement
+/// de cœur — et il ne faut pas s'en servir : une IP désigne la sortie du
+/// fournisseur d'accès, et derrière un VPN un autre pays. Cette route ne
+/// transmet que ce que l'utilisateur a tapé.
+pub async fn enregistrer_localisation(
+    http_client: &reqwest::Client,
+    instance_id: &str,
+    demande: &Value,
+) -> Result<Value, String> {
+    let mut corps = demande.clone();
+    if let Some(objet) = corps.as_object_mut() {
+        // L'instance est celle de CE serveur, jamais celle que le client
+        // prétend : sinon n'importe qui poserait la commune d'un autre.
+        objet.insert("instance_id".into(), Value::String(instance_id.to_string()));
+    }
+
+    let resp = http_client
+        .post(format!("{CONCERTS_API}/location"))
+        .json(&corps)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("concerts location: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("concerts location: HTTP {}", resp.status()));
+    }
+
+    resp.json().await.map_err(|e| format!("parse: {e}"))
+}
+
+/// `POST /api/v1/ext/concerts/location` — la commune SAISIE et le périmètre.
+///
+/// Le corps est relayé tel quel au cloud, à ceci près que l'`instance_id` est
+/// imposé par le serveur : c'est le sien, jamais celui que le client prétend.
+///
+/// Même portillon que la lecture, et pour la même raison : la décision tient
+/// dans `acces()`, un seul endroit, prêt à rendre `Reduit` le jour où les
+/// comptes gratuits auront leur version limitée.
+async fn poser_localisation(
+    axum::extract::State(etat): axum::extract::State<EtatConcerts>,
+    Json(demande): Json<Value>,
+) -> axum::response::Response {
+    match acces(&etat.license).await {
+        Acces::Complet => {}
+        Acces::Refuse => return refus_premium(),
+    }
+
+    let instance_id = SettingsRepo::with_backend(etat.backend.clone())
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    if instance_id.is_empty() {
+        return Json(json!({"code": "concerts.no_instance_id"})).into_response();
+    }
+
+    let client = match tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "concerts_client_build_failed");
+            return Json(json!({"code": "concerts.unavailable"})).into_response();
+        }
+    };
+
+    match enregistrer_localisation(&client, &instance_id, &demande).await {
+        Ok(corps) => Json(corps).into_response(),
+        Err(e) => {
+            warn!(error = %e, "concerts_location_failed");
+            Json(json!({"code": "concerts.unavailable"})).into_response()
+        }
+    }
 }
 
 /// La tâche périodique : abonnement toutes les 24 h, 2 min après le démarrage.
