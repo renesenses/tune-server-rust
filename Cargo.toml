@@ -61,7 +61,29 @@ regex = "1"
 csv = "1"
 symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg", "mkv"] }
 rubato = "3"
-audiopus = "0.3.0-rc.0"
+# libopus — liaison sûre `opus` (SpaceManiac/opus-rs) au-dessus d'`opusic-sys`
+# (DoumanAsh), qui embarque libopus 1.6.1 et la construit en statique.
+#
+# Remplace `audiopus 0.3.0-rc.0` / `audiopus_sys 0.2.2`, abandonnés depuis 2021
+# et signalés par RUSTSEC-2026-0150 (#2251). Ce que le changement apporte :
+#
+#   * la crate est maintenue — `opus 0.4.0` (23/08/2026) et `opusic-sys 0.7.5`
+#     (06/08/2026), contre une dernière publication en avril 2021 en face ;
+#   * la libopus embarquée passe de la copie de 2021 à la 1.6.1 amont, dont le
+#     `CMakeLists.txt` déclare `cmake_minimum_required(VERSION 3.16)`. Le SEUL
+#     défaut concret que nomme l'avis — un `cmake_minimum_required` antérieur à
+#     3.5 que CMake 4.x refuse — disparaît donc à la source, au lieu d'être
+#     contourné par `CMAKE_POLICY_VERSION_MINIMUM=3.5` ;
+#   * `opusic-sys` lie TOUJOURS en statique (`rustc-link-lib=static=opus`) et ne
+#     sonde jamais `pkg-config`. Le piège hôte/cible de `Cross.toml` (#1288),
+#     où le `build.rs` d'`audiopus_sys` décidait statique-vs-dynamique avec des
+#     `cfg!` évalués pour l'HÔTE, n'a plus d'objet ;
+#   * son `build.rs` gère explicitement le NDK Android (`ANDROID_NDK_HOME`,
+#     `android.toolchain.cmake`, `ANDROID_ABI`, variables `CARGO_NDK_*`).
+#
+# Licences : `opus` en MIT/Apache-2.0, `opusic-sys` en BSD-3-Clause — les trois
+# figurent déjà dans la liste `allow` de `deny.toml`.
+opus = "0.4.0"
 thiserror = "2"
 unicode-normalization = "0.1"
 oaat-core = { git = "https://github.com/renesenses/oaat", rev = "a5d5503", default-features = false }
