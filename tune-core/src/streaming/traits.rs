@@ -97,6 +97,81 @@ pub struct SearchResults {
     pub playlists: Vec<StreamPlaylist>,
 }
 
+/// Ce qu'un service annonce POSSÉDER pour une requête, par catégorie.
+///
+/// Distinct de ce qu'une page rend : c'est la borne haute d'un « Charger plus ».
+/// `0` quand le service n'annonce rien — l'absence de total ne s'invente pas.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTotals {
+    pub tracks: usize,
+    pub albums: usize,
+    pub artists: usize,
+    pub playlists: usize,
+}
+
+/// Une page de résultats de recherche, plus de quoi en demander la suite (#2160).
+///
+/// `#[serde(flatten)]` : le corps JSON garde EXACTEMENT les quatre clés
+/// `tracks` / `albums` / `artists` / `playlists` qu'il portait avant ; les clés
+/// de pagination s'ajoutent à côté. Un client antérieur, qui lit `.albums` et
+/// ignore le reste, ne voit aucune différence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPage {
+    #[serde(flatten)]
+    pub results: SearchResults,
+    /// Décalage, par catégorie, du premier élément rendu. `0` pour la première
+    /// page. C'est le curseur que le client renvoie en `?offset=`.
+    pub offset: usize,
+    /// Ce que le service annonce en tout, par catégorie.
+    pub totals: SearchTotals,
+    /// Reste-t-il, dans AU MOINS une catégorie, des éléments au-delà de cette
+    /// page ? C'est la condition d'affichage d'un « Charger plus ».
+    pub has_more: bool,
+    /// La page a-t-elle été écourtée par le plafond du SERVEUR plutôt que par
+    /// l'épuisement du catalogue ? « Tous » est borné — sans ce drapeau, un
+    /// écran croirait tenir tout ce que Qobuz possède.
+    pub truncated: bool,
+}
+
+impl SearchPage {
+    /// Page unique d'un service qui ne sait pas paginer sa recherche.
+    ///
+    /// Les totaux valent ce qui est rendu : c'est tout ce que le service dit
+    /// savoir. On n'annonce donc jamais une suite qu'on serait incapable de
+    /// servir.
+    pub fn page_unique(results: SearchResults) -> Self {
+        let totals = SearchTotals {
+            tracks: results.tracks.len(),
+            albums: results.albums.len(),
+            artists: results.artists.len(),
+            playlists: results.playlists.len(),
+        };
+        Self {
+            results,
+            offset: 0,
+            totals,
+            has_more: false,
+            truncated: false,
+        }
+    }
+
+    /// Page vide au-delà de ce qu'un service sait servir.
+    pub fn au_dela(offset: usize) -> Self {
+        Self {
+            results: SearchResults {
+                tracks: Vec::new(),
+                albums: Vec::new(),
+                artists: Vec::new(),
+                playlists: Vec::new(),
+            },
+            offset,
+            totals: SearchTotals::default(),
+            has_more: false,
+            truncated: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamGenre {
     pub id: String,
@@ -179,6 +254,26 @@ pub trait StreamingService: Send + Sync {
     async fn logout(&mut self) -> Result<(), TuneError>;
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError>;
+
+    /// Une PAGE de recherche : `limit` éléments par catégorie à partir de
+    /// `offset`, avec de quoi savoir s'il en reste (#2160).
+    ///
+    /// Défaut : le service ne sait pas paginer sa recherche. À `offset = 0` il
+    /// rend sa page unique ; au-delà il rend du vide, car recycler la première
+    /// page en prétendant que c'est la seconde ferait afficher deux fois les
+    /// mêmes titres.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        if offset > 0 {
+            return Ok(SearchPage::au_dela(offset));
+        }
+        Ok(SearchPage::page_unique(self.search(query, limit).await?))
+    }
+
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError>;
     async fn get_track_url(
         &self,
@@ -535,6 +630,63 @@ mod tests {
         let json = serde_json::to_value(&results).unwrap();
         assert!(json["tracks"].as_array().unwrap().is_empty());
         assert!(json["albums"].as_array().unwrap().is_empty());
+    }
+
+    /// #2160 — la pagination ne doit pas déplacer les quatre clés existantes.
+    ///
+    /// C'est la garantie de non-régression qui compte pour les clients déjà
+    /// installés : ils lisent `réponse.albums`. Si le `#[serde(flatten)]`
+    /// disparaissait, la recherche Qobuz deviendrait un écran vide sur toutes
+    /// les versions antérieures du client.
+    #[test]
+    fn une_page_de_recherche_garde_les_quatre_cles_a_la_racine() {
+        let page = SearchPage::page_unique(SearchResults {
+            tracks: vec![],
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        });
+        let json = serde_json::to_value(&page).unwrap();
+
+        for cle in ["tracks", "albums", "artists", "playlists"] {
+            assert!(
+                json[cle].is_array(),
+                "`{cle}` doit rester un tableau À LA RACINE, pas sous `results`"
+            );
+        }
+        assert!(json.get("results").is_none(), "aucune enveloppe `results`");
+        assert_eq!(json["offset"], 0);
+        assert_eq!(json["has_more"], false);
+        assert_eq!(json["truncated"], false);
+        assert_eq!(json["totals"]["tracks"], 0);
+    }
+
+    /// Un service qui ne sait pas paginer sa recherche annonce des totaux
+    /// égaux à ce qu'il rend : il ne promet pas une suite qu'il ne servirait
+    /// pas.
+    #[test]
+    fn une_page_unique_n_annonce_jamais_de_suite() {
+        let page = SearchPage::page_unique(SearchResults {
+            tracks: vec![],
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        });
+        assert!(!page.has_more);
+        assert!(!page.truncated);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.totals, SearchTotals::default());
+    }
+
+    /// Au-delà de ce qu'un service sait servir, on rend du VIDE — jamais la
+    /// première page recyclée, qui ferait afficher deux fois les mêmes titres.
+    #[test]
+    fn au_dela_rend_du_vide_et_se_nomme() {
+        let page = SearchPage::au_dela(200);
+        assert_eq!(page.offset, 200);
+        assert!(page.results.tracks.is_empty());
+        assert!(page.results.albums.is_empty());
+        assert!(!page.has_more);
     }
 
     #[test]
