@@ -97,6 +97,28 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
     16
 }
 
+/// La profondeur du **conteneur** PCM qui portera une source de `bd` bits.
+///
+/// Tout ce qui est en aval — l'en-tête WAV, `convert_pcm_bit_depth`,
+/// `StreamingPcmByteAdapter` — ne sait écrire que 16, 24 ou 32 bits, et le
+/// contrôle existait déjà sur la **cible** (`stream target bit depth …`,
+/// `PCM source bit depth …`) mais nulle part sur la profondeur **lue dans le
+/// fichier** : `resolve_bit_depth` rend `bits_per_sample` sans le borner.
+///
+/// On arrondit vers le **haut**, jamais vers le bas : le décalage de
+/// droitisation devient `32 - conteneur`, si bien qu'une source de 20 bits est
+/// droitisée sur 24 avec quatre zéros en poids faibles. Aucun bit n'est perdu,
+/// et la largeur annoncée redevient celle des octets réellement écrits — c'est
+/// ce désaccord-là qui faisait lire des trames de 32 bits dans des octets de
+/// 16 (#2157).
+fn container_bit_depth(bd: u16) -> u16 {
+    match bd {
+        0..=16 => 16,
+        17..=24 => 24,
+        _ => 32,
+    }
+}
+
 /// Rebuild the decoder after `Error::ResetRequired` from `next_packet`.
 ///
 /// A chained Ogg (an icecast rip, or two files joined with `cat`) contains a
@@ -499,6 +521,32 @@ fn pcm_bytes_to_i32(data: &[u8], bit_depth: u16) -> Result<Vec<i32>, String> {
     Ok(samples)
 }
 
+/// Requantifier un échantillon **droitisé** de `from_bd` vers `to_bd` bits.
+///
+/// Droitisé veut dire qu'un échantillon de 24 bits occupe les bits 0..23 du
+/// `i32`. Passer d'une profondeur à l'autre est donc un décalage — et **ce
+/// décalage EST le niveau**. L'omettre ne perd pas un bit de poids faible : il
+/// laisse l'échantillon `to_bd - from_bd` rangs trop bas, c'est-à-dire une
+/// division par `2^(to_bd - from_bd)`.
+///
+/// La table précédente n'énumérait que 16, 24 et 32 et rendait l'échantillon
+/// **inchangé** pour toute autre profondeur source. Or `resolve_bit_depth` rend
+/// `bits_per_sample` tel quel, et FLAC, WAV, AIFF et WavPack déclarent
+/// légalement 8, 12 ou 20 bits. La sortie locale (cpal/WASAPI) est la seule à
+/// demander `to_bd = 32` : une source de 20 bits y sortait donc `2^12` fois
+/// trop bas, soit **−72 dB** — audible mais noyé, exactement « son très très
+/// faible quasi inaudible » (#2157). En 16 bits de sortie, le même trou faisait
+/// pire : `*s as i16` tronquait un mot de 20 bits et **repliait** le signal.
+fn requantize(sample: i32, from_bd: u16, to_bd: u16) -> i32 {
+    let from = from_bd.clamp(1, 32);
+    let to = to_bd.clamp(1, 32);
+    if to >= from {
+        sample << (to - from)
+    } else {
+        sample >> (from - to)
+    }
+}
+
 /// Convert right-justified i32 samples from one bit depth to another,
 /// producing raw PCM bytes at the target depth.
 ///
@@ -509,40 +557,21 @@ pub(super) fn convert_pcm_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -
         24 => samples
             .iter()
             .map(|s| {
-                let v = match from_bd {
-                    32 => *s >> 8,
-                    16 => (*s as i32) << 8,
-                    _ => *s,
-                };
-                let b = v.to_le_bytes();
+                let b = requantize(*s, from_bd, 24).to_le_bytes();
                 [b[0], b[1], b[2]]
             })
             .flat_map(|a| a.into_iter())
             .collect(),
         32 => samples
             .iter()
-            .map(|s| {
-                let v = match from_bd {
-                    24 => *s << 8,
-                    16 => (*s as i32) << 16,
-                    _ => *s,
-                };
-                v.to_le_bytes()
-            })
+            .map(|s| requantize(*s, from_bd, 32).to_le_bytes())
             .flat_map(|a| a.into_iter())
             .collect(),
         _ => {
             // 16-bit output
             samples
                 .iter()
-                .flat_map(|s| {
-                    let v = match from_bd {
-                        32 => (*s >> 16) as i16,
-                        24 => (*s >> 8) as i16,
-                        _ => *s as i16,
-                    };
-                    v.to_le_bytes()
-                })
+                .flat_map(|s| (requantize(*s, from_bd, 16) as i16).to_le_bytes())
                 .collect()
         }
     }
@@ -1732,7 +1761,10 @@ fn decode_to_pcm_streaming_inner(
         .map_err(|e| format!("decoder: {e}"))?;
 
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
-    let source_bd = resolve_bit_depth(&audio_params);
+    // Borné au conteneur PCM : c'est cette valeur qui sert AUSSI de `shift`
+    // de droitisation et de `from_bd` de conversion, les trois doivent donc
+    // désigner la même largeur d'octets (#2157).
+    let source_bd = container_bit_depth(resolve_bit_depth(&audio_params));
     let shift = 32u16.saturating_sub(source_bd);
 
     // Use target_bit_depth if provided, otherwise use the source's native depth.
@@ -2434,7 +2466,10 @@ fn decode_symphonia(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    let source_bd = resolve_bit_depth(&audio_params);
+    // Borné au conteneur PCM : c'est cette valeur qui sert AUSSI de `shift`
+    // de droitisation et de `from_bd` de conversion, les trois doivent donc
+    // désigner la même largeur d'octets (#2157).
+    let source_bd = container_bit_depth(resolve_bit_depth(&audio_params));
 
     // Seek if requested. On a non-seekable source (e.g. a FLAC over SMB with no
     // seektable) `format.seek` fails and the reader stays at position 0. If we
@@ -3958,6 +3993,115 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
         // Output is exactly 2 bytes per sample (16-bit).
         assert_eq!(out.len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // #2157 — la profondeur source hors {16, 24, 32}
+    // ---------------------------------------------------------------
+
+    /// CONTRE-ÉPREUVE de non-régression : sur les trois profondeurs que la
+    /// table énumérait, `requantize` doit rendre EXACTEMENT ce que rendaient
+    /// les bras codés en dur. Si ce test tombe, le correctif a déplacé le
+    /// niveau d'un flux qui marchait, et c'est le correctif qui est faux.
+    #[test]
+    fn requantize_reproduit_a_l_identique_les_trois_profondeurs_connues() {
+        // Les couples (from, to) et le décalage que le code d'origine appliquait.
+        let attendu: &[(u16, u16, i32)] = &[
+            (24, 32, 8),   // `*s << 8`
+            (16, 32, 16),  // `(*s as i32) << 16`
+            (32, 32, 0),   // `*s`
+            (32, 24, -8),  // `*s >> 8`
+            (16, 24, 8),   // `(*s as i32) << 8`
+            (24, 24, 0),   // `*s`
+            (32, 16, -16), // `(*s >> 16) as i16`
+            (24, 16, -8),  // `(*s >> 8) as i16`
+            (16, 16, 0),   // `*s as i16`
+        ];
+        for &(from, to, decalage) in attendu {
+            for echantillon in [0i32, 1, -1, 12345, -12345, 0x0034_5678, -0x0034_5678] {
+                let origine = if decalage >= 0 {
+                    echantillon << decalage
+                } else {
+                    echantillon >> (-decalage)
+                };
+                assert_eq!(
+                    requantize(echantillon, from, to),
+                    origine,
+                    "requantize({echantillon}, {from}, {to}) s'écarte de la table d'origine"
+                );
+            }
+        }
+    }
+
+    /// Le défaut lui-même : une source de 20 bits servie à la sortie locale,
+    /// qui demande toujours 32 bits, sortait `2^12` fois trop bas — −72 dB.
+    #[test]
+    fn une_source_de_20_bits_ne_sort_plus_72_db_trop_bas() {
+        // Pleine échelle sur 20 bits, droitisée : 0x0007_FFFF.
+        let pleine_echelle_20 = 0x0007_FFFFi32;
+        let octets = convert_pcm_bit_depth(&[pleine_echelle_20], 20, 32);
+        let sorti = i32::from_le_bytes([octets[0], octets[1], octets[2], octets[3]]);
+
+        // Le décalage de 12 rangs remet les 20 bits en haut du mot de 32.
+        assert_eq!(sorti, pleine_echelle_20 << 12);
+
+        // Formulé comme l'entend le testeur : le niveau ne doit plus être
+        // divisé par 4096. Avant le correctif, `sorti` valait 0x0007_FFFF.
+        let rapport = sorti as f64 / (pleine_echelle_20 << 12) as f64;
+        assert!(
+            (rapport - 1.0).abs() < 1e-12,
+            "atténuation résiduelle : rapport {rapport}"
+        );
+        assert_ne!(
+            sorti, pleine_echelle_20,
+            "l'échantillon est resté droitisé sur 20 bits — c'est le défaut #2157"
+        );
+    }
+
+    /// Le même trou en sortie 16 bits ne se contentait pas d'atténuer : il
+    /// **repliait** le signal, parce qu'un mot de 20 bits ne tient pas dans un
+    /// `i16` et que `*s as i16` tronque.
+    #[test]
+    fn une_source_de_20_bits_ne_se_replie_plus_en_16_bits() {
+        let pleine_echelle_20 = 0x0007_FFFFi32; // positif, proche du maximum
+        let octets = convert_pcm_bit_depth(&[pleine_echelle_20], 20, 16);
+        let sorti = i16::from_le_bytes([octets[0], octets[1]]);
+
+        // 20 -> 16 bits : quatre rangs de moins, le signe est conservé.
+        assert_eq!(sorti, (pleine_echelle_20 >> 4) as i16);
+        assert!(
+            sorti > 0,
+            "repliement : un maximum positif est ressorti {sorti}"
+        );
+        // L'ancien `*s as i16` rendait 0xFFFF, soit -1.
+        assert_ne!(sorti, -1);
+    }
+
+    /// La normalisation qui empêche `shift`, `from_bd` et la largeur d'octets
+    /// de diverger. Arrondi vers le HAUT : aucun bit source n'est perdu.
+    #[test]
+    fn container_bit_depth_arrondit_vers_le_conteneur_superieur() {
+        assert_eq!(container_bit_depth(8), 16);
+        assert_eq!(container_bit_depth(12), 16);
+        assert_eq!(container_bit_depth(16), 16);
+        assert_eq!(container_bit_depth(20), 24);
+        assert_eq!(container_bit_depth(24), 24);
+        assert_eq!(container_bit_depth(32), 32);
+        // Une profondeur absurde ne doit pas produire un décalage de 32 rangs,
+        // qui paniquerait.
+        assert_eq!(container_bit_depth(0), 16);
+        assert_eq!(container_bit_depth(64), 32);
+    }
+
+    /// `requantize` est bornée : un `bd` nul ou aberrant ne doit jamais
+    /// produire un décalage >= 32, qui panique en Rust.
+    #[test]
+    fn requantize_ne_panique_sur_aucune_profondeur() {
+        for from in [0u16, 1, 8, 12, 16, 20, 24, 32, 64, u16::MAX] {
+            for to in [0u16, 1, 8, 12, 16, 20, 24, 32, 64, u16::MAX] {
+                let _ = requantize(1234, from, to);
+            }
+        }
     }
 
     #[test]
