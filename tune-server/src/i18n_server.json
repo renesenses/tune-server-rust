@@ -1722,5 +1722,29 @@
     "ko": "Radio France 소스를 사용하려면 API 키가 필요합니다. \"radiofrance_api_key\" 설정을 입력하면 활성화됩니다.",
     "ro": "Sursa Radio France necesită o cheie API. Completați setarea „radiofrance_api_key” pentru a o activa.",
     "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den."
+  },
+  "support.tropDeRequetes": {
+    "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
+    "en": "The support service has received too many requests from this server and is refusing further ones for now. Try again a little later.",
+    "de": "Der Support-Dienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuchen Sie es etwas später erneut.",
+    "es": "El servicio de soporte ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Vuelve a intentarlo un poco más tarde.",
+    "it": "Il servizio di assistenza ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova un po' più tardi.",
+    "zh": "支持服务收到本服务器发来的请求过多，暂时拒绝后续请求。请稍后再试。",
+    "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。少し時間をおいて再試行してください。",
+    "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. 잠시 후 다시 시도하세요.",
+    "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou puțin mai târziu.",
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare."
+  },
+  "support.tropDeRequetesDelai": {
+    "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
+    "en": "The support service has received too many requests from this server and is refusing further ones for now. Try again in {minutes} min.",
+    "de": "Der Support-Dienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuchen Sie es in {minutes} Min. erneut.",
+    "es": "El servicio de soporte ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Vuelve a intentarlo dentro de {minutes} min.",
+    "it": "Il servizio di assistenza ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova tra {minutes} min.",
+    "zh": "支持服务收到本服务器发来的请求过多，暂时拒绝后续请求。请在 {minutes} 分钟后重试。",
+    "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。{minutes} 分後に再試行してください。",
+    "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
+    "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
   }
 }
