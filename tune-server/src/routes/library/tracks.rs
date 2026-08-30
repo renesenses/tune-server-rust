@@ -246,7 +246,13 @@ pub(super) async fn stream_track_audio(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let path = std::path::Path::new(file_path);
+    // La graphie du disque, pas celle de la base : sur un nom décomposé
+    // (macOS, SMB/CIFS), `metadata()` échouait et la route rendait 404 pour un
+    // fichier présent — la même piste partant pourtant sans broncher par le
+    // chemin de lecture de l'orchestrateur, qui, lui, replie déjà (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let path = std::path::Path::new(&file_path);
     let file_size = match tokio::fs::metadata(path).await {
         Ok(m) => m.len(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -300,7 +306,10 @@ pub(super) async fn rescan_track(
         return (StatusCode::BAD_REQUEST, "no file path").into_response();
     };
 
-    let meta = tune_core::metadata::read_metadata(std::path::Path::new(file_path));
+    // #1865 : le chemin stocké est en NFC, le disque peut porter le NFD.
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let meta = tune_core::metadata::read_metadata(std::path::Path::new(&file_path));
     match meta {
         Some(m) => {
             apply_metadata_to_track(&mut track, &m);
@@ -358,9 +367,13 @@ pub(super) async fn track_all_tags(
 
     let mut result = serde_json::to_value(&track).unwrap_or_default();
 
-    // Try reading raw file tags with lofty
-    if let Some(ref path) = track.file_path {
-        if let Ok(tagged) = lofty::read_from_path(path) {
+    // Try reading raw file tags with lofty — sur la graphie du disque (#1865).
+    if let Some(path) = track
+        .file_path
+        .as_deref()
+        .and_then(tune_core::library::local_path::resolve_existing_local_path)
+    {
+        if let Ok(tagged) = lofty::read_from_path(&path) {
             let tags: Vec<Value> = tagged
                 .tags()
                 .iter()
@@ -694,6 +707,12 @@ pub(super) async fn track_waveform(
         }
     };
 
+    // Le décodeur reçoit la graphie du disque, pas celle de la base : sur les
+    // pistes dont le nom est décomposé, `generate_waveform` rendait un vecteur
+    // vide et la route répondait « file unreadable » pour un fichier qui se
+    // joue très bien (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(&file_path)
+        .unwrap_or(file_path);
     let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
     if points.is_empty() {
         return Json(json!({ "track_id": id, "waveform": null, "error": "file unreadable or unsupported format" })).into_response();
@@ -744,11 +763,16 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                     continue;
                 };
 
-                let path = std::path::Path::new(file_path);
-                if !path.exists() {
+                // Passe de fond : sans le repli, toute une bibliothèque venue
+                // d'un Mac est comptée « sautée » et ne voit jamais ses
+                // étiquettes relues — 147 pistes sur 46 877 pour `.18` (#1865).
+                let Some(reel) =
+                    tune_core::library::local_path::resolve_existing_local_path(file_path)
+                else {
                     skipped += 1;
                     continue;
-                }
+                };
+                let path = std::path::Path::new(&reel);
 
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
                     errors += 1;

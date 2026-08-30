@@ -1,6 +1,22 @@
+//! Lecture et écriture des étiquettes d'un fichier audio.
+//!
+//! ⚠️ **Tout chemin qui entre ici vient de `tracks.file_path`**, donc du
+//! scanner, donc normalisé en **NFC**. Le disque, lui, peut tenir le nom en
+//! NFD (macOS, SMB/CIFS) ou en graphie mixte : `lofty::read_from_path` rend
+//! alors `ENOENT` sur un fichier bel et bien présent (#1865). Aucune fonction
+//! de ce module ne doit donner à `lofty` — ni à `exists()` — la chaîne lue en
+//! base : elle passe d'abord par [`graphie_sur_disque`].
+//!
+//! Mesure sur `.18` le 30/08/2026 : **147 pistes sur 46 877** ont un chemin
+//! stocké qui ne désigne aucun fichier tel quel (135 retrouvées en NFD global,
+//! 12 seulement par le parcours composant par composant de #1837). Pour ces
+//! 147, `read_tags` rendait « lofty read: … », `write_tags` rendait « file not
+//! found », et la passe de paroles les comptait en `skipped_no_body` — alors
+//! que le corps existait et que le fichier était là.
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::library::local_path::{LocalPath, resolve_local_path};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
@@ -92,15 +108,33 @@ pub fn detect_format(file_path: &str) -> TagFormat {
     }
 }
 
+/// La graphie que le système de fichiers accepte pour un chemin lu en base.
+///
+/// Remplace le `Path::new(file_path).exists()` qui gardait autrefois chaque
+/// entrée du module : il répondait faux sur les 147 pistes de `.18` dont le
+/// nom est décomposé sur le disque, et le module rendait « file not found »
+/// pour un fichier présent (#1865).
+///
+/// Rend la chaîne **telle que le disque l'a reconnue** — jamais une forme
+/// normalisée par nos soins. C'est elle qu'il faut donner à `lofty`, aussi
+/// bien en lecture qu'en écriture : lofty réécrit le fichier qu'il a ouvert,
+/// donc ouvrir la bonne graphie, c'est écrire dans le bon fichier.
+///
+/// Le message d'erreur reste `file not found`, mot pour mot : les routes le
+/// remontent tel quel et un client peut le comparer.
+fn graphie_sur_disque(file_path: &str) -> Result<String, String> {
+    match resolve_local_path(file_path) {
+        LocalPath::Found(reel) => Ok(reel),
+        LocalPath::Missing => Err("file not found".into()),
+    }
+}
+
 pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResult, String> {
     let format = detect_format(file_path);
     if format == TagFormat::Unknown {
         return Err("unsupported tag format".into());
     }
-    if !Path::new(file_path).exists() {
-        return Err("file not found".into());
-    }
-    let path = file_path.to_string();
+    let path = graphie_sur_disque(file_path)?;
     let (update, corrections) = update.sanitized();
     if !corrections.is_empty() {
         tracing::warn!(
@@ -225,7 +259,7 @@ fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, 
 }
 
 pub async fn read_tags(file_path: &str) -> Result<HashMap<String, String>, String> {
-    let path = file_path.to_string();
+    let path = graphie_sur_disque(file_path)?;
     tokio::task::spawn_blocking(move || read_tags_lofty(&path))
         .await
         .map_err(|e| format!("join: {e}"))?
@@ -365,20 +399,22 @@ pub async fn write_metadata_to_file(
     if is_unsupported_format(file_path) {
         return Err("unsupported format for tag writing".into());
     }
-    if !Path::new(file_path).exists() {
-        return Err("file not found".into());
-    }
-    let path = file_path.to_string();
+    let path = graphie_sur_disque(file_path)?;
     let fields = fields.clone();
     tokio::task::spawn_blocking(move || write_metadata_to_file_sync(&path, &fields))
         .await
         .map_err(|e| format!("join: {e}"))?
 }
 
+/// ⚠️ Point d'entrée **appelé directement** par la passe de paroles
+/// (`library::lyrics_pass::write_one_tag`), qui ne passe donc PAS par
+/// [`write_metadata_to_file`] : la résolution de graphie doit être ici, sinon
+/// la moitié des appelants reste aveugle au NFD (#1865).
 pub(crate) fn write_metadata_to_file_sync(
     file_path: &str,
     fields: &HashMap<String, String>,
 ) -> Result<WriteResult, String> {
+    let file_path = &graphie_sur_disque(file_path)?;
     let mut tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
     let tag_type = tagged.primary_tag_type();
 
@@ -545,5 +581,131 @@ mod tests {
         assert!(!is_unsupported_format("/music/track.mp3"));
         assert!(!is_unsupported_format("/music/track.m4a"));
         assert!(!is_unsupported_format("/music/track.dsf"));
+    }
+
+    // ------------------------------------------------------------------
+    // #1865 — le chemin vient de la base (NFC), le disque porte le NFD.
+    //
+    // Les deux graphies s'affichent à l'identique : écrites en clair dans le
+    // source, un éditeur ou un filtre `git` pourrait les re-normaliser toutes
+    // les deux et le test comparerait alors deux fois la même chaîne sans le
+    // dire. D'où les échappements explicites — et l'assertion d'inégalité qui
+    // suit, qui refuse de tourner si la précaution a sauté.
+    // ------------------------------------------------------------------
+
+    /// « Décollage » précomposé : `é` = U+00E9. C'est ce que la base tient.
+    const EN_BASE_NFC: &str = "10. D\u{00e9}collage.flac";
+    /// Le même, décomposé : `e` + U+0301. C'est ce que macOS pose sur le
+    /// disque, et ce qu'un partage SMB/CIFS rend.
+    const SUR_DISQUE_NFD: &str = "10. De\u{0301}collage.flac";
+
+    fn fixture_flac() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac")
+    }
+
+    /// Le compositeur réellement inscrit dans le fichier, lu par lofty depuis
+    /// la graphie du DISQUE. Passer par le contenu, et pas par le code de
+    /// retour, est délibéré : un `Ok(_)` ne prouverait pas dans quel fichier
+    /// on a écrit.
+    ///
+    /// Compositeur et non titre : `write_metadata_to_file_sync` passe par
+    /// [`tune_key_to_lofty`], qui ne connaît pas `title` — un test écrivant un
+    /// titre par cette porte serait vert sans rien écrire du tout.
+    fn compositeur_dans(chemin: &std::path::Path) -> Option<String> {
+        let tagged = lofty::read_from_path(chemin).ok()?;
+        let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+        tag.get_string(ItemKey::Composer).map(|s| s.to_string())
+    }
+
+    #[test]
+    fn les_deux_graphies_sont_bien_distinctes() {
+        assert_ne!(
+            EN_BASE_NFC, SUR_DISQUE_NFD,
+            "les constantes ont ete re-normalisees : le test ne prouverait plus rien"
+        );
+    }
+
+    #[test]
+    fn ecriture_atteint_le_fichier_decompose_du_disque() {
+        let dir = tempfile::tempdir().unwrap();
+        let sur_disque = dir.path().join(SUR_DISQUE_NFD);
+        std::fs::copy(fixture_flac(), &sur_disque).unwrap();
+
+        // Ce que la base donnerait aux passes : la forme NFC, qui ne désigne
+        // aucun fichier telle quelle.
+        let en_base = dir.path().join(EN_BASE_NFC);
+        assert!(
+            !en_base.exists(),
+            "le systeme de fichiers a replie les graphies : le cas #1865 n'est pas reproduit ici"
+        );
+
+        let champs = HashMap::from([("composer".to_string(), "Decollage".to_string())]);
+        let r = write_metadata_to_file_sync(en_base.to_str().unwrap(), &champs);
+
+        assert!(r.is_ok(), "ecriture refusee : {r:?}");
+        assert_eq!(
+            compositeur_dans(&sur_disque).as_deref(),
+            Some("Decollage"),
+            "l'etiquette n'a pas atteint le fichier reellement present sur le disque"
+        );
+    }
+
+    /// Les deux portes `async` du module — `write_tags` puis `read_tags` — sur
+    /// le même fichier décomposé, désigné des deux côtés par la graphie de la
+    /// base. C'est le trajet exact de `PUT /metadata/tracks/{id}` suivi d'un
+    /// affichage.
+    #[tokio::test]
+    async fn ecriture_puis_lecture_async_sur_fichier_decompose() {
+        let dir = tempfile::tempdir().unwrap();
+        let sur_disque = dir.path().join(SUR_DISQUE_NFD);
+        std::fs::copy(fixture_flac(), &sur_disque).unwrap();
+
+        let en_base = dir.path().join(EN_BASE_NFC);
+        assert!(!en_base.exists());
+
+        let update = TagUpdate {
+            title: Some("Decollage".to_string()),
+            ..Default::default()
+        };
+        let ecrit = write_tags(en_base.to_str().unwrap(), &update).await;
+        assert!(ecrit.is_ok(), "ecriture refusee : {ecrit:?}");
+
+        let tags = read_tags(en_base.to_str().unwrap()).await;
+        assert!(tags.is_ok(), "lecture refusee : {tags:?}");
+        assert_eq!(
+            tags.unwrap().get("title").map(String::as_str),
+            Some("Decollage")
+        );
+    }
+
+    /// Témoin anti-régression : un chemin purement ASCII n'a qu'une graphie et
+    /// marchait déjà. Il doit continuer — le repli ne doit rien changer là où
+    /// il n'y avait rien à réparer.
+    #[test]
+    fn temoin_ascii_toujours_ecrit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ascii = dir.path().join("10. Takeoff.flac");
+        std::fs::copy(fixture_flac(), &ascii).unwrap();
+
+        let champs = HashMap::from([("composer".to_string(), "Takeoff".to_string())]);
+        write_metadata_to_file_sync(ascii.to_str().unwrap(), &champs).unwrap();
+
+        assert_eq!(compositeur_dans(&ascii).as_deref(), Some("Takeoff"));
+    }
+
+    /// Et le garde-fou n'a pas été retiré au passage : un fichier qu'AUCUNE
+    /// graphie ne trouve rend toujours le même « file not found », mot pour
+    /// mot, que les routes remontent au client.
+    #[test]
+    fn absent_rend_toujours_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let nulle_part = dir.path().join("Ho\u{0300}tel de personne.flac");
+
+        let r = write_metadata_to_file_sync(
+            nulle_part.to_str().unwrap(),
+            &HashMap::from([("composer".to_string(), "x".to_string())]),
+        );
+
+        assert_eq!(r.unwrap_err(), "file not found");
     }
 }
