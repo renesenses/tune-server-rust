@@ -334,6 +334,24 @@ impl DlnaOutput {
         .await
     }
 
+    /// Le battement que CET appareil a déclaré nécessaire entre un
+    /// `SetAVTransportURI` et le `Play` qui le suit — réglage `dlna_play_delay_ms`
+    /// (panneau renderer, `[device_delays]`, catalogue d'appareils : 800 ms pour
+    /// un Yamaha R-N2000A).
+    ///
+    /// Il n'était tenu que sur la PREMIÈRE pose d'URI. Les deux reprises qui en
+    /// reposent une — le réarmement d'un 701 (#2581) et la relance d'un `Play`
+    /// jamais appliqué — enchaînaient le `Play` sans lui, c'est-à-dire dans la
+    /// fenêtre exacte que ce réglage existe pour éviter, et sur les deux chemins
+    /// qui ne s'exécutent QUE lorsque l'appareil est déjà en train de refuser.
+    /// À 0 — le défaut de tout le monde — cette fonction ne fait rien.
+    async fn attendre_apres_set_uri(&self) {
+        let delai = self.play_delay_ms.load(Ordering::Relaxed);
+        if delai > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delai)).await;
+        }
+    }
+
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         Self::didl_metadata_mime(media, item_id, media.mime_type)
     }
@@ -694,9 +712,7 @@ impl OutputTarget for DlnaOutput {
         }
 
         let play_delay = self.play_delay_ms.load(Ordering::Relaxed);
-        if play_delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(play_delay)).await;
-        }
+        self.attendre_apres_set_uri().await;
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
         // reject Play immediately after SetAVTransportURI while still loading the URI.
@@ -738,6 +754,9 @@ impl OutputTarget for DlnaOutput {
                         let _ = self
                             .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
                             .await;
+                        // Même battement que la pose initiale : reposer l'URI
+                        // puis jouer aussitôt, c'est refabriquer le « trop tôt ».
+                        self.attendre_apres_set_uri().await;
                     }
                     // Chargement en cours, ou barème historique hors du premier
                     // essai : ne rien envoyer de plus.
@@ -793,6 +812,13 @@ impl OutputTarget for DlnaOutput {
         // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
         let mut applique = UriVerdict::Indeterminee;
         let mut uri_tenue: Option<String> = None;
+        // Le refus SOAP rendu par le `Play` de la relance, s'il y en a un. Cette
+        // réponse n'était pas relue : un renderer qui REFUSE ce Play — un 701,
+        // celui de #2581 — finissait accusé d'« avoir acquitté Play » et de
+        // « jouer une autre source », deux affirmations fausses. Le message
+        // d'échec doit dire ce qui s'est passé (#2396 : l'un des testeurs a
+        // réinstallé son système entier sur la foi de ce message).
+        let mut refus_relance: Option<String> = None;
         'verif: for relance in 0..2u32 {
             for essai in 0..3u32 {
                 let resp = self
@@ -818,9 +844,15 @@ impl OutputTarget for DlnaOutput {
                 let _ = self
                     .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
                     .await;
-                let _ = self
+                self.attendre_apres_set_uri().await;
+                if let Ok(resp) = self
                     .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-                    .await;
+                    .await
+                    && (resp.contains("UPnPError") || resp.contains("<errorCode>"))
+                {
+                    warn!(device = %self.name, response = %resp, "dlna_relance_play_refuse");
+                    refus_relance = Some(resp);
+                }
             }
         }
         if applique == UriVerdict::PasAppliquee {
@@ -855,6 +887,22 @@ impl OutputTarget for DlnaOutput {
                         "<InstanceID>0</InstanceID><CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
                     )
                     .await;
+            }
+            // Le renderer a-t-il ACQUITTÉ, ou REFUSÉ ? Les deux échouent ici,
+            // mais ils n'appellent pas la même conduite : un refus nomme un
+            // état (701 « Transition not available » : pas cette transition,
+            // maintenant), un acquittement sans effet désigne une URI restée en
+            // place. Dire l'un pour l'autre envoie l'utilisateur chercher là où
+            // il n'y a rien.
+            if let Some(resp) = &refus_relance {
+                return Err(format!(
+                    "Le renderer a REFUSÉ le Play de la relance{} : {resp}",
+                    if est_701(resp) {
+                        " (701 « Transition not available » : il n'accepte pas cette transition dans son état actuel)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             let detail = match uri_tenue.as_deref() {
                 Some(u) if !u.trim().is_empty() => format!("il tient encore : {u}"),
