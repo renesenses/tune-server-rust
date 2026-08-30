@@ -40,6 +40,18 @@ struct UpdatePlaylist {
 struct AddTracks {
     track_ids: Vec<i64>,
     position: Option<i64>,
+    /// Pistes de service (Qobuz, Tidal…) que le client joint à la demande.
+    ///
+    /// `AddToPlaylistModal.buildAddArgs()` (tune-web-client) le remplit dès que
+    /// la piste n'a pas d'`id` local, et laisse alors `track_ids` VIDE. Le
+    /// champ n'etait pas declare ici : serde ecarte en silence tout champ
+    /// inconnu, `add_tracks` n'ajoutait donc rien et repondait quand meme
+    /// `201 Created` (#1848).
+    ///
+    /// Le contenu n'est pas typé : la route ne peut de toute façon pas le
+    /// stocker (voir `add_tracks`), elle n'a besoin que de savoir COMBIEN il y
+    /// en a pour pouvoir le dire.
+    streaming_tracks: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -185,10 +197,66 @@ async fn add_tracks(
     Path(id): Path<i64>,
     Json(body): Json<AddTracks>,
 ) -> impl IntoResponse {
+    // #1848 — Dominique Comet : « lorsqu'on sélectionne une piste nous n'avons
+    // pas les mêmes possibilités sur la bibliothèque et sur Qobuz ».
+    //
+    // Le client OFFRE « ajouter à une playlist » sur une piste de service
+    // (`StreamingView.svelte`, trois listes : album, playlist, recherche) et
+    // poste alors `streaming_tracks` avec `track_ids` vide. Ce champ n'étant
+    // pas déclaré, serde l'écartait : `add_tracks_deduped(id, &[], …)`
+    // n'ajoutait rien, la route répondait `201 Created` avec la playlist, et le
+    // modal lisait ce 201 comme un succès — il affichait « ajoutée » devant une
+    // playlist restée vide.
+    //
+    // Ce n'est PAS réparable en stockant la piste : `playlist_tracks.track_id`
+    // est `NOT NULL REFERENCES tracks(id)` dans les trois définitions de schéma
+    // (sqlite.rs, migrations/postgres, pg_migrate.rs). Une playlist locale ne
+    // PEUT pas porter une piste de service. Le refus est donc légitime — c'est
+    // de le déguiser en succès qui ne l'était pas. Même doctrine que #1959 sur
+    // `save_queue_as_playlist` : 422 avec la raison, et le compte des ignorées
+    // sur le cas mixte.
+    let distantes = body.streaming_tracks.as_ref().map_or(0, Vec::len);
+
+    if distantes > 0 && body.track_ids.is_empty() {
+        tracing::warn!(
+            playlist_id = id,
+            distantes,
+            "playlist_add_tracks_refused_streaming_only"
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Cette demande ne porte que des pistes de service ({distantes}), \
+                 qui ne peuvent pas entrer dans une playlist locale. \
+                 Ajoutez-les à une playlist du service, ou ajoutez d'abord ces \
+                 titres à votre bibliothèque."
+            ),
+        )
+            .into_response();
+    }
+
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
         Ok(_) => match repo.get(id) {
-            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(Some(playlist)) => {
+                let mut corps = json!(playlist);
+                if distantes > 0 {
+                    // Une demande mixte perd ses pistes de service en chemin.
+                    // Le taire produirait le défaut d'à côté : une playlist
+                    // plus courte que la demande, sans que rien ne dise
+                    // pourquoi.
+                    tracing::info!(
+                        playlist_id = id,
+                        ajoutees = body.track_ids.len(),
+                        ignorees = distantes,
+                        "playlist_add_tracks_skipped_streaming"
+                    );
+                    if let Some(obj) = corps.as_object_mut() {
+                        obj.insert("skipped_streaming".into(), json!(distantes));
+                    }
+                }
+                (StatusCode::CREATED, Json(corps)).into_response()
+            }
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         },
