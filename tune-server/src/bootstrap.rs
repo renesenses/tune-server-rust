@@ -267,6 +267,13 @@ pub async fn run_with(opts: RunOptions) {
             .init();
     }
 
+    // Image builders alone cannot protect appliances already in the field:
+    // self-update replaces this binary, not /etc.  On Tune OS/Linux, migrate
+    // the historical public SSH password once before exposing the HTTP API.
+    // The embedded policy preserves every password that was already changed.
+    #[cfg(target_os = "linux")]
+    crate::tune_os_password::migrate_legacy_password();
+
     // Bind the HTTP listener BEFORE opening the database. If another
     // tune-server instance is already running (old LaunchAgent, manual
     // install, update race — Jean-Marie/FRIDER #1158), the previous order

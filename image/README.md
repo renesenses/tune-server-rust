@@ -166,7 +166,7 @@ Or use [balenaEtcher](https://etcher.balena.io/) / [Rufus](https://rufus.ie/).
 - **ALSA** with USB audio support (auto-detected)
 - **avahi-daemon** for mDNS (`.local` discovery)
 - **NetworkManager** (DHCP auto on all interfaces)
-- **SSH** enabled (user: `tune`, password: `tune`)
+- **SSH** enabled (user: `tune`, unique temporary password generated on first boot)
 - **Auto-resize** root partition on first boot
 - **systemd** service with audio RT priority
 
@@ -176,11 +176,18 @@ The `Tune OS Image` GitHub Actions workflow (`.github/workflows/tune-os.yml`,
 manual dispatch) builds the x86_64 image for an existing release and attaches
 `tune-os-x86_64-vX.Y.Z.img.gz` (+ `.sha256`) to it.
 
-## Default credentials
+## First SSH connection
 
 - **User:** `tune`
-- **Password:** `tune`
+- **Temporary password:** generated independently on every machine and shown
+  on its physical console during first boot
+- **Mandatory change:** SSH refuses a normal session until that temporary
+  password has been replaced
 - **Web UI:** `http://tune.local:8888`
+
+The temporary password is never baked into the downloadable image and is not
+sent in the SSH banner. After the first successful password change, Tune OS
+removes the console notice and its root-only credential copy.
 
 ## Mount music storage
 

@@ -112,25 +112,19 @@ pub(super) async fn list_tracks(
     // a SMART collection resolves to concrete track ids (its compiled rule query).
     // Manual wins on a name clash. An unknown name → empty album set → matches
     // nothing (the requested collection is simply empty).
-    let (collection_ids, collection_track_ids): (Option<Vec<i64>>, Option<Vec<i64>>) =
-        match p.collection.as_deref().filter(|s| !s.is_empty()) {
-            None => (None, None),
-            Some(name) => {
-                let album_ids = super::facets::collection_album_ids(&state, name);
-                if !album_ids.is_empty() {
-                    (Some(album_ids), None)
-                } else if let Some(track_ids) =
-                    super::facets::smart_collection_track_ids(&state, name)
-                {
-                    (None, Some(track_ids))
-                } else {
-                    (Some(Vec::new()), None)
-                }
-            }
-        };
+    //
+    // ⚠️ Résolution PARTAGÉE avec le compteur de facettes (#1864) : les deux
+    // routes doivent désigner le même ensemble, sinon le rail annonce des
+    // effectifs que cette liste ne rend pas.
+    let scope = p
+        .collection
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|name| super::facets::resolve_collection(&state, name))
+        .unwrap_or_default();
 
-    filter.collection_ids = collection_ids;
-    filter.collection_track_ids = collection_track_ids;
+    filter.collection_ids = scope.albums;
+    filter.collection_track_ids = scope.tracks;
 
     // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
     // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
@@ -150,8 +144,10 @@ pub(super) async fn list_tracks(
             }
         }
     } else {
-        let total = repo.count().unwrap_or(0);
-        let items = match repo.list(limit, offset) {
+        // Même exclusion des albums masqués que le chemin facetté (#1391) :
+        // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
+        let total = repo.count_visible().unwrap_or(0);
+        let items = match repo.list_visible(limit, offset) {
             Ok(tracks) => tracks,
             Err(e) => {
                 tracing::error!(

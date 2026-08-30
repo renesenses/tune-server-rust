@@ -273,8 +273,27 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
 pub async fn batch_match_artist_mbids(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
 ) -> usize {
+    batch_match_artist_mbids_scoped(db, None).await
+}
+
+/// Variante à portée (#1660) : seuls les artistes du répertoire demandé sont
+/// candidats au matching MBID. `None` = passe complète, code identique.
+pub async fn batch_match_artist_mbids_scoped(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    scope: Option<crate::metadata::enrich_scope::EnrichScope>,
+) -> usize {
     let repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
-    let artists = repo.list_without_mbid().unwrap_or_default();
+    let mut artists = repo.list_without_mbid().unwrap_or_default();
+    if let Some(scope) = &scope {
+        let avant = artists.len();
+        artists.retain(|(id, ..)| scope.contient_artiste(*id));
+        tracing::info!(
+            dir = %scope.dir,
+            retained = artists.len(),
+            dropped = avant - artists.len(),
+            "batch_artist_mbid_scope_applied"
+        );
+    }
 
     if artists.is_empty() {
         tracing::info!("batch_artist_mbid_match_skip_all_have_mbid");
@@ -313,7 +332,7 @@ pub async fn batch_match_artist_mbids(
             matched += 1;
             tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
         }
-        if (i + 1) % 5 == 0 || i + 1 == total {
+        if crate::library::artwork::doit_publier_avancement(i + 1, total) {
             write_progress(i + 1, matched);
         }
     }

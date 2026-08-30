@@ -492,7 +492,16 @@ pub fn zone_creee_contrat_client(
         // tout seul.
         obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
         let vol = zone.map(|z| z.volume).unwrap_or(50);
-        obj.insert("volume".into(), json!(vol as f64 / 100.0));
+        let lineaire = vol as f64 / 100.0;
+        obj.insert("volume".into(), json!(lineaire));
+        // #1274 — la lecture en dB accompagne le volume PARTOUT où il sort,
+        // ici comprise : ce contrat-ci est celui d'une zone qui vient de
+        // naitre, et un client qui affiche des dB ne doit pas avoir a
+        // attendre le premier refetch pour en avoir un. `null` = silence.
+        obj.insert(
+            "volume_db".into(),
+            json!(crate::audio::volume_scale::linear_to_db(lineaire)),
+        );
     }
     v
 }
@@ -1423,6 +1432,41 @@ impl ZoneRepo {
             .ok()?
             .first()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+    }
+
+    /// Zones réseau (DLNA/OpenHome) MASQUÉES à cet hôte — les suppressions
+    /// encore actives de l'utilisateur. Garde-fou #1281 : un appareil qui
+    /// s'annonce sous plusieurs identités SSDP (DLNA + OpenHome, double UUID —
+    /// buchardt A700) ne doit pas ressusciter, via son identité jumelle, la
+    /// zone qui vient d'être supprimée. `is_device_hidden` ne voit que
+    /// l'identité exacte ; ici on retrouve la suppression par l'hôte, et
+    /// l'appelant exige en plus une correspondance de NOM (une IP seule
+    /// n'identifie rien — leçon du ré-ancrage #1651).
+    pub fn hidden_zones_by_host(&self, host: &str) -> Vec<(i64, String)> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, name FROM zones WHERE host = {placeholder} \
+             AND output_type IN ('dlna', 'openhome') \
+             AND COALESCE(is_hidden, 0) = 1 ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&host];
+        // Strong read: la suppression vient parfois d'arriver dans la même
+        // session (même motif que zone_id_by_host).
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|cols| {
+                    let id = cols.first().and_then(|v| v.as_i64())?;
+                    let name = cols.get(1).and_then(|v| v.as_string())?;
+                    Some((id, name))
+                })
+                .collect(),
+            // Colonne `host` absente (base pré-migration) : pas de garde-fou.
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {

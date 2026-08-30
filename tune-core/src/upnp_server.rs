@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::models::Track;
+use crate::db::playlist_repo::PlaylistRepo;
 use crate::db::radio_repo::RadioRepo;
 use std::sync::Arc;
 
@@ -817,7 +818,7 @@ fn search_tracks_in_container(
     titres: &[PredicatTitre],
 ) -> Option<DidlResult> {
     match container_id {
-        "0" | "tracks" | "artists" | "albums" | "genres" => {
+        "0" | "tracks" | "artists" | "albums" | "genres" | "years" | "playlists" => {
             if titres.is_empty() {
                 // Sans predicat de titre, c'est le parcours d'indexation :
                 // la pagination reste celle de la base, pas de la memoire.
@@ -847,6 +848,22 @@ fn search_tracks_in_container(
             let tracks = TrackRepo::with_backend(state.backend.clone())
                 .list_by_artist(artist_id)
                 .ok()?;
+            Some(paginate_track_results(
+                filtrer_par_titre(tracks, titres),
+                id,
+                start,
+                count,
+                base_url,
+            ))
+        }
+        // Chercher DANS une liste de lecture restreint réellement aux pistes de
+        // cette liste, comme pour un album — et dans l'ordre de la liste.
+        id if id.starts_with("playlist/") => {
+            let playlist_id = decode_playlist_id(id)?;
+            let ids = PlaylistRepo::with_backend(state.backend.clone())
+                .get_track_ids(playlist_id)
+                .ok()?;
+            let tracks = pistes_dans_l_ordre(state, &ids);
             Some(paginate_track_results(
                 filtrer_par_titre(tracks, titres),
                 id,
@@ -1236,6 +1253,13 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "object.container",
             None,
         )),
+        "years" => Some(didl_container(
+            "years",
+            "0",
+            "Years",
+            "object.container",
+            None,
+        )),
         "tracks" => Some(didl_container(
             "tracks",
             "0",
@@ -1247,6 +1271,13 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "radios",
             "0",
             "Radio",
+            "object.container",
+            None,
+        )),
+        "playlists" => Some(didl_container(
+            "playlists",
+            "0",
+            "Playlists",
             "object.container",
             None,
         )),
@@ -1302,6 +1333,32 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                 None,
             )
         }),
+        // Même règle que `genre/` : une année est un conteneur comme un autre,
+        // et un point de contrôle strict le décrit avant de l'ouvrir.
+        id if id.starts_with("year/") => decode_year_id(id)
+            .map(|annee| didl_container(id, "years", &annee.to_string(), "object.container", None)),
+        // Une liste de lecture se décrit avec son nombre RÉEL de pistes : c'est
+        // ce `childCount` que le point de contrôle affiche avant d'ouvrir. Une
+        // liste vide n'est pas publiée par `browse_playlists` — on ne la décrit
+        // donc pas non plus, sinon le contrôleur ouvrirait un dossier qu'il ne
+        // pouvait pas voir et le lirait comme cassé.
+        id if id.starts_with("playlist/") => decode_playlist_id(id)
+            .and_then(|pid| {
+                PlaylistRepo::with_backend(state.backend.clone())
+                    .get(pid)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|liste| liste.track_count > 0)
+            .map(|liste| {
+                didl_container(
+                    id,
+                    "playlists",
+                    &liste.name,
+                    "object.container.playlistContainer",
+                    Some(liste.track_count as u64),
+                )
+            }),
         _ => None,
     };
 
@@ -1332,8 +1389,10 @@ fn browse_direct_children(
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
         "genres" => browse_genres(state),
+        "years" => browse_years(state),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state),
+        "playlists" => browse_playlists(state, start, count),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
                 .strip_prefix("artist/")
@@ -1357,6 +1416,21 @@ fn browse_direct_children(
             Some(genre) => browse_genre_albums(state, &genre, &base_url),
             None => empty_didl(),
         },
+        // La leçon de #1736 vaut pour les années : un conteneur publié par
+        // `browse_years` doit savoir s'ouvrir ici, sinon il se lit comme vide.
+        id if id.starts_with("year/") => match decode_year_id(id) {
+            Some(annee) => browse_year_albums(state, annee, &base_url),
+            None => empty_didl(),
+        },
+        // La même leçon, pour les listes de lecture (#1802) : c'est ici que
+        // « Playlists » manquait avant 0.9.79, et le conteneur se lisait comme
+        // un dossier vide.
+        id if id.starts_with("playlist/") => match decode_playlist_id(id) {
+            Some(playlist_id) => {
+                browse_playlist_tracks(state, playlist_id, start, count, &base_url)
+            }
+            None => empty_didl(),
+        },
         _ => empty_didl(),
     }
 }
@@ -1366,15 +1440,25 @@ fn browse_direct_children(
 /// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
 /// visible et vide se lit comme une bibliothèque cassée, pas comme une
 /// fonction manquante.
-const ROOT_CONTAINERS: [(&str, &str, &str); 5] = [
+const ROOT_CONTAINERS: [(&str, &str, &str); 7] = [
     ("artists", "Artists", "object.container"),
     ("albums", "Albums", "object.container"),
     ("genres", "Genres", "object.container"),
+    // Années des albums (#1789, Jean Valjean, fil forum #1439) : chaque année
+    // ouvre sur ses albums, exactement comme un genre ouvre sur les siens.
+    ("years", "Years", "object.container"),
     // Parcours à plat de toute la bibliothèque. Attendu par les points de
     // contrôle — le titre de #1390 le nomme explicitement (« Albums / All
     // tracks / Genres ») — et il manquait, sans qu'aucun ticket ne le suive.
     ("tracks", "All Tracks", "object.container"),
     ("radios", "Radio", "object.container"),
+    // Listes de lecture (#1802, Jean Valjean, fil forum #1439). Le conteneur
+    // avait été RETIRÉ en 0.9.79 (#1758) parce que `browse_playlists` était un
+    // marque-page — « Placeholder — playlists browsing can be extended later »
+    // — et rendait un DIDL vide. Il revient en DERNIER, une fois
+    // `browse_playlists` et `browse_playlist_tracks` écrits et testés : la
+    // règle n'était pas « pas de playlists », c'était « pas de dossier vide ».
+    ("playlists", "Playlists", "object.container"),
 ];
 
 fn empty_didl() -> DidlResult {
@@ -1399,6 +1483,158 @@ fn decode_genre_id(object_id: &str) -> Option<String> {
         return None;
     }
     Some(decoded)
+}
+
+/// Décode l'identifiant d'un conteneur d'année (`year/1959`).
+///
+/// Une année est un entier strictement positif : `browse_years` n'en publie
+/// pas d'autre, et tout identifiant malformé rend `None` — donc un DIDL vide,
+/// jamais une erreur.
+fn decode_year_id(object_id: &str) -> Option<i64> {
+    object_id
+        .strip_prefix("year/")?
+        .parse::<i64>()
+        .ok()
+        .filter(|annee| *annee > 0)
+}
+
+/// Décode l'identifiant d'un conteneur de liste de lecture (`playlist/12`).
+///
+/// Même forme que `decode_year_id` : un entier strictement positif, et tout le
+/// reste rend `None` — donc un DIDL vide, jamais une erreur.
+fn decode_playlist_id(object_id: &str) -> Option<i64> {
+    object_id
+        .strip_prefix("playlist/")?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+/// Profil dont le serveur média publie les listes de lecture.
+///
+/// `PlaylistRepo::list` est cloisonné par profil, mais une requête UPnP n'a ni
+/// session ni en-tête : il n'y a personne à qui demander « quel profil ? ».
+/// C'est le profil par défaut — le même que celui sous lequel le scan importe
+/// les listes trouvées sur le disque (`library::playlist_scan`,
+/// `library::folder_playlists`), donc celui qui contient réellement quelque
+/// chose sur une installation ordinaire.
+const UPNP_PROFILE_ID: i64 = 1;
+
+/// Borne haute de la lecture des listes de lecture.
+///
+/// Le filtrage des listes vides se fait après coup : la requête doit donc
+/// ramener bien plus que ce qu'une page rendra. Dix mille listes tiennent
+/// largement au-delà de toute bibliothèque réelle, et bornent la mémoire.
+const PLAYLIST_FETCH_CAP: i64 = 10_000;
+
+/// Les listes de lecture du profil par défaut, triées par nom.
+///
+/// **Une liste vide n'est pas publiée.** C'est la règle de `ROOT_CONTAINERS`
+/// descendue d'un niveau, la même que pour les années : un dossier visible et
+/// vide se lit comme une bibliothèque cassée. Une liste vidée depuis
+/// l'interface web disparaît donc du serveur média, et y réapparaît dès
+/// qu'elle a une piste — plutôt qu'un dossier qu'on ouvre pour rien.
+///
+/// `total` est le nombre RÉEL de listes publiables, pas la taille de la page :
+/// c'est lui que le point de contrôle lit pour savoir s'il reste des pages.
+fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let listes: Vec<_> = PlaylistRepo::with_backend(state.backend.clone())
+        .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|liste| liste.track_count > 0 && liste.id.is_some())
+        .collect();
+
+    let total = listes.len();
+    let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let demande = usize::try_from(count).unwrap_or(usize::MAX);
+    let fin = debut.saturating_add(demande).min(total);
+    let page = &listes[debut..fin];
+
+    let mut inner = String::new();
+    for liste in page {
+        inner.push_str(&didl_container(
+            &format!("playlist/{}", liste.id.unwrap_or(0)),
+            "playlists",
+            &liste.name,
+            "object.container.playlistContainer",
+            Some(liste.track_count as u64),
+        ));
+    }
+
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total: total as u64,
+        returned: page.len() as u64,
+    }
+}
+
+/// Les pistes d'une liste de lecture, **dans l'ordre de la liste**.
+///
+/// C'est le seul intérêt d'une liste de lecture, et c'est aussi le piège :
+/// `playlist_tracks.position` porte l'ordre voulu, mais `list_by_ids` rend les
+/// pistes dans l'ordre où la base les a écrites. Sans le ré-ordonnancement de
+/// [`pistes_dans_l_ordre`], le serveur média publierait une liste dans l'ordre
+/// d'insertion en base — c'est-à-dire n'importe lequel.
+///
+/// La page est bornée comme celle de `browse_all_tracks` : `RequestedCount=0`
+/// veut dire « tout », et « tout » sur une liste de plusieurs milliers de
+/// pistes bâtirait un DIDL de plusieurs mégaoctets. `TotalMatches` dit la
+/// taille réelle, un point de contrôle correct pagine à partir de là.
+fn browse_playlist_tracks(
+    state: &UpnpState,
+    playlist_id: i64,
+    start: u64,
+    count: u64,
+    base_url: &str,
+) -> DidlResult {
+    const MAX_PAGE: u64 = 500;
+
+    let ids = PlaylistRepo::with_backend(state.backend.clone())
+        .get_track_ids(playlist_id)
+        .unwrap_or_default();
+
+    let total = ids.len();
+    let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let demande = usize::try_from(count.min(MAX_PAGE)).unwrap_or(usize::MAX);
+    let fin = debut.saturating_add(demande).min(total);
+    let tracks = pistes_dans_l_ordre(state, &ids[debut..fin]);
+
+    let parent_id = format!("playlist/{playlist_id}");
+    let mut inner = String::new();
+    for track in &tracks {
+        inner.push_str(&didl_track_item(track, &parent_id, base_url));
+    }
+
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total: total as u64,
+        returned: tracks.len() as u64,
+    }
+}
+
+/// Les pistes désignées par `ids`, dans l'ordre de `ids`.
+///
+/// `TrackRepo::list_by_ids` bâtit un `WHERE id IN (…)`, qui n'ordonne rien.
+/// Une piste absente (supprimée de la bibliothèque sans que la liste ait été
+/// nettoyée) est simplement sautée ; une piste répétée dans la liste est rendue
+/// autant de fois qu'elle y figure — une liste de lecture a le droit de jouer
+/// deux fois le même titre.
+fn pistes_dans_l_ordre(state: &UpnpState, ids: &[i64]) -> Vec<Track> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let par_id: std::collections::HashMap<i64, Track> =
+        TrackRepo::with_backend(state.backend.clone())
+            .list_by_ids(ids)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|track| track.id.map(|id| (id, track)))
+            .collect();
+
+    ids.iter()
+        .filter_map(|id| par_id.get(id).cloned())
+        .collect()
 }
 
 fn browse_root(_state: &UpnpState) -> DidlResult {
@@ -1589,10 +1825,65 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
 fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlResult {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let albums = repo.list_by_genre(genre).unwrap_or_default();
-
     let parent_id = format!("genre/{}", urlencoding::encode(genre));
+    didl_albums_under(&albums, &parent_id, base_url)
+}
+
+/// Les années DISTINCT des albums, la plus récente d'abord.
+///
+/// Une année sans albums n'existe simplement pas dans la liste — la règle de
+/// `ROOT_CONTAINERS` (aucun conteneur annoncé qui s'ouvre vide) descend d'un
+/// niveau. Les albums sans année (`NULL` ou 0) restent visibles par les
+/// autres conteneurs, mais aucun dossier « année inconnue » n'est inventé.
+fn browse_years(state: &UpnpState) -> DidlResult {
+    let years: Vec<i64> = state
+        .backend
+        .query_many(
+            "SELECT DISTINCT year FROM albums \
+             WHERE year IS NOT NULL AND year > 0 ORDER BY year DESC",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_i64()))
+        .collect();
+
     let mut inner = String::new();
-    for album in &albums {
+    for annee in &years {
+        inner.push_str(&didl_container(
+            &format!("year/{annee}"),
+            "years",
+            &annee.to_string(),
+            "object.container",
+            None,
+        ));
+    }
+
+    let total = years.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
+}
+
+/// Les albums d'une année — le même rendu que ceux d'un genre.
+fn browse_year_albums(state: &UpnpState, annee: i64, base_url: &str) -> DidlResult {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let albums = repo.list_by_year(annee).unwrap_or_default();
+    didl_albums_under(&albums, &format!("year/{annee}"), base_url)
+}
+
+/// Le DIDL d'une liste d'albums sous un conteneur (genre, année) : créateur,
+/// pochette et nombre de pistes — pour que deux vues d'un même album disent
+/// exactement la même chose.
+fn didl_albums_under(
+    albums: &[crate::db::models::Album],
+    parent_id: &str,
+    base_url: &str,
+) -> DidlResult {
+    let mut inner = String::new();
+    for album in albums {
         let id = format!("album/{}", album.id.unwrap_or(0));
         let child_count = album.track_count.map(|c| c as u64);
         let mut extra = String::new();
@@ -1610,7 +1901,7 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
         }
         inner.push_str(&didl_container_ext(
             &id,
-            &parent_id,
+            parent_id,
             &album.title,
             "object.container.album.musicAlbum",
             child_count,
@@ -2212,6 +2503,378 @@ mod tests {
         assert_eq!(decode_genre_id("genre/%20%20"), None);
     }
 
+    /// Un état avec quatre albums : deux de 1959, un de 1970, un sans année.
+    fn state_with_years() -> UpnpState {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        for (titre, annee) in [
+            ("Kind of Blue", Some(1959)),
+            ("Time Out", Some(1959)),
+            ("Bitches Brew", Some(1970)),
+            ("Sans Année", None),
+        ] {
+            let mut album = album_with_genre(titre, "Jazz");
+            album.year = annee;
+            repo.create(&album).unwrap();
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #1789 — le conteneur racine « Years » liste les années DISTINCT,
+    /// la plus récente d'abord, et n'invente pas de dossier pour les albums
+    /// sans année.
+    #[test]
+    fn browser_les_annees_liste_les_annees_distinctes() {
+        let state = state_with_years();
+        let res = browse_direct_children(&state, "years", 0, 100);
+        assert_eq!(res.total, 2, "deux années distinctes : 1959 et 1970");
+        assert!(res.xml.contains("id=\"year/1959\""), "{}", res.xml);
+        assert!(res.xml.contains("id=\"year/1970\""), "{}", res.xml);
+        let pos_1970 = res.xml.find("year/1970").unwrap();
+        let pos_1959 = res.xml.find("year/1959").unwrap();
+        assert!(pos_1970 < pos_1959, "la plus récente d'abord : {}", res.xml);
+        assert!(res.xml.contains("parentID=\"years\""), "{}", res.xml);
+    }
+
+    /// #1789 — une année s'ouvre sur SES albums, comme un genre sur les siens.
+    #[test]
+    fn browser_une_annee_renvoie_ses_albums() {
+        let state = state_with_years();
+        let res = browse_direct_children(&state, "year/1959", 0, 100);
+        assert_eq!(res.total, 2);
+        assert!(res.xml.contains("Kind of Blue"), "{}", res.xml);
+        assert!(res.xml.contains("Time Out"), "{}", res.xml);
+        assert!(
+            !res.xml.contains("Bitches Brew"),
+            "un album d'une autre année n'a rien à faire ici"
+        );
+        assert!(
+            res.xml.contains("parentID=\"year/1959\""),
+            "le parentID doit ramener au conteneur d'année : {}",
+            res.xml
+        );
+    }
+
+    /// Contre-échec, même leçon que #1736 : un identifiant d'année inconnu ou
+    /// malformé rend un DIDL vide, jamais une erreur.
+    #[test]
+    fn une_annee_inconnue_reste_vide_sans_planter() {
+        let state = state_with_years();
+        for id in ["year/1234", "year/", "year/abc", "year/-5", "year/0"] {
+            assert_eq!(browse_direct_children(&state, id, 0, 100).total, 0, "{id}");
+        }
+    }
+
+    /// Un point de contrôle strict décrit l'objet avant de l'ouvrir — la
+    /// branche `year/` de BrowseMetadata, symétrique de celle de `genre/`.
+    #[test]
+    fn browse_metadata_decrit_le_conteneur_d_annee() {
+        let state = state_with_years();
+        let res = browse_metadata(&state, "year/1959");
+        assert_eq!(res.total, 1);
+        assert!(res.xml.contains("parentID=\"years\""), "{}", res.xml);
+        assert!(res.xml.contains("1959"), "{}", res.xml);
+
+        assert_eq!(browse_metadata(&state, "year/abc").total, 0);
+    }
+
+    /// `Search` sur le conteneur synthétique `years` est le même parcours à
+    /// plat que sur la racine — pas un 710.
+    #[test]
+    fn la_recherche_accepte_le_conteneur_years() {
+        let state = state_with_years();
+        assert!(
+            search_tracks_in_container(&state, "years", 0, 100, "http://127.0.0.1:8888", &[])
+                .is_some(),
+            "years est un conteneur racine annoncé : Search doit l'accepter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1802 — le conteneur « Playlists », cette fois peuplé
+    // -----------------------------------------------------------------------
+
+    /// Une bibliothèque avec de quoi remplir CHAQUE conteneur racine : un
+    /// artiste, un album (avec genre et année), deux pistes, une radio, et
+    /// deux listes de lecture dont une vide.
+    ///
+    /// Les identifiants rendus sont, dans l'ordre : la liste « Soirée » (trois
+    /// entrées, la piste « Blue in Green » deux fois), la liste vide, et les
+    /// identifiants des deux pistes.
+    fn state_complet() -> (UpnpState, i64, i64, i64, i64) {
+        use crate::db::models::{Album, Artist};
+        use crate::db::radio_repo::RadioStation;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let artist_id = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+
+        let mut album = Album::new("Kind of Blue".into());
+        album.genre = Some("Jazz".into());
+        album.year = Some(1959);
+        album.artist_id = Some(artist_id);
+        album.artist_name = Some("Miles Davis".into());
+        let album_id = AlbumRepo::with_backend(backend.clone())
+            .create(&album)
+            .unwrap();
+
+        let track_repo = TrackRepo::with_backend(backend.clone());
+        let mut so_what = Track::new("So What".into());
+        so_what.album_id = Some(album_id);
+        so_what.album_title = Some("Kind of Blue".into());
+        so_what.artist_id = Some(artist_id);
+        so_what.artist_name = Some("Miles Davis".into());
+        so_what.file_path = Some("/music/so-what.flac".into());
+        let so_what_id = track_repo.create(&so_what).unwrap();
+
+        let mut blue = Track::new("Blue in Green".into());
+        blue.album_id = Some(album_id);
+        blue.album_title = Some("Kind of Blue".into());
+        blue.artist_id = Some(artist_id);
+        blue.artist_name = Some("Miles Davis".into());
+        blue.file_path = Some("/music/blue-in-green.flac".into());
+        let blue_id = track_repo.create(&blue).unwrap();
+
+        RadioRepo::with_backend(backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "FIP HiFi".into(),
+                url: "https://icecast.example/fip-hifi.aac".into(),
+                homepage: None,
+                logo_url: None,
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: true,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let playlist_repo = PlaylistRepo::with_backend(backend.clone());
+        // L'ordre voulu est l'INVERSE de l'ordre d'insertion en base, et la
+        // deuxième piste y figure deux fois : deux pièges d'un coup.
+        let soiree = playlist_repo
+            .create("Soirée & Cie", None, UPNP_PROFILE_ID)
+            .unwrap();
+        playlist_repo
+            .set_tracks(soiree, &[blue_id, so_what_id, blue_id])
+            .unwrap();
+        let vide = playlist_repo
+            .create("Liste vide", None, UPNP_PROFILE_ID)
+            .unwrap();
+
+        (
+            UpnpState::new(backend, 8888, None),
+            soiree,
+            vide,
+            so_what_id,
+            blue_id,
+        )
+    }
+
+    /// #1802 — le conteneur racine « Playlists » est de retour, et il liste de
+    /// vraies listes : `childCount` réel, classe `playlistContainer`, et la
+    /// liste vide n'est pas publiée.
+    #[test]
+    fn le_conteneur_playlists_liste_les_listes_peuplees() {
+        let (state, soiree, vide, _, _) = state_complet();
+
+        let racine = browse_root(&state);
+        assert!(racine.xml.contains("id=\"playlists\""), "{}", racine.xml);
+        assert!(racine.xml.contains("Playlists"), "{}", racine.xml);
+
+        let res = browse_direct_children(&state, "playlists", 0, 100);
+        assert_eq!(res.total, 1, "seule la liste peuplée est publiée");
+        assert_eq!(res.returned, 1);
+        assert!(
+            res.xml.contains(&format!("id=\"playlist/{soiree}\"")),
+            "{}",
+            res.xml
+        );
+        assert!(
+            res.xml
+                .contains("<upnp:class>object.container.playlistContainer</upnp:class>"),
+            "{}",
+            res.xml
+        );
+        assert!(
+            res.xml.contains("childCount=\"3\""),
+            "childCount doit être le nombre RÉEL de pistes : {}",
+            res.xml
+        );
+        assert!(res.xml.contains("parentID=\"playlists\""), "{}", res.xml);
+        // Le nom passe par l'échappement XML : « & » devient « &amp; », et
+        // l'accent reste tel quel (le DIDL est de l'UTF-8).
+        assert!(res.xml.contains("Soirée &amp; Cie"), "{}", res.xml);
+        assert!(
+            !res.xml.contains(&format!("id=\"playlist/{vide}\"")),
+            "une liste vide ne se publie pas — c'est exactement le dossier vide \
+             que #1758 avait retiré : {}",
+            res.xml
+        );
+    }
+
+    /// #1802 — le cœur de la demande : une liste s'ouvre sur SES pistes, dans
+    /// SON ordre, y compris quand cet ordre contredit celui de la base et
+    /// qu'un titre y figure deux fois.
+    #[test]
+    fn une_liste_de_lecture_rend_ses_pistes_dans_son_ordre() {
+        let (state, soiree, _, so_what_id, blue_id) = state_complet();
+        let res = browse_direct_children(&state, &format!("playlist/{soiree}"), 0, 100);
+
+        assert_eq!(res.total, 3, "TotalMatches = les trois entrées de la liste");
+        assert_eq!(res.returned, 3);
+
+        let premier = res.xml.find("Blue in Green").unwrap();
+        let second = res.xml.find("So What").unwrap();
+        let troisieme = res.xml.rfind("Blue in Green").unwrap();
+        assert!(
+            premier < second && second < troisieme,
+            "l'ordre de la liste (position) doit primer sur l'ordre de la base \
+             (id croissant) : {}",
+            res.xml
+        );
+        assert!(
+            so_what_id < blue_id,
+            "le jeu d'essai ne prouve rien si l'ordre de la liste est déjà \
+             celui de la base"
+        );
+        assert!(
+            res.xml
+                .contains("<upnp:class>object.item.audioItem.musicTrack</upnp:class>"),
+            "{}",
+            res.xml
+        );
+        assert!(
+            res.xml.contains(&format!("parentID=\"playlist/{soiree}\"")),
+            "{}",
+            res.xml
+        );
+    }
+
+    /// La page suit `StartingIndex` / `RequestedCount`, et `TotalMatches` reste
+    /// la taille RÉELLE de la liste — c'est lui qui dit au point de contrôle
+    /// qu'il reste des pages. `RequestedCount = 0` veut dire « tout ».
+    #[test]
+    fn une_liste_de_lecture_pagine_sans_mentir_sur_le_total() {
+        let (state, soiree, _, _, _) = state_complet();
+        let id = format!("playlist/{soiree}");
+
+        let page = browse_direct_children(&state, &id, 1, 1);
+        assert_eq!(page.total, 3, "le total ne suit pas la page");
+        assert_eq!(page.returned, 1);
+        assert!(page.xml.contains("So What"), "{}", page.xml);
+
+        let tout = browse_direct_children(&state, &id, 0, UNLIMITED_BROWSE_COUNT);
+        assert_eq!(tout.total, 3);
+        assert_eq!(tout.returned, 3, "RequestedCount=0 doit rendre tout");
+
+        let au_dela = browse_direct_children(&state, &id, 99, 10);
+        assert_eq!(au_dela.total, 3);
+        assert_eq!(
+            au_dela.returned, 0,
+            "un StartingIndex hors borne ne plante pas"
+        );
+    }
+
+    /// Un point de contrôle strict décrit l'objet avant de l'ouvrir — la
+    /// branche `playlist/` de BrowseMetadata, symétrique de `genre/` et
+    /// `year/`. Une liste vide n'étant pas publiée, elle n'est pas décrite.
+    #[test]
+    fn browse_metadata_decrit_le_conteneur_de_liste() {
+        let (state, soiree, vide, _, _) = state_complet();
+
+        let res = browse_metadata(&state, &format!("playlist/{soiree}"));
+        assert_eq!(res.total, 1);
+        assert!(res.xml.contains("parentID=\"playlists\""), "{}", res.xml);
+        assert!(res.xml.contains("childCount=\"3\""), "{}", res.xml);
+        assert!(
+            res.xml
+                .contains("<upnp:class>object.container.playlistContainer</upnp:class>"),
+            "{}",
+            res.xml
+        );
+
+        assert_eq!(
+            browse_metadata(&state, &format!("playlist/{vide}")).total,
+            0
+        );
+        assert_eq!(browse_metadata(&state, "playlists").total, 1);
+    }
+
+    /// Contre-échec, la leçon de #1736 : un identifiant de liste inconnu ou
+    /// malformé rend un DIDL vide, jamais une erreur.
+    #[test]
+    fn une_liste_inconnue_reste_vide_sans_planter() {
+        let (state, _, _, _, _) = state_complet();
+        for id in [
+            "playlist/999999",
+            "playlist/",
+            "playlist/abc",
+            "playlist/-5",
+            "playlist/0",
+        ] {
+            assert_eq!(browse_direct_children(&state, id, 0, 100).total, 0, "{id}");
+            assert_eq!(browse_metadata(&state, id).total, 0, "{id}");
+        }
+    }
+
+    /// `Search` accepte le conteneur synthétique `playlists` — sinon une
+    /// recherche lancée depuis ce dossier rendrait un fault 710 — et une
+    /// recherche DANS une liste se restreint réellement à ses pistes.
+    #[test]
+    fn la_recherche_accepte_le_conteneur_playlists_et_s_y_restreint() {
+        let (state, soiree, _, _, _) = state_complet();
+        let base = "http://127.0.0.1:8888";
+
+        assert!(
+            search_tracks_in_container(&state, "playlists", 0, 100, base, &[]).is_some(),
+            "playlists est un conteneur racine annoncé : Search doit l'accepter"
+        );
+
+        let dans_la_liste =
+            search_tracks_in_container(&state, &format!("playlist/{soiree}"), 0, 100, base, &[])
+                .unwrap();
+        assert_eq!(dans_la_liste.total, 3);
+        assert!(
+            dans_la_liste.xml.contains("So What"),
+            "{}",
+            dans_la_liste.xml
+        );
+
+        let filtre = [PredicatTitre {
+            op: OpTitre::Contient,
+            valeur: "so what".into(),
+        }];
+        let restreint = search_tracks_in_container(
+            &state,
+            &format!("playlist/{soiree}"),
+            0,
+            100,
+            base,
+            &filtre,
+        )
+        .unwrap();
+        assert_eq!(restreint.total, 1, "{}", restreint.xml);
+        assert!(
+            !restreint.xml.contains("Blue in Green"),
+            "{}",
+            restreint.xml
+        );
+    }
+
     /// Un point de contrôle strict décrit l'objet avant de l'ouvrir.
     #[test]
     fn browse_metadata_decrit_le_conteneur_de_genre() {
@@ -2223,16 +2886,20 @@ mod tests {
         assert!(res.xml.contains("Jazz"));
     }
 
-    /// La racine ne doit annoncer que des dossiers réellement navigables :
-    /// « Playlists » était visible et vide depuis toujours.
+    /// La racine ne doit annoncer que des dossiers réellement navigables.
+    ///
+    /// La version d'origine de ce test interdisait le mot « Playlists » — le
+    /// conteneur venait d'être retiré en 0.9.79 parce que `browse_playlists`
+    /// était un marque-page qui rendait le vide. L'intention était juste, la
+    /// formulation trop courte : elle interdisait la fonctionnalité au lieu du
+    /// dossier vide. Elle est donc reformulée sur ce qui compte réellement —
+    /// **sur une bibliothèque peuplée, aucun conteneur racine ne s'ouvre
+    /// vide**. Un marque-page échoue à ce test ; une implémentation le passe
+    /// (#1802).
     #[test]
     fn la_racine_n_annonce_aucun_conteneur_impossible_a_ouvrir() {
-        let state = test_state();
+        let (state, _, _, _, _) = state_complet();
         let root = browse_root(&state);
-        assert!(
-            !root.xml.contains("Playlists"),
-            "un conteneur sans contenu navigable se lit comme une bibliothèque cassée"
-        );
         assert_eq!(root.total, ROOT_CONTAINERS.len() as u64);
 
         // Et le nombre d'enfants annoncé par BrowseMetadata suit la liste.
@@ -2242,11 +2909,25 @@ mod tests {
                 .contains(&format!("childCount=\"{}\"", ROOT_CONTAINERS.len()))
         );
 
-        // Chaque conteneur racine annoncé doit savoir s'ouvrir.
-        for (id, _, _) in ROOT_CONTAINERS.iter() {
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            // Chaque conteneur racine annoncé doit savoir se décrire…
             assert!(
                 browse_metadata(&state, id).total == 1,
                 "conteneur racine {id} sans BrowseMetadata"
+            );
+            // …être annoncé à la racine…
+            assert!(
+                root.xml.contains(&format!("id=\"{id}\"")),
+                "conteneur racine {id} ({titre}) absent de la racine : {}",
+                root.xml
+            );
+            // …et s'ouvrir sur quelque chose.
+            let enfants = browse_direct_children(&state, id, 0, 100);
+            assert!(
+                enfants.total > 0 && enfants.returned > 0,
+                "le conteneur racine {id} ({titre}) s'ouvre vide sur une \
+                 bibliothèque peuplée : un dossier visible et vide se lit comme \
+                 une bibliothèque cassée"
             );
         }
     }

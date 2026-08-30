@@ -269,6 +269,10 @@ fn spawn_paced_levels_forwarder(
         // pour le reste de la piste.
         let mut last_reported: Option<i64> = None;
         let mut reported_advancing = false;
+        // Crête tenue ~300 ms (#1694) : un transitoire survit à une trame
+        // perdue. Un état par forwarder = remise à zéro au changement de
+        // piste, gratuite par construction.
+        let mut peak_hold = crate::audio::levels::PeakHold::default();
         while let Some(raw) = rx.recv().await {
             let mut reported_position_ms: i64 = 0;
             loop {
@@ -358,6 +362,8 @@ fn spawn_paced_levels_forwarder(
                 raw.channels,
                 raw.sample_rate,
             );
+            let (peak_hold_left_db, peak_hold_right_db) =
+                peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
             bus.emit(
                 "playback.audio_levels",
                 serde_json::json!({
@@ -370,6 +376,12 @@ fn spawn_paced_levels_forwarder(
                     "rms_right_db": lvl.rms_right_db(),
                     "peak_left_db": lvl.peak_left_db(),
                     "peak_right_db": lvl.peak_right_db(),
+                    // Crête TENUE (max glissant ~300 ms) — champ ADDITIF
+                    // (#1694) : un client ancien l'ignore, un client neuf y
+                    // lit le transitoire même s'il a raté la trame qui le
+                    // portait. Sample peak, avant DSP, comme `peak_*_db`.
+                    "peak_hold_left_db": peak_hold_left_db,
+                    "peak_hold_right_db": peak_hold_right_db,
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
@@ -377,6 +389,26 @@ fn spawn_paced_levels_forwarder(
                     // forme normalisée trame par trame (contrat des clients
                     // déjà déployés) ; ce champ dit le vrai niveau.
                     "spectrum_db": lvl.spectrum_db,
+                    // Fréquence centrale RÉELLE de chaque bande, en Hz —
+                    // champ ADDITIF (#2081). Jusqu'ici `spectrum` était une
+                    // suite de nombres anonymes : rien ne disait à quelle
+                    // fréquence répondait la barre n° 12, et un client ne
+                    // pouvait graduer son analyseur qu'en recopiant le
+                    // découpage de `levels.rs`, arrondis compris, avec une
+                    // fréquence d'échantillonnage devinée depuis les
+                    // métadonnées de la piste. C'est la même grille que celle
+                    // que l'égaliseur Expert affiche en ISO.
+                    //
+                    // Deux bandes voisines de même valeur lisent les mêmes
+                    // raies FFT : l'analyse ne les distingue pas, et un client
+                    // honnête n'y pose qu'un seul repère.
+                    "spectrum_hz": &*lvl.spectrum_hz,
+                    // De quoi refaire le calcul soi-même si besoin : la
+                    // fréquence d'échantillonnage RÉELLEMENT analysée (celle
+                    // du décodage, pas celle du tag) et la taille de FFT qui a
+                    // servi — elle tombe sous 2048 sur une fenêtre courte.
+                    "sample_rate": raw.sample_rate,
+                    "spectrum_fft_size": lvl.spectrum_fft_size,
                 }),
             );
             next_emit += window;
@@ -386,12 +418,117 @@ fn spawn_paced_levels_forwarder(
     tx
 }
 
+/// Décode un fichier local EN FLUX, uniquement pour alimenter un forwarder de
+/// niveaux neuf : c'est ce qui rend les aiguilles à la piste devenue courante
+/// après une avance gapless.
+///
+/// Le PCM produit part dans un puits — seules comptent les fenêtres de niveaux
+/// et le fait de borner la mémoire. `decode_to_pcm` matérialisait ici la piste
+/// ENTIÈRE avant d'émettre la moindre fenêtre (~1,9 Go pour un 24/192 de dix
+/// minutes ; pire encore pour un DSD rendu en 176,4 kHz) : c'est la faute que
+/// #1423 avait corrigée sur le chemin passthrough et qui était restée sur
+/// celui-ci. Le décodeur en flux couvre en outre DSF/DFF, ce que la variante
+/// « tout en mémoire » ne pouvait pas se permettre (#1541).
+///
+/// Le puits s'arrête dès que le forwarder est mort (piste remplacée, zone
+/// stoppée) : le décodeur voit son consommateur disparaître et rend la main au
+/// lieu de convertir la fin d'une piste que plus personne n'écoute.
+///
+/// Et il est BRIDÉ au rythme de lecture, exactement comme la sonde proxy
+/// (`decode_http_stream_for_levels`) : un décodage plein pot produit les
+/// fenêtres bien plus vite que le forwarder ne les publie, et la file du
+/// forwarder — non bornée par construction — retiendrait alors tout le PCM de
+/// la piste (~600 Mo pour un DSD64 de dix minutes rendu en 176,4 kHz). Le
+/// puits ne consomme donc pas plus vite que
+/// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur, bloqué sur un canal
+/// borné, s'aligne dessus.
+fn spawn_local_file_levels_decode(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+) {
+    tokio::spawn(async move {
+        let cadence = playback.clone();
+        let levels_tx = spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+        // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
+        // que le bridage compare à la position rapportée par la zone.
+        let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // Relais : le décodeur ne sait pas compter son avance, mais chaque
+        // fenêtre porte sa durée.
+        let (relais_tx, mut relais_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        {
+            let avance_ms = avance_ms.clone();
+            tokio::spawn(async move {
+                while let Some(raw) = relais_rx.recv().await {
+                    avance_ms.fetch_add(
+                        raw.window.as_millis() as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if levels_tx.send(raw).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // Sonde du même canal : `is_closed()` devient vrai quand le relais a
+        // rendu la main, donc quand le forwarder est mort.
+        let relais = relais_tx.clone();
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        tokio::spawn(async move {
+            while sink_rx.recv().await.is_some() {
+                loop {
+                    if relais.is_closed() {
+                        return;
+                    }
+                    let position = cadence.get_state(zone_id).await.position_ms;
+                    if !levels_decode_doit_freiner(
+                        avance_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        position,
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(LEVELS_HOLD).await;
+                }
+            }
+        });
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let result = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &path,
+                None,
+                None,
+                None,
+                sink_tx,
+                LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+            )
+        })
+        .await;
+        match result {
+            Err(e) => debug!(zone_id, error = %e, "gapless_levels_task_panic"),
+            Ok(Err(e)) => debug!(zone_id, error = %e, "gapless_levels_decode_failed"),
+            Ok(Ok(_)) => {}
+        }
+    });
+}
+
 /// Avance maximale du décodage-pour-niveaux d'une session proxy sur la
 /// position rapportée par la zone. Borne à la fois la mémoire (fenêtres en
 /// attente dans le canal du forwarder) et la bande passante : le second fetch
 /// CDN s'étale sur la durée de la piste au lieu de télécharger le fichier
 /// d'un bloc.
 const PROXY_LEVELS_MAX_AHEAD_MS: i64 = 30_000;
+
+/// Le décodage-pour-niveaux doit-il attendre ? Règle unique des deux sondes —
+/// la sonde HTTP d'une session proxy et le décodage de fichier local rearmé
+/// après une avance gapless.
+fn levels_decode_doit_freiner(avance_ms: i64, position_rapportee_ms: i64) -> bool {
+    avance_ms > position_rapportee_ms + PROXY_LEVELS_MAX_AHEAD_MS
+}
 
 /// Décode un flux HTTP en arrière-plan, UNIQUEMENT pour les VU-mètres.
 ///
@@ -524,10 +661,10 @@ fn decode_http_stream_for_levels(
         // Bridage : rester au plus PROXY_LEVELS_MAX_AHEAD_MS devant la
         // position rapportée (0 tant que la lecture n'a pas démarré — la
         // sonde constitue alors juste son avance initiale puis attend).
-        while decoded_ms
-            > reported_position_ms.load(std::sync::atomic::Ordering::Relaxed)
-                + PROXY_LEVELS_MAX_AHEAD_MS
-        {
+        while levels_decode_doit_freiner(
+            decoded_ms,
+            reported_position_ms.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
             if levels_tx.is_closed() {
                 return Ok(());
             }
@@ -885,7 +1022,7 @@ pub(crate) fn command_may_have_landed(err: &str) -> bool {
 /// que le MIME exact qu'ils publient. Aucun MIME PCM ne porte ces trois
 /// lettres, donc la reconnaissance ne peut pas mordre à côté — un FLAC servi à
 /// la même zone n'est jamais confondu avec un DSD.
-fn est_dsd_brut(mime_type: &str) -> bool {
+pub fn est_dsd_brut(mime_type: &str) -> bool {
     let m = mime_type.to_ascii_lowercase();
     m.contains("dsd") || m.contains("dsf") || m.contains("dff")
 }
@@ -1075,6 +1212,38 @@ fn profondeur_sondee_si_la_base_ignore(file_path: &str, fmt: Option<AudioFormat>
 
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     (is_local && (dsd_mode == "native" || dsd_mode == "dop")) || (is_network && dsd_mode == "dop")
+}
+
+/// Cette piste est-elle du 1 bit (DSF/DFF) ? Le format vient de la base, tel
+/// que le scan l'a écrit.
+pub fn est_source_dsd(format: Option<&str>) -> bool {
+    format.is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"))
+}
+
+/// Le fichier à décoder pour ré-alimenter les VU-mètres après une avance
+/// gapless — `None` quand il n'y a rien à mesurer.
+///
+/// Le DSD en était exclu tout court (`file_path.filter(|_| !is_dsd)`), pour un
+/// motif qui n'existe plus : `decode_to_pcm_streaming_with_levels` décode
+/// DSF/DFF **en flux** depuis #1423, exactement comme le transcode de la
+/// première lecture. L'exclusion laissait donc la zone SANS forwarder après
+/// chaque enchaînement — `bump_levels_gen` venait de tuer le précédent — et
+/// les aiguilles gelaient sur leur dernière valeur pour tout le reste de
+/// l'album, alors que le FLAC de la même zone continuait de les animer
+/// (#1541, Smart DX1 en `dsd_mode: pcm`).
+///
+/// Ce que le DSD garde en propre, c'est le PRIX : rendre du 1 bit en PCM coûte
+/// cher, et sur le seul chemin qui ne mesure rien — OAAT en DSD natif, cf.
+/// [`PlaybackOrchestrator::output_produces_levels`] — ce serait précisément le
+/// décodage retiré pour débloquer Zicmu (`dsd_streaming_send_timeout`, #2280).
+/// On ne le paie que si la sortie publie vraiment des niveaux ; les autres
+/// formats gardent leur comportement, sans nouvelle condition.
+pub(crate) fn fichier_a_mesurer_apres_avance(
+    format: Option<&str>,
+    file_path: Option<String>,
+    la_sortie_mesure: bool,
+) -> Option<String> {
+    file_path.filter(|_| !est_source_dsd(format) || la_sortie_mesure)
 }
 
 impl PlaybackOrchestrator {
@@ -6898,6 +7067,11 @@ impl PlaybackOrchestrator {
                     // biquads match the DAC clock, mirroring the crossfeed.
                     let eq_ch = media.channels.unwrap_or(2).clamp(1, 8) as u16;
                     local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
+                    // Repli mono (#2362) — sortie LOCALE uniquement, comme le
+                    // crossfeed juste au-dessus. `zone_mono_downmix` rend
+                    // `false` en mode PURE, donc la promesse bit-perfect tient
+                    // sans garde supplémentaire, exactement comme pour l'EQ.
+                    local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
                 }
                 drop(output);
             }
@@ -7657,6 +7831,11 @@ impl PlaybackOrchestrator {
             // au remplacement — sinon la bascule claque.
             local_output.replace_crossfeed_live(self.load_crossfeed_processor(zone_id, taux));
             local_output.replace_eq_live(self.load_eq_processor(zone_id, taux, canaux));
+            // Le repli mono est lui aussi gouverné par PURE (#2362) : basculer
+            // PURE doit donc le désarmer ou le réarmer dans le même geste, sans
+            // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
+            // suivante alors que le panneau annonce déjà « Mono ».
+            local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -7831,6 +8010,99 @@ impl PlaybackOrchestrator {
             amount,
             delay_ms,
         ))
+    }
+
+    /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)
+    ///
+    /// Symétrique de [`Self::load_crossfeed_processor`] :
+    ///
+    ///   - mode PURE (audiophile) → `false` (chemin bit-perfect, intouché) ;
+    ///   - réglage absent, vide, ou différent de `"true"` → `false` (défaut).
+    ///
+    /// Le réglage vit dans la clé `zone_{id}_mono_downmix`, écrite par
+    /// `PATCH /zones/{id}` — même forme que `zone_{id}_upnp_renderer` : la clé
+    /// est SUPPRIMÉE quand l'utilisateur désactive, jamais mise à `"false"`.
+    ///
+    /// Public : `tune-server` le relit pour composer le chemin du signal, afin
+    /// que le panneau et le son répondent à la MÊME question — c'est la leçon
+    /// de #1548/#1559 (EQ oublié du verdict) et de #1627 (ReplayGain).
+    pub fn zone_mono_downmix(&self, zone_id: i64) -> bool {
+        Self::zone_mono_downmix_with(&self.db, zone_id)
+    }
+
+    /// Même règle, lisible sans orchestrateur — c'est par là que le serveur
+    /// compose le chemin du signal.
+    pub fn zone_mono_downmix_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        // PURE : le PCM atteint la sortie intact, aucun repli n'est appliqué.
+        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+            return false;
+        }
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get(&format!("zone_{zone_id}_mono_downmix"))
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true")
+    }
+
+    /// Réappliquer le repli mono d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// Jumeau de [`Self::refresh_zone_crossfeed`], pour le même défaut : sans
+    /// lui, cocher la case en écoutant persisterait le réglage, renverrait un
+    /// succès, et ne changerait rien avant la piste suivante (#1725, #1786).
+    /// Or c'est exactement ainsi qu'on vérifie ce réglage-ci : une seule
+    /// enceinte, on coche, et on doit entendre revenir ce qui était panné à
+    /// droite.
+    ///
+    /// Contrairement au crossfeed, il n'y a **pas** de garde sur
+    /// `current_format()` : le repli n'a aucun filtre à bâtir pour un taux
+    /// donné, donc rien à faire dépendre d'un flux en cours. Armer le drapeau
+    /// sur une sortie silencieuse est correct et évite de perdre le réglage.
+    ///
+    /// Renvoie `true` si le drapeau a été poussé vers une sortie locale vivante.
+    pub async fn refresh_zone_mono_downmix(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let mono = self.zone_mono_downmix(zone_id);
+            local_output.set_mono_downmix(mono);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                mono,
+                "zone_mono_downmix_refreshed_live"
+            );
+            true
+        }
     }
 
     fn record_listen(
@@ -9143,36 +9415,32 @@ impl PlaybackOrchestrator {
                 .get(track_id)
                 .ok()
                 .flatten();
-            // DSD : indécodable inline pour les niveaux (même garde que le
-            // chemin passthrough).
-            let is_dsd = track
-                .as_ref()
-                .and_then(|t| t.format.as_deref())
-                .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd"));
-            if let Some(path) = track.and_then(|t| t.file_path).filter(|_| !is_dsd) {
-                let playback = self.playback.clone();
+            let format = track.as_ref().and_then(|t| t.format.clone());
+            // La sortie ne se consulte QUE pour du DSD : c'est le seul format
+            // dont le décodage-pour-niveaux coûte assez cher pour valoir une
+            // lecture de zone, et le seul chemin qui ne mesure pas (OAAT en
+            // DSD natif) n'y arrive qu'en jouant du DSD. Interroger la sortie
+            // pour tous les formats aurait éteint les VU d'un FLAC enchaîné
+            // juste après un DSD, tant que le drapeau natif n'est pas retombé.
+            let la_sortie_mesure = if est_source_dsd(format.as_deref()) {
+                let device_id = ZoneRepo::with_backend(self.db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_device_id);
+                self.output_produces_levels(device_id.as_deref()).await
+            } else {
+                true
+            };
+            if let Some(path) = fichier_a_mesurer_apres_avance(
+                format.as_deref(),
+                track.and_then(|t| t.file_path),
+                la_sortie_mesure,
+            ) {
                 // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
                 // bien la piste devenue courante (#1110).
                 let play_seq = self.playback.current_play_seq(zone_id).await;
-                tokio::spawn(async move {
-                    let levels_tx =
-                        spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(dec) =
-                            crate::audio::decode::decode_to_pcm(&path, None, None, 0.0, 0.0)
-                        {
-                            crate::audio::tap::send_windowed_pcm(
-                                &levels_tx,
-                                &dec.pcm_bytes(),
-                                dec.bit_depth,
-                                dec.channels as u16,
-                                dec.sample_rate,
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
-                });
+                spawn_local_file_levels_decode(bus, self.playback.clone(), zone_id, play_seq, path);
             }
         } else if let (Some(bus), Some(source_id)) =
             (self.event_bus.clone(), advance_source_id.clone())
@@ -9215,26 +9483,16 @@ impl PlaybackOrchestrator {
                     let codec = data.quality.codec.to_lowercase();
                     if let Some(path) = data.url.strip_prefix("file://") {
                         // fMP4 DASH assemblé sur disque : décodage local
-                        // direct, même motif que la branche fichier ci-dessus.
+                        // direct, même motif — et même helper — que la branche
+                        // fichier ci-dessus.
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        let levels_tx =
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                        let path = path.to_string();
-                        tokio::task::spawn_blocking(move || {
-                            if let Ok(dec) =
-                                crate::audio::decode::decode_to_pcm(&path, None, None, 0.0, 0.0)
-                            {
-                                crate::audio::tap::send_windowed_pcm(
-                                    &levels_tx,
-                                    &dec.pcm_bytes(),
-                                    dec.bit_depth,
-                                    dec.channels as u16,
-                                    dec.sample_rate,
-                                );
-                            }
-                        })
-                        .await
-                        .ok();
+                        spawn_local_file_levels_decode(
+                            bus,
+                            playback,
+                            zone_id,
+                            play_seq,
+                            path.to_string(),
+                        );
                     } else {
                         spawn_proxy_levels_probe_task(
                             playback, bus, zone_id, data.url, codec, play_seq,
@@ -11495,6 +11753,272 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    // ------------------------------------------------------------------
+    // #1541 — VU-mètres après une avance gapless, DSD local compris.
+    // ------------------------------------------------------------------
+
+    /// Écrit un `.dsf` DSD64 stéréo valide : `blocs_par_canal` super-blocs de
+    /// 4096 octets par canal, remplis en carré (un bloc à `0xFF`, le suivant à
+    /// `0x00`, soit ~43 Hz). Le signal est FRANC : le test peut exiger des
+    /// niveaux au-dessus du silence, et pas seulement l'existence
+    /// d'événements — un forwarder nourri de zéros émettrait tout autant.
+    fn ecrire_dsf_carre(path: &std::path::Path, blocs_par_canal: usize) {
+        const BLOC: usize = 4096;
+        const CANAUX: usize = 2;
+        let mut data = Vec::with_capacity(blocs_par_canal * BLOC * CANAUX);
+        // Disposition DSF : bloc du canal 0, bloc du canal 1, bloc suivant du
+        // canal 0… Les deux canaux portent le même carré.
+        for indice_bloc in 0..blocs_par_canal * CANAUX {
+            let octet: u8 = if (indice_bloc / CANAUX) % 2 == 0 {
+                0xFF
+            } else {
+                0x00
+            };
+            data.extend(std::iter::repeat_n(octet, BLOC));
+        }
+        let total_samples = (blocs_par_canal * BLOC * 8) as u64;
+
+        let mut buf = Vec::with_capacity(92 + data.len());
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // pas de métadonnées
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u32.to_le_bytes()); // format = DSD brut
+        buf.extend_from_slice(&2u32.to_le_bytes()); // type de canaux = stéréo
+        buf.extend_from_slice(&(CANAUX as u32).to_le_bytes());
+        buf.extend_from_slice(&2_822_400u32.to_le_bytes()); // DSD64
+        buf.extend_from_slice(&1u32.to_le_bytes()); // bits par échantillon
+        buf.extend_from_slice(&total_samples.to_le_bytes());
+        buf.extend_from_slice(&(BLOC as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // réservé
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// Zone à sortie LOCALE, en lecture, dont la file contient deux fois le
+    /// même fichier : l'état exact d'un album au moment où l'enchaînement
+    /// gapless bascule sur la piste 2.
+    async fn zone_locale_prete_a_enchainer(
+        chemin: &str,
+        format: &str,
+    ) -> (
+        Arc<PlaybackOrchestrator>,
+        Arc<EventBus>,
+        i64,
+        tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+    ) {
+        let bus = Arc::new(EventBus::new());
+        let mut orch = test_orchestrator();
+        orch.event_bus = Some(bus.clone());
+        let orch = Arc::new(orch);
+
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Smart DX1", Some("local"), Some("local:Smart DX1"))
+            .unwrap();
+
+        let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+        let mut ids = Vec::new();
+        for n in 1..=2 {
+            let mut piste = crate::db::models::Track::new(format!("Piste {n}"));
+            // `tracks.file_path` est UNIQUE : seule la piste 2 — celle sur
+            // laquelle l'enchaînement bascule, donc la seule qui sera décodée
+            // — porte le vrai fichier.
+            piste.file_path = Some(if n == 2 {
+                chemin.to_string()
+            } else {
+                format!("{chemin}.piste1")
+            });
+            piste.format = Some(format.to_string());
+            piste.sample_rate = Some(2_822_400);
+            piste.bit_depth = Some(1);
+            piste.channels = 2;
+            piste.track_number = n;
+            piste.duration_ms = 2_000;
+            ids.push(pistes.create(&piste).unwrap());
+        }
+        crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+            .set_queue(zone_id, &ids)
+            .unwrap();
+
+        // La zone joue déjà la piste 1 : sans état `Playing`, le forwarder
+        // attend au lieu d'émettre et le test ne mesurerait que son horloge.
+        orch.playback.play(zone_id, NowPlaying::default()).await;
+        let rx = bus.subscribe();
+        (orch, bus, zone_id, rx)
+    }
+
+    /// Compte les `playback.audio_levels` de `zone_id` pendant `fenetre`, et
+    /// rend aussi la crête maximale vue. S'arrête dès que `attendus` sont
+    /// atteints : un test qui réussit ne paie pas le délai complet.
+    async fn compter_niveaux(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        zone_id: i64,
+        fenetre: std::time::Duration,
+        attendus: u32,
+    ) -> (u32, f64) {
+        let mut n = 0u32;
+        let mut crete = f64::NEG_INFINITY;
+        let echeance = tokio::time::Instant::now() + fenetre;
+        loop {
+            let reste = echeance.saturating_duration_since(tokio::time::Instant::now());
+            if reste.is_zero() || (attendus > 0 && n >= attendus) {
+                break;
+            }
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev))
+                    if ev.event_type == "playback.audio_levels"
+                        && ev.data.get("zone_id").and_then(|v| v.as_i64()) == Some(zone_id) =>
+                {
+                    n += 1;
+                    if let Some(p) = ev.data.get("peak_left_db").and_then(|v| v.as_f64()) {
+                        crete = crete.max(p);
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        (n, crete)
+    }
+
+    /// #1541 : après une avance gapless sur une piste **DSD locale**, la zone
+    /// doit ré-émettre des `playback.audio_levels`.
+    ///
+    /// `bump_levels_gen` vient de tuer le forwarder de la piste précédente ;
+    /// si rien ne le remplace, les aiguilles ne retombent pas à zéro — elles
+    /// GÈLENT sur leur dernière valeur, ce que Xavier Joly décrit depuis la
+    /// v0.9.98 (« l'aiguille bouge une fois au début puis reste bloquée »),
+    /// pendant que le FLAC de la même zone continue de les animer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn avance_gapless_en_dsd_local_ranime_les_vu_metres() {
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        // ~1,5 s de DSD64 : de quoi produire une quarantaine de fenêtres de
+        // 40 ms, cadencées à la vitesse de lecture par le forwarder.
+        ecrire_dsf_carre(dsf.path(), 130);
+        let chemin = dsf.path().to_str().unwrap().to_string();
+        let (orch, _bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "dsf").await;
+
+        orch.advance_queue_metadata(zone_id, 1)
+            .await
+            .expect("l'avance gapless doit aboutir");
+
+        let (n, crete) =
+            compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(20), 25).await;
+        assert!(
+            n >= 25,
+            "après l'avance gapless, un DSD local doit ré-alimenter les VU : reçu {n} événements"
+        );
+        assert!(
+            crete > -20.0,
+            "les niveaux doivent décrire le SIGNAL, pas du silence : crête {crete:.1} dBFS"
+        );
+    }
+
+    /// Contre-épreuve PERMANENTE du test ci-dessus : la décision d'avant le
+    /// correctif — `file_path.filter(|_| !is_dsd)` — recopiée telle quelle,
+    /// branchée sur le même harnais.
+    ///
+    /// Elle vérifie deux choses qu'un test vert ne prouve jamais tout seul :
+    /// que l'injection de panne ÉCHOUE bien (aucun forwarder n'est créé), et
+    /// que le compteur du harnais rend alors `0`. Si un jour des
+    /// `audio_levels` arrivaient dans ce harnais par un autre chemin, le test
+    /// principal deviendrait insensible au défaut : celui-ci tomberait en
+    /// premier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contre_epreuve_le_filtre_dsd_historique_eteint_bien_les_vu() {
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        ecrire_dsf_carre(dsf.path(), 130);
+        let chemin = dsf.path().to_str().unwrap().to_string();
+        let (orch, bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "dsf").await;
+
+        // Décision historique, verbatim.
+        let decision_historique = |format: Option<&str>, file_path: Option<String>| {
+            let is_dsd = format.is_some_and(|f: &str| {
+                matches!(f.to_ascii_lowercase().as_str(), "dsf" | "dff" | "dsd")
+            });
+            file_path.filter(|_| !is_dsd)
+        };
+
+        // Le reste de l'avance, à l'identique : les forwarders de la piste
+        // précédente meurent, puis on ne crée QUE ce que la décision autorise.
+        orch.playback.bump_levels_gen(zone_id);
+        let play_seq = orch.playback.current_play_seq(zone_id).await;
+        let choisi = decision_historique(Some("dsf"), Some(chemin.clone()));
+        assert!(
+            choisi.is_none(),
+            "l'injection de panne doit bien priver le DSD de forwarder"
+        );
+        if let Some(p) = choisi {
+            super::spawn_local_file_levels_decode(bus, orch.playback.clone(), zone_id, play_seq, p);
+        }
+
+        let (n, _) = compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(3), 0).await;
+        assert_eq!(
+            n, 0,
+            "sous le défaut, ce harnais doit voir ZÉRO niveau — sinon le test principal ne prouve rien"
+        );
+    }
+
+    /// La décision elle-même, cas par cas. Le DSD n'est plus exclu ; la seule
+    /// sortie qui ne mesure pas (OAAT en DSD natif) ne paie toujours pas le
+    /// décodage, et aucun autre format ne dépend de cette réponse.
+    #[test]
+    fn le_fichier_a_mesurer_couvre_le_dsd_sauf_quand_rien_ne_mesure() {
+        let f = || Some("/musique/piste".to_string());
+        for fmt in ["dsf", "dff", "dsd", "DSF", "Dff"] {
+            assert_eq!(
+                super::fichier_a_mesurer_apres_avance(Some(fmt), f(), true),
+                f(),
+                "{fmt} : une sortie qui mesure doit recevoir des niveaux"
+            );
+            assert_eq!(
+                super::fichier_a_mesurer_apres_avance(Some(fmt), f(), false),
+                None,
+                "{fmt} : rendre du 1 bit en PCM pour une sortie qui ne mesure pas"
+            );
+        }
+        for fmt in ["flac", "wav", "mp3", "alac"] {
+            assert_eq!(
+                super::fichier_a_mesurer_apres_avance(Some(fmt), f(), true),
+                f(),
+                "{fmt} : comportement inchangé"
+            );
+            assert_eq!(
+                super::fichier_a_mesurer_apres_avance(Some(fmt), f(), false),
+                f(),
+                "{fmt} : la réponse de la sortie ne concerne que le DSD"
+            );
+        }
+        assert_eq!(
+            super::fichier_a_mesurer_apres_avance(Some("flac"), None, true),
+            None,
+            "sans chemin de fichier, rien à décoder"
+        );
+        assert_eq!(
+            super::fichier_a_mesurer_apres_avance(None, f(), true),
+            f(),
+            "format inconnu : on décode, comme avant"
+        );
+    }
+
+    /// Le bridage du décodage-pour-niveaux : au plus 30 s d'avance sur ce que
+    /// la zone rapporte. Sans lui, le décodeur d'un DSD local part plein pot
+    /// et la file du forwarder — non bornée — retient tout le PCM de la piste.
+    #[test]
+    fn le_decodage_pour_niveaux_ne_prend_pas_plus_de_30_s_d_avance() {
+        assert!(!super::levels_decode_doit_freiner(0, 0));
+        assert!(!super::levels_decode_doit_freiner(30_000, 0));
+        assert!(super::levels_decode_doit_freiner(30_001, 0));
+        // La lecture avance : le décodage repart d'autant.
+        assert!(!super::levels_decode_doit_freiner(90_000, 60_000));
+        assert!(super::levels_decode_doit_freiner(90_001, 60_000));
     }
 
     /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend

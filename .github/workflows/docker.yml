@@ -130,7 +130,7 @@ jobs:
             sleep 20
           done
           cargo install --git https://github.com/renesenses/airplay2-rs \
-            --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
+            --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 \
             airplay-daemon --root /tmp/ap --locked
           cp /tmp/ap/bin/airplay-daemon dist/amd64/airplay-daemon
           touch dist/arm64/airplay-daemon

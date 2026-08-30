@@ -51,13 +51,14 @@ pub(super) async fn folder_facet(
     // Cumulative narrowing by the OTHER facets. exclude="folder" so the caller's
     // own folder selection isn't double-applied — this endpoint scopes by the
     // `path` prefix below instead. An active collection selection is resolved to
-    // album ids so it narrows the folder children too.
-    let coll_ids: Option<Vec<i64>> = filters
+    // its member set — la MÊME résolution que la liste et que le rail (#1864),
+    // collections intelligentes comprises — so it narrows the folder children too.
+    let coll = filters
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| super::facets::collection_album_ids(&state, name));
-    let (conds, params) = build_conditions(&filters, engine, "folder", coll_ids.as_deref());
+        .map(|name| super::facets::resolve_collection(&state, name));
+    let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref());
 
     let path = p
         .path

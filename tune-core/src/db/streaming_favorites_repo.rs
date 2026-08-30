@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
+use crate::favorites_sort::{self, CleDeTri, TriFavoris};
 
 /// A favorited streaming item (Tidal/Qobuz/…). Unlike local `favorites` (keyed
 /// on an INTEGER `item_id`), streaming items use string `service_id`s, so they
@@ -196,6 +197,30 @@ impl StreamingFavoritesRepo {
         };
         Ok(rows.iter().map(row_to_streaming_favorite).collect())
     }
+
+    /// Les mêmes favoris, rangés selon `tri` (#2001).
+    ///
+    /// Cette table mémorise déjà `title`, `artist` et `album` — c'est tout
+    /// l'intérêt de l'instantané posé à l'ajout — donc rien à joindre : on
+    /// range en Rust ce que `list` vient de lire, avec les règles du client web
+    /// (accents, champ absent en fin, tri naturel des nombres).
+    pub fn list_sorted(
+        &self,
+        profile_id: i64,
+        item_type: Option<&str>,
+        tri: TriFavoris,
+    ) -> Result<Vec<StreamingFavorite>, String> {
+        let mut items = self.list(profile_id, item_type)?;
+        match tri.cle {
+            CleDeTri::Ajout => favorites_sort::appliquer_ajout(&mut items, tri.sens),
+            CleDeTri::Titre => favorites_sort::trier_par(&mut items, tri.sens, |f| f.title.clone()),
+            CleDeTri::Artiste => {
+                favorites_sort::trier_par(&mut items, tri.sens, |f| f.artist.clone())
+            }
+            CleDeTri::Album => favorites_sort::trier_par(&mut items, tri.sens, |f| f.album.clone()),
+        }
+        Ok(items)
+    }
 }
 
 fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
@@ -265,6 +290,76 @@ mod tests {
         repo.remove(1, "track", "tidal", "t1").unwrap();
         assert!(!repo.is_favorite(1, "track", "tidal", "t1").unwrap());
         assert_eq!(repo.list(1, None).unwrap().len(), 1);
+    }
+
+    /// Quatre favoris de service, ajoutés du plus ancien au plus récent, dont
+    /// un sans titre ni album (#2001).
+    fn repo_a_trier() -> StreamingFavoritesRepo {
+        let repo = fresh_repo();
+        for (id, titre, artiste, album, date) in [
+            (
+                "s1",
+                Some("Volume 10"),
+                Some("Éric Zimmer"),
+                Some("Anthologie"),
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                "s2",
+                Some("volume 2"),
+                Some("aaron Zed"),
+                Some("bis"),
+                "2026-02-01T00:00:00Z",
+            ),
+            (
+                "s3",
+                Some("Zorro"),
+                Some("Erik Satie"),
+                Some("Coda"),
+                "2026-03-01T00:00:00Z",
+            ),
+            ("s4", None, None, None, "2026-04-01T00:00:00Z"),
+        ] {
+            repo.add(1, "track", "qobuz", id, titre, artiste, album, None)
+                .unwrap();
+            let params: [&dyn ToSqlValue; 2] = [&date, &id];
+            repo.db
+                .execute(
+                    "UPDATE streaming_favorites SET created_at = ? WHERE service_id = ?",
+                    &params,
+                )
+                .unwrap();
+        }
+        repo
+    }
+
+    fn ids(items: Vec<StreamingFavorite>) -> Vec<String> {
+        items.into_iter().map(|f| f.service_id).collect()
+    }
+
+    fn range(repo: &StreamingFavoritesRepo, sort: &str, order: &str) -> Vec<String> {
+        let tri = TriFavoris::depuis(Some(sort), Some(order)).unwrap();
+        ids(repo.list_sorted(1, None, tri).unwrap())
+    }
+
+    #[test]
+    fn sans_tri_les_favoris_de_service_gardent_l_ordre_d_ajout() {
+        let repo = repo_a_trier();
+        assert_eq!(ids(repo.list(1, None).unwrap()), ["s4", "s3", "s2", "s1"]);
+    }
+
+    #[test]
+    fn les_favoris_de_service_se_trient_sur_leur_instantane() {
+        let repo = repo_a_trier();
+        // Titre : tri naturel, casse ignoree, sans-titre en dernier.
+        assert_eq!(range(&repo, "title", "asc"), ["s2", "s1", "s3", "s4"]);
+        assert_eq!(range(&repo, "title", "desc"), ["s3", "s1", "s2", "s4"]);
+        // Artiste : « Éric » entre « aaron » et « Erik ».
+        assert_eq!(range(&repo, "artist", "asc"), ["s2", "s1", "s3", "s4"]);
+        // Album : la colonne existe ici, contrairement aux favoris locaux.
+        assert_eq!(range(&repo, "album", "asc"), ["s1", "s2", "s3", "s4"]);
+        // Ajout croissant = l'ordre dans lequel ils ont ete enregistres.
+        assert_eq!(range(&repo, "added", "asc"), ["s1", "s2", "s3", "s4"]);
     }
 
     #[test]

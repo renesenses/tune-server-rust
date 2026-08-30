@@ -144,28 +144,32 @@ pub fn select_host(backend: &str) -> cpal::Host {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
                     let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
-                    if device_count > 0 {
+                    let (active, fallback) = asio_outcome(Some(device_count));
+                    if fallback.is_none() {
                         info!(
                             backend = "asio",
                             devices = device_count,
                             "local_audio_host_selected"
                         );
-                        note_observed_backend("ASIO");
+                        note_observed_backend(active, fallback);
                         return host;
                     }
                     warn!(
+                        fallback_reason = LocalBackendFallback::AsioNoDevices.code(),
                         "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
                     );
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
                 Err(e) => {
+                    let (active, fallback) = asio_outcome(None);
                     warn!(
                         error = %e,
+                        fallback_reason = LocalBackendFallback::AsioHostUnavailable.code(),
                         "local_audio_asio_host_unavailable — check ASIO driver installation"
                     );
                     info!(backend = "wasapi", "local_audio_host_fallback");
-                    note_observed_backend("WASAPI");
+                    note_observed_backend(active, fallback);
                     return cpal::default_host();
                 }
             },
@@ -176,12 +180,12 @@ pub fn select_host(backend: &str) -> cpal::Host {
                 // (the canonical name; the older TUNE_AUDIO_BACKEND is still
                 // honoured as a fallback, but should not be recommended).
                 info!(backend = "wasapi", "local_audio_host_selected_auto");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
-                note_observed_backend("WASAPI");
+                note_observed_backend("WASAPI", None);
                 return cpal::default_host();
             }
         }
@@ -189,13 +193,21 @@ pub fn select_host(backend: &str) -> cpal::Host {
 
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
-        let _ = &backend_lower;
-        if backend_lower == "asio" {
+        // Le membre de la famille qui n'enregistrait RIEN. Un binaire Windows
+        // construit sans la feature `asio`, ou une bibliothèque migrée sur un
+        // serveur Linux/macOS avec `local_audio_backend=asio` déjà persisté,
+        // ouvrait le host par défaut sans laisser la moindre trace côté API :
+        // le sélecteur continuait d'afficher ASIO, la lecture sortait ailleurs,
+        // et le seul indice vivait dans une ligne WARN.
+        let (active, fallback) = unsupported_outcome(&backend_lower);
+        if let Some(reason) = fallback {
             warn!(
+                fallback_reason = reason.code(),
                 "local_audio_asio_requested_but_not_available — \
                  ASIO requires Windows and the `asio` cargo feature"
             );
         }
+        note_observed_backend(active, fallback);
         cpal::default_host()
     }
 }
@@ -209,19 +221,158 @@ pub fn select_host(backend: &str) -> cpal::Host {
 /// rien ne remontait cette bascule : l'interface continuait d'annoncer le
 /// backend *demandé*, si bien qu'un utilisateur ayant choisi ASIO se voyait
 /// confirmer « ASIO » alors que le son sortait en WASAPI (signalement Bilou).
-static OBSERVED_BACKEND: std::sync::RwLock<Option<&'static str>> = std::sync::RwLock::new(None);
+static OBSERVED_BACKEND: std::sync::RwLock<Option<ObservedBackend>> = std::sync::RwLock::new(None);
 
-/// Enregistre le backend réellement ouvert. Appelé par `select_host` seul.
+/// Ce que le dernier `select_host` a réellement ouvert, et pourquoi il n'a pas
+/// pu honorer la demande quand c'est le cas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedBackend {
+    name: &'static str,
+    fallback_reason: Option<LocalBackendFallback>,
+}
+
+/// Pourquoi la sortie locale ne tourne pas sur le backend demandé.
 ///
-/// Ses seuls appelants vivent dans la branche `windows + feature asio` de
-/// `select_host` : ailleurs, il n'y a aucun choix de backend à observer, donc
-/// aucun appel — d'où un `dead_code` sur toutes les autres cibles. On l'autorise
-/// explicitement plutôt que de placer la fonction sous le même `cfg`, pour
-/// qu'un futur appel depuis une autre plateforme n'ait pas à la ressusciter.
-#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
-fn note_observed_backend(name: &'static str) {
+/// #1395 — le nom du backend actif ne suffit pas. Bilou règle sa zone « Ce PC /
+/// Hauts Parleurs » sur ASIO, la lecture sort en WASAPI, et la seule trace du
+/// basculement est une ligne `local_audio_asio_no_devices` dans le journal : il
+/// a fallu qu'il poste une capture de ses logs sur le forum pour que quiconque
+/// sache pourquoi. Le motif existe côté serveur ; il n'était simplement remonté
+/// nulle part.
+///
+/// Les codes sont **stables** et destinés à la machine (le client les traduit),
+/// sur le modèle de `runtime_reasons` du chemin du signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalBackendFallback {
+    /// L'hôte ASIO s'ouvre mais n'expose **aucune** sortie. Cas de Bilou : un
+    /// pilote ASIO ne s'ouvre que dans un seul processus, donc une autre
+    /// application qui le tient le fait disparaître de l'énumération.
+    AsioNoDevices,
+    /// L'hôte ASIO ne s'ouvre pas du tout — pilote absent ou non enregistré.
+    AsioHostUnavailable,
+    /// ASIO a été demandé sur un binaire qui ne peut pas l'honorer : hors
+    /// Windows, ou Windows compilé sans la feature `asio`. Connu à la
+    /// compilation, donc affirmable sans avoir ouvert le moindre périphérique.
+    AsioUnsupportedBuild,
+}
+
+impl LocalBackendFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => "asio_no_devices",
+            Self::AsioHostUnavailable => "asio_host_unavailable",
+            Self::AsioUnsupportedBuild => "asio_unsupported_build",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
+    /// déjà ses `detail` en français (`runtime_signal_reason_detail`).
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::AsioNoDevices => {
+                "ASIO demandé : pilote présent mais aucune sortie exposée \
+                 (une autre application le tient peut-être) — repli WASAPI"
+            }
+            Self::AsioHostUnavailable => {
+                "ASIO demandé : pilote ASIO introuvable ou non ouvrable — repli WASAPI"
+            }
+            Self::AsioUnsupportedBuild => {
+                "ASIO demandé : cette version du serveur n'embarque pas ASIO — \
+                 sortie par le backend natif de la plateforme"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 3] = [
+        Self::AsioNoDevices,
+        Self::AsioHostUnavailable,
+        Self::AsioUnsupportedBuild,
+    ];
+}
+
+/// Ce que la sortie locale fait vraiment, à côté de ce qu'on lui a demandé.
+///
+/// Additif : `active` reprend exactement ce que rend [`active_backend_name`],
+/// les deux autres champs sont nouveaux. Un client qui ne les lit pas voit le
+/// même écran qu'avant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalBackendStatus {
+    /// Backend réellement ouvert : `"ASIO"`, `"WASAPI"`, `"CoreAudio"`, `"ALSA"`.
+    pub active: &'static str,
+    /// Ce que le réglage demandait, normalisé en minuscules (`"asio"`, `"auto"`…).
+    pub requested: String,
+    /// `true` dès que l'actif ne correspond pas au demandé.
+    pub fell_back: bool,
+    /// Pourquoi, quand le serveur le sait. `None` = aucun repli constaté.
+    pub fallback_reason: Option<LocalBackendFallback>,
+    /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
+    pub fallback_detail: Option<&'static str>,
+}
+
+/// Enregistre le backend réellement ouvert, et le motif du repli s'il y en a un.
+/// Appelé par `select_host` seul, sur **toutes** les cibles.
+fn note_observed_backend(name: &'static str, fallback_reason: Option<LocalBackendFallback>) {
     if let Ok(mut slot) = OBSERVED_BACKEND.write() {
-        *slot = Some(name);
+        *slot = Some(ObservedBackend {
+            name,
+            fallback_reason,
+        });
+    }
+}
+
+/// Issue d'une demande `asio` sur une cible qui embarque ASIO.
+///
+/// `asio_devices` : `None` = l'hôte ASIO ne s'ouvre pas ; `Some(0)` = il
+/// s'ouvre mais n'expose aucune sortie ; `Some(n > 0)` = ASIO joue.
+///
+/// Isolée de cpal exprès : la branche appelante vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et ne peut être
+/// exécutée ni sur macOS ni sur Linux. La décision, elle, se joue partout.
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+fn asio_outcome(asio_devices: Option<usize>) -> (&'static str, Option<LocalBackendFallback>) {
+    match asio_devices {
+        Some(n) if n > 0 => ("ASIO", None),
+        Some(_) => ("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+        None => ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable)),
+    }
+}
+
+/// Issue d'une demande sur une cible qui n'embarque **pas** ASIO.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn unsupported_outcome(requested_lower: &str) -> (&'static str, Option<LocalBackendFallback>) {
+    let active = platform_default_backend_name();
+    if requested_lower == "asio" {
+        (active, Some(LocalBackendFallback::AsioUnsupportedBuild))
+    } else {
+        (active, None)
+    }
+}
+
+/// Le backend qu'ouvre `cpal::default_host()` sur cette plateforme.
+///
+/// Sur Windows+ASIO, seul [`unsupported_outcome`] — lui-même inerte sur cette
+/// cible — s'en sert : d'où le `dead_code` autorisé plutôt qu'un `cfg` de plus.
+#[cfg_attr(all(target_os = "windows", feature = "asio"), allow(dead_code))]
+fn platform_default_backend_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "WASAPI"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "CoreAudio"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ALSA"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "default"
     }
 }
 
@@ -230,7 +381,24 @@ fn note_observed_backend(name: &'static str) {
 /// Ce qui a été *observé* prime sur ce qui a été *demandé* : c'est la seule
 /// réponse qui corresponde à ce que l'utilisateur entend réellement.
 pub fn active_backend_name(backend: &str) -> &'static str {
-    backend_display_name(OBSERVED_BACKEND.read().ok().and_then(|g| *g), backend)
+    backend_display_name(
+        OBSERVED_BACKEND
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .map(|o| o.name),
+        backend,
+    )
+}
+
+/// Ce que la sortie locale fait, ce qu'on lui a demandé, et l'écart s'il existe.
+///
+/// C'est la réponse à #1395 : `active_backend_name` disait déjà la vérité sur le
+/// backend, mais un utilisateur qui lit « WASAPI » alors qu'il a réglé « ASIO »
+/// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
+/// serveur a basculé — ni pourquoi.
+pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
+    backend_status(OBSERVED_BACKEND.read().ok().and_then(|g| *g), requested)
 }
 
 /// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
@@ -243,36 +411,144 @@ fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'stat
     {
         match backend.to_lowercase().as_str() {
             "asio" => "ASIO",
-            "wasapi" => "WASAPI",
-            "auto" => "WASAPI",
             _ => "WASAPI",
         }
     }
     #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
         let _ = backend;
-        #[cfg(target_os = "windows")]
-        {
-            "WASAPI"
-        }
-        #[cfg(target_os = "macos")]
-        {
-            "CoreAudio"
-        }
-        #[cfg(target_os = "linux")]
-        {
-            "ALSA"
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            "default"
-        }
+        platform_default_backend_name()
+    }
+}
+
+/// Même isolement pour le statut complet : aucune lecture de l'état global,
+/// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
+fn backend_status(observed: Option<ObservedBackend>, requested: &str) -> LocalBackendStatus {
+    let requested_lower = requested.to_lowercase();
+    let active = backend_display_name(observed.map(|o| o.name), requested);
+
+    let fallback_reason = match observed {
+        // Une OBSERVATION est autoritaire, y compris quand elle ne porte aucun
+        // motif : `select_host` a ouvert un périphérique et sait ce qu'il a
+        // ouvert. Retomber sur la déduction ici rajouterait un motif à un
+        // backend qui joue — la faute exactement inverse de celle qu'on
+        // corrige, et c'est ce test qui l'a attrapée.
+        Some(o) => o.fallback_reason,
+        // Sans observation, un seul motif est affirmable, parce qu'il est
+        // décidé à la COMPILATION : un binaire sans ASIO ne pourra jamais
+        // honorer « asio ». On n'en devine aucun autre.
+        None => (requested_lower == "asio" && !asio_available())
+            .then_some(LocalBackendFallback::AsioUnsupportedBuild),
+    };
+
+    // L'écart se voit sans motif : un réglage sur « asio » et un actif
+    // « WASAPI » suffisent à le dire, même quand la cause n'est pas connue
+    // (réglage changé, flux pas encore rouvert).
+    let fell_back = fallback_reason.is_some()
+        || !(requested_lower == "auto"
+            || requested_lower.is_empty()
+            || requested_lower.eq_ignore_ascii_case(active));
+
+    LocalBackendStatus {
+        active,
+        requested: requested_lower,
+        fell_back,
+        fallback_reason,
+        fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
     }
 }
 
 /// Returns `true` if this build includes ASIO support.
 pub fn asio_available() -> bool {
     cfg!(all(target_os = "windows", feature = "asio"))
+}
+
+/// Un choix de backend audio local, tel que le sélecteur de l'interface doit
+/// le proposer : la valeur à persister dans `local_audio_backend`, et un
+/// libellé technique (des noms propres — pas de traduction à faire côté
+/// client, hormis « Auto »).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BackendChoice {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// Les backends de sortie locale réellement sélectionnables sur CETTE machine.
+///
+/// #1268 ([Forum HiFi], Lapinou sous Debian puis Benjithom sous Fedora) : le
+/// sélecteur « Backend audio » du client web proposait Auto/WASAPI/ASIO — deux
+/// technologies Windows — parce que ces trois `<option>` étaient écrites en
+/// dur et que le serveur n'exposait nulle part la liste vraie. La voici,
+/// calculée à la compilation par plateforme, pour que l'interface n'ait plus
+/// rien à deviner.
+///
+/// `auto` est toujours présent et toujours premier : c'est le défaut, et c'est
+/// aussi le repli de [`select_host`] pour toute valeur inconnue — y compris
+/// une valeur Windows persistée avant qu'une bibliothèque ne migre vers une
+/// machine Linux.
+pub fn supported_backends() -> &'static [BackendChoice] {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+            BackendChoice {
+                value: "asio",
+                label: "ASIO (bit-perfect)",
+            },
+        ]
+    }
+    #[cfg(all(target_os = "windows", not(feature = "asio")))]
+    {
+        &[
+            BackendChoice {
+                value: "auto",
+                label: "Auto (WASAPI)",
+            },
+            BackendChoice {
+                value: "wasapi",
+                label: "WASAPI",
+            },
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (CoreAudio)",
+        }]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto (ALSA)",
+        }]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        &[BackendChoice {
+            value: "auto",
+            label: "Auto",
+        }]
+    }
+}
+
+/// Cette valeur de `local_audio_backend` correspond-elle à un backend
+/// sélectionnable sur cette machine ? Sert au repli d'affichage : une valeur
+/// Windows persistée sur un serveur Linux ne doit pas laisser le sélecteur
+/// sur un choix qui n'existe plus ([`select_host`] jouera de toute façon via
+/// le host par défaut de la plateforme).
+pub fn backend_value_is_supported(value: &str) -> bool {
+    supported_backends()
+        .iter()
+        .any(|b| b.value.eq_ignore_ascii_case(value))
 }
 
 /// List ASIO audio output devices specifically.
@@ -929,6 +1205,22 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
+    ///
+    /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
+    /// les DEUX voies stéréo, **en dernier** — après l'égaliseur, le convolveur
+    /// et le crossfeed, qui ont tous besoin de leur contexte stéréo pour
+    /// travailler. La duplication tombe donc juste avant l'adaptation au
+    /// périphérique, et le contrat du DAC (deux canaux) ne change pas.
+    ///
+    /// Défaut `false` : sans geste de l'utilisateur, le comportement est
+    /// strictement celui d'avant. Posé par piste par l'orchestrateur, comme
+    /// `pure_bypass` et `crossfeed`, et rafraîchissable en vol
+    /// (`refresh_zone_mono_downmix`).
+    ///
+    /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
+    /// signal » affiche l'étape « Mono » et le verdict tombe.
+    mono_downmix: Arc<AtomicBool>,
     /// True while the PCM currently flowing through this output is a **DoP**
     /// (DSD over PCM) payload, as detected on the bytes themselves by
     /// [`is_dop_pcm`].
@@ -1103,6 +1395,7 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            mono_downmix: Arc::new(AtomicBool::new(false)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -1260,6 +1553,23 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// Armer (ou désarmer) le repli mono de la zone qui joue sur cette sortie
+    /// (#2362). Posé par l'orchestrateur, exactement comme `set_pure_bypass`.
+    ///
+    /// Un simple `store` suffit et se fait aussi bien en début de piste qu'en
+    /// pleine lecture : contrairement au crossfeed ou à l'égaliseur, le repli
+    /// n'a AUCUN état à emporter — pas de ligne à retard, pas d'historique de
+    /// biquad. Il n'y a donc pas de `replace_..._live` séparé, et la bascule
+    /// ne peut pas claquer.
+    pub fn set_mono_downmix(&self, mono: bool) {
+        self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// Le repli mono est-il armé sur cette sortie ?
+    pub fn has_mono_downmix(&self) -> bool {
+        self.mono_downmix.load(Ordering::Relaxed)
     }
 
     /// Install (or clear with `None`) the headphone crossfeed processor for the
@@ -2266,6 +2576,7 @@ struct LocalPcmProcessor<'a> {
     convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -2313,6 +2624,7 @@ impl LocalPcmProcessor<'_> {
             self.convolver,
             self.crossfeed,
             self.pure_bypass,
+            self.mono_downmix,
             channels,
             dop,
         );
@@ -2425,6 +2737,7 @@ fn prepare_windows_exclusive_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -2441,6 +2754,7 @@ fn prepare_windows_exclusive_pcm(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
         channels,
         false,
     );
@@ -2476,6 +2790,7 @@ fn feed_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &RingBuf,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2494,6 +2809,7 @@ fn feed_windows_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?
     else {
         // The raw bytes remain staged until the first 24-bit probe reaches a
@@ -2555,6 +2871,7 @@ fn feed_windows_native_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: &NativePcmRing,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2575,6 +2892,7 @@ fn feed_windows_native_exclusive_leftover(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     )?;
 
     *must_classify_24_bit = false;
@@ -2605,6 +2923,7 @@ fn feed_selected_windows_exclusive_leftover(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     ring: WindowsExclusiveRingRef<'_>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
@@ -2623,6 +2942,7 @@ fn feed_selected_windows_exclusive_leftover(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             ring,
             stop_rx,
             paused,
@@ -2639,6 +2959,7 @@ fn feed_selected_windows_exclusive_leftover(
                 convolver,
                 crossfeed,
                 pure_bypass,
+                mono_downmix,
                 ring,
                 stop_rx,
                 paused,
@@ -2767,6 +3088,7 @@ fn flush_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
@@ -2791,6 +3113,13 @@ fn flush_local_dsp(
     {
         c.process_interleaved(&mut queue);
     }
+    // Même ordre que `apply_local_dsp` : sans ceci la queue du convolveur
+    // sortirait en stéréo pendant que le corps de la piste sort en mono, et
+    // l'auditeur à une seule enceinte entendrait la fin de chaque piste
+    // s'appauvrir (#2362).
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(&mut queue);
+    }
     queue
 }
 
@@ -2800,6 +3129,7 @@ fn apply_local_dsp(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     channels: u16,
     dop: bool,
 ) {
@@ -2824,6 +3154,14 @@ fn apply_local_dsp(
                 c.process_interleaved(samples);
             }
         }
+    }
+    // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
+    // besoin de leur contexte stéréo — le crossfeed travaille sur la
+    // DIFFÉRENCE des voies et n'aurait plus rien à traiter après la somme, le
+    // convolveur applique une IR par canal, l'égaliseur des gains par canal.
+    // La duplication tombe donc juste avant l'adaptation au périphérique.
+    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
+        crate::audio::channels::fold_stereo_to_mono_in_place(samples);
     }
 }
 
@@ -2946,11 +3284,17 @@ fn local_dsp_is_identity(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> bool {
     if pure_bypass.load(Ordering::Relaxed) {
         return true;
     }
-    eq.lock().is_ok_and(|guard| guard.is_none())
+    // Le repli mono compte comme les autres (#2362) : il RÉÉCRIT chaque
+    // échantillon. Sans lui ici, le producteur Windows prendrait la branche
+    // « octets source conservés » et le repli ne serait jamais appliqué — le
+    // réglage serait accepté et resterait sans effet.
+    !mono_downmix.load(Ordering::Relaxed)
+        && eq.lock().is_ok_and(|guard| guard.is_none())
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }
@@ -2961,6 +3305,7 @@ fn local_dsp_runtime_state(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
     dop: bool,
 ) -> OutputDspState {
     if dop {
@@ -2968,6 +3313,12 @@ fn local_dsp_runtime_state(
     }
     if pure_bypass.load(Ordering::Relaxed) {
         return OutputDspState::BypassedPure;
+    }
+    // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
+    // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
+    // chaque échantillon est réécrit (#2362, famille de #1548/#1559/#1627).
+    if mono_downmix.load(Ordering::Relaxed) {
+        return OutputDspState::Applied;
     }
     let (Ok(eq), Ok(convolver), Ok(crossfeed)) = (eq.lock(), convolver.lock(), crossfeed.lock())
     else {
@@ -2997,13 +3348,14 @@ fn windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let sample_transport = if native_transport {
         OutputSampleTransport::NativeInteger
     } else {
         OutputSampleTransport::Float
     };
-    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, dop);
+    let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, mono_downmix, dop);
     let volume = if dop {
         OutputVolumeState::BypassedDop
     } else if volume_units == 1000 {
@@ -3046,6 +3398,7 @@ fn publish_windows_signal_path_status(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> OutputSignalPathStatus {
     let mut status = windows_signal_path_status(
         native_transport,
@@ -3055,6 +3408,7 @@ fn publish_windows_signal_path_status(
         convolver,
         crossfeed,
         pure_bypass,
+        mono_downmix,
     );
     // Le verdict du producteur est autoritaire : il a choisi la branche raw
     // ou flottante pour CE buffer. La lecture des verrous ci-dessus décrit
@@ -3096,6 +3450,7 @@ fn prepare_windows_native_pcm(
     convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -3104,7 +3459,8 @@ fn prepare_windows_native_pcm(
 
     let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
     let bit_perfect = dop
-        || (volume_units == 1000 && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass));
+        || (volume_units == 1000
+            && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix));
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
@@ -3115,6 +3471,7 @@ fn prepare_windows_native_pcm(
             convolver,
             crossfeed,
             pure_bypass,
+            mono_downmix,
             channels,
             false,
         );
@@ -3342,6 +3699,7 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Les deux composantes du volume effectif, pour pouvoir le recalculer
@@ -3643,6 +4001,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     dec_ch,
                     false,
                 );
@@ -3651,7 +4010,14 @@ impl OutputTarget for LocalOutput {
                 // DSP, la queue du convolveur peut donc etre ajoutee ici — elle
                 // suivra la meme adaptation de canaux et le meme
                 // reechantillonnage que le reste (#2209).
-                let queue = flush_local_dsp(&convolver, &crossfeed, &pure_bypass, dec_ch, false);
+                let queue = flush_local_dsp(
+                    &convolver,
+                    &crossfeed,
+                    &pure_bypass,
+                    &mono_downmix,
+                    dec_ch,
+                    false,
+                );
                 samples.extend_from_slice(&queue);
 
                 // Adapt channels and resample if needed (using rubato
@@ -3876,6 +4242,7 @@ impl OutputTarget for LocalOutput {
                     convolver: &convolver,
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
+                    mono_downmix: &mono_downmix,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -3974,6 +4341,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -4135,6 +4503,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     selected_ring,
                     &stop_rx,
                     &paused,
@@ -4162,6 +4531,7 @@ impl OutputTarget for LocalOutput {
                             &convolver,
                             &crossfeed,
                             &pure_bypass,
+                            &mono_downmix,
                         );
                         bit_perfect_state = Some(runtime.bit_perfect);
                         info!(
@@ -4374,6 +4744,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         selected_ring,
                         &stop_rx,
                         &paused,
@@ -4401,6 +4772,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                             );
                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4483,6 +4855,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -4660,6 +5033,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 &ring,
                                 &stop_rx,
                                 &paused,
@@ -4689,6 +5063,7 @@ impl OutputTarget for LocalOutput {
                                     &convolver,
                                     &crossfeed,
                                     &pure_bypass,
+                                    &mono_downmix,
                                 );
                                 if bit_perfect_state != Some(runtime.bit_perfect) {
                                     bit_perfect_state = Some(runtime.bit_perfect);
@@ -4742,6 +5117,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                                 &ring,
                                                 &stop_rx,
                                                 &paused,
@@ -4774,6 +5150,7 @@ impl OutputTarget for LocalOutput {
                                                 &convolver,
                                                 &crossfeed,
                                                 &pure_bypass,
+                                                &mono_downmix,
                                             );
                                             if bit_perfect_state != Some(runtime.bit_perfect) {
                                                 bit_perfect_state = Some(runtime.bit_perfect);
@@ -4838,6 +5215,7 @@ impl OutputTarget for LocalOutput {
                                 &convolver,
                                 &crossfeed,
                                 &pure_bypass,
+                                &mono_downmix,
                                 channels,
                                 false,
                             );
@@ -5402,6 +5780,7 @@ impl OutputTarget for LocalOutput {
                 convolver: &convolver,
                 crossfeed: &crossfeed,
                 pure_bypass: &pure_bypass,
+                mono_downmix: &mono_downmix,
                 dop_active: &dop_active,
                 volume: &volume,
                 user_volume: &user_volume_ref,
@@ -5826,6 +6205,7 @@ impl OutputTarget for LocalOutput {
                         &convolver,
                         &crossfeed,
                         &pure_bypass,
+                        &mono_downmix,
                         prev_ch,
                         dop_active.load(Ordering::Relaxed),
                     );
@@ -6163,6 +6543,7 @@ impl OutputTarget for LocalOutput {
                     &convolver,
                     &crossfeed,
                     &pure_bypass,
+                    &mono_downmix,
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
@@ -7252,6 +7633,7 @@ mod tests {
             &sortie.convolver,
             &sortie.crossfeed,
             &sortie.pure_bypass,
+            &sortie.mono_downmix,
             2,
             false,
         );
@@ -7261,6 +7643,107 @@ mod tests {
             .expect("un EQ actif doit exposer ses compteurs");
         assert_eq!(metrics.eq_non_finite_samples, 1);
         assert_eq!(metrics.eq_overs, 0);
+    }
+
+    // ---- #2362 : sortie mono sur la chaîne locale ---------------------------
+
+    /// Fait traverser la chaîne DSP locale RÉELLE à un tampon, sans égaliseur,
+    /// sans convolveur, sans crossfeed : seul le repli mono peut donc en
+    /// changer le contenu.
+    fn chaine_locale_nue(mono: bool, pure: bool, dop: bool, pcm: &mut Vec<f32>) {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_mono_downmix(mono);
+        sortie.set_pure_bypass(pure);
+        apply_local_dsp(
+            pcm,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            2,
+            dop,
+        );
+    }
+
+    /// Armé, le repli somme réellement les deux voies DANS la chaîne locale.
+    ///
+    /// La deuxième trame est la mutation discriminante : elle ne porte du
+    /// signal QUE sur la voie droite. Un « mono » qui garderait la voie gauche
+    /// — le piège nommé au point 2 de #2362 — rendrait `0.0` et laisserait
+    /// Nicolas Tardif, dont l'unique enceinte est câblée à gauche, aussi sourd
+    /// qu'avant à tout ce qui est panné à droite.
+    #[test]
+    fn le_repli_mono_somme_les_deux_voies_dans_la_chaine_locale() {
+        let mut pcm = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        chaine_locale_nue(true, false, false, &mut pcm);
+        assert_eq!(pcm, vec![0.4, 0.4, 0.4, 0.4, 1.0, 1.0]);
+    }
+
+    /// CONTRE-ÉPREUVE — désarmé (le défaut), la chaîne est l'identité BIT À
+    /// BIT. C'est l'engagement de l'issue : « comportement actuel strictement
+    /// inchangé » tant que personne ne coche.
+    #[test]
+    fn sans_repli_la_chaine_locale_est_identite_bit_a_bit() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8, 1.0, 1.0];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(false, false, false, &mut pcm);
+        assert_eq!(
+            pcm.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            origine.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PURE court-circuite le repli comme il court-circuite l'égaliseur et le
+    /// crossfeed. `zone_mono_downmix` rend déjà `false` en PURE, mais la garde
+    /// de la chaîne doit tenir seule : c'est elle qui promet le bit-perfect.
+    #[test]
+    fn le_mode_pure_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, true, false, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// DoP n'est pas de l'audio : sommer ses voies détruirait le marqueur et le
+    /// DAC se TAIRAIT (famille de #1408). La garde existante doit couvrir le
+    /// repli comme elle couvre les trois autres traitements.
+    #[test]
+    fn le_dop_court_circuite_le_repli_mono() {
+        let origine = vec![0.5, 0.3, 0.0, 0.8];
+        let mut pcm = origine.clone();
+        chaine_locale_nue(true, false, true, &mut pcm);
+        assert_eq!(pcm, origine);
+    }
+
+    /// Le verdict d'exécution doit NOMMER le repli. Sans ceci, le producteur
+    /// entier de Windows prendrait la branche « octets source conservés » : le
+    /// réglage serait accepté, la case cochée, et le son inchangé.
+    #[test]
+    fn le_repli_mono_casse_l_identite_et_marque_le_dsp_comme_applique() {
+        let eq = std::sync::Mutex::new(None);
+        let convolver = std::sync::Mutex::new(None);
+        let crossfeed = std::sync::Mutex::new(None);
+        let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(true);
+
+        assert!(!local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Applied
+        );
+
+        // Témoin : le même état, repli désarmé, reste une identité inactive.
+        mono.store(false, Ordering::Relaxed);
+        assert!(local_dsp_is_identity(
+            &eq, &convolver, &crossfeed, &pure, &mono
+        ));
+        assert_eq!(
+            local_dsp_runtime_state(&eq, &convolver, &crossfeed, &pure, &mono, false),
+            OutputDspState::Inactive
+        );
     }
 
     fn stereo_sine_8k(frames: usize) -> Vec<f32> {
@@ -7300,11 +7783,27 @@ mod tests {
         // Une piste d'exactement un bloc, en stéréo.
         let piste: Vec<f32> = (0..bloc * 2).map(|i| (i as f32 + 1.0) / 16.0).collect();
         let mut tampon = piste.clone();
-        apply_local_dsp(&mut tampon, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut tampon,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Le buffer rendu est le silence d'amorçage : c'est la latence, et
         // c'est exactement ce que l'ancien code ne rendait jamais visible.
-        let queue = flush_local_dsp(&convolver, &crossfeed, &pure, 2, false);
+        let queue = flush_local_dsp(
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         let mut restitue = tampon.clone();
         restitue.extend_from_slice(&queue);
@@ -7370,14 +7869,32 @@ mod tests {
 
         // Première piste : un bloc bien reconnaissable, jamais drainé.
         let mut piste1 = vec![1.0f32; bloc * 2];
-        apply_local_dsp(&mut piste1, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste1,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
 
         // Frontière.
         reset_local_dsp(&convolver);
 
         // Seconde piste : du silence. Rien de la première ne doit en sortir.
         let mut piste2 = vec![0.0f32; bloc * 2];
-        apply_local_dsp(&mut piste2, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut piste2,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         for (i, v) in piste2.iter().enumerate() {
             assert!(
                 v.abs() < 1e-6,
@@ -7395,7 +7912,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         // On saute les 512 premières trames (établissement du filtre).
         let after = rms(&samples[1024..]);
 
@@ -7417,7 +7943,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7432,7 +7967,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert_eq!(samples, before);
     }
 
@@ -7464,7 +8008,16 @@ mod tests {
             })
             .collect();
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 1, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            1,
+            false,
+        );
         let after = rms(&samples[1024..]);
         assert!(20.0 * (after / before).log10() < -8.0);
     }
@@ -7507,6 +8060,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &AtomicBool::new(pure),
+            &AtomicBool::new(false),
         )
     }
 
@@ -7567,6 +8121,7 @@ mod tests {
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
             &std::sync::Mutex::new(None),
+            &AtomicBool::new(false),
             &AtomicBool::new(false),
         );
 
@@ -7957,7 +8512,17 @@ mod tests {
             let crossfeed = std::sync::Mutex::new(None);
             let pure = AtomicBool::new(false);
             let prepared = prepare_windows_native_pcm(
-                &source, bit_depth, 2, true, false, 1000, &eq, &convolver, &crossfeed, &pure,
+                &source,
+                bit_depth,
+                2,
+                true,
+                false,
+                1000,
+                &eq,
+                &convolver,
+                &crossfeed,
+                &pure,
+                &AtomicBool::new(false),
             )
             .expect("fenêtre PCM complète");
             assert!(prepared.bit_perfect);
@@ -7979,7 +8544,17 @@ mod tests {
         ));
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 250, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            250,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("DoP complet");
         assert!(prepared.dop);
@@ -8001,7 +8576,17 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
         let prepared = prepare_windows_native_pcm(
-            &source, 24, 2, true, false, 500, &eq, &convolver, &crossfeed, &pure,
+            &source,
+            24,
+            2,
+            true,
+            false,
+            500,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         )
         .expect("PCM complet");
         assert!(!prepared.dop);
@@ -8028,6 +8613,7 @@ mod tests {
             &convolver,
             &crossfeed,
             &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(pending, Ok(None)));
         assert_eq!(ring.available(), 0);
@@ -8035,7 +8621,15 @@ mod tests {
         // Once the byte window is conclusive, rejection happens at the last
         // preparation boundary — still before conversion, DSP and ring feed.
         let rejected = prepare_windows_exclusive_pcm(
-            &fixture, 24, 2, true, &eq, &convolver, &crossfeed, &pure,
+            &fixture,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
         );
         assert!(matches!(
             rejected,
@@ -8087,10 +8681,19 @@ mod tests {
         let crossfeed = std::sync::Mutex::new(None);
         let pure = AtomicBool::new(false);
 
-        let prepared =
-            prepare_windows_exclusive_pcm(&pcm, 24, 2, true, &eq, &convolver, &crossfeed, &pure)
-                .expect("PCM ordinaire accepté")
-                .expect("fenêtre de détection complète");
+        let prepared = prepare_windows_exclusive_pcm(
+            &pcm,
+            24,
+            2,
+            true,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+        )
+        .expect("PCM ordinaire accepté")
+        .expect("fenêtre de détection complète");
 
         let ring = RingBuf::new(prepared.len());
         assert_eq!(ring.push(&prepared), prepared.len());
@@ -8186,6 +8789,7 @@ mod tests {
         let baseline_convolver = std::sync::Mutex::new(None);
         let baseline_crossfeed = std::sync::Mutex::new(None);
         let baseline_pure = AtomicBool::new(false);
+        let baseline_mono = AtomicBool::new(false);
         let baseline_dop = AtomicBool::new(false);
         let baseline_volume = AtomicU32::new(500);
         let baseline_user = AtomicU32::new(500);
@@ -8195,6 +8799,7 @@ mod tests {
             convolver: &baseline_convolver,
             crossfeed: &baseline_crossfeed,
             pure_bypass: &baseline_pure,
+            mono_downmix: &baseline_mono,
             dop_active: &baseline_dop,
             volume: &baseline_volume,
             user_volume: &baseline_user,
@@ -8211,6 +8816,7 @@ mod tests {
         let split_convolver = std::sync::Mutex::new(None);
         let split_crossfeed = std::sync::Mutex::new(None);
         let split_pure = AtomicBool::new(false);
+        let split_mono = AtomicBool::new(false);
         let split_dop = AtomicBool::new(false);
         let split_volume = AtomicU32::new(500);
         let split_user = AtomicU32::new(500);
@@ -8220,6 +8826,7 @@ mod tests {
             convolver: &split_convolver,
             crossfeed: &split_crossfeed,
             pure_bypass: &split_pure,
+            mono_downmix: &split_mono,
             dop_active: &split_dop,
             volume: &split_volume,
             user_volume: &split_user,
@@ -8252,6 +8859,7 @@ mod tests {
             crate::audio::crossfeed::CrossfeedProcessor::new(176400, 0.3, 0.3),
         ));
         let pure = AtomicBool::new(false);
+        let mono = AtomicBool::new(false);
         let dop_active = AtomicBool::new(false);
         let volume = AtomicU32::new(400);
         let user = AtomicU32::new(500);
@@ -8261,6 +8869,7 @@ mod tests {
             convolver: &convolver,
             crossfeed: &crossfeed,
             pure_bypass: &pure,
+            mono_downmix: &mono,
             dop_active: &dop_active,
             volume: &volume,
             user_volume: &user,
@@ -8318,7 +8927,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(1024);
         let before = samples.clone();
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, true);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            true,
+        );
         assert_eq!(samples, before);
     }
 
@@ -8333,7 +8951,16 @@ mod tests {
 
         let mut samples = stereo_sine_8k(4096);
         let before = rms(&samples);
-        apply_local_dsp(&mut samples, &eq, &convolver, &crossfeed, &pure, 2, false);
+        apply_local_dsp(
+            &mut samples,
+            &eq,
+            &convolver,
+            &crossfeed,
+            &pure,
+            &AtomicBool::new(false),
+            2,
+            false,
+        );
         assert!(20.0 * (rms(&samples[1024..]) / before).log10() < -8.0);
     }
 
@@ -9044,6 +9671,366 @@ mod backend_display_tests {
             matches!(name, "ASIO" | "WASAPI" | "CoreAudio" | "ALSA" | "default"),
             "nom inattendu: {name}"
         );
+    }
+}
+
+/// #1395 — le motif du repli, pas seulement son résultat.
+///
+/// Toutes les fonctions éprouvées ici sont **pures** et compilées sur toutes les
+/// cibles : la branche ASIO de `select_host` vit sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]` et n'est exécutable ni
+/// sur macOS, ni sur Linux, ni en CI. Sortir la décision de cpal est ce qui rend
+/// la FAMILLE entière testable ailleurs que sur la machine du testeur.
+#[cfg(test)]
+mod backend_fallback_tests {
+    use super::{
+        LocalBackendFallback, ObservedBackend, asio_available, asio_outcome, backend_status,
+        platform_default_backend_name, unsupported_outcome,
+    };
+
+    fn observed(
+        name: &'static str,
+        reason: Option<LocalBackendFallback>,
+    ) -> Option<ObservedBackend> {
+        Some(ObservedBackend {
+            name,
+            fallback_reason: reason,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // La famille, membre par membre — jamais un seul représentant.
+    // ------------------------------------------------------------------
+
+    /// Contre-épreuve PERMANENTE (leçon #1864) : chaque motif déclaré doit être
+    /// réellement PRODUIT par l'une des deux fonctions de décision. Un motif
+    /// ajouté à l'énumération sans être câblé dans `select_host` fait tomber ce
+    /// test — c'est exactement le défaut où 15 prédicats sur 17 n'étaient
+    /// jamais construits pendant leur propre test.
+    #[test]
+    fn chaque_motif_declare_est_reellement_produit() {
+        let mut produits: Vec<LocalBackendFallback> = Vec::new();
+        // Toutes les issues possibles du sondage ASIO.
+        for probe in [None, Some(0usize), Some(1usize), Some(7usize)] {
+            if let (_, Some(reason)) = asio_outcome(probe) {
+                produits.push(reason);
+            }
+        }
+        // Toutes les demandes possibles sur une cible sans ASIO.
+        for requested in ["asio", "auto", "wasapi", "", "n'importe quoi"] {
+            if let (_, Some(reason)) = unsupported_outcome(requested) {
+                produits.push(reason);
+            }
+        }
+
+        for motif in LocalBackendFallback::ALL {
+            assert!(
+                produits.contains(&motif),
+                "le motif {motif:?} est déclaré mais AUCUN chemin de décision ne le construit — \
+                 il ne gardera jamais rien"
+            );
+        }
+    }
+
+    /// Les trois motifs doivent rester distincts, non vides, en `snake_case`,
+    /// et nommer ASIO : ce sont eux que le client reçoit et traduit.
+    #[test]
+    fn tous_les_motifs_ont_un_code_et_un_texte_utilisables() {
+        let mut codes: Vec<&str> = Vec::new();
+        for motif in LocalBackendFallback::ALL {
+            let code = motif.code();
+            assert!(!code.is_empty(), "{motif:?} : code vide");
+            assert!(
+                code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{motif:?} : code non snake_case ({code})"
+            );
+            assert!(
+                code.starts_with("asio_"),
+                "{motif:?} : le code doit nommer le backend demandé ({code})"
+            );
+            assert!(!codes.contains(&code), "code dupliqué : {code}");
+            codes.push(code);
+
+            let detail = motif.detail();
+            assert!(!detail.is_empty(), "{motif:?} : détail vide");
+            assert!(
+                detail.contains("ASIO"),
+                "{motif:?} : le détail ne dit pas ce qui a été demandé ({detail})"
+            );
+        }
+        assert_eq!(codes.len(), LocalBackendFallback::ALL.len());
+    }
+
+    /// Le contrat JSON, pour la famille entière : `serde` doit rendre
+    /// exactement `code()`. Un renommage de variante casserait le client sans
+    /// ce test.
+    #[test]
+    fn la_serialisation_json_suit_le_code_pour_chaque_motif() {
+        for motif in LocalBackendFallback::ALL {
+            let json = serde_json::to_string(&motif).expect("sérialisation");
+            assert_eq!(
+                json,
+                format!("\"{}\"", motif.code()),
+                "{motif:?} : la charge utile ne porte pas son code stable"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Les décisions, cas par cas.
+    // ------------------------------------------------------------------
+
+    /// LE cas Bilou (réponse forum 5217, 10/08, v0.9.65) : hôte ASIO ouvert,
+    /// zéro sortie exposée, repli WASAPI. Le journal le disait déjà
+    /// (`local_audio_asio_no_devices`) ; l'API se taisait.
+    #[test]
+    fn asio_ouvert_sans_peripherique_replie_en_nommant_la_cause() {
+        assert_eq!(
+            asio_outcome(Some(0)),
+            ("WASAPI", Some(LocalBackendFallback::AsioNoDevices))
+        );
+    }
+
+    /// L'autre membre : l'hôte ne s'ouvre pas du tout. Motif DIFFÉRENT — c'est
+    /// tout l'intérêt, Bertrand avait dû demander deux fois à Bilou laquelle
+    /// des deux lignes il voyait.
+    #[test]
+    fn hote_asio_inouvrable_donne_un_motif_distinct() {
+        assert_eq!(
+            asio_outcome(None),
+            ("WASAPI", Some(LocalBackendFallback::AsioHostUnavailable))
+        );
+        assert_ne!(
+            LocalBackendFallback::AsioHostUnavailable.code(),
+            LocalBackendFallback::AsioNoDevices.code()
+        );
+    }
+
+    /// Et le cas qui marche : aucun repli, aucun motif. On n'annonce pas une
+    /// panne quand il n'y en a pas.
+    #[test]
+    fn asio_qui_joue_ne_declare_aucun_repli() {
+        assert_eq!(asio_outcome(Some(1)), ("ASIO", None));
+        assert_eq!(asio_outcome(Some(9)), ("ASIO", None));
+    }
+
+    /// Le membre qui n'enregistrait RIEN avant ce correctif : un binaire sans
+    /// ASIO. Il ne pouvait pas honorer la demande, et ne le disait nulle part.
+    #[test]
+    fn binaire_sans_asio_nomme_la_cause() {
+        assert_eq!(
+            unsupported_outcome("asio"),
+            (
+                platform_default_backend_name(),
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            )
+        );
+    }
+
+    /// Contre-épreuve : sur la même cible, une demande qui n'est PAS ASIO ne
+    /// doit produire aucun motif. Plusieurs membres mutés, pas un seul.
+    #[test]
+    fn binaire_sans_asio_ne_crie_pas_sur_les_autres_demandes() {
+        for requested in ["auto", "wasapi", "", "valeur inconnue"] {
+            assert_eq!(
+                unsupported_outcome(requested),
+                (platform_default_backend_name(), None),
+                "demande « {requested} » : motif inventé"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L'arbitrage complet.
+    // ------------------------------------------------------------------
+
+    /// Le statut rendu à l'API dit les trois choses : ce qui tourne, ce qui
+    /// était demandé, et pourquoi ça diffère.
+    #[test]
+    fn le_statut_porte_lactif_le_demande_et_la_cause() {
+        let s = backend_status(
+            observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            "ASIO",
+        );
+        assert_eq!(s.active, "WASAPI");
+        assert_eq!(s.requested, "asio");
+        assert!(s.fell_back);
+        assert_eq!(s.fallback_reason, Some(LocalBackendFallback::AsioNoDevices));
+        assert_eq!(
+            s.fallback_detail,
+            Some(LocalBackendFallback::AsioNoDevices.detail())
+        );
+    }
+
+    /// Contre-épreuve : ASIO qui joue vraiment ne doit produire ni repli ni
+    /// motif. Le garde-fou doit savoir se taire.
+    #[test]
+    fn asio_honore_ne_declare_ni_repli_ni_motif() {
+        let s = backend_status(observed("ASIO", None), "asio");
+        assert_eq!(s.active, "ASIO");
+        assert!(!s.fell_back, "repli annoncé alors qu'ASIO joue");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.fallback_detail, None);
+    }
+
+    /// Contre-épreuve, sur plusieurs membres : les demandes honorées par le
+    /// backend natif de la plateforme ne déclarent rien non plus.
+    #[test]
+    fn les_demandes_honorees_ne_declarent_rien() {
+        let natif = platform_default_backend_name();
+        let natif_minuscules = natif.to_lowercase();
+        for requested in ["auto", "", natif, natif_minuscules.as_str()] {
+            let s = backend_status(observed(natif, None), requested);
+            assert!(
+                !s.fell_back,
+                "demande « {requested} » sur {natif} : repli annoncé à tort"
+            );
+            assert_eq!(s.fallback_reason, None);
+        }
+    }
+
+    /// Sans aucune observation, un seul motif est affirmable — celui qui se
+    /// décide à la COMPILATION. Sur une cible sans ASIO il doit sortir ; sur
+    /// une cible avec ASIO il ne doit surtout pas être inventé.
+    #[test]
+    fn sans_observation_seul_le_motif_de_compilation_est_affirme() {
+        let s = backend_status(None, "asio");
+        if asio_available() {
+            assert_eq!(
+                s.fallback_reason, None,
+                "motif inventé sur une cible qui embarque ASIO"
+            );
+        } else {
+            assert_eq!(
+                s.fallback_reason,
+                Some(LocalBackendFallback::AsioUnsupportedBuild)
+            );
+            assert!(s.fell_back);
+        }
+    }
+
+    /// Une observation contredit toujours la déduction de compilation : si un
+    /// jour ASIO s'ouvre, plus aucun motif ne doit traîner.
+    #[test]
+    fn lobservation_prime_sur_la_deduction() {
+        let s = backend_status(observed("ASIO", None), "asio");
+        assert_eq!(s.fallback_reason, None);
+        assert_eq!(s.active, "ASIO");
+    }
+
+    /// Le VERROU de branchement, pour la seule branche que PERSONNE ne peut
+    /// compiler ici.
+    ///
+    /// La branche `#[cfg(all(target_os = "windows", feature = "asio"))]` de
+    /// `select_host` ne se compile qu'avec le SDK Steinberg et Visual Studio :
+    /// ni ce Mac, ni la machine de compilation Linux ne peuvent la toucher —
+    /// seul le job `windows-latest` de la CI y arrive. Les tests ci-dessus
+    /// éprouvent donc la DÉCISION (`asio_outcome`), pas son BRANCHEMENT. Sans
+    /// ce garde, on pourrait supprimer un `note_observed_backend` dans cette
+    /// branche et tout resterait vert sur trois plateformes sur quatre.
+    ///
+    /// Même procédé que `contrat_des_retours_anticipes` côté serveur : on lit
+    /// la source, faute de pouvoir l'exécuter.
+    #[test]
+    fn chaque_sortie_de_select_host_enregistre_le_backend_ouvert() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
+            .expect("local.rs doit être lisible depuis la racine du crate");
+        let debut = src
+            .find("pub fn select_host(")
+            .expect("select_host introuvable");
+        let fin = src[debut..]
+            .find("static OBSERVED_BACKEND")
+            .map(|i| debut + i)
+            .expect("le corps de select_host doit précéder OBSERVED_BACKEND");
+        let corps = &src[debut..fin];
+
+        // Une sortie = un host rendu. Chacune doit avoir dit LEQUEL avant de
+        // le rendre, sinon l'API annonce de nouveau le backend demandé.
+        let sorties =
+            corps.matches("cpal::default_host()").count() + corps.matches("return host;").count();
+        let enregistrements = corps.matches("note_observed_backend(").count();
+        assert_eq!(
+            enregistrements, sorties,
+            "select_host rend {sorties} host(s) mais n'enregistre que {enregistrements} backend(s) : \
+             un chemin repart sans dire ce qu'il a ouvert (c'est exactement le défaut de #1395)"
+        );
+
+        // Et la décision doit rester celle qu'on éprouve plus haut, pas une
+        // règle réécrite en ligne dans la branche non compilable.
+        for attendu in [
+            "asio_outcome(Some(device_count))",
+            "asio_outcome(None)",
+            "unsupported_outcome(&backend_lower)",
+        ] {
+            assert!(
+                corps.contains(attendu),
+                "select_host ne passe plus par « {attendu} » — la décision testée n'est plus celle jouée"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod backends_supportes_tests {
+    use super::{backend_value_is_supported, supported_backends};
+
+    // #1268 — le cas Lapinou/Benjithom : sur Debian et Fedora, le sélecteur
+    // proposait WASAPI et ASIO. La liste que le serveur publie ne doit JAMAIS
+    // contenir un backend d'une autre plateforme.
+    #[test]
+    fn aucun_backend_windows_hors_windows() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let interdits = ["wasapi", "asio"];
+            for b in supported_backends() {
+                assert!(
+                    !interdits.contains(&b.value),
+                    "backend Windows « {} » proposé sur une plateforme non-Windows",
+                    b.value
+                );
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                supported_backends().iter().any(|b| b.value == "wasapi"),
+                "WASAPI doit rester proposé sous Windows"
+            );
+        }
+    }
+
+    // `auto` est le défaut ET le repli de select_host : toujours présent,
+    // toujours premier, sur toutes les plateformes.
+    #[test]
+    fn auto_toujours_present_et_premier() {
+        let backends = supported_backends();
+        assert!(!backends.is_empty());
+        assert_eq!(backends[0].value, "auto");
+        assert!(backend_value_is_supported("auto"));
+        assert!(backend_value_is_supported("AUTO"), "casse indifférente");
+    }
+
+    // ASIO n'apparaît que si le binaire sait réellement l'ouvrir — même
+    // vérité que `asio_available()`, qui voyage déjà dans la même réponse.
+    #[test]
+    fn asio_propose_ssi_disponible() {
+        assert_eq!(
+            supported_backends().iter().any(|b| b.value == "asio"),
+            super::asio_available()
+        );
+    }
+
+    // Le repli d'affichage : une valeur Windows persistée sur un serveur
+    // Linux/macOS est déclarée non supportée, pour que /system/config la
+    // ramène à `auto` au lieu de la resservir au sélecteur.
+    #[test]
+    fn une_valeur_d_une_autre_plateforme_est_declaree_non_supportee() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!backend_value_is_supported("wasapi"));
+            assert!(!backend_value_is_supported("asio"));
+        }
+        assert!(!backend_value_is_supported("n_importe_quoi"));
     }
 }
 

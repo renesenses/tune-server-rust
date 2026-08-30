@@ -53,6 +53,14 @@ mod tests {
         oublie_le_media_une_fois: Arc<Mutex<bool>>,
         /// Nombre de `Play` REFUSÉS avec un 701.
         play_refus_701: Arc<AtomicU32>,
+        /// Quand c'est `Some`, `SetVolume` est REFUSÉ avec ce code UPnP.
+        ///
+        /// C'est la panne d'Eric (#1393, fil forum) : un renderer Diretta et un
+        /// PC vu comme zone DLNA n'appliquaient pas le volume. Un renderer
+        /// logiciel sans RenderingControl complet répond `602 Optional Action
+        /// Not Implemented` — statut HTTP 500 AVEC corps, la forme qu'un vrai
+        /// appareil rend et que `soap_action` restitue telle quelle.
+        volume_refus_upnp: Arc<Mutex<Option<(u16, &'static str)>>>,
     }
 
     impl Default for MockState {
@@ -77,6 +85,7 @@ mod tests {
                 stop_oublie_le_media: Arc::new(Mutex::new(false)),
                 oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
                 play_refus_701: Arc::new(AtomicU32::new(0)),
+                volume_refus_upnp: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -114,6 +123,17 @@ mod tests {
     /// rendue comme un vrai renderer la rend : statut HTTP 500 AVEC corps.
     fn soap_701() -> String {
         r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>Transition not available</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+    }
+
+    /// Une faute SOAP UPnP quelconque, à la forme exacte de `soap_701()`.
+    ///
+    /// Sert le refus de `SetVolume` (#1393) : `602 Optional Action Not
+    /// Implemented` est ce que rend un renderer logiciel dont le
+    /// RenderingControl est décoratif — le « PC vu comme zone DLNA » d'Eric.
+    fn soap_fault_upnp(code: u16, description: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode><errorDescription>{description}</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
+        )
     }
 
     async fn av_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
@@ -236,23 +256,37 @@ mod tests {
         }
     }
 
-    async fn rc_handler(State(state): State<MockState>, body: String) -> String {
+    async fn rc_handler(State(state): State<MockState>, body: String) -> axum::response::Response {
+        use axum::response::IntoResponse;
         let action = extract_action(&body);
         match action.as_str() {
             "SetVolume" => {
+                // Compté AVANT le refus : la commande a bien été émise, c'est
+                // la réponse qui dit non. Sans ce compteur, un test vert ne
+                // distinguerait pas « refusé par l'appareil » de « jamais
+                // envoyé ».
                 state.volume_count.fetch_add(1, Ordering::Relaxed);
-                soap_ok("SetVolume", "")
+                if let Some((code, description)) = *state.volume_refus_upnp.lock().await {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        soap_fault_upnp(code, description),
+                    )
+                        .into_response();
+                }
+                soap_ok("SetVolume", "").into_response()
             }
-            "GetVolume" => soap_ok("GetVolume", "<CurrentVolume>50</CurrentVolume>"),
-            "SetMute" => soap_ok("SetMute", ""),
+            "GetVolume" => {
+                soap_ok("GetVolume", "<CurrentVolume>50</CurrentVolume>").into_response()
+            }
+            "SetMute" => soap_ok("SetMute", "").into_response(),
             // Répond « coupé » exprès : si `get_status` interrogeait encore le
             // renderer, le statut rendu porterait `muted = true` et les tests
             // de #2263 le verraient.
             "GetMute" => {
                 state.get_mute_count.fetch_add(1, Ordering::Relaxed);
-                soap_ok("GetMute", "<CurrentMute>1</CurrentMute>")
+                soap_ok("GetMute", "<CurrentMute>1</CurrentMute>").into_response()
             }
-            _ => soap_ok(&action, ""),
+            _ => soap_ok(&action, "").into_response(),
         }
     }
 
@@ -413,6 +447,115 @@ mod tests {
         );
     }
 
+    /// Un WAV servi à un renderer qui a appris le DIDL réduit — ALAC 24/192 +
+    /// « Forcer le WAV », la configuration d'Yves (forum #1437).
+    fn media_wav(url: &str, sample_rate: u32, bit_depth: u32) -> PlayMedia<'_> {
+        PlayMedia {
+            url,
+            mime_type: "audio/wav",
+            title: Some("Piste transcodée en WAV"),
+            duration_ms: Some(300_000),
+            file_size: Some(345_600_044),
+            sample_rate: Some(sample_rate),
+            bit_depth: Some(bit_depth),
+            channels: Some(2),
+            ..Default::default()
+        }
+    }
+
+    /// #1137 et #1458 ne valaient QUE pour le DIDL complet.
+    ///
+    /// Le DIDL réduit ne transmettait ni profondeur ni fréquence, donc
+    /// `dlna_flags_for_mime_bd_sr(mime, None, None)` retombait sur
+    /// `PN=LPCM` — le profil 16 bits / 48 kHz — pour un WAV 24 bits ou hi-res.
+    /// Un renderer strict rabat alors le flux sur le profil annoncé, lit des
+    /// échantillons désalignés et joue du SILENCE. Et comme le niveau réduit
+    /// est APPRIS par appareil (#2394), le défaut valait pour toutes les pistes
+    /// suivantes, pas seulement la première.
+    #[tokio::test]
+    async fn le_didl_minimal_ne_ment_plus_sur_le_profil_lpcm() {
+        // 16 bits mais 192 kHz : hors profil par la FRÉQUENCE (#1458) — c'est
+        // exactement ce que produit « Forcer le WAV 16 bits » sur un ALAC
+        // 24/192 sans plafond de fréquence.
+        let hires = media_wav("http://192.168.1.18:8888/stream/alac-192.wav", 192_000, 16);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&hires, "1", "audio/wav");
+        assert!(
+            !didl.contains("DLNA.ORG_PN=LPCM"),
+            "192 kHz n'est pas du profil LPCM : {didl}"
+        );
+
+        // 24 bits à 48 kHz : hors profil par la PROFONDEUR (#1137).
+        let vingt_quatre = media_wav("http://192.168.1.18:8888/stream/wav24.wav", 48_000, 24);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&vingt_quatre, "1", "audio/wav");
+        assert!(
+            !didl.contains("DLNA.ORG_PN=LPCM"),
+            "24 bits n'est pas du profil LPCM : {didl}"
+        );
+
+        // Le protocolInfo reste là — sans lui, le DMP-A8 accepte l'URI et ne
+        // vient jamais chercher le flux.
+        assert!(
+            didl.contains("DLNA.ORG_OP=01"),
+            "protocolInfo perdu : {didl}"
+        );
+    }
+
+    /// TÉMOIN de la parade : dans le profil, le `PN` reste annoncé. Les
+    /// renderers laxistes qui exigent un `PN` pour accepter le flux ne sont pas
+    /// touchés — sans ce cas, « ne jamais annoncer LPCM » passerait aussi.
+    #[tokio::test]
+    async fn le_didl_minimal_garde_le_profil_lpcm_quand_il_est_vrai() {
+        for sr in [44_100_u32, 48_000] {
+            let media = media_wav("http://192.168.1.18:8888/stream/cd.wav", sr, 16);
+            let didl = DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", "audio/wav");
+            assert!(
+                didl.contains("DLNA.ORG_PN=LPCM"),
+                "{sr} Hz / 16 bits reste du LPCM : {didl}"
+            );
+        }
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE de l'injection de panne.
+    ///
+    /// Les deux tests ci-dessus ne prouvent quelque chose que si le calcul du
+    /// profil dépend VRAIMENT des valeurs transmises. Ce cas fige l'état
+    /// d'avant : sans profondeur ni fréquence, la fonction de profil annonce
+    /// `PN=LPCM` — donc retirer le branchement de `didl_metadata_minimale`
+    /// FAIT échouer `le_didl_minimal_ne_ment_plus_sur_le_profil_lpcm`, il ne le
+    /// rend pas vacuement vert.
+    #[test]
+    fn sans_les_valeurs_le_profil_lpcm_serait_annonce_quand_meme() {
+        let sans_rien = crate::outputs::didl::dlna_flags_for_mime_bd_sr("audio/wav", None, None);
+        assert!(
+            sans_rien.contains("DLNA.ORG_PN=LPCM"),
+            "l'état d'avant doit rester reproductible, sinon la parade ne prouve rien : {sans_rien}"
+        );
+    }
+
+    /// Le profil se corrige SANS grossir l'enveloppe : le DIDL réduit existe
+    /// pour tenir sous un segment TCP, il ne doit gagner aucun attribut
+    /// `sampleFrequency` / `bitsPerSample` / `nrAudioChannels` au passage.
+    #[tokio::test]
+    async fn le_didl_minimal_n_ecrit_aucun_attribut_audio() {
+        let media = media_wav("http://192.168.1.18:8888/stream/alac-192.wav", 192_000, 16);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", "audio/wav");
+        for attribut in ["sampleFrequency", "bitsPerSample", "nrAudioChannels"] {
+            assert!(
+                !didl.contains(attribut),
+                "le DIDL réduit ne doit pas porter {attribut} : {didl}"
+            );
+        }
+        let complet = DlnaOutput::didl_metadata_pour_test(&media, "1", "audio/wav");
+        assert!(
+            complet.contains("sampleFrequency"),
+            "le DIDL complet, lui, garde ses attributs : {complet}"
+        );
+        assert!(
+            didl.len() < complet.len(),
+            "le réduit doit rester plus court que le complet"
+        );
+    }
+
     /// Le zombie Eversolo : Stop ACQUITTÉ mais IGNORÉ tant qu'un Pause n'est
     /// pas passé. La prise de contrôle doit escalader Pause→Stop au lieu de
     /// marteler des Stop sourds pendant 2 s.
@@ -563,6 +706,79 @@ mod tests {
 
         output.set_volume(0.75).await.unwrap();
         assert_eq!(state.volume_count.load(Ordering::Relaxed), 1);
+        handle.abort();
+    }
+
+    /// #1393 — un `SetVolume` REFUSÉ par le renderer doit remonter en erreur.
+    ///
+    /// Eric (fil forum, Windows 0.9.61) : « le volume ne fait rien » vers un
+    /// renderer Diretta et vers un PC vu comme zone DLNA. Trois couches se
+    /// mettaient d'accord sur un changement qui n'avait pas eu lieu — la sortie
+    /// lisait la faute UPnP, écrivait un WARN, et rendait `Ok(())` ; le curseur
+    /// bougeait, la valeur tenait en base, et le son ne changeait pas.
+    ///
+    /// Corrigé par #1417. Rien ne l'empêchait de revenir : les tests de
+    /// l'orchestrateur couvrent le contrat AU-DESSUS (un backend qui refuse ne
+    /// modifie ni mémoire ni base — `un_backend_qui_refuse_ne_modifie_ni_
+    /// memoire_ni_base`), et `dlna_set_volume` ne couvre que le succès. Ramener
+    /// ce `Ok(())` les laisserait TOUS verts, et Eric n'entendrait toujours
+    /// rien.
+    ///
+    /// Les deux moitiés sont dans le même test, et c'est délibéré : la seconde
+    /// est la contre-épreuve permanente de la première. Sans elle, un mock
+    /// devenu injoignable, un port fermé, un `set_volume` qui échouerait pour
+    /// n'importe quelle autre raison rendraient le premier `unwrap_err()` vert
+    /// sans rien prouver.
+    #[tokio::test]
+    async fn un_volume_refuse_par_le_renderer_remonte_en_erreur() {
+        // 1) Le renderer refuse : 602 « Optional Action Not Implemented »,
+        //    statut HTTP 500 AVEC corps — ce que rend un RenderingControl
+        //    décoratif.
+        let refus = MockState::default();
+        *refus.volume_refus_upnp.lock().await = Some((602, "Optional Action Not Implemented"));
+        let (base, handle) = start_mock(refus.clone()).await;
+        let output = make_dlna(&base);
+
+        let erreur = output
+            .set_volume(0.75)
+            .await
+            .expect_err("un renderer qui répond UPnPError ne doit JAMAIS donner Ok(())");
+
+        // La commande a bien été ÉMISE : l'échec vient de la réponse, pas d'un
+        // abandon en amont.
+        assert_eq!(
+            refus.volume_count.load(Ordering::Relaxed),
+            1,
+            "le SetVolume doit partir avant d'être refusé"
+        );
+        // Le message est celui que l'auditeur lit, pas une trace de transport :
+        // il nomme l'appareil et dit quoi faire.
+        assert!(
+            erreur.contains("Mock Renderer"),
+            "le message doit nommer l'appareil : {erreur}"
+        );
+        assert!(
+            erreur.contains("sur l'appareil"),
+            "le message doit dire où régler le volume : {erreur}"
+        );
+        assert!(
+            !erreur.contains("soap send") && !erreur.contains("soap read"),
+            "un refus n'est pas une panne de transport : {erreur}"
+        );
+        handle.abort();
+
+        // 2) CONTRE-ÉPREUVE. Même harnais, même appel, refus retiré : le
+        //    résultat doit être `Ok`. C'est ce qui prouve que la moitié
+        //    ci-dessus échoue à cause du refus injecté, et de rien d'autre.
+        let temoin = MockState::default();
+        let (base, handle) = start_mock(temoin.clone()).await;
+        let output = make_dlna(&base);
+
+        output
+            .set_volume(0.75)
+            .await
+            .expect("sans refus injecté, le même appel doit réussir");
+        assert_eq!(temoin.volume_count.load(Ordering::Relaxed), 1);
         handle.abort();
     }
 

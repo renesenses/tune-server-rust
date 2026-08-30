@@ -11,6 +11,24 @@ use crate::state::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Evenements re-cadences PAR CLIENT avant expedition.
+///
+/// Deuxieme filet, derriere celui de l'emetteur : un client lent ne doit pas se
+/// faire distancer par un flot d'avancement au point de perdre, par `Lagged`,
+/// les evenements qui comptent (fin de scan, changement de zone). Ne sont
+/// cadences que des evenements IDEMPOTENTS — en perdre un est sans consequence,
+/// le suivant porte l'etat complet.
+///
+/// `device.updated` en fait partie depuis #2870 : le mDNS re-resout un appareil
+/// a chaque rafraichissement de bail, et parfois a chaque changement d'etat de
+/// l'enceinte. Le client ne fait qu'y recharger sa liste d'appareils.
+const EVENEMENTS_CADENCES: &[&str] = &[
+    "library.scan.progress",
+    "library.enrich.progress",
+    "library.artwork.progress",
+    "device.updated",
+];
+
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(ws_handler))
 }
@@ -84,9 +102,9 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
+    let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
-    let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+    let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let devices = state.scanner.devices().await;
@@ -128,6 +146,10 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
                 tune_core::playback::PlayState::Stopped => "stopped",
             },
             "volume": ps.volume,
+            // #1274 — le WebSocket est la surface que le client relit en
+            // continu ; le priver du dB obligerait a un GET REST pour un
+            // nombre qu'on tient deja. `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(ps.volume),
             "muted": ps.muted,
             "shuffle": ps.shuffle,
             "repeat": ps.repeat,
@@ -136,6 +158,13 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             "queue_length": ps.queue_length,
             "now_playing": ps.now_playing,
             "signal_path": signal_path,
+            // #1395 — l'instantané WebSocket est ce que le client rend au
+            // premier affichage ; sans ce champ, la divergence « réglé ASIO /
+            // joué en WASAPI » n'apparaîtrait qu'après un GET /zones.
+            "audio_backend_status": crate::routes::zones::local_backend_status_value(
+                z.output_type.as_deref(),
+                &audio_backend_pref,
+            ),
             "output_capabilities": output_capabilities,
             "resolving": ps.resolving,
         }));
@@ -161,7 +190,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut patterns: Vec<String> = vec!["*".to_string()];
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.tick().await;
-    let mut last_scan_progress = std::time::Instant::now() - Duration::from_secs(10);
+    let mut cadences: std::collections::HashMap<&'static str, tune_core::cadence::Cadence> =
+        EVENEMENTS_CADENCES
+            .iter()
+            .map(|nom| (*nom, tune_core::cadence::Cadence::avancement()))
+            .collect();
 
     // Snapshot-on-connect: hand the client the full current state up front so
     // it has the truth immediately, instead of a blank UI until the next event
@@ -216,13 +249,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !patterns.iter().any(|p| matches_pattern(&ev.event_type, p)) {
                             continue;
                         }
-                        // Throttle scan progress events to max 1 per 2s per client
-                        if ev.event_type == "library.scan.progress" {
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_scan_progress) < Duration::from_secs(2) {
-                                continue;
-                            }
-                            last_scan_progress = now;
+                        // Throttle idempotent progress/refresh events to max 1
+                        // per 2s per client (see EVENEMENTS_CADENCES).
+                        if let Some(cadence) = cadences.get_mut(ev.event_type.as_str())
+                            && !cadence.autorise()
+                        {
+                            continue;
                         }
                         let ws_event = serde_json::json!({
                             "type": ev.event_type,
@@ -306,5 +338,65 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_cadence {
+    use super::*;
+
+    /// Le re-cadencement par client ne doit toucher QUE des evenements
+    /// idempotents : en perdre un ne perd aucune information, le suivant porte
+    /// l'etat complet. Un `library.scan.completed` cadence, lui, ferait
+    /// disparaitre la banniere de fin de scan.
+    #[test]
+    fn seuls_des_evenements_idempotents_sont_cadences() {
+        for nom in EVENEMENTS_CADENCES {
+            assert!(
+                nom.ends_with(".progress") || *nom == "device.updated",
+                "{nom} n'est pas un evenement d'avancement : le cadencer \
+                 ferait PERDRE de l'information au client"
+            );
+        }
+        for interdit in [
+            "library.scan.completed",
+            "library.enrich.completed",
+            "library.artwork.completed",
+            "device.discovered",
+            "device.lost",
+            "zone.updated",
+        ] {
+            assert!(
+                !EVENEMENTS_CADENCES.contains(&interdit),
+                "{interdit} ne doit JAMAIS etre cadence"
+            );
+        }
+    }
+
+    /// Les quatre noms cadences existent bien dans `EventType` : une faute de
+    /// frappe ici serait invisible (le filtre ne s'appliquerait a rien).
+    #[test]
+    fn chaque_nom_cadence_est_un_evenement_declare() {
+        for nom in EVENEMENTS_CADENCES {
+            assert!(
+                tune_core::event_types::EventType::TOUTES
+                    .iter()
+                    .any(|e| e.as_str() == *nom),
+                "« {nom} » ne correspond a aucune variante d'EventType"
+            );
+        }
+    }
+
+    /// Le filtre laisse passer la premiere annonce, retient la deuxieme dans la
+    /// foulee, et laisse repasser apres l'intervalle. C'est exactement la regle
+    /// que `library.scan.progress` appliquait deja a la main.
+    #[test]
+    fn le_filtre_espace_sans_tout_bloquer() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let mut c = tune_core::cadence::Cadence::avancement();
+        assert!(c.autorise_a(t0));
+        assert!(!c.autorise_a(t0 + Duration::from_millis(500)));
+        assert!(c.autorise_a(t0 + Duration::from_secs(3)));
     }
 }

@@ -357,19 +357,58 @@ pub type SharedSessions = Arc<Mutex<HashMap<String, Arc<StreamSession>>>>;
 // qui n'en a besoin que pour ça — ce registre étroit fait le lien, par
 // `stream_id`, la seule clé que les deux connaissent déjà. Il est délibérément
 // minuscule : une entrée par flux radio en cours.
-static RADIO_NOW: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Option<String>, String)>>> =
+//
+// ── Pourquoi la POCHETTE voyage ici aussi ──
+//
+// Le registre ne portait que l'artiste et le titre. La pochette du bloc ICY
+// était lue sur `StreamSession::cover_url` — un champ posé à `None` par
+// `StreamSession::new` et écrit NULLE PART ailleurs du dépôt, exactement comme
+// `track_title` et `track_artist` l'étaient avant #2161. `StreamUrl='…'` n'a
+// donc jamais quitté ce serveur : `build_icy_metadata` ne l'ajoute que sur un
+// `Some`, et l'argument était toujours `None`.
+//
+// Le poller, lui, connaît la pochette du morceau courant : il la calcule par
+// `vignette_du_pas_radio` et la pose dans le now-playing — c'est pour ça que
+// l'interface Tune la voit changer pendant que l'écran du renderer reste sur
+// la première (Serge Asselin, Hifi Rose RS250A, fil 1529). Elle emprunte donc
+// le même canal étroit que le titre, par le même `stream_id`.
+static RADIO_NOW: std::sync::LazyLock<std::sync::Mutex<HashMap<String, RadioNow>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Le morceau qui passe à l'antenne sur un flux radio, tel que le poller le
+/// connaît et tel que le bloc ICY doit le rendre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioNow {
+    pub artist: Option<String>,
+    pub title: String,
+    /// La pochette du morceau courant quand la station la donne, le logo de la
+    /// station sinon — c'est déjà l'arbitrage rendu par `vignette_du_pas_radio`
+    /// côté poller, et on ne le refait pas ici.
+    pub cover: Option<String>,
+}
 
 /// Publier le titre courant d'un flux radio. Appelé par le poller quand il
 /// détecte un changement de morceau.
-pub fn publish_radio_now(stream_id: &str, artist: Option<String>, title: String) {
+pub fn publish_radio_now(
+    stream_id: &str,
+    artist: Option<String>,
+    title: String,
+    cover: Option<String>,
+) {
     if let Ok(mut map) = RADIO_NOW.lock() {
-        map.insert(stream_id.to_string(), (artist, title));
+        map.insert(
+            stream_id.to_string(),
+            RadioNow {
+                artist,
+                title,
+                cover,
+            },
+        );
     }
 }
 
 /// Lire le titre courant d'un flux radio, s'il a été publié.
-pub fn radio_now(stream_id: &str) -> Option<(Option<String>, String)> {
+pub fn radio_now(stream_id: &str) -> Option<RadioNow> {
     RADIO_NOW.lock().ok()?.get(stream_id).cloned()
 }
 
@@ -1024,17 +1063,63 @@ mod tests {
         // Rien de publie : le flux se rabat sur le bloc de la connexion.
         assert!(radio_now(sid).is_none());
 
-        publish_radio_now(sid, Some("Pink Floyd".into()), "Time".into());
-        let (a1, t1) = radio_now(sid).expect("titre publie");
-        let bloc1 = build_icy_metadata(a1.as_deref(), Some(&t1), None);
+        publish_radio_now(sid, Some("Pink Floyd".into()), "Time".into(), None);
+        let n1 = radio_now(sid).expect("titre publie");
+        let bloc1 = build_icy_metadata(n1.artist.as_deref(), Some(&n1.title), n1.cover.as_deref());
 
         // Le morceau suivant passe a l'antenne.
-        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into());
-        let (a2, t2) = radio_now(sid).expect("titre publie");
-        let bloc2 = build_icy_metadata(a2.as_deref(), Some(&t2), None);
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into(), None);
+        let n2 = radio_now(sid).expect("titre publie");
+        let bloc2 = build_icy_metadata(n2.artist.as_deref(), Some(&n2.title), n2.cover.as_deref());
 
         assert_ne!(bloc1, bloc2, "le bloc ICY doit suivre le morceau courant");
         assert!(String::from_utf8_lossy(&bloc2).contains("Miles Davis - So What"));
+
+        forget_radio_now(sid);
+    }
+
+    /// La POCHETTE doit suivre le morceau, pas rester sur la premiere.
+    ///
+    /// Elle etait lue sur `StreamSession::cover_url`, capture une fois a la
+    /// connexion — un champ qui vaut TOUJOURS `None` : `StreamUrl='…'` ne
+    /// partait donc jamais, et l'ecran du renderer gardait la premiere image
+    /// (Serge Asselin, Hifi Rose RS250A, fil 1529 — #2161).
+    #[test]
+    fn radio_now_carries_the_cover_and_it_changes_with_the_track() {
+        let sid = "test-flux-radio-pochette";
+        forget_radio_now(sid);
+
+        publish_radio_now(
+            sid,
+            Some("Pink Floyd".into()),
+            "Time".into(),
+            Some("https://img.radioparadise.com/covers/l/time.jpg".into()),
+        );
+        let n1 = radio_now(sid).expect("titre publie");
+        let bloc1 = build_icy_metadata(n1.artist.as_deref(), Some(&n1.title), n1.cover.as_deref());
+        let txt1 = String::from_utf8_lossy(&bloc1).to_string();
+        assert!(
+            txt1.contains("StreamUrl='https://img.radioparadise.com/covers/l/time.jpg'"),
+            "la pochette publiee doit voyager dans le bloc ICY, or : {txt1}"
+        );
+
+        publish_radio_now(
+            sid,
+            Some("Miles Davis".into()),
+            "So What".into(),
+            Some("https://img.radioparadise.com/covers/l/sowhat.jpg".into()),
+        );
+        let n2 = radio_now(sid).expect("titre publie");
+        let bloc2 = build_icy_metadata(n2.artist.as_deref(), Some(&n2.title), n2.cover.as_deref());
+        let txt2 = String::from_utf8_lossy(&bloc2).to_string();
+        assert!(
+            txt2.contains("StreamUrl='https://img.radioparadise.com/covers/l/sowhat.jpg'"),
+            "la pochette doit suivre le morceau suivant, or : {txt2}"
+        );
+        assert!(
+            !txt2.contains("time.jpg"),
+            "la pochette du morceau precedent ne doit plus figurer, or : {txt2}"
+        );
 
         forget_radio_now(sid);
     }
@@ -1044,7 +1129,7 @@ mod tests {
     #[test]
     fn forgetting_a_stream_clears_its_entry() {
         let sid = "test-flux-radio-2";
-        publish_radio_now(sid, None, "Un titre".into());
+        publish_radio_now(sid, None, "Un titre".into(), None);
         assert!(radio_now(sid).is_some());
         forget_radio_now(sid);
         assert!(radio_now(sid).is_none());

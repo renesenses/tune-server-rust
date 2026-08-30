@@ -518,6 +518,16 @@ pub async fn analyze_embedding_batch(
             yielded_to_playback = true;
             break;
         }
+        // Un scan peut démarrer en plein lot — c'est précisément le cas de
+        // Thierry : le balayage tourne, 21 h arrive, le scan programmé part.
+        // Sans cette sortie, le lot en cours continuerait à décoder et à
+        // inférer pendant tout le début du scan (#2469, point 3).
+        if crate::scanner::activite::scan_bibliotheque_en_cours() {
+            info!(
+                "audio_embed_yield_to_library_scan — library scan started, pausing sweep mid-batch"
+            );
+            break;
+        }
         let (track_id, path) = match embedding_candidate(r) {
             EmbeddingCandidate::Ready { track_id, path } => (track_id, path),
             EmbeddingCandidate::MissingPath { track_id } => {
@@ -800,6 +810,12 @@ pub enum PauseAcoustique {
     Aucune,
     /// Une zone joue : l'analyse s'efface devant la lecture (#1515).
     Lecture,
+    /// Une mise à jour de bibliothèque tourne : l'analyse s'efface devant elle
+    /// (#2469, point 3). Thierry Clemont demandait que le scan programmé soit
+    /// « prioritaire sur le scan CLAP » — les deux passes lisent le même disque,
+    /// et l'analyse fait tourner ONNX sur plusieurs fils. Les laisser courir
+    /// ensemble allonge le scan sans rien accélérer.
+    ScanBibliotheque,
     /// Garde thermique (#1576).
     Thermique,
     /// Mémoire disponible sous le seuil.
@@ -815,6 +831,7 @@ impl PauseAcoustique {
         match self {
             PauseAcoustique::Aucune => None,
             PauseAcoustique::Lecture => Some("playback"),
+            PauseAcoustique::ScanBibliotheque => Some("library_scan"),
             PauseAcoustique::Thermique => Some("thermal"),
             PauseAcoustique::Memoire => Some("low_memory"),
             PauseAcoustique::NonPremium => Some("not_premium"),
@@ -831,6 +848,7 @@ fn poser_pause(raison: PauseAcoustique) {
         PauseAcoustique::Thermique => 2,
         PauseAcoustique::Memoire => 3,
         PauseAcoustique::NonPremium => 4,
+        PauseAcoustique::ScanBibliotheque => 5,
     };
     PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
@@ -852,7 +870,12 @@ fn pause_libere_session(pause: PauseAcoustique) -> bool {
         PauseAcoustique::Lecture
         | PauseAcoustique::Thermique
         | PauseAcoustique::Memoire
-        | PauseAcoustique::NonPremium => true,
+        | PauseAcoustique::NonPremium
+        // Un scan complet de grosse bibliothèque dure des dizaines de minutes :
+        // c'est la deuxième pause la plus longue après la lecture, et garder
+        // 1,2 Go de modèle CLAP résidents pendant qu'on veut justement libérer
+        // la machine pour le scan serait exactement à contresens.
+        | PauseAcoustique::ScanBibliotheque => true,
     }
 }
 
@@ -892,6 +915,7 @@ pub fn pause_acoustique() -> PauseAcoustique {
         2 => PauseAcoustique::Thermique,
         3 => PauseAcoustique::Memoire,
         4 => PauseAcoustique::NonPremium,
+        5 => PauseAcoustique::ScanBibliotheque,
         _ => PauseAcoustique::Aucune,
     }
 }
@@ -1114,6 +1138,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Latch for the playback hold, same style as `low_memory`: one line on
         // the way in, one on the way out, silence in between.
         let mut playback_hold = false;
+        // Vrai tant que la passe est en retrait devant un scan. N'existe que
+        // pour ne journaliser l'entrée et la sortie de retrait qu'UNE fois, et
+        // non toutes les 30 s pendant une heure de scan — même rôle que
+        // `playback_hold`.
+        let mut scan_hold = false;
         // Le modèle est-il là ? Verrou de boucle, pour ne pas relire 287 Mo à
         // chaque tour (voir le bloc de téléchargement plus bas). Et l'instant
         // du dernier essai infructueux, pour espacer les tentatives réseau.
@@ -1247,6 +1276,38 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     ))
                     .await;
                     continue;
+                }
+
+                // Priorité à la mise à jour de bibliothèque (#2469, point 3).
+                // Thierry Clemont (Tades) demandait que le scan programmé parte
+                // « dans les mêmes conditions que le scan CLAP mais de manière
+                // prioritaire sur le scan CLAP ». La condition de lecture
+                // existait des deux côtés ; la priorité entre les deux passes,
+                // non — elles se disputaient le disque et le CPU, et le scan de
+                // 21 h durait d'autant plus longtemps.
+                //
+                // La garde est posée APRÈS celle de lecture, et cet ordre
+                // compte : la lecture prime sur tout, y compris sur le scan.
+                // Elle relit le drapeau à chaque tour, donc l'analyse repart
+                // d'elle-même à la fin du scan, sans que le scan ait à la
+                // réveiller.
+                if crate::scanner::activite::scan_bibliotheque_en_cours() {
+                    if !scan_hold {
+                        scan_hold = true;
+                        info!(
+                            "audio_embed_yield_to_library_scan — library scan running, acoustic analysis paused until it finishes"
+                        );
+                    }
+                    entrer_en_pause(&mut embedder, PauseAcoustique::ScanBibliotheque);
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+                if scan_hold {
+                    scan_hold = false;
+                    info!("audio_embed_resumed_library_scan_finished");
                 }
                 if playback_hold {
                     playback_hold = false;
@@ -1517,6 +1578,7 @@ mod tests {
             PauseAcoustique::Thermique,
             PauseAcoustique::Memoire,
             PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
         ] {
             assert!(
                 pause_libere_session(raison),
@@ -1543,6 +1605,7 @@ mod tests {
             PauseAcoustique::Thermique,
             PauseAcoustique::Memoire,
             PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
         ] {
             let mut session = Some(());
             entrer_en_pause(&mut session, raison);
@@ -1556,6 +1619,51 @@ mod tests {
                 "{raison:?} doit rester visible dans l'interface"
             );
         }
+        poser_pause(PauseAcoustique::Aucune);
+    }
+
+    /// #2469, point 3 — le retrait devant un scan doit être NOMMÉ. Sans nom
+    /// stable, l'interface afficherait « analyse en pause » sans dire pourquoi,
+    /// et l'utilisateur croirait à un blocage exactement comme dans #2203.
+    #[test]
+    fn le_retrait_devant_un_scan_porte_un_nom_stable() {
+        assert_eq!(
+            PauseAcoustique::ScanBibliotheque.nom(),
+            Some("library_scan"),
+            "le nom part à l'API : le changer casse le client"
+        );
+    }
+
+    /// Le code stocké dans l'atomique doit revenir tel quel. Une collision avec
+    /// un code existant rendrait un retrait indiscernable d'un autre.
+    #[test]
+    fn chaque_pause_a_son_propre_code() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        let toutes = [
+            PauseAcoustique::Aucune,
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
+        ];
+        for raison in toutes {
+            poser_pause(raison);
+            assert_eq!(
+                pause_acoustique(),
+                raison,
+                "{raison:?} doit se relire à l'identique"
+            );
+        }
+        let mut noms: Vec<_> = toutes.iter().filter_map(|p| p.nom()).collect();
+        noms.sort_unstable();
+        let avant = noms.len();
+        noms.dedup();
+        assert_eq!(
+            avant,
+            noms.len(),
+            "deux pauses ne peuvent pas porter le même nom"
+        );
         poser_pause(PauseAcoustique::Aucune);
     }
 
