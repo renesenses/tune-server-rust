@@ -352,9 +352,7 @@ pub(super) async fn browse_directory(
             let file_path = cols.get(9).and_then(|v| v.as_string());
             let is_direct = file_path
                 .as_ref()
-                .map(|fp| {
-                    est_enfant_direct(fp, &repertoire_nfc)
-                })
+                .map(|fp| est_enfant_direct(fp, &repertoire_nfc))
                 .unwrap_or(false);
             if !is_direct {
                 return None;
@@ -528,8 +526,14 @@ mod browse_path_tests {
         let nfd: String = "/musique/Chostakovitch dirigé/".nfd().collect();
         let nfc: String = "/musique/Chostakovitch dirigé".nfc().collect();
         let attendu = format!("{nfc}{}%", std::path::MAIN_SEPARATOR);
-        assert_eq!(tune_core::db::track_repo::folder_like_pattern(&nfd), attendu);
-        assert_eq!(tune_core::db::track_repo::folder_like_pattern(&nfc), attendu);
+        assert_eq!(
+            tune_core::db::track_repo::folder_like_pattern(&nfd),
+            attendu
+        );
+        assert_eq!(
+            tune_core::db::track_repo::folder_like_pattern(&nfc),
+            attendu
+        );
     }
 
     #[test]
