@@ -64,10 +64,27 @@ jobs:
           accessible() { gh api "repos/renesenses/$1" --jq '.name' >/dev/null 2>&1; }
           prive()      { case " $PRIVES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
+          # Le CONTRAT du runbook, écrit ici pour être opposable. Vérifier la
+          # seule PRÉSENCE d'une règle `required_status_checks` ne dit rien :
+          # une règle présente avec les mauvais contextes rend vert, et c'est
+          # exactement ainsi qu'un check requis a pu manquer sans être vu.
+          contextes_exiges() {
+            case "$1/$2" in
+              tune-server-rust/main)
+                printf '%s\n' "release-gate" "Test (PostgreSQL)" "Issues déclarées corrigées" ;;
+              tune-server-rust/rc)
+                printf '%s\n' "Test" "Clippy" "Format" "Impact et garde-fous légers" \
+                              "Issues déclarées corrigées" "Security Audit" "FFI mobile (compilation)" ;;
+              tune-web-client/*)
+                printf '%s\n' "npm test" "Issues déclarées corrigées" ;;
+            esac
+          }
+
           echo "=== 1. Règles effectives des branches (dépôts PUBLICS) ==="
-          # `rules/branches/<branche>` rend les règles EFFECTIVES et se lit
-          # avec un simple droit de lecture — contrairement à
-          # `branches/<b>/protection`, qui exige l'administration et rend 403.
+          # `rules/branches/<branche>` rend les règles EFFECTIVES **avec leurs
+          # paramètres**, et se lit avec un simple droit de lecture —
+          # contrairement à `branches/<b>/protection`, qui exige
+          # l'administration et rend 403.
           # ⚠️ Il n'expose PAS les acteurs de contournement : une règle
           # présente ne dit pas qu'elle s'applique aux administrateurs.
           for d in $PUBLICS; do
@@ -77,6 +94,7 @@ jobs:
               continue
             fi
             for br in main "rc/v$VERSION"; do
+              case "$br" in main) classe=main ;; *) classe=rc ;; esac
               enc=$(printf '%s' "$br" | sed 's#/#%2F#g')
               if ! r=$(gh api "repos/renesenses/$d/rules/branches/$enc" 2>/dev/null); then
                 ko "$br : lecture des règles IMPOSSIBLE"
@@ -87,13 +105,42 @@ jobs:
                 continue
               fi
               dire "$br : $(echo "$r" | jq -r '[.[].type] | unique | join(", ")')"
-              for exig in deletion non_fast_forward required_status_checks; do
+              for exig in deletion non_fast_forward pull_request required_status_checks; do
                 if echo "$r" | jq -e --arg t "$exig" 'any(.[]; .type == $t)' >/dev/null; then
                   ok "$br : $exig"
                 else
                   ko "$br : $exig MANQUANTE"
                 fi
               done
+
+              # -- contenu de `pull_request` : méthode de fusion et fils résolus
+              p=$(echo "$r" | jq -c '[.[] | select(.type=="pull_request").parameters][0] // empty')
+              if [ -n "$p" ]; then
+                m=$(echo "$p" | jq -r '(.allowed_merge_methods // ["<absent>"]) | sort | join(",")')
+                if [ "$m" = "merge" ]; then
+                  ok "$br : fusion limitée au commit de fusion"
+                else
+                  ko "$br : méthodes de fusion autorisées = $m — le workflow exige le seul commit de fusion"
+                fi
+                [ "$(echo "$p" | jq -r '.required_review_thread_resolution')" = "true" ] \
+                  && ok "$br : conversations résolues exigées" \
+                  || ko "$br : conversations NON exigées comme résolues"
+              fi
+
+              # -- contenu de `required_status_checks` : les contextes du runbook
+              c=$(echo "$r" | jq -r '[.[] | select(.type=="required_status_checks")
+                                       | .parameters.required_status_checks[].context] | .[]' 2>/dev/null)
+              manquants=0
+              while IFS= read -r attendu; do
+                [ -z "$attendu" ] && continue
+                if printf '%s\n' "$c" | grep -Fxq "$attendu"; then
+                  ok "$br : contexte requis « $attendu »"
+                else
+                  ko "$br : contexte requis « $attendu » MANQUANT"
+                  manquants=$((manquants + 1))
+                fi
+              done < <(contextes_exiges "$d" "$classe")
+              [ "$manquants" -eq 0 ] && dire "$br : $(printf '%s\n' "$c" | grep -c .) contexte(s) requis au total"
             done
           done
           na "Les acteurs de contournement ne sont pas lisibles ici : une règle listée n'est pas une règle opposable aux administrateurs."
