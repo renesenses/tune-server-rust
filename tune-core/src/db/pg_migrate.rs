@@ -162,6 +162,10 @@ const MIGRATION_TABLES: &[&str] = &[
     // de doublons emporterait au scan suivant ce que l'utilisateur avait
     // explicitement protégé.
     "album_distinct_pairs",
+    // Appareils ignorés (#1280). Sans cette ligne, tous les appareils que
+    // l'utilisateur a fait taire réapparaîtraient à la bascule
+    // SQLite → PostgreSQL.
+    "ignored_devices",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -547,6 +551,18 @@ CREATE TABLE IF NOT EXISTS album_distinct_pairs (
     b_artist TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+
+-- Appareils ignorés (#1280). Tout en TEXT — comme la migration 044, qui
+-- déclare exactement les mêmes colonnes : rien à rattraper après la copie,
+-- contrairement à `hidden_items` et `favorite_facets`.
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;

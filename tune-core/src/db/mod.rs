@@ -12,6 +12,8 @@ pub mod favorites_reconcile;
 /// Albums masqués (#1391) — marqueurs réconciliés, sur le modèle des favoris.
 pub mod hidden_repo;
 pub mod history_repo;
+/// Appareils ignorés (#1280) — faire taire un appareil, pas ses zones.
+pub mod ignored_device_repo;
 pub mod metadata_proposal_repo;
 pub mod metadata_report_repo;
 pub mod migration_status;

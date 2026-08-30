@@ -1542,6 +1542,52 @@ CREATE TABLE IF NOT EXISTS album_distinct_pairs (
 CREATE INDEX IF NOT EXISTS idx_album_distinct_pairs_b ON album_distinct_pairs(album_b_id);
 ",
     },
+    Migration {
+        version: 92,
+        name: "ignored_devices",
+        // « Ignorer cet appareil » (#1280, Alex Campbell puis Patatorz) : faire
+        // taire un APPAREIL, pas chasser ses zones une par une.
+        //
+        // Pourquoi une table et pas le masquage de zone déjà en place
+        // (`zones.is_hidden` + `hidden_zones_by_host`, #1281) : celui-ci ne
+        // porte que ce qui a DÉJÀ une zone, et seulement pour les zones
+        // réseau. Il laisse l'appareil s'enregistrer comme SORTIE (la
+        // découverte enregistre avant d'atteindre le garde-fou de zone), donc
+        // proposé partout ; et un appareil dont la zone n'a jamais été créée
+        // (`zone_auto_create` à false — le contournement donné au testeur, TV
+        // filtrée, AirPlay 2 sans démon) n'a aucune ligne à masquer.
+        //
+        // Patron `hidden_items` (89, #1391) : table SANS clé étrangère,
+        // instantané d'identité figé à l'insertion. Le marqueur ne dépend
+        // d'aucune ligne `zones` — la purge des zones masquées ne l'emporte
+        // pas — et survit à la bascule SQLite → PostgreSQL.
+        //
+        // AUCUNE troisième notion d'identité : `mac` est celle de #2803
+        // (AirPlay/RAOP, déjà persistée sur `zones.mac`), `host` + `name` est
+        // exactement le couple de `hidden_zones_by_host`. Le NOM est exigé
+        // avec l'hôte pour ne pas bloquer un appareil différent héritant de
+        // l'adresse par le DHCP (leçon du ré-ancrage #1651).
+        //
+        // PAS DE COLONNE `id` : `device_id` EST la clé primaire — même choix
+        // que `favorite_facets` (85), `task_runs` (88) et `hidden_items` (89),
+        // pour éviter la divergence AUTOINCREMENT / BIGSERIAL de la bascule
+        // SQLite → PostgreSQL (#1706). Tout est TEXT : rien à rattraper côté
+        // PG, contrairement à 038 et 041.
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3053,6 +3099,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "album_distinct_pairs",
         include_str!("../../migrations/postgres/043_album_distinct_pairs.sql"),
     ),
+    // Appareils ignorés (#1280). Jumelle de la migration SQLite 92 — les deux
+    // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à tout
+    // le parc PostgreSQL (.15, .18, Docker) et « ignorer cet appareil » y
+    // rendrait une erreur SQL.
+    (
+        44,
+        "ignored_devices",
+        include_str!("../../migrations/postgres/044_ignored_devices.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4505,7 +4560,12 @@ mod tests {
         // qui n'exécute pas `-p tune-core`. On la remonte donc de 40 à 42 d'un
         // coup, en constatant les DEUX ajouts.
         // 43 : `album_distinct_pairs` (#1276), jumelle de la SQLite 91.
-        assert_eq!(pg_latest_version(), 43, "latest PG migration must be 43");
+        // 44 : `ignored_devices` (#1280), jumelle de la SQLite 92. Les numéros
+        // 42 puis 43 ont été pris tour à tour par le semis de radios (#2119)
+        // et par `album_distinct_pairs` (#1276), tous deux fusionnés pendant
+        // que cette branche passait ses portes — d'où le renumérotage, fait
+        // AVANT qu'aucune base ne voie l'ancien numéro.
+        assert_eq!(pg_latest_version(), 44, "latest PG migration must be 44");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

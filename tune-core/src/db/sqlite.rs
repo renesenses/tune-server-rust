@@ -633,6 +633,20 @@ CREATE TABLE IF NOT EXISTS album_distinct_pairs (
     PRIMARY KEY (profile_id, album_a_id, album_b_id)
 );
 CREATE INDEX IF NOT EXISTS idx_album_distinct_pairs_b ON album_distinct_pairs(album_b_id);
+
+-- Appareils ignorés (#1280) — miroir de la migration SQLite 92, présent AUSSI
+-- ici pour que la découverte tourne sur une base née de `init_schema` seul
+-- (tests de repo). Voir la migration 92 pour la doctrine complète.
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 ";
 
 #[cfg(test)]
