@@ -211,10 +211,27 @@ async fn pg_zones_round_trip() {
         .unwrap();
     let z = repo.get(id).unwrap().unwrap();
     assert_eq!(z.name, "Living Room");
-    assert_eq!(z.volume, 50);
+    assert_eq!(z.volume, 50.0);
 
-    repo.update_volume(id, 75).unwrap();
-    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75);
+    repo.update_volume(id, 75.0).unwrap();
+    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75.0);
+    // #2886 — la colonne est a virgule des DEUX cotes. Sur PG c'est la
+    // migration 048 qui le garantit : sans elle, ecrire un f64 dans une
+    // colonne `integer` echoue purement et simplement.
+    repo.update_volume(id, 0.398_107_170_553_497_2 * 100.0)
+        .unwrap();
+    let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+    assert!(
+        (relu - 0.398_107_170_553_497_2).abs() < 1e-12,
+        "-8 dB persiste puis relu a {relu}"
+    );
+    repo.update_volume(id, 10f64.powf(-48.0 / 20.0) * 100.0)
+        .unwrap();
+    assert!(
+        repo.get(id).unwrap().unwrap().volume > 0.0,
+        "-48 dB : la zone se rallumerait MUETTE sur PostgreSQL"
+    );
+    repo.update_volume(id, 75.0).unwrap();
 
     // The WAL fallback `query_many_strong` doesn't change behavior on
     // PG (same pool either way) — confirm list() works.
@@ -349,7 +366,8 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         // 011 (listen_history)
         ("listen_history", "duration_ms", &["bigint"]),
         // 013 (the rest)
-        ("zones", "volume", &["integer"]),
+        // #2886 — a virgule : l'entier coupait le son sous -46,02 dB.
+        ("zones", "volume", &["double precision"]),
         ("zones", "last_position_ms", &["bigint"]),
         ("queue_items", "position", &["integer"]),
         ("track_source_links", "confidence", &["double precision"]),

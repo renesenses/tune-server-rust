@@ -765,7 +765,7 @@ async fn handle_ssdp_discovered(
         seen_hosts.insert(dev.host.clone());
         set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
-            let vol = zone.volume as f64 / 100.0;
+            let vol = zone.volume / 100.0;
             playback.set_volume(zone_id, vol).await;
             // Backfill the host on zones created before host-based dedup existed,
             // so a later UUID change (Denon restart) can reconnect by host (#942).
@@ -796,7 +796,7 @@ async fn handle_ssdp_discovered(
             .get(existing_zone_id)
             .ok()
             .flatten()
-            .map(|z| z.volume as f64 / 100.0);
+            .map(|z| z.volume / 100.0);
         if let Some(vol) = vol {
             playback.set_volume(existing_zone_id, vol).await;
         }
@@ -1374,7 +1374,7 @@ pub fn spawn_mdns_handler(
                         } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
-                                let vol = zone.volume as f64 / 100.0;
+                                let vol = zone.volume / 100.0;
                                 playback.set_volume(zone_id, vol).await;
                             }
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
@@ -1975,7 +1975,7 @@ pub fn spawn_output_providers(
                     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev_id) {
                         set_zone_online(&event_bus, &db, &dev_id, true);
                         if let Some(zone_id) = zone.id {
-                            let vol = zone.volume as f64 / 100.0;
+                            let vol = zone.volume / 100.0;
                             playback.set_volume(zone_id, vol).await;
                         }
                         info!(name = %name, id = %dev_id, "provider_zone_reconnected");
@@ -2157,7 +2157,7 @@ mod tests {
             name: name.to_string(),
             output_type: Some(output_type.to_string()),
             output_device_id: Some(device_id.to_string()),
-            volume: 50,
+            volume: 50.0,
             muted: false,
             online: true,
             gapless_enabled: true,

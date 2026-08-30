@@ -2917,7 +2917,7 @@ async fn do_transfer(
     // symptôme que le trim par renderer corrige, autant ne plus l'aggraver).
     let target_volume = target_db_zone
         .as_ref()
-        .map(|z| f64::from(z.volume) / 100.0)
+        .map(|z| z.volume / 100.0)
         .unwrap_or(current.volume);
     state.playback.set_volume(target_zone, target_volume).await;
     state

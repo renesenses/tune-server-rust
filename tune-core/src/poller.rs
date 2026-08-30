@@ -2865,7 +2865,7 @@ impl PositionPoller {
                 && status.volume < 0.999
                 && status.state == TransportState::Playing
             {
-                let db_vol = zone.volume as f64 / 100.0;
+                let db_vol = zone.volume / 100.0;
                 let prev_device_vol = poll_states.get(&zone_id).and_then(|p| p.last_device_volume);
                 // Edge-triggered: adopt the renderer's volume only when it
                 // actually moved since the last poll (see decisions::
@@ -2873,9 +2873,11 @@ impl PositionPoller {
                 // Devialet stuck at 50%) can't overwrite the saved volume.
                 if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
                     self.playback.set_volume(zone_id, status.volume).await;
-                    let vol_int = (status.volume * 100.0) as i32;
+                    // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                    // tombait a 0 sous 0,01 lineaire (-40 dB).
+                    let vol_pct = status.volume * 100.0;
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-                        .update_volume(zone_id, vol_int)
+                        .update_volume(zone_id, vol_pct)
                         .ok();
                 }
                 // Remember what the renderer reported so the next tick can
@@ -3443,10 +3445,12 @@ impl PositionPoller {
                         )
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
-                        let vol_int = (status.volume * 100.0) as i32;
+                        // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                        // tombait a 0 sous 0,01 lineaire (-40 dB).
+                        let vol_pct = status.volume * 100.0;
                         let db = self.db.clone();
                         crate::db::zone_repo::ZoneRepo::with_backend(db)
-                            .update_volume(zone_id, vol_int)
+                            .update_volume(zone_id, vol_pct)
                             .ok();
                     }
                     ps.last_device_volume = Some(status.volume);
@@ -3648,10 +3652,12 @@ impl PositionPoller {
                 )
             {
                 self.playback.set_volume(zone_id, status.volume).await;
-                let vol_int = (status.volume * 100.0) as i32;
+                // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
+                // tombait a 0 sous 0,01 lineaire (-40 dB).
+                let vol_pct = status.volume * 100.0;
                 let db = self.db.clone();
                 crate::db::zone_repo::ZoneRepo::with_backend(db)
-                    .update_volume(zone_id, vol_int)
+                    .update_volume(zone_id, vol_pct)
                     .ok();
             }
             // Edge-triggered like the stopped/radio paths: record the reported
