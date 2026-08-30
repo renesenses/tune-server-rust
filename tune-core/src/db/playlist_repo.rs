@@ -240,6 +240,58 @@ impl PlaylistRepo {
         self.add_tracks(playlist_id, &to_add, position)
     }
 
+    /// Create a playlist AND fill it, in ONE transaction: either the playlist
+    /// exists with its tracks, or nothing was written at all.
+    ///
+    /// The two-step `create()` + `add_tracks…()` shape used by duplication and
+    /// by the playlist imports could not be honest: when the second step
+    /// failed, the empty playlist stayed in the database and the route dropped
+    /// the error with `.ok()`, so the caller got `201 Created` for a playlist
+    /// that holds nothing (#2798). Here a failed track insert rolls the
+    /// playlist row back with it.
+    ///
+    /// `track_ids` is de-duplicated in order (first occurrence wins), like
+    /// `add_tracks_deduped` — the playlist is brand new, so there is nothing
+    /// else to dedup against. Returns the new id **and the ids actually
+    /// written**, so the caller reports what is persisted instead of what it
+    /// hoped to persist.
+    pub fn create_with_tracks(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        profile_id: i64,
+        track_ids: &[i64],
+    ) -> Result<(i64, Vec<i64>), String> {
+        let create_sql = self.dialect_sql(sql::create, sql::create);
+        let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let to_add: Vec<i64> = track_ids
+            .iter()
+            .copied()
+            .filter(|tid| seen.insert(*tid))
+            .collect();
+
+        let mut new_id = 0i64;
+        {
+            let new_id_ref = &mut new_id;
+            let to_add_ref = &to_add;
+            self.db.write_tx(&mut |tx| {
+                let cp: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
+                tx.execute(&create_sql, &cp)?;
+                let id = tx.last_insert_rowid();
+                *new_id_ref = id;
+                for (i, tid) in to_add_ref.iter().enumerate() {
+                    let pos = i as i64;
+                    let p: [&dyn ToSqlValue; 3] = [&id, tid, &pos];
+                    tx.execute(&insert_sql, &p)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok((new_id, to_add))
+    }
+
     pub fn remove_tracks_at_positions(
         &self,
         playlist_id: i64,
@@ -654,5 +706,94 @@ mod tests {
         let repo = PlaylistRepo::with_backend(backend);
         let id = repo.create("X", None, 1).unwrap();
         assert!(repo.get(id).unwrap().is_some());
+    }
+
+    // --- #2798 : création + remplissage, tout ou rien -------------------
+
+    /// Ce que `create_with_tracks` rend décrit ce qui est EN BASE : les
+    /// positions sont contiguës et les répétitions du lot sont écartées, donc
+    /// le nombre rendu ne peut pas dépasser le nombre de lignes écrites.
+    #[test]
+    fn create_with_tracks_persiste_exactement_ce_qu_il_annonce() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut t = TrackModel::new(format!("T{i}"));
+            t.file_path = Some(format!("/t{i}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+
+        // ids[0] apparaît deux fois : un import M3U peut lister deux fois le
+        // même fichier.
+        let (plid, written) = repo
+            .create_with_tracks("Import", None, 1, &[ids[0], ids[1], ids[0], ids[2]])
+            .unwrap();
+
+        assert_eq!(written, vec![ids[0], ids[1], ids[2]]);
+        assert_eq!(repo.get_track_ids(plid).unwrap(), written);
+        assert_eq!(repo.get(plid).unwrap().unwrap().track_count, 3);
+    }
+
+    /// Le cœur de #2798 : un échec APRÈS la création de la playlist ne doit
+    /// laisser aucune playlist derrière lui.
+    ///
+    /// L'échec est injecté sans mock : `playlist_tracks.track_id` référence
+    /// `tracks(id)` et `PRAGMA foreign_keys=ON`, donc insérer une piste
+    /// inexistante échoue — de façon déterministe, sans horloge ni ordre
+    /// d'exécution. La deuxième piste est valide : l'échec survient bien au
+    /// MILIEU du remplissage, pas au premier insert.
+    #[test]
+    fn create_with_tracks_ne_laisse_rien_quand_une_piste_echoue() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t = TrackModel::new("Bonne".into());
+        t.file_path = Some("/bonne.flac".into());
+        let bonne = track_repo.create(&t).unwrap();
+
+        let avant = repo.count(1).unwrap();
+
+        let err = repo
+            .create_with_tracks("Copie", None, 1, &[bonne, 999_999_999, bonne + 1])
+            .expect_err("un track_id inexistant doit faire échouer la transaction");
+
+        assert_eq!(
+            repo.count(1).unwrap(),
+            avant,
+            "une playlist partielle a survécu à l'échec ({err})"
+        );
+        assert!(
+            repo.list(1, 100, 0)
+                .unwrap()
+                .iter()
+                .all(|p| p.name != "Copie"),
+            "la playlist « Copie » est restée en base après l'échec"
+        );
+    }
+
+    /// Contre-épreuve : l'ancienne séquence (create() puis add_tracks()) laisse
+    /// bel et bien la playlist vide derrière elle. Si ce test devenait vert
+    /// sans `create_with_tracks`, c'est que l'échec n'est plus injecté et que
+    /// le test ci-dessus ne prouve plus rien.
+    #[test]
+    fn contre_epreuve_l_ancienne_sequence_laisse_une_playlist_orpheline() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        let avant = repo.count(1).unwrap();
+        let plid = repo.create("Copie ancienne", None, 1).unwrap();
+        let echec = repo.add_tracks(plid, &[999_999_999], None);
+
+        assert!(echec.is_err(), "l'échec doit bien être injecté");
+        assert_eq!(
+            repo.count(1).unwrap(),
+            avant + 1,
+            "l'ancienne séquence laissait une playlist vide — c'est le défaut #2798"
+        );
+        assert!(repo.get_track_ids(plid).unwrap().is_empty());
     }
 }
