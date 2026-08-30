@@ -2,13 +2,10 @@ name: Post-release — synchroniser le tag vers main
 
 # La branche par défaut avait dérivé de plus de 800 commits : les crons ajoutés
 # à release/v0.9 existaient sur disque mais GitHub ne les enregistrait jamais.
-# Ce workflow vit donc sur main et observe la fin du workflow Release. Il ouvre
-# (ou vérifie à la relance) une PR dédiée depuis le tag publié, sans jamais la
-# fusionner. La résolution et la batterie restent une décision humaine.
+# Depuis #2808, le tag est deja contenu dans main avant toute construction.
+# Ce workflow ne subsiste que comme outil manuel de reparation d'un ancien
+# train ; il ne fait plus partie du chemin normal de release.
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,16 +18,12 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: post-release-main-sync-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  group: post-release-main-sync-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   preparer-pr:
     name: Préparer ou vérifier la PR tag → main
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -39,19 +32,12 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Résoudre le tag et le SHA du run
+      - name: Résoudre le tag historique
         id: release
         env:
-          EVENEMENT: ${{ github.event_name }}
-          TAG_DU_RUN: ${{ github.event.workflow_run.head_branch }}
-          SHA_DU_RUN: ${{ github.event.workflow_run.head_sha }}
           TAG_MANUEL: ${{ inputs.tag }}
         run: |
-          if [ "$EVENEMENT" = workflow_run ]; then
-            printf 'tag=%s\nrun_sha=%s\n' "$TAG_DU_RUN" "$SHA_DU_RUN" >> "$GITHUB_OUTPUT"
-          else
-            printf 'tag=%s\nrun_sha=\n' "$TAG_MANUEL" >> "$GITHUB_OUTPUT"
-          fi
+          printf 'tag=%s\nrun_sha=\n' "$TAG_MANUEL" >> "$GITHUB_OUTPUT"
 
       - name: Contre-épreuves du garde-fou
         run: python3 scripts/synchroniser-release-main.py --self-test

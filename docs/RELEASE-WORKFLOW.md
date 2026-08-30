@@ -30,10 +30,30 @@ rouge, annulé, absent ou ignoré. PostgreSQL reste un check requis séparé.
 Toute modification de la RC après le verdict invalide les checks et relance la
 batterie sur la nouvelle tête.
 
-## 3. Tag et publication
+## 3. Tags et staging
 
-Après fusion de la RC verte, le contrôleur de release vérifie que le commit est
-dans `main`, crée automatiquement le tag `vX.Y.Z`, puis construit les paquets.
+Après fusion des RC vertes, le contrôleur vérifie les quatre `main` puis crée
+les tags web, Universal, OS et enfin serveur. Seul le tag serveur déclenche le
+train. Ce train :
+
+1. conserve la GitHub Release serveur en brouillon ;
+2. pousse Docker uniquement sous `staging-vX.Y.Z` ;
+3. transmet à Tune OS le SHA OS, la version serveur et les deux SHA-256 Linux ;
+4. attend les trois builds OS et leurs tests ;
+5. conserve leur release en brouillon.
+
+Le tarball serveur attesté est embarqué dans chaque image OS. Le premier
+démarrage n'interroge ni `releases/latest`, ni une branche flottante.
+
+## 4. Promotion
+
+`Promote staged release` est le seul workflow qui déplace des canaux stables.
+Son dry-run est obligatoire. Après approbation de l'environnement protégé, une
+exécution idempotente recopie le digest Docker staged vers `vX.Y.Z` et
+`latest`, publie les releases OS et serveur, met Homebrew à jour puis notifie
+le site. Android reste inchangé tant qu'il n'est pas ajouté explicitement au
+manifeste du train.
+
 Les agents de correctif ne fusionnent pas, ne créent pas de tag et ne publient
 aucun canal.
 

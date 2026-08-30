@@ -27,3 +27,21 @@ par #2814. Les agents de correctif ne détiennent pas ce secret.
 Le contrôleur ne doit être armé qu'après retrait des publications indépendantes
 sur `push tag`. Le tag serveur reste l'unique signal du train ; les trois autres
 tags ne servent qu'à l'identité et à la traçabilité des composants.
+
+## Secrets et environnements
+
+- `release` : `RELEASE_CONTROLLER_TOKEN` et approbation, avec
+  `RELEASE_CONTROLLER_ENABLED=true` seulement pendant la pose des tags ;
+- dépôt Tune OS : `TUNE_SERVER_RELEASE_TOKEN`, lecture seule sur les releases
+  serveur, pour récupérer les tarballs encore en brouillon ;
+- staging serveur : `TUNE_OS_DISPATCH_TOKEN`, `DOCKERHUB_USERNAME`,
+  `DOCKERHUB_TOKEN` et la clé minisign ;
+- `release-promotion` : les mêmes accès plus `HOMEBREW_TAP_TOKEN` et
+  `WEBHOOK_SECRET`, avec `RELEASE_PROMOTION_ENABLED=true` seulement pendant la
+  promotion ;
+- `release-dry-run` : mêmes accès en lecture, sans pouvoir de publication.
+
+Le workflow de promotion refuse un manifeste non prêt, un tag divergent, une
+release déjà publique en dry-run, une signature absente, un actif OS manquant
+ou un digest Docker staged absent. Une relance en mode réel accepte en revanche
+les canaux déjà promus sur le même train et termine les étapes restantes.

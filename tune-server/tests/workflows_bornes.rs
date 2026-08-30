@@ -114,7 +114,14 @@ fn verifier(fichier: &str) {
 
 #[test]
 fn tout_job_de_release_a_un_plafond() {
-    verifier("release.yml");
+    for fichier in [
+        "release.yml",
+        "docker.yml",
+        "trigger-os-images.yml",
+        "promote-release.yml",
+    ] {
+        verifier(fichier);
+    }
 }
 
 #[test]
@@ -170,6 +177,84 @@ fn la_release_attend_le_preflight_avant_de_construire() {
 }
 
 #[test]
+fn le_tag_serveur_est_le_seul_declencheur_et_ne_promeut_rien_directement() {
+    let release = workflow("release.yml");
+    assert!(release.contains("push:\n    tags: [\"v*\"]"));
+
+    for fichier in ["docker.yml", "trigger-os-images.yml", "changelog.yml"] {
+        let source = workflow(fichier);
+        assert!(
+            !source.contains("push:\n    tags:"),
+            "{fichier} publie encore en parallele sur le push du tag"
+        );
+    }
+
+    let jobs = jobs(&release);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de release.yml"))
+    };
+    assert!(corps("stage-docker").contains("uses: ./.github/workflows/docker.yml"));
+    assert!(corps("stage-os").contains("uses: ./.github/workflows/trigger-os-images.yml"));
+    assert!(corps("staging-complete").contains("needs: [publish, stage-docker, stage-os]"));
+    assert!(corps("publish").contains("gh release view"));
+    assert!(!corps("publish").contains("--draft=false"));
+}
+
+#[test]
+fn docker_est_construit_une_fois_en_staging_puis_promu_par_digest() {
+    let docker = workflow("docker.yml");
+    assert!(docker.contains("push: true"));
+    assert!(docker.contains("staging-${{ steps.train.outputs.version }}"));
+    assert!(!docker.contains("format('{0}:latest'"));
+
+    let promotion = workflow("promote-release.yml");
+    assert!(promotion.contains("docker buildx imagetools inspect"));
+    assert!(promotion.contains("docker buildx imagetools create"));
+    assert!(promotion.contains("renesenses/tune:staging-$TAG"));
+    assert!(promotion.contains("--tag renesenses/tune:latest"));
+}
+
+#[test]
+fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
+    let os = workflow("trigger-os-images.yml");
+    for preuve in [
+        "server_sha256_x86_64",
+        "server_sha256_aarch64",
+        "os_sha",
+        "os_tag",
+        "release OS deja publique",
+        "wait_workflow build-iso.yml",
+        "wait_workflow build-rpi-image.yml",
+        "wait_workflow build-x86-image.yml",
+    ] {
+        assert!(
+            os.contains(preuve),
+            "preuve OS absente du workflow: {preuve}"
+        );
+    }
+}
+
+#[test]
+fn la_promotion_est_manuelle_armee_et_idempotente() {
+    let promotion = workflow("promote-release.yml");
+    assert!(promotion.contains("workflow_dispatch:"));
+    assert!(!promotion.contains("  push:"));
+    assert!(promotion.contains("default: true"));
+    assert!(promotion.contains("RELEASE_PROMOTION_ENABLED"));
+    assert!(promotion.contains(".ready == true"));
+    assert!(promotion.contains("release-dry-run"));
+    assert!(promotion.contains("release-promotion"));
+    assert!(
+        promotion
+            .contains("if [ \"$(gh release view \"$TAG\" --json isDraft --jq .isDraft)\" = true ]")
+    );
+    assert!(promotion.contains("Android inchange : absent du manifeste a quatre composants"));
+}
+
+#[test]
 fn les_runs_obsoletes_de_pr_sont_annules() {
     for fichier in [
         "ci.yml",
@@ -190,12 +275,10 @@ fn les_runs_obsoletes_de_pr_sont_annules() {
 }
 
 #[test]
-fn chaque_release_prepare_une_pr_du_tag_vers_main_sans_la_fusionner() {
+fn la_synchronisation_post_release_est_un_outil_de_reparation_manuel() {
     let garde = workflow("post-release-main-sync.yml");
-    assert!(garde.contains("workflow_run:"));
-    assert!(garde.contains("workflows: [\"Release\"]"));
-    assert!(garde.contains("types: [completed]"));
-    assert!(garde.contains("github.event.workflow_run.conclusion == 'success'"));
+    assert!(garde.contains("workflow_dispatch:"));
+    assert!(!garde.contains("workflow_run:"));
     assert!(garde.contains("pull-requests: write"));
     assert!(garde.contains("scripts/synchroniser-release-main.py --self-test"));
 

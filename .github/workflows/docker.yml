@@ -1,17 +1,23 @@
 name: Docker
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version sans le prefixe v
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       version:
         description: Version sans le prefixe v
         required: true
         type: string
-      publish:
-        description: Publier les tags Docker versionne et latest
-        required: true
-        default: false
-        type: boolean
 
 env:
   REGISTRY: docker.io
@@ -22,6 +28,7 @@ jobs:
   build-and-push:
     name: Build & Push (multi-arch)
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -71,7 +78,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
-        if: inputs.publish
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -155,15 +161,16 @@ jobs:
           cp /tmp/ap/bin/airplay-daemon dist/amd64/airplay-daemon
           touch dist/arm64/airplay-daemon
 
-      - uses: docker/build-push-action@v6
+      - id: image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.dist
           platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.publish }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.train.outputs.version }}
-            ${{ !contains(github.ref_name, '-') && format('{0}:latest', env.IMAGE_NAME) || '' }}
+          # Le tag de staging n'est consomme par aucun canal stable. La
+          # promotion le recopie ensuite par digest, sans reconstruire.
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:staging-${{ steps.train.outputs.version }}
           labels: |
             org.opencontainers.image.title=Tune Server
             org.opencontainers.image.description=Music server for audiophiles — DLNA, Chromecast, streaming services
@@ -172,3 +179,8 @@ jobs:
             org.opencontainers.image.version=${{ steps.train.outputs.version }}
           cache-from: type=gha,scope=docker-v2
           cache-to: type=gha,scope=docker-v2,mode=max
+
+      - name: Attester le digest staged
+        run: |
+          test -n "${{ steps.image.outputs.digest }}"
+          echo "Docker staging-${{ steps.train.outputs.version }} = ${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
