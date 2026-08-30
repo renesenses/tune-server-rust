@@ -84,9 +84,9 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
+    let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
-    let audio_backend =
-        tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+    let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
     let devices = state.scanner.devices().await;
@@ -136,6 +136,13 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             "queue_length": ps.queue_length,
             "now_playing": ps.now_playing,
             "signal_path": signal_path,
+            // #1395 — l'instantané WebSocket est ce que le client rend au
+            // premier affichage ; sans ce champ, la divergence « réglé ASIO /
+            // joué en WASAPI » n'apparaîtrait qu'après un GET /zones.
+            "audio_backend_status": crate::routes::zones::local_backend_status_value(
+                z.output_type.as_deref(),
+                &audio_backend_pref,
+            ),
             "output_capabilities": output_capabilities,
             "resolving": ps.resolving,
         }));
