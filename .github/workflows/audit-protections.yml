@@ -139,7 +139,17 @@ jobs:
           else
             # `.ready // "absent"` mentirait : en jq, `//` traite `false`
             # comme vide, et un manifeste NON prêt s'afficherait « absent ».
-            dire "ready = $(jq -r 'if has("ready") then (.ready | tostring) else "absent" end' "$manifest")"
+            pret=$(jq -r 'if has("ready") then (.ready | tostring) else "absent" end' "$manifest")
+            dire "ready = $pret"
+            # La sévérité d'un SHA en retard dépend de `ready` :
+            #   false   → la préparation est en cours, l'écart est normal ;
+            #   true    → le manifeste se déclare prêt à taguer, et il gèle
+            #             autre chose que la tête : BLOQUANT.
+            if [ "$pret" = "true" ]; then
+              dire "manifeste déclaré PRÊT : un SHA en retard est bloquant"
+            else
+              dire "manifeste en préparation : un SHA en retard est un avertissement"
+            fi
             n=0
             # `< <(...)` et non `| while` : le pipe exécuterait la boucle dans
             # un sous-shell, et `echec` y mourrait avec lui. Aucune erreur ne
@@ -195,7 +205,12 @@ jobs:
                   # Le SHA est bien sur la ligne, mais la ligne a AVANCÉ
                   # depuis le gel. Ce qui a été fusionné après ne partira pas.
                   d=$(gh api "repos/$repo/compare/$enc...$sha" --jq '.behind_by' 2>/dev/null || echo '?')
-                  na "$nom : $court est sur $repo@$ref mais en retard de $d commit(s) — le manifeste ne gèle PAS la tête actuelle" ;;
+                  msg="$nom : $court est sur $repo@$ref mais en retard de $d commit(s) — le manifeste ne gèle PAS la tête actuelle"
+                  if [ "$pret" = "true" ]; then
+                    ko "$msg (ready=true : BLOQUANT)"
+                  else
+                    na "$msg (ready=false : avertissement)"
+                  fi ;;
                 *)
                   ko "$nom : $court N'EST PAS sur $repo@$ref ($st)" ;;
               esac
