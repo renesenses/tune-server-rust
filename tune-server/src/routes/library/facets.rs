@@ -73,9 +73,9 @@ pub(super) fn build_conditions(
     q: &FacetQuery,
     engine: Engine,
     exclude: &str,
-    collection_ids: Option<&[i64]>,
+    collection: Option<&CollectionScope>,
 ) -> (Vec<String>, Vec<SqlValue>) {
-    let (mut conds, params) = build_facet_conditions(q, engine, exclude, collection_ids);
+    let (mut conds, params) = build_facet_conditions(q, engine, exclude, collection);
     // Albums masqués (#1391) : leurs pistes sortent de TOUS les effectifs de
     // facettes — le prédicat de SOCLE que `TrackRepo::list_filtered` pose de
     // son côté. Sans lui, « Jazz (12) » compterait des pistes que la liste ne
@@ -85,14 +85,59 @@ pub(super) fn build_conditions(
     (conds, params)
 }
 
+/// L'ensemble désigné par une sélection `collection`, résolu UNE fois par
+/// [`resolve_collection`] — le MIROIR exact des deux champs que `TrackFilter`
+/// porte de son côté (`collection_ids` / `collection_track_ids`).
+///
+/// #1864 : le compteur ne connaissait que les collections MANUELLES. Une
+/// collection INTELLIGENTE ne résolvant aucun album, il recevait `Some([])`,
+/// posait `1 = 0`, et TOUT le rail tombait à zéro pendant que la liste, elle,
+/// rendait bien ses pistes.
+#[derive(Default)]
+pub(super) struct CollectionScope {
+    /// Collection manuelle : des ids d'ALBUM (JSON des réglages).
+    pub(super) albums: Option<Vec<i64>>,
+    /// Collection intelligente : des ids de PISTE (règles compilées).
+    pub(super) tracks: Option<Vec<i64>>,
+}
+
+/// Résout un nom de collection en l'ensemble qu'il désigne.
+///
+/// Une collection MANUELLE rend des ids d'album (JSON des réglages) ; une
+/// collection INTELLIGENTE rend des ids de piste (requête de règles compilée).
+/// Le manuel gagne en cas d'homonymie. Un nom inconnu rend un ensemble d'albums
+/// VIDE, qui ne désigne rien — la collection demandée est simplement vide.
+///
+/// ⚠️ Appelée par les DEUX jumeaux (`/library/tracks` et `/library/facets`) :
+/// c'est ce qui garantit qu'ils désignent le même ensemble (#1864).
+pub(super) fn resolve_collection(state: &AppState, name: &str) -> CollectionScope {
+    let albums = collection_album_ids(state, name);
+    if !albums.is_empty() {
+        return CollectionScope {
+            albums: Some(albums),
+            tracks: None,
+        };
+    }
+    if let Some(tracks) = smart_collection_track_ids(state, name) {
+        return CollectionScope {
+            albums: None,
+            tracks: Some(tracks),
+        };
+    }
+    CollectionScope {
+        albums: Some(Vec::new()),
+        tracks: None,
+    }
+}
+
 /// Les prédicats des seules FACETTES — testés à l'identique, sans le socle.
 fn build_facet_conditions(
     q: &FacetQuery,
     engine: Engine,
     exclude: &str,
-    // Resolved album ids for the active `collection` selection (from settings
-    // JSON — the handler resolves the name so this stays a pure SQL builder).
-    collection_ids: Option<&[i64]>,
+    // L'ensemble résolu de la sélection `collection` (le handler le résout une
+    // fois, pour que ceci reste un pur constructeur de SQL).
+    collection: Option<&CollectionScope>,
 ) -> (Vec<String>, Vec<SqlValue>) {
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
@@ -246,7 +291,7 @@ fn build_facet_conditions(
     // settings JSON), so inlining them in the IN list is injection-safe. An empty
     // set matches nothing (an empty collection has zero tracks).
     if exclude != "collection" {
-        if let Some(ids) = collection_ids {
+        if let Some(ids) = collection.and_then(|c| c.albums.as_deref()) {
             if ids.is_empty() {
                 conds.push("1 = 0".to_string());
             } else {
@@ -256,6 +301,21 @@ fn build_facet_conditions(
                     .collect::<Vec<_>>()
                     .join(",");
                 conds.push(format!("t.album_id IN ({list})"));
+            }
+        }
+        // Collection INTELLIGENTE : les règles ont été résolues en ids de piste
+        // (nos propres i64), inlinés de la même façon sûre. Le JUMEAU
+        // `TrackRepo::list_filtered` pose exactement ce prédicat.
+        if let Some(ids) = collection.and_then(|c| c.tracks.as_deref()) {
+            if ids.is_empty() {
+                conds.push("1 = 0".to_string());
+            } else {
+                let list = ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conds.push(format!("t.id IN ({list})"));
             }
         }
     }
@@ -316,11 +376,14 @@ fn build_facet_conditions(
     }
     if let Some(query) = sel.q.as_deref().filter(|s| !s.is_empty()) {
         // Artist match via subquery — no artist_name column / no join here (#1189).
+        //
+        // ⚠️ `unaccent()` des DEUX côtés, comme le jumeau `list_filtered` : sans
+        // lui, `q=cafe` comptait sans « Café » mais la liste le rendait (#1864).
         let p = ph.take();
         let p2 = ph.take();
         conds.push(format!(
-            "(LOWER(t.title) LIKE LOWER({p}) OR t.artist_id IN \
-             (SELECT id FROM artists WHERE LOWER(name) LIKE LOWER({p2})))"
+            "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR t.artist_id IN \
+             (SELECT id FROM artists WHERE LOWER(unaccent(name)) LIKE LOWER(unaccent({p2}))))"
         ));
         let like = format!("%{query}%");
         params.push(SqlValue::Text(like.clone()));
@@ -387,15 +450,15 @@ pub(super) async fn library_facets(
     let engine = state.backend.engine();
     // Resolve the active collection selection once (name → album ids) for the
     // cumulative narrowing of every facet.
-    let coll_ids: Option<Vec<i64>> = q
+    let coll: Option<CollectionScope> = q
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| collection_album_ids(&state, name));
+        .map(|name| resolve_collection(&state, name));
     let mut out = serde_json::Map::new();
     for field in requested {
         // Conditions narrow the count by the OTHER active facets (cumulative).
-        let (conds, params) = build_conditions(&q, engine, &field, coll_ids.as_deref());
+        let (conds, params) = build_conditions(&q, engine, &field, coll.as_ref());
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
@@ -540,7 +603,10 @@ fn playlist_facet(
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
-    state
+    // Le filtre jumeau compare sans la casse (`in_list_ci` sur `pl.name`) :
+    // deux listes « ListeA » et « listea » se cochent ensemble, elles doivent
+    // donc aussi se compter ensemble (#1864).
+    let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
         .unwrap_or_default()
@@ -551,7 +617,8 @@ fn playlist_facet(
             let count = it.next()?.as_i64().unwrap_or(0);
             (!name.is_empty()).then_some((name, count))
         })
-        .collect()
+        .collect();
+    fusionner_les_casses(brut)
 }
 
 /// Combien de pistes il manque quoi. Un compte par étiquette surveillée.
@@ -607,7 +674,7 @@ fn column_facet(
         .iter()
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
-    state
+    let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
         .unwrap_or_default()
@@ -621,7 +688,45 @@ fn column_facet(
                 .or_else(|| v.as_i64().map(|n| n.to_string()))?;
             Some((value, c.as_i64().unwrap_or(0)))
         })
-        .collect()
+        .collect();
+    fusionner_les_casses(brut)
+}
+
+/// Regroupe les orthographes qui ne diffèrent que par la casse.
+///
+/// #1864 : le `GROUP BY` de SQL distingue « Jazz » de « JAZZ », mais le FILTRE
+/// jumeau (`in_list_ci`, des DEUX côtés) ne les distingue pas. Le rail
+/// affichait donc deux valeurs à 1 piste dont chacune, une fois cochée, en
+/// rendait 2 — précisément le compteur qui ment que cette issue combat.
+///
+/// L'orthographe retenue est la PLUS FRÉQUENTE (les lignes arrivent déjà
+/// triées par effectif décroissant, donc c'est la première rencontrée) : une
+/// bibliothèque où « Jazz » domine ne se met pas à afficher « JAZZ » parce
+/// qu'une piste est mal étiquetée. Sur des valeurs numériques (année,
+/// fréquence, profondeur) la fusion est un no-op.
+fn fusionner_les_casses(brut: Vec<(String, i64)>) -> Vec<(String, i64)> {
+    let mut sortie: Vec<(String, i64)> = Vec::with_capacity(brut.len());
+    let mut retenue: Vec<i64> = Vec::with_capacity(brut.len());
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (valeur, n) in brut {
+        match index.get(&valeur.to_lowercase()) {
+            Some(&i) => {
+                sortie[i].1 += n;
+                // Ne dépend pas de l'ordre d'arrivée : à effectif supérieur,
+                // l'orthographe affichée change.
+                if n > retenue[i] {
+                    retenue[i] = n;
+                    sortie[i].0 = valeur;
+                }
+            }
+            None => {
+                index.insert(valeur.to_lowercase(), sortie.len());
+                retenue.push(n);
+                sortie.push((valeur, n));
+            }
+        }
+    }
+    sortie
 }
 
 /// Count tracks by their album's rating (profile 1). Tracks inherit the rating
