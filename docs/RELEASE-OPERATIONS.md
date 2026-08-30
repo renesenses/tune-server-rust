@@ -10,12 +10,51 @@ release normale.
 
 ## Vue d'ensemble
 
-```text
-PR ciblées → rc/vX.Y.Z → gates complets → main
-    → contrôleur dry-run → STOP
-    → tags contrôlés → staging → promotion dry-run → STOP
-    → promotion publique
+```mermaid
+flowchart LR
+    MAIN0["main — base du train"] -->|"création puis réconciliation par PR"| RC["rc/vX.Y.Z"]
+    WORK["fix/* ou feat/*"] -->|"PR + tests ciblés"| BATCH["batch/* optionnelle"]
+    WORK -->|"PR directe autorisée"| RC
+    BATCH -->|"merge commit"| RC
+    RC -->|"PR + gates complets + merge commit"| MAIN1["main — arbre publié"]
+    MAIN1 -->|"contrôleur en dry-run"| STOP1{{"STOP 1 — accord JP"}}
+    STOP1 -->|"fenêtre de tags"| TAGS["tags web · Universal · OS · serveur"]
+    TAGS -->|"build une fois"| STAGING["releases draft + Docker staging"]
+    STAGING -->|"promotion en dry-run"| STOP2{{"STOP 2 — accord JP"}}
+    STOP2 -->|"promotion unique"| PUBLIC["GitHub · Docker · Homebrew · Tune OS"]
+
+    LEGACY["release/v0.9 — gelée, hors circuit"]
 ```
+
+### Vue Git — plan de métro
+
+Ce graphe superpose le trajet commun des quatre dépôts. La branche
+`batch/*` est facultative : sans lot, la PR de correctif rejoint directement
+la RC.
+
+```mermaid
+gitGraph LR:
+    commit id: "main de départ"
+    branch rc-vX-Y-Z
+    checkout rc-vX-Y-Z
+    branch batch-lot
+    checkout batch-lot
+    branch fix-1234
+    checkout fix-1234
+    commit id: "correctif + tests ciblés"
+    checkout batch-lot
+    merge fix-1234 id: "PR unitaire"
+    checkout rc-vX-Y-Z
+    merge batch-lot id: "lot intégré"
+    commit id: "RC figée" tag: "tags web · Universal · OS"
+    checkout main
+    merge rc-vX-Y-Z id: "promotion RC vers main" tag: "tag serveur"
+```
+
+Les tags sont créés après la promotion : le dessin indique leur **cible Git**,
+pas leur instant de création. Web, Universal et OS taguent la tête figée de
+leur RC, désormais ancêtre de `main`; le serveur tague le commit de fusion sur
+`main`. `release/v0.9` ne rejoint plus cette ligne.
 
 Les quatre composants sont `server`, `web`, `os` et `universal`. Le serveur
 porte le manifeste `.release/vX.Y.Z.json` et orchestre les tags ainsi que la
