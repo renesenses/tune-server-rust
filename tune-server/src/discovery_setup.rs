@@ -470,6 +470,27 @@ fn nos_adresses_depuis(
     v
 }
 
+/// #1280 — l'utilisateur a fait taire cet APPAREIL.
+///
+/// Consulté AVANT tout enregistrement de sortie et toute création de zone, sur
+/// les quatre chemins qui en créent (SSDP, mDNS, fournisseurs hors arbre,
+/// re-sondage au démarrage). Le masquage de zone de #1281 ne suffisait pas :
+/// il n'agit qu'après l'enregistrement de la sortie, donc l'appareil restait
+/// proposé, et il n'a rien à masquer quand aucune zone n'a jamais été créée.
+///
+/// Best-effort par construction (`matching` avale l'erreur d'une base
+/// pré-migration) : un défaut de lecture ne doit jamais interrompre la
+/// découverte.
+pub(crate) fn appareil_ignore(
+    db: &Arc<dyn DbBackend>,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> bool {
+    tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(db.clone()).is_ignored(
+        tune_core::db::ignored_device_repo::DeviceIdentity::new(&dev.id, &dev.host, &dev.name)
+            .with_mac(dev.mac_address.as_deref()),
+    )
+}
+
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
@@ -513,6 +534,15 @@ async fn handle_ssdp_discovered(
             name = %dev.name,
             "ssdp_notre_facade_reconnue_par_udn_ignoree"
         );
+        return;
+    }
+
+    // #1280 — appareil que l'utilisateur a fait taire. Le garde-fou est ICI,
+    // AVANT l'enregistrement de la sortie : le masquage de zone (#1281) plus
+    // bas arrive trop tard, l'appareil y est déjà enregistré, donc encore
+    // proposé dans `GET /devices` et dans le sélecteur de zone.
+    if appareil_ignore(db, dev) {
+        debug!(id = %dev.id, name = %dev.name, host = %dev.host, "ssdp_appareil_ignore");
         return;
     }
 
@@ -1052,6 +1082,14 @@ pub fn spawn_mdns_handler(
         while let Some(event) = mdns_rx.recv().await {
             match event {
                 MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
+                    // #1280 — appareil que l'utilisateur a fait taire. Le
+                    // parc de Patatorz est DLNA + AirPlay + Chromecast : le
+                    // garde-fou doit donc vivre sur CE chemin aussi, et
+                    // AVANT l'enregistrement de la sortie.
+                    if appareil_ignore(&db, &dev) {
+                        debug!(id = %dev.id, name = %dev.name, host = %dev.host, "mdns_appareil_ignore");
+                        continue;
+                    }
                     // Set when an AirPlay 2 device falls back to the legacy
                     // AirPlay output (daemon unavailable / deviceid unknown):
                     // the output is registered but no zone is auto-created.
@@ -1795,6 +1833,19 @@ pub fn spawn_output_providers(
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
                     let otype = output.output_type().to_string();
+                    // #1280 — appareil ignoré. Un fournisseur hors arbre
+                    // n'expose ni hôte ni MAC : seule l'identité exacte
+                    // s'applique ici, ce qui suffit — c'est celle que le
+                    // client transmet en faisant taire l'appareil.
+                    if tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(
+                        db.clone(),
+                    )
+                    .is_ignored(
+                        tune_core::db::ignored_device_repo::DeviceIdentity::new(&dev_id, "", &name),
+                    ) {
+                        debug!(id = %dev_id, name = %name, "provider_appareil_ignore");
+                        continue;
+                    }
                     {
                         let mut reg = outputs.lock().await;
                         if reg.contains(&dev_id) {
@@ -2958,6 +3009,203 @@ mod dedup_identites_ssdp_1281 {
             repo.list().unwrap().is_empty(),
             "la suppression doit tenir face à la seconde identité SSDP de \
              l'appareil"
+        );
+    }
+}
+
+/// #1280 — « ignorer cet appareil » : faire taire un APPAREIL, pas chasser ses
+/// zones une par une.
+///
+/// Le couple de tests qui compte est
+/// [`un_appareil_ignore_ne_cree_ni_zone_ni_sortie`] et
+/// [`le_meme_scenario_sans_blocage_cree_bien_la_zone`] : le SECOND est la
+/// contre-épreuve PERMANENTE du premier. Les deux jouent exactement le même
+/// scénario, seule la ligne d'ignorance change. Un garde-fou neutralisé en
+/// « toujours faux » rend le premier rouge ; neutralisé en « toujours vrai »,
+/// il rend le second rouge. Aucune constante ne peut satisfaire les deux, donc
+/// aucun des deux ne peut rester vert sur un correctif mort.
+#[cfg(test)]
+mod appareils_ignores_1280 {
+    use super::OpenHomeEventListener;
+    use tune_core::db::ignored_device_repo::{IgnoredDevice, IgnoredDeviceRepo};
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn renderer_ssdp(id: &str, name: &str, ty: OutputType, host: &str) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(id.into(), name.into(), ty, host.into(), 49152);
+        dev.capabilities.insert(
+            "service_urls".into(),
+            serde_json::json!({"avtransport": "/av", "renderingcontrol": "/rc"}),
+        );
+        dev
+    }
+
+    /// Une PASSE de découverte à part entière : `seen_hosts` neuf, comme entre
+    /// deux scans réels.
+    async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        let mut seen = std::collections::HashSet::new();
+        let listener: Option<std::sync::Arc<OpenHomeEventListener>> = None;
+        super::handle_ssdp_discovered(
+            dev,
+            &state.outputs,
+            &state.backend,
+            &state.config,
+            &state.event_bus,
+            &listener,
+            &state.playback,
+            &state.license,
+            &mut seen,
+        )
+        .await;
+    }
+
+    fn faire_taire(state: &crate::state::AppState, device_id: &str, host: &str, name: &str) {
+        IgnoredDeviceRepo::with_backend(state.backend.clone())
+            .ignore(&IgnoredDevice {
+                device_id: device_id.into(),
+                mac: String::new(),
+                host: host.into(),
+                name: name.into(),
+                device_type: "dlna".into(),
+                created_at: None,
+            })
+            .unwrap();
+    }
+
+    fn sonos(id: &str, ty: OutputType) -> DiscoveredDevice {
+        renderer_ssdp(id, "Chambre - Sonos One", ty, "192.168.1.50")
+    }
+
+    /// Le ticket, littéralement : l'appareil ignoré ne crée AUCUNE zone au
+    /// scan — et, ce que le masquage de zone (#1281) ne faisait pas, il n'entre
+    /// même pas dans le registre des sorties, donc il cesse d'être proposé.
+    #[tokio::test]
+    async fn un_appareil_ignore_ne_cree_ni_zone_ni_sortie() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        annoncer(&state, &sonos("uuid:sonos-dlna", OutputType::Dlna)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "un appareil ignoré ne doit créer aucune zone"
+        );
+        assert!(
+            !state.outputs.lock().await.contains("uuid:sonos-dlna"),
+            "un appareil ignoré ne doit pas être enregistré comme sortie : \
+             c'est ce qui le faisait rester proposé (#1280)"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE du test ci-dessus : le MÊME scénario, sans la
+    /// ligne d'ignorance, crée bien la zone et la sortie. Un garde-fou bloqué
+    /// sur « toujours ignoré » rend ce test rouge.
+    #[tokio::test]
+    async fn le_meme_scenario_sans_blocage_cree_bien_la_zone() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+
+        annoncer(&state, &sonos("uuid:sonos-dlna", OutputType::Dlna)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "sans blocage, le même appareil doit produire sa zone"
+        );
+        assert!(
+            state.outputs.lock().await.contains("uuid:sonos-dlna"),
+            "sans blocage, la sortie doit être enregistrée"
+        );
+    }
+
+    /// Le cœur du ticket : un Sonos s'annonce sous plusieurs identités. Faire
+    /// taire l'appareil doit valoir pour TOUTES, sinon l'utilisateur en chasse
+    /// une et la jumelle recrée la zone au scan suivant.
+    #[tokio::test]
+    async fn une_autre_identite_du_meme_appareil_reste_ignoree() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        annoncer(&state, &sonos("uuid:sonos-openhome", OutputType::Openhome)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert!(
+            repo.list().unwrap().is_empty(),
+            "la seconde identité SSDP du même appareil doit rester ignorée"
+        );
+        assert!(!state.outputs.lock().await.contains("uuid:sonos-openhome"));
+    }
+
+    /// GARDE-FOU ANTI-DHCP (#1651) : un appareil DIFFÉRENT qui hérite de
+    /// l'adresse du Sonos ignoré doit être découvert normalement. Sans
+    /// l'exigence de nom, l'utilisateur perdrait un appareil qu'il n'a jamais
+    /// bloqué — un faux blocage est pire que le défaut d'origine.
+    #[tokio::test]
+    async fn un_autre_appareil_au_meme_hote_apres_bail_dhcp_est_bien_cree() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        let nouvel_occupant = renderer_ssdp(
+            "uuid:cabasse",
+            "Cabasse Pearl Akoya",
+            OutputType::Dlna,
+            "192.168.1.50",
+        );
+        annoncer(&state, &nouvel_occupant).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let zones = repo.list().unwrap();
+        assert_eq!(zones.len(), 1, "le nouvel occupant du bail doit être créé");
+        assert_eq!(zones[0].name, "Cabasse Pearl Akoya");
+    }
+
+    /// Le déblocage doit être possible, sinon l'utilisateur se piège lui-même.
+    /// Il libère TOUTES les identités de l'appareil, et le scan suivant le
+    /// ramène.
+    #[tokio::test]
+    async fn debloquer_fait_revenir_l_appareil_au_scan_suivant() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo_ignores = IgnoredDeviceRepo::with_backend(state.backend.clone());
+        faire_taire(
+            &state,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+        faire_taire(
+            &state,
+            "uuid:sonos-openhome",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        // Débloquer par UNE des deux identités libère les deux.
+        let liberes = repo_ignores.unignore("uuid:sonos-dlna").unwrap();
+        assert_eq!(liberes.len(), 2, "les deux identités doivent être libérées");
+        assert!(repo_ignores.list().unwrap().is_empty());
+
+        annoncer(&state, &sonos("uuid:sonos-openhome", OutputType::Openhome)).await;
+
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            repo.list().unwrap().len(),
+            1,
+            "après déblocage, l'appareil revient au scan suivant"
         );
     }
 }

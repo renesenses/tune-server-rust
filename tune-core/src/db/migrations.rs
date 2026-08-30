@@ -1468,6 +1468,52 @@ CREATE TABLE IF NOT EXISTS hidden_items (
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
 ",
     },
+    Migration {
+        version: 90,
+        name: "ignored_devices",
+        // « Ignorer cet appareil » (#1280, Alex Campbell puis Patatorz) : faire
+        // taire un APPAREIL, pas chasser ses zones une par une.
+        //
+        // Pourquoi une table et pas le masquage de zone déjà en place
+        // (`zones.is_hidden` + `hidden_zones_by_host`, #1281) : celui-ci ne
+        // porte que ce qui a DÉJÀ une zone, et seulement pour les zones
+        // réseau. Il laisse l'appareil s'enregistrer comme SORTIE (la
+        // découverte enregistre avant d'atteindre le garde-fou de zone), donc
+        // proposé partout ; et un appareil dont la zone n'a jamais été créée
+        // (`zone_auto_create` à false — le contournement donné au testeur, TV
+        // filtrée, AirPlay 2 sans démon) n'a aucune ligne à masquer.
+        //
+        // Patron `hidden_items` (89, #1391) : table SANS clé étrangère,
+        // instantané d'identité figé à l'insertion. Le marqueur ne dépend
+        // d'aucune ligne `zones` — la purge des zones masquées ne l'emporte
+        // pas — et survit à la bascule SQLite → PostgreSQL.
+        //
+        // AUCUNE troisième notion d'identité : `mac` est celle de #2803
+        // (AirPlay/RAOP, déjà persistée sur `zones.mac`), `host` + `name` est
+        // exactement le couple de `hidden_zones_by_host`. Le NOM est exigé
+        // avec l'hôte pour ne pas bloquer un appareil différent héritant de
+        // l'adresse par le DHCP (leçon du ré-ancrage #1651).
+        //
+        // PAS DE COLONNE `id` : `device_id` EST la clé primaire — même choix
+        // que `favorite_facets` (85), `task_runs` (88) et `hidden_items` (89),
+        // pour éviter la divergence AUTOINCREMENT / BIGSERIAL de la bascule
+        // SQLite → PostgreSQL (#1706). Tout est TEXT : rien à rattraper côté
+        // PG, contrairement à 038 et 041.
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2958,6 +3004,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         41,
         "hidden_items",
         include_str!("../../migrations/postgres/041_hidden_items.sql"),
+    ),
+    // Appareils ignorés (#1280). Jumelle de la migration SQLite 90 — les deux
+    // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à tout
+    // le parc PostgreSQL (.15, .18, Docker) et « ignorer cet appareil » y
+    // rendrait une erreur SQL.
+    (
+        42,
+        "ignored_devices",
+        include_str!("../../migrations/postgres/042_ignored_devices.sql"),
     ),
 ];
 
