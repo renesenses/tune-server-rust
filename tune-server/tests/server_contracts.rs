@@ -37,6 +37,8 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+#[path = "playlists_ecritures_partielles.rs"]
+mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
 #[path = "radios_recherche_distinction.rs"]
