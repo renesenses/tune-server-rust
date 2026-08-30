@@ -995,6 +995,101 @@ fn zone_mono_downmix_step(
         .then(|| "Sortie mono : (G + D) / 2 sur les deux voies".to_string())
 }
 
+/// La famille DSD que désigne une cadence brute (2,8 MHz → DSD64, etc.).
+///
+/// Une seule table pour la ligne Source et pour l'étage de sortie : elles
+/// nommaient la même chose à deux endroits, et rien ne garantissait qu'elles
+/// disent la même chose.
+fn dsd_family_name(sample_rate: i32) -> &'static str {
+    match sample_rate {
+        r if r >= 22_000_000 => "DSD512",
+        r if r >= 11_000_000 => "DSD256",
+        r if r >= 5_000_000 => "DSD128",
+        _ => "DSD64",
+    }
+}
+
+/// « DSD128 5.6 MHz » — un DSD se dit par sa famille et sa cadence en MHz,
+/// jamais en kHz/bit.
+fn dsd_resolution_label(sample_rate: i32) -> String {
+    format!(
+        "{name} {mhz:.1} MHz",
+        name = dsd_family_name(sample_rate),
+        mhz = sample_rate as f64 / 1_000_000.0
+    )
+}
+
+/// Ces chiffres décrivent-ils du DSD ? 1 bit, ou une cadence en MHz.
+///
+/// Aucun PCM n'atteint le mégahertz (768 kHz est le maximum du marché) et
+/// aucun conteneur PCM ne porte 1 bit : les deux tests sont sans recouvrement
+/// possible avec du PCM légitime.
+fn is_dsd_resolution(sample_rate: i32, bit_depth: i32) -> bool {
+    // `== 1` et non `<= 1` : une profondeur de 0 est une valeur MANQUANTE, pas
+    // du DSD, et la traiter comme telle inventerait un « DSD64 0.0 MHz ».
+    bit_depth == 1 || sample_rate >= 1_000_000
+}
+
+/// Libellé d'un étage de SORTIE — le garde-fou structurel du #1315.
+///
+/// « FLAC 5644kHz/1bit » est un libellé IMPOSSIBLE : aucun FLAC ne transporte
+/// du 1 bit à 5,6 MHz. Il s'affichait pourtant sur l'Eversolo DMP-A6 de
+/// Stéphane Villerio, parce que les deux moitiés de la ligne n'ont pas la même
+/// origine — le nom du conteneur est DEVINÉ (`dlna_transcode_target`, une
+/// cible statique), les chiffres viennent du FIL, c'est-à-dire de ce qui part
+/// vraiment.
+///
+/// Quand les deux se contredisent, ce sont les chiffres qui gagnent : c'est
+/// déjà la règle du reste de `build_signal_path` (« le fil prime »), et c'est
+/// la seule moitié qui soit une mesure. Le libellé impossible ne peut donc
+/// plus sortir d'ici, quelle que soit la cible qu'on lui passe.
+fn output_stage_label(container: &str, sample_rate: i32, bit_depth: i32) -> String {
+    if is_dsd_resolution(sample_rate, bit_depth) {
+        if !container.starts_with("DSD") {
+            tracing::warn!(
+                container,
+                sample_rate,
+                bit_depth,
+                "signal_path_libelle_impossible_ecarte — une résolution DSD \
+                 annoncée sous un conteneur PCM ; le fil tranche (#1315)"
+            );
+        }
+        return dsd_resolution_label(sample_rate);
+    }
+    if sample_rate >= 1000 {
+        format!(
+            "{container} {sr}kHz/{bit_depth}bit",
+            sr = sample_rate / 1000
+        )
+    } else {
+        format!("{container} {sample_rate}Hz/{bit_depth}bit")
+    }
+}
+
+/// Le fil porte-t-il du DSD BRUT — le fichier .dsf/.dff tel quel ?
+///
+/// Miroir du `dsd_passthrough` de l'orchestrateur, et il manquait. `zones.rs`
+/// mire l'ALAC et l'AAC ; le commentaire du miroir ALAC dit lui-même qu'il a
+/// été ajouté pour tuer une étape fantôme « ALAC→FLAC » (#1131). Le même
+/// fantôme existait pour le DSD : `needs_transcode_for_output` restait vrai et
+/// le panneau annonçait une conversion vers FLAC pendant que l'orchestrateur
+/// envoyait le .dsf brut (#1315, Yves Corbat / Stéphane Villerio, DMP-A6).
+///
+/// La décision elle-même (`should_dsd_passthrough`) dépend d'un sondage SOAP
+/// asynchrone que ce constructeur synchrone ne peut pas rejouer — et la
+/// rejouer serait un septième miroir à maintenir. On lit donc ce que la
+/// session sert VRAIMENT : le passthrough crée sa session avec l'extension
+/// source et un MIME DSD (`orchestrator.rs`, branche « Standard passthrough:
+/// serve the raw file »), là où toutes les autres branches produisent du
+/// `wav`/`flac`. C'est le même principe que `wire_wav`, et il est plus fort
+/// qu'un miroir : il constate au lieu de deviner.
+fn wire_carries_raw_dsd(wire: Option<&StreamInfo>) -> bool {
+    wire.is_some_and(|w| {
+        tune_core::orchestrator::est_source_dsd(Some(&w.format))
+            || tune_core::orchestrator::est_dsd_brut(&w.mime_type)
+    })
+}
+
 fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
@@ -1137,12 +1232,7 @@ fn build_signal_path(
     };
 
     let format_name = if is_dsd {
-        match sample_rate {
-            r if r >= 22_000_000 => "DSD512",
-            r if r >= 11_000_000 => "DSD256",
-            r if r >= 5_000_000 => "DSD128",
-            _ => "DSD64",
-        }
+        dsd_family_name(sample_rate)
     } else if let Some(f) = source_format.as_ref() {
         f.display_name()
     } else {
@@ -1245,6 +1335,13 @@ fn build_signal_path(
         output_type,
         "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
     );
+    // Passthrough DSD natif : l'orchestrateur sert le .dsf/.dff brut au
+    // renderer (`orchestrator.rs` `dsd_passthrough`). Constaté sur le fil, pas
+    // deviné — cf. `wire_carries_raw_dsd`. Sans ce miroir, une piste DSD128
+    // envoyée telle quelle à un Eversolo DMP-A6 s'affichait « DSD128 5.6 MHz →
+    // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
+    // qui ne peut pas exister (#1315).
+    let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
     // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
     // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
     // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
@@ -1254,8 +1351,14 @@ fn build_signal_path(
     // A zone forced to serve WAV/LPCM (`dlna_lpcm`) always transcodes, so it takes
     // precedence over ALAC passthrough — matching the orchestrator.
     let zone_id = zone.id.unwrap_or(0);
-    let dlna_lpcm =
-        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    // `!dsd_passthrough` : même précédence que l'orchestrateur, où le forçage
+    // WAV ne peut pas s'appliquer à un flux DSD servi brut (`dlna_needs_wav`
+    // exige `will_be_flac`, faux dès que `needs_transcode_for_output` tombe).
+    // Sans cette garde, une zone cochée « LPCM » annoncerait du WAV sur un fil
+    // qui porte du DSD.
+    let dlna_lpcm = is_network_output
+        && !dsd_passthrough
+        && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
     // Zone opt-in 16-bit cap (Ruark R3, #1137): mirrors the orchestrator so the
     // signal path shows a real 16-bit downconvert instead of a phantom
     // bit-perfect passthrough when the source is hi-res.
@@ -1299,6 +1402,7 @@ fn build_signal_path(
         && !dlna_wav24
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
+        && !dsd_passthrough
         && !alac_passthrough
         && !aac_passthrough
         && source_format
@@ -1459,8 +1563,7 @@ fn build_signal_path(
     // Build steps
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
-        let mhz = sample_rate as f64 / 1_000_000.0;
-        format!("{format_name} {mhz:.1} MHz")
+        dsd_resolution_label(sample_rate)
     } else if sample_rate >= 1000 {
         format!(
             "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
@@ -1533,14 +1636,10 @@ fn build_signal_path(
                 .map(|m| (sample_rate as u32).min(m) as i32)
                 .unwrap_or(sample_rate)
         });
-        let out_desc = if out_sample_rate >= 1000 {
-            format!(
-                "{output_format_name} {sr}kHz/{out_bit_depth}bit",
-                sr = out_sample_rate / 1000
-            )
-        } else {
-            format!("{output_format_name} {out_sample_rate}Hz/{out_bit_depth}bit")
-        };
+        // Garde-fou #1315 : le nom du conteneur est deviné, les chiffres sont
+        // mesurés. Une résolution DSD ne peut donc pas sortir d'ici sous un
+        // nom de conteneur PCM, quelle que soit la cible de transcodage.
+        let out_desc = output_stage_label(output_format_name, out_sample_rate, out_bit_depth);
         steps.push(json!({
             "name": "Transcoder",
             "description": format!("{source_desc} \u{2192} {out_desc}"),
@@ -4253,6 +4352,246 @@ mod signal_path_tests {
             .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Transcoder"))
             .and_then(|s| s.get("description").and_then(|d| d.as_str()))
             .map(String::from)
+    }
+
+    // ------------------------------------------------------------------
+    // #1315 — l'affichage DSD sur Eversolo.
+    //
+    // Yves Corbat le 08/08, Stéphane Villerio le 28/08 avec les trois pièces :
+    // un DMP-A6 en DLNA, mode audiophile, volume figé à 100 %, une piste
+    // DSD128. Le panneau affichait un étage « DSD128 5.6 MHz → FLAC
+    // 5644kHz/1bit » pendant que le journal du serveur disait, à la seconde
+    // près, `dsd_passthrough_decide … dsd_mode=native passthrough=true` : le
+    // .dsf partait BRUT. Le transcodage était inventé, et son libellé
+    // impossible — aucun FLAC ne porte du 1 bit à 5,6 MHz.
+    //
+    // Les trois modes DSD d'une sortie réseau ont chacun leur test, pour que
+    // la disparition de l'étage fantôme ne se paie pas par la disparition des
+    // étages VRAIS.
+
+    /// Une piste DSD128 jouée sur une zone DLNA, avec le fil qu'on veut.
+    fn dsd128_playing() -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Une piste DSD".into(),
+                format: Some("dsf".into()),
+                sample_rate: Some(5_644_800),
+                bit_depth: Some(1),
+                stream_id: Some("sid-dsd".into()),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Un fil qui nomme aussi son MIME — c'est par là que le passthrough DSD
+    /// se reconnaît quand le renderer impose le sien (Yamaha R-N2000A :
+    /// `audio/dsf` et rien d'autre).
+    fn wire_mime(format: &str, mime: &str, sample_rate: u32, bit_depth: u16) -> StreamInfo {
+        StreamInfo {
+            format: format.into(),
+            mime_type: mime.into(),
+            sample_rate,
+            bit_depth,
+            ..Default::default()
+        }
+    }
+
+    /// Mode 1/3 — DSD NATIF : le .dsf part brut, aucun étage de transcodage.
+    #[test]
+    fn dsd_natif_sur_le_fil_n_affiche_aucun_transcodage() {
+        let (backend, zone) = dlna_zone();
+        let sp = build_signal_path(
+            &dsd128_playing(),
+            &zone,
+            &backend,
+            Some("DMP-A6"),
+            "none",
+            Some(&wire_mime("dsf", "application/x-dsd", 5_644_800, 1)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcoder_desc(&sp),
+            None,
+            "le .dsf part brut : annoncer un transcodage decrit une operation \
+             qui n'a pas lieu (#1315)"
+        );
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some("DSD128 5.6 MHz"));
+        assert_eq!(step_desc(&sp, "Transport").as_deref(), Some("DLNA/UPnP"));
+        assert_eq!(
+            sp.get("bit_perfect").and_then(Value::as_bool),
+            Some(true),
+            "un flux brut servi tel quel EST bit-perfect"
+        );
+        let summary = sp.get("summary").and_then(Value::as_str).unwrap();
+        assert!(
+            !summary.contains("FLAC"),
+            "le resume invente encore un FLAC : {summary}"
+        );
+    }
+
+    /// Le MIME suffit, quand le renderer impose le sien (`audio/dsf`) et que
+    /// la session porte l'extension du fichier.
+    #[test]
+    fn dsd_natif_se_reconnait_aussi_au_mime_annonce_par_le_renderer() {
+        for mime in ["application/x-dsd", "audio/x-dsf", "audio/dff", "audio/dsf"] {
+            let (backend, zone) = dlna_zone();
+            let sp = build_signal_path(
+                &dsd128_playing(),
+                &zone,
+                &backend,
+                Some("Yamaha R-N2000A"),
+                "none",
+                Some(&wire_mime("", mime, 5_644_800, 1)),
+            )
+            .unwrap();
+            assert_eq!(
+                transcoder_desc(&sp),
+                None,
+                "mime={mime} : le fil porte du DSD brut, pas un transcodage"
+            );
+        }
+    }
+
+    /// Mode 2/3 — DoP : le DSD voyage EMBALLÉ dans des trames PCM 24 bits.
+    /// L'étage existe vraiment et doit rester affiché, avec les chiffres du
+    /// fil (352,8 kHz / 24 bits pour du DSD128), jamais ceux de la source.
+    #[test]
+    fn dsd_en_dop_affiche_l_etage_wav_du_fil() {
+        let (backend, zone) = dlna_zone();
+        let sp = build_signal_path(
+            &dsd128_playing(),
+            &zone,
+            &backend,
+            Some("Wiim Pro"),
+            "none",
+            Some(&wire_mime("wav", "audio/wav", 352_800, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("DSD128 5.6 MHz \u{2192} WAV 352kHz/24bit"),
+            "le DoP est un vrai emballage : l'etage doit rester, avec les \
+             chiffres du fil"
+        );
+    }
+
+    /// Mode 3/3 — TRANSCODÉ en PCM : l'étage est réel, et son libellé aussi.
+    /// C'est le cas témoin du premier test : la même source, le même code, un
+    /// fil différent — et l'étage revient.
+    #[test]
+    fn dsd_transcode_en_pcm_affiche_bien_son_etage() {
+        let (backend, zone) = dlna_zone();
+        let sp = build_signal_path(
+            &dsd128_playing(),
+            &zone,
+            &backend,
+            Some("DMP-A6"),
+            "none",
+            Some(&wire_mime("flac", "audio/flac", 176_400, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcoder_desc(&sp).as_deref(),
+            Some("DSD128 5.6 MHz \u{2192} FLAC 176kHz/24bit"),
+            "une conversion REELLE doit rester visible — supprimer le fantome \
+             ne doit pas rendre le serveur muet sur ce qu'il fait vraiment"
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    }
+
+    /// Aucun réglage de zone ne peut contredire un fil qui porte du DSD brut.
+    /// Le même invariant que `wire_always_wins_over_every_zone_flag_combination`,
+    /// appliqué au DSD : c'est le réglage « LPCM » coché qui aurait ramené un
+    /// « → WAV » sur un fil .dsf.
+    #[test]
+    fn aucun_reglage_de_zone_ne_transcode_un_fil_dsd_brut() {
+        let served = wire_mime("dsf", "application/x-dsd", 5_644_800, 1);
+        for lpcm in [false, true] {
+            for cap16 in [false, true] {
+                for wav24 in [false, true] {
+                    for dsd_mode in ["auto", "native", "dop", "pcm"] {
+                        let (backend, zone) = dlna_zone();
+                        let repo = ZoneRepo::with_backend(backend.clone());
+                        let id = zone.id.unwrap();
+                        repo.update_dlna_lpcm(id, lpcm).unwrap();
+                        repo.update_dlna_cap_16bit(id, cap16).unwrap();
+                        repo.update_dlna_wav24(id, wav24).unwrap();
+                        repo.update_dsd_mode(id, dsd_mode).unwrap();
+                        let zone = repo.get(id).unwrap().unwrap();
+
+                        let sp = build_signal_path(
+                            &dsd128_playing(),
+                            &zone,
+                            &backend,
+                            Some("DMP-A6"),
+                            "none",
+                            Some(&served),
+                        )
+                        .unwrap();
+
+                        assert_eq!(
+                            transcoder_desc(&sp),
+                            None,
+                            "lpcm={lpcm} cap16={cap16} wav24={wav24} \
+                             dsd_mode={dsd_mode} : l'affichage contredit un fil \
+                             qui porte du DSD brut"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Contre-épreuve PERMANENTE du libellé impossible (#1315, point 2).
+    //
+    // Le test ci-dessus protège le chemin ; celui-ci protège la CLASSE. On
+    // injecte de force, dans le formateur d'étage de sortie, la contradiction
+    // exacte qui a produit « FLAC 5644kHz/1bit » — une résolution du domaine
+    // DSD sous chaque nom de conteneur PCM du code. Aucune ne doit pouvoir en
+    // ressortir. Si quelqu'un rétablit un jour le format naïf, ce test casse
+    // en nommant le conteneur fautif.
+    #[test]
+    fn aucun_conteneur_pcm_ne_peut_porter_une_resolution_dsd() {
+        for container in ["FLAC", "WAV", "ALAC", "AAC", "MP3", "AIFF", "Unknown"] {
+            for (sr, bd) in [
+                (5_644_800, 1),  // DSD128 brut, le cas de Stéphane Villerio
+                (2_822_400, 1),  // DSD64
+                (11_289_600, 1), // DSD256
+                (22_579_200, 1), // DSD512
+            ] {
+                let label = output_stage_label(container, sr, bd);
+                assert!(
+                    !label.contains(container),
+                    "injection acceptee : « {label} » — aucun {container} ne \
+                     transporte du {bd} bit a {sr} Hz (#1315)"
+                );
+                assert!(
+                    label.starts_with("DSD"),
+                    "le fil porte du DSD, le libelle doit le dire : {label}"
+                );
+            }
+        }
+    }
+
+    /// L'autre moitié de la contre-épreuve : le garde-fou ne doit pas mordre
+    /// sur du PCM légitime, jusqu'au 768 kHz/32 bits du marché.
+    #[test]
+    fn le_garde_fou_laisse_passer_tout_le_pcm_legitime() {
+        for (sr, bd, attendu) in [
+            (44_100, 16, "FLAC 44kHz/16bit"),
+            (96_000, 24, "FLAC 96kHz/24bit"),
+            (352_800, 24, "FLAC 352kHz/24bit"),
+            (768_000, 32, "FLAC 768kHz/32bit"),
+        ] {
+            assert_eq!(output_stage_label("FLAC", sr, bd), attendu);
+        }
     }
 
     // Sevy, LHC-52: the renderer is served WAV/LPCM (it does not advertise
