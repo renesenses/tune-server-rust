@@ -277,8 +277,12 @@ pub(super) async fn enrich_album_artwork(
     match tune_core::library::artwork::fetch_cover_art(mbid_val).await {
         Some(data) => {
             let cache_dir = artwork_cache_dir();
-            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
-            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            // Adressage par le CONTENU (#1444) : sous `artwork_hash(mbid)`,
+            // deux albums partageant un MBID écrivaient au même endroit et un
+            // ré-enrichissement réécrivait sous une adresse déjà servie
+            // `immutable, max-age=31536000`.
+            if let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
                 repo.update_cover_path(id, &hash).ok();
                 Json(json!({"enriched": true, "hash": hash, "size": data.len(), "mbid": mbid_val}))

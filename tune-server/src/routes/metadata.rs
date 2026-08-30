@@ -2208,8 +2208,12 @@ async fn fetch_album_cover(
     if let Some(ref mbid_val) = mbid {
         if let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await {
             let cache_dir = super::library::artwork_cache_dir();
-            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
-            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            // Adressage par le CONTENU (#1444). Route de RE-téléchargement
+            // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
+            // gardait l'adresse déjà distribuée, servie `immutable,
+            // max-age=31536000` — la nouvelle pochette n'apparaissait pas.
+            if let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
                 repo.force_update_cover_path(id, &hash).ok();
                 return Json(json!({
@@ -2243,12 +2247,32 @@ async fn fetch_album_cover(
         )
         .await
         {
-            // Extract filename as hash or use the path
-            let hash = std::path::Path::new(&path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&path)
-                .to_string();
+            // `fetch_cover_from_discogs` dépose son fichier dans le MÊME
+            // répertoire que le cache de pochettes, mais sous un nom PRÉFIXÉ
+            // (`discogs_{md5}.jpg`), et cette route annonçait le radical
+            // (`discogs_{md5}`) comme `cover_path`. Ce n'est pas un condensat :
+            // `is_hex_hash` le refuse (le souligné n'est pas un hexdigit), donc
+            // la lecture le traitait comme un CHEMIN et cherchait
+            // `md5("discogs_{md5}").jpg` — un fichier qui n'a jamais existé.
+            // Toute pochette trouvée par cette route était écrite puis servie
+            // en 404 (`artwork_cache_miss`). C'est le défaut #2567, et le seul
+            // endroit du dépôt où il subsistait.
+            //
+            // Ré-adressée par le CONTENU (#1444) : le condensat annoncé est
+            // celui des octets, donc toujours servable. Le fichier préfixé
+            // reste sur le disque, orphelin comme les autres (purge : ticket
+            // séparé).
+            let Ok(octets) = std::fs::read(&path) else {
+                return Json(json!({"ok": false, "error": "cover fetched but unreadable"}))
+                    .into_response();
+            };
+            let cache_dir = super::library::artwork_cache_dir();
+            let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&octets, &cache_dir, "jpg")
+            else {
+                return Json(json!({"ok": false, "error": "failed to save to cache"}))
+                    .into_response();
+            };
             repo.force_update_cover_path(id, &hash).ok();
             return Json(json!({
                 "ok": true,
