@@ -19,7 +19,6 @@ on:
 
 permissions:
   contents: read
-  administration: read
 
 jobs:
   audit:
@@ -31,7 +30,12 @@ jobs:
 
       - name: Auditer
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Lire une protection de branche exige des droits d'administration
+          # que `github.token` n'a PAS : l'API rend 403. Si le secret
+          # AUDIT_TOKEN existe (jeton personnel avec `repo`), l'audit vérifie
+          # réellement ; sinon il le DIT au lieu de rendre un vert creux.
+          GH_TOKEN: ${{ secrets.AUDIT_TOKEN || github.token }}
+          JETON_ADMIN: ${{ secrets.AUDIT_TOKEN != '' && 'oui' || 'non' }}
           VERSION: ${{ inputs.version }}
         run: |
           set -uo pipefail
@@ -46,6 +50,12 @@ jobs:
           TOUS="tune-server-rust tune-os tune-web-client tune-server-universal"
 
           echo "=== 1. Protections des dépôts PUBLICS ==="
+          if [ "$JETON_ADMIN" != "oui" ]; then
+            na "AUDIT_TOKEN absent : les protections de branche ne sont PAS lisibles"
+            na "  (github.token n'a pas les droits d'administration — l'API rend 403)"
+            na "  Poser un secret AUDIT_TOKEN pour que cette section vérifie vraiment."
+            PUBLICS=""
+          fi
           for d in $PUBLICS; do
             echo "· renesenses/$d"
             for br in main "rc/v$VERSION"; do
@@ -108,7 +118,9 @@ jobs:
 
           echo
           if [ "$echec" -eq 0 ]; then
-            echo "Audit vert. ⚠️  Rappel : les deux dépôts privés n'ont PAS été vérifiés — GitHub Free ne l'expose pas."
+            echo "Audit vert."
+            echo "⚠️  Rappel : les deux dépôts privés n'ont PAS été vérifiés — GitHub Free ne l'expose pas."
+            [ "$JETON_ADMIN" = "oui" ] || echo "⚠️  Rappel : les protections de branche n'ont PAS été vérifiées — AUDIT_TOKEN absent."
           else
             echo "Audit ROUGE — voir les ❌ ci-dessus."
           fi
