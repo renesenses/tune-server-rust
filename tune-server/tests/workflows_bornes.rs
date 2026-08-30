@@ -232,11 +232,11 @@ fn les_pr_empilees_declenchent_la_ci_rapide() {
 }
 
 #[test]
-fn la_voie_rapide_est_reservee_aux_bases_batch() {
+fn la_voie_rapide_est_reservee_aux_bases_integration() {
     let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
     let profil = fs::read_to_string(racine.join("../scripts/determiner-profil-ci.sh"))
         .expect("scripts/determiner-profil-ci.sh lisible");
-    assert!(profil.contains("batch/*) printf '%s\\n' rapide"));
+    assert!(profil.contains("batch/*|rc/*) printf '%s\\n' rapide"));
     assert!(profil.contains("*) printf '%s\\n' complet"));
     assert!(profil.contains("FORCER_COMPLET"));
 
@@ -249,6 +249,7 @@ fn la_voie_rapide_est_reservee_aux_bases_batch() {
 
     let postgres = workflow("test-postgres.yml");
     assert!(postgres.contains("!startsWith(github.base_ref, 'batch/')"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'rc/')"));
     assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
 }
 
@@ -276,7 +277,7 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(macos.contains("cargo check --package tune-server"));
 
     // Le noyau reste execute sur chaque correctif Rust. Les suites longues et
-    // les deux plateformes ne sont differees que pour une base batch/*.
+    // les deux plateformes ne sont differees que pour une base batch/* ou rc/*.
     for nom in ["fmt", "test", "clippy", "audit", "ffi"] {
         assert!(
             !corps(nom).contains("needs.impact.outputs.full"),

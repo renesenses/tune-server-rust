@@ -23,7 +23,7 @@ profil_ci() {
   fi
 
   case "$base_ref" in
-    batch/*) printf '%s\n' rapide ;;
+    batch/*|rc/*) printf '%s\n' rapide ;;
     *) printf '%s\n' complet ;;
   esac
 }
@@ -48,6 +48,7 @@ autotest() {
 
   # Seule une PR de correctif explicitement dirigee vers un lot est rapide.
   verifier rapide pull_request batch/v0.9-audio false
+  verifier rapide pull_request rc/v0.9.128 false
 
   # L'operateur peut forcer les contrats complets sur un correctif risque.
   verifier complet pull_request batch/v0.9-audio true
