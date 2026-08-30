@@ -1627,7 +1627,7 @@ fn build_signal_path(
     // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
     // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
     // Bebelalu55 #1480). Une seule source pour les deux affichages.
-    let ui_volume = (zone.volume as f64 / 100.0).clamp(0.0, 1.0);
+    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
     let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
@@ -2228,7 +2228,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 if ps.volume > 0.0 {
                     ps.volume
                 } else {
-                    z.volume as f64 / 100.0
+                    z.volume / 100.0
                 },
             );
             let renderer_label = z
@@ -2421,7 +2421,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("repeat".into(), json!(ps.repeat));
                 // #1274 — même paire qu'au-dessus, depuis la même source :
                 // ici la colonne `zones.volume`, arrondie au pour-cent.
-                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume as f64 / 100.0);
+                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume / 100.0);
                 let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
@@ -2820,7 +2820,7 @@ async fn patch_zone(
         ecrire!("fixed_volume", fixed, repo.update_fixed_volume(id, fixed));
         // When enabling fixed_volume, pin volume to 100% in DB and in-memory
         if fixed {
-            repo.update_volume(id, 100).ok();
+            repo.update_volume(id, 100.0).ok();
             state.playback.set_volume(id, 1.0).await;
         }
     }
@@ -3017,7 +3017,7 @@ async fn patch_zone(
                 if let Some(ref did) = z.output_device_id {
                     if let Err(error) = state
                         .orchestrator
-                        .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
+                        .set_volume(id, z.volume / 100.0, Some(did))
                         .await
                     {
                         warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
@@ -4771,7 +4771,7 @@ mod signal_path_tests {
 
     /// Monte une zone locale Windows dont la sonde a publié `reasons`.
     fn local_runtime_zone(
-        volume_percent: i32,
+        volume_percent: f64,
         volume: tune_core::outputs::traits::OutputVolumeState,
         reasons: Vec<OutputSignalReason>,
     ) -> (Zone, ZoneState, std::sync::Arc<dyn DbBackend>) {
@@ -4816,7 +4816,7 @@ mod signal_path_tests {
     #[test]
     fn software_volume_alone_does_not_announce_a_transcode() {
         let (zone, ps, backend) = local_runtime_zone(
-            85,
+            85.0,
             OutputVolumeState::Applied,
             vec![OutputSignalReason::SoftwareVolume],
         );
@@ -4853,7 +4853,7 @@ mod signal_path_tests {
     #[test]
     fn a_second_cause_beside_volume_keeps_the_negative_verdict() {
         let (zone, ps, backend) = local_runtime_zone(
-            85,
+            85.0,
             OutputVolumeState::Applied,
             vec![
                 OutputSignalReason::FloatTransport,
@@ -4874,7 +4874,7 @@ mod signal_path_tests {
     /// l'exemption exige la liste explicite, jamais une liste vide.
     #[test]
     fn an_unexplained_negative_verdict_is_never_upgraded() {
-        let (zone, ps, backend) = local_runtime_zone(85, OutputVolumeState::Applied, vec![]);
+        let (zone, ps, backend) = local_runtime_zone(85.0, OutputVolumeState::Applied, vec![]);
 
         let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
 
@@ -5290,7 +5290,7 @@ mod signal_path_tests {
         let (backend, zone) = dlna_zone();
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = zone.id.unwrap();
-        repo.update_volume(id, 20).unwrap();
+        repo.update_volume(id, 20.0).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
 
         // Copie mémoire périmée : le défaut 0,5 d'un ZoneState jamais resemé.
@@ -5308,7 +5308,7 @@ mod signal_path_tests {
         let (backend, zone) = dlna_zone();
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = zone.id.unwrap();
-        repo.update_volume(id, 100).unwrap();
+        repo.update_volume(id, 100.0).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
 
         let mut ps = alac_hires_playing();
@@ -6151,7 +6151,7 @@ mod patch_zone_deserialize_tests {
             name: "Salon".into(),
             output_type: output_type.map(str::to_string),
             output_device_id: Some("renderer-1".into()),
-            volume: 37,
+            volume: 37.0,
             muted: false,
             online: true,
             gapless_enabled: false,
@@ -6281,7 +6281,7 @@ mod zone_group_tests {
             name: name.to_string(),
             output_type: Some("local".into()),
             output_device_id: device.map(str::to_string),
-            volume: 50,
+            volume: 50.0,
             muted: false,
             online: true,
             gapless_enabled: false,
@@ -6685,7 +6685,7 @@ mod contrat_des_retours_anticipes {
         let id = repo
             .create("Salon", Some("dlna"), Some("uuid:abcd"))
             .unwrap();
-        repo.update_volume(id, 50).unwrap();
+        repo.update_volume(id, 50.0).unwrap();
 
         let v = crate::routes::playback::build_zone_json(&state, id).await;
 

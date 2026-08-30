@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS zones (
     name TEXT NOT NULL,
     output_type TEXT,
     output_device_id TEXT,
-    volume INTEGER DEFAULT 50,
+    -- #2886 : voir migration 047. DOUBLE PRECISION, echelle 0..100.
+    volume DOUBLE PRECISION DEFAULT 50,
     muted SMALLINT DEFAULT 0,
     online SMALLINT DEFAULT 1,
     gapless_enabled SMALLINT DEFAULT 1,

@@ -9384,7 +9384,7 @@ impl PlaybackOrchestrator {
         if zone.as_ref().is_some_and(|z| z.fixed_volume) {
             self.playback.set_volume(zone_id, 1.0).await;
             ZoneRepo::with_backend(self.db.clone())
-                .update_volume(zone_id, 100)
+                .update_volume(zone_id, 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
             return Ok(());
         }
@@ -9441,7 +9441,9 @@ impl PlaybackOrchestrator {
         self.playback.set_volume(zone_id, volume).await;
         self.playback.mark_volume_changed(zone_id).await;
         ZoneRepo::with_backend(self.db.clone())
-            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
+            // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
+            // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
+            .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
             .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
         Ok(())
     }
@@ -13324,7 +13326,7 @@ mod tests {
 
         let persisted = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(persisted.last_position_ms, 0);
-        assert_eq!(persisted.volume, 50);
+        assert_eq!(persisted.volume, 50.0);
         assert!(!persisted.muted);
     }
 
@@ -13393,7 +13395,7 @@ mod tests {
         assert!(!state.muted);
         let persisted = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(persisted.last_position_ms, 0);
-        assert_eq!(persisted.volume, 50);
+        assert_eq!(persisted.volume, 50.0);
         assert!(!persisted.muted);
     }
 
@@ -13662,7 +13664,7 @@ mod tests {
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.8).abs() < f64::EPSILON);
         let zone = zone_repo.get(zone_id).unwrap().unwrap();
-        assert_eq!(zone.volume, 80);
+        assert_eq!(zone.volume, 80.0);
     }
 
     #[tokio::test]

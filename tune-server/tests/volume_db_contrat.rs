@@ -158,35 +158,25 @@ async fn un_reglage_en_db_atteint_sa_cible() {
     );
 }
 
-/// Le volume que le serveur PERSISTE, tel qu'il est aujourd'hui.
+/// #2886 — ce que le serveur PERSISTE se relit **exactement**.
 ///
-/// `zones.volume` est une colonne `INTEGER` 0..100. L'état de lecture, lui,
-/// garde le `f64` exact — d'où deux vues qui ne disent pas la même chose :
+/// `zones.volume` etait une colonne `INTEGER` 0..100 : l'etat de lecture
+/// gardait le `f64` exact, la base l'arrondissait, et les deux vues ne disaient
+/// pas la meme chose des qu'on quittait un multiple de 1 %.
 ///
-/// | surface | source | précision |
+/// | surface | source | precision |
 /// |---|---|---|
-/// | réponse à POST/PUT `…/volume` | la valeur commandée | exacte |
-/// | `GET /zones` et `GET /zones/{id}/status` | état de lecture (`f64`) | exacte |
-/// | `GET /zones/{id}` | colonne `zones.volume` | **arrondie au pour-cent** |
+/// | reponse a POST/PUT `…/volume` | valeur commandee | exacte |
+/// | `GET /zones`, `GET /zones/{id}/status`, WebSocket | etat de lecture (`f64`) | exacte |
+/// | `GET /zones/{id}` et **apres redemarrage** | colonne `zones.volume` | exacte *depuis #2886* |
 ///
-/// L'arrondi coûte au plus 0,09 dB en haut d'échelle, mais 6 dB entre 1 % et
-/// 2 % : le « réglage au dB près » ne survit pas à un redémarrage sous −30 dB.
-/// Le corriger demande de changer le type de la colonne aux QUATRE endroits du
-/// schéma (SQLite neuf, migration SQLite, PG neuf, migration PG) et de relire
-/// chaque `z.volume as f64 / 100.0` — hors périmètre de #1274, et à arbitrer.
-///
-/// Ce test n'excuse pas la limite, il la CLOUE : il exige la valeur exacte que
-/// produit la quantification, pas une tolérance floue. Si quelqu'un change la
-/// résolution de la persistance, ce test rougit et la question se repose.
+/// Ce test exige desormais **l'egalite**, pas une tolerance de quantification.
+/// Contre le code d'avant il rougit des -1 dB (0,891 lineaire → 89 % → -1,01 dB).
 #[tokio::test]
-async fn la_vue_persistee_arrondit_au_pour_cent_limite_connue_et_mesuree() {
+async fn la_vue_persistee_rend_exactement_ce_qui_a_ete_commande() {
     let app = app();
     let id = zone(&app).await;
 
-    let mut pire_ecart: f64 = 0.0;
-    // Jusqu'à −40 dB seulement : c'est 1 %, le dernier cran que la colonne
-    // sait encore représenter. En dessous, elle ne quantifie plus, elle coupe
-    // — voir `sous_moins_quarante_six_db_la_persistance_tombe_au_silence`.
     for n in 0..=40 {
         let cible = -f64::from(n);
         let (status, _) = post(
@@ -197,77 +187,113 @@ async fn la_vue_persistee_arrondit_au_pour_cent_limite_connue_et_mesuree() {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // Ce que la colonne entière peut retenir de cette cible.
-        let lineaire = 10f64.powf(cible / 20.0);
-        let quantifie = (lineaire * 100.0).round() / 100.0;
-        let attendu = db_attendu(quantifie);
-
         let (_, relu) = get(&app, &format!("/api/v1/zones/{id}")).await;
         let relu_db = relu["volume_db"].as_f64().expect("volume_db");
         assert!(
-            presque(relu_db, attendu),
-            "{cible} dB persisté : attendu {attendu} dB (soit {quantifie} linéaire), reçu {relu_db}"
+            presque(relu_db, cible),
+            "{cible} dB persiste : relu {relu_db} dB — la base a bouge le niveau"
         );
-        pire_ecart = pire_ecart.max((attendu - cible).abs());
     }
-
-    // Et l'ampleur du défaut est elle aussi clouée : c'est le chiffre qui
-    // justifie l'arbitrage, il ne doit pas pouvoir enfler en silence.
-    assert!(
-        (1.0..4.0).contains(&pire_ecart),
-        "l'écart maximal de la persistance sur 0..−40 dB a changé : {pire_ecart} dB"
-    );
 }
 
-/// La même colonne entière, poussée jusqu'à son point de rupture.
+/// #2886 — le SEUIL, mesure et non estime : **-46,0205999133 dB**.
 ///
-/// Sous ≈ −46 dB, `round(volume × 100)` vaut **zéro**. Ce n'est plus un
-/// arrondi, c'est une coupure : la zone se rallume muette. Le défaut est
-/// ANTÉRIEUR à #1274 — `POST …/volume {"volume": 0.004}` produisait déjà cela
-/// depuis toujours — mais le réglage en dB le met à portée de doigt, parce que
-/// −48 dB est un réglage plausible pour qui a beaucoup de gain en aval.
+/// L'ecriture d'avant etait `update_volume(id, (v * 100.0).round() as i32)`.
+/// `f64::round` arrondit a l'oppose de zero : l'entier vaut 0 pour tout `v`
+/// **strictement inferieur a 0,005 lineaire**, et 0,005 lineaire vaut
+/// `20*log10(0,005) = -46,0205999133 dB` exactement. Sous ce nombre, la
+/// colonne ne quantifiait plus, elle COUPAIT : la zone se rallumait MUETTE
+/// apres un redemarrage, indiscernable d'un mute volontaire.
 ///
-/// Il n'est PAS corrigé ici : borner la valeur persistée à 1 % changerait le
-/// volume de quelqu'un sans qu'il le demande, et cela relève du même arbitrage
-/// que la résolution de la colonne. Ce test le rend visible et reproductible,
-/// pour que l'arbitrage se fasse sur un fait et non sur une intuition.
+/// Le test descend a -48 dB (le reglage plausible cite par l'issue) puis se
+/// serre autour du seuil des deux cotes.
 #[tokio::test]
-async fn sous_moins_quarante_six_db_la_persistance_tombe_au_silence() {
+async fn sous_le_seuil_mesure_la_zone_reste_audible_apres_persistance() {
     let app = app();
     let id = zone(&app).await;
 
-    let (status, commande) = post(
-        &app,
-        &format!("/api/v1/zones/{id}/volume"),
-        json!({"volume_db": -48.0}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{commande}");
+    // Le seuil lui-meme, en clair : c'est le chiffre qui a identifie la
+    // conversion fautive, il ne doit pas se perdre.
+    const SEUIL_DB: f64 = -46.020_599_913_279_62;
+    assert!((20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12);
 
-    // La commande, elle, est honorée : le son sort bien à −48 dB.
-    assert!(
-        presque(commande["volume_db"].as_f64().expect("volume_db"), -48.0),
-        "la commande doit être exacte — {commande}"
-    );
-    let (_, vivant) = get(&app, &format!("/api/v1/zones/{id}/status")).await;
-    assert!(
-        presque(vivant["volume_db"].as_f64().expect("volume_db"), -48.0),
-        "l'état de lecture doit être exact — {vivant}"
-    );
+    for cible in [
+        -40.0,
+        -46.0,
+        SEUIL_DB + 0.001,
+        SEUIL_DB,
+        SEUIL_DB - 0.001,
+        -48.0,
+        -60.0,
+        -80.0,
+    ] {
+        let (status, commande) = post(
+            &app,
+            &format!("/api/v1/zones/{id}/volume"),
+            json!({ "volume_db": cible }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{commande}");
 
-    // Mais ce qui est écrit en base ne l'est plus : c'est zéro, donc du
-    // silence, donc `null` en dB — indiscernable d'un mute volontaire.
-    let (_, persiste) = get(&app, &format!("/api/v1/zones/{id}")).await;
-    assert_eq!(
-        persiste["volume"],
-        json!(0.0),
-        "la colonne entière tombe à zéro — {persiste}"
-    );
-    assert_eq!(
-        persiste["volume_db"],
-        Value::Null,
-        "et le dB suit honnêtement : silence = null, jamais un plancher — {persiste}"
-    );
+        // La commande est honoree…
+        assert!(
+            presque(commande["volume_db"].as_f64().expect("volume_db"), cible),
+            "commande {cible} dB — {commande}"
+        );
+        // …l'etat de lecture aussi…
+        let (_, vivant) = get(&app, &format!("/api/v1/zones/{id}/status")).await;
+        assert!(
+            presque(vivant["volume_db"].as_f64().expect("volume_db"), cible),
+            "etat de lecture {cible} dB — {vivant}"
+        );
+        // …et la BASE aussi, ce qui est le fond de #2886.
+        let (_, persiste) = get(&app, &format!("/api/v1/zones/{id}")).await;
+        assert_ne!(
+            persiste["volume_db"],
+            Value::Null,
+            "{cible} dB : la base rend `null`, donc du silence — la zone se \
+             rallumerait MUETTE ({persiste})"
+        );
+        assert!(
+            presque(persiste["volume_db"].as_f64().expect("volume_db"), cible),
+            "{cible} dB persiste : {persiste}"
+        );
+        assert!(
+            persiste["volume"].as_f64().expect("volume") > 0.0,
+            "{cible} dB : volume persiste nul — {persiste}"
+        );
+    }
+}
+
+/// Temoin anti-regression #2886 : les volumes USUELS ne bougent pas d'un iota.
+///
+/// Un correctif sur le volume touche le niveau sonore reel. Chacun de ces
+/// reglages est un multiple exact de 1 %, donc l'ancienne colonne entiere les
+/// rendait deja parfaitement : ils doivent sortir EXACTEMENT pareil.
+#[tokio::test]
+async fn les_volumes_usuels_ne_bougent_pas_d_un_iota() {
+    let app = app();
+    let id = zone(&app).await;
+
+    for pour_cent in [
+        0, 1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 99, 100,
+    ] {
+        let lineaire = f64::from(pour_cent) / 100.0;
+        let (status, body) = post(
+            &app,
+            &format!("/api/v1/zones/{id}/volume"),
+            json!({ "volume": lineaire }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, persiste) = get(&app, &format!("/api/v1/zones/{id}")).await;
+        let relu = persiste["volume"].as_f64().expect("volume");
+        assert!(
+            (relu - lineaire).abs() < 1e-12,
+            "{pour_cent} % : persiste {relu} au lieu de {lineaire} — {persiste}"
+        );
+    }
 }
 
 #[tokio::test]

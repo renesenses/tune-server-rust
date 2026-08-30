@@ -60,7 +60,8 @@ DECLARE
     -- streaming link confidence (0.0..1.0)
     ['track_source_links','confidence','double precision','0'],
     -- zones: numeric (non-boolean) settings
-    ['zones','volume','integer','NULL'],
+    -- #2886 : a virgule, pas entier — voir migration 047.
+    ['zones','volume','double precision','NULL'],
     ['zones','sync_delay_ms','integer','0'],
     ['zones','last_position_ms','bigint','0'],
     ['zones','max_sample_rate','integer','NULL'],

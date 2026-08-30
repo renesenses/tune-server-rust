@@ -781,7 +781,7 @@ async fn restore_zone_volumes(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
-                let vol = (zone.volume as f64) / 100.0;
+                let vol = zone.volume / 100.0;
                 if zone.fixed_volume {
                     // Contrat « Volume fixe (bit-perfect) » : 100 % est un
                     // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
@@ -1138,11 +1138,11 @@ async fn resolve_ytdlp(state: &AppState) {
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+        (zone_volume / 100.0).clamp(0.0, 1.0)
     }
 }
 
@@ -1622,7 +1622,7 @@ mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
 
-    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+    fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let repo = ZoneRepo::with_backend(state.backend.clone());
         let id = repo
@@ -1641,7 +1641,7 @@ mod restore_zone_volumes_tests {
     /// d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn fixed_volume_zone_restarts_at_full_scale() {
-        let (state, id) = state_with_zone(100, true);
+        let (state, id) = state_with_zone(100.0, true);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1659,7 +1659,7 @@ mod restore_zone_volumes_tests {
     /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
-        let (state, id) = state_with_zone(100, false);
+        let (state, id) = state_with_zone(100.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1672,11 +1672,11 @@ mod restore_zone_volumes_tests {
     /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
     #[tokio::test]
     async fn memory_agrees_with_db_for_every_stored_level() {
-        for stocke in [0, 20, 55, 99, 100] {
+        for stocke in [0.0, 20.0, 55.0, 99.0, 100.0] {
             let (state, id) = state_with_zone(stocke, false);
             restore_zone_volumes(&state).await;
             let vol = state.playback.get_state(id).await.volume;
-            let attendu = stocke as f64 / 100.0;
+            let attendu = stocke / 100.0;
             assert!(
                 (vol - attendu).abs() < 1e-9,
                 "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
@@ -1691,31 +1691,84 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+    }
+
+    /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
+    ///
+    /// `restore_zone_volumes` est le pont entre la colonne et le son après un
+    /// redémarrage. Avec `zones.volume` en `INTEGER`, tout réglage sous
+    /// **0,005 linéaire — soit −46,0205999133 dB exactement** — était persisté
+    /// à 0 : la zone revenait à zéro, indiscernable d'un mute volontaire.
+    ///
+    /// Ce test balaie les deux côtés du seuil mesuré et exige que le niveau
+    /// restauré soit celui qui a été stocké, à l'ulp près.
+    #[tokio::test]
+    async fn un_volume_sous_le_seuil_mesure_ne_revient_pas_muet() {
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12,
+            "le seuil est 20·log10(0,005)"
+        );
+
+        for cible_db in [-40.0, -46.0, SEUIL_DB, SEUIL_DB - 0.001, -48.0, -60.0] {
+            let lineaire: f64 = 10f64.powf(cible_db / 20.0);
+            let (state, id) = state_with_zone(lineaire * 100.0, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            assert!(
+                vol > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (volume restauré {vol})"
+            );
+            assert!(
+                (vol - lineaire).abs() < 1e-12,
+                "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
+            );
+            // Et le chemin qui atteint vraiment le son dit la même chose.
+            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+        }
+    }
+
+    /// Témoin anti-régression #2886 : les volumes USUELS ne bougent pas d'un
+    /// iota. Multiples exacts de 1 %, donc déjà parfaits avant le correctif.
+    #[tokio::test]
+    async fn les_volumes_usuels_reviennent_identiques() {
+        for pour_cent in [
+            0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 90.0, 99.0, 100.0,
+        ] {
+            let (state, id) = state_with_zone(pour_cent, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = pour_cent / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-12,
+                "{pour_cent} % restauré à {vol} au lieu de {attendu}"
+            );
+        }
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
     #[tokio::test]
     async fn ordinary_volume_is_restored_verbatim() {
-        let (state, id) = state_with_zone(55, false);
+        let (state, id) = state_with_zone(55.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");

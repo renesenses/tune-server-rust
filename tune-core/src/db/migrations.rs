@@ -3197,6 +3197,18 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "listen_history_rang_dans_le_contexte",
         include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
     ),
+    // #2886 — `zones.volume` passe d'INTEGER a DOUBLE PRECISION. Pas de
+    // jumelle SQLite : SQLite est a typage dynamique et l'affinite INTEGER ne
+    // convertit une decimale que si c'est SANS PERTE, donc une base deja
+    // creee stocke deja 0,4 tel quel. PostgreSQL, lui, REFUSE un f64 dans une
+    // colonne integer — sans cette migration, tout reglage de volume echouerait
+    // sur PG. Le test `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer`
+    // tient l'autre moitie de la preuve.
+    (
+        47,
+        "zones_volume_a_virgule",
+        include_str!("../../migrations/postgres/047_zones_volume_a_virgule.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4782,7 +4794,16 @@ mod tests {
         // SQLite 93. Migration de DONNÉES : sans jumelle PG, le préréglage
         // « World Music » garderait « contient folk » sur tout le parc
         // PostgreSQL.
-        assert_eq!(pg_latest_version(), 45, "latest PG migration must be 45");
+        // 46 : `listen_history_rang_dans_le_contexte` (#2441), jumelle de la
+        // SQLite 94. Elle avait été enregistrée sans que cette ligne remonte —
+        // même angle mort qu'en 41 : ce test ne tourne dans AUCUN job, le job
+        // « Test (PostgreSQL) » n'exécutant que `-p tune-server`. On constate
+        // donc les deux ajouts d'un coup.
+        // 47 : `zones_volume_a_virgule` (#2886). `zones.volume` était un
+        // INTEGER : sous 0,005 linéaire (−46,0205999133 dB) la valeur
+        // persistée tombait à 0 et la zone se rallumait MUETTE. PAS de jumelle
+        // SQLite — voir le commentaire de l'entrée 47 dans PG_MIGRATIONS.
+        assert_eq!(pg_latest_version(), 47, "latest PG migration must be 47");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
