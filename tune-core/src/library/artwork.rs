@@ -2527,6 +2527,36 @@ mod tests {
         assert_eq!(nb_fichiers(&cache), 512, "aucune entrée écrasée");
     }
 
+    /// Toute adresse rendue est SERVABLE. C'est ce que le repli Discogs de
+    /// `routes/metadata.rs` ne garantissait pas : `cover_fetcher` dépose son
+    /// fichier dans le même répertoire mais sous un nom PRÉFIXÉ
+    /// (`discogs_{md5}.jpg`), et la route annonçait le radical `discogs_{md5}`
+    /// comme `cover_path`. `is_hex_hash` le refuse — le souligné n'est pas un
+    /// hexdigit — donc la lecture le prenait pour un CHEMIN et cherchait
+    /// `md5("discogs_{md5}").jpg`, un fichier qui n'a jamais existé. Toute
+    /// pochette trouvée par cette route était servie en 404 (#2567).
+    #[test]
+    fn l_adresse_rendue_est_toujours_servable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let h = cache_fetched_image(b"POCHETTE-DISCOGS", &cache, "jpg").unwrap();
+        assert_eq!(h.len(), 64, "la forme qu'is_hex_hash accepte");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            find_cached(&cache, &h).is_some(),
+            "la route doit retrouver le fichier sous l'adresse annoncée"
+        );
+
+        // Le radical préfixé d'avant : ni hexadécimal, ni retrouvable.
+        let radical = format!("discogs_{}", artwork_hash("un-album"));
+        std::fs::write(cache.join(format!("{radical}.jpg")), b"POCHETTE-DISCOGS").unwrap();
+        assert!(!radical.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            find_cached(&cache, &artwork_hash(&radical)).is_none(),
+            "traité comme un chemin par la lecture : 404 garanti"
+        );
+    }
+
     /// `save_embedded_cover` : la même jaquette intégrée à deux pistes
     /// différentes ne peuple le cache que d'une entrée.
     #[test]
