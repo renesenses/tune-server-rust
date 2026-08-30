@@ -1909,6 +1909,28 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
             }
+            // Les paires « ces deux albums ne sont pas des doublons » (#1276)
+            // suivent la même mécanique et la même garde `full_scan_ok` : le
+            // scan est précisément le moment où les rowids d'albums meurent et
+            // renaissent, donc celui où l'arbitrage doit être re-rattaché.
+            match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(d) if d.changed() > 0 || d.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = d.scanned,
+                        relinked = d.relinked,
+                        deduplicated = d.deduplicated,
+                        deleted = d.deleted,
+                        unresolved = d.unresolved,
+                        "post_scan_album_distinct_pairs_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "post_scan_album_distinct_pairs_reconcile_failed")
+                }
+            }
         }
 
         // Backfill embedded cover art for local albums still missing a cover.

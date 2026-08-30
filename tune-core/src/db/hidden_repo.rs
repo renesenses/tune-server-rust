@@ -49,7 +49,7 @@ use tracing::info;
 
 use super::backend::{DbBackend, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
-use super::favorites_reconcile::{ReconcileStats, find_album_by_identity};
+use super::favorites_reconcile::{ReconcileStats, album_live_identity, find_album_by_identity};
 use super::sqlite::SqliteDb;
 
 /// Seul type d'item masquable aujourd'hui. La table en accepte d'autres
@@ -156,20 +156,7 @@ impl HiddenRepo {
     /// Identité vivante (titre, artiste) de l'album, ou `None` s'il n'existe
     /// pas — le masquage d'un id fantôme est refusé plutôt qu'écrit.
     fn album_identity(&self, album_id: i64) -> Result<Option<(String, String)>, String> {
-        let params: [&dyn ToSqlValue; 1] = [&album_id];
-        Ok(self
-            .db
-            .query_one(
-                "SELECT a.title, COALESCE(ar.name, '') FROM albums a \
-                 LEFT JOIN artists ar ON ar.id = a.artist_id WHERE a.id = ?",
-                &params,
-            )?
-            .map(|cols| {
-                (
-                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
-                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                )
-            }))
+        album_live_identity(self.db.as_ref(), album_id)
     }
 
     /// Masque un album. `Ok(false)` = id inconnu (la route rend 404).

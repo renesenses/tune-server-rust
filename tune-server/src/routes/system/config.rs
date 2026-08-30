@@ -1046,6 +1046,8 @@ pub(super) async fn remove_music_dir(
         favoris_non_resolus = r.favoris_non_resolus,
         masques_rerattaches = r.masques_rerattaches,
         masques_non_resolus = r.masques_non_resolus,
+        paires_distinctes_rerattachees = r.paires_distinctes_rerattachees,
+        paires_distinctes_non_resolues = r.paires_distinctes_non_resolues,
         "music_dir_removed_avec_purge — retrait du dossier et suppression de son contenu, \
          explicitement confirmée par l'utilisateur (#2149)."
     );
@@ -1061,6 +1063,8 @@ pub(super) async fn remove_music_dir(
         "favorites_unresolved": r.favoris_non_resolus,
         "hidden_relinked": r.masques_rerattaches,
         "hidden_unresolved": r.masques_non_resolus,
+        "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
+        "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
     })))
 }
@@ -1439,6 +1443,8 @@ pub(crate) struct ResultatPurge {
     favoris_non_resolus: i64,
     masques_rerattaches: i64,
     masques_non_resolus: i64,
+    paires_distinctes_rerattachees: i64,
+    paires_distinctes_non_resolues: i64,
 }
 
 /// **LE** chemin de purge — il n'en existe qu'un.
@@ -1495,6 +1501,18 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
         .unwrap_or_default();
     r.masques_rerattaches = masques.relinked as i64;
     r.masques_non_resolus = masques.unresolved as i64;
+
+    // Même absence de clé étrangère, même règle pour les paires « ces deux
+    // albums ne sont pas des doublons » (#1276) : la purge fait mourir des
+    // `albums.id`, donc des paires deviennent orphelines. `false` = on ne
+    // SUPPRIME jamais un arbitrage ici — le perdre laisserait
+    // `merge-duplicates` fusionner (et supprimer) au prochain passage.
+    let distinctes =
+        tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(state.backend.clone())
+            .reconcile(false)
+            .unwrap_or_default();
+    r.paires_distinctes_rerattachees = distinctes.relinked as i64;
+    r.paires_distinctes_non_resolues = distinctes.unresolved as i64;
 
     r
 }
@@ -1685,6 +1703,8 @@ pub(super) async fn purge_orphan_tracks(
         favoris_non_resolus = r.favoris_non_resolus,
         masques_rerattaches = r.masques_rerattaches,
         masques_non_resolus = r.masques_non_resolus,
+        paires_distinctes_rerattachees = r.paires_distinctes_rerattachees,
+        paires_distinctes_non_resolues = r.paires_distinctes_non_resolues,
         "purge_orphelines_effectuee — suppression explicitement confirmée par l'utilisateur."
     );
 
@@ -1697,6 +1717,8 @@ pub(super) async fn purge_orphan_tracks(
         "favorites_unresolved": r.favoris_non_resolus,
         "hidden_relinked": r.masques_rerattaches,
         "hidden_unresolved": r.masques_non_resolus,
+        "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
+        "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
     }))
     .into_response())
