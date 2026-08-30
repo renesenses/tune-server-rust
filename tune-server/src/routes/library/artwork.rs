@@ -438,6 +438,168 @@ pub(super) fn libelle_phase(phase: Option<&str>) -> &'static str {
     }
 }
 
+/// Clé du réglage où `tune-core` écrit l'avancement fin de l'enrichissement
+/// d'images d'artistes, et identifiant de la tâche de fond correspondante.
+const REGLAGE_AVANCEMENT_IMAGES_ARTISTES: &str = "artist_artwork_enrich_result";
+const TACHE_IMAGES_ARTISTES: &str = "artist_artwork";
+
+/// Le drapeau nu, écrit à côté du réglage détaillé. Personne ne le lit
+/// aujourd'hui, mais il est neutralisé au démarrage comme le réglage détaillé
+/// (`startup::DRAPEAUX_AVANCEMENT_ENRICHISSEMENT`) : le laisser mentir en base
+/// finirait par trouver un lecteur.
+const DRAPEAU_AVANCEMENT_IMAGES_ARTISTES: &str = "artist_artwork_enrich_status";
+
+/// Période de recopie du réglage vers le registre des tâches de fond.
+const PERIODE_SONDAGE_AVANCEMENT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Interrompt la sonde d'avancement dès sa chute — fin normale du travail,
+/// retour anticipé ou panique.
+///
+/// C'est ce garde qui remplace le plafond de tours : la sonde n'a plus besoin
+/// de se limiter d'elle-même puisque plus rien ne peut la laisser tourner seule.
+struct SondeEnCours(tokio::task::JoinHandle<()>);
+
+impl Drop for SondeEnCours {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Recopie l'avancement fin de l'enrichissement d'images d'artistes — écrit par
+/// `tune-core` dans le réglage `artist_artwork_enrich_result` — vers le registre
+/// des tâches de fond, pour que l'indicateur global affiche « Images 340/1183 »
+/// au lieu d'une présence nue.
+///
+/// S'arrête d'elle-même dès que le réglage annonce autre chose que `running`.
+async fn sonder_avancement_images_artistes(
+    bg_tasks: crate::background_tasks::BackgroundTasks,
+    db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db);
+    loop {
+        tokio::time::sleep(PERIODE_SONDAGE_AVANCEMENT).await;
+        let Some(raw) = settings
+            .get(REGLAGE_AVANCEMENT_IMAGES_ARTISTES)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v.get("status").and_then(|s| s.as_str()) != Some("running") {
+            break;
+        }
+        let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
+        let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
+        let detail = libelle_phase(v.get("phase").and_then(|s| s.as_str()));
+        bg_tasks.update_progress(TACHE_IMAGES_ARTISTES, processed, total, detail);
+    }
+}
+
+/// Exécute `travail` en publiant son avancement pendant toute sa durée.
+///
+/// Les deux passes d'images d'artistes — celle des manquantes et la reprise
+/// forcée — enregistrent la même tâche de fond, mais **seule la première
+/// sondait**. La reprise forcée déclarait sa présence puis n'écrivait plus
+/// rien : l'indicateur global restait sur « Récupération forcée des images
+/// d'artistes… », sans compteur, pendant tout le travail. Or c'est la passe la
+/// PLUS longue des deux, puisqu'elle reprend TOUS les artistes et non les seuls
+/// artistes sans image ; c'est précisément celle sur laquelle un testeur conclut
+/// « il ne se passe rien » (#2073, Fuccaro).
+///
+/// Le suivi vit donc ici, en un seul endroit, et les deux passes le partagent.
+///
+/// La sonde ne se plafonne plus à 1200 tours de trois secondes. Ce plafond
+/// valait **une heure**, au-delà de laquelle l'avancement gelait alors que la
+/// passe continuait : sur une bibliothèque non étiquetée la résolution des MBID
+/// coûte à elle seule une seconde par artiste, donc plus d'une heure dès le
+/// millier. La sonde s'arrête maintenant sur ce qui la concerne vraiment — la
+/// fin du travail, par [`SondeEnCours`], ou un réglage qui n'annonce plus
+/// `running`.
+async fn sous_suivi_davancement<F>(
+    bg_tasks: crate::background_tasks::BackgroundTasks,
+    db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    travail: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let _sonde = SondeEnCours(tokio::spawn(sonder_avancement_images_artistes(
+        bg_tasks, db,
+    )));
+    travail.await;
+}
+
+/// Garantit que la passe d'images d'artistes annonce sa fin, quoi qu'il arrive.
+///
+/// Le `phase: "done"` de fin est posé APRÈS la boucle, dans
+/// `tune_core::library::artwork::batch_enrich_artist_artwork_inner`. Deux
+/// sorties le sautent : le retour anticipé quand la liste d'artistes est
+/// illisible (`batch_artist_artwork_list_failed`), et une panique de la tâche.
+/// Le réglage affirme alors `running` pour toujours.
+///
+/// Pour la reprise FORCÉE, ce `phase === 'done'` est le **seul** signal de fin
+/// qui existe : `SettingsView.svelte` écarte volontairement
+/// `artists_without_image === 0` comme condition d'arrêt de cette passe — elle
+/// reprend précisément des artistes qui « ont » déjà une image, donc ce nombre
+/// vaut zéro d'un bout à l'autre. Sans fin annoncée, son bandeau reste ouvert
+/// jusqu'au plafond de sécurité de trente minutes, puis annonce une réussite
+/// qui n'a pas eu lieu (#2073).
+///
+/// Même geste que [`FinDeReprise`] pour les pochettes, et **même réécriture**
+/// que `startup::avancement_interrompu` au démarrage : une seule règle, deux
+/// déclencheurs — la tâche s'arrête, ou le processus redémarre. Les compteurs
+/// sont conservés : « interrompu à 340 / 1183 » se comprend.
+///
+/// Sur le chemin normal, c'est un non-geste : la boucle a déjà écrit
+/// `status: "done"`, et `avancement_interrompu` ne touche que du `running`.
+struct FinDePasseArtistes {
+    settings: tune_core::db::settings_repo::SettingsRepo,
+}
+
+impl FinDePasseArtistes {
+    fn nouvelle(db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Self {
+        Self {
+            settings: tune_core::db::settings_repo::SettingsRepo::with_backend(db),
+        }
+    }
+}
+
+impl Drop for FinDePasseArtistes {
+    fn drop(&mut self) {
+        rendre_la_main_si_la_passe_n_a_pas_annonce_sa_fin(&self.settings);
+    }
+}
+
+/// La réécriture portée par [`FinDePasseArtistes`], hors du `Drop` pour être
+/// éprouvable directement.
+fn rendre_la_main_si_la_passe_n_a_pas_annonce_sa_fin(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+) {
+    if let Ok(Some(brut)) = settings.get(REGLAGE_AVANCEMENT_IMAGES_ARTISTES)
+        && let Some((neuf, traite, total)) = crate::startup::avancement_interrompu(&brut)
+    {
+        match settings.set(REGLAGE_AVANCEMENT_IMAGES_ARTISTES, &neuf) {
+            Ok(()) => tracing::info!(
+                traite,
+                total,
+                "images_artistes_passe_marquee_interrompue — la tâche s'est arrêtée sans écrire sa fin ; le bandeau du client est rendu à l'utilisateur"
+            ),
+            Err(e) => tracing::warn!(error = %e, "images_artistes_fin_interrompue_echec"),
+        }
+    }
+
+    // Le drapeau nu suit le même sort qu'au démarrage : `running` sans passe
+    // vivante est un mensonge en base.
+    if let Ok(Some(v)) = settings.get(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES)
+        && v == "running"
+        && let Err(e) = settings.set(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES, "interrupted")
+    {
+        tracing::warn!(error = %e, "images_artistes_drapeau_interrompu_echec");
+    }
+}
+
 pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -465,16 +627,18 @@ pub(super) async fn batch_enrich_artist_artwork(
 
     // Store initial status
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    settings.set("artist_artwork_enrich_status", "running").ok();
+    settings
+        .set(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES, "running")
+        .ok();
     settings
         .set(
-            "artist_artwork_enrich_result",
+            REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
             &json!({"total": sans_image.total(), "enriched": 0, "without_mbid": without_mbid, "status": "running"}).to_string(),
         )
         .ok();
 
     let task_guard = state.background_tasks.begin(
-        "artist_artwork",
+        TACHE_IMAGES_ARTISTES,
         "Récupération des images d'artistes…",
         "enrichment",
     );
@@ -483,39 +647,19 @@ pub(super) async fn batch_enrich_artist_artwork(
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
 
-        // Mirror the enrichment's granular progress (written to the
-        // `artist_artwork_enrich_result` setting by the two phases) into the
-        // background-tasks registry, so the global indicator shows e.g.
-        // "MusicBrainz 340/1183" instead of a bare "in progress" (grafts the
-        // per-artist detail onto the presence-only task).
-        let progress_poller = tokio::spawn(async move {
-            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(poll_db);
-            for _ in 0..1200u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                let Some(raw) = settings.get("artist_artwork_enrich_result").ok().flatten() else {
-                    continue;
-                };
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
-                if v.get("status").and_then(|s| s.as_str()) != Some("running") {
-                    break;
-                }
-                let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
-                let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
-                let detail = libelle_phase(v.get("phase").and_then(|s| s.as_str()));
-                bg_tasks.update_progress("artist_artwork", processed, total, detail);
-            }
-        });
+        // La fin doit être annoncée quoi qu'il arrive : le `phase: "done"` de
+        // `tune-core` est posé APRÈS la boucle et deux sorties le sautent.
+        let _fin = FinDePasseArtistes::nouvelle(poll_db.clone());
 
-        // Phase 1: Match artists without MBID by searching MusicBrainz
-        let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
-        tracing::info!(matched, "batch_artist_mbid_phase_complete");
+        sous_suivi_davancement(bg_tasks, poll_db, async move {
+            // Phase 1: Match artists without MBID by searching MusicBrainz
+            let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
+            tracing::info!(matched, "batch_artist_mbid_phase_complete");
 
-        // Phase 2: Fetch images for all artists with MBID but no image
-        tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
-
-        progress_poller.abort();
+            // Phase 2: Fetch images for all artists with MBID but no image
+            tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
+        })
+        .await;
     });
 
     (
@@ -569,26 +713,41 @@ pub(super) async fn force_refetch_artist_artwork(
         .len();
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    settings.set("artist_artwork_enrich_status", "running").ok();
+    settings
+        .set(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES, "running")
+        .ok();
     settings
         .set(
-            "artist_artwork_enrich_result",
+            REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
             &json!({"total": total_artists, "enriched": 0, "status": "running", "force": true})
                 .to_string(),
         )
         .ok();
 
     let task_guard = state.background_tasks.begin(
-        "artist_artwork",
+        TACHE_IMAGES_ARTISTES,
         "Récupération forcée des images d'artistes…",
         "enrichment",
     );
+    let bg_tasks = state.background_tasks.clone();
+    let poll_db = state.backend.clone();
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
-        // Phase 1: ensure MBIDs are matched, then force re-fetch everyone.
-        let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
-        tracing::info!(matched, "force_artist_mbid_phase_complete");
-        tune_core::library::artwork::batch_refetch_artist_artwork(db, cache_dir).await;
+
+        // La reprise forcée n'a AUCUN autre signal de fin que celui-ci : le
+        // client écarte volontairement `artists_without_image === 0` comme
+        // condition d'arrêt pour cette passe. Voir [`FinDePasseArtistes`].
+        let _fin = FinDePasseArtistes::nouvelle(poll_db.clone());
+
+        // Même suivi que la passe des manquantes : sans lui, la reprise forcée
+        // ne publiait QUE sa présence (#2073).
+        sous_suivi_davancement(bg_tasks, poll_db, async move {
+            // Phase 1: ensure MBIDs are matched, then force re-fetch everyone.
+            let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
+            tracing::info!(matched, "force_artist_mbid_phase_complete");
+            tune_core::library::artwork::batch_refetch_artist_artwork(db, cache_dir).await;
+        })
+        .await;
     });
 
     (
@@ -602,12 +761,500 @@ pub(super) async fn force_refetch_artist_artwork(
         .into_response()
 }
 
+/// Le suivi d'avancement partagé par les deux passes d'images d'artistes.
+///
+/// Aucun de ces essais ne touche à Discogs, Last.fm, MusicBrainz ni au dépôt
+/// communautaire : le « travail » est fourni par l'essai lui-même et se contente
+/// d'écrire dans le réglage, exactement comme `tune-core` le fait.
+#[cfg(test)]
+mod tests_suivi_avancement_images_artistes {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::event_bus::EventBus;
+
+    use crate::background_tasks::BackgroundTasks;
+
+    fn base_memoire() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn registre() -> BackgroundTasks {
+        BackgroundTasks::new(Arc::new(EventBus::new()))
+    }
+
+    /// Ce que l'indicateur global affiche : `None` quand la tâche n'annonce que
+    /// sa présence, sans compteur.
+    fn avancement_affiche(taches: &BackgroundTasks) -> Option<(u64, u64, String)> {
+        taches
+            .snapshot()
+            .into_iter()
+            .find(|t| t.id == TACHE_IMAGES_ARTISTES)
+            .and_then(|t| t.progress)
+            .map(|p| (p.processed, p.total, p.detail))
+    }
+
+    /// Ce qu'écrit `tune-core` au fil de la passe des images.
+    fn ecrire_avancement(settings: &SettingsRepo, traites: u64, total: u64) {
+        settings
+            .set(
+                REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                &json!({
+                    "status": "running",
+                    "phase": "images",
+                    "processed": traites,
+                    "total": total,
+                })
+                .to_string(),
+            )
+            .unwrap();
+    }
+
+    /// Le défaut de #2073 : la reprise forcée enregistrait sa tâche et n'y
+    /// attachait plus jamais le moindre compteur. L'indicateur global restait
+    /// sur son libellé seul pendant toute la passe — la plus longue des deux,
+    /// puisqu'elle reprend TOUS les artistes.
+    ///
+    /// L'essai observe la suite exacte de ce qu'un écran aurait vue.
+    #[tokio::test(start_paused = true)]
+    async fn la_passe_forcee_publie_son_avancement_pendant_le_travail() {
+        let db = base_memoire();
+        let taches = registre();
+        let _tache = taches.begin(
+            TACHE_IMAGES_ARTISTES,
+            "Récupération forcée des images d'artistes…",
+            "enrichment",
+        );
+
+        // Au départ : présence seule, aucun compteur. C'est l'état où la
+        // reprise forcée restait bloquée du début à la fin.
+        assert_eq!(
+            avancement_affiche(&taches),
+            None,
+            "une tâche fraîchement enregistrée n'annonce que sa présence"
+        );
+
+        let settings = SettingsRepo::with_backend(db.clone());
+        let vues = Arc::new(Mutex::new(Vec::new()));
+        let observateur = taches.clone();
+        let journal = vues.clone();
+
+        sous_suivi_davancement(taches.clone(), db.clone(), async move {
+            for traites in [5u64, 10, 15] {
+                ecrire_avancement(&settings, traites, 15);
+                // Plus d'une période de sondage : la sonde a le temps de lire.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                journal
+                    .lock()
+                    .unwrap()
+                    .push(avancement_affiche(&observateur));
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *vues.lock().unwrap(),
+            vec![
+                Some((5, 15, "Images".to_string())),
+                Some((10, 15, "Images".to_string())),
+                Some((15, 15, "Images".to_string())),
+            ],
+            "l'indicateur doit suivre le travail, pas rester sur la présence"
+        );
+    }
+
+    /// La sonde se plafonnait à 1200 tours de trois secondes, soit une heure :
+    /// au-delà, l'avancement gelait alors que la passe continuait. Une reprise
+    /// forcée sur une bibliothèque non étiquetée dépasse l'heure dès le millier
+    /// d'artistes — une seconde chacun rien que pour résoudre les MBID.
+    #[tokio::test(start_paused = true)]
+    async fn le_suivi_ne_gele_plus_apres_une_heure() {
+        let db = base_memoire();
+        let taches = registre();
+        let _tache = taches.begin(TACHE_IMAGES_ARTISTES, "Reprise forcée…", "enrichment");
+
+        let settings = SettingsRepo::with_backend(db.clone());
+        let observateur = taches.clone();
+        let apres = Arc::new(Mutex::new(None));
+        let journal = apres.clone();
+
+        sous_suivi_davancement(taches.clone(), db.clone(), async move {
+            ecrire_avancement(&settings, 1, 1000);
+            // Au-delà des 1200 tours de 3 s de l'ancien plafond.
+            tokio::time::sleep(Duration::from_secs(4000)).await;
+            ecrire_avancement(&settings, 900, 1000);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            *journal.lock().unwrap() = avancement_affiche(&observateur);
+        })
+        .await;
+
+        assert_eq!(
+            *apres.lock().unwrap(),
+            Some((900, 1000, "Images".to_string())),
+            "après une heure de travail l'avancement doit encore suivre, pas rester figé sur 1/1000"
+        );
+    }
+
+    /// Ce qui rend le retrait du plafond sans danger : la sonde s'arrête d'un
+    /// réglage qui n'annonce plus `running`, en plus de l'interruption à la fin
+    /// du travail. Sans cette sortie, une boucle sans plafond survivrait à la
+    /// passe qu'elle observe.
+    #[tokio::test(start_paused = true)]
+    async fn la_sonde_s_arrete_des_que_la_passe_n_est_plus_en_cours() {
+        let db = base_memoire();
+        let taches = registre();
+        let _tache = taches.begin(TACHE_IMAGES_ARTISTES, "Reprise forcée…", "enrichment");
+
+        let settings = SettingsRepo::with_backend(db.clone());
+        let observateur = taches.clone();
+        let apres = Arc::new(Mutex::new(None));
+        let journal = apres.clone();
+
+        sous_suivi_davancement(taches.clone(), db.clone(), async move {
+            ecrire_avancement(&settings, 7, 10);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // La passe se termine : le réglage n'annonce plus `running`.
+            settings
+                .set(
+                    REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                    &json!({"status": "done", "phase": "done", "total": 10, "enriched": 7})
+                        .to_string(),
+                )
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Une passe SUIVANTE écrit son propre avancement. La sonde de la
+            // passe terminée ne doit plus rien en recopier.
+            ecrire_avancement(&settings, 999, 999);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            *journal.lock().unwrap() = avancement_affiche(&observateur);
+        })
+        .await;
+
+        assert_eq!(
+            *apres.lock().unwrap(),
+            Some((7, 10, "Images".to_string())),
+            "la sonde arrêtée ne doit plus publier l'avancement d'une autre passe"
+        );
+    }
+}
+
+/// La fin annoncée de la passe d'images d'artistes.
+///
+/// Aucun de ces essais ne touche à Discogs, Last.fm, MusicBrainz ni au dépôt
+/// communautaire : la « passe » est fournie par l'essai lui-même et n'écrit que
+/// dans le réglage, exactement comme `tune-core` le fait.
+#[cfg(test)]
+mod tests_fin_de_passe_images_artistes {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn base_memoire() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn lire(settings: &SettingsRepo) -> Value {
+        serde_json::from_str(
+            &settings
+                .get(REGLAGE_AVANCEMENT_IMAGES_ARTISTES)
+                .unwrap()
+                .expect("le réglage d'avancement doit exister"),
+        )
+        .expect("le réglage doit rester du JSON lisible")
+    }
+
+    /// La condition d'arrêt du client pour la reprise FORCÉE, telle que
+    /// `SettingsView.svelte` la lit : `phase === 'done'`. Écrite ici pour que
+    /// l'essai porte sur ce que l'écran voit, pas sur un champ voisin.
+    fn le_client_voit_la_fin(settings: &SettingsRepo) -> bool {
+        lire(settings)
+            .get("phase")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| p == "done")
+    }
+
+    /// Ce que la route écrit au lancement de la reprise forcée : ni `phase`, ni
+    /// `processed` — seulement le total annoncé et `running`.
+    fn passe_forcee_lancee(settings: &SettingsRepo, total: u64) {
+        settings
+            .set(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES, "running")
+            .unwrap();
+        settings
+            .set(
+                REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                &json!({"total": total, "enriched": 0, "status": "running", "force": true})
+                    .to_string(),
+            )
+            .unwrap();
+    }
+
+    /// LE défaut. La reprise forcée s'arrête en cours de route — liste
+    /// d'artistes illisible, panique de la tâche — donc `tune-core` n'atteint
+    /// jamais le `phase: "done"` posé APRÈS la boucle. Or c'est le seul signal
+    /// de fin dont dispose le client pour cette passe : `artists_without_image`
+    /// vaut zéro d'un bout à l'autre par construction. Sans fin annoncée, le
+    /// bandeau reste ouvert trente minutes puis annonce une réussite qui n'a pas
+    /// eu lieu (#2073).
+    #[tokio::test]
+    async fn la_fin_est_annoncee_meme_si_la_passe_forcee_s_arrete_en_cours_de_route() {
+        let db = base_memoire();
+        let settings = SettingsRepo::with_backend(db.clone());
+        passe_forcee_lancee(&settings, 1183);
+
+        {
+            let _fin = FinDePasseArtistes::nouvelle(db.clone());
+            // La passe a travaillé, puis s'est arrêtée sans écrire sa fin.
+            settings
+                .set(
+                    REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                    &json!({
+                        "status": "running",
+                        "phase": "images",
+                        "processed": 340,
+                        "total": 1183,
+                        "enriched": 12,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            // On sort du bloc sans que la boucle soit allée au bout.
+        }
+
+        assert!(
+            le_client_voit_la_fin(&settings),
+            "sans `phase: \"done\"`, le bandeau de la reprise forcée ne se referme jamais"
+        );
+        let apres = lire(&settings);
+        assert_eq!(
+            apres["status"], "interrupted",
+            "et il ne ment pas sur l'issue"
+        );
+        assert_eq!(
+            apres["processed"], 340,
+            "« interrompu à 340/1183 » se comprend ; un compteur effacé ne dirait plus rien"
+        );
+        assert_eq!(apres["total"], 1183);
+        assert_eq!(
+            settings
+                .get(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES)
+                .unwrap()
+                .as_deref(),
+            Some("interrupted"),
+            "le drapeau nu ne doit pas rester à `running` sans passe vivante"
+        );
+    }
+
+    /// Le cas le plus traître : la tâche s'arrête AVANT d'avoir traité le
+    /// moindre artiste — c'est très exactement le retour anticipé
+    /// `batch_artist_artwork_list_failed`. Le réglage est alors resté celui que
+    /// la route a écrit : ni `phase`, ni `processed`. Rien ne bougeant jamais,
+    /// le client n'a aucun moyen de distinguer cet état d'une passe qui démarre.
+    #[tokio::test]
+    async fn la_fin_est_annoncee_meme_si_la_passe_forcee_n_a_rien_traite() {
+        let db = base_memoire();
+        let settings = SettingsRepo::with_backend(db.clone());
+        passe_forcee_lancee(&settings, 1183);
+
+        drop(FinDePasseArtistes::nouvelle(db.clone()));
+
+        assert!(
+            le_client_voit_la_fin(&settings),
+            "une passe morte au premier geste doit rendre la main comme les autres"
+        );
+        assert_eq!(lire(&settings)["status"], "interrupted");
+    }
+
+    /// Contre-épreuve du témoin : sur le chemin NORMAL, `tune-core` a déjà écrit
+    /// sa fin. Le garde doit être un non-geste — surtout ne pas repeindre en
+    /// « interrompu » une passe qui est allée au bout, ni toucher aux comptes
+    /// qu'elle annonce.
+    #[tokio::test]
+    async fn une_passe_allee_au_bout_n_est_pas_repeinte_en_interrompue() {
+        let db = base_memoire();
+        let settings = SettingsRepo::with_backend(db.clone());
+        passe_forcee_lancee(&settings, 900);
+
+        {
+            let _fin = FinDePasseArtistes::nouvelle(db.clone());
+            settings
+                .set(
+                    REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                    &json!({
+                        "status": "done",
+                        "phase": "done",
+                        "total": 900,
+                        "enriched": 137,
+                        "failed": 763,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+
+        let apres = lire(&settings);
+        assert_eq!(
+            apres["status"], "done",
+            "la fin normale reste une fin normale"
+        );
+        assert_eq!(apres["enriched"], 137, "et son bilan n'est pas réécrit");
+        assert_eq!(apres["failed"], 763);
+    }
+
+    /// Le garde et la sonde vivent dans la même tâche, et l'ORDRE compte : la
+    /// sonde doit être arrêtée avant que la fin soit écrite, sinon elle peut
+    /// republier un `running` par-dessus. C'est l'assemblage exact des deux
+    /// routes qui est éprouvé ici, pas chaque pièce séparément.
+    #[tokio::test(start_paused = true)]
+    async fn assemblee_comme_dans_la_route_la_passe_interrompue_annonce_sa_fin() {
+        use crate::background_tasks::BackgroundTasks;
+        use tune_core::event_bus::EventBus;
+
+        let db = base_memoire();
+        let settings = SettingsRepo::with_backend(db.clone());
+        passe_forcee_lancee(&settings, 50);
+
+        let taches = BackgroundTasks::new(Arc::new(EventBus::new()));
+        let garde = taches.begin(TACHE_IMAGES_ARTISTES, "Reprise forcée…", "enrichment");
+
+        // Le corps de `force_refetch_artist_artwork`, à l'identique.
+        {
+            let _task_guard = garde;
+            let _fin = FinDePasseArtistes::nouvelle(db.clone());
+            let ecrivain = SettingsRepo::with_backend(db.clone());
+            sous_suivi_davancement(taches.clone(), db.clone(), async move {
+                ecrivain
+                    .set(
+                        REGLAGE_AVANCEMENT_IMAGES_ARTISTES,
+                        &json!({
+                            "status": "running",
+                            "phase": "images",
+                            "processed": 5,
+                            "total": 50,
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // La passe s'arrête ici, sans écrire sa fin.
+            })
+            .await;
+        }
+
+        assert!(
+            le_client_voit_la_fin(&settings),
+            "la sonde s'arrête, PUIS la fin est écrite — et elle reste écrite"
+        );
+        assert_eq!(lire(&settings)["processed"], 5);
+    }
+}
+
+/// Le CÂBLAGE, pas seulement les pièces.
+///
+/// Les essais ci-dessus assemblent le suivi et le garde de fin à la main : ils
+/// prouvent que les deux pièces marchent, et resteraient verts si une route
+/// cessait de les monter. Vérifié : retirer `FinDePasseArtistes::nouvelle` de
+/// `force_refetch_artist_artwork` ne faisait rougir aucun d'eux. Ce garde-là
+/// lit le corps des deux routes et exige qu'elles montent les deux pièces —
+/// c'est le seul contrôle que la dégradation « la route ne câble plus rien »
+/// fasse tomber.
+///
+/// Une route d'enrichissement ne peut pas être éprouvée en l'appelant : elle
+/// part interroger MusicBrainz, Discogs et Last.fm. La source est donc lue.
+#[cfg(test)]
+mod garde_cablage_des_routes_images_artistes {
+    /// Le corps d'une fonction de ce fichier, bornes comprises.
+    ///
+    /// ⚠️ La découpe est ce qui empêche ce garde de se trouver lui-même :
+    /// `include_str!` rend le fichier ENTIER, modules de test compris, et les
+    /// motifs cherchés y figurent mot pour mot. Un `contains` sur le fichier
+    /// complet rendrait vrai quoi qu'il arrive (#2082).
+    fn corps_de(nom: &str) -> &'static str {
+        const TOUT: &str = include_str!("artwork.rs");
+        let entete = format!("pub(super) async fn {nom}(");
+        let debut = TOUT
+            .find(&entete)
+            .unwrap_or_else(|| panic!("route `{nom}` introuvable : ce garde ne protège plus rien"));
+        // L'accolade fermante en colonne zéro : les accolades imbriquées d'un
+        // corps de fonction sont toutes indentées.
+        let fin = TOUT[debut..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("fin de `{nom}` introuvable"));
+        &TOUT[debut..debut + fin]
+    }
+
+    /// Témoin de la découpe. Sans lui, un `corps_de` qui rendrait une tranche
+    /// vide ou fausse ferait passer les deux contrôles suivants pour rien.
+    #[test]
+    fn la_decoupe_rend_bien_le_corps_des_deux_routes() {
+        assert!(
+            corps_de("force_refetch_artist_artwork")
+                .contains("forced artist artwork re-fetch started"),
+            "la tranche ne contient pas la réponse de la reprise forcée"
+        );
+        assert!(
+            corps_de("batch_enrich_artist_artwork").contains("batch artist enrichment started"),
+            "la tranche ne contient pas la réponse de la passe des manquantes"
+        );
+        assert!(
+            !corps_de("force_refetch_artist_artwork").contains("batch artist enrichment started"),
+            "la découpe déborde sur la route voisine : elle ne distingue plus rien"
+        );
+    }
+
+    /// #2073. La reprise forcée déclarait sa présence dans le registre des
+    /// tâches de fond et n'y attachait plus jamais le moindre compteur :
+    /// l'indicateur global restait sur « Récupération forcée des images
+    /// d'artistes… », sans fraction, pendant toute la passe — la plus longue
+    /// des deux, puisqu'elle reprend TOUS les artistes.
+    #[test]
+    fn les_deux_routes_publient_leur_avancement() {
+        for route in [
+            "force_refetch_artist_artwork",
+            "batch_enrich_artist_artwork",
+        ] {
+            assert!(
+                corps_de(route).contains("sous_suivi_davancement("),
+                "`{route}` ne monte plus le suivi d'avancement : l'indicateur global \
+                 n'affichera qu'une présence nue, sans compteur"
+            );
+        }
+    }
+
+    /// La fin annoncée. Le `phase: \"done\"` de `tune-core` est posé APRÈS la
+    /// boucle ; une passe qui s'arrête avant ne l'écrit jamais, et pour la
+    /// reprise forcée c'est le SEUL signal de fin que le client possède.
+    #[test]
+    fn les_deux_routes_garantissent_une_fin_annoncee() {
+        for route in [
+            "force_refetch_artist_artwork",
+            "batch_enrich_artist_artwork",
+        ] {
+            assert!(
+                corps_de(route).contains("FinDePasseArtistes::nouvelle("),
+                "`{route}` n'installe plus le garde de fin : une passe interrompue \
+                 laisserait le bandeau du client ouvert pour toujours"
+            );
+        }
+    }
+}
+
 pub(super) async fn batch_enrich_artist_artwork_status(
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let result = settings
-        .get("artist_artwork_enrich_result")
+        .get(REGLAGE_AVANCEMENT_IMAGES_ARTISTES)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());

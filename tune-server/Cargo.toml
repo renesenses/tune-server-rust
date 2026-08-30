@@ -99,6 +99,12 @@ chrono = { workspace = true }
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+# Test-only : `#[tokio::test(start_paused = true)]`. La sonde d'avancement des
+# images d'artistes se relit toutes les trois secondes et la passe qu'elle
+# observe dure des heures — sans horloge virtuelle, l'éprouver coûterait ce
+# temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
+# que dans les cibles de test : le binaire publié ne le compile pas.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "server_contracts"
