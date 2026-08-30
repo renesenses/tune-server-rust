@@ -4,6 +4,15 @@ name: Trigger OS image builds
 # workflow en parallèle de Release : le futur orchestrateur l'appellera avec
 # une version exacte après validation des actifs obligatoires.
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Tune version (X.Y.Z, sans v)"
+        required: true
+        type: string
+    secrets:
+      TUNE_OS_DISPATCH_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       version:
@@ -14,6 +23,7 @@ on:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     if: ${{ !contains(inputs.version, '-') }}
     steps:
       - uses: actions/checkout@v4
@@ -35,23 +45,105 @@ jobs:
           PLAN=".release/v$V.json"
           test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
           OS_SHA="$(jq -r '.components.os.sha' "$PLAN")"
+          OS_TAG="$(jq -r '.components.os.tag' "$PLAN")"
           [[ "$OS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA OS invalide"; exit 1; }
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "os_sha=$OS_SHA" >> "$GITHUB_OUTPUT"
+          [ "$OS_TAG" = "tune-os-rpi-v$V" ] || { echo "::error::tag OS invalide"; exit 1; }
+          {
+            echo "version=$V"
+            echo "os_sha=$OS_SHA"
+            echo "os_tag=$OS_TAG"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch to OS-image repos
+      - name: Lire les checksums serveur attestes
+        id: sums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" --pattern SHA256SUMS --output /tmp/SHA256SUMS --clobber
+          checksum() {
+            local asset="$1"
+            awk -v wanted="$asset" '{ name=$2; sub(/^.*\//, "", name); if (name == wanted) print $1 }' /tmp/SHA256SUMS
+          }
+          X86="$(checksum "tune-server-v$VERSION-linux-x86_64.tar.gz")"
+          ARM="$(checksum "tune-server-v$VERSION-linux-aarch64.tar.gz")"
+          [[ "$X86" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum linux-x86_64 absent"; exit 1; }
+          [[ "$ARM" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum linux-aarch64 absent"; exit 1; }
+          echo "x86=$X86" >> "$GITHUB_OUTPUT"
+          echo "arm=$ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Creer ou verifier la release OS de staging
+        env:
+          TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+          OS_SHA: ${{ steps.v.outputs.os_sha }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+        run: |
+          set -euo pipefail
+          [ -n "$TOKEN" ] || { echo "::error::TUNE_OS_DISPATCH_TOKEN absent"; exit 1; }
+          TAG_SHA="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/git/ref/tags/$OS_TAG" --jq .object.sha)"
+          [ "$TAG_SHA" = "$OS_SHA" ] || { echo "::error::$OS_TAG pointe sur $TAG_SHA, attendu $OS_SHA"; exit 1; }
+          if RELEASE="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" 2>/dev/null)"; then
+            [ "$(jq -r .draft <<<"$RELEASE")" = true ] || { echo "::error::release OS deja publique"; exit 1; }
+          else
+            GH_TOKEN="$TOKEN" gh api --method POST repos/renesenses/tune-os/releases \
+              -f tag_name="$OS_TAG" -f target_commitish="$OS_SHA" \
+              -f name="Tune OS v${{ steps.v.outputs.version }}" -F draft=true >/dev/null
+          fi
+
+      - name: Dispatcher et attendre les trois builds OS
         env:
           TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
           OS_SHA: ${{ steps.v.outputs.os_sha }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+          X86_SHA256: ${{ steps.sums.outputs.x86 }}
+          ARM_SHA256: ${{ steps.sums.outputs.arm }}
         run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::TUNE_OS_DISPATCH_TOKEN absent"
-            exit 1
-          fi
+          set -euo pipefail
+          STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PAYLOAD="$(jq -n \
+            --arg version "$VERSION" --arg os_sha "$OS_SHA" --arg os_tag "$OS_TAG" \
+            --arg x86 "$X86_SHA256" --arg arm "$ARM_SHA256" \
+            '{event_type:"tune-release",client_payload:{version:$version,os_sha:$os_sha,os_tag:$os_tag,server_sha256_x86_64:$x86,server_sha256_aarch64:$arm}}')"
           echo "→ repository_dispatch tune-release to renesenses/tune-os for v$VERSION"
           curl -fsS -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/renesenses/tune-os/dispatches" \
-            -d "{\"event_type\":\"tune-release\",\"client_payload\":{\"version\":\"$VERSION\",\"os_sha\":\"$OS_SHA\"}}"
+            -d "$PAYLOAD"
+
+          wait_workflow() {
+            local workflow="$1" status conclusion url
+            for _ in $(seq 1 700); do
+              IFS=$'\t' read -r status conclusion url < <(
+                GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/actions/workflows/$workflow/runs?event=repository_dispatch&per_page=20" \
+                  --jq ".workflow_runs | map(select(.created_at >= \"$STARTED_AT\")) | sort_by(.created_at) | last | [.status, (.conclusion // \"\"), .html_url] | @tsv"
+              )
+              if [ "$status" = completed ]; then
+                [ "$conclusion" = success ] || { echo "::error::$workflow: $conclusion ($url)"; return 1; }
+                echo "$workflow: success ($url)"
+                return 0
+              fi
+              sleep 30
+            done
+            echo "::error::$workflow n'a pas termine dans les 350 minutes"
+            return 1
+          }
+
+          wait_workflow build-iso.yml & P1=$!
+          wait_workflow build-rpi-image.yml & P2=$!
+          wait_workflow build-x86-image.yml & P3=$!
+          wait "$P1"; wait "$P2"; wait "$P3"
+
+      - name: Verifier la matrice OS staged
+        env:
+          TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+          OS_TAG: ${{ steps.v.outputs.os_tag }}
+        run: |
+          set -euo pipefail
+          ASSETS="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq '.assets[].name')"
+          grep -Eq 'x86_64.*\.iso$' <<<"$ASSETS" || { echo "::error::ISO x86_64 absente"; exit 1; }
+          grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image x86_64 absente"; exit 1; }
+          grep -Eq 'aarch64.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image aarch64 absente"; exit 1; }
+          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 3 ] || { echo "::error::checksums OS incomplets"; exit 1; }

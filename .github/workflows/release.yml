@@ -1234,6 +1234,7 @@ jobs:
       contents: write
     outputs:
       promoted: ${{ steps.gate.outputs.promoted }}
+      version: ${{ steps.gate.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -1255,7 +1256,46 @@ jobs:
             exit 1
           }
           echo "promoted=false" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "Release $TAG complète et conservée en brouillon."
+
+  stage-docker:
+    name: Stage Docker image
+    needs: publish
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  stage-os:
+    name: Stage Tune OS images
+    needs: publish
+    uses: ./.github/workflows/trigger-os-images.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  staging-complete:
+    name: Release staging complete
+    needs: [publish, stage-docker, stage-os]
+    if: >-
+      always()
+      && needs.publish.result == 'success'
+      && needs.stage-docker.result == 'success'
+      && needs.stage-os.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Attester la matrice staged
+        run: |
+          {
+            echo "## v${{ needs.publish.outputs.version }} entierement staged"
+            echo
+            echo "- GitHub Release serveur : draft"
+            echo "- Docker : staging-v${{ needs.publish.outputs.version }}"
+            echo "- Tune OS : trois images et leurs checksums sur une release draft"
+            echo "- aucun canal stable promu"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   homebrew:
     name: Update Homebrew tap
