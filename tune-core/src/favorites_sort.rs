@@ -16,6 +16,23 @@
 //! 3. **« Volume 2 » précède « Volume 10 »** — les nombres se comparent comme
 //!    des nombres, pas comme du texte.
 //!
+//! ## Piste 2 — l'ordre manuel (`sort=manual`)
+//!
+//! Le tri ci-dessus range d'après un champ ; il ne rend pas le geste de Tades,
+//! qui voulait **déplacer** un favori. [`CleDeTri::Manuel`] lit un rang écrit
+//! par l'utilisateur (colonne `position`), posé par les routes
+//! `POST /profiles/{id}/favorites/reorder` et `…/favorites/streaming/reorder`.
+//!
+//! **Périmètre.** Le rang manuel n'existe que sur les deux tables que Tune
+//! possède — `favorites` (bibliothèque locale) et `streaming_favorites`
+//! (favoris de service enregistrés chez Tune) — et il est **par onglet** :
+//! la clé du rang est `(profil, item_type)`. Il n'existe PAS sur les favoris
+//! lus en direct chez Qobuz/Tidal (`/streaming/{service}/favorites/{type}`) :
+//! ces lignes reviennent du service à chaque resynchronisation, Tune n'en
+//! possède aucune, et leur donner un rang durable demanderait une table de
+//! correspondance — arbitrage non rendu (cf. #2001, piste 2). Une demande
+//! `sort=manual` sur cette route-là ne range donc rien et ne fait pas d'erreur.
+//!
 //! Rétro-compatibilité : sans paramètre `sort`, [`TriFavoris::depuis`] rend
 //! `None` et l'appelant garde son `ORDER BY` d'origine. Le tri se fait en Rust
 //! et non en SQL, pour deux raisons : les règles ci-dessus n'ont pas
@@ -33,6 +50,14 @@ pub enum CleDeTri {
     Titre,
     Artiste,
     Album,
+    /// L'ordre que l'utilisateur a posé **à la main** (#2001, piste 2) — le
+    /// geste que Tades avait tenté à la souris. Lu dans la colonne `position`
+    /// de `favorites` / `streaming_favorites`, écrite par les routes
+    /// `…/favorites/reorder` et `…/favorites/streaming/reorder`.
+    ///
+    /// Un favori jamais rangé à la main n'a pas de rang : il finit la liste,
+    /// dans les deux sens, comme n'importe quel champ absent (règle 2).
+    Manuel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +88,7 @@ impl TriFavoris {
             "title" | "titre" | "name" | "nom" => CleDeTri::Titre,
             "artist" | "artiste" => CleDeTri::Artiste,
             "album" => CleDeTri::Album,
+            "manual" | "manuel" | "custom" | "ordre" | "position" => CleDeTri::Manuel,
             _ => return None,
         };
         let sens = match order.map(|o| o.trim().to_ascii_lowercase()).as_deref() {
@@ -90,6 +116,37 @@ pub fn trier_par<T>(items: &mut [T], sens: Sens, cle: impl Fn(&T) -> Option<Stri
 pub fn appliquer_ajout<T>(items: &mut [T], sens: Sens) {
     if sens == Sens::Croissant {
         items.reverse();
+    }
+}
+
+/// Range `items` selon le **rang manuel** rendu par `rang` (#2001, piste 2).
+///
+/// Le rang est un entier, pas du texte : il se compare **numériquement**, ce
+/// qui compte ici plus qu'ailleurs. Le miroir PostgreSQL de ce dépôt stocke
+/// `position` en TEXT (comme `listen_history.context_position`, PG 046) ; un
+/// `ORDER BY position` en SQL rangerait donc « 10 » avant « 2 » sur PostgreSQL
+/// et pas sur SQLite — deux ordres différents pour la même bibliothèque. Le
+/// rang est relu par `SqlValue::as_i64`, qui convertit le TEXT, et comparé
+/// ici : les deux moteurs rendent le même ordre.
+///
+/// Un favori sans rang (`None` — jamais rangé à la main, ou ajouté après le
+/// dernier réordonnancement) finit la liste **dans les deux sens**, règle 2.
+/// Le tri restant stable, ces sans-rang gardent entre eux le `created_at DESC`
+/// de la requête.
+pub fn trier_par_rang<T>(items: &mut [T], sens: Sens, rang: impl Fn(&T) -> Option<i64>) {
+    items.sort_by(|a, b| comparer_rang(rang(a), rang(b), sens));
+}
+
+/// Compare deux rangs manuels. Voir [`trier_par_rang`].
+pub fn comparer_rang(a: Option<i64>, b: Option<i64>, sens: Sens) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => match sens {
+            Sens::Croissant => a.cmp(&b),
+            Sens::Decroissant => b.cmp(&a),
+        },
     }
 }
 
@@ -142,6 +199,13 @@ pub fn trier_liste_json(donnees: &mut serde_json::Value, tri: TriFavoris) {
                 appliquer_ajout(liste, tri.sens);
                 continue;
             }
+            // Un ordre manuel n'existe QUE sur les lignes que Tune possède
+            // (`favorites`, `streaming_favorites`). Ici la liste vient d'être
+            // lue chez Qobuz/Tidal : ces éléments n'ont pas de rang, et le
+            // service en renvoie un jeu qui change à chaque resynchronisation.
+            // On laisse donc l'ordre du service intact plutôt que d'inventer
+            // un rang — voir la note de périmètre en tête de module.
+            CleDeTri::Manuel => continue,
             CleDeTri::Titre => &["title", "name"][..],
             CleDeTri::Artiste => &["artist_name", "artist"][..],
             CleDeTri::Album => &["album_title", "album"][..],
@@ -267,6 +331,9 @@ mod tests {
         assert_eq!(tri("ARTIST", "asc").cle, CleDeTri::Artiste);
         assert_eq!(tri("album", "asc").cle, CleDeTri::Album);
         assert_eq!(tri("added", "asc").cle, CleDeTri::Ajout);
+        assert_eq!(tri("manual", "asc").cle, CleDeTri::Manuel);
+        assert_eq!(tri("manuel", "asc").cle, CleDeTri::Manuel);
+        assert_eq!(tri("CUSTOM", "asc").cle, CleDeTri::Manuel);
         assert_eq!(tri("title", "desc").sens, Sens::Decroissant);
         // Un `order` absent ou farfelu vaut croissant.
         assert_eq!(tri("title", "n'importe quoi").sens, Sens::Croissant);
@@ -350,6 +417,73 @@ mod tests {
         let mut v = vec!["recent", "moyen", "ancien"];
         appliquer_ajout(&mut v, Sens::Decroissant);
         assert_eq!(v, vec!["recent", "moyen", "ancien"]);
+    }
+
+    fn ranger_rangs(v: Vec<(&str, Option<i64>)>, sens: Sens) -> Vec<&str> {
+        let mut v = v;
+        trier_par_rang(&mut v, sens, |(_, r)| *r);
+        v.into_iter().map(|(n, _)| n).collect()
+    }
+
+    #[test]
+    fn le_rang_manuel_se_compare_en_nombre_pas_en_texte() {
+        // Le miroir PostgreSQL stocke `position` en TEXT : un ORDER BY SQL y
+        // mettrait « 10 » avant « 2 ». Comparé en i64, l'ordre est le meme sur
+        // les deux moteurs.
+        assert_eq!(
+            ranger_rangs(
+                vec![("dix", Some(10)), ("deux", Some(2)), ("un", Some(1))],
+                Sens::Croissant
+            ),
+            vec!["un", "deux", "dix"]
+        );
+    }
+
+    #[test]
+    fn un_favori_sans_rang_manuel_finit_la_liste_dans_les_deux_sens() {
+        // Regle 2, transposee au rang : un favori ajoute apres le dernier
+        // reordonnancement n'a pas de rang. Il va EN FIN, meme en descendant —
+        // sinon descendre l'ordre manuel remonterait les nouveaux venus en tete.
+        assert_eq!(
+            ranger_rangs(
+                vec![("b", Some(2)), ("neuf", None), ("a", Some(1))],
+                Sens::Croissant
+            ),
+            vec!["a", "b", "neuf"]
+        );
+        assert_eq!(
+            ranger_rangs(
+                vec![("b", Some(2)), ("neuf", None), ("a", Some(1))],
+                Sens::Decroissant
+            ),
+            vec!["b", "a", "neuf"]
+        );
+    }
+
+    #[test]
+    fn deux_favoris_sans_rang_gardent_l_ordre_d_arrivee() {
+        // Stabilite : les sans-rang restent departages par `created_at DESC`.
+        assert_eq!(
+            ranger_rangs(
+                vec![("recent", None), ("ancien", None), ("range", Some(1))],
+                Sens::Croissant
+            ),
+            vec!["range", "recent", "ancien"]
+        );
+    }
+
+    /// Une reponse de service (Qobuz/Tidal) n'a pas de rang manuel : le tri
+    /// manuel ne doit rien y bouger, et surtout pas paniquer.
+    #[test]
+    fn le_tri_manuel_laisse_une_liste_de_service_intacte() {
+        let mut donnees = serde_json::json!({
+            "albums": [{"title": "C"}, {"title": "A"}, {"title": "B"}]
+        });
+        let avant = donnees.clone();
+        trier_liste_json(&mut donnees, tri("manual", "asc"));
+        assert_eq!(donnees, avant);
+        trier_liste_json(&mut donnees, tri("manual", "desc"));
+        assert_eq!(donnees, avant);
     }
 
     #[test]
