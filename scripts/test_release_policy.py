@@ -34,6 +34,8 @@ class PolicyFixture:
         self.root = Path(self._temp.name)
         for relative in FIXTURE_FILES:
             source = SOURCE_ROOT / relative
+            if not source.exists():
+                continue
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
@@ -100,7 +102,8 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_legacy_runbook_must_be_disabled(self) -> None:
         path = self.fixture.root / "docs/RELEASE-OPERATIONS.md"
-        path.write_text(path.read_text(encoding="utf-8").replace("RELEASE_RUNBOOK_STATUS: legacy-disabled", ""), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Legacy release runbook\n\ngit tag v0.9.999\n", encoding="utf-8")
         with self.assertRaisesRegex(PolicyError, "not explicitly disabled"):
             validate(self.fixture.root)
 
