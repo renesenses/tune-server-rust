@@ -868,6 +868,45 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
         track.insert("metadata_age_ms".into(), json!(age));
     }
 }
+/// La nature et l'identifiant de ce que l'auditeur a DEMANDÉ, dits au client.
+///
+/// `POST /zones/:id/play` les déduit déjà du corps de la requête
+/// (`contexte_de_lecture`) et les pose sur la session de la zone
+/// (`set_session_context`, #2441). Jusqu'ici l'unique lecteur était
+/// l'orchestrateur, au moment de tamponner `listen_history` : le serveur
+/// savait quel album Qobuz jouait sur quelle zone, et ne le disait à personne.
+///
+/// Le client ne POUVAIT donc pas bâtir le « Retour à l'album en cours » que
+/// Cyrille Moutia réclame depuis le 30/06/2026 (#1361).
+/// `current_track.album_id` / `artist_id` sont des `i64` de BIBLIOTHÈQUE :
+/// toujours `null` sur une piste de service, faute de ligne en base. Il ne
+/// restait que `source` + `source_id`, l'identifiant de la PISTE — d'où un
+/// aller-retour `GET /streaming/{service}/tracks/{track_id}` à chaque
+/// changement de piste pour seulement en retrouver l'album.
+///
+/// Au niveau de la ZONE, pas de `current_track` : le contexte décrit le geste,
+/// pas la piste. Il survit aux avances automatiques — la deuxième piste d'un
+/// album reste une écoute « album » — là où `current_track` change à chaque
+/// piste. C'est exactement ce qui fait un « retour à l'album » stable.
+///
+/// Toujours écrits, `null` compris. Un champ ABSENT dit « ce serveur ne
+/// connaît pas la notion » ; un champ `null` dit « aucun contexte sur cette
+/// session ». Le client doit distinguer les deux pour MASQUER le raccourci ou
+/// le GRISER, et un défaut silencieux côté client masquerait la disparition du
+/// champ au lieu de la signaler (leçon de `volume_db`, #1274).
+///
+/// `GET /zones/{id}/status` les publiait déjà — il sérialise le `ZoneState`
+/// entier — mais sous une charge de forme différente (`now_playing`). Les
+/// trois surfaces qui portent `current_track` restaient muettes ; ce
+/// fabricant les aligne, à l'identique de `inject_metadata_anchor`, et aux
+/// mêmes trois points d'appel, pour qu'elles ne puissent plus diverger.
+pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
+    obj.insert(
+        "session_context_type".into(),
+        json!(ps.session_context_type),
+    );
+    obj.insert("session_context_id".into(), json!(ps.session_context_id));
+}
 
 /// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
 /// tire son flux n'est plus un démarrage lent mais un silence.
@@ -2150,6 +2189,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            inject_session_context(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
             obj.insert(
@@ -2363,6 +2403,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 inject_metadata_anchor(obj, &ps);
+                inject_session_context(obj, &ps);
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 // Expose the queue index too so the client can refresh the
