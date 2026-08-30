@@ -1615,6 +1615,42 @@
     "fr": "Quand ce réglage est activé, Tune envoie au cloud communautaire mozaiklabs.fr les biographies d'artistes et d'albums de votre bibliothèque (nom de l'artiste, titre de l'album, identifiant MusicBrainz, texte de la biographie, source, licence et langue) ainsi que les images d'artistes récupérées automatiquement, accompagnées d'un identifiant d'installation anonyme. Ni vos fichiers, ni vos chemins de dossiers, ni votre historique d'écoute ne sont concernés. Désactivé par défaut : tant que vous ne l'activez pas, aucune de ces données ne quitte votre machine.",
     "en": "When this setting is on, Tune sends your library's artist and album biographies (artist name, album title, MusicBrainz ID, biography text, source, licence and language) plus the artist images it fetched automatically to the mozaiklabs.fr community cloud, together with an anonymous installation identifier. Your files, your folder paths and your listening history are not involved. Off by default: until you turn it on, none of this data leaves your machine."
   },
+  "settings.replayGainSource.off": {
+    "fr": "Désactivé",
+    "en": "Off",
+    "de": "Deaktiviert",
+    "es": "Desactivado",
+    "it": "Disattivato",
+    "zh": "已停用",
+    "ja": "無効",
+    "ko": "사용 안 함",
+    "ro": "Dezactivat",
+    "sv": "Av"
+  },
+  "settings.replayGainSource.file_tags": {
+    "fr": "Tags des fichiers",
+    "en": "File tags",
+    "de": "Datei-Tags",
+    "es": "Etiquetas de los archivos",
+    "it": "Tag dei file",
+    "zh": "文件标签",
+    "ja": "ファイルのタグ",
+    "ko": "파일 태그",
+    "ro": "Etichetele fișierelor",
+    "sv": "Filernas taggar"
+  },
+  "settings.replayGainSource.tags_then_analysis": {
+    "fr": "Tags des fichiers, puis analyse",
+    "en": "File tags, then analysis",
+    "de": "Datei-Tags, dann Analyse",
+    "es": "Etiquetas de los archivos, luego análisis",
+    "it": "Tag dei file, poi analisi",
+    "zh": "文件标签，然后分析",
+    "ja": "ファイルのタグ、次に解析",
+    "ko": "파일 태그, 그다음 분석",
+    "ro": "Etichetele fișierelor, apoi analiză",
+    "sv": "Filernas taggar, sedan analys"
+  },
   "radio.recherche.aucunResultat": {
     "fr": "Aucune station de ce nom dans le catalogue Tune. Vous pouvez l'ajouter par son adresse de flux.",
     "en": "No station by that name in the Tune catalogue. You can add it using its stream address.",

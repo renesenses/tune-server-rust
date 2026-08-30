@@ -165,6 +165,11 @@ pub(super) async fn get_config(
         // historique), -0.5 ou -1. Persisté par PATCH /config comme les
         // autres ; honoré dans `gain_factor` (tune-core).
         ("replaygain_true_peak_ceiling_db", json!(0.0)),
+        // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
+        // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
+        // normalise en plus la valeur persistée (`"false"` → `false`). Une
+        // entrée `or_insert` ici serait morte — la contre-épreuve de #1627 l'a
+        // montrée : la retirer ne cassait aucun test.
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),
@@ -230,6 +235,52 @@ pub(super) async fn get_config(
         .and_then(|v| v.as_str().map(|s| s == "true").or_else(|| v.as_bool()))
         .unwrap_or(false);
     config.insert("dsd_lpcm_stream".to_string(), json!(dsd_lpcm_stream));
+    // Les TROIS modes ReplayGain de #1627 — « néant / tags du fichier /
+    // calcul » — publiés comme UN seul fait, en LECTURE.
+    //
+    // Rien de nouveau n'est persisté et aucune sémantique ne bouge : les deux
+    // axes existants (`replaygain_mode` × `replaygain_analysis_enabled`)
+    // restent la seule vérité, et restent les seuls écrivables. Ce bloc dit
+    // seulement lequel des trois modes en RÉSULTE, pour que l'interface cesse
+    // d'avoir à recomposer la règle de son côté — et de la recomposer faux :
+    // depuis #2496, « Désactivé » arrête aussi le balayage, ce qu'un client
+    // qui lisait les deux réglages séparément ne pouvait pas savoir.
+    //
+    // `analysis_enabled` = l'état de la bascule ; `analysis_effective` = ce qui
+    // se passe vraiment. Même distinction que `community_contribution`
+    // ci-dessous, et pour la même raison : promettre une analyse qui n'aura
+    // pas lieu est aussi trompeur que de la cacher.
+    let rg_source_mode = tune_core::audio::replaygain::active_source_mode(&state.backend);
+    let rg_analysis_effective = tune_core::audio::replaygain::analysis_enabled(&state.backend);
+    //
+    // `analysis_enabled` est publié ici et NULLE PART ailleurs : l'insertion
+    // est inconditionnelle, donc elle publie le défaut (`true`) sur une base
+    // fraîche ET normalise le `"false"` persisté en booléen. C'était le trou —
+    // la clé était simplement absente de la réponse, et le client devait
+    // deviner son défaut.
+    let rg_analysis_enabled = config
+        .get(tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY)
+        .and_then(|v| v.as_str().map(|s| s != "false").or_else(|| v.as_bool()))
+        .unwrap_or(true);
+    config.insert(
+        tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY.to_string(),
+        json!(rg_analysis_enabled),
+    );
+    config.insert(
+        "replaygain_source".to_string(),
+        json!({
+            "mode": rg_source_mode.as_str(),
+            "analysis_enabled": rg_analysis_enabled,
+            "analysis_effective": rg_analysis_effective,
+            // Les deux réglages qui COMPOSENT ce mode, nommés pour que le
+            // client sache quoi écrire au lieu de deviner les clés.
+            "setting_keys": [
+                tune_core::audio::replaygain::MODE_KEY,
+                tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY,
+            ],
+            "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
+        }),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -2903,5 +2954,92 @@ mod purge_hors_perimetre_tests {
             )
             .unwrap();
         assert!(restants.is_empty(), "marqueur hidden_items orphelin laissé");
+    }
+}
+
+/// #1627 — les trois modes ReplayGain publiés comme UN fait, en lecture.
+///
+/// La demande d'origine (« 1- néant, 2- fichier, 3- calcul ») n'a jamais eu de
+/// réglage unique côté serveur, et n'en gagne pas ici : ce bloc DÉRIVE le mode
+/// des deux axes existants. Ce qu'il apporte, et que le client ne pouvait pas
+/// obtenir seul : le défaut de `replaygain_analysis_enabled` n'était publié
+/// nulle part, et la règle a changé (#2496 — « Désactivé » arrête aussi le
+/// balayage). Un client qui recomposait la règle de son côté présentait donc le
+/// mauvais mode comme actif sur toute base fraîche.
+#[cfg(test)]
+mod replaygain_source_tests {
+    use super::get_config;
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    async fn config_de(state: &AppState) -> serde_json::Value {
+        get_config(HeaderMap::new(), State(state.clone())).await.0
+    }
+
+    #[tokio::test]
+    async fn les_trois_modes_voyagent_dans_get_config() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+
+        // Base fraîche : rien n'est écrit, et pourtant le mode est dit.
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "off");
+        assert_eq!(c["replaygain_source"]["label"], "Désactivé");
+        // Le défaut de la coche est publié — c'était le trou : absent de la
+        // réponse, il obligeait le client à le deviner.
+        assert_eq!(c["replaygain_analysis_enabled"], true);
+        // ... mais rien ne tourne tant que le mode est « Désactivé » (#2496).
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+        assert_eq!(
+            c["replaygain_source"]["setting_keys"],
+            serde_json::json!(["replaygain_mode", "replaygain_analysis_enabled"]),
+            "le client doit savoir QUOI écrire : ce bloc est en lecture seule"
+        );
+
+        // 3- calcul.
+        settings.set("replaygain_mode", "track").unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(c["replaygain_source"]["analysis_effective"], true);
+        assert_eq!(
+            c["replaygain_source"]["label"],
+            "Tags des fichiers, puis analyse"
+        );
+
+        // 2- fichier.
+        settings
+            .set("replaygain_analysis_enabled", "false")
+            .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+        assert_eq!(c["replaygain_source"]["label"], "Tags des fichiers");
+
+        // Les deux axes restent intacts et publiés tels quels : ce bloc
+        // n'a rien remplacé.
+        assert_eq!(c["replaygain_mode"], "track");
+    }
+
+    /// Le libellé suit la langue de l'app (`Accept-Language`), comme le reste
+    /// des chaînes que l'API renvoie déjà.
+    #[tokio::test]
+    async fn le_libelle_du_mode_est_traduit() {
+        let state = etat();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("replaygain_mode", "album")
+            .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("accept-language", "en-GB,en;q=0.9".parse().unwrap());
+
+        let c = get_config(h, State(state.clone())).await.0;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
     }
 }
