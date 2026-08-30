@@ -17,9 +17,24 @@ use crate::TuneError;
 /// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
 /// the separator stored in `tracks.file_path` (paths are absolute local paths on
 /// the scanning host), so both the flat filter and the folder facet agree.
+///
+/// Le préfixe est replié en **NFC**, parce que c'est la forme sous laquelle le
+/// scanner écrit `tracks.file_path` (`scanner::walker` et `routes/system/scan`
+/// appellent tous deux `.nfc()` avant d'insérer). Un préfixe qui vient du
+/// *disque* — et non de la base — peut arriver en **NFD** : un dossier accentué
+/// créé côté NAS, ou copié depuis macOS, n'existe qu'en forme décomposée, et
+/// c'est cette forme-là que `resolve_browse_path` rend puisque c'est la seule
+/// que le système de fichiers accepte d'ouvrir. Les deux chaînes s'affichent à
+/// l'identique et ne partagent pas un octet : sans ce repli, le `LIKE` ne
+/// ramène **aucune** ligne pour un dossier pourtant scanné, et l'écran annonce
+/// un répertoire vide.
+///
+/// Sur un préfixe déjà NFC — tout ce qui sort de la base — le repli est un
+/// no-op par construction.
 pub fn folder_like_pattern(prefix: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
     let sep = std::path::MAIN_SEPARATOR;
-    let base = prefix.trim_end_matches(['/', '\\']);
+    let base: String = prefix.trim_end_matches(['/', '\\']).nfc().collect();
     format!("{base}{sep}%")
 }
 
