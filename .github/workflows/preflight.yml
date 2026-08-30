@@ -10,6 +10,8 @@ name: Preflight
 # Checks performed (each independently pass/fail):
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
 # - version_bump: tag > Cargo.toml workspace version
+# - release_identity: bump author/committer do not mix known maintainers'
+#   names and addresses
 # - no_p0_issues: no blocking P0 issue open; merged fixes awaiting release
 #   verification (release:verification-pending) are reported but do not create
 #   a release/closure deadlock, and P0 suspended for want of field information

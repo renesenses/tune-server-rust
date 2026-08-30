@@ -278,26 +278,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "audiopus"
-version = "0.3.0-rc.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab55eb0e56d7c6de3d59f544e5db122d7725ec33be6a276ee8241f3be6473955"
-dependencies = [
- "audiopus_sys",
-]
-
-[[package]]
-name = "audiopus_sys"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
-dependencies = [
- "cmake",
- "log",
- "pkg-config",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3102,6 +3082,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9d1ecdf206421bc74343ab3bb2f30ad2abbfee41fa341f7181fecbaf957769a"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "ort"
 version = "2.0.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5224,7 +5222,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-trait",
  "axum",
@@ -5237,7 +5235,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "axum",
  "bytes",
@@ -5258,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5272,13 +5270,12 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "ape-decoder",
  "argon2",
  "async-stream",
  "async-trait",
- "audiopus",
  "axum",
  "blowfish",
  "bytes",
@@ -5307,6 +5304,7 @@ dependencies = [
  "oaat-core",
  "objc2-core-audio",
  "objc2-core-audio-types",
+ "opus",
  "ort",
  "quick-xml",
  "rand_core 0.6.4",
@@ -5347,7 +5345,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-trait",
  "axum",
@@ -5359,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "axum",
  "serde_json",
@@ -5372,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-trait",
  "axum",
@@ -5385,7 +5383,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-trait",
  "serde",
@@ -5394,7 +5392,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5403,7 +5401,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5452,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-stream",
  "axum",
@@ -5466,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.125"
+version = "0.9.126"
 dependencies = [
  "async-stream",
  "axum",

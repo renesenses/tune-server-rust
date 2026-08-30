@@ -178,6 +178,17 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
+/// Whether the server would accept the manual "next" action as an actual
+/// advance instead of stopping the zone at the end of the queue.
+///
+/// Keep this as a thin projection of the command's own decision.  Rebuilding
+/// the rule from `queue_position` on the client is wrong under shuffle, where
+/// the next item follows the materialised permutation rather than raw queue
+/// order (#2337).
+pub(crate) fn can_skip_next(zone_state: &tune_core::playback::ZoneState) -> bool {
+    tune_core::poller::PositionPoller::next_position_manual(zone_state).is_some()
+}
+
 pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -213,6 +224,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
+        "can_skip_next": can_skip_next(&zone_state),
         "muted": zone_state.muted,
     });
     // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
@@ -3612,6 +3624,60 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
         })),
     )
         .into_response()
+}
+
+/// Contre-épreuve du booléen envoyé aux clients pour le bouton « suivant ».
+///
+/// Le cas discriminant est une file aléatoire : la position brute peut être la
+/// dernière alors que la permutation a encore une suite, ou l'inverse.  Le
+/// contrat doit suivre la décision de l'endpoint, pas reconstruire une seconde
+/// règle depuis la file visible (#2337).
+#[cfg(test)]
+mod contrat_suivant_tests {
+    use super::can_skip_next;
+    use tune_core::playback::{RepeatMode, ZoneState};
+
+    #[test]
+    fn la_fin_reelle_du_tirage_desactive_meme_si_la_position_brute_n_est_pas_la_derniere() {
+        let state = ZoneState {
+            queue_position: 0,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 4,
+            ..Default::default()
+        };
+
+        assert!(!can_skip_next(&state));
+    }
+
+    #[test]
+    fn la_position_brute_finale_reste_active_si_le_tirage_a_une_suite() {
+        let state = ZoneState {
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 4, 1, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+
+        assert!(can_skip_next(&state));
+    }
+
+    #[test]
+    fn le_saut_manuel_sous_repeat_one_reboucle_comme_l_endpoint() {
+        let state = ZoneState {
+            queue_position: 0,
+            queue_length: 1,
+            repeat: RepeatMode::One,
+            ..Default::default()
+        };
+
+        assert!(can_skip_next(&state));
+    }
 }
 
 /// Le plafond de la lecture aléatoire doit être DIT, pas seulement appliqué.

@@ -777,7 +777,7 @@ fn encode_lossless_native(
 }
 
 /// Encode to Ogg Opus fully in-process (#1525): native decode → rubato to
-/// 48 kHz → libopus (audiopus) → native Ogg mux. Replaces opusenc/ffmpeg.
+/// 48 kHz → libopus (the `opus` crate) → native Ogg mux. Replaces opusenc/ffmpeg.
 fn encode_opus_native(input: &str, output: &Path, quality: Option<&str>) -> Result<(), String> {
     let decoded = decode_for_convert(input, None)?;
     if decoded.channels > 2 {

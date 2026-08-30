@@ -997,6 +997,107 @@ pub fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> b
         || cache_dir.join(format!("{image_path}.png")).exists()
 }
 
+/// Nom de la passe « par nom » (phase 3) dans le réglage
+/// `artist_artwork_enrich_result`, aux côtés de `mbid` et `images`.
+///
+/// Publique parce que `tune-server` la traduit en libellé affiché. Deux
+/// chaînes recopiées de part et d'autre se seraient désaccordées en silence, et
+/// l'écran aurait annoncé « MusicBrainz » pendant que la passe interroge
+/// Discogs et Last.fm.
+pub const PHASE_PAR_NOM: &str = "names";
+
+/// Cadence de publication de l'avancement : une écriture toutes les cinq
+/// fiches, et toujours sur la dernière.
+///
+/// Les trois passes appliquaient déjà cette règle, chacune avec sa propre copie
+/// de la condition. Une seule définition désormais — et le `traites == total`
+/// n'est pas décoratif : sans lui, un lot de douze cesserait d'afficher à dix.
+pub(crate) fn doit_publier_avancement(traites: usize, total: usize) -> bool {
+    traites % 5 == 0 || traites == total
+}
+
+/// Instantané d'avancement de la passe 3 — recherche d'image **par nom**
+/// (Discogs puis Last.fm), pour les artistes qui n'ont toujours ni MBID ni
+/// image après les passes 1 et 2.
+///
+/// Cette passe ne publiait **rien** : ni `processed`, ni `total`, ni `phase`.
+/// Le dernier état écrit restait donc celui de la fin de passe 2 —
+/// `processed == total`, soit 100 % — pendant toute sa durée, puis la tâche
+/// disparaissait. Or sur une bibliothèque non étiquetée c'est la seule passe
+/// qui travaille : le compteur montait jusqu'au total, se figeait, et la
+/// fenêtre se refermait sans qu'aucun bilan intermédiaire n'ait été dit
+/// (#2227 Jean Valjean ; #2257 Sandro, 350 artistes sans MBID).
+pub(crate) fn avancement_par_nom(
+    traites: usize,
+    total: usize,
+    discogs_enriched: u32,
+    lastfm_enriched: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "running",
+        "phase": PHASE_PAR_NOM,
+        "processed": traites,
+        "total": total,
+        // `enriched` est le champ que les deux autres passes publient et que
+        // l'écran lit : il doit compter les images posées par CETTE passe.
+        "enriched": discogs_enriched + lastfm_enriched,
+        "discogs_enriched": discogs_enriched,
+        "lastfm_enriched": lastfm_enriched,
+    })
+}
+
+/// Source ayant effectivement posé l'image d'un artiste cherché par nom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceParNom {
+    Discogs,
+    Lastfm,
+}
+
+/// Le corps de la passe 3, séparé de ses accès réseau.
+///
+/// La publication d'avancement vit ici, donc un test peut l'observer sans
+/// appeler le moindre service d'images : `poser_image` porte à elle seule les
+/// requêtes Discogs / Last.fm et l'écriture en cache.
+pub(crate) async fn passe_par_nom<F, Fut>(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    artistes: &[(i64, String)],
+    mut poser_image: F,
+) -> (u32, u32)
+where
+    F: FnMut(i64, String) -> Fut,
+    Fut: std::future::Future<Output = Option<SourceParNom>>,
+{
+    let total = artistes.len();
+    let publier = |traites: usize, discogs: u32, lastfm: u32| {
+        settings
+            .set(
+                "artist_artwork_enrich_result",
+                &avancement_par_nom(traites, total, discogs, lastfm).to_string(),
+            )
+            .ok();
+    };
+
+    // Basculer l'affichage sur cette passe DÈS son démarrage. Sinon l'écran
+    // reste sur le 100 % de la passe 2 le temps des cinq premières fiches,
+    // c'est-à-dire précisément le compteur figé qui a été signalé.
+    publier(0, 0, 0);
+
+    let mut discogs_enriched = 0u32;
+    let mut lastfm_enriched = 0u32;
+    for (index, (artist_id, name)) in artistes.iter().enumerate() {
+        match poser_image(*artist_id, name.clone()).await {
+            Some(SourceParNom::Discogs) => discogs_enriched += 1,
+            Some(SourceParNom::Lastfm) => lastfm_enriched += 1,
+            None => {}
+        }
+        let traites = index + 1;
+        if doit_publier_avancement(traites, total) {
+            publier(traites, discogs_enriched, lastfm_enriched);
+        }
+    }
+    (discogs_enriched, lastfm_enriched)
+}
+
 /// Phase 1: Check community-approved images from mozaiklabs.fr first.
 /// Phase 2: For remaining artists, fetch from mozaiklabs API / Fanart.tv / MusicBrainz,
 /// then submit discovered images back to the community (fire-and-forget).
@@ -1308,7 +1409,7 @@ async fn batch_enrich_artist_artwork_inner(
         }
 
         // Publish live progress for the UI (Fabien: enrichment looked frozen).
-        if (i + 1) % 5 == 0 || i + 1 == total_images {
+        if doit_publier_avancement(i + 1, total_images) {
             settings
                 .set(
                     "artist_artwork_enrich_result",
@@ -1364,39 +1465,52 @@ async fn batch_enrich_artist_artwork_inner(
                 .build()
                 .unwrap_or_default();
 
-            for (artist_id, name) in &no_mbid_artists {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Le parcours et la publication d'avancement sont dans
+            // `passe_par_nom` ; ne reste ici que ce qui touche le réseau et le
+            // cache. Le `continue` d'antan — Discogs a posé, on saute Last.fm —
+            // devient le retour anticipé de cette fermeture.
+            let (d, l) = passe_par_nom(&settings, &no_mbid_artists, |artist_id, name| {
+                let client = &client;
+                let cache_dir = &cache_dir;
+                let artist_repo = &artist_repo;
+                let discogs_token = discogs_token.as_deref();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-                // Try Discogs first
-                if discogs_available {
-                    if let Some(data) =
-                        fetch_artist_image_discogs(&client, name, discogs_token.as_deref()).await
-                    {
-                        let hash = artwork_hash(&format!("artist-name-{name}"));
-                        std::fs::create_dir_all(&cache_dir).ok();
-                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
-                            artist_repo.update_image(*artist_id, &hash, "discogs").ok();
-                            discogs_enriched += 1;
-                            info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
-                            continue;
+                    // Try Discogs first
+                    if discogs_available {
+                        if let Some(data) =
+                            fetch_artist_image_discogs(client, &name, discogs_token).await
+                        {
+                            let hash = artwork_hash(&format!("artist-name-{name}"));
+                            std::fs::create_dir_all(cache_dir).ok();
+                            if save_to_cache(&data, cache_dir, &hash, "jpg").is_some() {
+                                artist_repo.update_image(artist_id, &hash, "discogs").ok();
+                                info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
+                                return Some(SourceParNom::Discogs);
+                            }
                         }
                     }
-                }
 
-                // Fallback to Last.fm
-                if lastfm_available {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if let Some(data) = fetch_artist_image_lastfm(&client, name).await {
-                        let hash = artwork_hash(&format!("artist-name-{name}"));
-                        std::fs::create_dir_all(&cache_dir).ok();
-                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
-                            artist_repo.update_image(*artist_id, &hash, "lastfm").ok();
-                            lastfm_enriched += 1;
-                            info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
+                    // Fallback to Last.fm
+                    if lastfm_available {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if let Some(data) = fetch_artist_image_lastfm(client, &name).await {
+                            let hash = artwork_hash(&format!("artist-name-{name}"));
+                            std::fs::create_dir_all(cache_dir).ok();
+                            if save_to_cache(&data, cache_dir, &hash, "jpg").is_some() {
+                                artist_repo.update_image(artist_id, &hash, "lastfm").ok();
+                                info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
+                                return Some(SourceParNom::Lastfm);
+                            }
                         }
                     }
+                    None
                 }
-            }
+            })
+            .await;
+            discogs_enriched = d;
+            lastfm_enriched = l;
             info!(
                 discogs_enriched,
                 lastfm_enriched,
@@ -1627,6 +1741,120 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // #2227 / #2257 — la passe PAR NOM doit publier son avancement.
+    //
+    // Elle n'écrivait rien du tout : l'écran restait sur le 100 % de la passe
+    // précédente pendant tout son travail, puis la fenêtre se refermait. Sur
+    // une bibliothèque non étiquetée, c'est pourtant la seule passe qui
+    // travaille.
+    // ---------------------------------------------------------------------
+
+    fn base_neuve() -> std::sync::Arc<dyn crate::db::backend::DbBackend> {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        std::sync::Arc::new(db)
+    }
+
+    /// Toutes les cinq fiches, et toujours la dernière.
+    #[test]
+    fn la_cadence_publie_toutes_les_cinq_fiches_et_la_derniere() {
+        let publiees: Vec<usize> = (1..=12)
+            .filter(|t| doit_publier_avancement(*t, 12))
+            .collect();
+        assert_eq!(publiees, vec![5, 10, 12]);
+
+        // Un lot plus petit que la cadence publie quand même : sinon un
+        // enrichissement de trois artistes n'afficherait jamais rien.
+        let petites: Vec<usize> = (1..=3).filter(|t| doit_publier_avancement(*t, 3)).collect();
+        assert_eq!(petites, vec![3]);
+    }
+
+    /// L'instantané se distingue de celui de la passe 2, sans quoi le sondeur
+    /// de la route afficherait « MusicBrainz » pendant une recherche Discogs.
+    #[test]
+    fn l_instantane_par_nom_porte_sa_phase_et_ses_compteurs() {
+        let v = avancement_par_nom(7, 350, 2, 1);
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["phase"], PHASE_PAR_NOM);
+        assert_ne!(
+            v["phase"], "images",
+            "la passe par nom n'est pas la passe 2"
+        );
+        assert_eq!(v["processed"], 7);
+        assert_eq!(v["total"], 350);
+        assert_eq!(v["enriched"], 3);
+    }
+
+    /// LE cas signalé : douze artistes sans MBID, aucun service d'images
+    /// appelé. On relit le réglage AVANT chaque fiche, ce qui donne la suite
+    /// exacte de ce qu'un écran qui sonde aurait vu.
+    #[tokio::test]
+    async fn la_passe_par_nom_publie_son_avancement_fiche_apres_fiche() {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(base_neuve());
+        let artistes: Vec<(i64, String)> = (1..=12).map(|i| (i, format!("Artiste {i}"))).collect();
+
+        // La passe 2 vient de finir : l'écran est à 12/12, phase « images ».
+        settings
+            .set(
+                "artist_artwork_enrich_result",
+                &serde_json::json!({
+                    "status": "running", "phase": "images",
+                    "processed": 12, "total": 12, "enriched": 0,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let lu = |s: &crate::db::settings_repo::SettingsRepo| -> serde_json::Value {
+            serde_json::from_str(&s.get("artist_artwork_enrich_result").unwrap().unwrap()).unwrap()
+        };
+
+        let vus = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
+        let (discogs, lastfm) = passe_par_nom(&settings, &artistes, |artist_id, _name| {
+            vus.borrow_mut().push(lu(&settings));
+            async move {
+                // Un artiste sur quatre trouve une image. Aucun réseau.
+                if artist_id % 4 == 0 {
+                    Some(SourceParNom::Discogs)
+                } else {
+                    None
+                }
+            }
+        })
+        .await;
+
+        let vus = vus.into_inner();
+        assert_eq!(vus.len(), 12);
+
+        // Avant la toute première fiche, l'écran a DÉJÀ quitté le 100 % de la
+        // passe 2 : c'est le compteur figé qui a été signalé.
+        assert_eq!(vus[0]["phase"], PHASE_PAR_NOM);
+        assert_eq!(vus[0]["processed"], 0);
+        assert_eq!(vus[0]["total"], 12);
+
+        // Cadence : rien ne bouge avant la cinquième, puis la dixième.
+        for avant in 1..5 {
+            assert_eq!(
+                vus[avant]["processed"],
+                0,
+                "publication hors cadence avant la fiche {}",
+                avant + 1
+            );
+        }
+        assert_eq!(vus[5]["processed"], 5, "cinquième fiche publiée");
+        assert_eq!(vus[10]["processed"], 10, "dixième fiche publiée");
+
+        // Et la dernière tranche n'est pas perdue.
+        let fin = lu(&settings);
+        assert_eq!(fin["phase"], PHASE_PAR_NOM);
+        assert_eq!(fin["processed"], 12);
+        assert_eq!(fin["total"], 12);
+        assert_eq!(fin["enriched"], 3);
+        assert_eq!((discogs, lastfm), (3, 0));
+    }
 
     // ---------------------------------------------------------------------
     // #2221 — la recherche d'image d'artiste PAR NOM doit départager.
