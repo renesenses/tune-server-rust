@@ -753,10 +753,70 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     list_audio_devices_with_backend("auto")
 }
 
+/// Ce que doit faire une énumération de périphériques quand le pilote ASIO —
+/// qui ne s'ouvre qu'UNE fois, tous processus confondus — est déjà pris.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsioEnumerationPlan {
+    /// Interroger le matériel : aucun pilote ASIO n'est en jeu, ou il est libre.
+    Probe,
+    /// Servir le dernier inventaire connu sans toucher au pilote.
+    ServeCache,
+}
+
+/// #1267 — l'énumération générique doit-elle s'écarter du pilote ASIO ?
+///
+/// Le pilote ASIO ne supporte qu'un seul ouvreur. Le rouvrir pour DRESSER LA
+/// LISTE pendant qu'une session exclusive tente de le verrouiller le fait
+/// tourner en rond — `connect → getBufferSize → disconnect`, sans jamais
+/// atteindre `createBuffers`/`start` : la sortie ne se verrouille JAMAIS.
+/// C'est le symptôme rapporté par `zaurux` sur la sortie Diretta ASIO, et la
+/// panne déjà observée sur le Diretta SOtM.
+///
+/// [`list_asio_devices`] se gardait déjà (cf. `try_with_asio_device_lock`).
+/// L'autre porte, celle-ci, ne se gardait pas — et c'est elle qu'empruntent la
+/// page Diagnostic, `/devices/audio` et le rescan à chaud. La page Diagnostic
+/// est précisément celle qu'on ouvre quand la sortie refuse de se verrouiller :
+/// elle rouvrait le pilote et entretenait la panne qu'elle devait documenter.
+///
+/// Seule la valeur `asio` ouvre le host ASIO : `auto` passe par WASAPI (cf.
+/// [`select_host`]), et toute autre valeur également.
+pub fn plan_audio_enumeration(backend: &str, asio_device_busy: bool) -> AsioEnumerationPlan {
+    if asio_device_busy && backend.eq_ignore_ascii_case("asio") {
+        AsioEnumerationPlan::ServeCache
+    } else {
+        AsioEnumerationPlan::Probe
+    }
+}
+
+/// Une session de lecture exclusive tient-elle le pilote ASIO ?
+///
+/// Toujours `false` là où il n'y a pas d'ASIO : macOS, Linux, et Windows
+/// compilé sans la fonctionnalité `asio`.
+fn asio_device_busy() -> bool {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        super::asio_exclusive::asio_device_is_busy()
+    }
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        false
+    }
+}
+
 /// List audio devices using the specified backend preference.
 /// Protected by a global Mutex + 5s cache to prevent concurrent ASIO
 /// driver enumeration which crashes on Windows (non-reentrant COM STA).
 pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
+    // Avant tout : ne pas rouvrir un pilote ASIO qu'une lecture exclusive est
+    // en train de verrouiller (#1267). Le cooldown de 5 s ci-dessous ne suffit
+    // pas — passé ce délai il relance un balayage complet en pleine session.
+    if plan_audio_enumeration(backend, asio_device_busy()) == AsioEnumerationPlan::ServeCache {
+        debug!(
+            backend = %backend,
+            "local_audio_enumeration_skipped_asio_device_busy"
+        );
+        return cached_audio_devices();
+    }
     let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((last_scan, ref cached)) = *guard {
         if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
@@ -10137,5 +10197,95 @@ mod chemin_compresse_dsp_tests {
                  les frequences de coupure."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod enumeration_asio_occupee_tests {
+    use super::{AsioEnumerationPlan, plan_audio_enumeration};
+
+    /// #1267 — pendant qu'une session exclusive verrouille le pilote ASIO,
+    /// l'énumération générique doit servir le cache, pas rouvrir le pilote.
+    #[test]
+    fn le_pilote_asio_occupe_fait_servir_le_cache() {
+        assert_eq!(
+            plan_audio_enumeration("asio", true),
+            AsioEnumerationPlan::ServeCache
+        );
+        // La valeur vient de la base ou de l'environnement : la casse varie.
+        assert_eq!(
+            plan_audio_enumeration("ASIO", true),
+            AsioEnumerationPlan::ServeCache
+        );
+        assert_eq!(
+            plan_audio_enumeration("Asio", true),
+            AsioEnumerationPlan::ServeCache
+        );
+    }
+
+    /// Pilote libre : rien ne change, on interroge le matériel. Sans cela le
+    /// correctif transformerait la panne en une liste figée à vie.
+    #[test]
+    fn le_pilote_asio_libre_laisse_sonder() {
+        assert_eq!(
+            plan_audio_enumeration("asio", false),
+            AsioEnumerationPlan::Probe
+        );
+    }
+
+    /// Les autres backends n'ouvrent JAMAIS le host ASIO — `auto` passe par
+    /// WASAPI. Les priver de balayage parce qu'une zone ASIO joue ferait
+    /// disparaître les DAC USB de la liste (défaut #1084, à ne pas rejouer).
+    #[test]
+    fn les_autres_backends_sondent_meme_pilote_asio_occupe() {
+        for backend in ["auto", "wasapi", "AUTO", "coreaudio", "alsa", ""] {
+            assert_eq!(
+                plan_audio_enumeration(backend, true),
+                AsioEnumerationPlan::Probe,
+                "« {backend} » n'ouvre pas le host ASIO : il doit continuer à sonder"
+            );
+        }
+    }
+
+    /// Le VERROU de branchement.
+    ///
+    /// La décision ci-dessus est éprouvée partout ; son BRANCHEMENT, lui, ne
+    /// se voit qu'à l'exécution sous Windows avec un pilote ASIO réel, que
+    /// personne ne peut jouer en CI. Sans ce garde on pourrait supprimer le
+    /// retour anticipé de `list_audio_devices_with_backend` et les trois tests
+    /// ci-dessus resteraient verts pendant que #1267 reviendrait.
+    ///
+    /// Même procédé que `chaque_sortie_de_select_host_enregistre_le_backend_ouvert`.
+    #[test]
+    fn list_audio_devices_with_backend_consulte_le_plan_avant_de_sonder() {
+        let source = include_str!("local.rs");
+        let debut = source
+            .find("pub fn list_audio_devices_with_backend(")
+            .expect("list_audio_devices_with_backend introuvable");
+        let corps = &source[debut..];
+        let fin = corps
+            .find("\n}\n")
+            .expect("fin du corps de list_audio_devices_with_backend introuvable");
+        let corps = &corps[..fin];
+
+        let pos_plan = corps
+            .find("plan_audio_enumeration(backend, asio_device_busy())")
+            .expect(
+                "list_audio_devices_with_backend ne consulte plus le plan : la page Diagnostic \
+             rouvrira le pilote ASIO pendant que la sortie tente de se verrouiller (#1267)",
+            );
+        let pos_sonde = corps
+            .find("list_audio_devices_uncached(")
+            .expect("le balayage matériel a disparu du corps");
+        assert!(
+            pos_plan < pos_sonde,
+            "le plan doit être consulté AVANT le balayage matériel, sinon le pilote est \
+             déjà rouvert quand on décide de ne pas le rouvrir (#1267)"
+        );
+        assert!(
+            corps.contains("return cached_audio_devices();"),
+            "le chemin ServeCache doit rendre le dernier inventaire connu, pas une liste vide : \
+             une zone ASIO active ferait autrement disparaître toutes les sorties de l'interface"
+        );
     }
 }
