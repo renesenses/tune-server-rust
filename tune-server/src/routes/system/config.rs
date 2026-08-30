@@ -521,6 +521,21 @@ pub(super) async fn update_config(
             .into_response());
     }
 
+    // `music_dirs` passe aussi par ici : ce patch générique accepte N'IMPORTE
+    // QUELLE clé, et `GET /system/settings` publie `music_dirs` — la liste
+    // fait donc un aller-retour complet par cette route. Retirer une racine en
+    // réécrivant le tableau était jusqu'ici totalement muet : ni compte, ni
+    // journal, ni scan. C'est la TROISIÈME porte de #2149, restée nue quand
+    // `/music-dirs/remove` et `/music-dirs/purge-orphans` ont été traitées.
+    //
+    // On lit l'AVANT ici, avant la boucle d'écriture : après, il est perdu.
+    let patch_music_dirs = values.get("music_dirs").and_then(dirs_depuis_valeur);
+    let racines_avant = if patch_music_dirs.is_some() {
+        super::get_music_dirs_list(&state.backend)
+    } else {
+        Vec::new()
+    };
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     for (key, value) in values {
         let str_val = if value.is_string() {
@@ -535,7 +550,112 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
     }
-    Ok(Json(json!({"ok": true})).into_response())
+
+    let Some(racines_apres) = patch_music_dirs else {
+        return Ok(Json(json!({"ok": true})).into_response());
+    };
+
+    // Le symétrique de `add_music_dir` : une racine AJOUTÉE par cette porte
+    // n'était ni scannée ni surveillée avant un redémarrage. « Ajoutée » se
+    // lit avec la même fonction, arguments inversés.
+    let ajoutees = racines_retirees(&racines_apres, &racines_avant);
+    if !ajoutees.is_empty() {
+        super::scan::spawn_library_scan(state.clone(), false, None).await;
+    }
+
+    let retirees = racines_retirees(&racines_avant, &racines_apres);
+    if retirees.is_empty() {
+        return Ok(Json(json!({"ok": true, "music_dirs_removed": []})).into_response());
+    }
+
+    // On DIT, on ne supprime pas. La doctrine de #2149 est « deux portes
+    // d'entrée, UNE suppression » : `/music-dirs/remove?confirm_purge=N` et
+    // `/music-dirs/purge-orphans`. Un patch de réglages n'est pas un geste de
+    // suppression — il n'en porte ni la confirmation chiffrée ni le plafond de
+    // #1943. Ce qu'il doit à l'utilisateur, c'est de ne plus être muet.
+    //
+    // Le compte se fait par [`orphelines_parmi`], donc CONTRE les racines qui
+    // restent : retirer `/media/disque` en gardant `/media/disque/Classique`
+    // n'annonce pas les pistes de `Classique`.
+    let pistes = pistes_locales(&state);
+    let mut ids: Vec<i64> = Vec::new();
+    for retiree in &retirees {
+        for id in orphelines_parmi(&pistes, retiree, &racines_apres) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let plan = impact(&state, &ids);
+    if plan.tracks > 0 {
+        tracing::warn!(
+            dossiers = ?retirees,
+            pistes = plan.tracks,
+            "config_patch_music_dirs_tracks_left_behind — des racines ont été retirées par \
+             PATCH /system/config. Leurs pistes ne sont plus sous aucune racine configurée : \
+             le scan ne les visitera plus et ne les purgera jamais (HorsPerimetre, #1943). \
+             Seul un geste explicite — /music-dirs/remove avec confirm_purge=N, ou \
+             /music-dirs/purge-orphans — peut les retirer."
+        );
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "music_dirs_removed": retirees,
+        "orphan_tracks": plan.tracks,
+        "impact": impact_json(&plan),
+        "confirm_purge_required": plan.tracks,
+    }))
+    .into_response())
+}
+
+/// La valeur `music_dirs` d'un patch, qu'elle arrive en tableau JSON ou en
+/// chaîne contenant du JSON — les deux formes atteignent `settings` avec le
+/// même contenu, la lecture doit donc accepter les deux.
+fn dirs_depuis_valeur(v: &Value) -> Option<Vec<String>> {
+    match v {
+        Value::Array(_) => serde_json::from_value(v.clone()).ok(),
+        Value::String(s) => serde_json::from_str(s).ok(),
+        _ => None,
+    }
+}
+
+/// Racines présentes AVANT et absentes APRÈS — l'ensemble effectivement
+/// retiré par une réécriture de `music_dirs`.
+///
+/// Fonction PURE : elle se vérifie sans base ni disque.
+///
+/// # Pourquoi des chaînes et jamais `Path`
+///
+/// Sur hôte POSIX, `Path::components()` voit `D:\Musique\..\x` comme UN seul
+/// composant : la comparaison de composants rendrait ces tests verts sur Mac
+/// et faux chez Rhorn, qui est sous Windows. On compare donc des chaînes
+/// normalisées par `normalize_path`, qui rogne les deux séparateurs de fin.
+///
+/// La comparaison est SENSIBLE À LA CASSE, comme l'égalité qu'utilise déjà
+/// `remove_music_dir` : sur Windows `D:\Musique` et `d:\musique` désignent le
+/// même dossier, et ne seraient pas appariés ici. Conséquence : la racine
+/// serait vue comme retirée ET comme ajoutée — donc un scan de trop et un
+/// compte d'orphelines de trop, jamais une suppression de trop, cette route
+/// n'en faisant aucune.
+pub(crate) fn racines_retirees(avant: &[String], apres: &[String]) -> Vec<String> {
+    fn cle(r: &str) -> String {
+        tune_core::scanner::walker::normalize_path(r)
+            .trim_end_matches(['/', '\\'])
+            .to_string()
+    }
+    let restantes: std::collections::HashSet<String> = apres
+        .iter()
+        .map(|r| cle(r))
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut vues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    avant
+        .iter()
+        .map(|r| cle(r))
+        .filter(|r| !r.is_empty())
+        .filter(|r| !restantes.contains(r))
+        .filter(|r| vues.insert(r.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3091,6 +3211,171 @@ mod purge_hors_perimetre_tests {
             )
             .unwrap();
         assert!(restants.is_empty(), "marqueur hidden_items orphelin laissé");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // La TROISIÈME porte : `PATCH /system/config`
+    //
+    // `/music-dirs/remove` et `/music-dirs/purge-orphans` ont été traitées.
+    // Le patch de configuration générique, lui, accepte n'importe quelle clé
+    // — `music_dirs` comprise — et l'écrivait sans un mot. Retirer une racine
+    // par cet aller-retour ne produisait ni compte, ni journal, ni scan : le
+    // même angle mort que #2149, par une porte restée nue.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Rejoue un `PATCH /system/config` et rend le corps JSON.
+    async fn patcher(state: &AppState, patch: serde_json::Value) -> serde_json::Value {
+        let objet = patch.as_object().expect("patch objet").clone();
+        let reponse = super::update_config(
+            RequireAdmin,
+            State(state.clone()),
+            Json(super::ConfigPatch(objet)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_config a échoué"))
+        .into_response();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps lisible");
+        serde_json::from_slice(&octets).expect("corps JSON")
+    }
+
+    /// Le cœur du correctif, mesuré DANS LES DEUX SENS.
+    ///
+    /// `/musique/rock` est retiré, `/musique/rock2` reste. Les deux noms
+    /// partagent un préfixe : un `LIKE '/musique/rock%'` ou un
+    /// `starts_with` emporterait les deux. Le test échoue si le compte
+    /// annoncé dépasse les seules pistes de `rock`, et il échoue aussi si
+    /// les pistes de `rock2` bougent d'un pouce.
+    #[tokio::test]
+    async fn le_patch_de_config_compte_les_pistes_du_dossier_retire_et_ignore_la_soeur() {
+        let state = etat();
+        racines(&state, &["/musique/rock", "/musique/rock2"]);
+        let a = piste(&state, "/musique/rock/album/01.flac");
+        let b = piste(&state, "/musique/rock/album/02.flac");
+        let c = piste(&state, "/musique/rock/autre/03.flac");
+        // Le témoin anti-régression : dossier voisin au nom PRÉFIXE.
+        let s1 = piste(&state, "/musique/rock2/album/01.flac");
+        let s2 = piste(&state, "/musique/rock2/album/02.flac");
+        assert_eq!(compte(&state), 5);
+
+        let rep = patcher(
+            &state,
+            serde_json::json!({ "music_dirs": [n("/musique/rock2")] }),
+        )
+        .await;
+
+        assert_eq!(
+            rep["music_dirs_removed"].as_array().map(|v| v.len()),
+            Some(1),
+            "le patch retire /musique/rock : la route doit le NOMMER, pas rester muette : {rep}"
+        );
+        assert_eq!(
+            rep["music_dirs_removed"][0].as_str(),
+            Some(n("/musique/rock").as_str()),
+            "{rep}"
+        );
+        assert_eq!(
+            rep["orphan_tracks"].as_i64(),
+            Some(3),
+            "3 pistes sous /musique/rock deviennent orphelines — et 3 SEULEMENT : \
+             les 2 de /musique/rock2 ne sont pas dans le périmètre retiré : {rep}"
+        );
+        // Ce patch ne supprime rien : c'est la doctrine « deux portes
+        // d'entrée, UNE suppression ». Il annonce, il ne tranche pas.
+        assert_eq!(
+            compte(&state),
+            5,
+            "un patch de réglages ne supprime pas : {rep}"
+        );
+        for id in [a, b, c, s1, s2] {
+            assert!(existe(&state, id), "piste {id} disparue : {rep}");
+        }
+
+        // Et le geste explicite, lui, emporte EXACTEMENT ces 3 pistes.
+        let (code, purge) = purger(&state, "/musique/rock", Some(3)).await;
+        assert_eq!(code, 200, "{purge}");
+        assert_eq!(purge["purged"].as_i64(), Some(3), "{purge}");
+        assert_eq!(
+            compte(&state),
+            2,
+            "il doit rester les 2 pistes de /musique/rock2 : {purge}"
+        );
+        assert!(
+            !existe(&state, a) && !existe(&state, b) && !existe(&state, c),
+            "{purge}"
+        );
+        assert!(
+            existe(&state, s1) && existe(&state, s2),
+            "/musique/rock2 n'a pas été retiré des réglages : ses pistes devaient rester : {purge}"
+        );
+    }
+
+    /// Une racine encore configurée SOUS celle qu'on retire garde ses pistes.
+    ///
+    /// `music_dirs = ["/media/disque", "/media/disque/Classique"]` est un
+    /// réglage courant. Retirer le parent par un patch ne doit pas annoncer
+    /// les pistes de `Classique` comme orphelines.
+    #[tokio::test]
+    async fn le_patch_de_config_n_annonce_pas_les_pistes_d_une_racine_imbriquee_restante() {
+        let state = etat();
+        racines(&state, &["/media/disque", "/media/disque/Classique"]);
+        piste(&state, "/media/disque/Rock/01.flac");
+        piste(&state, "/media/disque/Classique/Bach/01.flac");
+        piste(&state, "/media/disque/Classique/Bach/02.flac");
+
+        let rep = patcher(
+            &state,
+            serde_json::json!({ "music_dirs": [n("/media/disque/Classique")] }),
+        )
+        .await;
+        assert_eq!(
+            rep["orphan_tracks"].as_i64(),
+            Some(1),
+            "seule la piste hors de Classique est orpheline : {rep}"
+        );
+    }
+
+    /// Un patch qui ne touche pas `music_dirs` reste ce qu'il était.
+    #[tokio::test]
+    async fn un_patch_sans_music_dirs_ne_dit_rien_de_plus() {
+        let state = etat();
+        racines(&state, &["/musique/rock"]);
+        piste(&state, "/musique/rock/01.flac");
+        let rep = patcher(&state, serde_json::json!({ "theme": "dark" })).await;
+        assert_eq!(rep["ok"].as_bool(), Some(true), "{rep}");
+        assert!(rep.get("music_dirs_removed").is_none(), "{rep}");
+        assert_eq!(compte(&state), 1);
+    }
+
+    /// `racines_retirees` — pure, et éprouvée sur des chemins WINDOWS depuis
+    /// un hôte POSIX. `Path::components()` y verrait un composant unique :
+    /// ces cas seraient verts sur Mac et faux chez Rhorn.
+    #[test]
+    fn racines_retirees_distingue_un_prefixe_de_nom_et_tolere_les_deux_separateurs() {
+        use super::racines_retirees;
+        let v = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
+
+        // Windows, le cas de Rhorn : l'ancien NAS retiré, le nouveau gardé.
+        assert_eq!(
+            racines_retirees(
+                &v(&[r"D:\Musique\rock", r"D:\Musique\rock2"]),
+                &v(&[r"D:\Musique\rock2"]),
+            ),
+            v(&[r"D:\Musique\rock"]),
+        );
+        // Le séparateur de fin ne fait pas une racine différente.
+        assert!(
+            racines_retirees(&v(&[r"D:\Musique\rock\"]), &v(&[r"D:\Musique\rock"])).is_empty(),
+            "un antislash de fin ne retire pas une racine"
+        );
+        assert!(racines_retirees(&v(&["/musique/rock/"]), &v(&["/musique/rock"])).is_empty(),);
+        // Rien retiré quand rien ne bouge, doublons compris.
+        assert!(racines_retirees(&v(&["/a", "/a", "/b"]), &v(&["/b", "/a"])).is_empty(),);
+        // Une entrée vide n'est pas une racine retirée.
+        assert!(racines_retirees(&v(&["", "  "]), &v(&[])).is_empty());
+        // Et le sens inverse lit les AJOUTS.
+        assert_eq!(racines_retirees(&v(&["/a", "/b"]), &v(&["/a"])), v(&["/b"]),);
     }
 }
 
