@@ -3197,6 +3197,18 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "listen_history_rang_dans_le_contexte",
         include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
     ),
+    // #2860 — `listen_history.album_id` est TEXT et `albums.id` BIGINT : la
+    // jointure de « Continuer l'ecoute » rend `operator does not exist:
+    // text = bigint`, avalee par `unwrap_or_default()`, donc section vide sur
+    // TOUTE installation PostgreSQL. La 012 convertit deja cette colonne, mais
+    // elle ne l'a jamais vue : `album_id` n'arrive par aucun script numerote,
+    // seulement par ENSURE_COLUMNS, joue APRES. Cette migration rejoue la
+    // conversion maintenant que la colonne existe.
+    (
+        47,
+        "listen_history_album_id_bigint",
+        include_str!("../../migrations/postgres/047_listen_history_album_id_bigint.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4782,7 +4794,18 @@ mod tests {
         // SQLite 93. Migration de DONNÉES : sans jumelle PG, le préréglage
         // « World Music » garderait « contient folk » sur tout le parc
         // PostgreSQL.
-        assert_eq!(pg_latest_version(), 45, "latest PG migration must be 45");
+        // 46 : `listen_history_rang_dans_le_contexte` (#2441). ⚠️ Cette
+        // migration a été ajoutée SANS remonter la borne ci-dessous : la
+        // branche était donc déjà ROUGE sur ce test avant #2860. Personne ne
+        // l'a vu parce que « Test (PostgreSQL) » est SAUTÉ sur une PR vers
+        // `batch/*` ou `rc/*` sans l'étiquette `ci:full` — c'est cette
+        // PR-ci, qui la porte, qui a réveillé le test.
+        // 47 : `listen_history_album_id_bigint` (#2860). `album_id` était
+        // TEXT contre `albums.id` BIGINT : la jointure de « Continuer
+        // l'écoute » rendait `operator does not exist: text = bigint`, avalé
+        // par `unwrap_or_default()`, donc section vide sur tout le parc
+        // PostgreSQL.
+        assert_eq!(pg_latest_version(), 47, "latest PG migration must be 47");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

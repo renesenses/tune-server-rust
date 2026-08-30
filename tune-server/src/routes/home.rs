@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::home_queries::{self, HISTORIQUE_VERS_ALBUM};
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -46,77 +47,6 @@ fn ph(engine: Engine, idx: usize) -> String {
         Engine::Postgres => PostgresDialect.placeholder(idx),
     }
 }
-
-/// Rapproche une ligne d'historique (`lh`) de son album (`a`).
-///
-/// Le titre SEUL ne designe pas un album : un « Live » de Police et un
-/// « Live » de Pulp portent le meme titre et se retrouvaient comptes pour un
-/// seul disque — un album jamais ecoute remontait dans « Continuer l'ecoute »,
-/// et le compteur d'avancement additionnait les pistes des deux (#2731,
-/// Tades, fil 1600).
-///
-/// L'identifiant fait foi quand il est ecrit. Il ne l'est PAS toujours :
-/// `record_listen` le tire de la piste locale, donc toute ecoute en flux
-/// (track_id absent) et toute ligne anterieure a la migration
-/// `add_listen_history_source_id_album_id` l'ont a NULL. Joindre sur le seul
-/// `album_id` viderait la section pour ces gens-la ; d'ou le repli sur
-/// titre ET artiste.
-///
-/// Le repli suit la regle de `find_album_by_identity`
-/// (`tune-core/src/db/favorites_reconcile.rs`), deja partagee par les favoris
-/// et par les albums masques (#1391 / PR #2817) — pas une seconde regle de
-/// rapprochement inventee ici, la meme, a une reserve pres (la casse, voir
-/// plus bas) :
-/// * artiste connu — NULL **et** chaine vide valent « inconnu », comme
-///   `artist.is_empty()` la-bas : titre + artiste, l'artiste absent de
-///   l'album valant chaine vide ;
-/// * artiste inconnu : titre seul, et UNIQUEMENT s'il ne designe qu'un
-///   album. Un titre partage par deux disques ne rattache plus rien —
-///   c'est le cas de Tades par l'autre porte, et la doctrine de
-///   `find_album_by_identity` (« AUCUN repli titre seul » quand ca peut
-///   designer l'homonyme d'un autre artiste).
-///
-/// RESERVE MESUREE — la casse reste significative ici, alors que
-/// `find_album_by_identity` compare en `LOWER`. Transposer le `LOWER` dans
-/// CETTE jointure coute la section : mesure sur 45 000 albums / 5 000 lignes
-/// d'historique (dont 20 % sans `album_id`), meme machine, meme jeu de
-/// donnees, `fetch_continue_listening` seul :
-///
-/// ```text
-///   titre compare tel quel   :    19 ms
-///   LOWER(...) des deux cotes : 83 662 ms
-/// ```
-///
-/// Quatre mille fois plus cher, sur le chemin de l'accueil. La cause est
-/// l'index : `idx_albums_title ON albums(title COLLATE NOCASE)` sert la
-/// comparaison directe, aucun index ne sert `LOWER(title)`. Le rendre
-/// gratuit demanderait un index d'expression AUX QUATRE endroits du schema
-/// (CORE_SCHEMA, migration SQLite, PG_FULL_SCHEMA, migration PG) — et
-/// PostgreSQL, lui, n'a pas d'equivalent de `COLLATE NOCASE` a portee de
-/// main. Hors du perimetre de #2731 : c'est un chantier de schema, pas la
-/// confusion de deux albums. Le test
-/// `la_casse_separe_encore_une_ecoute_de_son_album` fige la limite pour
-/// qu'on ne la redecouvre pas une troisieme fois.
-///
-/// Le sous-select sur `artists` evite de dependre de l'ordre des jointures —
-/// `ar` n'existe pas encore quand cette condition est evaluee, et le
-/// GROUP BY de PostgreSQL n'accepte pas qu'on enveloppe `albums` dans une
-/// table derivee (la dependance fonctionnelle ne vaut que pour la cle
-/// primaire d'une vraie table).
-///
-/// Cout : les deux sous-selects ne sont atteints QUE par les lignes a
-/// `album_id` NULL dont le titre d'album tombe deja juste ; le chemin
-/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus.
-const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
-     OR (lh.album_id IS NULL AND lh.album_title = a.title \
-         AND ((COALESCE(lh.artist_name, '') <> '' \
-               AND lh.artist_name \
-                   = (SELECT ar_hist.name FROM artists ar_hist \
-                      WHERE ar_hist.id = a.artist_id)) \
-              OR (COALESCE(lh.artist_name, '') = '' \
-                  AND NOT EXISTS (SELECT 1 FROM albums a_hom \
-                                  WHERE a_hom.title = a.title \
-                                    AND a_hom.id <> a.id)))))";
 
 /// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
 /// celui de l'album. Partage entre les recommandations et les « top mixes »,
@@ -300,26 +230,29 @@ fn fetch_continue_listening(
     // inchange depuis #2731) : n'avancer que sur les lignes sans contexte
     // sous-estimerait un disque commence avant la mise a jour et poursuivi
     // apres.
+    //
+    // DEUX ecritures imposees par PostgreSQL, mesurees sur une base reelle
+    // (#2860) — SQLite tolerait les deux, et l'erreur etait avalee par le
+    // `unwrap_or_default()` ci-dessous, donc la section disparaissait sans un
+    // seul message :
+    //
+    // * `GROUP BY a.id` seul ne suffit pas. La dependance fonctionnelle de
+    //   PostgreSQL ne couvre que les colonnes de la table dont on groupe la
+    //   cle primaire ; `ar.name` vient d'une AUTRE table :
+    //     ERROR: column "ar.name" must appear in the GROUP BY clause
+    //            or be used in an aggregate function
+    //   C'est la meme correction que `resoudre_albums` porte deja.
+    //
+    // * `HAVING listened_tracks < ...` ne marche pas non plus. Un alias de la
+    //   liste SELECT n'existe pas encore quand le HAVING est evalue :
+    //     ERROR: column "listened_tracks" does not exist
+    //   (l'alias reste legal en ORDER BY et en GROUP BY, lui.) On repete donc
+    //   l'agregat.
     let deja: std::collections::HashSet<i64> = items
         .iter()
         .filter_map(|(_, item)| item["album_id"].as_i64())
         .collect();
-    let p1 = ph(engine, 1);
-    let sql = format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
-               COUNT(DISTINCT lh.title) as listened_tracks, a.track_count, \
-               MAX(lh.listened_at) as dernier \
-        FROM listen_history lh \
-        JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
-        LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
-        {zone_filter}\
-        GROUP BY a.id \
-        HAVING listened_tracks < a.track_count \
-           AND SUM(CASE WHEN lh.context_type IS NULL THEN 1 ELSE 0 END) > 0 \
-        ORDER BY MAX(lh.listened_at) DESC \
-        LIMIT {p1}"
-    );
+    let sql = home_queries::continue_listening_albums_deduits(engine, &zone_filter);
     let marge = marge_de_contextes(limit);
     let params: [&dyn ToSqlValue; 1] = [&marge];
     for cols in state.backend.query_many(&sql, &params).unwrap_or_default() {
@@ -1414,23 +1347,18 @@ async fn recently_added(
     Ok(Json(json!(items)))
 }
 
+/// « Ajoutes recemment ».
+///
+/// GROUP BY exhaustif, et non `GROUP BY a.id` : jumelle exacte du defaut de
+/// « Continuer l'ecoute » (#2860). `ar.name` vient de `artists`, que la
+/// dependance fonctionnelle de PostgreSQL sur `albums.id` ne couvre pas —
+/// `column "ar.name" must appear in the GROUP BY clause or be used in an
+/// aggregate function`, avalee par le `unwrap_or_default()` plus bas. Cette
+/// section-la etait donc vide, elle aussi, sur toute installation PostgreSQL.
 fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
     let seven_days_ago = chrono_epoch_seven_days_ago();
-    let p1 = ph(engine, 1);
-    let p2 = ph(engine, 2);
-    let sql = format!(
-        "SELECT DISTINCT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
-               a.format, a.sample_rate, a.bit_depth, a.track_count, \
-               MAX(t.file_mtime) as newest_mtime \
-        FROM tracks t \
-        JOIN albums a ON t.album_id = a.id \
-        LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE t.file_mtime IS NOT NULL AND t.file_mtime > {p1} \
-        GROUP BY a.id \
-        ORDER BY newest_mtime DESC \
-        LIMIT {p2}"
-    );
+    let sql = home_queries::recently_added(engine);
     let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
     let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
     Ok(rows
