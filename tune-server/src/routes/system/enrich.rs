@@ -441,7 +441,11 @@ pub(super) struct EnrichmentRunBody {
 /// garde que le scan ciblé, mais en REFUS franc plutôt qu'en repli silencieux :
 /// ici un repli enrichirait toute la bibliothèque, exactement ce que
 /// l'utilisateur demandait d'éviter (#1660).
-fn resoudre_portee(
+///
+/// `pub(crate)` : `/library/enrich-all` — la route que le bouton
+/// « Enrichir les métadonnées » de `SettingsView.svelte` appelle réellement —
+/// valide son `path` avec CETTE fonction, pas une copie.
+pub(crate) fn resoudre_portee(
     state: &AppState,
     path: &str,
 ) -> Result<tune_core::metadata::enrich_scope::EnrichScope, (StatusCode, Json<Value>)> {
