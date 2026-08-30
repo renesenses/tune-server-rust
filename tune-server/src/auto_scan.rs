@@ -1210,6 +1210,162 @@ mod settle_tests {
     }
 }
 
+/// La quatrième porte de suppression — celle du surveillant de fichiers.
+///
+/// Aucun système de fichiers, aucune horloge, aucun minuteur : la liste des
+/// racines illisibles est un paramètre. Ces tests rendent le même verdict sur
+/// n'importe quel hôte, y compris la CI Linux, alors que le défaut qu'ils
+/// couvrent frappe surtout Windows et les partages réseau.
+#[cfg(test)]
+mod surveillant_suppression_tests {
+    use super::verdict_suppression_surveillant as verdict;
+    use crate::routes::system::scan::VerdictPurge;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Le cas normal : le fichier a vraiment disparu d'une racine qui répond.
+    #[test]
+    fn un_fichier_efface_sous_une_racine_saine_part() {
+        assert_eq!(
+            verdict("/mnt/music/Jazz/a.flac", &v(&["/mnt/music"]), &[]),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// La racine qui porte le fichier est tombée : on garde.
+    #[test]
+    fn une_racine_illisible_protege_ses_pistes() {
+        assert_eq!(
+            verdict(
+                "/mnt/music/Jazz/a.flac",
+                &v(&["/mnt/music"]),
+                &v(&["/mnt/music"])
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+    }
+
+    /// PREMIÈRE moitié perdue : `starts_with` nu, et la PREMIÈRE racine qui
+    /// préfixe l'emporte. `/mnt/music2` répond, `/mnt/music22` est tombé —
+    /// l'ancien garde interrogeait `/mnt/music2`, la trouvait lisible, et
+    /// supprimait toute la bibliothèque du partage absent.
+    #[test]
+    fn la_racine_voisine_ne_repond_plus_pour_le_partage_tombe() {
+        let racines = v(&["/mnt/music2", "/mnt/music22"]);
+        let illisibles = v(&["/mnt/music22"]);
+        assert_eq!(
+            verdict("/mnt/music22/Jazz/a.flac", &racines, &illisibles),
+            VerdictPurge::ProtegeIllisible
+        );
+        // Et la voisine, elle, purge normalement : la protection ne déborde pas.
+        assert_eq!(
+            verdict("/mnt/music2/Jazz/a.flac", &racines, &illisibles),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// Même moitié, écriture Windows — `G:\Musique` et `G:\Musique 2`.
+    /// `starts_with` ne voyait pas non plus la frontière d'antislash.
+    #[test]
+    fn la_frontiere_vaut_aussi_en_antislash() {
+        let racines = v(&[r"G:\Musique", r"G:\Musique 2"]);
+        assert_eq!(
+            verdict(
+                r"G:\Musique 2\Jazz\a.flac",
+                &racines,
+                &v(&[r"G:\Musique 2"])
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+        assert_eq!(
+            verdict(r"G:\Musique\Jazz\a.flac", &racines, &[]),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// SECONDE moitié perdue : hors périmètre (#1943). L'ancien garde ne
+    /// trouvait aucune racine préfixe, sautait le `if let`, et supprimait
+    /// sans condition. C'est le trou des 21 277 pistes de Yacine.
+    #[test]
+    fn une_piste_sous_aucune_racine_est_conservee() {
+        assert_eq!(
+            verdict("/ancien/montage/Jazz/a.flac", &v(&["/mnt/music"]), &[]),
+            VerdictPurge::HorsPerimetre
+        );
+    }
+
+    /// Aucune racine connue : on ne sait rien, on ne supprime rien.
+    #[test]
+    fn sans_racine_configuree_rien_ne_part() {
+        assert_eq!(
+            verdict("/mnt/music/Jazz/a.flac", &[], &[]),
+            VerdictPurge::HorsPerimetre
+        );
+    }
+
+    /// Contre-épreuve figée : l'ANCIENNE formule du garde, telle qu'elle
+    /// était écrite, sur les deux cas ci-dessus. Elle laissait passer les
+    /// deux suppressions. Ce test échouerait si quelqu'un la réintroduisait
+    /// en croyant qu'elle était équivalente.
+    #[test]
+    fn l_ancien_garde_laissait_passer_les_deux() {
+        let racines = v(&["/mnt/music2", "/mnt/music22"]);
+        let illisible = "/mnt/music22";
+        let ancien_supprimait = |chemin: &str| {
+            // `find` : la PREMIÈRE racine qui préfixe, pas la bonne.
+            match racines.iter().find(|r| chemin.starts_with(r.as_str())) {
+                // La racine trouvée est lisible ⇒ l'ancien code supprimait.
+                Some(root) => root != illisible,
+                // Aucune racine ⇒ l'ancien code supprimait aussi.
+                None => true,
+            }
+        };
+        assert!(
+            ancien_supprimait("/mnt/music22/Jazz/a.flac"),
+            "l'ancien garde retenait /mnt/music2 pour un chemin de /mnt/music22"
+        );
+        assert!(
+            ancien_supprimait("/ancien/montage/Jazz/a.flac"),
+            "l'ancien garde n'avait aucune protection hors périmètre"
+        );
+    }
+}
+
+/// Le surveillant a-t-il le droit de retirer cette piste de la base ?
+///
+/// Le surveillant de fichiers supprime des lignes de `tracks`, comme la purge
+/// de fin de scan — et c'était la seule des quatre portes de suppression
+/// (scan manuel, scan automatique, retrait de racine, surveillant) à ne pas
+/// passer par [`verdict_purge`]. Elle y perdait ses DEUX moitiés :
+///
+/// 1. **La frontière de séparateur.** Le garde testait
+///    `change.path.starts_with(racine)`, un préfixe de NOM : `/mnt/music2`
+///    « contient » alors `/mnt/music22/album/a.flac`. Pire, il retenait la
+///    PREMIÈRE racine qui préfixe — donc si `/mnt/music2` répond et que
+///    `/mnt/music22` est le partage tombé, le garde interroge la mauvaise
+///    racine, la trouve lisible, et supprime. C'est la quatrième occurrence
+///    du défaut de #2016.
+/// 2. **La protection « hors périmètre » (#1943).** Une piste sous AUCUNE
+///    racine configurée ne trouvait aucun garde du tout : `find` rendait
+///    `None`, le `if let` était sauté, et `delete_by_path` partait sans
+///    condition. C'est très exactement le trou par lequel 21 277 pistes de
+///    Yacine ont disparu — un point de montage renommé, l'ancienne racine
+///    plus configurée, personne pour dire « je ne sais pas ».
+///
+/// `racines_illisibles` est la liste des racines dont `read_dir` échoue à cet
+/// instant. Elle est passée en paramètre, et non relue ici, pour que la règle
+/// se teste sans système de fichiers — et pour qu'un lot de mille
+/// suppressions ne paie pas mille `read_dir` sur un partage tombé.
+pub(crate) fn verdict_suppression_surveillant(
+    chemin: &str,
+    racines: &[String],
+    racines_illisibles: &[String],
+) -> crate::routes::system::scan::VerdictPurge {
+    crate::routes::system::scan::verdict_purge(chemin, racines, racines_illisibles, &[], &[], &[])
+}
+
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
 pub fn spawn_file_watcher(
@@ -1228,6 +1384,10 @@ pub fn spawn_file_watcher(
     if music_dirs.is_empty() {
         return;
     }
+
+    // Le surveillant supprime des lignes de `tracks` : il doit passer par le
+    // MÊME arbitrage que la purge de fin de scan (#1943).
+    use crate::routes::system::scan::VerdictPurge;
 
     // Normalized roots for the delete guard below — same normalization the
     // watcher applies internally.
@@ -1313,6 +1473,22 @@ pub fn spawn_file_watcher(
                 let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
                 pending_settle = still_writing;
                 let had_changes = !changes.is_empty();
+                // Racines illisibles À CET INSTANT. Calculée une fois par
+                // lot, et seulement s'il porte une suppression : `read_dir`
+                // sur un partage réseau tombé peut bloquer plusieurs
+                // secondes, et un lot en porte des centaines.
+                let racines_illisibles: Vec<String> = if changes
+                    .iter()
+                    .any(|c| c.change_type == tune_core::scanner::watcher::ChangeType::Deleted)
+                {
+                    guard_roots
+                        .iter()
+                        .filter(|r| std::fs::read_dir(r).is_err())
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 for change in changes {
                     // Same exclusions as the scans (re-read per event batch
                     // so setting edits apply without a restart is overkill;
@@ -1502,17 +1678,30 @@ pub fn spawn_file_watcher(
                                 tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
                                 continue;
                             }
-                            if let Some(root) = guard_roots
-                                .iter()
-                                .find(|r| change.path.starts_with(r.as_str()))
-                                && std::fs::read_dir(root).is_err()
-                            {
-                                tracing::warn!(
-                                    path = %change.path,
-                                    root = %root,
-                                    "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
-                                );
-                                continue;
+                            // Même arbitrage que la purge de fin de scan, et
+                            // par la MÊME fonction : cette règle ne doit
+                            // exister qu'à un endroit (#1943). Ce chemin-ci
+                            // la contournait, et y perdait ses deux moitiés.
+                            match verdict_suppression_surveillant(
+                                &change.path,
+                                &guard_roots,
+                                &racines_illisibles,
+                            ) {
+                                VerdictPurge::ProtegeIllisible => {
+                                    tracing::warn!(
+                                        path = %change.path,
+                                        "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
+                                    );
+                                    continue;
+                                }
+                                VerdictPurge::HorsPerimetre => {
+                                    tracing::warn!(
+                                        path = %change.path,
+                                        "watcher_delete_skipped_out_of_scope — cette piste n'est sous AUCUNE racine configurée, elle n'est pas « disparue » (#1943)"
+                                    );
+                                    continue;
+                                }
+                                VerdictPurge::Supprimer => {}
                             }
                             let track_repo = TrackRepo::with_backend(db.clone());
                             if track_repo.delete_by_path(&change.path).is_ok() {
