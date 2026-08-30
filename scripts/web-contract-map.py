@@ -40,7 +40,12 @@ from pathlib import Path
 # amputées avant ce correctif. La normalisation vient après, sur la chaîne
 # complète.
 MOTIF_APPEL = re.compile(
-    r"fetchJSON<(?P<type>.+?)>\(\s*(?P<q>[`'\"])\$\{BASE\}(?P<route>(?:(?!(?P=q)).)*)",
+    # Ne jamais franchir un second `fetchJSON<`. Sans cette borne, la
+    # déclaration `async function fetchJSON<T>(url: string)` peut commencer un
+    # faux match qui avale tout le corps de la fonction jusqu'au premier vrai
+    # appel. C'est ainsi que `/zones` disparaissait de la carte derrière un
+    # gigantesque pseudo-type commençant par `T>(url: string, ...)`.
+    r"fetchJSON<(?P<type>(?:(?!fetchJSON<).)+?)>\(\s*(?P<q>[`'\"])\$\{BASE\}(?P<route>(?:(?!(?P=q)).)*)",
     re.S,
 )
 
@@ -234,6 +239,9 @@ def self_test() -> int:
         """
     }
     api = """
+      async function fetchJSON<T>(url: string): Promise<T> {
+        throw new Error(url);
+      }
       export const zones = () => fetchJSON<Zone[]>(`${BASE}/zones`);
       export const zone = (id) => fetchJSON<Zone>(`${BASE}/zones/${id}`);
       export const dr = (p) => fetchJSON<{ items: X[]; total: number }>(`${BASE}/library/albums-detailed?${p}`);
@@ -290,8 +298,9 @@ def self_test() -> int:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 11 garanties (type nommé, optionnels, liste, paramètre "
-          "d'URL, type en ligne, import en ligne, route à parenthèses, méthode HTTP, et les deux non-résolutions)")
+    print("SELF-TEST: ok — 12 garanties (déclaration générique ignorée, type nommé, "
+          "optionnels, liste, paramètre d'URL, type en ligne, import en ligne, route "
+          "à parenthèses, méthode HTTP, et les deux non-résolutions)")
     return 0
 
 
