@@ -1053,7 +1053,7 @@ fn search_containers_in_container(
                 .unwrap_or_default();
             let retenus = retenir_par_titre(artistes, titres, |a| a.name.as_str());
             let (page, total) = paginer(retenus, start, count);
-            Some(didl_artistes(&page, "artists", total))
+            Some(didl_artistes(state, &page, "artists", total))
         }
         CibleRecherche::Albums => {
             let albums = AlbumRepo::with_backend(state.backend.clone())
@@ -1486,55 +1486,24 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "object.container.storageFolder",
             Some(ROOT_CONTAINERS.len() as u64),
         )),
-        "artists" => Some(didl_container(
-            "artists",
-            "0",
-            "Artists",
-            "object.container",
-            None,
-        )),
-        "albums" => Some(didl_container(
-            "albums",
-            "0",
-            "Albums",
-            "object.container",
-            None,
-        )),
-        "genres" => Some(didl_container(
-            "genres",
-            "0",
-            "Genres",
-            "object.container",
-            None,
-        )),
-        "years" => Some(didl_container(
-            "years",
-            "0",
-            "Years",
-            "object.container",
-            None,
-        )),
-        "tracks" => Some(didl_container(
-            "tracks",
-            "0",
-            "All Tracks",
-            "object.container",
-            None,
-        )),
-        "radios" => Some(didl_container(
-            "radios",
-            "0",
-            "Radio",
-            "object.container",
-            None,
-        )),
-        "playlists" => Some(didl_container(
-            "playlists",
-            "0",
-            "Playlists",
-            "object.container",
-            None,
-        )),
+        // Les sept rubriques racine se décrivent depuis `ROOT_CONTAINERS`,
+        // seule source de vérité de leur identifiant, de leur titre et de leur
+        // classe — sept branches recopiées à la main finissaient toujours par
+        // diverger de la liste. Et chacune annonce le nombre d'enfants que son
+        // Browse ouvrira : c'est ce que le point de contrôle affiche AVANT
+        // d'ouvrir, la différence entre une bibliothèque et un dossier.
+        id if ROOT_CONTAINERS.iter().any(|(racine, _, _)| *racine == id) => ROOT_CONTAINERS
+            .iter()
+            .find(|(racine, _, _)| *racine == id)
+            .map(|(racine, titre, classe)| {
+                didl_container(
+                    racine,
+                    "0",
+                    titre,
+                    classe,
+                    compter_enfants_racine(state, racine),
+                )
+            }),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
                 .strip_prefix("artist/")
@@ -1546,12 +1515,21 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                 .ok()
                 .flatten()
                 .map(|a| {
+                    // Décrit avec le même nombre d'albums que la liste
+                    // d'artistes en annonce : deux vues du même artiste ne
+                    // doivent pas donner deux tailles.
+                    let nb = AlbumRepo::with_backend(state.backend.clone())
+                        .count_by_artists(&[artist_id])
+                        .unwrap_or_default()
+                        .get(&artist_id)
+                        .copied()
+                        .unwrap_or(0);
                     didl_container(
                         id,
                         "artists",
                         &a.name,
                         "object.container.person.musicArtist",
-                        None,
+                        u64::try_from(nb).ok(),
                     )
                 })
         }
@@ -1792,12 +1770,7 @@ const PLAYLIST_FETCH_CAP: i64 = 10_000;
 /// `total` est le nombre RÉEL de listes publiables, pas la taille de la page :
 /// c'est lui que le point de contrôle lit pour savoir s'il reste des pages.
 fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let listes: Vec<_> = PlaylistRepo::with_backend(state.backend.clone())
-        .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|liste| liste.track_count > 0 && liste.id.is_some())
-        .collect();
+    let listes = lire_listes_publiables(state);
 
     let total = listes.len();
     let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
@@ -1821,6 +1794,20 @@ fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
         total: total as u64,
         returned: page.len() as u64,
     }
+}
+
+/// Les listes de lecture que « Playlists » publie réellement : celles qui ont
+/// au moins une piste et une identité. Extraite de `browse_playlists` pour que
+/// le `childCount` du conteneur racine et la liste qu'il ouvre appliquent le
+/// MÊME filtre — annoncer 9 listes et n'en ouvrir que 7 serait pire que de
+/// n'annoncer aucun nombre.
+fn lire_listes_publiables(state: &UpnpState) -> Vec<crate::db::playlist_repo::Playlist> {
+    PlaylistRepo::with_backend(state.backend.clone())
+        .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|liste| liste.track_count > 0 && liste.id.is_some())
+        .collect()
 }
 
 /// Les pistes d'une liste de lecture, **dans l'ordre de la liste**.
@@ -1891,12 +1878,59 @@ fn pistes_dans_l_ordre(state: &UpnpState, ids: &[i64]) -> Vec<Track> {
         .collect()
 }
 
-fn browse_root(_state: &UpnpState) -> DidlResult {
+/// Le nombre d'enfants d'un conteneur RACINE, calculé sans bâtir leur DIDL.
+///
+/// C'est ce qui sépare une bibliothèque d'un dossier : sans `childCount`, la
+/// racine d'un serveur Tune distant se lit comme sept dossiers anonymes, et
+/// c'est exactement le reproche de #2299. L'attribut est standard — tout point
+/// de contrôle le rend déjà, et la vue « Serveurs multimédia » aussi
+/// (`network.rs::parse_didl_browse_response` le lit en `child_count`). Aucun
+/// écran n'est à dessiner pour que ce nombre s'affiche.
+///
+/// Chaque branche appelle la MÊME source que le `browse_*` correspondant —
+/// `lire_genres`, `lire_annees` et `lire_listes_publiables` ont été extraites
+/// pour ça. Le test [`le_nombre_annonce_est_celui_qui_s_ouvre`] verrouille
+/// l'égalité avec `browse_direct_children(..., 0, 0).total` pour chaque entrée
+/// de [`ROOT_CONTAINERS`] : un compteur qui diverge de ce que le conteneur
+/// ouvre serait pire que pas de compteur du tout.
+///
+/// `None` pour un identifiant qui n'est pas une racine : l'appelant n'émet
+/// alors aucun attribut, plutôt qu'un zéro qui se lirait « dossier vide ».
+fn compter_enfants_racine(state: &UpnpState, object_id: &str) -> Option<u64> {
+    let n: i64 = match object_id {
+        "artists" => ArtistRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "albums" => AlbumRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "genres" => lire_genres(state).len() as i64,
+        "years" => lire_annees(state).len() as i64,
+        "tracks" => TrackRepo::with_backend(state.backend.clone())
+            .count()
+            .ok()?,
+        "radios" => RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .ok()?
+            .len() as i64,
+        "playlists" => lire_listes_publiables(state).len() as i64,
+        _ => return None,
+    };
+    u64::try_from(n).ok()
+}
+
+fn browse_root(state: &UpnpState) -> DidlResult {
     let containers = ROOT_CONTAINERS;
 
     let mut inner = String::new();
     for (id, title, class) in &containers {
-        inner.push_str(&didl_container(id, "0", title, class, None));
+        inner.push_str(&didl_container(
+            id,
+            "0",
+            title,
+            class,
+            compter_enfants_racine(state, id),
+        ));
     }
 
     DidlResult {
@@ -1910,21 +1944,43 @@ fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0) as u64;
     let artists = repo.list(count as i64, start as i64).unwrap_or_default();
-    didl_artistes(&artists, "artists", total)
+    didl_artistes(state, &artists, "artists", total)
 }
 
 /// Le DIDL d'une liste d'artistes. `Browse` et `Search` passent tous deux par
 /// ici : deux vues d'un meme artiste doivent dire exactement la meme chose.
-fn didl_artistes(artists: &[crate::db::models::Artist], parent_id: &str, total: u64) -> DidlResult {
+///
+/// Chaque artiste annonce son nombre d'albums — celui que `browse_artist_albums`
+/// ouvrira, puisque [`AlbumRepo::count_by_artists`] applique le prédicat de
+/// `list_by_artist`. Les comptes de toute la page viennent d'UNE requête : une
+/// par artiste ferait cinq cents allers-retours sur une seule page de Browse.
+fn didl_artistes(
+    state: &UpnpState,
+    artists: &[crate::db::models::Artist],
+    parent_id: &str,
+    total: u64,
+) -> DidlResult {
+    let ids: Vec<i64> = artists.iter().filter_map(|a| a.id).collect();
+    let nb_albums = AlbumRepo::with_backend(state.backend.clone())
+        .count_by_artists(&ids)
+        .unwrap_or_default();
+
     let mut inner = String::new();
     for artist in artists {
         let id = format!("artist/{}", artist.id.unwrap_or(0));
+        // Un artiste absent de la réponse groupée n'a aucun album visible :
+        // c'est un zéro, pas une inconnue. On l'annonce, sinon un dossier sans
+        // attribut se lit comme un dossier dont on ignore la taille.
+        let nb = artist
+            .id
+            .and_then(|aid| nb_albums.get(&aid).copied())
+            .unwrap_or(0);
         inner.push_str(&didl_container(
             &id,
             parent_id,
             &artist.name,
             "object.container.person.musicArtist",
-            None,
+            u64::try_from(nb).ok(),
         ));
     }
 
@@ -2076,17 +2132,7 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
 /// niveau. Les albums sans année (`NULL` ou 0) restent visibles par les
 /// autres conteneurs, mais aucun dossier « année inconnue » n'est inventé.
 fn browse_years(state: &UpnpState) -> DidlResult {
-    let years: Vec<i64> = state
-        .backend
-        .query_many(
-            "SELECT DISTINCT year FROM albums \
-             WHERE year IS NOT NULL AND year > 0 ORDER BY year DESC",
-            &[],
-        )
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| row.first().and_then(|v| v.as_i64()))
-        .collect();
+    let years = lire_annees(state);
 
     let mut inner = String::new();
     for annee in &years {
@@ -2105,6 +2151,23 @@ fn browse_years(state: &UpnpState) -> DidlResult {
         total,
         returned: total,
     }
+}
+
+/// Les années publiées par « Years ». Extraite de `browse_years` pour que le
+/// `childCount` du conteneur racine et la liste qu'il ouvre viennent de la
+/// MÊME requête, et ne puissent pas diverger.
+fn lire_annees(state: &UpnpState) -> Vec<i64> {
+    state
+        .backend
+        .query_many(
+            "SELECT DISTINCT year FROM albums \
+             WHERE year IS NOT NULL AND year > 0 ORDER BY year DESC",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_i64()))
+        .collect()
 }
 
 /// Les albums d'une année — le même rendu que ceux d'un genre.
@@ -2925,6 +2988,95 @@ mod tests {
             so_what_id,
             blue_id,
         )
+    }
+
+    /// #2299 — « une vraie bibliothèque, pas un dossier ».
+    ///
+    /// Un dossier ne dit pas combien il contient ; une bibliothèque si. Chaque
+    /// rubrique racine annonce donc sa taille, à la racine ET en
+    /// `BrowseMetadata`, et ce nombre est EXACTEMENT celui que le conteneur
+    /// ouvre : promettre 3 214 albums et en montrer 2 900 se lit comme une
+    /// bibliothèque abîmée, pas comme un compteur approximatif.
+    #[test]
+    fn chaque_rayon_racine_annonce_la_taille_qu_il_ouvre() {
+        let (state, _, _, _, _) = state_complet();
+        let racine = browse_root(&state);
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let ouvert = browse_direct_children(&state, id, 0, 0).total;
+            assert!(
+                ouvert > 0,
+                "le rayon {id} ({titre}) s'ouvre vide sur une bibliothèque peuplée"
+            );
+
+            assert_eq!(
+                compter_enfants_racine(&state, id),
+                Some(ouvert),
+                "le compteur du rayon {id} ({titre}) diverge de ce qu'il ouvre"
+            );
+
+            // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
+            let attendu = format!("id=\"{id}\" parentID=\"0\" childCount=\"{ouvert}\"");
+            assert!(
+                racine.xml.contains(&attendu),
+                "la racine n'annonce pas la taille du rayon {id} ({titre}) : {}",
+                racine.xml
+            );
+            let meta = browse_metadata(&state, id);
+            assert!(
+                meta.xml.contains(&attendu),
+                "BrowseMetadata({id}) n'annonce pas sa taille : {}",
+                meta.xml
+            );
+        }
+    }
+
+    /// #2299 — un artiste annonce le nombre d'albums qu'il OUVRE, masqués
+    /// exclus (#1391). Une liste de neuf cents noms sans compteur est un
+    /// arbre de dossiers ; avec, c'est un index d'artistes.
+    #[test]
+    fn un_artiste_annonce_le_nombre_d_albums_qu_il_ouvre() {
+        use crate::db::hidden_repo::HiddenRepo;
+        use crate::db::models::Album;
+
+        let (state, _, _, _, _) = state_complet();
+        let backend = state.backend.clone();
+        let artiste = ArtistRepo::with_backend(backend.clone())
+            .list(10, 0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("state_complet crée un artiste");
+        let artist_id = artiste.id.unwrap();
+
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        // Un second album visible…
+        let mut sketches = Album::new("Sketches of Spain".into());
+        sketches.artist_id = Some(artist_id);
+        album_repo.create(&sketches).unwrap();
+        // …et un troisième MASQUÉ, qui ne doit compter pour rien.
+        let mut brouillon = Album::new("Brouillon".into());
+        brouillon.artist_id = Some(artist_id);
+        let masque = album_repo.create(&brouillon).unwrap();
+        HiddenRepo::with_backend(backend.clone())
+            .hide_album(masque)
+            .unwrap();
+
+        let conteneur = format!("artist/{artist_id}");
+        let ouvert = browse_direct_children(&state, &conteneur, 0, 100).total;
+        assert_eq!(ouvert, 2, "l'album masqué ne doit pas s'ouvrir");
+
+        let attendu = format!("id=\"{conteneur}\" parentID=\"artists\" childCount=\"2\"");
+        let liste = browse_direct_children(&state, "artists", 0, 100);
+        assert!(
+            liste.xml.contains(&attendu),
+            "la liste d'artistes n'annonce pas les albums de {conteneur} : {}",
+            liste.xml
+        );
+        assert!(
+            browse_metadata(&state, &conteneur).xml.contains(&attendu),
+            "BrowseMetadata({conteneur}) et la liste ne disent pas la même taille"
+        );
     }
 
     /// #1802 — le conteneur racine « Playlists » est de retour, et il liste de
