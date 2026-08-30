@@ -908,6 +908,57 @@ impl ReplayGainSourceMode {
             Self::TagsThenAnalysis => "tags_then_analysis",
         }
     }
+
+    /// Relit une des trois valeurs de [`as_str`](Self::as_str).
+    ///
+    /// Rend `None` — et JAMAIS un repli silencieux — sur tout le reste. Un
+    /// `_ => Self::Off` en fin de `match` serait ici la faute classique : un
+    /// mode mal orthographié couperait le ReplayGain sans le dire, en
+    /// répondant « c'est fait ». L'appelant doit refuser la demande.
+    pub fn from_setting(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "file_tags" => Some(Self::FileTagsOnly),
+            "tags_then_analysis" => Some(Self::TagsThenAnalysis),
+            _ => None,
+        }
+    }
+}
+
+/// Les écritures que le mode à trois valeurs de #1627 REPRÉSENTE.
+///
+/// C'est la moitié écriture de [`active_source_mode`], et sa réciproque :
+/// aucune clé nouvelle n'est persistée, les deux axes existants restent la
+/// seule vérité en base. On traduit seulement « néant / tags du fichier /
+/// calcul » vers les `settings` que tout le reste du serveur lit déjà
+/// ([`ReplayGainSettings::load`], [`analysis_enabled`]) — donc les chemins
+/// d'application du gain ne changent pas d'un octet.
+///
+/// `granularite` est l'axe piste/album, que les trois modes ne portent PAS :
+/// il est conservé tel qu'il est, jamais deviné.
+pub fn source_mode_settings(
+    mode: ReplayGainSourceMode,
+    granularite: ReplayGainMode,
+) -> Vec<(&'static str, &'static str)> {
+    // `Off` ne peut pas servir de granularité : réécrire `off` en réponse à
+    // « tags du fichier » ne changerait RIEN tout en répondant « ok ». Le
+    // repli est `track`, la granularité par défaut de l'interface.
+    let granularite = match granularite {
+        ReplayGainMode::Album => "album",
+        _ => "track",
+    };
+    match mode {
+        // « Néant » ne touche PAS à la coche d'analyse : `analysis_enabled`
+        // rend déjà `false` quand le mode est `off` (#2496), et l'écraser
+        // détruirait le choix de l'utilisateur pour le jour où il rallume.
+        ReplayGainSourceMode::Off => vec![(MODE_KEY, "off")],
+        ReplayGainSourceMode::FileTagsOnly => {
+            vec![(MODE_KEY, granularite), (ANALYSIS_ENABLED_KEY, "false")]
+        }
+        ReplayGainSourceMode::TagsThenAnalysis => {
+            vec![(MODE_KEY, granularite), (ANALYSIS_ENABLED_KEY, "true")]
+        }
+    }
 }
 
 /// Lequel des trois modes est ACTIF, dérivé des deux réglages existants.
@@ -1863,6 +1914,98 @@ mod tests {
             ReplayGainSourceMode::TagsThenAnalysis.as_str(),
             "tags_then_analysis"
         );
+    }
+
+    /// La réciproque : ÉCRIRE l'un des trois modes, et le relire tel quel.
+    ///
+    /// C'est le tour complet — `source_mode_settings` pose les deux réglages,
+    /// `active_source_mode` les relit — donc aucune des deux moitiés ne peut
+    /// dériver sans que ce test le dise.
+    #[test]
+    fn ecrire_un_des_trois_modes_le_rend_actif_et_preserve_la_granularite() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let poser = |mode: ReplayGainSourceMode| {
+            let granularite = ReplayGainSettings::load(&backend).mode;
+            for (cle, valeur) in source_mode_settings(mode, granularite) {
+                settings.set(cle, valeur).unwrap();
+            }
+        };
+
+        // 2- fichier depuis « néant » : la granularité par défaut est `track`.
+        // Le piège évité ici : repartir de la granularité persistée (`off`)
+        // écrirait `replaygain_mode = off`, donc RIEN, en répondant « ok ».
+        poser(ReplayGainSourceMode::FileTagsOnly);
+        assert_eq!(settings.get(MODE_KEY).unwrap().as_deref(), Some("track"));
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+
+        // La granularité album est CONSERVÉE quand on change de source.
+        settings.set(MODE_KEY, "album").unwrap();
+        poser(ReplayGainSourceMode::TagsThenAnalysis);
+        assert_eq!(
+            settings.get(MODE_KEY).unwrap().as_deref(),
+            Some("album"),
+            "changer de source ne doit jamais reculer l'album vers la piste"
+        );
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // 1- néant coupe le gain SANS écraser la coche d'analyse : c'est le
+        // choix de l'utilisateur pour le jour où il rallume.
+        poser(ReplayGainSourceMode::Off);
+        assert_eq!(settings.get(MODE_KEY).unwrap().as_deref(), Some("off"));
+        assert_eq!(
+            settings.get(ANALYSIS_ENABLED_KEY).unwrap().as_deref(),
+            Some("true"),
+            "« néant » ne doit toucher qu'un seul des deux axes"
+        );
+        assert_eq!(active_source_mode(&backend), ReplayGainSourceMode::Off);
+
+        // Aucune clé nouvelle en base : les deux axes restent la seule vérité.
+        for mode in [
+            ReplayGainSourceMode::Off,
+            ReplayGainSourceMode::FileTagsOnly,
+            ReplayGainSourceMode::TagsThenAnalysis,
+        ] {
+            for (cle, _) in source_mode_settings(mode, ReplayGainMode::Track) {
+                assert!(
+                    cle == MODE_KEY || cle == ANALYSIS_ENABLED_KEY,
+                    "clé persistée inattendue : {cle}"
+                );
+            }
+        }
+    }
+
+    /// Un mode inconnu n'est pas un mode : il ne doit rien rendre du tout.
+    ///
+    /// Le repli `_ => Off` serait ici la faute qui coûte cher — une faute de
+    /// frappe couperait le ReplayGain en silence, ou pire, l'allumerait.
+    #[test]
+    fn un_mode_inconnu_ne_se_replie_sur_rien() {
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("off"),
+            Some(ReplayGainSourceMode::Off)
+        );
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("  FILE_TAGS  "),
+            Some(ReplayGainSourceMode::FileTagsOnly)
+        );
+        assert_eq!(
+            ReplayGainSourceMode::from_setting("tags_then_analysis"),
+            Some(ReplayGainSourceMode::TagsThenAnalysis)
+        );
+        for inconnu in ["", "calcul", "track", "album", "tags", "analysis", "true"] {
+            assert_eq!(
+                ReplayGainSourceMode::from_setting(inconnu),
+                None,
+                "« {inconnu} » doit être refusé, jamais interprété"
+            );
+        }
     }
 
     /// La provenance du gain, sur les trois configurations qui existent en base.

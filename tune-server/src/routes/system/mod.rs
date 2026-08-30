@@ -11,6 +11,13 @@ mod explorateur;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 pub(crate) use enrich::gate_enrichment;
+// Même partage, même raison, pour la PORTÉE par répertoire (#1660) : les deux
+// routes d'enrichissement doivent valider un `path` à l'identique — refus des
+// composantes `..`, appartenance à une racine musicale, refus franc plutôt que
+// repli sur la bibliothèque entière. Une seconde validation écrite à côté
+// finirait par diverger, et un repli silencieux enrichirait justement ce que
+// l'utilisateur voulait épargner.
+pub(crate) use enrich::resoudre_portee;
 mod import;
 mod playlist_hub;
 mod plugins;
