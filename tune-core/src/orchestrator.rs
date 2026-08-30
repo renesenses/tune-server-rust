@@ -1084,15 +1084,25 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// `dsd_lpcm_stream` toggle on: the streaming path already advertises an exact
 /// Content-Length (`StreamInfo::wav_content_length`), so blocking to /tmp is
 /// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
-/// timeout → the renderer plays silence). Kept a pure function so the decision
-/// matrix is unit-testable without an orchestrator.
+/// timeout → the renderer plays silence).
+///
+/// `dsp_active` PRIME sur tout le reste. Le bras progressif appelle
+/// `decode_to_pcm_streaming_seeked`, qui ne reçoit ni égaliseur, ni convolveur,
+/// ni facteur ReplayGain : seul `transcode_source_to_file` les applique. Une
+/// zone dont un traitement est actif doit donc repasser par le fichier, sans
+/// quoi le traitement est perdu EN SILENCE — famille #1216, déjà corrigée pour
+/// le passthrough réseau, le navigateur et les sorties PULL.
+///
+/// Kept a pure function so the decision matrix is unit-testable without an
+/// orchestrator.
 fn use_file_transcode_for(
     is_network: bool,
     target_is_wav: bool,
     dlna_needs_wav: bool,
     dsd_lpcm_streams: bool,
+    dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams)) || dsp_active
 }
 
 /// Is `output_type` (from [`PlaybackOrchestrator::output_type_of`]) one of the
@@ -4338,14 +4348,31 @@ impl PlaybackOrchestrator {
                 target_format_str == "wav",
                 dlna_needs_wav,
                 dsd_lpcm_streams,
-            )
-                // Browser zone with an active EQ: the streaming pipe does NOT
-                // run the EqProcessor (only transcode_source_to_file does), so
-                // the "forced" transcode served EQ-less audio — measured on
-                // .18: EQ'd WAV capture was byte-identical to the decoded
-                // source. Route through the temp-file path, which also gives
-                // <audio> the Content-Length + Range it wants (#1168).
-                || (is_browser_output && eq_forces_transcode);
+                // Une zone dont un TRAITEMENT est actif doit l'entendre : le
+                // bras progressif appelle `decode_to_pcm_streaming_seeked`, qui
+                // ne reçoit ni EqProcessor, ni convolveur, ni facteur
+                // ReplayGain — seul `transcode_source_to_file` les applique
+                // (voir les points 1a/1b de cette fonction). Le « transcodage
+                // forcé » servait donc un flux sans aucun des trois.
+                //
+                // Mesuré sur .18 pour le NAVIGATEUR : capture WAV avec EQ
+                // strictement identique à la source décodée (#1168). La même
+                // fuite existe sur une sortie RÉSEAU depuis que le DSD y part en
+                // WAV progressif (0cf27ade, 27/07) : une zone DLNA/OpenHome avec
+                // égaliseur, correction FIR ou ReplayGain actif lisant du DSD
+                // prend ce bras et perd les trois, en silence. C'est la famille
+                // #1216 — déjà corrigée pour le passthrough réseau, le
+                // navigateur et les sorties PULL, jamais ici.
+                //
+                // `eq_forces_transcode` est déjà borné aux sorties réseau /
+                // navigateur / PULL et aux zones où un traitement est
+                // RÉELLEMENT actif (PURE rend `None`) : une zone sans
+                // traitement — l'immense majorité, et le cas qu'arbitre #1363 —
+                // garde le bras progressif. Les sorties PULL (`oaat`,
+                // `diretta`) restent hors du champ : elles ne passent jamais par
+                // le transcodage fichier et le changement n'est pas mesuré.
+                (is_browser_output || is_network_output) && eq_forces_transcode,
+            );
 
             let info = StreamInfo {
                 format: out_ext.clone(),
@@ -11474,17 +11501,40 @@ mod tests {
         // ONLY with the toggle on. Everything else keeps its prior behaviour.
 
         // DSD → WAV, renderer needs LPCM, toggle ON → stream (the fix).
-        assert!(!use_file_transcode_for(true, true, true, true));
+        assert!(!use_file_transcode_for(true, true, true, true, false));
         // Same, toggle OFF → temp file (rollback, unchanged).
-        assert!(use_file_transcode_for(true, true, true, false));
+        assert!(use_file_transcode_for(true, true, true, false, false));
         // FLAC target (non-WAV) always temp-files for Content-Length — the
         // dsd flag can't apply (dsd_lpcm_streams stays false for non-DSD/WAV).
-        assert!(use_file_transcode_for(true, false, false, false));
+        assert!(use_file_transcode_for(true, false, false, false, false));
         // WAV target a renderer is fine to stream (dlna_needs_wav false):
         // streams regardless of the flag (local/OAAT/Linn path, unchanged).
-        assert!(!use_file_transcode_for(true, true, false, false));
+        assert!(!use_file_transcode_for(true, true, false, false, false));
         // Local/OAAT (not network): never file-transcodes.
-        assert!(!use_file_transcode_for(false, true, true, false));
+        assert!(!use_file_transcode_for(false, true, true, false, false));
+    }
+
+    /// Un traitement actif RAMÈNE au fichier temporaire, quel que soit le reste.
+    ///
+    /// Le bras progressif ne branche ni égaliseur, ni convolveur, ni
+    /// ReplayGain : les y envoyer, c'est les perdre sans le dire. Les deux
+    /// premières lignes sont exactement les cas que le bras progressif gagne
+    /// aujourd'hui (renderer FLAC depuis 0cf27ade ; renderer LPCM le jour où
+    /// `dsd_lpcm_stream` deviendrait le défaut, #1363).
+    #[test]
+    fn un_traitement_actif_ramene_au_fichier() {
+        // Renderer FLAC-capable, DSD → WAV progressif : streame sans DSP…
+        assert!(!use_file_transcode_for(true, true, false, false, false));
+        // …et repasse par le fichier dès qu'un traitement est actif.
+        assert!(use_file_transcode_for(true, true, false, false, true));
+        // Renderer LPCM, bascule « Streaming continu » armée : même règle.
+        assert!(!use_file_transcode_for(true, true, true, true, false));
+        assert!(use_file_transcode_for(true, true, true, true, true));
+        // Zone navigateur (non « réseau ») avec EQ : le cas déjà couvert par
+        // #1168, qui passait par un `||` hors de cette fonction.
+        assert!(use_file_transcode_for(false, true, false, false, true));
+        // Sans traitement, une sortie non réseau ne file-transcode toujours pas.
+        assert!(!use_file_transcode_for(false, true, false, false, false));
     }
 
     #[test]
