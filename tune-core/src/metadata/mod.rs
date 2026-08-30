@@ -4392,11 +4392,23 @@ mod genres_multivalues_i1821 {
     /// le nom de l'épreuve : deux tests du même binaire ne peuvent pas se voler
     /// leur fichier, et un nettoyage par glob commun ne peut pas emporter
     /// celui d'un autre.
+    ///
+    /// ⚠️ Le nom de l'épreuve ne suffisait PAS (#2864) : sans pid, deux
+    /// binaires de test concurrents — deux agents sur la même machine de
+    /// compilation, `/tmp` partagé — visaient le même `i1821-<épreuve>-<nom>`.
+    /// `scratch_name` ajoute le pid ET un compteur ; l'étiquette ne sert plus
+    /// qu'à la lisibilité d'un résidu dans `/tmp`.
     fn gabarit(nom: &str, epreuve: &str) -> std::path::PathBuf {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(nom);
-        let copie = std::env::temp_dir().join(format!("i1821-{epreuve}-{nom}"));
+        // `nom` porte l'EXTENSION, et lofty choisit son analyseur dessus :
+        // elle doit rester en dernier. Le suffixe unique se glisse donc
+        // avant, jamais après.
+        let copie = std::env::temp_dir().join(format!(
+            "{}-{nom}",
+            crate::test_scratch::scratch_name(&format!("i1821-{epreuve}"))
+        ));
         std::fs::copy(&source, &copie).expect("copie du gabarit");
         copie
     }

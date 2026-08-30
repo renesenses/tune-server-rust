@@ -446,7 +446,10 @@ FATAL meltdown";
     fn tail_window_drops_partial_first_line() {
         // Unique temp path without external crates.
         let mut path = std::env::temp_dir();
-        path.push(format!("tune_admin_errors_test_{}.log", std::process::id()));
+        path.push(format!(
+            "{}.log",
+            tune_core::test_scratch::scratch_name("tune_admin_errors_test")
+        ));
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "ERROR very-old-should-be-cut-by-window").unwrap();
         writeln!(f, "ERROR recent-one").unwrap();

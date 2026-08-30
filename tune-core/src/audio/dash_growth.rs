@@ -201,9 +201,11 @@ mod tests {
     fn growing_source_blocks_then_reads_all() {
         // Writer appends in two bursts; a reader thread must see every byte and
         // only hit EOF after finish(), never mid-stream.
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!("tune-growtest-{}.bin", std::process::id()))
+        let path = std::env::temp_dir()
+            .join(format!(
+                "{}.bin",
+                crate::test_scratch::scratch_name("tune-growtest")
+            ))
             .to_string_lossy()
             .to_string();
         std::fs::write(&path, b"AAAA").unwrap(); // 4 initial bytes
@@ -244,9 +246,11 @@ mod tests {
 
     #[test]
     fn failed_download_surfaces_error_not_silent_eof() {
-        let dir = std::env::temp_dir();
-        let path = dir
-            .join(format!("tune-growtest-fail-{}.bin", std::process::id()))
+        let path = std::env::temp_dir()
+            .join(format!(
+                "{}.bin",
+                crate::test_scratch::scratch_name("tune-growtest-fail")
+            ))
             .to_string_lossy()
             .to_string();
         std::fs::write(&path, b"AAAA").unwrap();

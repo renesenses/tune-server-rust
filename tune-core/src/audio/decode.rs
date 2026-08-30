@@ -3648,8 +3648,10 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "{}.ogg",
+            crate::test_scratch::scratch_name("tune_chained_vorbis")
+        ));
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
@@ -3711,8 +3713,10 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // replays the head of the track: the same « boucle de 2-3 s » of
         // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
         let single = std::fs::read(fixture_path("test.opus")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_opus_{}.opus", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "{}.opus",
+            crate::test_scratch::scratch_name("tune_chained_opus")
+        ));
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
