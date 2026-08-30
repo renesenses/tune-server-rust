@@ -1385,10 +1385,13 @@ pub async fn register_local_outputs(state: &AppState) {
 /// musique.
 ///
 /// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
-/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
-/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
-/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
-/// que le serveur ne remplit jamais.
+/// active`). Une SECONDE definition de `network_mounts` a longtemps coexiste,
+/// dans `tune-core/src/mount_manager.rs` (`host/share_name/…/auto_mount`) :
+/// meme nom, colonnes differentes, jamais construite hors tests. Elle a ete
+/// supprimee par #1914 ; le test `network_mounts_n_a_qu_une_definition_par_moteur`
+/// (tune-core, `db/migrations.rs`) empeche desormais qu'une concurrente
+/// reapparaisse. Batir le remontage sur `auto_mount` interrogerait donc une
+/// colonne qui n'existe plus.
 ///
 /// Chaque montage est independant : un partage injoignable est journalise et
 /// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
