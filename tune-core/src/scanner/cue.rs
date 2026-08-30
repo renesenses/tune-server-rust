@@ -21,6 +21,13 @@ pub struct CueTrack {
     pub title: Option<String>,
     /// Interprète de la piste, ou celui de l'album à défaut.
     pub performer: Option<String>,
+    /// Le `FILE` sous lequel cette piste est déclarée, tel qu'écrit dans la
+    /// feuille. Une feuille peut en enchaîner plusieurs — un `.cue` par face de
+    /// vinyle est le cas courant, mais le format autorise aussi plusieurs
+    /// `FILE` dans une seule feuille (rip piste-à-piste). Les temps sont alors
+    /// relatifs à CE fichier, jamais à l'album : sans ce champ, les pistes du
+    /// second fichier se superposeraient à celles du premier.
+    pub audio_file: Option<String>,
     /// Début dans le fichier, en millisecondes.
     pub start_ms: u64,
     /// Fin dans le fichier, en millisecondes : le début de la piste suivante.
@@ -32,12 +39,29 @@ pub struct CueTrack {
 /// Le contenu exploitable d'une feuille CUE.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CueSheet {
-    /// Nom du fichier audio référencé par `FILE`, tel qu'écrit dans la feuille.
-    /// C'est un nom relatif au dossier de la feuille, jamais un chemin absolu.
-    pub audio_file: Option<String>,
+    /// Les fichiers audio référencés par `FILE`, dans l'ordre de la feuille et
+    /// tels qu'écrits. Ce sont des noms relatifs au dossier de la feuille.
+    ///
+    /// Une liste, et non un seul nom : la version précédente écrasait la valeur
+    /// à chaque `FILE`, de sorte qu'une feuille multi-`FILE` ne gardait que le
+    /// dernier et rattachait toutes ses pistes au mauvais fichier.
+    pub audio_files: Vec<String>,
     pub album_title: Option<String>,
     pub album_performer: Option<String>,
+    /// `REM GENRE …`. Hors norme mais universellement écrit par EAC et foobar :
+    /// c'est le seul endroit où une feuille porte le genre de l'album.
+    pub album_genre: Option<String>,
+    /// `REM DATE …`. Idem — l'année de l'album, absente du CUE standard.
+    pub album_date: Option<String>,
     pub tracks: Vec<CueTrack>,
+}
+
+impl CueSheet {
+    /// Le premier `FILE` déclaré, qui est le seul dans l'immense majorité des
+    /// feuilles.
+    pub fn premier_fichier(&self) -> Option<&str> {
+        self.audio_files.first().map(String::as_str)
+    }
 }
 
 /// Découpe une ligne CUE en (mot-clé majuscule, reste).
@@ -99,14 +123,18 @@ pub fn parse_cue_time(s: &str) -> Option<u64> {
 /// une ligne parasite.
 pub fn parse_cue_sheet(content: &str) -> CueSheet {
     let mut sheet = CueSheet {
-        audio_file: None,
+        audio_files: Vec::new(),
         album_title: None,
         album_performer: None,
+        album_genre: None,
+        album_date: None,
         tracks: Vec::new(),
     };
     // `TITLE` et `PERFORMER` valent pour l'album AVANT le premier `TRACK`, et
     // pour la piste après : c'est la position qui décide, pas le mot-clé.
     let mut in_track = false;
+    // Le `FILE` courant : toute piste déclarée ensuite lui appartient.
+    let mut fichier_courant: Option<String> = None;
 
     for raw in content.lines() {
         let Some((kw, rest)) = split_keyword(raw) else {
@@ -117,16 +145,36 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 // `FILE "album.ape" WAVE` — le type suit le nom entre
                 // guillemets. Sans guillemets, on garde tout sauf le dernier
                 // mot, qui est le type.
-                if let Some(start) = rest.find('"')
+                let nom = if let Some(start) = rest.find('"')
                     && let Some(len) = rest[start + 1..].find('"')
                 {
-                    sheet.audio_file = unquote(&rest[start..start + len + 2]);
+                    unquote(&rest[start..start + len + 2])
                 } else {
                     let mut w: Vec<&str> = rest.split_whitespace().collect();
                     if w.len() > 1 {
                         w.pop();
                     }
-                    sheet.audio_file = unquote(&w.join(" "));
+                    unquote(&w.join(" "))
+                };
+                if let Some(nom) = nom {
+                    if !sheet.audio_files.contains(&nom) {
+                        sheet.audio_files.push(nom.clone());
+                    }
+                    fichier_courant = Some(nom);
+                }
+            }
+            // `REM` n'est pas un commentaire libre en pratique : EAC, foobar2000
+            // et dBpoweramp y déposent le genre et l'année, qui n'ont pas de
+            // mot-clé dans le format. Les ignorer, c'était perdre les deux
+            // seules métadonnées d'album que la feuille apporte en plus du
+            // titre (Gros Bidon, fil 1495 : `REM GENRE "Rock"`, `REM DATE 1984`).
+            "REM" => {
+                if let Some((sous_kw, valeur)) = split_keyword(rest) {
+                    match sous_kw.as_str() {
+                        "GENRE" => sheet.album_genre = unquote(valeur),
+                        "DATE" => sheet.album_date = unquote(valeur),
+                        _ => {}
+                    }
                 }
             }
             "TRACK" => {
@@ -139,6 +187,7 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     number,
                     title: None,
                     performer: None,
+                    audio_file: fichier_courant.clone(),
                     start_ms: 0,
                     end_ms: None,
                 });
@@ -181,8 +230,16 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
         }
     }
 
-    // La fin d'une piste est le début de la suivante. La dernière reste ouverte.
+    // La fin d'une piste est le début de la suivante — mais SEULEMENT si elles
+    // partagent le même fichier. Au passage d'un `FILE` à l'autre, les temps
+    // repartent de zéro : chaîner par-dessus la frontière donnerait à la
+    // dernière piste d'un fichier une fin ANTÉRIEURE à son début, donc une
+    // durée négative. La dernière piste de chaque fichier reste ouverte
+    // jusqu'à la fin de ce fichier.
     for i in 0..sheet.tracks.len().saturating_sub(1) {
+        if sheet.tracks[i].audio_file != sheet.tracks[i + 1].audio_file {
+            continue;
+        }
         let next_start = sheet.tracks[i + 1].start_ms;
         sheet.tracks[i].end_ms = Some(next_start);
     }
@@ -261,10 +318,65 @@ FILE "gould.ape" WAVE
     #[test]
     fn reads_album_header_and_audio_file() {
         let s = parse_cue_sheet(SHEET);
-        assert_eq!(s.audio_file.as_deref(), Some("gould.ape"));
+        assert_eq!(s.premier_fichier(), Some("gould.ape"));
+        assert_eq!(s.audio_files, vec!["gould.ape".to_string()]);
         assert_eq!(s.album_title.as_deref(), Some("Goldberg Variations"));
         assert_eq!(s.album_performer.as_deref(), Some("Glenn Gould"));
         assert_eq!(s.tracks.len(), 3);
+        // Chaque piste sait de quel fichier elle est tirée.
+        assert!(
+            s.tracks
+                .iter()
+                .all(|t| t.audio_file.as_deref() == Some("gould.ape"))
+        );
+    }
+
+    /// `REM GENRE` et `REM DATE` sont hors norme mais universels : c'est là que
+    /// vivent le genre et l'année d'un album rippé en image + feuille.
+    #[test]
+    fn reads_genre_and_date_from_rem_lines() {
+        let s = parse_cue_sheet(
+            "REM GENRE \"Rock\"\nREM DATE 1984\nREM COMMENT \"Vinyle collection\"\nREM DISCID A20B1C0D\nTITLE \"Stationary Traveller\"\nFILE \"a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        );
+        assert_eq!(s.album_genre.as_deref(), Some("Rock"));
+        assert_eq!(s.album_date.as_deref(), Some("1984"));
+        // Les autres `REM` restent ignorés, sans casser la lecture.
+        assert_eq!(s.album_title.as_deref(), Some("Stationary Traveller"));
+    }
+
+    /// Une feuille qui enchaîne deux `FILE` ne doit pas rattacher toutes ses
+    /// pistes au dernier : chaque piste appartient au `FILE` qui la précède.
+    #[test]
+    fn each_track_belongs_to_the_file_declared_above_it() {
+        let s = parse_cue_sheet(
+            "FILE \"face-a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 04:00:00\nFILE \"face-b.flac\" WAVE\nTRACK 03 AUDIO\nINDEX 01 00:00:00\n",
+        );
+        assert_eq!(s.audio_files, vec!["face-a.flac", "face-b.flac"]);
+        let fichiers: Vec<Option<&str>> =
+            s.tracks.iter().map(|t| t.audio_file.as_deref()).collect();
+        assert_eq!(
+            fichiers,
+            vec![
+                Some("face-a.flac"),
+                Some("face-a.flac"),
+                Some("face-b.flac")
+            ]
+        );
+    }
+
+    /// Au passage d'un `FILE` à l'autre les temps repartent de zéro : chaîner
+    /// la fin par-dessus la frontière donnerait une durée négative.
+    #[test]
+    fn end_time_never_crosses_a_file_boundary() {
+        let s = parse_cue_sheet(
+            "FILE \"face-a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 04:00:00\nFILE \"face-b.flac\" WAVE\nTRACK 03 AUDIO\nINDEX 01 00:00:00\nTRACK 04 AUDIO\nINDEX 01 03:00:00\n",
+        );
+        assert_eq!(s.tracks[0].end_ms, Some(240_000));
+        // Dernière piste de la face A : ouverte jusqu'au bout de SON fichier,
+        // et surtout pas fermée sur le 00:00:00 de la face B.
+        assert_eq!(s.tracks[1].end_ms, None);
+        assert_eq!(s.tracks[2].end_ms, Some(180_000));
+        assert_eq!(s.tracks[3].end_ms, None);
     }
 
     /// La troisième composante est en frames CD — 75 par seconde, pas 100.
@@ -325,17 +437,14 @@ FILE "gould.ape" WAVE
     fn accepts_unquoted_values() {
         let s = parse_cue_sheet("TITLE Sans Guillemets\nFILE album.flac WAVE\nTRACK 01 AUDIO\n");
         assert_eq!(s.album_title.as_deref(), Some("Sans Guillemets"));
-        assert_eq!(s.audio_file.as_deref(), Some("album.flac"));
+        assert_eq!(s.premier_fichier(), Some("album.flac"));
     }
 
     /// Un nom de fichier peut contenir des espaces : c'est le cas usuel.
     #[test]
     fn keeps_spaces_inside_the_file_name() {
         let s = parse_cue_sheet("FILE \"Bach - Cantatas (disc 1).flac\" WAVE\n");
-        assert_eq!(
-            s.audio_file.as_deref(),
-            Some("Bach - Cantatas (disc 1).flac")
-        );
+        assert_eq!(s.premier_fichier(), Some("Bach - Cantatas (disc 1).flac"));
     }
 
     /// Une feuille bancale doit rendre ce qu'elle a, pas rien : sinon un album
