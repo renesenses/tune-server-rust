@@ -1259,6 +1259,16 @@ pub fn spawn_mdns_handler(
                                 settings.set("lms_host", &lms_addr).ok();
                                 settings.set("squeezebox_host", &lms_addr).ok();
                                 settings.set("squeezebox_enabled", "true").ok();
+                                // On mémorise l'ADRESSE trouvée, pas un simple
+                                // « oui » : le panneau des réglages n'affiche
+                                // « Auto-détecté : … » que si l'adresse en
+                                // vigueur est encore celle-là. Un drapeau
+                                // booléen resterait vrai après une saisie
+                                // manuelle, et il faudrait l'effacer depuis la
+                                // route de configuration générique — un second
+                                // écrivain, donc un second endroit à oublier
+                                // (#2066).
+                                settings.set("lms_host_auto", &lms_addr).ok();
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
                             }
                             (None, "squeezebox")
