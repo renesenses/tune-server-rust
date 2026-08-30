@@ -61,6 +61,7 @@ jobs:
 
           jq -e --arg version "$VERSION" '
             .version == $version and
+            (.ready | type == "boolean") and
             (.components | keys | sort == ["os", "server", "universal", "web"]) and
             .components.server.repository == "renesenses/tune-server-rust" and
             .components.server.sha == "self" and
@@ -120,6 +121,10 @@ jobs:
             echo "::error::secret RELEASE_CONTROLLER_TOKEN absent"
             exit 1
           fi
+          jq -e '.ready == true' "$PLAN" >/dev/null || {
+            echo "::error::le manifeste est encore un candidat (ready=false)"
+            exit 1
+          }
 
       - name: Creer les quatre tags
         env:

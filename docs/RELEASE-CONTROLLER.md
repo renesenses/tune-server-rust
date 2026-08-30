@@ -4,6 +4,10 @@ Le fichier `.release/vX.Y.Z.json` épingle les quatre sources d'un train. Le
 SHA serveur vaut `self` dans le plan, puis le contrôleur le remplace par le SHA
 exact de `main` qui exécute le workflow.
 
+Un manifeste peut rester en préparation avec `ready: false`. Le dry-run le
+contrôle, mais aucune création réelle de tag n'est possible avant le passage
+explicite à `ready: true` avec les SHA finaux.
+
 Le workflow `Release controller` vérifie que chaque SHA est atteignable depuis
 le `main` de son dépôt. Il crée ensuite, de manière idempotente :
 
