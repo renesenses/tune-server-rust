@@ -610,10 +610,18 @@ mod eq_refresh_guard {
     /// continuait de filtrer (#1986). Elle exige `apply_audiophile_change`,
     /// pour la même raison que l'EQ exige `apply_eq_change` : le cas non local
     /// (DLNA, navigateur) n'est réglé que par un redémarrage de flux.
+    ///
+    /// `zone_*_mono_downmix` (#2362) est la quatrième. Elle n'exige que
+    /// `refresh_zone_mono_downmix`, et non un jumeau « apply_ » : contrairement
+    /// à l'égaliseur et au mode PURE, ce réglage ne s'applique QUE sur la
+    /// sortie locale — c'est le périmètre écrit dans l'issue. Il n'y a donc
+    /// aucun chemin non local à réveiller par un redémarrage de flux, et en
+    /// programmer un ferait redémarrer une zone DLNA pour rien.
     const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
         ("_eq_profile", "apply_eq_change"),
         ("_crossfeed", "refresh_zone_crossfeed"),
         ("_audiophile", "apply_audiophile_change"),
+        ("_mono_downmix", "refresh_zone_mono_downmix"),
     ];
 
     #[test]

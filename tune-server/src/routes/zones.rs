@@ -144,6 +144,22 @@ struct PatchZone {
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
+    /// Sortie mono : sommer `M = (L + R) / 2` et émettre `M` sur les DEUX voies
+    /// de la zone (#2362). Persisté en setting `zone_{id}_mono_downmix` ; défaut
+    /// off, donc le comportement d'aujourd'hui ne change pas d'un bit tant que
+    /// personne ne coche.
+    ///
+    /// **Sortie LOCALE uniquement**, et c'est le périmètre demandé : les
+    /// sorties réseau ne sont pas touchées. Le réglage se persiste sur
+    /// n'importe quelle zone, mais il n'agit que là où la chaîne DSP locale
+    /// existe.
+    ///
+    /// Pour qui a une seule enceinte câblée sur un canal, la moitié de la
+    /// musique est aujourd'hui inaudible (Nicolas Tardif, fil forum 1532 :
+    /// « je perds toute la musique qui passe par le canal droit »). Ce n'est
+    /// donc PAS derrière la barrière Premium : c'est une compensation de
+    /// câblage, pas un effet de confort.
+    mono_downmix: Option<bool>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -202,6 +218,17 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_renderer".into(), json!(upnp_renderer));
+    // Sortie mono (#2362). Lue telle qu'elle est PERSISTÉE, sans la garde PURE :
+    // c'est l'état de l'interrupteur que le client doit afficher. Ce que le
+    // signal subit RÉELLEMENT est dit par le chemin du signal, qui applique la
+    // règle PURE (`PlaybackOrchestrator::zone_mono_downmix_with`).
+    let mono_downmix = settings
+        .get(&format!("zone_{zone_id}_mono_downmix"))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    obj.insert("mono_downmix".into(), json!(mono_downmix));
     obj.insert(
         "detected_manufacturer".into(),
         json!(detected.and_then(|d| d.manufacturer.clone())),
@@ -944,6 +971,30 @@ fn zone_replaygain_step(
     Some(format!("ReplayGain ({label}, {applied_db:+.1} dB)"))
 }
 
+/// La zone replie-t-elle sa sortie LOCALE en mono — et si oui, que dire ?
+///
+/// Miroir exact de ce que l'orchestrateur pousse à la sortie locale
+/// (`PlaybackOrchestrator::zone_mono_downmix_with`, PURE compris), et restreint aux
+/// sorties locales : c'est le seul chemin où le repli est appliqué, et une
+/// étape affichée sur une zone DLNA décrirait un traitement qui n'a pas lieu.
+///
+/// Sans ce miroir, le panneau annoncerait un chemin intouché pendant que chaque
+/// échantillon est réécrit — la faute exacte de #1548/#1559 (égaliseur oublié
+/// du verdict) et de #1627 (ReplayGain). Ici la transformation est réelle et
+/// doit APPARAÎTRE : #2825 vient de corriger le cas inverse, où le volume
+/// logiciel prétendait à tort dégrader.
+fn zone_mono_downmix_step(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    output_type: &str,
+) -> Option<String> {
+    if output_type != "local" {
+        return None;
+    }
+    tune_core::orchestrator::PlaybackOrchestrator::zone_mono_downmix_with(backend, zone_id)
+        .then(|| "Sortie mono : (G + D) / 2 sur les deux voies".to_string())
+}
+
 fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
@@ -1167,6 +1218,11 @@ fn build_signal_path(
     // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
     let replaygain_step = zone_replaygain_step(&backend, zid, np.track_id);
 
+    // Sortie mono (#2362) : sortie locale seulement, jamais en PURE. C'est une
+    // vraie transformation — elle réécrit chaque échantillon — donc elle porte
+    // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
+    let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
+
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
     //
@@ -1369,11 +1425,16 @@ fn build_signal_path(
     // not a signal degradation. ReplayGain, lui, multiplie chaque échantillon :
     // l'orchestrateur le traite déjà comme l'EQ (`zone_replaygain_changes_audio`
     // force le chemin transcodé), le verdict doit dire la même chose (#1627).
+    // + le repli mono (#2362) : sommer les deux voies et les réémettre
+    // identiques réécrit chaque échantillon. Une zone qui l'active n'est PAS
+    // bit-perfect, et le panneau doit le dire — c'est exactement la promesse
+    // que #1548/#1559 (EQ) et #1627 (ReplayGain) avaient laissé mentir.
     let bit_perfect = is_lossless
         && transport_bit_perfect
         && !dsp_enabled
         && !resampling_active
-        && replaygain_step.is_none();
+        && replaygain_step.is_none()
+        && mono_downmix_step.is_none();
 
     // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
     //
@@ -1575,6 +1636,24 @@ fn build_signal_path(
         steps.push(json!({
             "name": "DSP",
             "description": eq_step_description.as_deref().unwrap_or("EQ/DSP active"),
+            "bit_perfect": false,
+        }));
+    }
+
+    // Étape « Mono » (#2362) — APRÈS le DSP et juste avant le transport, parce
+    // que c'est exactement là qu'elle a lieu dans la chaîne : le repli tombe en
+    // dernier dans `apply_local_dsp`, après l'égaliseur, le convolveur et le
+    // crossfeed, qui ont tous besoin de leur contexte stéréo.
+    //
+    // `bit_perfect: false` sans hésitation : la profondeur et la fréquence sont
+    // conservées, mais le CONTENU des deux voies est remplacé par leur demi-
+    // somme. Ce n'est pas une préférence d'écoute comme le volume, c'est une
+    // transformation du signal — et l'utilisateur qui la demande a le droit de
+    // savoir ce qu'il échange.
+    if let Some(desc) = &mono_downmix_step {
+        steps.push(json!({
+            "name": "Mono",
+            "description": desc,
             "bit_perfect": false,
         }));
     }
@@ -2368,6 +2447,24 @@ async fn patch_zone(
         ecrire!("upnp_renderer", enabled, r);
         // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
         crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
+    }
+    // Sortie mono (#2362) → setting zone_{id}_mono_downmix. Même forme que
+    // `upnp_renderer` juste au-dessus : la clé est supprimée à la désactivation
+    // plutôt qu'écrite à « false », pour que l'absence de clé et le défaut
+    // désarmé soient un seul et même état.
+    if let Some(enabled) = body.mono_downmix {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_mono_downmix");
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("mono_downmix", enabled, r);
+        // Persister ne suffit pas : sans ceci, cocher la case en écoutant ne
+        // changerait rien avant la piste suivante (#1725, #1786). Or ce
+        // réglage-ci se vérifie précisément à l'oreille, musique en cours.
+        state.orchestrator.refresh_zone_mono_downmix(id).await;
     }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
@@ -4540,6 +4637,142 @@ mod signal_path_tests {
         .unwrap();
 
         assert_eq!(step_desc(&sp, "ReplayGain"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // ---- #2362 : sortie mono ------------------------------------------------
+
+    /// Une zone LOCALE, seule à porter la chaîne DSP où le repli est appliqué.
+    fn local_zone_migrated() -> (Arc<dyn DbBackend>, Zone) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let id = repo
+            .create("Bureau", Some("local"), Some("local:dac-1"))
+            .unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        (backend, zone)
+    }
+
+    fn flac_playing() -> ZoneState {
+        ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                title: "Piste".into(),
+                format: Some("flac".into()),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+                stream_id: Some("sid-1".into()),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn armer_mono(backend: &Arc<dyn DbBackend>, zone_id: i64) {
+        SettingsRepo::with_backend(backend.clone())
+            .set(&format!("zone_{zone_id}_mono_downmix"), "true")
+            .unwrap();
+    }
+
+    /// #2362 — le chemin du signal DIT la transformation.
+    ///
+    /// C'est la contrepartie de #2825, fusionnée cette nuit : là, le volume
+    /// logiciel prétendait à tort dégrader ; ici, une vraie transformation
+    /// devait apparaître et n'apparaissait pas. Le même chemin, mono désarmé,
+    /// est un passthrough FLAC bit-perfect (test suivant) : c'est le RÉGLAGE
+    /// qui décide, et lui seul.
+    #[test]
+    fn sortie_mono_affiche_son_etape_et_fait_tomber_le_verdict() {
+        let (backend, zone) = local_zone_migrated();
+        armer_mono(&backend, zone.id.unwrap());
+
+        let sp = build_signal_path(
+            &flac_playing(),
+            &zone,
+            &backend,
+            Some("DAC"),
+            "CoreAudio",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            step_desc(&sp, "Mono").as_deref(),
+            Some("Sortie mono : (G + D) / 2 sur les deux voies")
+        );
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+        // Le repli ne rend pas la SOURCE avec perte : le badge qualité reste vert.
+        assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    /// Défaut désarmé : aucune étape inventée, verdict intact. Sans ce témoin,
+    /// le test ci-dessus passerait aussi avec une étape affichée en permanence.
+    #[test]
+    fn sortie_mono_desarmee_ninvente_aucune_etape() {
+        let (backend, zone) = local_zone_migrated();
+
+        let sp = build_signal_path(
+            &flac_playing(),
+            &zone,
+            &backend,
+            Some("DAC"),
+            "CoreAudio",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "Mono"), None);
+        assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    /// Le périmètre de l'issue est la zone LOCALE. Une zone réseau qui porte le
+    /// réglage ne doit PAS afficher l'étape : rien ne l'applique sur ce chemin,
+    /// et l'annoncer décrirait un traitement qui n'a pas lieu.
+    #[test]
+    fn sortie_mono_ne_deborde_pas_sur_une_zone_reseau() {
+        let (backend, zone) = dlna_zone_migrated();
+        armer_mono(&backend, zone.id.unwrap());
+
+        let sp = build_signal_path(
+            &flac_playing(),
+            &zone,
+            &backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "Mono"), None);
+    }
+
+    /// Le mode PURE gouverne le repli comme il gouverne l'égaliseur, le
+    /// crossfeed et le ReplayGain : rien ne touche le signal, donc aucune étape
+    /// et le verdict tient. Miroir de `zone_mono_downmix_with`.
+    #[test]
+    fn le_mode_pure_desarme_la_sortie_mono() {
+        let (backend, zone) = local_zone_migrated();
+        let zid = zone.id.unwrap();
+        armer_mono(&backend, zid);
+        SettingsRepo::with_backend(backend.clone())
+            .set(&format!("zone_{zid}_audiophile"), r#"{"enabled":true}"#)
+            .unwrap();
+
+        let sp = build_signal_path(
+            &flac_playing(),
+            &zone,
+            &backend,
+            Some("DAC"),
+            "CoreAudio",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap();
+
+        assert_eq!(step_desc(&sp, "Mono"), None);
         assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
     }
 

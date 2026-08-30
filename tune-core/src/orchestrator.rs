@@ -6930,6 +6930,11 @@ impl PlaybackOrchestrator {
                     // biquads match the DAC clock, mirroring the crossfeed.
                     let eq_ch = media.channels.unwrap_or(2).clamp(1, 8) as u16;
                     local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
+                    // Repli mono (#2362) — sortie LOCALE uniquement, comme le
+                    // crossfeed juste au-dessus. `zone_mono_downmix` rend
+                    // `false` en mode PURE, donc la promesse bit-perfect tient
+                    // sans garde supplémentaire, exactement comme pour l'EQ.
+                    local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
                 }
                 drop(output);
             }
@@ -7689,6 +7694,11 @@ impl PlaybackOrchestrator {
             // au remplacement — sinon la bascule claque.
             local_output.replace_crossfeed_live(self.load_crossfeed_processor(zone_id, taux));
             local_output.replace_eq_live(self.load_eq_processor(zone_id, taux, canaux));
+            // Le repli mono est lui aussi gouverné par PURE (#2362) : basculer
+            // PURE doit donc le désarmer ou le réarmer dans le même geste, sans
+            // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
+            // suivante alors que le panneau annonce déjà « Mono ».
+            local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -7863,6 +7873,99 @@ impl PlaybackOrchestrator {
             amount,
             delay_ms,
         ))
+    }
+
+    /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)
+    ///
+    /// Symétrique de [`Self::load_crossfeed_processor`] :
+    ///
+    ///   - mode PURE (audiophile) → `false` (chemin bit-perfect, intouché) ;
+    ///   - réglage absent, vide, ou différent de `"true"` → `false` (défaut).
+    ///
+    /// Le réglage vit dans la clé `zone_{id}_mono_downmix`, écrite par
+    /// `PATCH /zones/{id}` — même forme que `zone_{id}_upnp_renderer` : la clé
+    /// est SUPPRIMÉE quand l'utilisateur désactive, jamais mise à `"false"`.
+    ///
+    /// Public : `tune-server` le relit pour composer le chemin du signal, afin
+    /// que le panneau et le son répondent à la MÊME question — c'est la leçon
+    /// de #1548/#1559 (EQ oublié du verdict) et de #1627 (ReplayGain).
+    pub fn zone_mono_downmix(&self, zone_id: i64) -> bool {
+        Self::zone_mono_downmix_with(&self.db, zone_id)
+    }
+
+    /// Même règle, lisible sans orchestrateur — c'est par là que le serveur
+    /// compose le chemin du signal.
+    pub fn zone_mono_downmix_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        // PURE : le PCM atteint la sortie intact, aucun repli n'est appliqué.
+        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+            return false;
+        }
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get(&format!("zone_{zone_id}_mono_downmix"))
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true")
+    }
+
+    /// Réappliquer le repli mono d'une zone à la sortie locale qui joue, sans
+    /// attendre la piste suivante.
+    ///
+    /// Jumeau de [`Self::refresh_zone_crossfeed`], pour le même défaut : sans
+    /// lui, cocher la case en écoutant persisterait le réglage, renverrait un
+    /// succès, et ne changerait rien avant la piste suivante (#1725, #1786).
+    /// Or c'est exactement ainsi qu'on vérifie ce réglage-ci : une seule
+    /// enceinte, on coche, et on doit entendre revenir ce qui était panné à
+    /// droite.
+    ///
+    /// Contrairement au crossfeed, il n'y a **pas** de garde sur
+    /// `current_format()` : le repli n'a aucun filtre à bâtir pour un taux
+    /// donné, donc rien à faire dépendre d'un flux en cours. Armer le drapeau
+    /// sur une sortie silencieuse est correct et évite de perdre le réglage.
+    ///
+    /// Renvoie `true` si le drapeau a été poussé vers une sortie locale vivante.
+    pub async fn refresh_zone_mono_downmix(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let mono = self.zone_mono_downmix(zone_id);
+            local_output.set_mono_downmix(mono);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                mono,
+                "zone_mono_downmix_refreshed_live"
+            );
+            true
+        }
     }
 
     fn record_listen(
