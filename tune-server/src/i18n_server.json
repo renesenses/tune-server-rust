@@ -1735,6 +1735,18 @@
     "ro": "Niciun post cu acest nume în catalogul Tune. Îl puteți adăuga folosind adresa fluxului său.",
     "sv": "Ingen station med det namnet i Tune-katalogen. Du kan lägga till den med dess strömadress."
   },
+  "radio.recherche.annuaireSeul": {
+    "fr": "Cette station n'est pas encore dans votre catalogue, mais l'annuaire Tune la connaît. Ajoutez-la d'un geste — son adresse de flux est déjà là.",
+    "en": "This station is not in your catalogue yet, but the Tune directory knows it. Add it in one click — its stream address is already there.",
+    "de": "Dieser Sender ist noch nicht in Ihrem Katalog, aber das Tune-Verzeichnis kennt ihn. Fügen Sie ihn mit einem Klick hinzu — seine Stream-Adresse liegt bereits vor.",
+    "es": "Esta emisora aún no está en su catálogo, pero el directorio de Tune la conoce. Añádala con un clic: su dirección de flujo ya está disponible.",
+    "it": "Questa stazione non è ancora nel suo catalogo, ma l'elenco Tune la conosce. La aggiunga con un clic: il suo indirizzo di flusso è già disponibile.",
+    "zh": "该电台尚未加入您的目录，但 Tune 名录中已有记录。一键即可添加——流地址已经就绪。",
+    "ja": "この放送局はまだお使いのカタログにありませんが、Tune のディレクトリには登録されています。ワンクリックで追加できます — ストリームのアドレスはすでにあります。",
+    "ko": "이 방송국은 아직 카탈로그에 없지만 Tune 디렉터리에 등록되어 있습니다. 한 번의 클릭으로 추가하세요 — 스트림 주소는 이미 준비되어 있습니다.",
+    "ro": "Acest post nu este încă în catalogul dumneavoastră, dar directorul Tune îl cunoaște. Adăugați-l dintr-un clic — adresa fluxului este deja disponibilă.",
+    "sv": "Den här stationen finns ännu inte i din katalog, men Tune-katalogen känner till den. Lägg till den med ett klick — strömadressen finns redan."
+  },
   "radio.recherche.echec": {
     "fr": "La recherche de stations n'a pas pu aboutir : le catalogue n'a pas répondu. Ce n'est pas une station manquante — réessayez, et redémarrez Tune si cela persiste.",
     "en": "The station search could not complete: the catalogue did not answer. This is not a missing station — try again, and restart Tune if it persists.",
