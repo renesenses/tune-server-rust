@@ -17,6 +17,8 @@ mod bios_langue_entete;
 mod bump_natifs_android;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "enrich_artiste_langue_entete.rs"]
+mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
 mod enrichissement_repertoire;
 #[path = "etiquettes_types_et_playlists.rs"]

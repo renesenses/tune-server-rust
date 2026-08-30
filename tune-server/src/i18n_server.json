@@ -1782,5 +1782,17 @@
     "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
     "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+  },
+  "metadata.enrich.cleLastfmAbsente": {
+    "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
+    "en": "Biography enrichment requires a Last.fm API key. Set the “lastfm_api_key” setting to enable it.",
+    "de": "Die Anreicherung der Biografien benötigt einen Last.fm-API-Schlüssel. Hinterlegen Sie die Einstellung „lastfm_api_key“, um sie zu aktivieren.",
+    "es": "El enriquecimiento de biografías requiere una clave API de Last.fm. Configure el ajuste «lastfm_api_key» para activarlo.",
+    "it": "L'arricchimento delle biografie richiede una chiave API Last.fm. Impostare «lastfm_api_key» per attivarlo.",
+    "zh": "补全艺人简介需要 Last.fm API 密钥。请填写“lastfm_api_key”设置以启用。",
+    "ja": "経歴の補完には Last.fm の API キーが必要です。設定「lastfm_api_key」を入力すると有効になります。",
+    "ko": "전기 보강에는 Last.fm API 키가 필요합니다. \"lastfm_api_key\" 설정을 입력하면 활성화됩니다.",
+    "ro": "Îmbogățirea biografiilor necesită o cheie API Last.fm. Completați setarea „lastfm_api_key” pentru a o activa.",
+    "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den."
   }
 }
