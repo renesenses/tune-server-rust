@@ -41,7 +41,13 @@ jobs:
 
       - name: Valider et resoudre le manifeste
         env:
-          GH_TOKEN: ${{ github.token }}
+          # `github.token` est limite au depot courant : il rend 404 sur
+          # `tune-os` et `tune-server-universal`, qui sont prives. La
+          # validation lit les quatre `main` — elle ne peut donc PAS se
+          # contenter du jeton d'action, y compris en dry-run. Sans cela le
+          # controleur s'arrete sur le troisieme composant, et un dry-run qui
+          # ne verifie que la moitie du train ne verifie rien.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +91,17 @@ jobs:
             > /tmp/release-manifest.json
 
           while IFS=$'\t' read -r name repo sha tag; do
-            main_sha="$(gh api "repos/$repo/branches/main" --jq .commit.sha)"
+            # Un 404 nu ici ne dit pas POURQUOI. Les deux causes sont tres
+            # differentes : le depot n'existe pas, ou le jeton n'y a pas
+            # acces (cas des deux depots prives sous GitHub Free). Le
+            # deuxieme est le seul qu'on rencontre en pratique, et il se
+            # corrige en posant RELEASE_CONTROLLER_TOKEN.
+            if ! main_sha="$(gh api "repos/$repo/branches/main" --jq .commit.sha 2>/dev/null)"; then
+              echo "::error::$name: impossible de lire repos/$repo/branches/main."
+              echo "::error::Si $repo est prive, le jeton employe n'y a pas acces."
+              echo "::error::Poser le secret RELEASE_CONTROLLER_TOKEN (jeton avec 'repo' sur les quatre depots)."
+              exit 1
+            fi
             merge_base="$(gh api "repos/$repo/compare/$sha...$main_sha" --jq .merge_base_commit.sha)"
             if [ "$merge_base" != "$sha" ]; then
               echo "::error::$name: $sha n'est pas atteignable depuis main ($main_sha)"
@@ -128,7 +144,16 @@ jobs:
 
       - name: Creer les quatre tags
         env:
-          GH_TOKEN: ${{ inputs.dry_run && github.token || secrets.RELEASE_CONTROLLER_TOKEN }}
+          # Meme jeton en dry-run et en tir reel. Avec `github.token`, la
+          # lecture d'un tag existant sur `tune-os` ou
+          # `tune-server-universal` rend 404 faute de droits — et
+          # `cible_tag()` traite un echec comme « aucun tag n'existe ».
+          # Un tag DIVERGENT sur un depot prive serait donc invisible, en
+          # silence, exactement dans l'etape censee le detecter.
+          # C'est l'environnement qui separe les pouvoirs, pas le workflow :
+          # `release-dry-run` porte un jeton en lecture seule,
+          # `release` un jeton en ecriture, sous approbation.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
