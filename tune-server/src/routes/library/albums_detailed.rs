@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::state::AppState;
 
-use super::facets::{FacetQuery, build_conditions, collection_album_ids};
+use super::facets::{FacetQuery, build_conditions, resolve_collection};
 
 /// Une piste sans `album_id` n'est pas un album : elle n'a ni pochette, ni
 /// numéro de disque fiable, et regrouper toutes les orphelines sous une carte
@@ -34,18 +34,19 @@ pub(super) async fn albums_detailed(
     // doivent compter exactement ce que le rail annonce.
     let q = q.hydrate(raw.as_deref())?;
     let engine = state.backend.engine();
-    // Même résolution que le rail : le nom d'une collection manuelle vit dans
-    // un JSON de réglages, pas dans une table joignable.
-    let coll_ids: Option<Vec<i64>> = q
+    // Même résolution que le rail ET que la liste (#1864) : le nom d'une
+    // collection manuelle vit dans un JSON de réglages, celui d'une collection
+    // intelligente dans des règles à compiler — jamais dans une table joignable.
+    let coll = q
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| collection_album_ids(&state, name));
+        .map(|name| resolve_collection(&state, name));
 
     // `exclude` vide : ici AUCUNE facette n'est exclue. Le rail exclut la
     // facette qu'il compte pour garder ses alternatives visibles ; une liste
     // d'albums, elle, doit refléter la sélection entière.
-    let (mut conds, params) = build_conditions(&q, engine, "", coll_ids.as_deref());
+    let (mut conds, params) = build_conditions(&q, engine, "", coll.as_ref());
     conds.push(ONLY_REAL_ALBUMS.to_string());
     let where_clause = format!(" WHERE {}", conds.join(" AND "));
 
