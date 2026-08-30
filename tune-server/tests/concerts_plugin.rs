@@ -35,6 +35,17 @@ fn new_state() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
 }
 
+/// Construit l'app avec le plugin chargé, sur un serveur PREMIUM.
+///
+/// Le greffon appartient au module « Concerts » : sur un compte gratuit ses
+/// routes répondent 402 avant d'atteindre le moindre handler. Les tests qui
+/// portent sur le contrat d'erreur du greffon doivent donc partir d'un serveur
+/// qui a le droit de s'en servir — le cas gratuit a son propre test.
+async fn app_avec_concerts_premium(state: &AppState) -> axum::Router {
+    state.license.set_account_premium(true, None).await;
+    app_avec_concerts(state).await
+}
+
 /// Construit l'app avec le plugin chargé par le vrai chemin d'enregistrement.
 async fn app_avec_concerts(state: &AppState) -> axum::Router {
     use_scratch_plugin_data_dir();
@@ -87,7 +98,7 @@ async fn la_route_du_coeur_a_disparu() {
 #[tokio::test]
 async fn le_routeur_est_monte_sous_son_nom() {
     let state = new_state();
-    let app = app_avec_concerts(&state).await;
+    let app = app_avec_concerts_premium(&state).await;
 
     // Sans `instance_id`, le plugin répond sans jamais appeler le cloud : le
     // test ne dépend d'aucun réseau.
@@ -104,7 +115,7 @@ async fn le_routeur_est_monte_sous_son_nom() {
 #[tokio::test]
 async fn le_corps_ne_porte_aucune_phrase_anglaise() {
     let state = new_state();
-    let app = app_avec_concerts(&state).await;
+    let app = app_avec_concerts_premium(&state).await;
 
     let (_, corps) = get_json(&app, "/api/v1/ext/concerts/upcoming").await;
     assert!(
@@ -159,4 +170,47 @@ async fn la_tache_periodique_s_arrete_avec_le_greffon() {
     // plus rien. Un plugin qu'on arrête doit emporter sa tâche, sinon elle
     // survit à son propriétaire et continue d'appeler le cloud.
     greffon.teardown().await.expect("teardown");
+}
+
+/// ⚠️ LE PORTILLON PORTE SUR LES ROUTES, PAS SUR LE CHARGEMENT.
+///
+/// Le greffon se charge même sans Premium — sinon le gestionnaire ne pourrait
+/// pas l'annoncer à qui ne l'a pas encore. C'est la route qui refuse, avec le
+/// corps exact de `require_premium` : le client sait déjà le reconnaître comme
+/// un refus d'offre et non comme une panne (`estRefusPremium`).
+#[tokio::test]
+async fn un_compte_gratuit_recoit_un_refus_d_offre_pas_une_panne() {
+    let state = new_state();
+    let app = app_avec_concerts(&state).await;
+
+    let (statut, corps) = get_json(&app, "/api/v1/ext/concerts/upcoming").await;
+
+    assert_eq!(
+        statut,
+        StatusCode::PAYMENT_REQUIRED,
+        "un compte gratuit doit recevoir 402, pas une liste vide qui se lirait \
+         « il n'y a aucun concert »"
+    );
+    assert_eq!(
+        corps["error"], "premium_required",
+        "le corps doit être celui de require_premium, sans quoi l'écran devrait \
+         apprendre une deuxième forme de refus — donc en oublier une"
+    );
+    assert_eq!(corps["feature"], "Concerts");
+}
+
+/// Le module se déclare, pour que le gestionnaire montre le cadenas AVANT le
+/// clic. Sans ça, l'utilisateur installe, redémarre, et n'obtient qu'un 402.
+#[test]
+fn le_greffon_declare_son_module() {
+    use tune_core::license::Feature;
+    use tune_core::plugin_sdk::TunePlugin;
+
+    let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    let greffon = tune_concerts::ConcertsPlugin::new(tune_concerts::HostServices {
+        backend: std::sync::Arc::new(db),
+    });
+
+    assert_eq!(greffon.required_feature(), Some(Feature::Concerts));
 }

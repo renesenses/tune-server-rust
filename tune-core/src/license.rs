@@ -60,6 +60,14 @@ pub enum Feature {
     /// acoustique. C'est le traitement le plus lourd du serveur (décodage +
     /// inférence ONNX multi-thread, ~300 Mo résidents).
     AcousticAnalysis,
+    /// « Concerts près de chez soi » (#2363). Le greffon `tune-concerts` la
+    /// déclare via `TunePlugin::required_feature` : c'est le GREFFON qui porte
+    /// son module, pas une route en dur — un second greffon public n'aura
+    /// rien à déclarer et passera librement.
+    ///
+    /// Gratuite au sens où elle ne se facture pas à part : elle s'ouvre avec
+    /// Premium, comme les autres tuiles de la grille.
+    Concerts,
 }
 
 impl Feature {
@@ -93,6 +101,7 @@ impl Feature {
             Feature::PlaylistsHub,
             Feature::Declick,
             Feature::AcousticAnalysis,
+            Feature::Concerts,
         ]
     }
 
@@ -110,6 +119,7 @@ impl Feature {
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
             Feature::AcousticAnalysis => "Acoustic Analysis",
+            Feature::Concerts => "Concerts",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -1075,12 +1085,14 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyfive_features() {
+    fn all_premium_has_twentysix_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
-        // rien et tournait sur des installations gratuites.
-        assert_eq!(Feature::all_premium().len(), 25);
+        // rien et tournait sur des installations gratuites ; de 25 à 26 avec
+        // `Concerts` (#2363), décision de Bertrand du 30/08/2026 — sa propre
+        // tuile dans la grille, et non un rattachement à `WeeklyDigest`.
+        assert_eq!(Feature::all_premium().len(), 26);
     }
 
     #[test]

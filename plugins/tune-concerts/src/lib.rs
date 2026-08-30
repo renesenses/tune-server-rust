@@ -45,6 +45,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ use tracing::{debug, info, warn};
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::TuneEvent;
+use tune_core::license::{Feature, LicenseManager};
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
@@ -103,6 +105,21 @@ impl TunePlugin for ConcertsPlugin {
         false
     }
 
+    /// Le module Premium auquel ce greffon appartient.
+    ///
+    /// Déclaré ici, et non câblé sur le chemin d'URL par l'hôte : un second
+    /// greffon, public celui-là, ne déclarera rien et passera librement, sans
+    /// qu'on ait à défaire quoi que ce soit.
+    ///
+    /// ⚠️ Cette déclaration ne FERME rien à elle seule. Elle sert au
+    /// gestionnaire de greffons, qui affiche le cadenas avant le clic. Le
+    /// comportement réel se décide dans [`acces`], chez le greffon — parce
+    /// que « Concerts » doit un jour servir une version RÉDUITE aux comptes
+    /// gratuits, ce qu'un garde tout-ou-rien de l'hôte ne saurait pas faire.
+    fn required_feature(&self) -> Option<Feature> {
+        Some(Feature::Concerts)
+    }
+
     /// Hors catalogue tant qu'aucun écran ne consomme ces routes — voir l'en-
     /// tête du module. Le plugin reste compilé, testé, et se charge si
     /// `plugin_concerts_installed` est posé à la main.
@@ -111,7 +128,7 @@ impl TunePlugin for ConcertsPlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(router(self.backend.clone()));
+        ctx.register_router(router(self.backend.clone(), ctx.license.clone()));
         self.tache = Some(lancer_synchronisation(self.backend.clone()));
         Ok(())
     }
@@ -136,12 +153,36 @@ impl TunePlugin for ConcertsPlugin {
 #[derive(Clone)]
 struct EtatConcerts {
     backend: Arc<dyn DbBackend>,
+    license: Option<Arc<LicenseManager>>,
 }
 
-pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
+/// Ce que le serveur a le droit de rendre, selon sa licence.
+///
+/// ⚠️ C'EST LE SEUL ENDROIT OÙ LE PAYANT SE DÉCIDE, et c'est délibéré.
+///
+/// La variante manquante ici est `Reduit` : une version limitée pour les
+/// comptes gratuits, prévue une fois le module abouti. Le jour venu, elle
+/// s'ajoute à cette énumération et à l'unique `match` qui la lit — rien
+/// d'autre ne bouge. Si le refus avait été monté par l'hôte devant les routes,
+/// il aurait fallu le défaire.
+enum Acces {
+    Complet,
+    Refuse,
+}
+
+async fn acces(license: &Option<Arc<LicenseManager>>) -> Acces {
+    // Pas de licence fournie par l'hôte = pas de Premium. Une absence ne
+    // s'interprète jamais en faveur du doute.
+    match license {
+        Some(l) if l.check_feature(Feature::Concerts).await => Acces::Complet,
+        _ => Acces::Refuse,
+    }
+}
+
+pub fn router(backend: Arc<dyn DbBackend>, license: Option<Arc<LicenseManager>>) -> Router<()> {
     Router::new()
         .route("/upcoming", get(concerts_a_venir))
-        .with_state(EtatConcerts { backend })
+        .with_state(EtatConcerts { backend, license })
 }
 
 /// `GET /api/v1/ext/concerts/upcoming` — remplace `GET /system/concerts`.
@@ -152,7 +193,26 @@ pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
 /// **code stable**, traduisible côté client, et le détail part au journal.
 async fn concerts_a_venir(
     axum::extract::State(etat): axum::extract::State<EtatConcerts>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    match acces(&etat.license).await {
+        Acces::Complet => {}
+        // Même corps que `require_premium` de l'hôte : le client sait déjà
+        // reconnaître ce refus comme un refus d'offre et non comme une panne
+        // (`estRefusPremium`, tune-web-client). Un corps de plus aurait obligé
+        // l'écran à apprendre une deuxième forme, donc à en oublier une.
+        Acces::Refuse => {
+            return (
+                axum::http::StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "error": "premium_required",
+                    "feature": Feature::Concerts.display_name(),
+                    "upgrade_url": "https://mozaiklabs.fr/pricing",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let instance_id = SettingsRepo::with_backend(etat.backend.clone())
         .get("instance_id")
         .ok()
@@ -160,7 +220,7 @@ async fn concerts_a_venir(
         .unwrap_or_default();
 
     if instance_id.is_empty() {
-        return Json(json!({"concerts": [], "code": "concerts.no_instance_id"}));
+        return Json(json!({"concerts": [], "code": "concerts.no_instance_id"})).into_response();
     }
 
     let client = match tune_core::http::client::builder()
@@ -171,15 +231,15 @@ async fn concerts_a_venir(
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "concerts_client_build_failed");
-            return Json(json!({"concerts": [], "code": "concerts.unavailable"}));
+            return Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response();
         }
     };
 
     match recuperer_concerts(&client, &instance_id).await {
-        Ok(concerts) => Json(json!({"concerts": concerts})),
+        Ok(concerts) => Json(json!({"concerts": concerts})).into_response(),
         Err(e) => {
             warn!(error = %e, "concerts_fetch_failed");
-            Json(json!({"concerts": [], "code": "concerts.unavailable"}))
+            Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response()
         }
     }
 }
@@ -547,5 +607,59 @@ mod tests {
             450,
             "la somme des lots doit rendre la bibliotheque entiere"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_portillon {
+    use super::*;
+    use tune_core::db::migrations;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::license::LicenseManager;
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Une licence neuve : compte gratuit, comme une installation qui vient de
+    /// démarrer.
+    fn licence() -> Arc<LicenseManager> {
+        Arc::new(LicenseManager::new(base()))
+    }
+
+    /// ⚠️ Une licence absente ne vaut PAS une autorisation.
+    ///
+    /// C'est le cas d'un hôte qui n'en fournit pas — tests, tune-cli, ou une
+    /// construction future qui oublierait de la brancher. Interpréter
+    /// l'absence en faveur du doute ouvrirait la fonction à tout le monde le
+    /// jour où quelqu'un déplace une ligne dans `AppState`.
+    #[tokio::test]
+    async fn sans_licence_l_acces_est_refuse() {
+        assert!(matches!(acces(&None).await, Acces::Refuse));
+    }
+
+    #[tokio::test]
+    async fn un_compte_gratuit_est_refuse() {
+        let l = licence();
+        assert!(matches!(acces(&Some(l)).await, Acces::Refuse));
+    }
+
+    #[tokio::test]
+    async fn un_compte_premium_a_l_acces_complet() {
+        let l = licence();
+        l.set_account_premium(true, None).await;
+        assert!(matches!(acces(&Some(l)).await, Acces::Complet));
+    }
+
+    /// Le greffon déclare son module pour que le gestionnaire affiche le
+    /// cadenas AVANT le clic — sans quoi l'utilisateur installe, redémarre, et
+    /// n'obtient qu'un 402.
+    #[test]
+    fn le_greffon_nomme_son_module() {
+        let greffon = ConcertsPlugin::new(HostServices { backend: base() });
+        assert_eq!(greffon.required_feature(), Some(Feature::Concerts));
     }
 }

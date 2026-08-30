@@ -341,6 +341,7 @@ impl AppState {
         let plugins = Arc::new(Mutex::new(crate::plugins::build_loader(
             &event_bus,
             backend.clone(),
+            license.clone(),
         )));
 
         Ok(Self {
