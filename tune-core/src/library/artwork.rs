@@ -271,6 +271,46 @@ pub fn content_hash(data: &[u8]) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Met en cache une image **fraîchement récupérée en ligne** et rend son
+/// adresse, adressée par son CONTENU (#1444).
+///
+/// Le pendant écriture de [`content_hash`] pour les producteurs qui n'ont
+/// aucune entrée héritée à ménager : ils viennent de télécharger des octets
+/// neufs, il n'y a rien à sonder. Ils écrivaient jusqu'ici sous un condensat
+/// d'**identité** figé — `artwork_hash(mbid)`,
+/// `artwork_hash("{artiste}|{titre}")`, `artwork_hash("artist-mbid-{mbid}")`,
+/// `artwork_hash("artist-name-{nom}")` — ce qui posait deux défauts opposés,
+/// que l'adressage par le contenu referme tous les deux :
+///
+/// - **la même adresse pour deux images différentes.** Deux albums distincts
+///   qui partagent nom d'artiste et titre écrivent au même endroit : le second
+///   enrichi écrase la pochette du premier, et les deux lignes de la base
+///   pointent la même image. Mesuré le 30/08/2026 sur `.18` : **5 groupes,
+///   11 albums** collisionnent sur `{artiste}|{titre}`, plus 1 groupe / 2
+///   albums sur le MBID. Le commentaire de la phase 2 des images d'artistes
+///   garde la trace du même défaut déjà survenu, en pire — un MBID vide faisait
+///   converger *tous* les artistes sans MBID sur `md5("artist-mbid-")`.
+/// - **la même adresse pour deux versions successives d'une image.** Un
+///   re-téléchargement (`force`, bouton « re-télécharger les images
+///   d'artistes ») réécrit sous l'adresse déjà distribuée, que la route sert
+///   `Cache-Control: immutable, max-age=31536000` : navigateurs et cache
+///   d'images Flutter continuent d'afficher l'ancienne image **un an**. C'est
+///   le défaut refermé pour les téléversements en v0.9.127, laissé nu sur les
+///   chemins d'enrichissement.
+///
+/// Sous SHA-256 des octets, deux images différentes ne peuvent pas se retrouver
+/// à la même adresse, et deux images identiques au bit près partagent une
+/// entrée — ce qui est le comportement voulu, aucun chemin de suppression par
+/// entrée n'existant dans le dépôt.
+pub fn cache_fetched_image(data: &[u8], cache_dir: &Path, ext: &str) -> Option<String> {
+    let hash = content_hash(data);
+    // Déjà en cache sous cette adresse : mêmes octets, rien à réécrire.
+    if find_cached(cache_dir, &hash).is_some() {
+        return Some(hash);
+    }
+    save_to_cache(data, cache_dir, &hash, ext).map(|_| hash)
+}
+
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     let client = crate::http::client::builder()
@@ -527,12 +567,14 @@ pub async fn batch_enrich_artwork_scoped(
 
         match fetched {
             Some(data) => {
-                let key = mbid_to_use
-                    .clone()
-                    .unwrap_or_else(|| format!("{artist}|{title}"));
-                let hash = artwork_hash(&key);
+                // Adressage par le CONTENU (#1444). L'ancienne clé était
+                // l'identité de l'album — le MBID, sinon `{artiste}|{titre}` —
+                // ce qui faisait écrire DEUX albums distincts au même endroit
+                // dès qu'ils partagent artiste et titre (5 groupes / 11 albums
+                // mesurés sur .18) : le second enrichi écrasait la pochette du
+                // premier. Voir `cache_fetched_image`.
                 std::fs::create_dir_all(&cache_dir).ok();
-                if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
                     album_repo.update_cover_path(*album_id, &hash).ok();
                     enriched += 1;
                     info!(
@@ -1230,9 +1272,13 @@ async fn batch_enrich_artist_artwork_inner(
                     .build();
                 if let Ok(client) = client {
                     if let Some(data) = download_image(&client, &img.image_url).await {
-                        let hash = artwork_hash(&format!("artist-mbid-{}", img.mbid));
+                        // Adressage par le CONTENU (#1444) : sous
+                        // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
+                        // — dont c'est tout l'objet — réécrivait sous l'adresse
+                        // déjà distribuée, servie `immutable, max-age=31536000` :
+                        // l'ancienne photo restait affichée un an.
                         std::fs::create_dir_all(&cache_dir).ok();
-                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                        if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
                             artist_repo.update_image(artist_id, &hash, "community").ok();
                             community_applied += 1;
                             info!(
@@ -1432,19 +1478,19 @@ async fn batch_enrich_artist_artwork_inner(
 
         match fetch_artist_image(&mbid, name, discogs_token.as_deref()).await {
             Some(data) => {
-                // Cache key: by MBID when known, else by NAME. Keying by
-                // `artist-mbid-` with an EMPTY mbid made every artist without an
-                // MBID collide on the same file (md5("artist-mbid-")), so they
-                // overwrote each other's image (Keith Jarrett, Duke Ellington…
-                // all sharing one photo). By-name matches Phase 3's convention.
-                let key = if mbid.is_empty() {
-                    format!("artist-name-{name}")
-                } else {
-                    format!("artist-mbid-{mbid}")
-                };
-                let hash = artwork_hash(&key);
+                // Adressage par le CONTENU (#1444), plus par l'identité de
+                // l'artiste. L'ancienne clé était `artist-mbid-{mbid}`, sinon
+                // `artist-name-{nom}` — et sa forme précédente, un
+                // `artist-mbid-` à MBID VIDE, avait déjà fait converger TOUS
+                // les artistes sans MBID sur `md5("artist-mbid-")` : Keith
+                // Jarrett, Duke Ellington… partageaient une seule photo, chacun
+                // écrasant celle du précédent. Le passage par le nom a réduit
+                // la famille de collisions sans la fermer (deux artistes
+                // homonymes restent une seule adresse), et le mode `force`
+                // réécrivait sous une adresse servie `immutable` un an. Le
+                // condensat des octets ferme les deux.
                 std::fs::create_dir_all(&cache_dir).ok();
-                if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
                     artist_repo.update_image(*artist_id, &hash, "auto").ok();
                     enriched += 1;
                     info!(
@@ -1563,9 +1609,10 @@ async fn batch_enrich_artist_artwork_inner(
                         if let Some(data) =
                             fetch_artist_image_discogs(client, &name, discogs_token).await
                         {
-                            let hash = artwork_hash(&format!("artist-name-{name}"));
+                            // Adressage par le CONTENU (#1444) : deux artistes
+                            // homonymes ne partagent plus une seule adresse.
                             std::fs::create_dir_all(cache_dir).ok();
-                            if save_to_cache(&data, cache_dir, &hash, "jpg").is_some() {
+                            if let Some(hash) = cache_fetched_image(&data, cache_dir, "jpg") {
                                 artist_repo.update_image(artist_id, &hash, "discogs").ok();
                                 info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
                                 return Some(SourceParNom::Discogs);
@@ -1577,9 +1624,10 @@ async fn batch_enrich_artist_artwork_inner(
                     if lastfm_available {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         if let Some(data) = fetch_artist_image_lastfm(client, &name).await {
-                            let hash = artwork_hash(&format!("artist-name-{name}"));
+                            // Adressage par le CONTENU (#1444), même raison
+                            // qu'au passage Discogs juste au-dessus.
                             std::fs::create_dir_all(cache_dir).ok();
-                            if save_to_cache(&data, cache_dir, &hash, "jpg").is_some() {
+                            if let Some(hash) = cache_fetched_image(&data, cache_dir, "jpg") {
                                 artist_repo.update_image(artist_id, &hash, "lastfm").ok();
                                 info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
                                 return Some(SourceParNom::Lastfm);
@@ -1718,6 +1766,58 @@ pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> 
         .and_then(|e| e.to_str())
         .unwrap_or("jpg");
     save_to_cache(&data, cache_dir, &hash, ext).map(|_| hash)
+}
+
+/// Noms acceptés pour une photo d'ARTISTE posée à côté des pistes.
+///
+/// Reprend à l'identique la liste que l'import parcourait en ligne.
+pub const FOLDER_ARTIST_IMAGE_NAMES: &[&str] =
+    &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"];
+
+/// Photo d'ARTISTE posée dans le dossier des pistes (`artist.jpg`), mise en
+/// cache, adressée par son CONTENU (#1444).
+///
+/// C'est littéralement le défaut que nomme le titre du ticket : l'adresse était
+/// `artwork_hash(chemin du fichier)`. La même `artist.jpg` recopiée dans les N
+/// dossiers d'album d'un artiste — ce que font tous les extracteurs de
+/// bibliothèque — produisait **N entrées de cache** pour une seule photo, et le
+/// moindre déplacement du dossier en fabriquait une de plus en laissant
+/// l'ancienne orpheline.
+///
+/// Sonde d'abord l'entrée héritée, adressée par le chemin : une URL déjà
+/// distribuée reste valable (la route sert `immutable, max-age=31536000`) et un
+/// rescan ne relit pas le fichier. Même contrat que [`folder_cover_hash`].
+pub fn folder_artist_image_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
+    let parent = audio_path.parent()?;
+    for name in FOLDER_ARTIST_IMAGE_NAMES {
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            continue;
+        }
+        // Entrée héritée, adressée par le CHEMIN de l'image.
+        let legacy = artwork_hash(&candidate.to_string_lossy());
+        if find_cached(cache_dir, &legacy).is_some() {
+            return Some(legacy);
+        }
+        let Ok(data) = std::fs::read(&*extended_path(&candidate)) else {
+            debug!(path = %candidate.display(), "folder_artist_image_read_failed");
+            continue;
+        };
+        let ext = candidate
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg");
+        // Nouvelle écriture : adressée par le CONTENU.
+        if let Some(hash) = cache_fetched_image(&data, cache_dir, ext) {
+            return Some(hash);
+        }
+        warn!(
+            path = %candidate.display(),
+            cache_dir = %cache_dir.display(),
+            "folder_artist_image_cache_write_failed"
+        );
+    }
+    None
 }
 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
@@ -2279,6 +2379,152 @@ mod tests {
             1,
             "aucune entrée de contenu en doublon"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1444 — les producteurs restés adressés par l'IDENTITÉ.
+    // ------------------------------------------------------------------
+
+    /// Le défaut nommé par le titre du ticket, sur le seul producteur local
+    /// qui l'avait encore : la photo d'artiste posée dans le dossier était
+    /// adressée par le CHEMIN du fichier. La même `artist.jpg` recopiée dans
+    /// les N dossiers d'album d'un artiste — ce que fait tout extracteur de
+    /// bibliothèque — écrivait N entrées de cache pour une seule photo.
+    #[test]
+    fn artist_jpg_identique_dans_n_dossiers_une_seule_entree() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = b"PHOTO-DE-L-ARTISTE";
+        let cache = dir.path().join("cache");
+        let mut adresses = Vec::new();
+        for album in ["Album 1", "Album 2", "Album 3"] {
+            let dossier = dir.path().join("Keith Jarrett").join(album);
+            std::fs::create_dir_all(&dossier).unwrap();
+            std::fs::write(dossier.join("artist.jpg"), photo).unwrap();
+            let piste = dossier.join("01.flac");
+            std::fs::write(&piste, b"").unwrap();
+            adresses.push(folder_artist_image_hash(&piste, &cache).unwrap());
+        }
+        assert_eq!(adresses[0], adresses[1], "mêmes octets = même adresse");
+        assert_eq!(adresses[1], adresses[2], "mêmes octets = même adresse");
+        assert_eq!(
+            nb_fichiers(&cache),
+            1,
+            "une seule entrée de cache pour N dossiers"
+        );
+        assert_eq!(
+            std::fs::read(cache.join(format!("{}.jpg", adresses[0]))).unwrap(),
+            photo
+        );
+    }
+
+    /// Témoin de non-fusion — le sens que la migration de clé doit garantir
+    /// AUSSI : deux photos différentes n'ont jamais la même adresse. Vert des
+    /// deux côtés du correctif ; c'est ce qui rend la bascule sûre.
+    #[test]
+    fn deux_artist_jpg_differents_ne_fusionnent_jamais() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let mut adresses = Vec::new();
+        for (nom, octets) in [
+            ("Keith Jarrett", b"PHOTO-JARRETT".as_slice()),
+            ("Duke Ellington", b"PHOTO-ELLINGTON"),
+        ] {
+            let dossier = dir.path().join(nom);
+            std::fs::create_dir_all(&dossier).unwrap();
+            std::fs::write(dossier.join("artist.jpg"), octets).unwrap();
+            let piste = dossier.join("01.flac");
+            std::fs::write(&piste, b"").unwrap();
+            adresses.push(folder_artist_image_hash(&piste, &cache).unwrap());
+        }
+        assert_ne!(adresses[0], adresses[1]);
+        assert_eq!(nb_fichiers(&cache), 2);
+        assert_eq!(
+            std::fs::read(cache.join(format!("{}.jpg", adresses[0]))).unwrap(),
+            b"PHOTO-JARRETT"
+        );
+        assert_eq!(
+            std::fs::read(cache.join(format!("{}.jpg", adresses[1]))).unwrap(),
+            b"PHOTO-ELLINGTON"
+        );
+    }
+
+    /// Témoin de non-régression : une entrée déjà constituée sous l'ancien
+    /// schéma (condensat du CHEMIN) reste servie sous la MÊME adresse — la
+    /// route sert `immutable, max-age=31536000`, aucune URL distribuée ne doit
+    /// tomber en 404. Vert des deux côtés du correctif.
+    #[test]
+    fn artist_jpg_entree_heritee_par_chemin_reste_servie() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let photo = dossier.join("artist.jpg");
+        std::fs::write(&photo, b"PHOTO-HERITEE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let legacy = artwork_hash(&photo.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"PHOTO-HERITEE").unwrap();
+
+        let h = folder_artist_image_hash(&piste, &cache).unwrap();
+        assert_eq!(h, legacy, "l'adresse déjà distribuée est conservée");
+        assert_eq!(nb_fichiers(&cache), 1, "aucun doublon de contenu");
+    }
+
+    /// `cache_fetched_image`, le chemin des enrichissements en ligne. Deux
+    /// sujets distincts qui partageaient une IDENTITÉ — deux albums de même
+    /// artiste et même titre (5 groupes / 11 albums mesurés sur .18), deux
+    /// artistes homonymes — écrivaient au même endroit : le second écrasait
+    /// l'image du premier. Chacun garde désormais la sienne.
+    #[test]
+    fn enrichissement_deux_images_ne_se_recouvrent_plus() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let a = b"POCHETTE-EDITION-2011";
+        let b = b"POCHETTE-EDITION-2019";
+        let ha = cache_fetched_image(a, &cache, "jpg").unwrap();
+        let hb = cache_fetched_image(b, &cache, "jpg").unwrap();
+        assert_ne!(ha, hb, "deux images différentes, deux adresses");
+        assert_eq!(nb_fichiers(&cache), 2);
+        assert_eq!(std::fs::read(cache.join(format!("{ha}.jpg"))).unwrap(), a);
+        assert_eq!(std::fs::read(cache.join(format!("{hb}.jpg"))).unwrap(), b);
+    }
+
+    /// Le re-téléchargement (`force`) obtient une adresse NEUVE. Sous l'ancien
+    /// condensat d'identité il réécrivait l'adresse déjà distribuée, servie
+    /// `immutable, max-age=31536000` : navigateurs et cache d'images Flutter
+    /// affichaient l'ancienne image un an.
+    #[test]
+    fn re_telechargement_obtient_une_adresse_neuve() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let avant = cache_fetched_image(b"ANCIENNE-PHOTO", &cache, "jpg").unwrap();
+        let apres = cache_fetched_image(b"NOUVELLE-PHOTO", &cache, "jpg").unwrap();
+        assert_ne!(
+            avant, apres,
+            "une image remplacée doit changer d'URL, sinon le cache immuable la masque un an"
+        );
+        // L'ancienne reste lisible : les URL déjà distribuées ne tombent pas.
+        assert_eq!(
+            std::fs::read(cache.join(format!("{avant}.jpg"))).unwrap(),
+            b"ANCIENNE-PHOTO"
+        );
+    }
+
+    /// Comptage des COLLISIONS de la nouvelle clé, dans le sens qui compte :
+    /// N images deux à deux différentes doivent donner N adresses distinctes.
+    /// Aucune fusion ne doit apparaître. Témoin vert des deux côtés.
+    #[test]
+    fn aucune_collision_sur_un_corpus_d_images_distinctes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let mut adresses = std::collections::HashSet::new();
+        for i in 0..512u32 {
+            let octets = format!("IMAGE-{i}").into_bytes();
+            adresses.insert(cache_fetched_image(&octets, &cache, "jpg").unwrap());
+        }
+        assert_eq!(adresses.len(), 512, "512 images distinctes, 512 adresses");
+        assert_eq!(nb_fichiers(&cache), 512, "aucune entrée écrasée");
     }
 
     /// `save_embedded_cover` : la même jaquette intégrée à deux pistes

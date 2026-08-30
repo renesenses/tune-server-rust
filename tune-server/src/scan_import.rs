@@ -619,46 +619,34 @@ impl TrackImporter {
         }
 
         // Check for a local artist image (artist.jpg/png next to the tracks).
+        //
+        // La mise en cache est passée dans `tune_core::library::artwork` pour
+        // être adressée par le CONTENU (#1444) et testable : la même
+        // `artist.jpg` recopiée dans les N dossiers d'album d'un artiste
+        // n'écrit plus qu'UNE entrée de cache. L'entrée héritée, adressée par
+        // le chemin, reste sondée d'abord — aucune URL déjà distribuée ne
+        // bouge. Rien n'est enregistré si l'écriture du cache échoue, sinon la
+        // base annonce « a une image » sans rien sur le disque (carré gris +
+        // saut définitif).
         if let Some(ref art) = track_artist {
             if art.image_path.is_none() {
-                if let Some(parent) = std::path::Path::new(&sf.path).parent() {
-                    for name in &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"] {
-                        let candidate = parent.join(name);
-                        if candidate.exists() {
-                            let hash = tune_core::library::artwork::artwork_hash(
-                                &candidate.to_string_lossy(),
-                            );
-                            let ext = candidate
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("jpg");
-                            // Only record the image if the cache write succeeded —
-                            // otherwise the DB claims "has image" with nothing on
-                            // disk (grey square + permanent skip).
-                            let saved = std::fs::read(&candidate).ok().and_then(|data| {
-                                tune_core::library::artwork::save_to_cache(
-                                    &data,
-                                    &self.cache_dir,
-                                    &hash,
-                                    ext,
-                                )
-                            });
-                            if saved.is_none() {
-                                tracing::warn!(
-                                    artist = %art.name,
-                                    candidate = %candidate.display(),
-                                    "artist_image_cache_write_failed_not_recording"
-                                );
-                                continue;
-                            }
-                            let mut updated_artist = tune_core::db::models::Artist::clone(art);
-                            updated_artist.image_path = Some(hash);
-                            updated_artist.image_source = Some("local".to_string());
-                            if let Err(e) = self.artist_repo.update(&updated_artist) {
-                                tracing::warn!(error = %e, "artist_image_update_failed");
-                            }
-                            break;
+                match tune_core::library::artwork::folder_artist_image_hash(
+                    std::path::Path::new(&sf.path),
+                    &self.cache_dir,
+                ) {
+                    Some(hash) => {
+                        let mut updated_artist = tune_core::db::models::Artist::clone(art);
+                        updated_artist.image_path = Some(hash);
+                        updated_artist.image_source = Some("local".to_string());
+                        if let Err(e) = self.artist_repo.update(&updated_artist) {
+                            tracing::warn!(error = %e, "artist_image_update_failed");
                         }
+                    }
+                    None => {
+                        tracing::trace!(
+                            artist = %art.name,
+                            "artist_image_absente_ou_non_mise_en_cache"
+                        );
                     }
                 }
             }

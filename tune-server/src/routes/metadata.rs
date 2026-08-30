@@ -2208,8 +2208,12 @@ async fn fetch_album_cover(
     if let Some(ref mbid_val) = mbid {
         if let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await {
             let cache_dir = super::library::artwork_cache_dir();
-            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
-            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            // Adressage par le CONTENU (#1444). Route de RE-téléchargement
+            // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
+            // gardait l'adresse déjà distribuée, servie `immutable,
+            // max-age=31536000` — la nouvelle pochette n'apparaissait pas.
+            if let Some(hash) =
+                tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
                 repo.force_update_cover_path(id, &hash).ok();
                 return Json(json!({
