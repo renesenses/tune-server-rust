@@ -25,6 +25,50 @@ fn charge_avancement_enrichissement(enriched: i32, total: usize) -> Value {
     json!({ "processed": enriched, "total": total })
 }
 
+/// Corps optionnel de `POST /library/enrich-all`. Sans corps — ou sans `path`,
+/// ou avec un `path` vide — la passe couvre toute la bibliothèque : contrat
+/// historique strictement inchangé (#1660).
+#[derive(serde::Deserialize, Default)]
+pub(super) struct EnrichAllBody {
+    /// Répertoire (sous une racine musicale) auquel limiter la passe.
+    pub(super) path: Option<String>,
+}
+
+/// Index de `t.file_path` dans la sélection de candidats de
+/// [`enrich_all_library`]. Nommé parce que la boucle ET la portée le lisent :
+/// un `SELECT` réordonné doit se voir ici, pas filtrer en silence sur la
+/// mauvaise colonne.
+const COL_FILE_PATH: usize = 4;
+
+/// Restreint les pistes candidates à celles qui vivent sous le répertoire
+/// demandé (#1660).
+///
+/// `None` = passe complète : la liste ressort **telle quelle**. C'est le témoin
+/// anti-régression du ticket — sans portée, l'enrichissement continue de
+/// couvrir toute la bibliothèque, à la ligne près.
+///
+/// Le filtrage se fait en Rust via `sous_le_dossier`, jamais par un `LIKE` SQL
+/// (sur PostgreSQL l'antislash des chemins Windows est un caractère
+/// d'échappement et le motif dégénère en silence), et jamais via `Path` : sur
+/// un hôte POSIX, `D:\Musique\x` ne compte qu'UN composant et `is_absolute()`
+/// le déclare relatif. Une garde écrite avec `Path` refuserait Windows en
+/// entier tout en restant verte en CI Linux (#1837, #2056).
+fn restreindre_a_la_portee(
+    rows: Vec<Vec<tune_core::db::backend::SqlValue>>,
+    scope: Option<&tune_core::metadata::enrich_scope::EnrichScope>,
+) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
+    let Some(scope) = scope else {
+        return rows;
+    };
+    rows.into_iter()
+        .filter(|row| {
+            row.get(COL_FILE_PATH)
+                .and_then(|v| v.as_string())
+                .is_some_and(|p| scope.contient_chemin(&p))
+        })
+        .collect()
+}
+
 /// POST /library/enrich-all
 ///
 /// Enriches tracks with metadata from MusicBrainz. Finds tracks with
@@ -34,13 +78,37 @@ fn charge_avancement_enrichissement(enriched: i32, total: usize) -> Value {
 ///
 /// Updates DB with ALL enriched fields using COALESCE to never
 /// overwrite existing data.
-pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse {
+///
+/// Portée par répertoire (#1660) : c'est CETTE route que le bouton
+/// « Enrichir les métadonnées » de `SettingsView.svelte` appelle
+/// (`startBatchEnrich` → `POST /library/enrich-all`), et non
+/// `/system/enrichment/run`. Un `path` limité au sous-arbre demandé restreint
+/// la sélection des candidats ; sans `path`, rien ne change.
+pub(super) async fn enrich_all_library(
+    State(state): State<AppState>,
+    body: Option<Json<EnrichAllBody>>,
+) -> impl IntoResponse {
+    // Portée résolue AVANT le gate de quota : un chemin invalide ne doit rien
+    // consommer. Refus franc, jamais de repli sur la bibliothèque entière —
+    // le repli enrichirait exactement ce que l'utilisateur voulait épargner.
+    let scope = match body
+        .and_then(|Json(b)| b.path)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
+        Some(p) => match crate::routes::system::resoudre_portee(&state, &p) {
+            Ok(s) => Some(s),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
     // Full-library MusicBrainz enrichment is the same class of operation as the
     // premium-gated /system/enrich-metadata, so gate it the same way (premium
     // unlimited, free daily quota) instead of leaving it a free bypass (#6).
     if let Err(resp) = crate::routes::system::gate_enrichment(&state).await {
         return resp;
     }
+    let scope_tache = scope.clone();
     let task_id = uuid::Uuid::new_v4().to_string();
     let backend = state.backend.clone();
     let http_client = state.http_client.clone();
@@ -106,7 +174,19 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 Vec::new()
             });
 
+        // La portée s'applique ICI, sur la sélection des candidats, avant que
+        // `total` ne soit calculé : la barre d'avancement compte alors les
+        // seules pistes du répertoire, et la boucle ne part sur MusicBrainz
+        // pour aucune autre (#1660).
+        let track_rows = restreindre_a_la_portee(track_rows, scope_tache.as_ref());
         let total = track_rows.len();
+        if let Some(s) = scope_tache.as_ref() {
+            info!(
+                dir = %s.dir,
+                candidats = total,
+                "enrich_all_library limité à un répertoire"
+            );
+        }
 
         // Publish the total as soon as it is known: the next periodic write
         // only happens every 50 enriched tracks, and with the ~1 req/s
@@ -404,7 +484,17 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
     (
         StatusCode::ACCEPTED,
-        Json(json!({"status": "accepted", "task_id": task_id})),
+        Json(json!({
+            "status": "accepted",
+            "task_id": task_id,
+            // Portée annoncée synchroniquement (#1660) : l'écran peut dire
+            // « 6 000 albums de Jazz Instrumental » avant le premier
+            // aller-retour MusicBrainz. `null` = passe complète.
+            "directory": scope.as_ref().map(|s| s.dir.clone()),
+            "directory_tracks": scope.as_ref().map(|s| s.track_count),
+            "directory_albums": scope.as_ref().map(|s| s.album_ids.len()),
+            "directory_artists": scope.as_ref().map(|s| s.artist_ids.len()),
+        })),
     )
 }
 
@@ -641,6 +731,131 @@ fn pick_best_genre(tags_value: &Value) -> Option<String> {
         })
         .max_by_key(|(_, count)| *count)
         .map(|(name, _)| tune_core::metadata::normalize_genre(&name))
+}
+
+/// Portée par répertoire de `/library/enrich-all` (#1660).
+///
+/// Ces tests portent sur la SÉLECTION DES CANDIDATS, là où le ticket se joue :
+/// une piste écartée ici ne déclenche aucune requête MusicBrainz, ne compte pas
+/// dans `total`, et ne peut donc pas voir ses tags réécrits.
+#[cfg(test)]
+mod tests_portee_repertoire {
+    use super::*;
+    use tune_core::db::backend::SqlValue;
+    use tune_core::metadata::enrich_scope::EnrichScope;
+
+    /// Une ligne de la sélection réduite à ce que la portée lit : la colonne
+    /// `t.file_path`, à son index réel dans le `SELECT`.
+    fn ligne(chemin: &str) -> Vec<SqlValue> {
+        let mut cols = vec![SqlValue::Null; COL_FILE_PATH];
+        cols.push(SqlValue::Text(chemin.to_string()));
+        cols
+    }
+
+    fn chemins(rows: &[Vec<SqlValue>]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| r.get(COL_FILE_PATH).and_then(|v| v.as_string()))
+            .collect()
+    }
+
+    fn portee(dir: &str) -> EnrichScope {
+        EnrichScope {
+            dir: dir.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION. Sans portée, l'enrichissement couvre toujours
+    /// toute la bibliothèque : aucune ligne perdue, ordre conservé.
+    #[test]
+    fn sans_portee_la_bibliotheque_entiere_reste_candidate() {
+        let rows = vec![
+            ligne("/musique/rock/a.flac"),
+            ligne("/musique/jazz/b.flac"),
+            ligne("/autre/c.flac"),
+        ];
+        let sortie = restreindre_a_la_portee(rows, None);
+        assert_eq!(
+            chemins(&sortie),
+            vec![
+                "/musique/rock/a.flac",
+                "/musique/jazz/b.flac",
+                "/autre/c.flac"
+            ],
+        );
+    }
+
+    /// Le cœur du ticket : seules les pistes du répertoire demandé restent
+    /// candidates. « Ma collection Jazz mal taggée, à l'exclusion des autres
+    /// répertoires » (jfpaquet).
+    #[test]
+    fn avec_portee_seules_les_pistes_du_repertoire_restent() {
+        let rows = vec![
+            ligne("/musique/jazz/Kind of Blue/01.flac"),
+            ligne("/musique/electro/Autobahn/01.flac"),
+            ligne("/musique/jazz/Comp/02.flac"),
+        ];
+        let sortie = restreindre_a_la_portee(rows, Some(&portee("/musique/jazz")));
+        assert_eq!(
+            chemins(&sortie),
+            vec![
+                "/musique/jazz/Kind of Blue/01.flac",
+                "/musique/jazz/Comp/02.flac"
+            ],
+            "la piste d'Electro n'est pas candidate"
+        );
+    }
+
+    /// Le dossier VOISIN au nom proche. `/musique/rock` choisi ⇒ `/musique/rock2`
+    /// exclu : un préfixe de nom n'est pas un sous-arbre. Un filtre écrit en
+    /// `starts_with` — ou en `LIKE 'dir%'` — enrichirait tout `rock2` par
+    /// surprise.
+    #[test]
+    fn un_dossier_voisin_au_nom_proche_est_exclu() {
+        let rows = vec![
+            ligne("/musique/rock/a.flac"),
+            ligne("/musique/rock2/b.flac"),
+            ligne("/musique/rock"),
+        ];
+        let sortie = restreindre_a_la_portee(rows, Some(&portee("/musique/rock")));
+        assert_eq!(
+            chemins(&sortie),
+            vec!["/musique/rock/a.flac", "/musique/rock"],
+            "/musique/rock2 n'est pas sous /musique/rock"
+        );
+    }
+
+    /// Windows, joué sur l'hôte POSIX de la CI. C'est l'angle mort de #1837 et
+    /// #2056 : une garde bâtie sur `Path` verrait UN seul composant dans
+    /// `D:\Musique\x`, le déclarerait relatif, et écarterait toute la
+    /// bibliothèque d'un utilisateur Windows en restant verte ici.
+    #[test]
+    fn les_chemins_windows_sont_filtres_sur_hote_posix() {
+        let rows = vec![
+            ligne(r"G:\Jazz - Vocal\Ella\01.flac"),
+            ligne(r"G:\Jazz - Vocal 2\x\01.flac"),
+            ligne(r"G:\Rock\01.flac"),
+        ];
+        let sortie = restreindre_a_la_portee(rows, Some(&portee(r"G:\Jazz - Vocal")));
+        assert_eq!(
+            chemins(&sortie),
+            vec![r"G:\Jazz - Vocal\Ella\01.flac"],
+            "un antislash sépare, et « Jazz - Vocal 2 » n'est pas sous « Jazz - Vocal »"
+        );
+    }
+
+    /// Une ligne sans `file_path` exploitable ne se glisse pas dans une passe
+    /// limitée : la portée retient ce qu'elle a pu situer, rien d'autre.
+    #[test]
+    fn une_ligne_sans_chemin_ne_passe_pas_la_portee() {
+        let rows = vec![
+            vec![SqlValue::Null; COL_FILE_PATH],
+            ligne("/musique/jazz/a.flac"),
+        ];
+        let sortie = restreindre_a_la_portee(rows, Some(&portee("/musique/jazz")));
+        assert_eq!(chemins(&sortie), vec!["/musique/jazz/a.flac"]);
+        assert_eq!(sortie.len(), 1, "la ligne sans chemin est écartée");
+    }
 }
 
 #[cfg(test)]
