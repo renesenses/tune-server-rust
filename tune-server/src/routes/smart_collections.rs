@@ -924,6 +924,93 @@ mod tests {
         assert!(w.contains("playlist_tracks"), "{w}");
     }
 
+    /// #1426 (Jean Valjean, forum « F5 obligatoire ») : « Dans la Smart
+    /// Collection "World Music" [il] n'a pas les bons albums, c'est un peu
+    /// mélangé (Folk, Folk Métal, Folk Rock) ».
+    ///
+    /// Le défaut est dans le PRÉRÉGLAGE, pas dans le moteur : `contient folk`
+    /// compile en `LIKE '%folk%'`, ce qui ramasse « Folk Metal » et « Folk
+    /// Rock » par construction. La migration SQLite 93 (jumelle PG 045) resserre
+    /// `folk` en égalité stricte et laisse `world` / `ethnic` en « contient ».
+    ///
+    /// On rejoue la chaîne ENTIÈRE, parce que c'est le seul niveau où le défaut
+    /// est visible : migrations tune-core → règles LUES EN BASE →
+    /// `build_album_query` (le compilateur qui sert réellement l'écran, et non
+    /// celui de `tune-core/library/smart_collections.rs`) → SQL exécuté sur une
+    /// bibliothèque témoin. Un test qui se contenterait de comparer la chaîne
+    /// de règles ne dirait rien de ce que l'utilisateur voit.
+    #[test]
+    fn le_prereglage_world_music_ne_ramasse_plus_folk_metal_ni_folk_rock() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+
+        // Un album par genre, une piste chacun — le genre vit sur la PISTE
+        // (`t.genre`), c'est la colonne que compile la règle.
+        db.execute_batch(
+            "INSERT INTO albums (id, title) VALUES \
+               (1,'Kanyaleng'),(2,'Ethnic Jazz Session'),(3,'Chants de Bretagne'), \
+               (4,'Tuonela'),(5,'Sweetheart of the Rodeo'),(6,'Kind of Blue'); \
+             INSERT INTO tracks (album_id, title, genre, file_path) VALUES \
+               (1,'a','World','/m/1.flac'), \
+               (2,'b','Ethnic Jazz','/m/2.flac'), \
+               (3,'c','Folk','/m/3.flac'), \
+               (4,'d','Folk Metal','/m/4.flac'), \
+               (5,'e','Folk Rock','/m/5.flac'), \
+               (6,'f','Jazz','/m/6.flac');",
+        )
+        .unwrap();
+
+        // Les règles telles qu'elles SONT EN BASE après migrations — pas une
+        // copie recollée ici, sinon le test ne garde plus le préréglage livré.
+        let rows = db
+            .query_many(
+                "SELECT rules, match_mode FROM smart_collections WHERE name LIKE '%World%'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "le préréglage « World Music » doit exister en un seul exemplaire"
+        );
+        let regles = rows[0][0].as_string().unwrap_or_default();
+        let mode = rows[0][1].as_string().unwrap_or_default();
+
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (where_clause, order, _) =
+            build_album_query(&regles, &mode, "title", "asc", None, &ctx);
+        let sql = format!(
+            "SELECT al.title FROM albums al \
+             LEFT JOIN artists ar ON al.artist_id = ar.id \
+             LEFT JOIN tracks t ON t.album_id = al.id \
+             {where_clause} GROUP BY al.id, al.title {order}"
+        );
+        let titres: Vec<String> = db
+            .query_many(&sql, &[])
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_string().unwrap_or_default())
+            .collect();
+
+        for attendu in ["Kanyaleng", "Ethnic Jazz Session", "Chants de Bretagne"] {
+            assert!(
+                titres.iter().any(|t| t == attendu),
+                "« {attendu} » doit rester dans World Music : {titres:?}\n{sql}"
+            );
+        }
+        for indesirable in ["Tuonela", "Sweetheart of the Rodeo", "Kind of Blue"] {
+            assert!(
+                !titres.iter().any(|t| t == indesirable),
+                "« {indesirable} » n'a rien à faire dans World Music (#1426) : \
+                 {titres:?}\n{sql}"
+            );
+        }
+    }
+
     #[test]
     fn normalize_sort_order_tolerates_encodings() {
         // Raw form (this route's save path).
