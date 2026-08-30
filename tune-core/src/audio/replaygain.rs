@@ -625,6 +625,14 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 // tags, #1382) ; `prevent_clipping` PRÉFÈRE celle-ci quand
                 // elle existe. Peut dépasser 1.0 — c'est l'information.
                 let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
+                // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en
+                // base un gain MESURÉ ici d'un gain lu dans les tags du
+                // fichier : les deux s'écrivent sous `rg_track_gain`, et c'est
+                // voulu (interchangeables à la lecture). Mais le chemin du
+                // signal doit pouvoir dire d'où vient le gain qu'il applique,
+                // et « tags du fichier » affiché sur une mesure Tune serait un
+                // affichage inventé.
+                let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -789,6 +797,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         if let Some(tp) = &true_peak_str {
             let _ = repo.set(*tid, "rg_album_true_peak", tp);
         }
+        // Provenance (#1627) : ce gain d'album n'est dans AUCUN fichier. Il
+        // vient d'être calculé ici, à partir des gains de piste — que ceux-ci
+        // soient eux-mêmes des tags ou des mesures ne change rien : la valeur
+        // d'album, elle, est de Tune.
+        let _ = repo.set(*tid, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS);
     }
     info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
     1
@@ -823,6 +836,98 @@ pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
 /// `peak × factor` ne dépasse pas `10^(plafond/20)`. Avec le true peak
 /// stocké, cela laisse la marge inter-échantillons aux DAC qui la demandent.
 pub const TRUE_PEAK_CEILING_KEY: &str = "replaygain_true_peak_ceiling_db";
+
+/// Témoin de provenance du gain de PISTE (#1627) : posé par la passe d'analyse
+/// à côté de `rg_track_gain`. Absent ⇒ la valeur vient des tags du fichier.
+pub const TRACK_SOURCE_KEY: &str = "rg_track_source";
+/// Idem pour le gain d'ALBUM, posé par `analyze_album_batch`.
+pub const ALBUM_SOURCE_KEY: &str = "rg_album_source";
+/// Seule valeur écrite dans ces deux témoins : la mesure vient de Tune.
+/// « Tags du fichier » ne s'écrit pas — c'est l'ABSENCE de témoin.
+pub const SOURCE_ANALYSIS: &str = "analysis";
+/// Sentinelle « on a essayé d'analyser cette piste » (voir `spawn`).
+const ANALYZED_KEY: &str = "rg_analyzed";
+
+/// D'où vient le gain qui s'applique réellement à une piste (#1627).
+///
+/// Les deux sources s'écrivent sous les MÊMES clés (`rg_track_gain`…) et sont
+/// volontairement interchangeables à la lecture. Cet enum ne change rien à ce
+/// qui est appliqué : il permet seulement de le DIRE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainSource {
+    /// Lu tel quel dans les tags du fichier au scan (rsgain, foobar, …).
+    /// Ceux-ci priment toujours : ils ne sont jamais recalculés (#1382).
+    FileTags,
+    /// Mesuré par la passe EBU R128 de Tune, ou calculé par elle
+    /// (gain d'album dérivé des gains de piste).
+    Analysis,
+}
+
+impl GainSource {
+    /// Valeur stable pour l'API et l'affichage — jamais traduite.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FileTags => "file_tags",
+            Self::Analysis => "analysis",
+        }
+    }
+
+    /// Libellé français court, tel qu'il apparaît dans le chemin du signal.
+    pub fn label_fr(self) -> &'static str {
+        match self {
+            Self::FileTags => "tags du fichier",
+            Self::Analysis => "analyse Tune",
+        }
+    }
+}
+
+/// Les TROIS modes de la demande initiale (#1627), vus comme UN seul choix.
+///
+/// Le serveur n'a jamais eu de réglage à trois valeurs, et n'en gagne pas un
+/// ici : c'est une LECTURE dérivée des deux axes existants
+/// (`replaygain_mode` × `replaygain_analysis_enabled`), sans migration et sans
+/// changement de sémantique. Un enum unique en base coûterait soit la
+/// distinction piste/album, soit cinq valeurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayGainSourceMode {
+    /// « 1- néant » : aucun gain appliqué, et depuis #2496 aucune analyse.
+    Off,
+    /// « 2- fichier » : on applique ce que les fichiers portent, rien d'autre.
+    FileTagsOnly,
+    /// « 3- calcul » : les tags priment, l'analyse ne COMBLE que les manques.
+    /// Jamais d'écrasement — c'est la réponse à #1382.
+    TagsThenAnalysis,
+}
+
+impl ReplayGainSourceMode {
+    /// Valeur stable pour l'API — jamais traduite, jamais persistée.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::FileTagsOnly => "file_tags",
+            Self::TagsThenAnalysis => "tags_then_analysis",
+        }
+    }
+}
+
+/// Lequel des trois modes est ACTIF, dérivé des deux réglages existants.
+///
+/// Rien n'est lu ni écrit d'autre que ce que lisaient déjà
+/// [`ReplayGainSettings::load`] et [`analysis_enabled`] : les deux axes restent
+/// la seule vérité, cette fonction ne fait que les nommer ensemble.
+pub fn active_source_mode(backend: &Arc<dyn DbBackend>) -> ReplayGainSourceMode {
+    let mode = ReplayGainSettings::load(backend).mode;
+    if mode == ReplayGainMode::Off {
+        // `analysis_enabled` rend déjà `false` dans ce cas (#2496) ; on ne
+        // dépend pas de cette coïncidence, on l'énonce.
+        return ReplayGainSourceMode::Off;
+    }
+    if analysis_enabled(backend) {
+        ReplayGainSourceMode::TagsThenAnalysis
+    } else {
+        ReplayGainSourceMode::FileTagsOnly
+    }
+}
 
 /// How the gain is chosen for a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -953,6 +1058,57 @@ pub fn stored_gain_detail(
         _ => pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
             .map(|g| (g, ReplayGainMode::Track)),
     }
+}
+
+/// D'où vient le gain que [`stored_gain_detail`] vient de rendre (#1627).
+///
+/// `granularity` est celle qui a effectivement FOURNI la valeur — la seconde
+/// composante de [`stored_gain_detail`], pas le mode demandé : en mode album
+/// sans tags d'album, c'est la provenance du gain de PISTE qu'il faut nommer.
+///
+/// Rend `None` quand la piste n'a aucun gain à cette granularité : ne rien
+/// afficher vaut mieux qu'affirmer une origine pour une valeur absente.
+pub fn stored_gain_source(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    granularity: ReplayGainMode,
+) -> Option<GainSource> {
+    let meta = TrackMetadataRepo::with_backend(backend.clone())
+        .get_all(track_id)
+        .ok()?;
+    gain_source_from_meta(&meta, granularity)
+}
+
+/// Cœur testable de [`stored_gain_source`], sur une carte déjà lue.
+fn gain_source_from_meta(
+    meta: &std::collections::HashMap<String, String>,
+    granularity: ReplayGainMode,
+) -> Option<GainSource> {
+    let (gain_key, source_key) = match granularity {
+        ReplayGainMode::Album => ("rg_album_gain", ALBUM_SOURCE_KEY),
+        // `Off` n'atteint pas ce point via `stored_gain_detail`, qui rend
+        // `None` avant. Le traiter comme `Track` évite un cas mort.
+        _ => ("rg_track_gain", TRACK_SOURCE_KEY),
+    };
+    meta.get(gain_key)?;
+    if meta
+        .get(source_key)
+        .is_some_and(|v| v.trim() == SOURCE_ANALYSIS)
+    {
+        return Some(GainSource::Analysis);
+    }
+    // Repli pour les bibliothèques analysées AVANT que ce témoin existe — la
+    // quasi-totalité du parc installé. La passe n'analyse QUE les pistes
+    // dépourvues de `rg_track_gain` (double `NOT EXISTS` du balayage) : un
+    // gain présent sur une piste estampillée `rg_analyzed` a donc été mesuré
+    // ici. Le seul cas où ce repli se trompe est celui d'un fichier analysé,
+    // puis retagué et rescané depuis (et, en granularité album, celui d'un
+    // fichier portant des tags d'album sans tags de piste) — le témoin
+    // explicite ci-dessus tranche pour tout ce qui sera analysé désormais.
+    if meta.contains_key(ANALYZED_KEY) {
+        return Some(GainSource::Analysis);
+    }
+    Some(GainSource::FileTags)
 }
 
 /// The linear factor to multiply samples by: `1.0` means "leave the audio
@@ -1651,6 +1807,120 @@ mod tests {
         assert_eq!(g.peak, Some(1.10));
     }
 
+    // ---- #1627 : les trois modes, et d'où vient le gain ---------------------
+
+    /// Les TROIS modes de la demande, lus sur les deux réglages existants.
+    ///
+    /// Aucune valeur nouvelle n'est persistée : le test écrit `replaygain_mode`
+    /// et `replaygain_analysis_enabled`, rien d'autre. Si un jour quelqu'un
+    /// introduit un troisième réglage, ce test le dira.
+    #[test]
+    fn les_trois_modes_se_lisent_sur_les_deux_reglages_existants() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+
+        // 1- néant : c'est le défaut, sans qu'aucune clé n'ait été écrite.
+        assert_eq!(active_source_mode(&backend), ReplayGainSourceMode::Off);
+
+        // 3- calcul : mode armé, analyse au défaut (activée).
+        settings.set(MODE_KEY, "track").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // 2- fichier : mode armé, analyse explicitement coupée.
+        settings.set(ANALYSIS_ENABLED_KEY, "false").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+
+        // La granularité album ne change pas de MODE : c'est l'autre axe.
+        settings.set(MODE_KEY, "album").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+        settings.set(ANALYSIS_ENABLED_KEY, "true").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // Retour à « Désactivé » : la coche seule ne rouvre rien (#2496).
+        settings.set(MODE_KEY, "off").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::Off,
+            "mode off ⇒ néant, quelle que soit la coche d'analyse"
+        );
+
+        // Valeurs stables de l'API : elles voyagent dans GET /config.
+        assert_eq!(ReplayGainSourceMode::Off.as_str(), "off");
+        assert_eq!(ReplayGainSourceMode::FileTagsOnly.as_str(), "file_tags");
+        assert_eq!(
+            ReplayGainSourceMode::TagsThenAnalysis.as_str(),
+            "tags_then_analysis"
+        );
+    }
+
+    /// La provenance du gain, sur les trois configurations qui existent en base.
+    #[test]
+    fn la_provenance_distingue_un_tag_de_fichier_d_une_mesure_tune() {
+        let (_db, backend) = sweep_db(3);
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Piste 1 — tags du fichier seuls (le cas rsgain de #1382).
+        meta.set(1, "rg_track_gain", "-4.20 dB").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 1, ReplayGainMode::Track),
+            Some(GainSource::FileTags)
+        );
+
+        // Piste 2 — mesurée ici, témoin explicite.
+        meta.set(2, "rg_track_gain", "-6.50 dB").unwrap();
+        meta.set(2, TRACK_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Track),
+            Some(GainSource::Analysis)
+        );
+
+        // Piste 3 — bibliothèque analysée AVANT que le témoin existe : le
+        // repli sur `rg_analyzed` tranche, parce que le balayage n'analyse que
+        // les pistes dépourvues de `rg_track_gain`.
+        meta.set(3, "rg_track_gain", "-2.00 dB").unwrap();
+        meta.set(3, ANALYZED_KEY, "1700000000").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 3, ReplayGainMode::Track),
+            Some(GainSource::Analysis)
+        );
+
+        // Aucun gain à cette granularité ⇒ rien à dire, surtout pas une
+        // origine inventée. La piste 1 n'a pas de gain d'album.
+        assert_eq!(stored_gain_source(&backend, 1, ReplayGainMode::Album), None);
+
+        // Un gain d'album lu dans le fichier reste « tags du fichier », même
+        // sur une piste dont le gain de PISTE, lui, a été mesuré ici : les deux
+        // granularités ont leur propre témoin et ne décident pas l'une pour
+        // l'autre.
+        meta.set(2, "rg_album_gain", "-3.00 dB").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Album),
+            Some(GainSource::FileTags),
+            "le témoin de piste ne doit pas décider de l'origine du gain d'album"
+        );
+        meta.set(2, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Album),
+            Some(GainSource::Analysis)
+        );
+
+        // Valeurs stables de l'API.
+        assert_eq!(GainSource::FileTags.as_str(), "file_tags");
+        assert_eq!(GainSource::Analysis.as_str(), "analysis");
+    }
+
     #[test]
     fn clipping_prevention_never_boosts_a_quiet_track() {
         // A track peaking at 0.2 with a -3 dB tag must still be attenuated:
@@ -2232,6 +2502,58 @@ mod tests {
         assert!(
             !temoins.contains_key("rg_track_gain"),
             "aucun gain ne peut sortir d'une analyse abandonnée ; témoins = {temoins:?}"
+        );
+    }
+
+    /// #1627 — une analyse RÉELLE laisse derrière elle de quoi dire qu'elle a
+    /// eu lieu.
+    ///
+    /// Le test ne pose aucun témoin lui-même : il fait décoder un vrai fichier
+    /// par `analyze_track_batch`, puis relit la base par l'API publique
+    /// [`stored_gain_source`]. Sans le `repo.set(TRACK_SOURCE_KEY, …)` de la
+    /// passe, le gain mesuré serait indiscernable d'un tag rsgain et le chemin
+    /// du signal afficherait « tags du fichier » sur une mesure Tune.
+    #[tokio::test]
+    async fn une_analyse_reelle_laisse_le_temoin_de_provenance() {
+        let (tmp, _db, backend) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let wav = tmp.path().join("i1627.wav");
+        ecrire_wav_long(&wav, 2);
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = ?, duration_ms = 2000, sample_rate = 96000 \
+                 WHERE id = 1",
+                &[&wav.to_string_lossy().to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "le fichier devait être analysé pour de bon"
+        );
+
+        let temoins = TrackMetadataRepo::with_backend(backend.clone())
+            .get_all(1)
+            .unwrap();
+        assert!(
+            temoins.contains_key("rg_track_gain"),
+            "sans gain mesuré, le test ne prouverait rien ; témoins = {temoins:?}"
+        );
+        // Le témoin EXPLICITE, et pas seulement la relecture : `rg_analyzed`
+        // suffirait à faire passer l'assertion suivante par le repli, et le
+        // test ne dirait alors plus rien de la ligne qu'il est censé garder.
+        assert_eq!(
+            temoins.get(TRACK_SOURCE_KEY).map(String::as_str),
+            Some(SOURCE_ANALYSIS),
+            "la passe doit estampiller la provenance ; témoins = {temoins:?}"
+        );
+        assert_eq!(
+            stored_gain_source(&backend, 1, ReplayGainMode::Track),
+            Some(GainSource::Analysis),
+            "un gain mesuré ici doit se relire comme mesuré ici ; témoins = {temoins:?}"
         );
     }
 

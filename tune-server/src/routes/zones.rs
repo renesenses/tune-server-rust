@@ -939,16 +939,22 @@ fn zone_eq_step_description(
 /// Ensuite le facteur EFFECTIF (tags + pré-ampli + anti-écrêtage) : un mode
 /// « track » sans tag stocké ne change rien au signal et n'affiche donc rien.
 ///
-/// Retourne la description de l'étape (« ReplayGain (track, -4.2 dB) ») quand
-/// le gain s'applique, `None` sinon. La granularité affichée est celle qui a
-/// FOURNI la valeur : en mode album sans tags d'album, c'est le gain de piste
-/// qui joue, et c'est lui qu'on nomme.
+/// Retourne la description de l'étape (« ReplayGain (track, -4.2 dB, tags du
+/// fichier) ») quand le gain s'applique, `None` sinon. La granularité affichée
+/// est celle qui a FOURNI la valeur : en mode album sans tags d'album, c'est le
+/// gain de piste qui joue, et c'est lui qu'on nomme.
+///
+/// La PROVENANCE est le reste de #1627 : le panneau disait ce qui s'applique et
+/// de combien, jamais d'où ça vient. « Tune utilise-t-il mes tags rsgain ? »
+/// (#1382) se répondait alors partout sauf à l'endroit où la question se pose.
 fn zone_replaygain_step(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
     track_id: Option<i64>,
-) -> Option<String> {
-    use tune_core::audio::replaygain::{ReplayGainSettings, gain_factor, stored_gain_detail};
+) -> Option<ReplayGainStep> {
+    use tune_core::audio::replaygain::{
+        GainSource, ReplayGainSettings, gain_factor, stored_gain_detail, stored_gain_source,
+    };
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
@@ -968,7 +974,34 @@ fn zone_replaygain_step(
         tune_core::audio::replaygain::ReplayGainMode::Album => "album",
         _ => "track",
     };
-    Some(format!("ReplayGain ({label}, {applied_db:+.1} dB)"))
+    // La provenance porte sur la granularité qui a fourni la valeur, pas sur
+    // le mode demandé. Une base illisible ne doit rien inventer : on retombe
+    // sur la description d'avant, sans mention d'origine.
+    let origin = stored_gain_source(backend, tid, source);
+    let description = match origin {
+        Some(src) => format!(
+            "ReplayGain ({label}, {applied_db:+.1} dB, {})",
+            src.label_fr()
+        ),
+        None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+    };
+    Some(ReplayGainStep {
+        description,
+        granularity: label,
+        source: origin.map(GainSource::as_str),
+    })
+}
+
+/// L'étape ReplayGain du chemin du signal, description ET faits bruts.
+///
+/// Les deux champs structurés sont ADDITIFS : le client qui ne lit que
+/// `description` continue de fonctionner à l'identique.
+struct ReplayGainStep {
+    description: String,
+    /// `"track"` ou `"album"` — celle qui a fourni la valeur.
+    granularity: &'static str,
+    /// `"file_tags"` ou `"analysis"`, absent si la base n'a pas répondu.
+    source: Option<&'static str>,
 }
 
 /// La zone replie-t-elle sa sortie LOCALE en mono — et si oui, que dire ?
@@ -1564,11 +1597,16 @@ fn build_signal_path(
     // (le gain est appliqué avant l'égaliseur, orchestrator.rs). Jamais en
     // PURE, jamais en mode off, jamais sans gain stocké : l'étape n'existe
     // que quand un facteur ≠ 1 multiplie réellement les échantillons.
-    if let Some(desc) = &replaygain_step {
+    if let Some(rg) = &replaygain_step {
         steps.push(json!({
             "name": "ReplayGain",
-            "description": desc,
+            "description": rg.description,
             "bit_perfect": false,
+            // Additifs (#1627) : la description reste le libellé prêt à
+            // afficher, ces deux champs permettent au client de composer le
+            // sien (icône, traduction) sans analyser une chaîne française.
+            "granularity": rg.granularity,
+            "gain_source": rg.source,
         }));
     }
 
@@ -4612,7 +4650,7 @@ mod signal_path_tests {
 
         assert_eq!(
             step_desc(&sp, "ReplayGain").as_deref(),
-            Some("ReplayGain (track, -4.2 dB)")
+            Some("ReplayGain (track, -4.2 dB, tags du fichier)")
         );
         assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
         // Le RG ne rend pas la SOURCE lossy : le badge qualité reste vert.
@@ -4872,7 +4910,113 @@ mod signal_path_tests {
 
         assert_eq!(
             step_desc(&sp, "ReplayGain").as_deref(),
-            Some("ReplayGain (track, -4.2 dB)")
+            Some("ReplayGain (track, -4.2 dB, tags du fichier)")
+        );
+    }
+
+    // ---- #1627 : d'où vient le gain -----------------------------------------
+
+    /// L'étape ReplayGain complète, faits structurés compris.
+    fn rg_step(sp: &serde_json::Value) -> serde_json::Value {
+        sp.get("steps")
+            .and_then(|s| s.as_array())
+            .and_then(|steps| {
+                steps
+                    .iter()
+                    .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("ReplayGain"))
+            })
+            .cloned()
+            .expect("étape ReplayGain absente")
+    }
+
+    fn signal_path_mode_track(
+        backend: &Arc<dyn DbBackend>,
+        zone: &Zone,
+        ps: &ZoneState,
+    ) -> serde_json::Value {
+        SettingsRepo::with_backend(backend.clone())
+            .set(tune_core::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        build_signal_path(
+            ps,
+            zone,
+            backend,
+            Some("Node"),
+            "none",
+            Some(&wire("flac", 96_000, 24)),
+        )
+        .unwrap()
+    }
+
+    // Un gain qui vient des tags du fichier (rsgain, foobar…) est nommé comme
+    // tel : c'est la réponse à « Tune utilise-t-il mes tags ? » (#1382), rendue
+    // à l'endroit où la question se pose.
+    #[test]
+    fn replaygain_gain_venu_des_tags_est_nomme_tags_du_fichier() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+
+        let step = rg_step(&signal_path_mode_track(&backend, &zone, &ps));
+
+        assert_eq!(
+            step.get("description").and_then(|d| d.as_str()),
+            Some("ReplayGain (track, -4.2 dB, tags du fichier)")
+        );
+        assert_eq!(
+            step.get("gain_source").and_then(|s| s.as_str()),
+            Some("file_tags")
+        );
+        assert_eq!(
+            step.get("granularity").and_then(|s| s.as_str()),
+            Some("track")
+        );
+    }
+
+    // Le même gain, mais MESURÉ par la passe EBU R128 : le témoin de
+    // provenance écrit à côté de `rg_track_gain` fait basculer le libellé.
+    // Sans lui les deux cas étaient indiscernables en base — et l'affichage
+    // aurait dû inventer.
+    #[test]
+    fn replaygain_gain_mesure_par_tune_est_nomme_analyse() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+            .set(
+                tid,
+                tune_core::audio::replaygain::TRACK_SOURCE_KEY,
+                tune_core::audio::replaygain::SOURCE_ANALYSIS,
+            )
+            .unwrap();
+
+        let step = rg_step(&signal_path_mode_track(&backend, &zone, &ps));
+
+        assert_eq!(
+            step.get("description").and_then(|d| d.as_str()),
+            Some("ReplayGain (track, -4.2 dB, analyse Tune)")
+        );
+        assert_eq!(
+            step.get("gain_source").and_then(|s| s.as_str()),
+            Some("analysis")
+        );
+    }
+
+    // Bibliothèque analysée AVANT que le témoin existe (le parc installé) :
+    // `rg_analyzed` seul suffit à trancher, parce que le balayage n'analyse
+    // QUE les pistes dépourvues de `rg_track_gain`. Sans ce repli, tout le
+    // parc verrait « tags du fichier » sur des mesures Tune.
+    #[test]
+    fn replaygain_base_ancienne_retombe_sur_rg_analyzed() {
+        let (backend, zone) = dlna_zone_migrated();
+        let (tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+            .set(tid, "rg_analyzed", "1700000000")
+            .unwrap();
+
+        let step = rg_step(&signal_path_mode_track(&backend, &zone, &ps));
+
+        assert_eq!(
+            step.get("gain_source").and_then(|s| s.as_str()),
+            Some("analysis")
         );
     }
 }
