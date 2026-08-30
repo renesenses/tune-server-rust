@@ -28,33 +28,73 @@ flowchart LR
 
 ### Vue Git — plan de métro
 
-Ce graphe superpose le trajet commun des quatre dépôts. La branche
-`batch/*` est facultative : sans lot, la PR de correctif rejoint directement
-la RC.
+Ce graphe superpose le trajet commun des quatre dépôts sur trois trains. Les
+libellés courts gardent les lignes lisibles : `clients` désigne web, Universal
+et OS. La branche `batch/*` est facultative, comme le montre le train `.129`.
 
 ```mermaid
+%%{init: { "gitGraph": { "mainBranchName": "main", "showCommitLabel": true, "rotateCommitLabel": false } } }%%
 gitGraph LR:
-    commit id: "main de départ"
-    branch rc-vX-Y-Z
-    checkout rc-vX-Y-Z
-    branch batch-lot
-    checkout batch-lot
-    branch fix-1234
-    checkout fix-1234
-    commit id: "correctif + tests ciblés"
-    checkout batch-lot
-    merge fix-1234 id: "PR unitaire"
-    checkout rc-vX-Y-Z
-    merge batch-lot id: "lot intégré"
-    commit id: "RC figée" tag: "tags web · Universal · OS"
+    commit id: "base"
+
+    branch rc-128
+    checkout rc-128
+    branch batch-128
+    checkout batch-128
+    branch fix-128-a
+    checkout fix-128-a
+    commit id: "A"
+    checkout batch-128
+    merge fix-128-a id: "PR-A"
+    branch fix-128-b
+    checkout fix-128-b
+    commit id: "B"
+    checkout batch-128
+    merge fix-128-b id: "PR-B"
+    checkout rc-128
+    merge batch-128 id: "lot128"
+    commit id: "gel128" tag: "clients .128"
     checkout main
-    merge rc-vX-Y-Z id: "promotion RC vers main" tag: "tag serveur"
+    merge rc-128 id: "main128" tag: "serveur .128"
+
+    branch rc-129
+    checkout rc-129
+    branch fix-129-a
+    checkout fix-129-a
+    commit id: "C"
+    checkout rc-129
+    merge fix-129-a id: "PR-C"
+    commit id: "gel129" tag: "clients .129"
+    checkout main
+    merge rc-129 id: "main129" tag: "serveur .129"
+
+    branch rc-130
+    checkout rc-130
+    branch batch-130
+    checkout batch-130
+    branch fix-130-a
+    checkout fix-130-a
+    commit id: "D"
+    checkout batch-130
+    merge fix-130-a id: "PR-D"
+    branch fix-130-b
+    checkout fix-130-b
+    commit id: "E"
+    checkout batch-130
+    merge fix-130-b id: "PR-E"
+    checkout rc-130
+    merge batch-130 id: "lot130"
+    commit id: "gel130" tag: "clients .130"
+    checkout main
+    merge rc-130 id: "main130" tag: "serveur .130"
 ```
 
 Les tags sont créés après la promotion : le dessin indique leur **cible Git**,
 pas leur instant de création. Web, Universal et OS taguent la tête figée de
 leur RC, désormais ancêtre de `main`; le serveur tague le commit de fusion sur
-`main`. `release/v0.9` ne rejoint plus cette ligne.
+`main`. `PR-A` à `PR-E` sont les merges des correctifs ; `lot128` et `lot130`
+sont les merges des branches `batch/*` ; `gel128` à `gel130` portent versions,
+manifeste et preuve complète. `release/v0.9` ne rejoint plus cette ligne.
 
 Les quatre composants sont `server`, `web`, `os` et `universal`. Le serveur
 porte le manifeste `.release/vX.Y.Z.json` et orchestre les tags ainsi que la
