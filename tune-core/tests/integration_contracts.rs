@@ -17,3 +17,7 @@ mod no_blind_ffmpeg;
 mod oaat_negociation;
 #[path = "poller_bascule.rs"]
 mod poller_bascule;
+// Refuse tout fichier de tests/ que ni le manifeste ni cet agrégateur n'atteint
+// — sans quoi le prochain harnais posé ici serait vert sans jamais tourner.
+#[path = "tests_orphelins.rs"]
+mod tests_orphelins;
