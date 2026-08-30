@@ -31,6 +31,8 @@ pub mod smb;
 mod sqlite_write_gate;
 pub mod startup;
 pub mod state;
+#[cfg(target_os = "linux")]
+mod tune_os_password;
 pub mod windows_migrate;
 
 /// The whole server startup, so out-of-tree binaries can compose it with their

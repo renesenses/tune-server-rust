@@ -1920,6 +1920,19 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        let system_default_device_id = crate::startup::first_system_default_name(
+            new_devices_to_zone
+                .iter()
+                .map(|(device_id, _, is_default)| (device_id.as_str(), *is_default)),
+        )
+        .map(str::to_owned);
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
             // When ASIO is configured, don't create new zones for WASAPI
@@ -1936,44 +1949,33 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 dev_name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Ce chemin etait le SEUL des cinq a ne pas consulter le reglage :
-            // `startup.rs`, et les trois chemins de decouverte de
-            // `discovery_setup.rs` (SSDP, mDNS, fournisseur) le lisent tous.
-            // #1577 n'avait couvert que le demarrage.
-            //
-            // Le defaut se voit surtout au basculement ASIO -> WASAPI (#1770,
-            // DEvir). Tant qu'ASIO est configure, le `continue` ci-dessus
-            // suspend la creation : les endpoints WASAPI sont enregistres dans
-            // l'`OutputRegistry` mais n'obtiennent AUCUNE ligne en base. Au
-            // premier tick apres la bascule, la retenue saute d'un coup et
-            // chaque endpoint reclame sa zone. Supprimer toutes les zones juste
-            // avant ne protege de rien : `delete_all` masque des lignes, or il
-            // n'y en avait aucune a masquer. L'utilisateur cree UNE zone et en
-            // voit apparaitre une par peripherique dans les deux minutes.
-            //
-            // On ne bloque que la CREATION : une zone deja existante est
-            // renvoyee telle quelle par `get_or_create`, donc la reconnexion
-            // d'un peripherique connu reste intacte, reglage decoche ou non.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
+            // système. Les autres sorties restent enregistrées pour que
+            // l'interface puisse les proposer à la création manuelle. Une zone
+            // déjà connue est reconnectée normalement.
+            let zone_exists = zone_repo
+                .get_by_device_id(device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action =
+                crate::startup::local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == crate::startup::LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_hotplug_zone_auto_create_disabled_skipping"
+                    "local_audio_hotplug_zone_manual_creation_required"
+                );
+                state.event_bus.emit(
+                    "device.discovered",
+                    serde_json::json!({
+                        "id": device_id,
+                        "name": dev_name,
+                        "type": "local",
+                        "hotplug": true,
+                        "zone_creation": "manual",
+                    }),
                 );
                 continue;
             }
