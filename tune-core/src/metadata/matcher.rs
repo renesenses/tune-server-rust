@@ -313,7 +313,7 @@ pub async fn batch_match_artist_mbids(
             matched += 1;
             tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
         }
-        if (i + 1) % 5 == 0 || i + 1 == total {
+        if crate::library::artwork::doit_publier_avancement(i + 1, total) {
             write_progress(i + 1, matched);
         }
     }
