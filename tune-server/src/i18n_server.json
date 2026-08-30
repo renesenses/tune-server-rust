@@ -923,6 +923,66 @@
     "ro": "Creează o aplicație și copiază token-ul.",
     "sv": "Skapa ett program och kopiera token."
   },
+  "svctok.radiofrance.purpose": {
+    "fr": "Podcasts et émissions de Radio France.",
+    "en": "Radio France podcasts and shows.",
+    "de": "Podcasts und Sendungen von Radio France.",
+    "es": "Pódcasts y programas de Radio France.",
+    "it": "Podcast e programmi di Radio France.",
+    "zh": "Radio France 播客与节目。",
+    "ja": "Radio France のポッドキャストと番組。",
+    "ko": "Radio France 팟캐스트와 프로그램.",
+    "ro": "Podcasturi și emisiuni Radio France.",
+    "sv": "Poddar och program från Radio France."
+  },
+  "svctok.radiofrance.pricing": {
+    "fr": "API gratuite.",
+    "en": "Free API.",
+    "de": "Kostenlose API.",
+    "es": "API gratuita.",
+    "it": "API gratuita.",
+    "zh": "免费 API。",
+    "ja": "無料 API。",
+    "ko": "무료 API.",
+    "ro": "API gratuit.",
+    "sv": "Gratis API."
+  },
+  "svctok.radiofrance.step1": {
+    "fr": "Crée un compte sur developers.radiofrance.fr.",
+    "en": "Create an account at developers.radiofrance.fr.",
+    "de": "Erstelle ein Konto auf developers.radiofrance.fr.",
+    "es": "Crea una cuenta en developers.radiofrance.fr.",
+    "it": "Crea un account su developers.radiofrance.fr.",
+    "zh": "在 developers.radiofrance.fr 创建账户。",
+    "ja": "developers.radiofrance.fr でアカウントを作成します。",
+    "ko": "developers.radiofrance.fr에서 계정을 만드세요.",
+    "ro": "Creează un cont pe developers.radiofrance.fr.",
+    "sv": "Skapa ett konto på developers.radiofrance.fr."
+  },
+  "svctok.radiofrance.step2": {
+    "fr": "Demande l'accès à l'API Open Radio France.",
+    "en": "Request access to the Open Radio France API.",
+    "de": "Beantrage Zugang zur Open-Radio-France-API.",
+    "es": "Solicita acceso a la API Open Radio France.",
+    "it": "Richiedi l'accesso all'API Open Radio France.",
+    "zh": "申请 Open Radio France API 的访问权限。",
+    "ja": "Open Radio France API へのアクセスを申請します。",
+    "ko": "Open Radio France API 접근 권한을 신청하세요.",
+    "ro": "Solicită acces la API-ul Open Radio France.",
+    "sv": "Begär åtkomst till Open Radio France-API:et."
+  },
+  "svctok.radiofrance.step3": {
+    "fr": "Copie la clé API et colle-la ici.",
+    "en": "Copy the API key and paste it here.",
+    "de": "Kopiere den API-Schlüssel und füge ihn hier ein.",
+    "es": "Copia la clave API y pégala aquí.",
+    "it": "Copia la chiave API e incollala qui.",
+    "zh": "复制 API 密钥并粘贴到这里。",
+    "ja": "API キーをコピーしてここに貼り付けます。",
+    "ko": "API 키를 복사해 여기에 붙여 넣으세요.",
+    "ro": "Copiază cheia API și lipește-o aici.",
+    "sv": "Kopiera API-nyckeln och klistra in den här."
+  },
   "svctok.tidal.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
     "en": "Hi-res streaming + years + covers.",
@@ -1150,6 +1210,18 @@
     "ko": "Genius token이 설정되지 않았습니다.",
     "ro": "Token Genius neconfigurat.",
     "sv": "Genius-token är inte konfigurerad."
+  },
+  "svctok.err.radiofranceNotConfigured": {
+    "fr": "Clé API Radio France non configurée.",
+    "en": "Radio France API key not configured.",
+    "de": "Radio-France-API-Schlüssel nicht konfiguriert.",
+    "es": "Clave API de Radio France no configurada.",
+    "it": "Chiave API Radio France non configurata.",
+    "zh": "Radio France API 密钥未配置。",
+    "ja": "Radio France の API キーが設定されていません。",
+    "ko": "Radio France API 키가 설정되지 않았습니다.",
+    "ro": "Cheia API Radio France neconfigurată.",
+    "sv": "Radio France-API-nyckeln är inte konfigurerad."
   },
   "ai.nextTrack": {
     "fr": "Piste suivante : {title}",
