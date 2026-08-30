@@ -166,7 +166,7 @@ mod tests {
     /// Un dossier temporaire à soi, sans dépendance : deux tests qui
     /// partageraient un chemin se voleraient leur `.1`.
     fn dossier(nom: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tune-journal-{nom}-{}", std::process::id()));
+        let d = tune_core::test_scratch::scratch_dir(&format!("tune-journal-{nom}"));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

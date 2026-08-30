@@ -2680,7 +2680,7 @@ mod tests {
         // exercises the backfill wiring end to end (list_without_cover →
         // get_or_extract → force_update_cover_path); DSF ID3v2 extraction
         // itself is covered by the metadata parser path.
-        let base = std::env::temp_dir().join(format!("tune_backfill_{}", std::process::id()));
+        let base = crate::test_scratch::scratch_dir("tune_backfill");
         let music = base.join("album");
         std::fs::create_dir_all(&music).unwrap();
         std::fs::write(music.join("cover.jpg"), b"\xff\xd8\xff\xe0dummyjpegdata").unwrap();

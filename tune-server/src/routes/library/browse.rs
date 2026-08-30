@@ -438,7 +438,7 @@ mod browse_path_tests {
     /// que le client renvoie la forme composée ou décomposée.
     #[test]
     fn an_accented_directory_resolves_from_either_normalization_form() {
-        let tmp = std::env::temp_dir().join(format!("tune-browse-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-browse");
         let nfd_name: String = "CDThèque Yves".nfd().collect();
         let dir = tmp.join(&nfd_name);
         std::fs::create_dir_all(&dir).expect("création du dossier de test");

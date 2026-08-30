@@ -1165,7 +1165,10 @@ mod settle_tests {
         // there, which would (correctly) exclude the fixtures and mask the logic
         // under test. A unique dir relative to the test cwd (the crate root) is
         // resolved by fs::metadata but never matches starts_with(temp_dir()).
-        let dir = std::path::PathBuf::from(format!(".settle_test_{}", std::process::id()));
+        let dir = std::path::PathBuf::from(format!(
+            ".{}",
+            tune_core::test_scratch::scratch_name("settle_test")
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let stable = dir.join("stable.flac");

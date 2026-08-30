@@ -186,9 +186,8 @@ async fn un_lien_vers_un_arbre_systeme_est_refuse_par_la_route() {
     // `/tmp` et non `std::env::temp_dir()` : sous macOS ce dernier vit sous
     // `/private/var`, donc déjà hors périmètre — le refus attendu tomberait
     // pour la mauvaise raison et ne prouverait plus rien du lien.
-    let base = std::path::PathBuf::from("/tmp").join(format!(
-        "tune-explorateur-route-{}-i1275",
-        std::process::id()
+    let base = std::path::PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
+        "tune-explorateur-route-i1275",
     ));
     std::fs::remove_dir_all(&base).ok();
     std::fs::create_dir_all(&base).expect("dossier de test");

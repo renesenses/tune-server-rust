@@ -303,7 +303,7 @@ mod tests {
         let pcm = sine_48k_stereo(seconds);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-test-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-opus-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("roundtrip.opus");
         std::fs::write(&path, &bytes).unwrap();
@@ -374,7 +374,7 @@ mod tests {
         let pcm = two_tone_48k_stereo(1.0, 440.0, 880.0, AMP);
         let bytes = encode_ogg_opus(&pcm, 2, 128, 48000).expect("encode");
 
-        let dir = std::env::temp_dir().join(format!("tune-opus-tones-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-opus-tones");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("two-tone.opus");
         std::fs::write(&path, &bytes).unwrap();

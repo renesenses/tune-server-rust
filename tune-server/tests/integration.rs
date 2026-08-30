@@ -1574,7 +1574,7 @@ async fn lyrics_track_without_any_source_is_404_no_lyrics() {
 
 #[tokio::test]
 async fn lyrics_sidecar_lrc_is_synced() {
-    let dir = std::env::temp_dir().join(format!("tune_lyrics_it_{}", std::process::id()));
+    let dir = tune_core::test_scratch::scratch_dir("tune_lyrics_it");
     std::fs::create_dir_all(&dir).unwrap();
     let audio = dir.join("Ma Chanson.flac");
     // Multi-timestamps on one line + metadata tags to ignore.

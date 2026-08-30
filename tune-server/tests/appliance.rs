@@ -48,7 +48,7 @@ async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, 
 
 fn write_nmcli_stub() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("tune-appliance-test-{}", std::process::id()));
+    let dir = tune_core::test_scratch::scratch_dir("tune-appliance-test");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("nmcli-stub.sh");
     let script = r#"#!/bin/bash

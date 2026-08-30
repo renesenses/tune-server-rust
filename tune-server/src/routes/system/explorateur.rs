@@ -370,9 +370,8 @@ mod tests {
         // sous `/private/var`, donc DÉJÀ hors périmètre, et le test passerait
         // pour la mauvaise raison. `/tmp` (`/private/tmp` après résolution)
         // est dans le périmètre sur les deux systèmes.
-        let base = std::path::PathBuf::from("/tmp").join(format!(
-            "tune-explorateur-lien-{}-i1275",
-            std::process::id()
+        let base = std::path::PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
+            "tune-explorateur-lien-i1275",
         ));
         std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).expect("dossier de test");

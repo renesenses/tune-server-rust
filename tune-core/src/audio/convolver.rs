@@ -1090,7 +1090,7 @@ mod tests {
     /// fichiers mono, jamais un stereo (Daniel, 24/08/2026).
     #[test]
     fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("gauche.wav");
         let d = dir.join("droite.wav");
@@ -1130,7 +1130,7 @@ mod tests {
     /// convoluer a deux cadences decalerait un canal par rapport a l'autre.
     #[test]
     fn deux_cadences_differentes_sont_refusees() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-sr-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir-sr");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
@@ -1157,7 +1157,7 @@ mod tests {
     /// impulsions de signes opposes doivent ressortir de signes opposes.
     #[test]
     fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-conv-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir-conv");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
