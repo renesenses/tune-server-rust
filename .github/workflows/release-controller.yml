@@ -144,7 +144,16 @@ jobs:
 
       - name: Creer les quatre tags
         env:
-          GH_TOKEN: ${{ inputs.dry_run && github.token || secrets.RELEASE_CONTROLLER_TOKEN }}
+          # Meme jeton en dry-run et en tir reel. Avec `github.token`, la
+          # lecture d'un tag existant sur `tune-os` ou
+          # `tune-server-universal` rend 404 faute de droits — et
+          # `cible_tag()` traite un echec comme « aucun tag n'existe ».
+          # Un tag DIVERGENT sur un depot prive serait donc invisible, en
+          # silence, exactement dans l'etape censee le detecter.
+          # C'est l'environnement qui separe les pouvoirs, pas le workflow :
+          # `release-dry-run` porte un jeton en lecture seule,
+          # `release` un jeton en ecriture, sous approbation.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
