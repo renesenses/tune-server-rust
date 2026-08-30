@@ -446,6 +446,21 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     out
 }
 
+/// Nombre d'ids inlinés par requête `WHERE t.id IN (…)`.
+///
+/// Les ids sont des `i64` issus de nos propres requêtes : les inliner ne
+/// consomme **aucun** paramètre lié, donc aucune requête ne peut atteindre la
+/// limite de paramètres d'un moteur — SQLite `SQLITE_MAX_VARIABLE_NUMBER`
+/// (999 avant 3.32, 32766 depuis) ni PostgreSQL (65535 paramètres par message
+/// Bind, le champ de comptage étant un entier 16 bits non signé).
+///
+/// Reste la limite de *longueur* d'instruction de SQLite (`SQLITE_MAX_SQL_LENGTH`,
+/// 1 Mo par défaut) : d'où le découpage. 5000 ids × 20 caractères ≈ 100 Ko au
+/// pire, soit un ordre de grandeur de marge. Même valeur que la matérialisation
+/// de page d'`AlbumRepo::list_filtered` (#1269), pour ne pas multiplier les
+/// constantes de découpage dans le dépôt.
+pub(crate) const ID_INLINE_BATCH: usize = 5_000;
+
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1259,32 +1274,53 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Hydrate tracks for `ids`, **in the caller's order**, duplicates kept.
+    ///
+    /// Deux défauts corrigés (#2797) :
+    ///
+    /// 1. **Quadratique.** La réindexation faisait un
+    ///    `tracks.iter().find(...)` par id demandé : O(n²) comparaisons sur
+    ///    une grosse playlist. Elle passe par une `HashMap<i64, Track>`,
+    ///    donc une seule passe, O(n).
+    /// 2. **Limite de paramètres SQL.** Un placeholder par id faisait
+    ///    échouer la requête au-delà de la limite du moteur — SQLite
+    ///    `SQLITE_MAX_VARIABLE_NUMBER` (999 avant 3.32, 32766 depuis),
+    ///    PostgreSQL 65535 paramètres par message Bind — et les routes
+    ///    playlists rendaient alors une liste vide. Les ids sont des `i64`
+    ///    issus de nos propres requêtes : ils sont **inlinés** (zéro
+    ///    paramètre lié, même rationale que `list_by_ids`), ce qui met la
+    ///    requête hors d'atteinte des deux limites, et découpés en lots pour
+    ///    rester sous la limite de *longueur* d'instruction de SQLite (1 Mo
+    ///    par défaut) : `ID_INLINE_BATCH` ids × 20 caractères au pire.
+    ///
+    /// Contrat inchangé : ordre du tableau d'entrée, doublons reproduits,
+    /// ids absents simplement omis.
     pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let make_ph = |i: usize| match self.db.engine() {
-            Engine::Sqlite => SqliteDialect.placeholder(i),
-            Engine::Postgres => PostgresDialect.placeholder(i),
-        };
-        let placeholders: Vec<String> = (1..=ids.len()).map(make_ph).collect();
-        let sql = format!(
-            "{} WHERE t.id IN ({})",
-            sql::select_track(),
-            placeholders.join(",")
-        );
-        let owned: Vec<SqlValue> = ids.iter().map(|id| SqlValue::Int(*id)).collect();
-        let refs: Vec<&dyn ToSqlValue> = owned.iter().map(|v| v as &dyn ToSqlValue).collect();
-        let rows = self.db.query_many(&sql, &refs)?;
-        let tracks: Vec<Track> = rows.iter().map(row_to_track).collect();
-        // Preserve caller's ordering
-        let mut ordered = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
-                ordered.push(t.clone());
+        // 1er temps : hydrater chaque id DISTINCT une seule fois, par lots.
+        let mut wanted: Vec<i64> = ids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut by_id: HashMap<i64, Track> = HashMap::with_capacity(wanted.len());
+        for chunk in wanted.chunks(ID_INLINE_BATCH) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+            let rows = self.db.query_many(&sql, &[])?;
+            for row in &rows {
+                let track = row_to_track(row);
+                if let Some(id) = track.id {
+                    by_id.insert(id, track);
+                }
             }
         }
-        Ok(ordered)
+        // 2e temps : réordonner en mémoire — un accès haché par id, O(n).
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     // ─── Group B/C: write_tx + simple inline ──────────────────────
@@ -2118,6 +2154,157 @@ mod tests {
         assert_eq!(result[0].title, "Gamma");
         assert_eq!(result[1].title, "Alpha");
         assert_eq!(result[2].title, "Beta");
+    }
+
+    /// Sème `n` pistes d'ids 1..=n en quelques `execute_batch`, sans passer par
+    /// `create` (une transaction par piste serait le coût dominant du test).
+    fn seed_pistes(db: &SqliteDb, n: usize) {
+        let mut sql = String::with_capacity(1 << 22);
+        sql.push_str("BEGIN;\n");
+        for id in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO tracks (id, title, file_path, duration_ms) \
+                 VALUES ({id}, 'piste {id}', '/musique/{id}.flac', {id});\n"
+            ));
+            if sql.len() > (1 << 22) {
+                sql.push_str("COMMIT;\n");
+                db.execute_batch(&sql).unwrap();
+                sql.clear();
+                sql.push_str("BEGIN;\n");
+            }
+        }
+        sql.push_str("COMMIT;\n");
+        db.execute_batch(&sql).unwrap();
+    }
+
+    /// #2797, défaut n°2 — la limite de paramètres SQL.
+    ///
+    /// L'ancienne forme posait UN placeholder par id. Au-delà de la limite du
+    /// moteur (SQLite `SQLITE_MAX_VARIABLE_NUMBER` : 999 avant 3.32, 32766
+    /// depuis ; PostgreSQL : 65535), la requête est refusée et les routes
+    /// playlists rendaient une liste VIDE. 40 000 ids dépassent les deux
+    /// seuils SQLite, quelle que soit la version liée.
+    ///
+    /// Contre-épreuve : en réinjectant la forme à placeholders, ce test
+    /// échoue avec « too many SQL variables ».
+    #[test]
+    fn get_multiple_tient_au_dela_de_la_limite_de_parametres_2797() {
+        let db = test_db();
+        seed_pistes(&db, 6);
+        let repo = TrackRepo::new(db);
+
+        // 40 000 ids demandés, dont 6 seulement existent, disséminés.
+        let mut ids: Vec<i64> = (1_000_000..1_040_000).collect();
+        ids[0] = 4;
+        ids[9_999] = 1;
+        ids[19_999] = 6;
+        ids[29_999] = 3;
+        ids[39_998] = 5;
+        ids[39_999] = 2;
+        assert!(ids.len() > 32_766, "le test doit dépasser les deux seuils");
+
+        let result = repo.get_multiple(&ids).expect("aucune erreur de moteur");
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 4", "piste 1", "piste 6", "piste 3", "piste 5", "piste 2"
+            ],
+            "résultat complet, dans l'ordre demandé, ids absents omis"
+        );
+    }
+
+    /// #2797 — le contrat de sortie : ordre d'entrée, doublons reproduits,
+    /// ids absents omis. La réindexation par `HashMap` ne doit rien changer
+    /// à ce qu'observaient les appelants (positions de playlist, rang
+    /// acoustique de `library/search`).
+    #[test]
+    fn get_multiple_reproduit_les_doublons_et_omet_les_absents_2797() {
+        let db = test_db();
+        seed_pistes(&db, 3);
+        let repo = TrackRepo::new(db);
+
+        let result = repo.get_multiple(&[3, 1, 999, 1, 2, 3, 1]).unwrap();
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 3", "piste 1", "piste 1", "piste 2", "piste 3", "piste 1"
+            ]
+        );
+        assert!(repo.get_multiple(&[]).unwrap().is_empty());
+    }
+
+    /// #2797, défaut n°1 — la réindexation était quadratique
+    /// (`tracks.iter().find(...)` par id demandé).
+    ///
+    /// Contre-épreuve de complexité : on mesure le même appel à `n` puis à
+    /// `4n`. Un coût linéaire multiplie le temps par ~4 ; un coût quadratique
+    /// par ~16. Le seuil est à 8× — à mi-chemin en échelle log, donc ~2×
+    /// de marge de chaque côté pour ne pas devenir instable sur une machine
+    /// de CI chargée. Meilleure de 3 passes, pour la même raison.
+    #[test]
+    fn get_multiple_ne_coute_pas_de_maniere_quadratique_2797() {
+        use std::time::Instant;
+
+        const N: usize = 4_000;
+        let db = test_db();
+        seed_pistes(&db, 4 * N);
+        let repo = TrackRepo::new(db);
+
+        let petit: Vec<i64> = (1..=N as i64).collect();
+        let grand: Vec<i64> = (1..=(4 * N) as i64).collect();
+
+        let mesure = |ids: &[i64]| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(ids).unwrap();
+                let dt = t0.elapsed().as_secs_f64();
+                assert_eq!(out.len(), ids.len());
+                best = best.min(dt);
+            }
+            best
+        };
+
+        let t_petit = mesure(&petit);
+        let t_grand = mesure(&grand);
+        let ratio = t_grand / t_petit.max(1e-6);
+        assert!(
+            ratio < 8.0,
+            "coût quadratique : n={N} {:.1} ms, 4n={} {:.1} ms → ×{ratio:.1} (linéaire ≈ ×4)",
+            t_petit * 1e3,
+            4 * N,
+            t_grand * 1e3,
+        );
+    }
+
+    /// Mesure de référence pour #2797 : le coût par piste doit rester plat.
+    /// `--ignored`, hors CI (build release, plusieurs dizaines de milliers de
+    /// lignes semées) — c'est la table de preuve de la PR, pas un garde-fou.
+    #[test]
+    #[ignore]
+    fn bench_get_multiple_2797() {
+        use std::time::Instant;
+
+        let db = test_db();
+        seed_pistes(&db, 100_000);
+        let repo = TrackRepo::new(db);
+        for n in [1_000usize, 5_000, 20_000, 50_000, 100_000] {
+            let ids: Vec<i64> = (1..=n as i64).collect();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(&ids).unwrap();
+                assert_eq!(out.len(), n);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "BENCH2797 n={n:>7} total={:>9.1} ms par_piste={:>7.3} µs",
+                best * 1e3,
+                best * 1e6 / n as f64
+            );
+        }
     }
 
     #[test]

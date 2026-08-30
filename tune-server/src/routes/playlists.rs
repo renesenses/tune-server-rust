@@ -150,13 +150,22 @@ async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> 
     }
 }
 
-async fn get_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// Une erreur de base ne doit PAS se déguiser en playlist vide (#2797) : le
+/// client ne peut alors pas distinguer « la playlist est vide » de « la
+/// requête a échoué », et l'utilisateur voit une playlist se vider toute
+/// seule. On remonte un 500 explicite.
+async fn get_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
-    Json(json!(tracks))
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!(tracks)))
 }
 
 async fn add_tracks(
@@ -256,10 +265,14 @@ async fn export_m3u(
         _ => return Err(AppError::not_found("playlist not found")),
     };
 
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    // Exporter un M3U vide sur erreur de base produit un fichier qui a l'air
+    // valide et détruit la playlist chez qui le réimporte (#2797).
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     let mut m3u = String::from("#EXTM3U\n");
     for t in &tracks {
@@ -301,10 +314,12 @@ async fn export_multi_format(
         .ok()
         .flatten()
         .ok_or(AppError::not_found("playlist not found"))?;
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     let (content, content_type, ext) = match format {
         "json" => {
@@ -1002,10 +1017,16 @@ async fn get_shared_playlist(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let track_ids = repo.get_track_ids(playlist_id).unwrap_or_default();
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .get_multiple(&track_ids)
-        .unwrap_or_default();
+    // Une erreur de base rendait un partage « vide » indistinguable d'une
+    // playlist réellement vide (#2797) : 500 explicite.
+    let track_ids = match repo.get_track_ids(playlist_id) {
+        Ok(ids) => ids,
+        Err(e) => return AppError::internal(e.to_string()).into_response(),
+    };
+    let tracks = match TrackRepo::with_backend(state.backend.clone()).get_multiple(&track_ids) {
+        Ok(t) => t,
+        Err(e) => return AppError::internal(e.to_string()).into_response(),
+    };
 
     Json(json!({
         "playlist": playlist,
