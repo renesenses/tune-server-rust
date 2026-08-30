@@ -9,7 +9,7 @@
     },
     "web": {
       "repository": "renesenses/tune-web-client",
-      "sha": "2e36aae38b82e01bc4d1a8d62d362bba2c0e9d1b",
+      "sha": "36c2ee99b4ad4a330ae167b376018794e2680e2d",
       "tag": "v0.9.128"
     },
     "os": {
