@@ -1545,6 +1545,7 @@ mod tests_cache_utilisateur {
             quality: None,
             isrc: None,
             composer: None,
+            artist_id: None,
         }
     }
 

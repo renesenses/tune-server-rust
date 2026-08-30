@@ -324,6 +324,9 @@ impl DeezerService {
             explicit: item["explicit_lyrics"].as_bool().unwrap_or(false),
             isrc: item["isrc"].as_str().map(Into::into),
             composer: None,
+            // Même nœud que le nom juste au-dessus : l'identifiant rendu est
+            // bien celui de l'artiste affiché (#1361).
+            artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             // Le catalogue Deezer ne dit pas sous quel format la piste sera
             // servie : cette valeur décrivait l'extrait public de 30 s, et était
             // donc affichée « MP3 44,1/16 » pour TOUTES les pistes, y compris
