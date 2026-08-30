@@ -60,6 +60,12 @@ impl ScanGate {
                     return Some(ScanLease {
                         gate: self,
                         generation,
+                        // Le balayage acoustique s'efface devant le scan tant
+                        // que cette marque vit (#2469, point 3). Elle est posée
+                        // ICI, dans la seule branche qui délivre un jeton, et
+                        // baissée par le `Drop` du jeton : les deux gestes ne
+                        // peuvent pas se désynchroniser.
+                        _marque_acoustique: tune_core::scanner::activite::MarqueDeScan::poser(),
                     });
                 }
                 Err(current) => observed = current,
@@ -121,6 +127,10 @@ impl ScanGate {
 pub(crate) struct ScanLease<'a> {
     gate: &'a ScanGate,
     generation: u64,
+    /// Tenue pour sa durée de vie seule : elle dit au balayage acoustique qu'un
+    /// scan de bibliothèque tourne. Son `Drop` s'exécute avec celui du jeton,
+    /// donc aussi quand la tâche de scan panique.
+    _marque_acoustique: tune_core::scanner::activite::MarqueDeScan,
 }
 
 impl Drop for ScanLease<'_> {
@@ -145,11 +155,24 @@ pub(crate) fn scan_cancel_requested() -> bool {
 mod scan_gate_tests {
     use super::ScanGate;
 
+    /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
+    /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
+    /// point 3). Deux tests qui tiennent un jeton en même temps se voient donc
+    /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
+    /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
+    /// verrou.
+    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialiser() -> std::sync::MutexGuard<'static, ()> {
+        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
     /// requête tente de démarrer B. Le refus de B ne doit jamais remettre le
     /// bit d'annulation de A à zéro.
     #[test]
     fn un_second_depart_refuse_ne_desarme_pas_stop() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
 
@@ -171,10 +194,43 @@ mod scan_gate_tests {
         );
     }
 
+    /// #2469, point 3 — le jeton de scan doit RENDRE VISIBLE le scan au
+    /// balayage acoustique, et le lui cacher dès qu'il est rendu.
+    ///
+    /// C'est le câblage qui fait vivre la priorité demandée par Thierry
+    /// Clemont : sans lui, `scan_bibliotheque_en_cours()` resterait faux à
+    /// jamais et la garde ajoutée dans `embedding.rs` serait du code mort —
+    /// exactement le défaut que #2469 a déjà rencontré une fois, quand
+    /// `spawn_scan_scheduler` n'était appelé de nulle part.
+    #[test]
+    fn le_jeton_de_scan_efface_le_balayage_acoustique() {
+        use tune_core::scanner::activite::scan_bibliotheque_en_cours;
+
+        let _serialise = serialiser();
+        let gate = ScanGate::new();
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "aucun scan ne tourne avant d'avoir pris la porte"
+        );
+
+        let scan = gate.try_acquire().expect("le scan doit demarrer");
+        assert!(
+            scan_bibliotheque_en_cours(),
+            "un scan qui tourne doit etre visible du balayage acoustique"
+        );
+
+        drop(scan);
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "la fin du scan doit rendre la main au balayage acoustique"
+        );
+    }
+
     /// Une requête Stop sans propriétaire ne doit pas empoisonner le prochain
     /// scan. C'est l'autre moitié de l'attachement à une génération précise.
     #[test]
     fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         assert!(!gate.request_cancel());
         let _scan = gate.try_acquire().expect("le scan doit demarrer");
@@ -188,6 +244,7 @@ mod scan_gate_tests {
     fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
         use std::sync::{Arc, Barrier, mpsc};
 
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let depart = Arc::new(Barrier::new(3));
         let maintien = Arc::new(Barrier::new(3));
