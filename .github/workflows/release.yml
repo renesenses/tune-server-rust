@@ -366,12 +366,33 @@ jobs:
             # « A timestamp was expected but was not found ». C'est arrive sur
             # la v0.9.119 (x86_64-apple-darwin) : panne d'Apple, rien de local.
             # On reessaie donc, au lieu de perdre le train sur un aleas reseau.
+            # #1641 — permission de chargement de bibliothèque. Le runtime
+            # durci (`--options runtime`) active la validation de bibliothèque :
+            # tune-server ne peut alors charger QUE des dylibs de sa propre Team
+            # ID. L'analyse acoustique (CLAP) fait un `dlopen` sur la
+            # `libonnxruntime.dylib` de Microsoft, signée adhoc et SANS Team ID —
+            # le noyau la refusait, et la jauge restait à 0 % sur tout macOS.
+            # Le plist ne porte AUCUN commentaire XML. Un commentaire contenant
+            # deux tirets consecutifs est illegal en XML, et AMFI — le lecteur
+            # de plist qu'appelle « codesign --entitlements » — refuse alors le
+            # FICHIER ENTIER (« AMFIUnserializeXML: syntax error »), codesign
+            # sort en erreur, et ce job tombe en plein train de publication.
+            # Or toute prose sur ce sujet contient deux tirets consecutifs.
+            # L'explication vit donc ici et dans tune-core/src/audio/runtime.rs,
+            # jamais dans le plist. Un test la verrouille.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            # Le troisième argument est le fichier de permissions, vide pour les
+            # binaires qui n'en ont pas besoin (ffmpeg, airplay-daemon).
             sign_horodate() {
-              local cible="$1" identifiant="$2" i
+              local cible="$1" identifiant="$2" droits="$3" i
               for i in 1 2 3 4 5; do
-                if codesign --force --options runtime --timestamp \
-                     --identifier "$identifiant" --sign "$IDENTITY" "$cible"; then
-                  return 0
+                if [ -n "$droits" ]; then
+                  codesign --force --options runtime --timestamp \
+                    --entitlements "$droits" \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
+                else
+                  codesign --force --options runtime --timestamp \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
                 fi
                 echo "::warning::codesign --timestamp a echoue sur $cible (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
                 sleep $((i * 15))
@@ -379,14 +400,25 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
-            sign_horodate package/tune-server fr.mozaiklabs.tune-server
+            sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
-              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon
+              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
             fi
             if [ -f package/ffmpeg ]; then
-              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg
+              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg ""
             fi
             codesign --verify --strict --verbose=2 package/tune-server
+            # Garde #1641 : une signature qui « réussit » sans porter la
+            # permission repart pour un train entier de macOS sans analyse
+            # acoustique, et personne ne le voit avant le rapport d'un testeur.
+            # On relit donc la signature PRODUITE, pas la commande écrite.
+            if codesign -d --entitlements - --xml package/tune-server 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — package/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::package/tune-server est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib sur macOS (#1641)."
+              exit 1
+            fi
           elif [ "$RUNNER_OS" = "macOS" ]; then
             echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
@@ -699,7 +731,12 @@ jobs:
           PLIST
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
-            codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # #1641 — même permission que pour le tarball, et pour la même
+            # raison : sans elle le runtime durci refuse le `dlopen` de
+            # libonnxruntime.dylib et l'analyse acoustique reste à 0 %. Le .app
+            # était le SECOND chemin macOS, aussi nu que le premier.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            codesign --force --options runtime --entitlements "$DROITS" --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
             # signing) so the bundle stays valid and notarization does not reject
             # an unsigned executable.
@@ -710,6 +747,18 @@ jobs:
               codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
             fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
+            # Garde #1641, jumelle de celle du tarball : on relit la signature
+            # produite sur le binaire IMBRIQUÉ, celui qui fera le `dlopen`.
+            # Signer le .app par-dessus ne resigne pas ce binaire, mais un
+            # `--force` mal placé le ferait — et la permission repartirait en
+            # silence.
+            if codesign -d --entitlements - --xml "$APP/Contents/Resources/tune-server" 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — $APP/Contents/Resources/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::Le tune-server du .app est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib (#1641)."
+              exit 1
+            fi
           fi
           DMG_DIR="dmg-staging"
           mkdir -p "$DMG_DIR"
