@@ -616,6 +616,23 @@ CREATE TABLE IF NOT EXISTS hidden_items (
     PRIMARY KEY (profile_id, item_type, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
+
+-- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
+-- migration SQLite 90, présent AUSSI ici pour que le rapprochement d'albums
+-- (grouped / merge-duplicates) tourne sur une base née de `init_schema` seul,
+-- comme les tests de repo. Voir la migration 90 pour la doctrine complète.
+CREATE TABLE IF NOT EXISTS album_distinct_pairs (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    album_a_id INTEGER NOT NULL,
+    album_b_id INTEGER NOT NULL,
+    a_name TEXT,
+    a_artist TEXT,
+    b_name TEXT,
+    b_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_album_distinct_pairs_b ON album_distinct_pairs(album_b_id);
 ";
 
 #[cfg(test)]
