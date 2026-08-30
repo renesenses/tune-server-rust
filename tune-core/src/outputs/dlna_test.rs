@@ -413,6 +413,115 @@ mod tests {
         );
     }
 
+    /// Un WAV servi à un renderer qui a appris le DIDL réduit — ALAC 24/192 +
+    /// « Forcer le WAV », la configuration d'Yves (forum #1437).
+    fn media_wav(url: &str, sample_rate: u32, bit_depth: u32) -> PlayMedia<'_> {
+        PlayMedia {
+            url,
+            mime_type: "audio/wav",
+            title: Some("Piste transcodée en WAV"),
+            duration_ms: Some(300_000),
+            file_size: Some(345_600_044),
+            sample_rate: Some(sample_rate),
+            bit_depth: Some(bit_depth),
+            channels: Some(2),
+            ..Default::default()
+        }
+    }
+
+    /// #1137 et #1458 ne valaient QUE pour le DIDL complet.
+    ///
+    /// Le DIDL réduit ne transmettait ni profondeur ni fréquence, donc
+    /// `dlna_flags_for_mime_bd_sr(mime, None, None)` retombait sur
+    /// `PN=LPCM` — le profil 16 bits / 48 kHz — pour un WAV 24 bits ou hi-res.
+    /// Un renderer strict rabat alors le flux sur le profil annoncé, lit des
+    /// échantillons désalignés et joue du SILENCE. Et comme le niveau réduit
+    /// est APPRIS par appareil (#2394), le défaut valait pour toutes les pistes
+    /// suivantes, pas seulement la première.
+    #[tokio::test]
+    async fn le_didl_minimal_ne_ment_plus_sur_le_profil_lpcm() {
+        // 16 bits mais 192 kHz : hors profil par la FRÉQUENCE (#1458) — c'est
+        // exactement ce que produit « Forcer le WAV 16 bits » sur un ALAC
+        // 24/192 sans plafond de fréquence.
+        let hires = media_wav("http://192.168.1.18:8888/stream/alac-192.wav", 192_000, 16);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&hires, "1", "audio/wav");
+        assert!(
+            !didl.contains("DLNA.ORG_PN=LPCM"),
+            "192 kHz n'est pas du profil LPCM : {didl}"
+        );
+
+        // 24 bits à 48 kHz : hors profil par la PROFONDEUR (#1137).
+        let vingt_quatre = media_wav("http://192.168.1.18:8888/stream/wav24.wav", 48_000, 24);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&vingt_quatre, "1", "audio/wav");
+        assert!(
+            !didl.contains("DLNA.ORG_PN=LPCM"),
+            "24 bits n'est pas du profil LPCM : {didl}"
+        );
+
+        // Le protocolInfo reste là — sans lui, le DMP-A8 accepte l'URI et ne
+        // vient jamais chercher le flux.
+        assert!(
+            didl.contains("DLNA.ORG_OP=01"),
+            "protocolInfo perdu : {didl}"
+        );
+    }
+
+    /// TÉMOIN de la parade : dans le profil, le `PN` reste annoncé. Les
+    /// renderers laxistes qui exigent un `PN` pour accepter le flux ne sont pas
+    /// touchés — sans ce cas, « ne jamais annoncer LPCM » passerait aussi.
+    #[tokio::test]
+    async fn le_didl_minimal_garde_le_profil_lpcm_quand_il_est_vrai() {
+        for sr in [44_100_u32, 48_000] {
+            let media = media_wav("http://192.168.1.18:8888/stream/cd.wav", sr, 16);
+            let didl = DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", "audio/wav");
+            assert!(
+                didl.contains("DLNA.ORG_PN=LPCM"),
+                "{sr} Hz / 16 bits reste du LPCM : {didl}"
+            );
+        }
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE de l'injection de panne.
+    ///
+    /// Les deux tests ci-dessus ne prouvent quelque chose que si le calcul du
+    /// profil dépend VRAIMENT des valeurs transmises. Ce cas fige l'état
+    /// d'avant : sans profondeur ni fréquence, la fonction de profil annonce
+    /// `PN=LPCM` — donc retirer le branchement de `didl_metadata_minimale`
+    /// FAIT échouer `le_didl_minimal_ne_ment_plus_sur_le_profil_lpcm`, il ne le
+    /// rend pas vacuement vert.
+    #[test]
+    fn sans_les_valeurs_le_profil_lpcm_serait_annonce_quand_meme() {
+        let sans_rien = crate::outputs::didl::dlna_flags_for_mime_bd_sr("audio/wav", None, None);
+        assert!(
+            sans_rien.contains("DLNA.ORG_PN=LPCM"),
+            "l'état d'avant doit rester reproductible, sinon la parade ne prouve rien : {sans_rien}"
+        );
+    }
+
+    /// Le profil se corrige SANS grossir l'enveloppe : le DIDL réduit existe
+    /// pour tenir sous un segment TCP, il ne doit gagner aucun attribut
+    /// `sampleFrequency` / `bitsPerSample` / `nrAudioChannels` au passage.
+    #[tokio::test]
+    async fn le_didl_minimal_n_ecrit_aucun_attribut_audio() {
+        let media = media_wav("http://192.168.1.18:8888/stream/alac-192.wav", 192_000, 16);
+        let didl = DlnaOutput::didl_metadata_minimale_pour_test(&media, "1", "audio/wav");
+        for attribut in ["sampleFrequency", "bitsPerSample", "nrAudioChannels"] {
+            assert!(
+                !didl.contains(attribut),
+                "le DIDL réduit ne doit pas porter {attribut} : {didl}"
+            );
+        }
+        let complet = DlnaOutput::didl_metadata_pour_test(&media, "1", "audio/wav");
+        assert!(
+            complet.contains("sampleFrequency"),
+            "le DIDL complet, lui, garde ses attributs : {complet}"
+        );
+        assert!(
+            didl.len() < complet.len(),
+            "le réduit doit rester plus court que le complet"
+        );
+    }
+
     /// Le zombie Eversolo : Stop ACQUITTÉ mais IGNORÉ tant qu'un Pause n'est
     /// pas passé. La prise de contrôle doit escalader Pause→Stop au lieu de
     /// marteler des Stop sourds pendant 2 s.

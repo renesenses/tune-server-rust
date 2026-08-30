@@ -370,13 +370,31 @@ impl DlnaOutput {
     /// quand les mêmes octets passent en une seule trame. Ce DIDL-ci tient
     /// l'enveloppe sous un segment. Le protocolInfo reste : sans lui, le
     /// DMP-A8 accepte l'URI d'un `.dsf` mais ne vient jamais le chercher.
+    ///
+    /// Le protocolInfo doit être JUSTE, pas seulement présent. Le profil
+    /// `DLNA.ORG_PN=LPCM` n'est défini que pour 16 bits (#1137) et pour 44,1 /
+    /// 48 kHz (#1458) : l'annoncer sur un WAV 24 bits ou hi-res fait rabattre
+    /// le flux sur le profil déclaré, lire des échantillons désalignés, et
+    /// jouer du SILENCE. Or ce DIDL-ci ne transmettait NI la profondeur NI la
+    /// fréquence : `dlna_flags_for_mime_bd_sr(mime, None, None)` retombait donc
+    /// sur `PN=LPCM` quoi qu'il arrive, et les deux correctifs restaient sans
+    /// effet dès que l'appareil avait appris le niveau réduit — c'est-à-dire à
+    /// chaque piste, définitivement (`didl_niveau_appris`, #2394).
+    ///
+    /// `sans_attributs_audio` rend les valeurs au calcul du profil sans écrire
+    /// `sampleFrequency` / `bitsPerSample` dans `<res>` : le budget d'un
+    /// segment TCP est préservé — la variante sans `PN` est même plus courte.
     fn didl_metadata_minimale(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
+        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
             .byte_seekable(media.byte_seekable)
             .item_id(item_id)
             .duration_ms_opt(media.duration_ms)
+            .sample_rate_opt(if is_dsd { None } else { media.sample_rate })
+            .bit_depth_opt(if is_dsd { None } else { media.bit_depth })
+            .sans_attributs_audio()
             .build_escaped()
     }
 
