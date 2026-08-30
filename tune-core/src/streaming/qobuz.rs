@@ -165,33 +165,56 @@ fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
 }
 
 /// Traduit le type de favori du client (pluriel) en paramètre attendu par
-/// l'API Qobuz.
+/// `/favorite/create` et `/favorite/delete`.
 ///
-/// `playlists` est traité à part : le type est parfaitement connu du
-/// connecteur — il lit `/playlist/getUserPlaylists`, `/playlist/get`,
-/// `/playlist/getFeatured` — mais **aucun appel de souscription à une
-/// playlist tierce n'est établi dans ce dépôt**. `/favorite/create` n'accepte,
-/// pour ce que le code démontre, que `track_ids`, `album_ids` et `artist_ids`.
-/// Rendre « unknown favorite type » ferait chercher une faute de frappe là où il
-/// y a une fonction à écrire (#2370).
+/// `playlists` n'a PAS de clé ici, et c'est le contrat de Qobuz, pas un oubli :
+/// `/favorite/create` ne porte que `track_ids`, `album_ids` et `artist_ids`.
+/// Suivre une playlist qui ne vous appartient pas passe par un endpoint
+/// distinct — [`ENDPOINT_SOUSCRIPTION_PLAYLIST`]. Le refus le dit, pour que
+/// personne n'ajoute ici une quatrième clé qui n'existe pas (#2370).
 fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
     match fav_type {
         "tracks" => Ok("track_ids"),
         "albums" => Ok("album_ids"),
         "artists" => Ok("artist_ids"),
-        "playlists" => Err(MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE.into()),
+        "playlists" => Err(MOTIF_PLAYLIST_HORS_FAVORITE_CREATE.into()),
         _ => Err(format!("unknown favorite type: {fav_type}").into()),
     }
 }
 
-/// Motif de refus d'un favori de playlist Qobuz.
+/// Pourquoi une playlist ne passe pas par `/favorite/create`.
+const MOTIF_PLAYLIST_HORS_FAVORITE_CREATE: &str = "qobuz: une playlist ne se met pas en favori via /favorite/create — elle passe \
+     par /playlist/subscribe (#2370)";
+
+/// Souscrire à une playlist Qobuz — l'équivalent du « cœur » pour une playlist
+/// qui ne vous appartient pas.
 ///
-/// Il nomme ce qui manque plutôt que de déclarer le type inconnu : l'appel de
-/// souscription à une playlist qui n'appartient pas à l'utilisateur n'est
-/// documenté nulle part dans ce dépôt, et on n'invente pas un endpoint Qobuz.
-const MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE: &str = "qobuz: favori de playlist non pris en charge — l'appel de souscription à une \
-     playlist tierce n'est pas établi contre l'API Qobuz (#2370). La LECTURE des \
-     playlists de l'utilisateur reste disponible via /playlist/getUserPlaylists.";
+/// Le ticket #2370 laissait ce point ouvert : « rien dans ce dépôt ne dit que
+/// `/favorite/create` accepte un quatrième type ». Il n'en accepte pas. La
+/// playlist a son endpoint propre, établi contre **deux** clients Qobuz publics
+/// et indépendants :
+///
+/// * `tidalf/plugin.audio.qobuz` — `resources/lib/qobuz/api/raw.py` :
+///   `playlist_subscribe` exige `playlist_id` et POSTe sur `/playlist/subscribe` ;
+///   `favorite_create` n'y énumère que `artist_ids`, `album_ids`, `track_ids`.
+/// * `bbye98/minim` — `src/minim/qobuz.py` : `favorite_playlist(playlist_id)`
+///   POSTe sur `/playlist/subscribe` avec `data={"playlist_id": ...}`.
+///
+/// Aucun endpoint n'est deviné ici, et aucun test ne touche l'API réelle.
+const ENDPOINT_SOUSCRIPTION_PLAYLIST: &str = "/playlist/subscribe";
+
+/// Symétrique de [`ENDPOINT_SOUSCRIPTION_PLAYLIST`] — mêmes sources.
+const ENDPOINT_DESOUSCRIPTION_PLAYLIST: &str = "/playlist/unsubscribe";
+
+/// Le seul paramètre porté par les deux endpoints de souscription.
+///
+/// Au SINGULIER, contrairement aux clés de `/favorite/create` qui sont des
+/// listes d'identifiants (`album_ids`). Confondre les deux formes est l'erreur
+/// que le test de souscription surveille.
+const PARAM_PLAYLIST_ID: &str = "playlist_id";
+
+/// Le type de favori, côté client, qui désigne une playlist.
+const TYPE_FAVORI_PLAYLISTS: &str = "playlists";
 
 /// Offsets des pages restant à charger après la première page d'un endpoint
 /// paginé Qobuz.
@@ -321,6 +344,29 @@ impl QobuzService {
         Ok(())
     }
 
+    /// Souscrire ou désouscrire une playlist Qobuz.
+    ///
+    /// Chemin volontairement distinct de `/favorite/{create,delete}` : Qobuz
+    /// range la playlist sous `/playlist/{,un}subscribe`, avec `playlist_id`
+    /// au singulier — pas sous une quatrième clé de `/favorite/create`
+    /// (#2370). Le jeton utilisateur est exigé d'emblée, pour la même raison
+    /// que sur les autres favoris : sans lui Qobuz répond OK sans rien
+    /// enregistrer.
+    async fn souscription_playlist(
+        &self,
+        endpoint: &'static str,
+        op: &str,
+        playlist_id: &str,
+    ) -> Result<(), TuneError> {
+        self.require_user_token(endpoint)?;
+        let res = self
+            .api_post(endpoint, &[(PARAM_PLAYLIST_ID, playlist_id)])
+            .await;
+        log_favorite_result(op, TYPE_FAVORI_PLAYLISTS, playlist_id, &res);
+        res?;
+        Ok(())
+    }
+
     pub fn new(app_id: String, app_secret: String) -> Self {
         Self {
             client: crate::http::client::builder()
@@ -356,8 +402,12 @@ impl QobuzService {
         svc
     }
 
-    /// (primaire, secours) pour une LECTURE.
-    fn bases_de_lecture(&self) -> (&str, &str) {
+    /// (primaire, secours) pour un appel API — lecture comme ecriture.
+    ///
+    /// Une seule fonction pour les deux : un `base_forcee` qui ne vaudrait que
+    /// pour les GET rendrait les POST intestables, et c'est exactement ce qui
+    /// manquait pour prouver la souscription d'une playlist (#2370).
+    fn bases_api(&self) -> (&str, &str) {
         match self.base_forcee {
             Some(ref base) => (base.as_str(), base.as_str()),
             None => endpoint_order(self.proxy_first),
@@ -398,7 +448,7 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let (primary, fallback) = self.bases_de_lecture();
+        let (primary, fallback) = self.bases_api();
         match self.api_get_at(primary, path, params).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
@@ -1319,7 +1369,7 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let (primary, fallback) = self.bases_api();
         match self.api_post_at(primary, path, params).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
@@ -2158,6 +2208,11 @@ impl StreamingService for QobuzService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        if fav_type == TYPE_FAVORI_PLAYLISTS {
+            return self
+                .souscription_playlist(ENDPOINT_SOUSCRIPTION_PLAYLIST, "subscribe", item_id)
+                .await;
+        }
         let key = favorite_key(fav_type)?;
         self.require_user_token("favorite/create")?;
         let res = self.api_post("/favorite/create", &[(key, item_id)]).await;
@@ -2167,6 +2222,11 @@ impl StreamingService for QobuzService {
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        if fav_type == TYPE_FAVORI_PLAYLISTS {
+            return self
+                .souscription_playlist(ENDPOINT_DESOUSCRIPTION_PLAYLIST, "unsubscribe", item_id)
+                .await;
+        }
         let key = favorite_key(fav_type)?;
         self.require_user_token("favorite/delete")?;
         let res = self.api_post("/favorite/delete", &[(key, item_id)]).await;
@@ -2663,29 +2723,25 @@ mod tests {
         );
     }
 
-    /// #2370 — Gros Bidon (fil 1541). `favorite_key("playlists")` rend
-    /// aujourd'hui « unknown favorite type: playlists », ce qui est FAUX : le
-    /// type existe et le connecteur le manipule partout ailleurs
-    /// (`/playlist/getUserPlaylists`, `/playlist/get`…). Ce qui manque, c'est
-    /// l'appel de souscription a une playlist tierce, qui n'est etabli nulle
-    /// part dans ce depot. Le message doit dire cela, et pas mentir sur la
-    /// nature du blocage — sans quoi le prochain lecteur cherche une faute de
-    /// frappe la ou il y a une fonction a ecrire.
+    /// #2370 — Gros Bidon (fil 1541). `favorite_key` est le tableau de
+    /// correspondance de `/favorite/create` UNIQUEMENT, et cet endpoint ne
+    /// porte pas les playlists. Le refus doit rester — mais en nommant
+    /// l'endpoint qui, lui, les porte, pour que personne n'invente ici une
+    /// quatrieme cle `playlist_ids` qui n'existe pas chez Qobuz.
     #[test]
-    fn le_type_playlists_n_est_pas_un_type_inconnu() {
+    fn le_type_playlists_n_est_pas_une_cle_de_favorite_create() {
         let err = favorite_key("playlists")
-            .expect_err(
-                "l'appel de souscription Qobuz n'est pas etabli : ca doit rester une erreur",
-            )
+            .expect_err("/favorite/create ne porte pas les playlists : ca reste une erreur")
             .to_string();
         assert!(
             !err.contains("unknown favorite type"),
-            "le type playlist est connu du connecteur : le refus doit nommer \
-             l'appel manquant, pas pretendre que le type est inconnu. Message rendu : {err}"
+            "le type playlist est connu du connecteur : le refus ne doit pas \
+             pretendre que le type est inconnu. Message rendu : {err}"
         );
         assert!(
-            err.to_lowercase().contains("playlist"),
-            "le message doit nommer la playlist. Message rendu : {err}"
+            err.contains(ENDPOINT_SOUSCRIPTION_PLAYLIST),
+            "le refus doit renvoyer vers l'endpoint qui porte les playlists. \
+             Message rendu : {err}"
         );
     }
 
@@ -4517,5 +4573,146 @@ mod tests_recherche_paginee {
         let ids = |v: &[StreamTrack]| v.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&ancienne.tracks), ids(&page.results.tracks));
         assert_eq!(ancienne.albums.len(), page.results.albums.len());
+    }
+}
+
+/// #2370 — « Ajouter une playlist Qobuz en favori » (Gros Bidon, fil 1541).
+///
+/// Ces essais prouvent que l'ÉCRITURE d'un favori de playlist part bien sur
+/// `/playlist/subscribe` avec `playlist_id`, et non sur `/favorite/create`.
+/// Serveur simulé en local : **aucun appel n'atteint l'API Qobuz**, et aucun
+/// identifiant Qobuz n'apparaît ici.
+#[cfg(test)]
+mod tests_souscription_playlist {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Ce que le serveur simulé a reçu : (chemin, corps urlencodé).
+    type Recus = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Serveur qui accepte n'importe quelle écriture, note le chemin et le
+    /// corps, et répond `{"status":"success"}` comme Qobuz.
+    async fn qobuz_ecriture_simulee() -> (String, Recus) {
+        use axum::{Json, Router};
+
+        let recus: Recus = Arc::new(Mutex::new(Vec::new()));
+        let vus = recus.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri, corps: String| {
+            let vus = vus.clone();
+            async move {
+                vus.lock()
+                    .expect("verrou d'essai")
+                    .push((uri.path().to_string(), corps));
+                Json(json!({"status": "success"}))
+            }
+        });
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), recus)
+    }
+
+    /// Service d'essai pointant sur le serveur simulé, avec un jeton
+    /// utilisateur factice — sans jeton, `require_user_token` refuse avant
+    /// d'émettre et l'essai ne prouverait rien du chemin réseau.
+    fn service_essai(base: String) -> QobuzService {
+        let mut svc = QobuzService::avec_base_forcee(base);
+        svc.user_auth_token = Some(String::from("jeton-essai"));
+        svc
+    }
+
+    fn seul_appel(recus: &Recus) -> (String, String) {
+        let v = recus.lock().expect("verrou d'essai").clone();
+        assert_eq!(v.len(), 1, "un seul aller-retour attendu, reçu : {v:?}");
+        v[0].clone()
+    }
+
+    #[tokio::test]
+    async fn mettre_une_playlist_en_favori_appelle_playlist_subscribe() {
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.add_favorite("playlists", "15732665")
+            .await
+            .expect("serveur simulé : la souscription doit aboutir");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(
+            chemin, "/playlist/subscribe",
+            "une playlist ne se met pas en favori via /favorite/create : Qobuz \
+             lui donne son propre endpoint (#2370)"
+        );
+        assert!(
+            corps.contains("playlist_id=15732665"),
+            "le paramètre est `playlist_id`, au SINGULIER, pas une liste \
+             d'identifiants comme les clés de /favorite/create. Corps : {corps}"
+        );
+        assert!(
+            !corps.contains("playlist_ids"),
+            "`playlist_ids` n'existe pas chez Qobuz. Corps : {corps}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirer_une_playlist_des_favoris_appelle_playlist_unsubscribe() {
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.remove_favorite("playlists", "15732665")
+            .await
+            .expect("serveur simulé : la désouscription doit aboutir");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(
+            chemin, "/playlist/unsubscribe",
+            "le retrait doit être le symétrique de la souscription, pas \
+             /favorite/delete"
+        );
+        assert!(corps.contains("playlist_id=15732665"), "corps : {corps}");
+    }
+
+    #[tokio::test]
+    async fn les_trois_autres_types_passent_toujours_par_favorite_create() {
+        // Non-régression : la souscription playlist est un chemin EN PLUS, elle
+        // ne détourne pas les favoris qui marchaient déjà.
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.add_favorite("albums", "0060254776343")
+            .await
+            .expect("serveur simulé");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(chemin, "/favorite/create");
+        assert!(corps.contains("album_ids=0060254776343"), "corps : {corps}");
+    }
+
+    #[tokio::test]
+    async fn une_souscription_sans_jeton_utilisateur_n_emet_rien() {
+        // Même garde que sur les autres favoris : sans jeton, Qobuz répond OK
+        // sans rien enregistrer. On refuse avant d'émettre.
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = QobuzService::avec_base_forcee(base); // pas de jeton
+
+        let err = svc
+            .add_favorite("playlists", "15732665")
+            .await
+            .expect_err("sans jeton utilisateur, la souscription doit être refusée")
+            .to_string();
+
+        assert!(
+            err.to_lowercase().contains("qobuz"),
+            "le message doit nommer la session Qobuz. Message rendu : {err}"
+        );
+        assert!(
+            recus.lock().expect("verrou d'essai").is_empty(),
+            "aucune requête ne doit partir sans jeton utilisateur"
+        );
     }
 }

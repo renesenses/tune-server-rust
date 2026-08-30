@@ -100,8 +100,8 @@ impl AutoFixEngine {
         let repo = TrackRepo::new(self.db.clone());
         let enricher = MetadataEnricher::new(self.db.clone());
 
-        let incomplete = find_incomplete_tracks(&repo);
-        let total = incomplete.len();
+        let defective = find_defective_tracks(&repo);
+        let total = defective.len();
 
         {
             let mut p = self.progress.lock().await;
@@ -114,7 +114,7 @@ impl AutoFixEngine {
 
         info!(total, "auto_fix_scan_start");
 
-        for (i, track_id) in incomplete.iter().enumerate() {
+        for (i, track_id) in defective.iter().enumerate() {
             if *self.cancel.lock().await {
                 info!("auto_fix_cancelled");
                 break;
@@ -279,14 +279,50 @@ impl AutoFixEngine {
     }
 }
 
-fn find_incomplete_tracks(repo: &TrackRepo) -> Vec<i64> {
+fn find_defective_tracks(repo: &TrackRepo) -> Vec<i64> {
     let db = repo.backend();
     db.query_many(
-        "SELECT id FROM tracks WHERE \
-         (genre IS NULL OR genre = '') OR \
-         (year IS NULL OR year = 0) OR \
-         isrc IS NULL \
-         ORDER BY id LIMIT 5000",
+        // Un champ d'enrichissement absent n'est pas un defaut : la plupart
+        // des fichiers locaux n'ont legitimement ni ISRC, ni genre, ni annee.
+        // Ne lancer les appels MusicBrainz couteux que lorsqu'un indice de
+        // metadata reellement incoherente existe deja dans la bibliotheque.
+        //
+        // La numerotation manquante n'est suspecte que si le meme album est
+        // par ailleurs numerote. Cela protege notamment les singles et albums
+        // autoproduits entierement non numerotes. Deux numeros positifs
+        // identiques sur le meme disque sont en revanche contradictoires.
+        "SELECT DISTINCT t.id FROM tracks t \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         WHERE (t.source IS NULL OR t.source = '' OR t.source = 'local') AND (\
+             TRIM(t.title) = '' \
+             OR LOWER(TRIM(COALESCE(ar.name, ''))) IN ('', 'unknown artist') \
+             OR COALESCE(t.disc_number, 0) <= 0 \
+             OR (COALESCE(t.track_number, 0) <= 0 AND EXISTS (\
+                 SELECT 1 FROM tracks numbered \
+                 WHERE numbered.album_id = t.album_id \
+                   AND COALESCE(numbered.disc_number, 1) = COALESCE(t.disc_number, 1) \
+                   AND numbered.track_number > 0\
+             )) \
+             OR (t.track_number > 0 AND EXISTS (\
+                 SELECT 1 FROM tracks duplicate_number \
+                 WHERE duplicate_number.album_id = t.album_id \
+                   AND COALESCE(duplicate_number.disc_number, 1) = COALESCE(t.disc_number, 1) \
+                   AND duplicate_number.track_number = t.track_number \
+                   AND duplicate_number.id <> t.id\
+             )) \
+             OR (al.folder_path IS NOT NULL AND TRIM(al.folder_path) <> '' \
+                 AND t.file_path IS NOT NULL AND TRIM(t.file_path) <> '' \
+                 AND SUBSTR(t.file_path, 1, LENGTH(RTRIM(al.folder_path, '/\\')) + 1) \
+                     NOT IN (RTRIM(al.folder_path, '/\\') || '/', RTRIM(al.folder_path, '/\\') || '\\')\
+             ) \
+             OR (al.folder_path IS NOT NULL AND TRIM(al.folder_path) <> '' AND EXISTS (\
+                 SELECT 1 FROM albums sibling_album \
+                 WHERE sibling_album.folder_path = al.folder_path \
+                   AND sibling_album.id <> al.id \
+                   AND LOWER(TRIM(sibling_album.title)) <> LOWER(TRIM(al.title))\
+             ))\
+         ) ORDER BY t.id LIMIT 5000",
         &[],
     )
     .unwrap_or_default()
@@ -377,5 +413,157 @@ mod tests {
         let progress = engine.status().await;
         assert_eq!(progress.fixed, 1);
         assert_eq!(progress.suggestions, 1);
+    }
+
+    fn seed_artist_album(
+        db: &SqliteDb,
+        artist_id: i64,
+        artist: &str,
+        album_id: i64,
+        album: &str,
+        folder: &str,
+    ) {
+        db.execute(
+            "INSERT INTO artists (id, name) VALUES (?, ?)",
+            &[&artist_id, &artist],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id, folder_path) VALUES (?, ?, ?, ?)",
+            &[&album_id, &album, &artist_id, &folder],
+        )
+        .unwrap();
+    }
+
+    fn seed_track(
+        db: &SqliteDb,
+        id: i64,
+        title: &str,
+        album_id: i64,
+        artist_id: i64,
+        disc: i64,
+        number: i64,
+        path: &str,
+    ) {
+        db.execute(
+            "INSERT INTO tracks \
+             (id, title, album_id, artist_id, disc_number, track_number, file_path, source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'local')",
+            &[&id, &title, &album_id, &artist_id, &disc, &number, &path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn healthy_self_released_tracks_without_isrc_are_not_selected() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        seed_artist_album(
+            &db,
+            1,
+            "The Bedroom Tapes",
+            1,
+            "Home Recordings",
+            "/music/home-recordings",
+        );
+        seed_track(
+            &db,
+            1,
+            "First Light",
+            1,
+            1,
+            1,
+            1,
+            "/music/home-recordings/01-first-light.flac",
+        );
+        // Cas frequent et sain : ni ISRC, ni genre, ni annee.
+        let track = TrackRepo::new(db.clone()).get(1).unwrap().unwrap();
+        assert_eq!(track.isrc, None);
+        assert_eq!(track.genre, None);
+        assert_eq!(track.year, None);
+
+        assert!(find_defective_tracks(&TrackRepo::new(db)).is_empty());
+    }
+
+    #[test]
+    fn entirely_unnumbered_album_is_not_assumed_broken() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        seed_artist_album(&db, 1, "DIY Artist", 1, "Loose Sessions", "/music/loose");
+        seed_track(&db, 1, "Day One", 1, 1, 1, 0, "/music/loose/day-one.flac");
+        seed_track(&db, 2, "Day Two", 1, 1, 1, 0, "/music/loose/day-two.flac");
+
+        assert!(find_defective_tracks(&TrackRepo::new(db)).is_empty());
+    }
+
+    #[test]
+    fn real_metadata_defects_are_selected() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        seed_artist_album(&db, 1, "Known Artist", 1, "Numbered", "/music/numbered");
+        seed_artist_album(&db, 2, "Unknown Artist", 2, "Unknown", "/music/unknown");
+        seed_artist_album(&db, 3, "Known Artist 2", 3, "Tagged A", "/music/mixed-tags");
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id, folder_path) \
+             VALUES (4, 'Tagged B', 3, '/music/mixed-tags')",
+            &[],
+        )
+        .unwrap();
+
+        seed_track(&db, 1, "", 1, 1, 1, 1, "/music/numbered/01.flac");
+        seed_track(&db, 2, "Mystery", 2, 2, 1, 1, "/music/unknown/01.flac");
+        // Un trou au milieu d'un album numerote est un signal, contrairement
+        // a un album entierement sans numeros.
+        seed_track(&db, 3, "Numbered", 1, 1, 1, 2, "/music/numbered/02.flac");
+        seed_track(
+            &db,
+            4,
+            "Missing number",
+            1,
+            1,
+            1,
+            0,
+            "/music/numbered/x.flac",
+        );
+        // Deux numeros identiques sur le meme disque sont contradictoires.
+        seed_track(
+            &db,
+            5,
+            "Duplicate A",
+            1,
+            1,
+            1,
+            3,
+            "/music/numbered/03-a.flac",
+        );
+        seed_track(
+            &db,
+            6,
+            "Duplicate B",
+            1,
+            1,
+            1,
+            3,
+            "/music/numbered/03-b.flac",
+        );
+        // Le chemin de la piste contredit le dossier rattache a l'album.
+        seed_track(
+            &db,
+            7,
+            "Wrong folder",
+            1,
+            1,
+            1,
+            4,
+            "/music/elsewhere/04.flac",
+        );
+        // Deux titres d'album distincts revendiquent le meme dossier.
+        seed_track(&db, 8, "Mixed A", 3, 3, 1, 1, "/music/mixed-tags/a.flac");
+        seed_track(&db, 9, "Mixed B", 4, 3, 1, 2, "/music/mixed-tags/b.flac");
+
+        assert_eq!(
+            find_defective_tracks(&TrackRepo::new(db)),
+            vec![1, 2, 4, 5, 6, 7, 8, 9]
+        );
     }
 }

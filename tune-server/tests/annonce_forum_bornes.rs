@@ -50,14 +50,11 @@ impl Verdict {
 /// Le faux `curl` respecte la seule forme que le script utilise : `-o FICHIER`
 /// pour le corps, `-w '%{http_code}'` pour le code sur la sortie standard.
 fn executer(releases_json: &str, fils_json: &str, http: &str, env: &[(&str, &str)]) -> Verdict {
-    let bac = std::env::temp_dir().join(format!(
-        "i2328-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let bac_temporaire = tempfile::Builder::new()
+        .prefix("i2328-")
+        .tempdir()
+        .expect("bac a sable temporaire unique");
+    let bac = bac_temporaire.path();
     let outils = bac.join("outils");
     fs::create_dir_all(&outils).expect("bac a sable");
 
@@ -112,7 +109,6 @@ fn executer(releases_json: &str, fils_json: &str, http: &str, env: &[(&str, &str
     }
 
     let issue = commande.output().expect("le script s'execute");
-    let _ = fs::remove_dir_all(&bac);
 
     Verdict {
         code: issue.status.code().unwrap_or(-1),

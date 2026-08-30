@@ -616,40 +616,184 @@ async fn sync_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Durée d'observation minimale avant d'oser annoncer un débit.
+///
+/// Les premiers blocs d'une session partent en rafale — remplissage du tampon,
+/// en-tête WAV, réponse au `Range` initial. Rapportés aux quelques dizaines de
+/// millisecondes qui viennent de s'écouler, ils donnent un débit à cinq
+/// chiffres qui ne décrit rien. Une seconde suffit à lisser l'amorçage.
+const FENETRE_MINIMALE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Les deux faits d'une mesure de débit, lus ENSEMBLE sur la MÊME session.
+///
+/// C'est le point du correctif : le compteur d'octets et la durée pendant
+/// laquelle ils sont partis doivent décrire le même objet. Les lire à deux
+/// endroits différents est exactement ce qui avait permis de diviser les
+/// octets d'une session par l'ancienneté du SERVEUR.
+///
+/// Ce que compte `bytes_sent` : TOUT ce que le serveur a émis pour cette
+/// session, tous chemins de sortie confondus (fichier, radio, mandataire —
+/// voir `corps_compte` dans `tune-core/src/http/streamer.rs`). Sortie locale,
+/// renderer DLNA et — depuis #2738 — le relais du pont y sont additionnés. Ce
+/// n'est donc pas « ce que reçoit un navigateur », c'est ce que la zone a fait
+/// sortir.
+fn mesure_de_session(
+    session: &tune_core::http::streamer::StreamSession,
+) -> (u64, std::time::Duration) {
+    (
+        session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed),
+        session.created_at.elapsed(),
+    )
+}
+
+/// Le débit MOYEN observé sur la vie du flux, en kbit/s — ou `None`.
+///
+/// `None` n'est pas `0.0`. Les deux se lisent pareil à l'écran et ne disent
+/// pas la même chose : `0.0` affirme que rien ne circule, `None` dit qu'on n'a
+/// pas de quoi mesurer. Le champ rendait `0.0` dans les deux cas, si bien
+/// qu'un flux qui démarre était annoncé muet.
+///
+/// Le calcul reste en flottant de bout en bout. `octets * 8 / 1000` était une
+/// division ENTIÈRE, faite avant celle par le temps : les décimales étaient
+/// jetées là, et l'arrondi final à la décimale près ne rattrapait qu'un
+/// chiffre déjà faux.
+///
+/// C'est une MOYENNE sur la session, pas un débit instantané : une pause en
+/// cours de piste continue de creuser la fenêtre et tire la valeur vers le
+/// bas. Ce qui est garanti, c'est que la fenêtre appartient au flux mesuré.
+fn debit_observe_kbps(octets_envoyes: u64, fenetre: std::time::Duration) -> Option<f64> {
+    if octets_envoyes == 0 || fenetre < FENETRE_MINIMALE {
+        return None;
+    }
+    let kbps = octets_envoyes as f64 * 8.0 / 1000.0 / fenetre.as_secs_f64();
+    Some((kbps * 10.0).round() / 10.0)
+}
+
 async fn network_health(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let metrics = state.poller_metrics.lock().await;
     let poller = metrics.get(&id).cloned().unwrap_or_default();
     let ps = state.playback.get_state(id).await;
 
-    let stream_bytes: u64 = if let Some(ref np) = ps.now_playing
+    let mesure: Option<(u64, std::time::Duration)> = if let Some(ref np) = ps.now_playing
         && let Some(ref sid) = np.stream_id
     {
         let sessions = state.streamer.sessions_state();
         let sessions = sessions.lock().await;
-        sessions
-            .get(sid.as_str())
-            .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
+        sessions.get(sid.as_str()).map(|s| mesure_de_session(s))
     } else {
-        0
+        None
     };
 
-    let uptime_s = state.started_at.elapsed().as_secs();
-    let bitrate_kbps = if uptime_s > 0 && stream_bytes > 0 {
-        (stream_bytes * 8 / 1000) as f64 / uptime_s as f64
-    } else {
-        0.0
-    };
+    let stream_bytes = mesure.map_or(0, |(octets, _)| octets);
+    let bitrate_kbps = mesure.and_then(|(octets, fenetre)| debit_observe_kbps(octets, fenetre));
 
     Json(json!({
         "zone_id": id,
         "bytes_sent": stream_bytes,
-        "bitrate_kbps": (bitrate_kbps * 10.0).round() / 10.0,
+        "bitrate_kbps": bitrate_kbps,
         "poll_latency_ms": poller.last_latency_ms,
         "max_latency_ms": poller.max_latency_ms,
         "poll_errors": poller.total_errors,
         "total_polls": poller.total_polls,
     }))
+}
+
+#[cfg(test)]
+mod debit_de_zone_tests {
+    use super::{FENETRE_MINIMALE, debit_observe_kbps, mesure_de_session};
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Duration;
+    use tune_core::http::streamer::{StreamInfo, StreamSession};
+
+    fn session_de_test() -> StreamSession {
+        StreamSession::new(
+            "session-de-test".to_string(),
+            StreamInfo {
+                format: "flac".to_string(),
+                mime_type: "audio/flac".to_string(),
+                sample_rate: 44_100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+                seek_ms: None,
+            },
+            true,
+            8,
+        )
+    }
+
+    /// La fenêtre de mesure appartient au FLUX, pas au serveur.
+    ///
+    /// Une session qui vient de naître n'a rien à annoncer, quel que soit le
+    /// nombre d'octets déjà comptés : on n'a pas encore observé assez
+    /// longtemps. L'horloge du serveur, elle, aurait rendu un chiffre — c'est
+    /// tout le défaut : elle avance depuis le démarrage du processus et ne
+    /// sait rien de ce flux-ci.
+    #[test]
+    fn la_fenetre_de_mesure_est_celle_de_la_session() {
+        let session = session_de_test();
+        session.bytes_sent.store(1_000_000, Relaxed);
+
+        let (octets, fenetre) = mesure_de_session(&session);
+
+        assert_eq!(octets, 1_000_000, "le compteur de la session doit être lu");
+        assert!(
+            fenetre < FENETRE_MINIMALE,
+            "session tout juste créée : sa fenêtre vaut {fenetre:?}, \
+             elle ne peut pas déjà dépasser {FENETRE_MINIMALE:?}"
+        );
+        assert_eq!(
+            debit_observe_kbps(octets, fenetre),
+            None,
+            "trop tôt pour mesurer ce flux — une horloge de serveur, elle, \
+             aurait fourni une fenêtre et donc un chiffre"
+        );
+    }
+
+    /// Un débit qu'on n'a pas mesuré ne s'annonce pas.
+    #[test]
+    fn aucun_octet_ne_permet_aucune_annonce() {
+        assert_eq!(
+            debit_observe_kbps(0, Duration::from_secs(30)),
+            None,
+            "pas un octet envoyé : il n'y a rien à mesurer, donc rien à annoncer"
+        );
+    }
+
+    /// Trop tôt pour mesurer : la rafale d'amorçage n'est pas un débit.
+    #[test]
+    fn une_fenetre_trop_courte_ne_permet_aucune_annonce() {
+        assert_eq!(
+            debit_observe_kbps(200_000, Duration::from_millis(120)),
+            None,
+            "120 ms de session : le remplissage du tampon n'est pas un débit"
+        );
+    }
+
+    /// Le débit annoncé est celui qu'on a compté, pas un entier arrondi en
+    /// chemin. `octets * 8 / 1000` en arithmétique entière jette les décimales
+    /// AVANT la division par le temps.
+    #[test]
+    fn le_debit_annonce_est_la_mesure_pas_une_troncature() {
+        assert_eq!(
+            debit_observe_kbps(12_345, Duration::from_secs(1)),
+            Some(98.8),
+            "12 345 octets en 1 s = 98,76 kbit/s, arrondi à 98,8 — pas 98,0"
+        );
+    }
+
+    /// Le cas nominal : un FLAC stéréo 16/44,1 tourne autour de 1 000 kbit/s.
+    #[test]
+    fn un_flac_s_annonce_a_son_vrai_debit() {
+        assert_eq!(
+            debit_observe_kbps(1_000_000, Duration::from_secs(8)),
+            Some(1000.0),
+            "1 Mo en 8 s = 1 000 kbit/s"
+        );
+    }
 }
 
 pub async fn create_zone_handler(

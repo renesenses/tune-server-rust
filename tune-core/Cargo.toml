@@ -50,7 +50,7 @@ symphonia = { workspace = true }
 # SPIKE (#1145): pure-Rust Monkey's Audio (.ape) decoder, MIT/Apache-2.0.
 # Evaluated as a replacement for the "not supported" fallback. Not production.
 ape-decoder = "0.3.2"
-audiopus = { workspace = true }
+opus = { workspace = true }
 rubato = { workspace = true }
 unicode-normalization = { workspace = true }
 oaat-core = { workspace = true, optional = true }
@@ -168,4 +168,5 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Power",
 ] }

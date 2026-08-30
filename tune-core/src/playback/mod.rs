@@ -394,6 +394,9 @@ pub struct PlaybackEvent {
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
+    /// Inhibition de veille agrégée : une zone qui s'arrête ne la relâche pas
+    /// tant qu'une autre joue encore (#2108).
+    sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor,
     /// Un [`crate::audio::tap::ZoneTap`] par zone — le tap PCM que le
     /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
     /// Verrou synchrone : accès courts, jamais tenus à travers un await.
@@ -417,6 +420,7 @@ impl PlaybackManager {
         Self {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor::new(),
             zone_taps: std::sync::Mutex::new(HashMap::new()),
             levels_gens: std::sync::Mutex::new(HashMap::new()),
         }
@@ -627,6 +631,7 @@ impl PlaybackManager {
         }
 
         let data = now_playing_event_data(state);
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "started".into(),
             zone_id,
@@ -640,6 +645,7 @@ impl PlaybackManager {
             state.state = PlayState::Paused;
             state.paused_at = Some(Instant::now());
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "paused".into(),
             zone_id,
@@ -653,6 +659,7 @@ impl PlaybackManager {
             state.state = PlayState::Playing;
             state.paused_at = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "resumed".into(),
             zone_id,
@@ -677,6 +684,7 @@ impl PlaybackManager {
         } else {
             serde_json::json!({})
         };
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
@@ -696,11 +704,20 @@ impl PlaybackManager {
             state.position_ms = 0;
             state.metadata_changed_at_ms = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
             data: serde_json::json!({}),
         });
+    }
+
+    fn sync_sleep_inhibition(&self, zones: &HashMap<i64, ZoneState>) {
+        self.sleep_inhibitor.set_active(
+            zones
+                .values()
+                .any(|state| state.state == PlayState::Playing),
+        );
     }
 
     /// Stamp a stall-recovery restart for this zone. Called by the OAAT stall
@@ -1269,5 +1286,35 @@ mod tests {
         pm.set_resolving(2, true).await;
         pm.stop_and_clear(2).await;
         assert!(!pm.get_state(2).await.resolving);
+    }
+
+    /// #2108 — la garde de veille appartient à l'ensemble des zones, pas à la
+    /// dernière commande reçue. Une pause ne doit jamais endormir le serveur
+    /// si une autre zone continue de jouer.
+    #[tokio::test]
+    async fn inhibition_de_veille_suit_la_derniere_zone_qui_joue() {
+        let pm = super::PlaybackManager::new();
+        assert!(!pm.sleep_inhibitor.requested());
+
+        pm.play(1, super::NowPlaying::default()).await;
+        assert!(pm.sleep_inhibitor.requested());
+
+        pm.play(2, super::NowPlaying::default()).await;
+        pm.pause(1).await;
+        assert!(
+            pm.sleep_inhibitor.requested(),
+            "la zone 2 joue encore : la pause de la zone 1 ne libère rien"
+        );
+
+        pm.stop(2).await;
+        assert!(
+            !pm.sleep_inhibitor.requested(),
+            "la dernière zone active est arrêtée : la garde doit être libérée"
+        );
+
+        pm.resume(1).await;
+        assert!(pm.sleep_inhibitor.requested());
+        pm.stop_and_clear(1).await;
+        assert!(!pm.sleep_inhibitor.requested());
     }
 }

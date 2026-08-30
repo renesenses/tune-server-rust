@@ -445,7 +445,7 @@ pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value>
 
 pub(super) async fn health_alerts(State(state): State<AppState>) -> Json<Value> {
     let alerts = state.health_monitor.alerts().await;
-    Json(json!({ "alerts": alerts }))
+    Json(json!(alerts))
 }
 
 #[derive(Deserialize)]

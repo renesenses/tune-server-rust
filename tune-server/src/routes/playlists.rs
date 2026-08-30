@@ -125,7 +125,15 @@ async fn create_playlist(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, body.description.as_deref(), profile.id()) {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Ok(id) => match repo.get(id) {
+            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(None) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "playlist created but not found",
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -137,7 +145,11 @@ async fn update_playlist(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.description.as_deref()) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => match repo.get(id) {
+            Ok(Some(playlist)) => Json(json!(playlist)).into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -175,7 +187,11 @@ async fn add_tracks(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
-        Ok(ids) => (StatusCode::CREATED, Json(json!({ "added": ids.len() }))).into_response(),
+        Ok(_) => match repo.get(id) {
+            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
