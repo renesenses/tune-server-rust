@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -1817,7 +1818,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                      WHERE source = 'local' \
                      GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
                     &[],
-                ).unwrap_or_default();
+                ).ou_defaut_journalise();
                 let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
                     (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
                 }).collect();

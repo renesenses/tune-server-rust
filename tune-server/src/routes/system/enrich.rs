@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -201,7 +202,7 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -595,7 +596,7 @@ pub(super) async fn enrichment_run(
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -738,7 +739,7 @@ fn merge_duplicate_albums(
     let dupe_rows = db.query_many(
         "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
         &[],
-    ).unwrap_or_default();
+    ).ou_defaut_journalise();
     let dupes: Vec<(String, String)> = dupe_rows
         .iter()
         .map(|r| {
@@ -801,7 +802,7 @@ fn cleanup_orphan_artwork(
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
         if let Some(path) = r[0].as_string() {

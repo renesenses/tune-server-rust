@@ -94,6 +94,18 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
 
+      # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
+      # base. Ces requetes vivaient dans tune-server, que ce job ne compile
+      # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
+      # precisement ce que PostgreSQL refuse. Elles sont descendues dans
+      # tune-core (db/home_queries.rs) pour que cette etape les EXECUTE.
+      # Le test porte ses trois contre-epreuves : il rejoue les formes
+      # d'avant et exige l'erreur PostgreSQL litterale.
+      - name: « Continuer l'écoute » sur PostgreSQL (#2860)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune

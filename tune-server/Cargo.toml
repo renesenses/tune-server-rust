@@ -122,3 +122,13 @@ path = "tests/plugin_contracts.rs"
 name = "plugin_wasm_contracts"
 path = "tests/plugin_wasm_contracts.rs"
 required-features = ["plugins-wasm"]
+
+# Cible à elle seule, et NON un module de `server_contracts` : le test installe
+# un abonné `tracing` GLOBAL pour lire le journal. `tracing` met en cache, pour
+# tout le processus, la décision « ce point d'appel intéresse-t-il quelqu'un ? »
+# — un abonné posé au milieu d'un binaire qui lance des tests en parallèle rend
+# des captures vides de façon imprévisible (leçon de
+# `tune-core/tests/journal_descriptif_illisible.rs`). Un binaire, un test.
+[[test]]
+name = "panne_sql_journalisee"
+path = "tests/panne_sql_journalisee.rs"

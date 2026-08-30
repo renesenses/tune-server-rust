@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
@@ -48,7 +49,7 @@ pub(super) async fn list_duplicates(
     let hash_rows = state
         .backend
         .query_many(&hash_sql, hash_params)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let hash_dups: Vec<Value> = hash_rows
         .iter()
         .filter_map(|row| {
@@ -97,7 +98,7 @@ pub(super) async fn list_duplicates(
     let meta_rows = state
         .backend
         .query_many(&meta_sql, meta_params)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let meta_dups: Vec<Value> = meta_rows
         .iter()
         .map(|row| {
@@ -287,7 +288,10 @@ pub(super) async fn smart_duplicates(
     let limit_val = limit as i64;
     let offset_val = offset as i64;
     let params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
-    let rows = state.backend.query_many(&sql, params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, params)
+        .ou_defaut_journalise();
 
     let items: Vec<Value> = rows
         .iter()

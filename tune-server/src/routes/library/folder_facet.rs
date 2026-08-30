@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
@@ -247,7 +248,7 @@ fn folder_children(
     let (where_sql, all) = where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
     let sql = format!("SELECT t.file_path FROM tracks t WHERE {where_sql}");
     let refs: Vec<&dyn ToSqlValue> = all.iter().map(|v| v as &dyn ToSqlValue).collect();
-    let rows = state.backend.query_many(&sql, &refs).unwrap_or_default();
+    let rows = state.backend.query_many(&sql, &refs).ou_defaut_journalise();
 
     // Aggregate the immediate child segment (portable: no engine-specific SQL
     // string surgery, no case/normalization equality traps). A row with no

@@ -41,6 +41,7 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+pub mod panne_sql;
 pub mod party;
 pub mod peers;
 pub mod playback;

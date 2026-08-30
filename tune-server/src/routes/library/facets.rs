@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
@@ -533,7 +534,7 @@ fn original_year_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -612,7 +613,7 @@ fn playlist_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -680,7 +681,7 @@ fn column_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -739,7 +740,11 @@ fn genre_facet(
         .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
         .collect();
     let mut brut: Vec<(String, i64)> = Vec::new();
-    for row in state.backend.query_many(&sql, &bound).unwrap_or_default() {
+    for row in state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+    {
         let mut it = row.into_iter();
         let colonne = it.next().and_then(|v| v.as_string());
         let tableau = it.next().and_then(|v| v.as_string());
@@ -835,7 +840,7 @@ fn rating_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -924,7 +929,7 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
             "SELECT name, rules, match_mode FROM smart_collections ORDER BY name",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     for row in &rows {
         let name = row.first().and_then(|v| v.as_string()).unwrap_or_default();
         if name.is_empty() || manual_names.contains(&name.to_lowercase()) {
@@ -1067,7 +1072,7 @@ fn artist_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -1109,7 +1114,7 @@ fn kv_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();

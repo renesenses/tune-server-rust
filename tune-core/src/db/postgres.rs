@@ -137,7 +137,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT",
+    // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer
+    // l'ecoute » compare les deux. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et la section disparait en silence (#2860). Sur une
+    // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
+    // la migration 047 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT",
