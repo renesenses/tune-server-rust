@@ -41,10 +41,16 @@ pub type PluginRouters = Vec<(String, axum::Router<()>)>;
 pub fn build_loader(
     event_bus: &tune_core::event_bus::EventBus,
     backend: Arc<dyn tune_core::db::backend::DbBackend>,
+    license: Arc<tune_core::license::LicenseManager>,
 ) -> PluginLoader {
+    // La licence descend jusqu'aux greffons pour qu'un greffon payant ADAPTE sa
+    // réponse au lieu de se voir claquer la porte au nez par l'hôte : « Concerts »
+    // doit un jour servir une version réduite aux comptes gratuits, et cette
+    // décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
+        .with_license(license)
 }
 
 /// Where plugins keep their private state. Each plugin gets

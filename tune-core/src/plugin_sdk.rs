@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 use crate::event_bus::{EventBus, TuneEvent};
+use crate::license::{Feature, LicenseManager};
 use crate::outputs::traits::OutputTarget;
 
 /// The plugin ABI generation. A plugin declares the version it was built
@@ -94,6 +95,15 @@ pub struct AvailablePluginInfo {
     /// "Install"); `false` = a default-on plugin the user disabled (offer
     /// "Enable").
     pub opt_in: bool,
+    /// Le module Premium exigé, s'il y en a un — le `display_name` de la
+    /// [`Feature`], tel que la grille des modules l'affiche.
+    ///
+    /// Sans ce champ, le gestionnaire proposerait « Installer » à quelqu'un
+    /// dont les routes seront refusées juste après : l'utilisateur redémarre,
+    /// et n'obtient qu'un 402. Le porter ici permet d'afficher le cadenas AVANT
+    /// le clic, comme le fait déjà la grille des modules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_feature: Option<String>,
 }
 
 pub struct PluginContext {
@@ -107,6 +117,22 @@ pub struct PluginContext {
     pub api_base_url: String,
     pub data_dir: PathBuf,
     pub event_bus: Option<EventBus>,
+    /// La licence du serveur, pour que le greffon ADAPTE sa réponse.
+    ///
+    /// ⚠️ POURQUOI ICI, ET PAS UN REFUS AUTOMATIQUE DANS L'HÔTE.
+    ///
+    /// Un garde monté par l'hôte devant les routes d'un greffon ne sait faire
+    /// qu'une chose : ouvrir ou fermer. Or « Concerts » doit un jour servir une
+    /// version RÉDUITE aux comptes gratuits, pas une porte close. Un refus
+    /// câblé dans l'hôte serait alors à défaire.
+    ///
+    /// En donnant la licence au greffon, la décision « complet / réduit /
+    /// refusé » tient dans UNE fonction, chez lui.
+    ///
+    /// `None` chez un hôte qui n'en fournit pas (tests, tune-cli) : le greffon
+    /// se comporte alors comme SANS Premium, jamais l'inverse — une licence
+    /// absente ne s'interprète pas en faveur du doute.
+    pub license: Option<Arc<LicenseManager>>,
     plugin_name: String,
     db: Option<Arc<dyn DbBackend>>,
     /// Deferred registrations collected during `setup`. Interior mutability so
@@ -121,6 +147,7 @@ impl PluginContext {
             api_base_url: api_base_url.to_string(),
             data_dir,
             event_bus: None,
+            license: None,
             plugin_name: String::new(),
             db: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
@@ -135,6 +162,22 @@ impl PluginContext {
     pub fn with_db(mut self, db: Arc<dyn DbBackend>) -> Self {
         self.db = Some(db);
         self
+    }
+
+    pub fn with_license(mut self, license: Arc<LicenseManager>) -> Self {
+        self.license = Some(license);
+        self
+    }
+
+    /// Ce module est-il ouvert sur ce serveur ?
+    ///
+    /// Rend `false` quand l'hôte ne fournit pas de licence : voir la note sur
+    /// [`PluginContext::license`]. Une absence ne vaut pas une autorisation.
+    pub async fn feature_licensed(&self, feature: Feature) -> bool {
+        match &self.license {
+            Some(license) => license.check_feature(feature).await,
+            None => false,
+        }
     }
 
     pub fn with_plugin_name(mut self, name: &str) -> Self {
@@ -297,6 +340,28 @@ pub trait TunePlugin: Send + Sync {
         true
     }
 
+    /// Le module Premium que ce greffon exige, s'il en exige un.
+    ///
+    /// ⚠️ LE PAYANT EST UNE PROPRIÉTÉ DU GREFFON, PAS D'UN CHEMIN D'URL.
+    ///
+    /// La tentation serait de garder la route du greffon là où l'hôte la monte,
+    /// avec un `require_premium` écrit en dur. Ce serait un piège pour le
+    /// suivant : le jour où un greffon PUBLIC arrive — et c'est prévu — il
+    /// faudrait défaire ce câblage au lieu de simplement ne rien déclarer.
+    ///
+    /// Ici, un greffon gratuit n'implémente pas cette méthode et ses routes
+    /// répondent à tout le monde. Un greffon payant nomme son module, et l'hôte
+    /// refuse ses routes avec un **402** au corps identique à celui de
+    /// `require_premium` — le client sait déjà le reconnaître comme un refus
+    /// d'offre et non comme une panne (`estRefusPremium`, tune-web-client).
+    ///
+    /// Le refus porte sur les ROUTES, jamais sur le chargement : un greffon
+    /// payant se charge quand même, sinon le gestionnaire ne pourrait pas
+    /// l'annoncer à qui n'a pas encore Premium.
+    fn required_feature(&self) -> Option<Feature> {
+        None
+    }
+
     /// The [`PLUGIN_PROTOCOL_VERSION`] this plugin was built against.
     ///
     /// Defaults to the version compiled into the SDK the plugin links, which
@@ -343,6 +408,7 @@ pub struct PluginLoader {
     data_root: PathBuf,
     event_bus: Option<EventBus>,
     db: Option<Arc<dyn DbBackend>>,
+    license: Option<Arc<LicenseManager>>,
     event_dispatch_handle: Option<tokio::task::JoinHandle<()>>,
     /// Registrations accumulated across every plugin's `setup`, awaiting
     /// collection by the host.
@@ -359,6 +425,7 @@ impl PluginLoader {
             data_root,
             event_bus: None,
             db: None,
+            license: None,
             event_dispatch_handle: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
             unloaded: StdMutex::new(Vec::new()),
@@ -372,6 +439,11 @@ impl PluginLoader {
 
     pub fn with_db(mut self, db: Arc<dyn DbBackend>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    pub fn with_license(mut self, license: Arc<LicenseManager>) -> Self {
+        self.license = Some(license);
         self
     }
 
@@ -422,6 +494,9 @@ impl PluginLoader {
                             description: plugin.description().to_string(),
                             config_schema: plugin.config_schema(),
                             opt_in,
+                            required_feature: plugin
+                                .required_feature()
+                                .map(|f| f.display_name().to_string()),
                         });
                     } else {
                         info!(plugin_name = %name, "plugin_hors_catalogue");
@@ -463,6 +538,9 @@ impl PluginLoader {
             }
             if let Some(db) = &self.db {
                 ctx = ctx.with_db(Arc::clone(db));
+            }
+            if let Some(license) = &self.license {
+                ctx = ctx.with_license(Arc::clone(license));
             }
 
             match plugin.setup(&ctx).await {
@@ -523,6 +601,21 @@ impl PluginLoader {
             .lock()
             .map(|mut r| std::mem::take(&mut *r))
             .unwrap_or_default()
+    }
+
+    /// Le module Premium exigé par chaque greffon chargé, par nom.
+    ///
+    /// Les enregistrements ne portent que `(nom, routeur)` : le nom est tout ce
+    /// que le greffon transmet, et c'est voulu — il ne choisit ni son préfixe
+    /// d'URL ni son garde. L'hôte recolle ici l'exigence au routeur, juste
+    /// avant de le monter.
+    pub async fn required_features(&self) -> std::collections::HashMap<String, Feature> {
+        self.plugins
+            .lock()
+            .await
+            .iter()
+            .filter_map(|p| p.required_feature().map(|f| (p.name().to_string(), f)))
+            .collect()
     }
 
     /// Start dispatching EventBus events to all loaded plugins.
