@@ -1537,7 +1537,6 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
 CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 ",
     },
-    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -4500,7 +4499,11 @@ mod tests {
         // cette ligne soit remontée — ce test ne tourne que dans le job PG,
         // qui n'exécute pas `-p tune-core`. On la remonte donc de 40 à 42 d'un
         // coup, en constatant les DEUX ajouts.
-        assert_eq!(pg_latest_version(), 42, "latest PG migration must be 42");
+        // 43 : `ignored_devices` (#1280). Le numéro 42 était pris par le semis
+        // de radios (#2119), fusionné pendant que cette branche passait ses
+        // portes — d'où le renumérotage, fait AVANT qu'aucune base ne voie
+        // l'ancien numéro.
+        assert_eq!(pg_latest_version(), 43, "latest PG migration must be 43");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
