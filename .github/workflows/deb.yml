@@ -1,0 +1,240 @@
+name: Paquet Debian (.deb)
+
+# Ce workflow est DÉLIBÉRÉMENT séparé de release.yml.
+#
+# release.yml est le cœur du train de publication : il construit, signe,
+# notarise et publie treize artefacts. Y greffer l'empaquetage Debian aurait
+# fait porter à toute la release le risque d'un `dpkg-deb` qui échoue. Ici,
+# le .deb se construit APRÈS coup, à partir des archives déjà publiées : si ce
+# workflow tombe, la release reste intacte et le paquet se rejoue seul par
+# `workflow_dispatch`.
+#
+# Corollaire : le .deb n'apparaît pas dans SHA256SUMS (produit par release.yml
+# avant que ce workflow existe). Il porte son propre SHA256SUMS.deb.
+
+on:
+  # Une release vient d'être publiée (release.yml bascule le brouillon en
+  # public tout à la fin) → on attache les .deb.
+  release:
+    types: [published]
+
+  # Rejeu manuel sur n'importe quel tag déjà publié.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag de release (ex. v0.9.126)"
+        required: true
+        type: string
+      publish:
+        description: "Attacher les .deb à la release"
+        required: false
+        default: true
+        type: boolean
+
+  # Sur une PR qui touche la recette : on construit ET on installe pour de
+  # vrai, sans rien publier. C'est la contre-épreuve du paquet.
+  pull_request:
+    paths:
+      - "packaging/deb/**"
+      - "scripts/build-deb.sh"
+      - ".github/workflows/deb.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Construire le .deb (${{ matrix.arch }})
+    # ubuntu-22.04 comme release.yml : le paquet doit être fabriqué sur la même
+    # base que les binaires qu'il contient, sinon les hypothèses de
+    # compatibilité (glibc 2.35) ne sont plus vérifiables ici.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux-x86_64
+          - arch: arm64
+            platform: linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Déterminer le tag source
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            release)           TAG="${{ github.event.release.tag_name }}" ;;
+            workflow_dispatch) TAG="${{ inputs.tag }}" ;;
+            *)
+              # Sur une PR il n'y a pas de tag associé : on prend la dernière
+              # release publiée. On ne teste alors pas « ce commit », on teste
+              # la RECETTE — c'est bien ce que la PR modifie.
+              TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+              ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "--- source : ${TAG} ---"
+
+      - name: Télécharger l'archive Linux publiée
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "tune-server-${{ steps.tag.outputs.tag }}-${{ matrix.platform }}.tar.gz" \
+            --dir dist
+          ls -la dist
+
+      - name: Construire le paquet
+        run: |
+          set -euo pipefail
+          scripts/build-deb.sh \
+            --tarball "dist/tune-server-${{ steps.tag.outputs.tag }}-${{ matrix.platform }}.tar.gz" \
+            --version "${{ steps.tag.outputs.version }}" \
+            --arch "${{ matrix.arch }}" \
+            --outdir dist
+
+      - name: Contenu du paquet
+        run: |
+          set -euo pipefail
+          DEB="dist/tune-server_${{ steps.tag.outputs.version }}_${{ matrix.arch }}.deb"
+          echo "::group::control"
+          dpkg-deb --info "$DEB"
+          echo "::endgroup::"
+          echo "::group::contenu"
+          dpkg-deb --contents "$DEB"
+          echo "::endgroup::"
+          # Garde : un paquet sans binaire, sans unité systemd ou sans client
+          # web s'installe très bien et ne sert à rien. On refuse ici.
+          for required in ./opt/tune/tune-server ./opt/tune/web/index.html \
+                          ./lib/systemd/system/tune-server.service \
+                          ./etc/default/tune-server ./usr/bin/tune-server; do
+            dpkg-deb --contents "$DEB" | grep -q " ${required}\( ->\)\?$" \
+              || { echo "::error::absent du paquet : ${required}"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          retention-days: 7
+
+  verify-install:
+    name: Installer et démarrer (amd64)
+    needs: build
+    # Un runner GitHub est une VM complète avec un vrai systemd : l'unité est
+    # réellement chargée, démarrée, et le serveur répond. Une simple extraction
+    # `dpkg-deb -x` ne prouverait rien de tout ça.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-amd64
+          path: dist
+
+      - name: apt install
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # `apt-get install ./fichier.deb` résout les dépendances déclarées,
+          # là où `dpkg -i` les laisserait manquantes. C'est la commande que
+          # l'utilisateur tapera.
+          sudo apt-get install -y ./dist/tune-server_*_amd64.deb
+
+      - name: Le paquet a posé ce qu'il annonce
+        run: |
+          set -euo pipefail
+          dpkg -L tune-server
+          test -x /opt/tune/tune-server
+          test -f /opt/tune/web/index.html
+          test -L /usr/bin/tune-server
+          test -f /etc/default/tune-server
+          getent passwd tune
+          id tune | grep -q audio
+          # /opt/tune doit appartenir à `tune` : c'est ce qui permet à la mise
+          # à jour intégrée de réécrire son propre binaire.
+          test "$(stat -c %U /opt/tune/tune-server)" = tune
+          test "$(stat -c %U /var/lib/tune)" = tune
+
+      - name: L'unité est activée, valide et le service tourne
+        run: |
+          set -euo pipefail
+          systemd-analyze verify /lib/systemd/system/tune-server.service
+          systemctl is-enabled tune-server
+          for i in $(seq 1 30); do
+            if systemctl is-active --quiet tune-server; then break; fi
+            sleep 1
+          done
+          systemctl is-active tune-server
+          systemctl show tune-server -p User -p WorkingDirectory -p AmbientCapabilities
+
+      - name: Le serveur répond
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8888/api/v1/system/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8888/api/v1/system/health
+          echo
+          curl -fsS http://127.0.0.1:8888/api/v1/system/version
+          echo
+          # Le client web est bien servi depuis /opt/tune/web.
+          curl -fsS http://127.0.0.1:8888/ | head -c 200
+          echo
+
+      - name: Journal du service (pour diagnostic)
+        if: always()
+        run: sudo journalctl -u tune-server --no-pager -n 80 || true
+
+      - name: apt purge — /opt/tune part, les données restent
+        run: |
+          set -euo pipefail
+          sudo apt-get purge -y tune-server
+          test ! -e /opt/tune || { echo "::error::/opt/tune survit au purge"; exit 1; }
+          test ! -e /lib/systemd/system/tune-server.service
+          test ! -e /etc/default/tune-server
+          # Décision assumée (cf. packaging/deb/postrm) : la bibliothèque
+          # indexée n'est JAMAIS effacée par un purge.
+          test -d /var/lib/tune || { echo "::error::/var/lib/tune effacé par le purge"; exit 1; }
+          ! systemctl is-active --quiet tune-server
+
+  publish:
+    name: Attacher les .deb à la release
+    needs: [build, verify-install]
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
+      - name: Sommes de contrôle
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.deb > SHA256SUMS.deb
+          cat SHA256SUMS.deb
+
+      - name: Envoi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          gh release upload "$TAG" dist/*.deb dist/SHA256SUMS.deb \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name'

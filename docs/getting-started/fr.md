@@ -27,6 +27,31 @@ brew install tune-server
 brew services start tune-server
 ```
 
+### Debian / Ubuntu (paquet .deb)
+
+Télécharger `tune-server_<version>_amd64.deb` (ou `_arm64.deb` pour un
+Raspberry Pi) depuis [GitHub Releases](https://github.com/renesenses/tune-server-rust/releases), puis :
+
+```bash
+sudo apt install ./tune-server_<version>_amd64.deb
+```
+
+Le service démarre tout seul et se relance au redémarrage de la machine.
+Indiquer ensuite les dossiers de musique dans `/etc/default/tune-server` :
+
+```bash
+sudo nano /etc/default/tune-server     # TUNE_MUSIC_DIRS=/srv/musique
+sudo systemctl restart tune-server
+journalctl -u tune-server -f
+```
+
+> Requiert Debian 12 ou Ubuntu 22.04 au minimum (glibc 2.35). Sur une base plus
+> ancienne, `apt` refuse l'installation avec un message clair plutôt que de
+> laisser un serveur à moitié fonctionnel.
+
+Détails (emplacements, mise à jour, désinstallation) :
+`/usr/share/doc/tune-server/README.Debian`.
+
 ### Windows
 
 Télécharger l'installeur `.exe` depuis [GitHub Releases](https://github.com/renesenses/tune-server-rust/releases) et le lancer.

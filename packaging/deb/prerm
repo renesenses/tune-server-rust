@@ -1,0 +1,23 @@
+#!/bin/sh
+# Pré-suppression : arrêter le service AVANT que le binaire disparaisse.
+set -e
+
+case "$1" in
+remove | deconfigure)
+    if [ -d /run/systemd/system ]; then
+        systemctl stop tune-server.service >/dev/null 2>&1 || true
+        # `disable` ici et pas dans postrm : une fois l'unité supprimée du
+        # disque, systemctl ne sait plus résoudre les liens de `enable`.
+        systemctl disable tune-server.service >/dev/null 2>&1 || true
+    fi
+    ;;
+
+upgrade | failed-upgrade) ;;
+
+*)
+    echo "prerm appelé avec un argument inconnu : $1" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
