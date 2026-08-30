@@ -165,15 +165,11 @@ pub(super) async fn get_config(
         // historique), -0.5 ou -1. Persisté par PATCH /config comme les
         // autres ; honoré dans `gain_factor` (tune-core).
         ("replaygain_true_peak_ceiling_db", json!(0.0)),
-        // Analyse EBU R128 de fond. Ce réglage EXISTAIT et pilotait déjà le
-        // balayage, mais son défaut n'était publié nulle part : une base
-        // fraîche répondait « clé absente », et le client devait deviner. Or
-        // c'est l'un des deux axes qui composent les trois modes de #1627 —
-        // le deviner, c'est présenter le mauvais mode comme actif.
-        (
-            tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY,
-            json!(true),
-        ),
+        // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
+        // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
+        // normalise en plus la valeur persistée (`"false"` → `false`). Une
+        // entrée `or_insert` ici serait morte — la contre-épreuve de #1627 l'a
+        // montrée : la retirer ne cassait aucun test.
         (
             "local_audio_backend",
             json!(state.config.local_audio_backend),
@@ -256,6 +252,12 @@ pub(super) async fn get_config(
     // pas lieu est aussi trompeur que de la cacher.
     let rg_source_mode = tune_core::audio::replaygain::active_source_mode(&state.backend);
     let rg_analysis_effective = tune_core::audio::replaygain::analysis_enabled(&state.backend);
+    //
+    // `analysis_enabled` est publié ici et NULLE PART ailleurs : l'insertion
+    // est inconditionnelle, donc elle publie le défaut (`true`) sur une base
+    // fraîche ET normalise le `"false"` persisté en booléen. C'était le trou —
+    // la clé était simplement absente de la réponse, et le client devait
+    // deviner son défaut.
     let rg_analysis_enabled = config
         .get(tune_core::audio::replaygain::ANALYSIS_ENABLED_KEY)
         .and_then(|v| v.as_str().map(|s| s != "false").or_else(|| v.as_bool()))
