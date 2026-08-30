@@ -760,10 +760,13 @@ impl TrackRepo {
             let in_part = ph
                 .in_list_ci("t.genre", n)
                 .expect("liste non vide déjà vérifiée");
-            let like_part = (0..n)
-                .map(|_| format!("t.genres LIKE {}", ph.take()))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            // ⚠️ Insensible à la casse des DEUX côtés, comme le `in_list_ci`
+            // ci-dessus : un `LIKE` nu l'est en SQLite, mais PAS en
+            // PostgreSQL. Jumeau strict du rail (`facets::build_conditions`),
+            // qui a reçu la même correction (#1821).
+            let like_part = ph
+                .or_like_ci("t.genres", n)
+                .expect("liste non vide déjà vérifiée");
             conditions.push(format!("({in_part} OR {like_part})"));
             for g in &f.genres {
                 owned_params.push(SqlValue::Text(g.clone()));
