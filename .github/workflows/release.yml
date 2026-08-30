@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -46,14 +45,22 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      - name: Lire le SHA web du manifeste
+        id: web
+        shell: bash
+        run: |
+          PLAN=".release/${GITHUB_REF_NAME}.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          # The web client mirrors the server's branch topology: RC tags
-          # (v*-rc*) build from tune-web-client's release/v0.9 (0.9.x); stable
-          # v0.8.x tags build from its main. Keeps the two version lines apart.
-          ref: ${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}
+          ref: ${{ steps.web.outputs.sha }}
+          path: .web-client
       - name: Verify web-client version matches release tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: .web-client
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           # Compare the base X.Y.Z only: a pre-release tag (v0.9.0-rc1) ships the
@@ -71,12 +78,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: .web-client/package-lock.json
       - run: npm ci
+        working-directory: .web-client
       - run: npm run build
+        working-directory: .web-client
       - uses: actions/upload-artifact@v4
         with:
           name: web-client
-          path: dist/
+          path: .web-client/dist/
           retention-days: 1
 
   build:
