@@ -2291,7 +2291,7 @@ pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
 /// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
 /// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
 /// est mis en cache.
-pub(super) fn server_urls(port: u16) -> Vec<String> {
+pub(crate) fn server_urls(port: u16) -> Vec<String> {
     let mut urls = Vec::new();
     if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
         if !ip.is_empty() {

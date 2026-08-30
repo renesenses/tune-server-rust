@@ -27,6 +27,12 @@ mod youtube;
 /// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
 pub(crate) use config::resolve_server_name;
 
+/// Adresses complètes — schéma ET port — auxquelles ce serveur répond depuis
+/// un autre appareil. Réexporté parce que le démarrage les imprime aussi
+/// (#1272) : elles ne doivent exister qu'en UN endroit, sans quoi la console
+/// et l'interface finiraient par annoncer deux adresses différentes.
+pub(crate) use config::server_urls;
+
 use axum::Router;
 use axum::routing::{get, post};
 
