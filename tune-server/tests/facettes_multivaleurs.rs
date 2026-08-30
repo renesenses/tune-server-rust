@@ -531,6 +531,25 @@ fn bibliotheque_contrat_facettes() -> axum::Router {
           bit_depth, source, genre, genres, composer, year, label) VALUES \
          (91006, 'PisteE', NULL, NULL, '/contrat/e.aiff', 1000, 'aiff', 48000, \
           24, 'local', NULL, '[\"Jazzy\"]', NULL, NULL, NULL)",
+        // #1821 — un disque dont le tag porte PLUSIEURS genres. C'est ce
+        // qu'écrivent nativement Vorbis Comment (champ `GENRE` répété) et MP4
+        // (atome `©gen` répété) : la colonne `genre` garde le principal, le
+        // tableau `genres` les garde tous. Le rail ne comptait que la colonne,
+        // donc « Fusion » n'apparaissait nulle part — alors que le filtre, lui,
+        // savait le trouver.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91008, 'PisteF', 92001, 93001, '/contrat/g.flac', 1000, 'flac', 96000, \
+          24, 'local', 'Jazz', '[\"Jazz\",\"Fusion\"]', 'Bach', 1959, 'ECM')",
+        // Même genre secondaire, CASSE différente, et seulement dans le
+        // tableau JSON : sans `LOWER()` des deux côtés du `LIKE`, cette ligne
+        // est trouvée sur SQLite et perdue sur PostgreSQL.
+        "INSERT INTO tracks \
+         (id, title, album_id, artist_id, file_path, duration_ms, format, sample_rate, \
+          bit_depth, source, genre, genres, composer, year, label) VALUES \
+         (91009, 'PisteG', NULL, NULL, '/contrat/h.flac', 1000, 'flac', 44100, \
+          16, 'local', NULL, '[\"FUSION\"]', NULL, NULL, NULL)",
         // Titre ACCENTUÉ : la liste passe par `unaccent()`, le compteur doit
         // en faire autant, sinon `q=cafe` compte sans cette piste.
         "INSERT INTO tracks \
@@ -780,4 +799,76 @@ async fn la_recherche_libre_narrow_le_rail_comme_la_liste() {
             "« Café Bleu » doit répondre à q={recherche} des DEUX côtés"
         );
     }
+}
+
+/// #1821 — le rail « Genre » d'Oxygen doit annoncer les genres SECONDAIRES.
+///
+/// DEvir, ambassadeur : « songs purchased from different platforms or labels
+/// end up being categorized under different genres ». La cause mesurée est
+/// l'encodage du tag, pas le vocabulaire des marchands : « ce disque est du
+/// Jazz ET de la Fusion » s'écrit soit en plusieurs valeurs (Vorbis, MP4,
+/// ID3v2.4), soit en une chaîne séparée (ID3v2.3), et Tune ne rangeait le
+/// disque sous ses deux genres que dans le second cas.
+///
+/// Côté serveur, le rail groupait sur la seule colonne `t.genre` tandis que son
+/// filtre jumeau testait AUSSI le tableau `t.genres` : « Fusion » n'était donc
+/// proposé par aucune carte, alors que le cocher aurait bien rendu des pistes.
+#[tokio::test]
+async fn le_rail_genre_annonce_les_genres_secondaires() {
+    let app = bibliotheque_contrat_facettes();
+
+    let (status, facettes) = get(&app, "/api/v1/library/facets?fields=genre&limit=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let rail = effectifs(&facettes, "genre");
+
+    // « Fusion » n'est le genre PRINCIPAL d'aucune piste : il ne vit que dans
+    // le tableau multivalué. Il doit malgré tout être proposé.
+    let fusion = rail
+        .iter()
+        .find(|(v, _)| v.eq_ignore_ascii_case("Fusion"))
+        .unwrap_or_else(|| panic!("« Fusion » absent du rail : {rail:?}"));
+
+    // Les DEUX pistes qui le portent, quelle que soit la casse écrite dans le
+    // tableau : c'est la même intention, gravée par deux logiciels différents.
+    assert_eq!(
+        fusion.1, 2,
+        "« Fusion » doit compter les deux gravures : {rail:?}"
+    );
+
+    // Et le compteur ne ment pas : cocher la carte rend exactement ce nombre.
+    let encodee = urlencoding::encode(&fusion.0);
+    let (status, pistes) = get(
+        &app,
+        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        total(&pistes),
+        fusion.1,
+        "le rail annonce {} pour « {} », la liste en rend {}",
+        fusion.1,
+        fusion.0,
+        total(&pistes)
+    );
+
+    // La piste 91008 porte « Jazz » ET « Fusion » : elle compte une fois dans
+    // chaque carte, jamais deux fois dans la même.
+    let jazz = rail
+        .iter()
+        .find(|(v, _)| v.eq_ignore_ascii_case("Jazz"))
+        .unwrap_or_else(|| panic!("« Jazz » absent du rail : {rail:?}"));
+    let encodee = urlencoding::encode(&jazz.0);
+    let (_, pistes) = get(
+        &app,
+        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
+    )
+    .await;
+    assert_eq!(
+        total(&pistes),
+        jazz.1,
+        "« Jazz » : rail {} contre liste {}",
+        jazz.1,
+        total(&pistes)
+    );
 }
