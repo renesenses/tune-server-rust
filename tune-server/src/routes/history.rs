@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -148,7 +149,7 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {

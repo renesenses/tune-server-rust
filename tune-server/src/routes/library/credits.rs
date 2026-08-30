@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -293,7 +294,7 @@ pub(super) async fn enrich_all_credits(State(state): State<AppState>) -> impl In
                 "SELECT id, musicbrainz_recording_id FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|r| {
                 let id = r.get(0).and_then(|v| v.as_i64())?;

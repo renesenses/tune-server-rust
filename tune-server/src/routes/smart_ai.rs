@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -172,7 +173,7 @@ async fn generate_smart_playlist(
     let artist_names: Vec<String> = state
         .backend
         .query_many("SELECT name FROM artists", &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
         .collect();
@@ -204,7 +205,10 @@ async fn generate_smart_playlist(
         params.push(artist as &dyn ToSqlValue);
     }
     params.push(&limit as &dyn ToSqlValue);
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -374,7 +378,7 @@ async fn mood_playlist(
                     &limit as &dyn ToSqlValue,
                 ],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(decode_track_row)
             .collect()
@@ -525,7 +529,7 @@ async fn similar_to_playlist(
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -593,7 +597,7 @@ async fn history_based_playlist(
     let top_genres: Vec<String> = state
         .backend
         .query_many(&top_genres_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -612,7 +616,7 @@ async fn history_based_playlist(
     let top_artist_ids: Vec<i64> = state
         .backend
         .query_many(&top_artists_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_i64()))
         .collect();
@@ -640,7 +644,7 @@ async fn history_based_playlist(
         let artist_tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&artist_limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -683,7 +687,7 @@ async fn history_based_playlist(
         let genre_tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&genre_limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -718,7 +722,7 @@ async fn history_based_playlist(
         all_tracks = state
             .backend
             .query_many(&sql, &[&limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -800,7 +804,7 @@ async fn tempo_match_playlist(
                 &limit as &dyn ToSqlValue,
             ],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -857,7 +861,7 @@ async fn discovery_playlist(
              LIMIT 5",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -878,7 +882,7 @@ async fn discovery_playlist(
         let tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -927,7 +931,7 @@ async fn discovery_playlist(
     let tracks: Vec<Value> = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({

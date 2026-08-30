@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use std::collections::HashMap;
 
 use axum::extract::{Path, Query, State};
@@ -265,7 +266,7 @@ fn pistes_mp3(state: &AppState) -> Vec<(i64, String, Option<i64>, Option<i64>)> 
             "SELECT id, file_path, duration_ms, file_size FROM tracks              WHERE file_path IS NOT NULL AND LOWER(file_path) LIKE '%.mp3'",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|r| {
             Some((
@@ -2578,7 +2579,7 @@ fn known_genres(state: &AppState) -> Vec<String> {
              WHERE genre IS NOT NULL AND genre <> '' ORDER BY genre",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next().and_then(|v| v.as_string()))
         .filter(|g| g.chars().count() >= 3)
@@ -2597,7 +2598,7 @@ fn tracks_missing_genre(state: &AppState) -> Vec<(i64, String, String)> {
                AND file_path IS NOT NULL AND file_path <> ''",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();

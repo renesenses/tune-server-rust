@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
@@ -345,7 +346,7 @@ pub(super) async fn browse_directory(
             &sql,
             &[&dir_prefix as &dyn tune_core::db::backend::ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .filter_map(|cols| {
