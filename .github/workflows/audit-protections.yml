@@ -1,0 +1,115 @@
+name: Audit des protections
+
+# Audit minimal du train de release (#2816, runbook GitHub Free de #2808).
+#
+# Il ne vérifie QUE ce que GitHub Free expose réellement, et il le dit quand
+# il ne peut pas vérifier. Un audit qui prétend contrôler une règle
+# inexistante est pire qu'un audit absent : il fabrique une assurance.
+#
+# Lancé à la main, avant le dry-run du contrôleur. Aucun service, aucune base,
+# aucune App, aucun jeton supplémentaire — `GITHUB_TOKEN` et `jq` suffisent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version du train à auditer (ex. 0.9.128)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  administration: read
+
+jobs:
+  audit:
+    name: Protections, armement, manifeste
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auditer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -uo pipefail
+          echec=0
+          dire()  { printf '  %s\n' "$1"; }
+          ok()    { printf '  ✅ %s\n' "$1"; }
+          ko()    { printf '  ❌ %s\n' "$1"; echec=1; }
+          na()    { printf '  ⚠️  %s\n' "$1"; }
+
+          PUBLICS="tune-server-rust tune-web-client"
+          PRIVES="tune-os tune-server-universal"
+          TOUS="tune-server-rust tune-os tune-web-client tune-server-universal"
+
+          echo "=== 1. Protections des dépôts PUBLICS ==="
+          for d in $PUBLICS; do
+            echo "· renesenses/$d"
+            for br in main "rc/v$VERSION"; do
+              enc=$(printf '%s' "$br" | sed 's#/#%2F#g')
+              p=$(gh api "repos/renesenses/$d/branches/$enc/protection" 2>/dev/null || echo "")
+              if [ -z "$p" ]; then
+                ko "$br : AUCUNE protection lisible"
+                continue
+              fi
+              [ "$(echo "$p" | jq -r '.allow_force_pushes.enabled')" = "false" ] \
+                && ok "$br : force-push interdit" || ko "$br : force-push AUTORISÉ"
+              [ "$(echo "$p" | jq -r '.allow_deletions.enabled')" = "false" ] \
+                && ok "$br : suppression interdite" || ko "$br : suppression AUTORISÉE"
+              [ "$(echo "$p" | jq -r '.enforce_admins.enabled')" = "true" ] \
+                && ok "$br : règles appliquées aux administrateurs" \
+                || ko "$br : administrateurs EXEMPTÉS — la protection ne vaut que pour les autres"
+              n=$(echo "$p" | jq -r '[.required_status_checks.contexts[]?] | length')
+              [ "$n" -gt 0 ] && ok "$br : $n contrôle(s) requis" || ko "$br : AUCUN contrôle requis"
+            done
+          done
+
+          echo "=== 2. Dépôts PRIVÉS — ce que GitHub Free ne permet pas ==="
+          for d in $PRIVES; do
+            na "renesenses/$d : protection non disponible — GitHub Free. Exception documentée : seuls JP et Bertrand fusionnent ou taguent."
+          done
+
+          echo "=== 3. Variables d'armement ==="
+          for v in RELEASE_CONTROLLER_ENABLED RELEASE_PROMOTION_ENABLED; do
+            val=$(gh api "repos/renesenses/tune-server-rust/actions/variables/$v" --jq '.value' 2>/dev/null || echo "ABSENTE")
+            case "$val" in
+              false|ABSENTE) ok "$v = $val" ;;
+              *)             ko "$v = $val — le contrôleur est ARMÉ" ;;
+            esac
+          done
+
+          echo "=== 4. Aucun tag du train ne doit exister ==="
+          for d in $TOUS; do
+            t=$(gh api "repos/renesenses/$d/git/matching-refs/tags" \
+                  --jq "[.[] | select(.ref | test(\"v$VERSION\$\"))] | length" 2>/dev/null || echo 0)
+            [ "$t" = "0" ] && ok "$d : aucun tag v$VERSION" || ko "$d : $t tag(s) v$VERSION DÉJÀ créé(s)"
+          done
+
+          echo "=== 5. Manifeste : les SHA doivent être atteignables depuis leur main ==="
+          m=".release/v$VERSION.json"
+          if [ ! -f "$m" ]; then
+            na "$m absent de cette branche — rien à vérifier ici"
+          else
+            echo "  ready = $(jq -r '.ready // "absent"' "$m")"
+            jq -r 'to_entries[] | select(.value | type == "object" and has("sha")) | "\(.key) \(.value.sha)"' "$m" \
+            | while read -r nom sha; do
+                [ -z "$sha" ] && { ko "$nom : SHA vide"; continue; }
+                if gh api "repos/renesenses/$nom/compare/main...$sha" --jq '.status' 2>/dev/null \
+                     | grep -qE '^(identical|behind)$'; then
+                  ok "$nom : $sha atteignable depuis main"
+                else
+                  ko "$nom : $sha N'EST PAS atteignable depuis main"
+                fi
+              done
+          fi
+
+          echo
+          if [ "$echec" -eq 0 ]; then
+            echo "Audit vert. ⚠️  Rappel : les deux dépôts privés n'ont PAS été vérifiés — GitHub Free ne l'expose pas."
+          else
+            echo "Audit ROUGE — voir les ❌ ci-dessus."
+          fi
+          exit "$echec"

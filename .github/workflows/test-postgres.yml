@@ -16,13 +16,16 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/test-postgres.yml"
+  # PAS de filtre `paths` ici, delibérément (#2808).
+  #
+  # Avec un filtre de chemins, une PR `rc/* -> main` qui ne touche ni
+  # `tune-core/**` ni les manifestes Cargo ne declenche PAS ce workflow --
+  # donc une release d'infrastructure pure passait la promotion vers `main`
+  # SANS qu'aucune base PostgreSQL vivante n'ait ete exercee. GitHub ne sait
+  # pas conditionner `paths` a la branche cible : le filtrage se fait donc
+  # dans le `if:` du job ci-dessous, qui reste le seul endroit ou l'on decide.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    paths:
-      - "tune-core/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/test-postgres.yml"
   workflow_dispatch:
 
 concurrency:
@@ -35,6 +38,10 @@ jobs:
     # Une PR de correctif vers batch/* ou rc/* garde le noyau Rust de ci.yml.
     # Cette suite revient sur la promotion vers main ou des que ci:full
     # l'exige.
+    #
+    # Consequence de la levee du filtre `paths` : toute PR vers `main` passe
+    # ici, y compris une promotion `rc/* -> main` qui ne touche aucun fichier
+    # Rust. C'est exactement le trou que #2808 demandait de fermer.
     if: >-
       github.event_name != 'pull_request'
       || (!startsWith(github.base_ref, 'batch/') && !startsWith(github.base_ref, 'rc/'))
