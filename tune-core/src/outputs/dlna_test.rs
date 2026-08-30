@@ -53,6 +53,12 @@ mod tests {
         oublie_le_media_une_fois: Arc<Mutex<bool>>,
         /// Nombre de `Play` REFUSÉS avec un 701.
         play_refus_701: Arc<AtomicU32>,
+        /// Le renderer ACQUITTE le premier `Play` puis refuse tous les suivants
+        /// avec un 701 — c'est le `Play` de la relance (« acquitté mais jamais
+        /// appliqué ») qui se fait refuser. Ce chemin-là repose l'URI et rejoue,
+        /// exactement comme la boucle de #2581, mais sa réponse n'était pas
+        /// relue : le refus passait pour un acquittement.
+        relance_701: Arc<Mutex<bool>>,
         /// Nombre TOTAL d'actions SOAP reçues, tous services confondus.
         ///
         /// L'instrument de mesure de #2263 : le sondeur passe par `get_status`
@@ -113,6 +119,7 @@ mod tests {
                 stop_oublie_le_media: Arc::new(Mutex::new(false)),
                 oublie_le_media_une_fois: Arc::new(Mutex::new(false)),
                 play_refus_701: Arc::new(AtomicU32::new(0)),
+                relance_701: Arc::new(Mutex::new(false)),
                 actions_soap: Arc::new(AtomicU32::new(0)),
                 position_ms: Arc::new(AtomicU32::new(90_000)),
                 // Position IMMOBILE par défaut : c'est ce que le renderer
@@ -347,6 +354,16 @@ mod tests {
                 if charge_encore {
                     state.play_refus_701.fetch_add(1, Ordering::Relaxed);
                     *state.transport_state.lock().await = "TRANSITIONING".into();
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
+                        .into_response();
+                }
+                // Le premier `Play` est acquitté ; le suivant — celui de la
+                // relance — se fait refuser. Déterministe : c'est le COMPTE de
+                // Play acceptés qui décide, jamais une horloge.
+                if *state.relance_701.lock().await && state.play_count.load(Ordering::Relaxed) >= 1
+                {
+                    state.play_refus_701.fetch_add(1, Ordering::Relaxed);
+                    *state.transport_state.lock().await = "STOPPED".into();
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, soap_701())
                         .into_response();
                 }
@@ -1281,6 +1298,59 @@ mod tests {
             *state.current_uri.lock().await,
             url,
             "le renderer doit finir sur NOTRE flux"
+        );
+        handle.abort();
+    }
+
+    /// LA SŒUR NUE de #2581 : `play_media` contient DEUX séquences
+    /// `SetAVTransportURI` → `Play`. La première a la lecture du 701 (la boucle
+    /// à cinq essais, corrigée pour #2581) ; la seconde — la relance d'un Play
+    /// « acquitté mais jamais appliqué » — repose l'URI, rejoue… et **jetait la
+    /// réponse**. Un 701 sur ce Play ressortait donc sous le message « Le
+    /// renderer a acquitté Play mais joue toujours une autre source » : deux
+    /// affirmations fausses, sur le message même qui avait poussé un testeur à
+    /// réinstaller son système entier (#2396).
+    ///
+    /// Le mock est déterministe : c'est le NOMBRE de `Play` acceptés qui décide
+    /// du refus, jamais une horloge — aucune course, aucun tour sur deux.
+    #[tokio::test]
+    async fn un_701_sur_le_play_de_la_relance_est_nomme_et_non_travesti() {
+        let state = MockState::default();
+        // Le renderer acquitte tout mais n'applique jamais l'URI : c'est ce qui
+        // déclenche la relance (l'Eversolo de la course des 5 ms).
+        *state.media_info_fige.lock().await = true;
+        // …et il refuse le Play de cette relance avec le 701 de FabienM.
+        *state.relance_701.lock().await = true;
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let url = "http://192.168.1.74:8085/stream/relance-701.flac";
+        let erreur = output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("Never Let Me Down Again"),
+                ..Default::default()
+            })
+            .await
+            .expect_err("l'URI n'est jamais appliquée : la lecture doit échouer");
+
+        assert_eq!(
+            state.play_refus_701.load(Ordering::Relaxed),
+            1,
+            "le Play de la relance devait bien être refusé une fois"
+        );
+        assert!(
+            erreur.contains("701"),
+            "le message doit NOMMER le code que l'appareil a rendu : {erreur}"
+        );
+        assert!(
+            erreur.contains("REFUSÉ"),
+            "le message doit dire que l'appareil a refusé, pas acquitté : {erreur}"
+        );
+        assert!(
+            !erreur.contains("joue toujours une autre source"),
+            "l'appareil ne joue RIEN d'autre : il a refusé la transition — {erreur}"
         );
         handle.abort();
     }
