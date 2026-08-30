@@ -142,6 +142,21 @@ static CACHE_VERSIONS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 const CACHE_VERSIONS_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
+/// Taille du vivier demandé au service avant le classement local.
+///
+/// Gardé dans une fonction pure pour que le contrat propre à chaque API soit
+/// testable sans authentifiants de streaming.
+fn limite_recherche_versions(service: &str) -> usize {
+    match service {
+        // Qobuz accepte 50 éléments dans sa première page. Demander cette
+        // page entière ne coûte donc aucun aller-retour de plus, mais évite
+        // qu'un titre courant (`Somebody`, #2774) chasse les versions du bon
+        // artiste hors du vivier avant `classer_version`.
+        "qobuz" => 50,
+        _ => 10,
+    }
+}
+
 /// Les autres versions d'un morceau PRESENTES DANS LA BIBLIOTHEQUE.
 ///
 /// `exclure` est la piste de depart : elle satisferait le predicat si son
@@ -235,7 +250,10 @@ pub(crate) async fn versions_streaming(
             if !svc.enabled() || !svc.auth_status().await.authenticated {
                 continue;
             }
-            let Ok(resultats) = svc.search(titre, 10).await else {
+            let Ok(resultats) = svc
+                .search(titre, limite_recherche_versions(nom_service))
+                .await
+            else {
                 continue;
             };
             drop(svc);
@@ -323,9 +341,21 @@ pub(crate) async fn versions_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClasseVersion, classer_version, predicat_rapprochement, predicat_titres_equivalents,
-        titres_equivalents,
+        ClasseVersion, classer_version, limite_recherche_versions, predicat_rapprochement,
+        predicat_titres_equivalents, titres_equivalents,
     };
+
+    /// Contre-épreuve de #2774 : `Somebody` / Depeche Mode peut être absent
+    /// des dix premiers résultats Qobuz. Cinquante tient encore dans l'unique
+    /// page de `/catalog/search`, donc élargit le vivier sans appel réseau
+    /// supplémentaire. Les autres services conservent leur contrat existant.
+    #[test]
+    fn qobuz_classe_une_page_entiere_avant_de_filtrer_les_versions() {
+        assert_eq!(limite_recherche_versions("qobuz"), 50);
+        assert_eq!(limite_recherche_versions("tidal"), 10);
+        assert_eq!(limite_recherche_versions("deezer"), 10);
+        assert_eq!(limite_recherche_versions("spotify"), 10);
+    }
 
     /// « Billie Jean » par Michael Jackson sur un AUTRE album : une version.
     #[test]

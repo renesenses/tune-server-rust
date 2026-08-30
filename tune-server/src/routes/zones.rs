@@ -1766,6 +1766,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             inject_metadata_anchor(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
+            obj.insert(
+                "can_skip_next".into(),
+                json!(crate::routes::playback::can_skip_next(&ps)),
+            );
             // L'aleatoire et la repetition appartiennent a la ZONE, et ils
             // survivent aux redemarrages : `queue_persistence` les enregistre
             // avec la file, `startup.rs` les restaure.
@@ -1969,6 +1973,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 // "now playing" highlight on track change without refetching the
                 // whole queue (expensive under a large shuffle queue, #1096).
                 obj.insert("queue_position".into(), json!(ps.queue_position));
+                obj.insert(
+                    "can_skip_next".into(),
+                    json!(crate::routes::playback::can_skip_next(&ps)),
+                );
                 // Meme raison qu'au-dessus (#2092) : c'est cette charge utile
                 // que le client relit apres chaque evenement de lecture, et
                 // c'est elle qui doit lui apprendre un aleatoire deja actif.
@@ -5245,9 +5253,9 @@ mod charge_utile_zone_guard {
 
     /// `queue_length` sert de marqueur : c'est le champ que porte toute charge
     /// utile décrivant l'état de lecture d'une zone. Chacune doit porter aussi
-    /// l'aléatoire et la répétition.
+    /// l'aléatoire, la répétition et la décision autoritaire « suivant ».
     #[test]
-    fn toute_charge_utile_de_zone_porte_l_aleatoire_et_la_repetition() {
+    fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
         let src = code_de_production();
         // Les motifs ne portent PAS le `obj.insert(` qui les précède : rustfmt
         // coupe un appel long sur trois lignes dès que ses arguments grossissent,
@@ -5257,6 +5265,7 @@ mod charge_utile_zone_guard {
         let etats = src.matches(r#""queue_length".into()"#).count();
         let aleatoire = src.matches(r#""shuffle".into()"#).count();
         let repetition = src.matches(r#""repeat".into()"#).count();
+        let suivant = src.matches(r#""can_skip_next".into()"#).count();
 
         assert!(
             etats >= 2,
@@ -5273,6 +5282,12 @@ mod charge_utile_zone_guard {
             repetition, etats,
             "{etats} charge(s) utile(s) de zone, mais {repetition} portent \
              `repeat` : même divergence, autre réglage."
+        );
+        assert_eq!(
+            suivant, etats,
+            "{etats} charge(s) utile(s) de zone, mais {suivant} portent \
+             `can_skip_next` : le client recommencerait à deviner la fin de la \
+             permutation depuis l'ordre brut de la file (#2337)."
         );
     }
 }
@@ -5338,7 +5353,13 @@ mod contrat_des_retours_anticipes {
             Some(0.5),
             "volume en contrat client (0..1), pas la valeur de la base"
         );
-        for champ in ["state", "current_track", "position_ms", "queue_length"] {
+        for champ in [
+            "state",
+            "current_track",
+            "position_ms",
+            "queue_length",
+            "can_skip_next",
+        ] {
             assert!(
                 v.get(champ).is_some(),
                 "{champ} absent : le client garderait la valeur d'une autre zone"
