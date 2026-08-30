@@ -33,6 +33,14 @@
 //! 4. **la contre-épreuve** : les deux issues précédentes ne partagent NI le
 //!    statut HTTP, NI le code, NI le message. Sans cette assertion-là, rien ne
 //!    prouve que la distinction est observable.
+//!
+//! **Section 7 — le titre même du ticket.** « La recherche n'interroge aucun
+//! annuaire » restait vrai après la migration 90 : celle-ci a gelé un relevé du
+//! 30/08 dans le semis, ce qui règle le catalogue livré du jour et non le
+//! mécanisme. La recherche consulte désormais le relevé de l'annuaire conservé
+//! en mémoire, et distingue « nulle part » de « pas encore chez vous ». Aucun
+//! de ces essais ne touche au réseau : l'annuaire y est déposé à la main, là où
+//! `refresh_radio_logos` le pose au démarrage.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -394,10 +402,12 @@ async fn le_message_daucun_resultat_suit_la_langue_demandee() {
 
 /// La portée est un relevé, pas une promesse.
 ///
-/// Brancher l'annuaire public de mozaiklabs.fr sur la recherche est la voie 1
-/// de l'issue, laissée à l'arbitrage. Tant qu'elle n'est pas tranchée, la
-/// réponse doit dire honnêtement où elle a cherché — sans quoi « pas trouvé »
-/// continue de se lire « n'existe pas ».
+/// Sur un serveur qui n'a PAS relevé l'annuaire — hors ligne au démarrage,
+/// mozaiklabs.fr indisponible, ou un essai comme celui-ci qui ne touche jamais
+/// au réseau — la recherche n'a bel et bien que le catalogue local, et la
+/// réponse doit continuer de le dire. C'est aussi le témoin de non-régression
+/// du branchement de l'annuaire : la valeur `"catalogue_local"` ne bouge pas
+/// pour un serveur dans cette situation.
 #[tokio::test]
 async fn la_portee_est_annoncee_sur_les_trois_issues() {
     let (app_sain, etat_sain) = app_et_etat();
@@ -419,4 +429,348 @@ async fn la_portee_est_annoncee_sur_les_trois_issues() {
             "portée absente pour {nom} : {corps}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 7. LE TITRE DU TICKET — « la recherche n'interroge aucun annuaire »
+// ---------------------------------------------------------------------------
+//
+// La migration 90 (PR #2878) a gelé un relevé de l'annuaire au 30/08 dans le
+// semis. Elle règle le catalogue livré du jour ; elle ne règle pas le
+// MÉCANISME. L'annuaire servait 46 stations le 22/08 et 51 le 30/08, et tout
+// ce qui y entre après le gel n'atteint plus personne — c'est mot pour mot ce
+// que Bilou a vécu : « je les avais fait ajouter » était vrai côté annuaire
+// (fil 626, 14/06) et faux côté produit pendant deux mois.
+//
+// Ces essais ne touchent JAMAIS au réseau : l'annuaire est déposé directement
+// dans `state.annuaire_radios`, exactement là où `refresh_radio_logos` le pose
+// au démarrage. Le chemin de la recherche est le même, à la source du relevé
+// près.
+
+use tune_server::routes::radios::StationAnnuaire;
+
+fn station_annuaire(nom: &str, url: &str, pays: &str, genre: &str) -> StationAnnuaire {
+    StationAnnuaire {
+        name: nom.into(),
+        stream_url: url.into(),
+        logo_url: Some("https://mozaiklabs.fr/storage/radios/logo.png".into()),
+        country: Some(pays.into()),
+        genre: Some(genre.into()),
+        quality: Some("flac".into()),
+        website_url: None,
+    }
+}
+
+/// Dépose un relevé d'annuaire, comme le ferait un démarrage en ligne.
+fn relever_lannuaire(state: &tune_server::state::AppState, stations: Vec<StationAnnuaire>) {
+    *state
+        .annuaire_radios
+        .write()
+        .expect("le relevé de l'annuaire doit être accessible") = stations;
+}
+
+/// Une station ajoutée à l'annuaire APRÈS le gel du semis : le cas que la
+/// migration 90 ne peut structurellement pas couvrir.
+fn station_posterieure_au_semis() -> StationAnnuaire {
+    station_annuaire(
+        "Radio Ajoutee Apres Le Gel",
+        "https://exemple.invalid/apres-le-gel.flac",
+        "Islande",
+        "Ambient",
+    )
+}
+
+/// LE défaut du titre : une station présente à l'annuaire et absente du
+/// catalogue était introuvable, et rien ne la distinguait d'une station qui
+/// n'existe pas.
+#[tokio::test]
+async fn une_station_de_lannuaire_absente_du_catalogue_est_desormais_proposee() {
+    let (app, state) = app_et_etat();
+    le_catalogue_est_peuple(&state);
+    relever_lannuaire(&state, vec![station_posterieure_au_semis()]);
+
+    let (status, corps) = chercher(&app, "Ajoutee Apres Le Gel").await;
+
+    // La recherche a ABOUTI, et sur autre chose que le vide.
+    assert_eq!(status, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["statut"], "annuaire_seul", "corps = {corps}");
+    assert_eq!(
+        corps["code"], "radio_recherche_annuaire_seul",
+        "corps = {corps}"
+    );
+
+    // `items` garde son sens : le catalogue LOCAL. Il ne la contient pas.
+    assert_eq!(corps["count"], 0, "corps = {corps}");
+    assert_eq!(corps["items"], json!([]), "corps = {corps}");
+
+    // Et la station est là, avec son adresse — l'ajout tient en un geste.
+    assert_eq!(corps["annuaire_count"], 1, "corps = {corps}");
+    assert_eq!(
+        corps["annuaire"][0]["stream_url"], "https://exemple.invalid/apres-le-gel.flac",
+        "corps = {corps}"
+    );
+    assert_eq!(
+        corps["annuaire"][0]["name"], "Radio Ajoutee Apres Le Gel",
+        "corps = {corps}"
+    );
+
+    // La portée a changé, et le dit.
+    assert_eq!(
+        corps["portee"], "catalogue_local_et_annuaire",
+        "corps = {corps}"
+    );
+
+    // Le message n'est PLUS celui de « aucun résultat » : il ne demande pas de
+    // saisir une adresse qu'on a déjà.
+    let message = corps["message"].as_str().expect("message absent");
+    assert!(
+        !message.contains("Aucune station de ce nom"),
+        "message d'absence servi alors que l'annuaire connaît la station : {message}"
+    );
+    assert!(message.contains("annuaire"), "message = {message}");
+}
+
+/// CONTRE-ÉPREUVE de l'essai précédent : la MÊME requête, sur un serveur qui
+/// n'a pas relevé l'annuaire, rend « aucun résultat ».
+///
+/// Sans elle, `annuaire_seul` pourrait être rendu pour n'importe quelle raison.
+#[tokio::test]
+async fn sans_releve_dannuaire_la_meme_requete_rend_aucun_resultat() {
+    let (app, state) = app_et_etat();
+    le_catalogue_est_peuple(&state);
+    // Aucun relevé : c'est l'état exact d'un serveur hors ligne, et l'état
+    // d'avant ce correctif pour tout le monde.
+
+    let (status, corps) = chercher(&app, "Ajoutee Apres Le Gel").await;
+
+    assert_eq!(status, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["statut"], "aucun_resultat", "corps = {corps}");
+    assert_eq!(corps["annuaire_count"], 0, "corps = {corps}");
+    assert_eq!(corps["portee"], "catalogue_local", "corps = {corps}");
+}
+
+/// Une station de l'annuaire DÉJÀ au catalogue n'est jamais proposée deux fois
+/// — ni par son adresse, ni par son nom.
+///
+/// L'appariement porte sur les deux, comme la garde de la migration 90 : une
+/// station repointée vers un relais local garde son nom, une station renommée
+/// garde son adresse, et aucune des deux ne doit revenir en suggestion.
+#[tokio::test]
+async fn une_station_deja_au_catalogue_nest_pas_proposee_en_double() {
+    let (app, state) = app_et_etat();
+    semer_station(
+        &state,
+        "Radio Temoin Doublon",
+        "https://exemple.invalid/temoin-doublon.mp3",
+    );
+    semer_station(
+        &state,
+        "Radio Temoin Repointee",
+        "https://mon-relais.local/temoin.mp3",
+    );
+
+    relever_lannuaire(
+        &state,
+        vec![
+            // Même adresse, nom différent (station renommée localement) —
+            // et le nom local ne répond même pas à la requête, ce que seule
+            // l'exclusion sur le CATALOGUE ENTIER permet de voir.
+            station_annuaire(
+                "Radio Temoin Doublon (annuaire)",
+                "http://exemple.invalid/temoin-doublon.mp3/",
+                "Temoinie",
+                "Temoin",
+            ),
+            // Même nom, adresse différente (station repointée localement).
+            station_annuaire(
+                "Radio Temoin Repointee",
+                "https://exemple.invalid/officiel.mp3",
+                "Temoinie",
+                "Temoin",
+            ),
+        ],
+    );
+
+    let (status, corps) = chercher(&app, "Temoinie").await;
+
+    assert_eq!(status, StatusCode::OK, "corps = {corps}");
+    assert_eq!(
+        corps["annuaire_count"], 0,
+        "des stations déjà au catalogue ont été proposées : {corps}"
+    );
+    // Rien à suggérer ⇒ on ne bascule pas en `annuaire_seul` : le pays
+    // « Temoinie » n'est porté par aucune station locale.
+    assert_eq!(corps["statut"], "aucun_resultat", "corps = {corps}");
+}
+
+/// Une station de l'annuaire ne se glisse JAMAIS dans `items`.
+///
+/// C'est la garantie de compatibilité : `items` porte des `RadioStation` avec
+/// un `id` en base. Un client qui y trouverait une suggestion tenterait de
+/// jouer un identifiant qui n'existe pas.
+#[tokio::test]
+async fn les_suggestions_de_lannuaire_ne_polluent_pas_items() {
+    let (app, state) = app_et_etat();
+    semer_station(
+        &state,
+        "Radio Temoin Melange",
+        "https://exemple.invalid/melange.mp3",
+    );
+    relever_lannuaire(
+        &state,
+        vec![station_annuaire(
+            "Radio Temoin Melange Bis",
+            "https://exemple.invalid/melange-bis.mp3",
+            "France",
+            "Temoin",
+        )],
+    );
+
+    let (status, corps) = chercher(&app, "Temoin Melange").await;
+
+    assert_eq!(status, StatusCode::OK, "corps = {corps}");
+    // Le catalogue local a répondu : le statut reste `resultats`.
+    assert_eq!(corps["statut"], "resultats", "corps = {corps}");
+    assert_eq!(corps["count"], 1, "corps = {corps}");
+    assert_eq!(corps["annuaire_count"], 1, "corps = {corps}");
+
+    let items = corps["items"].as_array().expect("items");
+    assert!(
+        items.iter().all(|i| i["id"].is_i64()),
+        "une entrée sans id en base s'est glissée dans items : {corps}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|i| i["name"] != "Radio Temoin Melange Bis"),
+        "une suggestion d'annuaire est passée dans items : {corps}"
+    );
+}
+
+/// Une PANNE du catalogue ne fait pas proposer l'annuaire.
+///
+/// On ne sait alors rien du catalogue local, et surtout pas qu'il ne contient
+/// pas ces stations : suggérer un ajout mènerait droit au doublon.
+#[tokio::test]
+async fn une_panne_du_catalogue_ne_propose_rien_de_lannuaire() {
+    let (app, state) = app_et_etat();
+    relever_lannuaire(&state, vec![station_posterieure_au_semis()]);
+    casser_le_catalogue(&state);
+
+    let (status, corps) = chercher(&app, "Ajoutee Apres Le Gel").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "corps = {corps}");
+    assert_eq!(corps["statut"], "echec", "corps = {corps}");
+    assert_eq!(
+        corps["annuaire_count"], 0,
+        "l'annuaire a été proposé sur un catalogue en panne : {corps}"
+    );
+}
+
+/// TÉMOIN ANTI-RÉGRESSION : les radios françaises déjà servies aujourd'hui le
+/// restent, que l'annuaire ait été relevé ou non.
+///
+/// Le correctif ne touche ni au semis, ni à `repo.search`, ni au sens de
+/// `items` — cet essai le MESURE au lieu de l'affirmer, dans les deux
+/// configurations, et compare les deux `items` champ à champ.
+#[tokio::test]
+async fn les_radios_francaises_restent_servies_avec_ou_sans_annuaire() {
+    let (app_hors_ligne, etat_hors_ligne) = app_et_etat();
+    le_catalogue_est_peuple(&etat_hors_ligne);
+
+    let (app_en_ligne, etat_en_ligne) = app_et_etat();
+    le_catalogue_est_peuple(&etat_en_ligne);
+    relever_lannuaire(
+        &etat_en_ligne,
+        vec![
+            station_posterieure_au_semis(),
+            // Une entrée qui DOUBLE une station livrée : elle ne doit rien
+            // changer aux résultats français.
+            station_annuaire(
+                "FIP",
+                "https://icecast.radiofrance.fr/fip-hifi.aac",
+                "FR",
+                "eclectic",
+            ),
+        ],
+    );
+
+    for requete in ["fip", "France Musique", "Radio Classique", "France"] {
+        let (statut_hl, corps_hl) = chercher(&app_hors_ligne, requete).await;
+        let (statut_el, corps_el) = chercher(&app_en_ligne, requete).await;
+
+        assert_eq!(statut_hl, StatusCode::OK, "{requete} : {corps_hl}");
+        assert_eq!(statut_el, StatusCode::OK, "{requete} : {corps_el}");
+        assert_eq!(corps_hl["statut"], "resultats", "{requete} : {corps_hl}");
+        assert_eq!(corps_el["statut"], "resultats", "{requete} : {corps_el}");
+        assert!(
+            corps_hl["count"].as_u64().unwrap_or(0) >= 1,
+            "{requete} : plus rien hors ligne, {corps_hl}"
+        );
+        // L'assertion qui compte : le catalogue rendu est IDENTIQUE.
+        assert_eq!(
+            corps_hl["items"], corps_el["items"],
+            "{requete} : le branchement de l'annuaire a changé les résultats locaux"
+        );
+        assert_eq!(
+            corps_hl["count"], corps_el["count"],
+            "{requete} : {corps_el}"
+        );
+    }
+}
+
+/// Le message d'« annuaire seul » suit la langue, comme les deux autres.
+#[tokio::test]
+async fn le_message_dannuaire_seul_suit_la_langue_demandee() {
+    let (app, state) = app_et_etat();
+    relever_lannuaire(&state, vec![station_posterieure_au_semis()]);
+
+    let (_, en_fr) = chercher_dans_la_langue(&app, "Ajoutee Apres Le Gel", "fr-FR,fr;q=0.9").await;
+    let (_, en_en) = chercher_dans_la_langue(&app, "Ajoutee Apres Le Gel", "en-GB,en;q=0.9").await;
+
+    let fr = en_fr["message"].as_str().expect("message fr absent");
+    let en = en_en["message"].as_str().expect("message en absent");
+    assert!(fr.contains("annuaire Tune"), "fr = {fr}");
+    assert!(en.contains("Tune directory"), "en = {en}");
+    assert_ne!(fr, en, "la traduction n'a pas été appliquée");
+    assert_eq!(en_fr["code"], en_en["code"], "le code doit être stable");
+}
+
+/// CONTRE-ÉPREUVE des trois issues, portée à quatre : « annuaire seul » ne
+/// partage NI le code, NI le message, NI la portée avec « aucun résultat ».
+///
+/// C'est l'assertion qui donne son sens aux précédentes — sans elle, rien ne
+/// prouve qu'un client puisse distinguer « nulle part » de « pas chez vous ».
+#[tokio::test]
+async fn annuaire_seul_et_aucun_resultat_sont_discernables() {
+    let (app_avec, etat_avec) = app_et_etat();
+    relever_lannuaire(&etat_avec, vec![station_posterieure_au_semis()]);
+    let (app_sans, _etat_sans) = app_et_etat();
+
+    let (statut_avec, corps_avec) = chercher(&app_avec, "Ajoutee Apres Le Gel").await;
+    let (statut_sans, corps_sans) = chercher(&app_sans, "Ajoutee Apres Le Gel").await;
+
+    // Les deux ABOUTISSENT — ce n'est pas la distinction panne/vide.
+    assert_eq!(statut_avec, StatusCode::OK);
+    assert_eq!(statut_sans, StatusCode::OK);
+
+    assert_ne!(
+        corps_avec["code"], corps_sans["code"],
+        "code identique : {}",
+        corps_avec["code"]
+    );
+    assert_ne!(
+        corps_avec["message"], corps_sans["message"],
+        "message identique : {}",
+        corps_avec["message"]
+    );
+    assert_ne!(
+        corps_avec["portee"], corps_sans["portee"],
+        "portée identique : {}",
+        corps_avec["portee"]
+    );
+    assert_ne!(
+        corps_avec["annuaire_count"], corps_sans["annuaire_count"],
+        "aucune station proposée d'un côté comme de l'autre : {corps_avec}"
+    );
 }

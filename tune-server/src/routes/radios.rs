@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
@@ -286,6 +286,16 @@ pub(crate) enum IssueRecherche {
     /// Le catalogue local a répondu, et ne connaît aucune station de ce nom.
     /// C'est un fait sur CE catalogue, pas sur la station.
     Aucune,
+    /// Le catalogue local ne connaît pas la station, **mais l'annuaire public
+    /// si**. C'est le cas exact de Radio Paradise pour Belkadi Yacine : absente
+    /// de son Tune, présente dans notre annuaire depuis le 14/06 (fil 626), et
+    /// rien ne le lui disait.
+    ///
+    /// Une variante à part, et non un `Aucune` avec une liste en plus : le
+    /// message de `Aucune` invite à saisir une adresse de flux à la main, alors
+    /// qu'ici l'adresse est CONNUE et l'ajout tient en un geste. Les deux
+    /// situations n'appellent pas la même phrase.
+    AnnuaireSeul,
     /// La recherche n'a pas pu aboutir — dépôt injoignable, schéma absent,
     /// requête refusée. On ne sait RIEN du catalogue, et surtout pas qu'il
     /// serait vide.
@@ -298,6 +308,7 @@ impl IssueRecherche {
         match self {
             Self::Resultats => "resultats",
             Self::Aucune => "aucun_resultat",
+            Self::AnnuaireSeul => "annuaire_seul",
             Self::Echec(_) => "echec",
         }
     }
@@ -307,6 +318,7 @@ impl IssueRecherche {
         match self {
             Self::Resultats => "radio_recherche_resultats",
             Self::Aucune => "radio_recherche_aucun_resultat",
+            Self::AnnuaireSeul => "radio_recherche_annuaire_seul",
             Self::Echec(_) => "radio_recherche_echec",
         }
     }
@@ -316,7 +328,7 @@ impl IssueRecherche {
     /// telle même par un client qui ne regarde que le code de retour.
     pub(crate) fn statut_http(&self) -> StatusCode {
         match self {
-            Self::Resultats | Self::Aucune => StatusCode::OK,
+            Self::Resultats | Self::Aucune | Self::AnnuaireSeul => StatusCode::OK,
             Self::Echec(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -327,31 +339,204 @@ impl IssueRecherche {
         match self {
             Self::Resultats => None,
             Self::Aucune => Some(crate::i18n::t(lang, "radio.recherche.aucunResultat")),
+            Self::AnnuaireSeul => Some(crate::i18n::t(lang, "radio.recherche.annuaireSeul")),
             Self::Echec(_) => Some(crate::i18n::t(lang, "radio.recherche.echec")),
         }
     }
 }
 
-/// Le seul endroit interrogé par `/radios/search` aujourd'hui.
+/// Une entrée de l'annuaire public de mozaiklabs.fr, réduite à ce qui sert.
 ///
-/// Nommé dans la réponse pour que « pas trouvé » soit qualifié. L'annuaire
-/// public de mozaiklabs.fr n'est joint qu'au démarrage, et seulement pour les
-/// logos ([`refresh_radio_logos`]) : l'étendre à la recherche est une décision
-/// produit, pas une omission de code (#2119).
-pub(crate) const PORTEE_RECHERCHE: &str = "catalogue_local";
+/// L'annuaire est téléchargé À CHAQUE DÉMARRAGE par [`refresh_radio_logos`],
+/// lu en entier — et son contenu jeté sauf `logo_url`. `name`, `stream_url`,
+/// `country`, `genre` étaient reçus puis perdus, c'est écrit noir sur blanc au
+/// deuxième commentaire de #2119. Ce type est ce qu'on cesse de jeter.
+///
+/// La migration 90 (#2119, PR #2878) a gelé un relevé du 30/08 dans le semis.
+/// Elle règle le catalogue livré du jour, pas le mécanisme : l'annuaire servait
+/// 46 stations le 22/08 et 51 le 30/08, et **tout ce qui y sera ajouté après le
+/// gel n'atteint personne**. C'est exactement ce que Bilou a vécu — « je les
+/// avais fait ajouter » était VRAI côté annuaire (fil 626, 14/06) et faux côté
+/// produit pendant deux mois.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StationAnnuaire {
+    pub name: String,
+    pub stream_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+}
+
+/// Racine des adresses relatives de l'annuaire (les `logo_url` en `/storage/…`).
+pub(crate) const ANNUAIRE_BASE: &str = "https://mozaiklabs.fr";
+
+/// Convertit le JSON brut de l'annuaire en entrées exploitables.
+///
+/// Une entrée sans nom ou sans adresse de flux est écartée : elle ne pourrait
+/// ni s'afficher ni s'ajouter. Aucun filtre de PAYS ni de LANGUE n'est appliqué
+/// ici, et aucun paramètre de ce genre n'est introduit par ce correctif —
+/// l'annuaire est pris ENTIER, et c'est la requête de l'utilisateur qui filtre.
+/// Un défaut de localisation trop large produit des résultats faux sans jamais
+/// échouer ; le seul moyen de ne pas en poser un est de ne pas en poser.
+pub(crate) fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
+    let texte = |item: &Value, cle: &str| {
+        item.get(cle)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    brut.iter()
+        .filter_map(|item| {
+            let name = texte(item, "name")?;
+            let stream_url = texte(item, "stream_url")?;
+            let logo_url = texte(item, "logo_url").map(|logo| {
+                if logo.starts_with("http") {
+                    logo
+                } else {
+                    format!("{ANNUAIRE_BASE}{logo}")
+                }
+            });
+            Some(StationAnnuaire {
+                name,
+                stream_url,
+                logo_url,
+                country: texte(item, "country"),
+                genre: texte(item, "genre"),
+                quality: texte(item, "quality"),
+                website_url: texte(item, "website_url"),
+            })
+        })
+        .collect()
+}
+
+/// Le repli employé par la recherche locale, reproduit à l'identique.
+///
+/// `RadioRepo::search` interroge `LOWER(unaccent(name)) LIKE LOWER(unaccent(?))`
+/// sur `name`, `genre` et `country` ; côté SQLite, `unaccent` EST
+/// [`tune_core::db::engine::fold_diacritics`] (`db/sqlite.rs`, `register_functions`).
+/// On appelle donc la même fonction plutôt qu'une approximation maison, sans
+/// quoi l'annuaire et le catalogue ne répondraient pas aux mêmes requêtes.
+fn repli(s: &str) -> String {
+    tune_core::db::engine::fold_diacritics(s).to_lowercase()
+}
+
+/// La station de l'annuaire répond-elle à la requête ?
+///
+/// Mêmes trois colonnes et même `LIKE %q%` que la recherche locale.
+pub(crate) fn annuaire_correspond(station: &StationAnnuaire, requete: &str) -> bool {
+    let motif = repli(requete);
+    if motif.is_empty() {
+        return false;
+    }
+    [
+        Some(station.name.as_str()),
+        station.genre.as_deref(),
+        station.country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|champ| repli(champ).contains(&motif))
+}
+
+/// Normalise une adresse de flux pour la comparaison : insensible au schéma,
+/// à la casse et au `/` final. Repris mot pour mot de [`refresh_radio_logos`],
+/// qui apparie déjà l'annuaire au catalogue de cette façon.
+fn norm_url(u: &str) -> String {
+    u.trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
+/// Ce que l'annuaire connaît, que la requête vise, et que le catalogue local
+/// n'a PAS.
+///
+/// L'exclusion se fait sur le catalogue **entier**, pas sur les résultats de la
+/// recherche : une station peut porter la même adresse et avoir été renommée
+/// localement, auquel cas elle ne ressort pas de `repo.search` mais reste bel
+/// et bien présente. La proposer à nouveau poserait un doublon.
+///
+/// Appariement par adresse **ou** par nom, comme la garde de la migration 90 —
+/// ici aussi le coût d'une exclusion de trop est une suggestion en moins,
+/// quand le coût d'une exclusion manquante est une station en double.
+pub(crate) fn stations_annuaire_absentes(
+    annuaire: &[StationAnnuaire],
+    requete: &str,
+    catalogue: &[RadioStation],
+) -> Vec<StationAnnuaire> {
+    let urls: std::collections::HashSet<String> =
+        catalogue.iter().map(|s| norm_url(&s.url)).collect();
+    let noms: std::collections::HashSet<String> =
+        catalogue.iter().map(|s| repli(&s.name)).collect();
+    annuaire
+        .iter()
+        .filter(|s| annuaire_correspond(s, requete))
+        .filter(|s| !urls.contains(&norm_url(&s.stream_url)) && !noms.contains(&repli(&s.name)))
+        .cloned()
+        .collect()
+}
+
+/// Où la recherche a effectivement cherché.
+///
+/// Remplace une constante qui valait toujours `"catalogue_local"`. Ce n'était
+/// pas faux — c'était le relevé du jour — mais le champ était censé dire ce que
+/// « pas trouvé » veut dire, et une valeur figée ne peut pas le faire dès lors
+/// que la portée dépend de l'état du serveur (annuaire relevé ou non).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PorteeRecherche {
+    /// Le catalogue local SEUL. C'est la portée d'un serveur qui n'a pas pu
+    /// joindre l'annuaire au démarrage — installation hors ligne, mozaiklabs.fr
+    /// indisponible. La valeur ne change pas : un client écrit avant ce
+    /// correctif lit toujours `"catalogue_local"` dans ce cas.
+    CatalogueLocal,
+    /// Le catalogue local ET le relevé de l'annuaire public.
+    CatalogueEtAnnuaire,
+}
+
+impl PorteeRecherche {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogueLocal => "catalogue_local",
+            Self::CatalogueEtAnnuaire => "catalogue_local_et_annuaire",
+        }
+    }
+}
 
 /// Le corps rendu par `/radios/search`, quelle que soit l'issue.
 ///
 /// La forme ne change pas d'une issue à l'autre — `items` est toujours là,
 /// éventuellement vide — pour qu'un client n'ait pas à deviner la structure
 /// avant de savoir ce qui s'est passé.
-pub(crate) fn corps_recherche(issue: &IssueRecherche, items: &[RadioStation], lang: &str) -> Value {
+///
+/// `items` et `count` gardent EXACTEMENT leur sens : le catalogue local. Les
+/// stations de l'annuaire arrivent dans un champ à part (`annuaire`), sans quoi
+/// un client existant se retrouverait à jouer des stations qu'il croit avoir en
+/// base, avec un `id` qui n'existe pas.
+pub(crate) fn corps_recherche(
+    issue: &IssueRecherche,
+    items: &[RadioStation],
+    annuaire: &[StationAnnuaire],
+    portee: PorteeRecherche,
+    lang: &str,
+) -> Value {
     let mut corps = json!({
         "statut": issue.statut(),
         "code": issue.code(),
-        "portee": PORTEE_RECHERCHE,
+        "portee": portee.as_str(),
         "count": items.len(),
         "items": items,
+        "annuaire_count": annuaire.len(),
+        "annuaire": annuaire,
         "message": issue.message(lang),
     });
     if let IssueRecherche::Echec(detail) = issue {
@@ -423,9 +608,14 @@ impl RattrapageLogos {
 /// Rend un [`RattrapageLogos`] et non un simple compteur : voir la note de ce
 /// type — `0` seul est indéchiffrable, et c'est précisément l'information qui
 /// manquait pour instruire le fil 1508 (#2421).
+///
+/// **Publie aussi l'annuaire dans [`AppState::annuaire_radios`]** (#2119). La
+/// fonction téléchargeait déjà la liste entière et n'en gardait que les logos ;
+/// la conserver ne coûte pas une requête de plus, et c'est ce qui permet à
+/// `/radios/search` d'interroger l'annuaire sans jamais toucher au réseau.
 pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
     const DIRECTORY_URL: &str = "https://mozaiklabs.fr/api/v1/radios";
-    const BASE: &str = "https://mozaiklabs.fr";
+    const BASE: &str = ANNUAIRE_BASE;
 
     let directory: Vec<Value> = match tune_core::http::client::shared()
         .get(DIRECTORY_URL)
@@ -436,6 +626,17 @@ pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
         Ok(r) => r.json().await.unwrap_or_default(),
         Err(_) => return RattrapageLogos::injoignable(),
     };
+
+    // On garde l'annuaire AVANT d'en extraire les logos. Un relevé vide n'écrase
+    // pas le précédent : une passe qui échoue ne doit pas faire régresser la
+    // portée de la recherche d'un serveur qui avait déjà relevé l'annuaire.
+    let releve = annuaire_depuis_json(&directory);
+    if !releve.is_empty() {
+        if let Ok(mut cache) = state.annuaire_radios.write() {
+            tracing::info!(stations = releve.len(), "radio_annuaire_releve");
+            *cache = releve;
+        }
+    }
 
     // Normalize a stream URL for matching: scheme-insensitive, no trailing slash.
     let norm = |u: &str| {
@@ -523,10 +724,20 @@ async fn refresh_logos_handler(State(state): State<AppState>) -> Json<Value> {
     let bilan = refresh_radio_logos(&state).await;
     // `updated` reste en tête et garde son nom : c'est le champ que la réponse
     // portait déjà.
+    // `annuaire_stations` : la même passe relève désormais l'annuaire pour la
+    // recherche (#2119). Le dire ici donne le seul moyen de VÉRIFIER, sur une
+    // installation réelle, que la portée « catalogue + annuaire » est acquise —
+    // et cette route est aussi la façon de rafraîchir le relevé sans redémarrer.
+    let annuaire_stations = state
+        .annuaire_radios
+        .read()
+        .map(|a| a.len())
+        .unwrap_or_default();
     Json(json!({
         "updated": bilan.updated,
         "sans_logo": bilan.sans_logo,
         "annuaire_injoignable": bilan.annuaire_injoignable,
+        "annuaire_stations": annuaire_stations,
     }))
 }
 
@@ -856,11 +1067,19 @@ async fn play_radio(
     .into_response()
 }
 
-/// Cherche une station dans le catalogue local, et DIT ce qui s'est passé.
+/// Cherche une station dans le catalogue local **et dans l'annuaire relevé**,
+/// et DIT ce qui s'est passé.
 ///
-/// Voir [`IssueRecherche`] pour le pourquoi : jusqu'ici, « aucune station de ce
-/// nom » et « la recherche a échoué » sortaient tous deux sous la forme d'un
-/// tableau vide (#2119).
+/// Voir [`IssueRecherche`] pour le premier volet : « aucune station de ce nom »
+/// et « la recherche a échoué » sortaient tous deux sous la forme d'un tableau
+/// vide (#2119, PR #2833).
+///
+/// Le second volet est le titre même du ticket — « la recherche n'interroge
+/// aucun annuaire ». Elle en interroge un désormais, **sans toucher au
+/// réseau sur ce chemin** : l'annuaire lu au démarrage est conservé en mémoire
+/// ([`AppState::annuaire_radios`]) au lieu d'être jeté. Une recherche reste
+/// donc une requête locale, à la milliseconde près, et fonctionne hors ligne —
+/// avec la portée d'un serveur hors ligne, et la réponse le dit.
 async fn search_radios(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -879,9 +1098,55 @@ async fn search_radios(
             (IssueRecherche::Echec(erreur), Vec::new())
         }
     };
+
+    // Un verrou empoisonné rend `Err` : on retombe alors sur la portée
+    // « catalogue local », c'est-à-dire le comportement d'avant ce correctif.
+    // Jamais un `unwrap()` sur le chemin d'une requête utilisateur.
+    let annuaire_releve: Vec<StationAnnuaire> = state
+        .annuaire_radios
+        .read()
+        .map(|a| a.clone())
+        .unwrap_or_default();
+
+    let (portee, suggestions) = if annuaire_releve.is_empty() {
+        // L'annuaire n'a pas été relevé : hors ligne au démarrage, ou
+        // mozaiklabs.fr indisponible. La portée redevient exactement celle
+        // d'avant ce correctif, et la réponse l'annonce.
+        (PorteeRecherche::CatalogueLocal, Vec::new())
+    } else if matches!(issue, IssueRecherche::Echec(_)) {
+        // Sur un ÉCHEC du dépôt on ne sait rien du catalogue local, et surtout
+        // pas qu'il ne contient pas ces stations : proposer un ajout ici
+        // mènerait tout droit au doublon. On ne suggère rien.
+        (PorteeRecherche::CatalogueEtAnnuaire, Vec::new())
+    } else {
+        // Le catalogue ENTIER sert d'exclusion, pas les seuls résultats — voir
+        // [`stations_annuaire_absentes`]. Si la liste n'est pas lisible alors
+        // que la recherche l'était, on se rabat sur les résultats : au pire une
+        // suggestion redondante, jamais une suggestion manquante.
+        let catalogue = match repo.list() {
+            Ok(catalogue) => catalogue,
+            Err(erreur) => {
+                tracing::warn!(erreur = %erreur, "radio_annuaire_exclusion_degradee");
+                items.clone()
+            }
+        };
+        (
+            PorteeRecherche::CatalogueEtAnnuaire,
+            stations_annuaire_absentes(&annuaire_releve, &q.q, &catalogue),
+        )
+    };
+
+    // « Rien chez vous, mais l'annuaire connaît » n'est pas « rien nulle
+    // part » : c'est le cas de Radio Paradise pour Yacine, et il appelle une
+    // autre phrase — celle qui dit que l'ajout tient en un geste.
+    let issue = match issue {
+        IssueRecherche::Aucune if !suggestions.is_empty() => IssueRecherche::AnnuaireSeul,
+        autre => autre,
+    };
+
     (
         issue.statut_http(),
-        Json(corps_recherche(&issue, &items, &lang)),
+        Json(corps_recherche(&issue, &items, &suggestions, portee, &lang)),
     )
         .into_response()
 }

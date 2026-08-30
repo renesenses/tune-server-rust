@@ -98,6 +98,23 @@ pub struct AppState {
     /// settings page only takes effect on the next start, so between the two
     /// the honest answer is still WASAPI.
     pub active_audio_backend: Arc<std::sync::RwLock<Option<String>>>,
+    /// L'annuaire public de mozaiklabs.fr, tel que relevé au démarrage.
+    ///
+    /// Vide tant que [`crate::routes::radios::refresh_radio_logos`] n'a pas
+    /// abouti — donc toujours vide sur un serveur hors ligne, et dans les
+    /// essais, qui ne touchent jamais au réseau.
+    ///
+    /// **Pourquoi ici et pas dans un `static`.** Chaque `AppState` porte le
+    /// sien : deux essais qui tournent en parallèle dans le même binaire
+    /// n'héritent pas l'un de l'annuaire de l'autre.
+    ///
+    /// **Fraîcheur.** Relevé à chaque démarrage du serveur, et à chaque appel de
+    /// `POST /radios/refresh-logos`. Une station ajoutée à l'annuaire pendant
+    /// que le serveur tourne n'apparaît donc qu'au prochain démarrage ou au
+    /// prochain rafraîchissement explicite — ce qui reste sans commune mesure
+    /// avec le semis de la migration 90, gelé au 30/08 et jamais remis à jour
+    /// (#2119).
+    pub annuaire_radios: Arc<std::sync::RwLock<Vec<crate::routes::radios::StationAnnuaire>>>,
     pub license: Arc<tune_core::license::LicenseManager>,
     pub skin_manager: Arc<tune_core::skins::SkinManager>,
     /// Compiled-in plugins. Empty until [`crate::plugins::init`] runs, which
@@ -371,6 +388,7 @@ impl AppState {
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
+            annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),
             license,
             skin_manager,
             plugins,
