@@ -1,4 +1,4 @@
--- 047_zones_volume_a_virgule.sql
+-- 048_zones_volume_a_virgule.sql
 --
 -- #2886 — `zones.volume` etait un INTEGER borne 0..100. Le volume commande
 -- (0..1 en virgule flottante) etait donc arrondi avant persistance :
@@ -63,7 +63,7 @@ END
 $migration_2886$;
 
 INSERT INTO schema_version (version, name)
-VALUES (47, 'zones_volume_a_virgule')
+VALUES (48, 'zones_volume_a_virgule')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

@@ -216,7 +216,7 @@ async fn pg_zones_round_trip() {
     repo.update_volume(id, 75.0).unwrap();
     assert_eq!(repo.get(id).unwrap().unwrap().volume, 75.0);
     // #2886 — la colonne est a virgule des DEUX cotes. Sur PG c'est la
-    // migration 047 qui le garantit : sans elle, ecrire un f64 dans une
+    // migration 048 qui le garantit : sans elle, ecrire un f64 dans une
     // colonne `integer` echoue purement et simplement.
     repo.update_volume(id, 0.398_107_170_553_497_2 * 100.0)
         .unwrap();

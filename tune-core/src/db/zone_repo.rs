@@ -2293,7 +2293,7 @@ mod tests {
     /// decimale en entier que si la conversion est SANS PERTE. Une base creee
     /// avant ce correctif, dont la colonne est encore declaree `INTEGER`,
     /// stocke donc 0,4 tel quel. Seul PostgreSQL, qui type reellement ses
-    /// colonnes, exige la migration 047.
+    /// colonnes, exige la migration 048.
     ///
     /// Ce test le PROUVE sur une table declaree a l'ancienne au lieu de le
     /// supposer : si un jour SQLite changeait d'avis, il rougirait ici plutot

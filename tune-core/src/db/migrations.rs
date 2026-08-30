@@ -3205,9 +3205,9 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
     // sur PG. Le test `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer`
     // tient l'autre moitie de la preuve.
     (
-        47,
+        48,
         "zones_volume_a_virgule",
-        include_str!("../../migrations/postgres/047_zones_volume_a_virgule.sql"),
+        include_str!("../../migrations/postgres/048_zones_volume_a_virgule.sql"),
     ),
 ];
 
