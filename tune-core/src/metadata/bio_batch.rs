@@ -528,6 +528,56 @@ async fn fetch_album_bio_theaudiodb(
 
 /// Batch enrich artist bios: Wikipedia FR via Wikidata + Last.fm fallback.
 /// Submits each bio to mozaiklabs.fr community API.
+/// Le bilan d'une passe de biographies, tel qu'il est rangé dans les réglages
+/// pour que l'interface puisse enfin le montrer.
+///
+/// ## Le bilan était écrit ; personne ne le lisait (#1311)
+///
+/// Les deux passes rangeaient déjà `total` / `enriched` / `failed` sous
+/// `artist_bio_enrich_result` et `album_bio_enrich_result` à la fin de leur
+/// travail. Une recherche de ces deux clés dans tout le dépôt ne rendait
+/// qu'une seule ligne chacune : celle de l'**écriture**. Aucune route, aucun
+/// écran ne les relisait — le bilan était un mécanisme juste, sans appelant.
+///
+/// C'est ce qui rend « les bios ne sont pas disponibles » impossible à
+/// instruire, et c'est le vrai défaut derrière ce ticket : quand une passe
+/// rentre à vide, Tune le SAIT, l'écrit, et n'en dit rien. L'utilisateur ne
+/// peut pas distinguer une passe qui n'a trouvé personne à enrichir, une passe
+/// dont toutes les sources ont répondu « je n'ai rien », et une passe qui
+/// n'avait aucune source à interroger. Ce sont trois causes différentes, avec
+/// trois remèdes différents, derrière un seul écran vide.
+///
+/// Deux champs s'ajoutent donc à ce que la passe rangeait déjà :
+///
+/// - `sans_source` — combien de candidats n'avaient **aucune** source
+///   possible. Ce sont des échecs *certains*, connus d'avance, et ils se
+///   confondaient jusqu'ici avec les « pas trouvé » dans le `failed` global.
+/// - `fini_le` — sans horodatage, un bilan resservi ne dit pas s'il vient de
+///   la passe qu'on vient de lancer ou d'une passe d'il y a trois semaines.
+///
+/// `lastfm_configure` accompagne les deux : c'est le réglage que
+/// l'utilisateur peut corriger lui-même.
+///
+/// La forme est **la même pour les deux passes**, pour que l'écran n'ait
+/// qu'une structure à lire.
+fn bilan_de_passe(
+    total: usize,
+    enriched: u32,
+    failed: u32,
+    sans_source: usize,
+    lastfm_configure: bool,
+) -> String {
+    serde_json::json!({
+        "total": total,
+        "enriched": enriched,
+        "failed": failed,
+        "sans_source": sans_source,
+        "lastfm_configure": lastfm_configure,
+        "fini_le": chrono::Utc::now().to_rfc3339(),
+    })
+    .to_string()
+}
+
 pub async fn batch_enrich_artist_bios(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     lang: &str,
@@ -652,15 +702,24 @@ pub async fn batch_enrich_artist_bios_scoped(
         enriched, failed, "batch_artist_bio_enrichment_complete"
     );
 
+    // `sans_source` : un artiste sans MBID **et** sans clé Last.fm n'a aucune
+    // source — ni Wikidata/Wikipédia ni TheAudioDB, qui partent tous du MBID,
+    // ni la recherche par nom, qui demande la clé. La boucle ci-dessus les
+    // compte dans `failed` sans les distinguer ; ils sont pourtant les seuls
+    // dont l'échec était connu AVANT la première requête, et le seul cas que
+    // l'utilisateur peut corriger lui-même (en posant sa clé).
+    let sans_source = if lastfm_key.is_empty() { sans_mbid } else { 0 };
+
     settings
         .set(
             "artist_bio_enrich_result",
-            &serde_json::json!({
-                "total": artists.len(),
-                "enriched": enriched,
-                "failed": failed,
-            })
-            .to_string(),
+            &bilan_de_passe(
+                artists.len(),
+                enriched,
+                failed,
+                sans_source,
+                !lastfm_key.is_empty(),
+            ),
         )
         .ok();
 }
@@ -765,17 +824,75 @@ pub async fn batch_enrich_album_bios_scoped(
     );
 
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
+    // Chemin sœur de la passe artistes, et c'est bien pour cela qu'on écrit ce
+    // zéro plutôt que de laisser le champ de côté : `fetch_album_bio` commence
+    // par Wikipédia (langue demandée, puis anglais), qui ne réclame **aucune**
+    // clé. Un album a donc toujours au moins une source à interroger, alors
+    // qu'un artiste sans MBID n'en a aucune sans clé Last.fm. Le champ garde
+    // la même forme pour les deux passes — l'écran n'a qu'une structure à
+    // lire — et il dit ici une vérité mesurée, pas une valeur par défaut.
+    let sans_source = 0usize;
     settings
         .set(
             "album_bio_enrich_result",
-            &serde_json::json!({
-                "total": albums.len(),
-                "enriched": enriched,
-                "failed": failed,
-            })
-            .to_string(),
+            &bilan_de_passe(
+                albums.len(),
+                enriched,
+                failed,
+                sans_source,
+                !lastfm_key.is_empty(),
+            ),
         )
         .ok();
+}
+
+#[cfg(test)]
+mod tests_bilan_de_passe {
+    use super::bilan_de_passe;
+
+    /// #1311 — le bilan doit porter de quoi DISTINGUER les causes d'une passe
+    /// rentrée à vide, pas seulement son décompte d'échecs.
+    ///
+    /// `failed` seul confond « la source n'avait rien » et « il n'y avait pas
+    /// de source à interroger ». Ce sont deux situations différentes : la
+    /// première ne se corrige pas côté utilisateur, la seconde se corrige en
+    /// posant une clé Last.fm.
+    ///
+    /// Contre-épreuve : retirer `sans_source` (ou `lastfm_configure`) de
+    /// `bilan_de_passe` fait rougir ce test.
+    #[test]
+    fn le_bilan_distingue_l_echec_certain_du_pas_trouve() {
+        let brut = bilan_de_passe(120, 0, 120, 118, false);
+        let v: serde_json::Value = serde_json::from_str(&brut).expect("bilan JSON");
+
+        assert_eq!(v["total"], 120);
+        assert_eq!(v["enriched"], 0);
+        assert_eq!(v["failed"], 120);
+        assert_eq!(
+            v["sans_source"], 118,
+            "les candidats sans aucune source doivent se compter a part"
+        );
+        assert_eq!(
+            v["lastfm_configure"], false,
+            "l'ecran doit pouvoir dire a l'utilisateur ce qu'il peut corriger"
+        );
+        assert!(
+            v["fini_le"].as_str().is_some_and(|d| d.len() >= 20),
+            "un bilan sans horodatage ne dit pas s'il date de la passe qu'on vient de lancer"
+        );
+    }
+
+    /// Témoin : le décompte historique ne change pas de nom ni de type.
+    /// Un écran qui lisait déjà `total`/`enriched`/`failed` continue de les
+    /// trouver — ce test reste vert avant comme après le correctif.
+    #[test]
+    fn les_champs_historiques_restent_en_place() {
+        let brut = bilan_de_passe(7, 5, 2, 0, true);
+        let v: serde_json::Value = serde_json::from_str(&brut).expect("bilan JSON");
+        assert_eq!(v["total"], 7);
+        assert_eq!(v["enriched"], 5);
+        assert_eq!(v["failed"], 2);
+    }
 }
 
 #[cfg(test)]
