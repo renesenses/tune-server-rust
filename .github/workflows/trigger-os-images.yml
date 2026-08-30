@@ -1,114 +1,57 @@
 name: Trigger OS image builds
 
-# When a Tune release is published, tell the downstream OS-image repos to bake
-# an ISO/image for that version (repository_dispatch → their build workflows).
-# Deliberately separate from release.yml so the release pipeline is untouched.
-#
-# Requires a fine-grained PAT with `contents: write` (or `repo`) on the target
-# repos, stored as the secret TUNE_OS_DISPATCH_TOKEN — the default GITHUB_TOKEN
-# cannot dispatch events to another repository. Without the secret the job just
-# warns and exits (never blocks a release; this workflow is independent of it).
-# Déclenché sur le PUSH DU TAG, surtout pas sur `release: published`.
-#
-# GitHub ne relance pas de workflow sur un événement produit par le
-# GITHUB_TOKEN — garde-fou anti-récursion. Or la release est créée par
-# release.yml (softprops/action-gh-release, GITHUB_TOKEN) : l'événement
-# `release: published` qui en découle n'a donc JAMAIS déclenché ce workflow.
-# Résultat : plus une seule image OS construite automatiquement depuis fin
-# juillet, et un dispatch manuel oublié à chaque release (0.9.54 → 0.9.59
-# livrées sans image, les dernières datant de la 0.9.53).
-#
-# Le push du tag, lui, vient d'un humain (git push origin vX.Y.Z) : il
-# déclenche normalement. Il arrive AVANT que les binaires ne soient publiés,
-# ce qui est sans conséquence — les builds d'image téléchargent la version
-# depuis l'API au moment de leur propre exécution (~15 min plus tard), et
-# `build-iso.yml` échoue clairement si l'asset n'est pas encore là, auquel cas
-# il suffit de relancer.
+# Outil de dispatch explicite vers Tune OS. La pose du tag ne lance plus ce
+# workflow en parallèle de Release : le futur orchestrateur l'appellera avec
+# une version exacte après validation des actifs obligatoires.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Tune version (X.Y.Z, no leading v) — empty = the release tag"
-        required: false
-        default: ""
+        description: "Tune version (X.Y.Z, sans v)"
+        required: true
+        type: string
 
 jobs:
   dispatch:
     runs-on: ubuntu-latest
-    # Tags stables uniquement : une pré-release (vX.Y.Z-rcN) ne mérite pas une
-    # image de 1,2 Go, et la page /download ne sert que du stable. Même règle
-    # que le job homebrew de release.yml.
-    if: github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-rc')
+    if: ${{ !contains(inputs.version, '-') }}
     steps:
-      # Le tag est poussé ~30 min AVANT que release.yml n'ait publié la release
-      # et ses binaires. Dispatcher tout de suite fait arriver le webhook des
-      # images OS chez mozaiklabs.fr AVANT que la ForumRelease de la version
-      # n'existe — les images sont alors ignorées et /download n'en propose
-      # aucune. Vécu en v0.9.60 : ISO à 08:29, RPi à 08:39, release serveur à
-      # 08:57, et deux images publiées sur GitHub que la page ne montrait pas.
-      #
-      # On attend donc que la release porte ses assets avant de dispatcher.
-      # Cela restaure l'ordre dont dépend le webhook, sans revenir à
-      # `release: published` — qui, lui, ne se déclenche jamais (la release est
-      # créée par le GITHUB_TOKEN, garde anti-récursion de GitHub).
-      #
-      # Les images sont saines même construites tôt : elles épinglent la version
-      # dans le kickstart et téléchargent le binaire à l'INSTALLATION. L'attente
-      # sert au rattachement sur /download, pas à la validité de l'image.
-      - name: Wait for the server release to carry its assets
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          # 3 h de marge. Le facteur limitant n'est pas la compilation — les
-          # sept cibles finissent en ~15 min — mais la NOTARISATION Apple, qui
-          # est un service tiers sans engagement de délai. Vécu en v0.9.61 :
-          # `Notarize DMG (macOS)` bloquée 1 h 41 sur aarch64-apple-darwin,
-          # 6 cibles vertes sur 7, et cette attente abandonnée à 45 min alors
-          # que la release finissait par sortir. Un plafond trop bas transforme
-          # une lenteur d'Apple en images OS manquantes.
-          #
-          # Le coût d'attendre est un runner ubuntu qui dort ; le coût
-          # d'abandonner est une release sans image sur /download, et personne
-          # ne pense au re-dispatch manuel. On attend donc largement.
-          for i in $(seq 1 360); do
-            N=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-                  --json assets -q '[.assets[]|select(.name|endswith(".tar.gz"))]|length' 2>/dev/null || echo 0)
-            if [ "${N:-0}" -ge 3 ]; then
-              echo "release $TAG prête ($N archives) après $((i*30))s"
-              exit 0
-            fi
-            sleep 30
-          done
-          echo "::error::$TAG n'a toujours pas ses assets après 3 h — dispatch annulé pour ne pas perdre le rattachement /download. Relancer ce workflow à la main une fois la release publiée."
-          exit 1
+      - uses: actions/checkout@v4
 
       - name: Resolve version
         id: v
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          V="${{ inputs.version }}"
-          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
-          test -n "$V"
+          V="$RELEASE_VERSION"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::version invalide: $V"
+            exit 1
+          }
+          [ "$GITHUB_REF" = "refs/tags/v$V" ] || {
+            echo "::error::ce workflow doit etre lance sur refs/tags/v$V"
+            exit 1
+          }
+          PLAN=".release/v$V.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          OS_SHA="$(jq -r '.components.os.sha' "$PLAN")"
+          [[ "$OS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA OS invalide"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "os_sha=$OS_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch to OS-image repos
         env:
           TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
+          OS_SHA: ${{ steps.v.outputs.os_sha }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::warning::TUNE_OS_DISPATCH_TOKEN not set — skipping OS-image dispatch (add the secret to enable auto ISO/image builds)."
-            exit 0
+            echo "::error::TUNE_OS_DISPATCH_TOKEN absent"
+            exit 1
           fi
-          # Add tune-os-rpi (and any future image repo) to this list once created.
-          for repo in tune-os; do
-            echo "→ repository_dispatch tune-release to renesenses/$repo for v$VERSION"
-            curl -fsS -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/renesenses/$repo/dispatches" \
-              -d "{\"event_type\":\"tune-release\",\"client_payload\":{\"version\":\"$VERSION\"}}"
-          done
+          echo "→ repository_dispatch tune-release to renesenses/tune-os for v$VERSION"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/renesenses/tune-os/dispatches" \
+            -d "{\"event_type\":\"tune-release\",\"client_payload\":{\"version\":\"$VERSION\",\"os_sha\":\"$OS_SHA\"}}"
