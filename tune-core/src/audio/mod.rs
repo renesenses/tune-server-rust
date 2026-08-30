@@ -41,6 +41,8 @@ pub mod tap;
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
+pub mod volume_scale;
 pub mod wav;
 pub mod wavpack;
 

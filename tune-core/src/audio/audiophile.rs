@@ -78,7 +78,14 @@ pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
 /// sinon la valeur demandée, bornée à `[0, 1]`. Le point d'entrée unique :
 /// la route de volume s'en sert pour répondre la valeur *effective*, ce qui
 /// fait remonter le curseur de l'interface au lieu de le laisser mentir.
-pub fn effective_volume(db: &Arc<dyn DbBackend>, zone_id: i64, requested: f32) -> f32 {
+/// `f64` et non `f32` : tout le reste de la chaîne de volume est en double
+/// précision (`Orchestrator::set_volume`, `PlaybackState::volume`, la colonne
+/// et les charges utiles JSON). Cette fonction était le seul rétrécissement du
+/// parcours, et il se voyait : un réglage à −20 dB ressortait à
+/// −19,99999987 dB, parce que 0,1 n'est pas représentable en `f32`. Inaudible,
+/// mais c'est exactement la réversibilité que #1274 promet — et un aller-retour
+/// lecture/écriture faisait dériver le curseur d'un pouième à chaque passage.
+pub fn effective_volume(db: &Arc<dyn DbBackend>, zone_id: i64, requested: f64) -> f64 {
     if volume_lock_enabled(db, zone_id) && zone_enabled(db, zone_id) {
         return 1.0;
     }
