@@ -1858,6 +1858,57 @@ async fn sonos_speakers_rend_un_tableau() {
     );
 }
 
+/// `POST /sonos/rooms/{id}/group` : ne pas décrire un groupe qu'on n'a pas formé.
+///
+/// La route répondait **200 OK** avec `{coordinator, members, status}`, le
+/// champ `status` valant « grouping not yet implemented ». Aucune enceinte
+/// n'était contactée : les `members` renvoyés étaient une simple copie du
+/// corps de la requête.
+///
+/// Le piège est propre à ce dossier : un 200 dont un champ dit « pas
+/// implémenté » **passe tous les tests de forme**. On ne teste donc pas ici le
+/// code HTTP pour lui-même, mais le COMPORTEMENT observable : la réponse ne
+/// doit pas ressembler à un groupe formé. Un appelant écrit contre le code
+/// HTTP — c'est ce que fait `fetchJSON` côté client — lisait un succès et un
+/// coordinateur avec ses membres.
+///
+/// Ce qui manque réellement : le serveur ne sait pas qui est coordinateur
+/// (service UPnP `ZoneGroupTopology`, que rien n'interroge) et n'envoie aucun
+/// `SetAVTransportURI` / `x-rincon:` aux enceintes.
+#[tokio::test]
+async fn sonos_group_ne_decrit_pas_un_groupe_non_forme() {
+    let app = make_app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/sonos/rooms/RINCON_salon/group",
+        json!({ "room_ids": ["RINCON_cuisine", "RINCON_chambre"] }),
+    )
+    .await;
+
+    assert!(
+        !status.is_success(),
+        "aucune enceinte n'a été contactée : un 2xx annonce un groupe formé, \
+         reçu {status} avec {body}"
+    );
+
+    assert!(
+        body.get("coordinator").is_none(),
+        "désigner un coordinateur, c'est affirmer qu'un groupe existe : {body}"
+    );
+    assert!(
+        body.get("members").is_none(),
+        "les « membres » n'étaient qu'une copie de la requête, jamais un état \
+         d'enceinte : {body}"
+    );
+
+    // Et l'échec doit se nommer, sinon l'appelant ne peut rien en dire à
+    // l'utilisateur.
+    assert_eq!(
+        body["error"], "sonos_grouping_not_implemented",
+        "le refus doit porter une cause lisible : {body}"
+    );
+}
+
 /// `/metadata/mp3/diagnose` : les compteurs que l'écran lit doivent exister.
 ///
 /// Le contrat web laisse la liste des anomalies libre, mais `scanned`,
