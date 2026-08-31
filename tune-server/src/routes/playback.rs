@@ -807,6 +807,84 @@ mod sqlite_scan_queue_arbitration_tests {
     }
 }
 
+/// La position rendue par la base au démarrage, à demander pour CETTE piste.
+///
+/// Ce que le serveur écrit : le poller persiste `zones.last_position_ms` tout
+/// au long de la lecture, et `restore_playback_positions` la réinjecte dans
+/// l'état de zone au démarrage. C'est cette valeur que `/zones` sert sous le
+/// nom `position_ms` et que le curseur affiche à l'ouverture de l'interface.
+///
+/// Ce que le serveur en faisait : rien. Les chemins « Lecture après arrêt »
+/// construisaient tous leur `PlayRequest` avec `seek_ms: None`, si bien que le
+/// morceau repartait de 0:00 pendant que l'écran annonçait 2:31 — Sandro,
+/// fil 1610, sortie Diretta UPnP (#2876).
+///
+/// Rend la position à passer dans le `PlayRequest`. Ne vaut QUE pour la piste
+/// restaurée, et une seule fois : le `play()` qui suit efface le marqueur (voir
+/// `ZoneState::pending_resume_ms`).
+async fn position_de_reprise(
+    state: &AppState,
+    zone_id: i64,
+    piste: Option<i64>,
+    source_id: Option<&str>,
+) -> Option<u64> {
+    let zone = state.playback.get_state(zone_id).await;
+    reprise_applicable(&zone, piste, source_id).map(|ms| ms as u64)
+}
+
+/// Ancre dans l'état de zone la position que la requête demande VRAIMENT.
+///
+/// `PlaybackManager::play` remet `position_ms` à zéro sauf juste après un seek,
+/// et le poller lit la même estampille pour ouvrir sa fenêtre de grâce. Sans cet
+/// ancrage, le son repartirait au bon endroit et le curseur retomberait à
+/// 0:00 — on aurait déplacé le mensonge de Sandro au lieu de le lever.
+///
+/// ⚠️ Lit `demandee`, c'est-à-dire le `seek_ms` **tel qu'il part dans le
+/// `PlayRequest`**, et jamais la variable qui l'a produit. C'est ce qui fait que
+/// débrancher le champ éteint aussi l'ancrage : un ancrage qui survivrait au
+/// débranchement rendrait la contre-épreuve verte alors que le morceau
+/// repartirait toujours de zéro (mesuré : cette première rédaction du correctif
+/// ne prouvait rien).
+///
+/// N'agit que pour une reprise : un `seek_ms` venu du corps de la requête garde
+/// le comportement d'avant.
+async fn ancrer_position_demandee(
+    state: &AppState,
+    zone_id: i64,
+    demandee: Option<u64>,
+    reprise: Option<u64>,
+) {
+    let (Some(position), Some(_)) = (demandee, reprise) else {
+        return;
+    };
+    state.playback.seek(zone_id, position as i64).await;
+    info!(
+        zone_id,
+        position_ms = position,
+        "reprise_a_la_position_restauree"
+    );
+}
+
+/// La décision seule, sans effet de bord : cette demande de lecture porte-t-elle
+/// sur la piste dont le démarrage a restauré la position ?
+///
+/// Une piste locale s'identifie par son `track_id`, un flux distant par son
+/// `source_id` — comparer l'un à l'autre ferait reprendre au mauvais endroit
+/// une piste qui n'a rien à voir.
+fn reprise_applicable(
+    zone: &tune_core::playback::ZoneState,
+    piste: Option<i64>,
+    source_id: Option<&str>,
+) -> Option<i64> {
+    let position = zone.pending_resume_ms.filter(|ms| *ms > 0)?;
+    let np = zone.now_playing.as_ref()?;
+    let meme_piste = match (piste, np.track_id) {
+        (Some(demandee), Some(restauree)) => demandee == restauree,
+        _ => source_id.is_some() && source_id == np.source_id.as_deref(),
+    };
+    meme_piste.then_some(position)
+}
+
 async fn play(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -830,6 +908,9 @@ async fn play(
             let current = state.playback.get_state(zone_id).await;
             if let Some(ref np) = current.now_playing {
                 let output_device_id = get_zone_device_id(&state, zone_id);
+                let reprise =
+                    position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref())
+                        .await;
                 let orch_req = tune_core::orchestrator::PlayRequest {
                     zone_id,
                     output_device_id,
@@ -845,7 +926,7 @@ async fn play(
                     album_title: np.album_title.clone(),
                     cover_url: np.cover_path.clone(),
                     duration_ms: Some(np.duration_ms),
-                    seek_ms: None,
+                    seek_ms: reprise,
                     temp_file_path: None,
                     sample_rate: None,
                     bit_depth: None,
@@ -853,6 +934,7 @@ async fn play(
                     track_number: None,
                     disc_number: None,
                 };
+                ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
                         // Restore queue_length from DB so the poller can
@@ -1281,6 +1363,18 @@ async fn play(
         };
     }
 
+    // #2876 — une demande NUE, c'est-à-dire une seule piste et aucun contenant.
+    // C'est la forme qu'envoie la barre de transport quand la zone est à
+    // l'arrêt : `{ "track_id": N }` et rien d'autre. Un album, une liste de
+    // lecture ou un `start_index` désignent un nouveau geste d'écoute, qui
+    // commence à son début même si sa première piste se trouve être celle que
+    // le démarrage a restaurée. Relevé AVANT la résolution : la chaîne
+    // ci-dessous consomme `body`.
+    let demande_nue = body.album_id.is_none()
+        && body.playlist_id.is_none()
+        && body.track_ids.is_none()
+        && body.start_index.is_none();
+
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
@@ -1302,6 +1396,8 @@ async fn play(
             let output_device_id = body
                 .output_device_id
                 .or_else(|| get_zone_device_id(&state, zone_id));
+            let reprise =
+                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
             let orch_req = tune_core::orchestrator::PlayRequest {
                 zone_id,
                 output_device_id,
@@ -1317,7 +1413,7 @@ async fn play(
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
-                seek_ms: None,
+                seek_ms: reprise,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -1325,6 +1421,7 @@ async fn play(
                 track_number: None,
                 disc_number: None,
             };
+            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
                     persist_queue_async(&state, zone_id);
@@ -1401,6 +1498,17 @@ async fn play(
             .and_then(|z| z.output_device_id)
     });
 
+    // Le chemin réellement emprunté par le bouton Lecture des clients web et
+    // Flutter quand la zone est à l'arrêt : ils envoient `{ "track_id": N }`,
+    // pas un corps vide. Un `seek_ms` explicite reste prioritaire — il vient
+    // d'un geste, la reprise n'est qu'un souvenir (#2876).
+    let reprise = if body.seek_ms.is_none() && demande_nue {
+        position_de_reprise(&state, zone_id, Some(target_id), None).await
+    } else {
+        None
+    };
+    let seek_ms = body.seek_ms.or(reprise);
+
     let orch_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id,
@@ -1422,7 +1530,7 @@ async fn play(
         duration_ms: body
             .duration_ms
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
-        seek_ms: body.seek_ms,
+        seek_ms,
         temp_file_path: body.temp_file_path,
         sample_rate: body.sample_rate,
         bit_depth: body.bit_depth,
@@ -1430,6 +1538,8 @@ async fn play(
         track_number: None,
         disc_number: None,
     };
+
+    ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
 
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -1466,10 +1576,17 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
 async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let current = state.playback.get_state(zone_id).await;
 
-    // When stopped with a valid NowPlaying, re-play the current track from the start
+    // Zone à l'arrêt avec une piste en mémoire : on la rejoue — à la position
+    // que le démarrage a restaurée si elle vaut encore, depuis le début sinon.
+    // Le commentaire d'avant disait « from the start », en contradiction avec
+    // celui de `PlaybackManager::stop` : « keep position_ms […] can resume from
+    // the same position ». L'intention était écrite, l'instruction manquait
+    // (#2876).
     if current.state == tune_core::playback::PlayState::Stopped {
         if let Some(ref np) = current.now_playing {
             let output_device_id = get_zone_device_id(&state, zone_id);
+            let reprise =
+                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
             let orch_req = tune_core::orchestrator::PlayRequest {
                 zone_id,
                 output_device_id,
@@ -1485,7 +1602,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
-                seek_ms: None,
+                seek_ms: reprise,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -1493,6 +1610,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 track_number: None,
                 disc_number: None,
             };
+            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
                     // Restore queue_length from DB so the poller can
@@ -4441,5 +4559,95 @@ mod tests_crossfade_indisponible {
 
         assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
         assert_eq!(validate_crossfade_update(&default), Ok(3.0));
+    }
+}
+
+/// #2876 — la position restaurée au démarrage doit atteindre le son.
+///
+/// Sandro (fil 1610, sortie DirettaRenderer UPnP) : « le curseur de temps
+/// affiche exactement la position où je m'étais arrêté […] lorsque j'appuie sur
+/// Play, le morceau reprend depuis le début (0:00) ». Les deux moitiés sont
+/// vraies et elles se contredisent : `restore_playback_positions` réinjecte
+/// bien `zones.last_position_ms` dans l'état de zone — c'est ce que `/zones`
+/// sert et que le curseur affiche — mais les chemins de lecture posaient tous
+/// `seek_ms: None`.
+#[cfg(test)]
+mod tests_reprise_position_2876 {
+    use super::reprise_applicable;
+    use tune_core::playback::{NowPlaying, ZoneState};
+
+    fn zone_restauree(position: Option<i64>, track_id: Option<i64>) -> ZoneState {
+        ZoneState {
+            zone_id: 1,
+            pending_resume_ms: position,
+            now_playing: Some(NowPlaying {
+                track_id,
+                title: "Piste".into(),
+                duration_ms: 300_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Le cas signalé : même piste, position restaurée, Play doit la demander.
+    #[test]
+    fn la_piste_restauree_repart_a_sa_position() {
+        let zone = zone_restauree(Some(151_000), Some(42));
+        assert_eq!(
+            reprise_applicable(&zone, Some(42), None),
+            Some(151_000),
+            "la position affichée par le curseur n'a pas atteint le PlayRequest (#2876)"
+        );
+    }
+
+    /// Témoin anti-régression : une AUTRE piste ne récupère pas la position de
+    /// celle qui a été interrompue. C'est le risque propre à ce correctif —
+    /// démarrer un morceau à 2:31 parce qu'un autre s'y était arrêté.
+    #[test]
+    fn une_autre_piste_repart_de_zero() {
+        let zone = zone_restauree(Some(151_000), Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(43), None), None);
+    }
+
+    /// Sans marqueur, rien ne change : c'est tout le comportement en session
+    /// (Stop puis Play, file arrivée à son terme) qui reste intact. `stop()`
+    /// conserve `position_ms` sans armer `pending_resume_ms`.
+    #[test]
+    fn sans_marqueur_la_lecture_repart_de_zero() {
+        let zone = zone_restauree(None, Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+
+    /// Une position nulle n'est pas une reprise.
+    #[test]
+    fn une_position_nulle_n_arme_rien() {
+        let zone = zone_restauree(Some(0), Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+
+    /// Un flux distant n'a pas de `track_id` : il s'identifie par son
+    /// `source_id`. Les comparer de travers ferait reprendre au mauvais endroit.
+    #[test]
+    fn un_flux_distant_s_identifie_par_son_source_id() {
+        let mut zone = zone_restauree(Some(88_000), None);
+        if let Some(np) = zone.now_playing.as_mut() {
+            np.source = "qobuz".into();
+            np.source_id = Some("12345".into());
+        }
+        assert_eq!(reprise_applicable(&zone, None, Some("12345")), Some(88_000));
+        assert_eq!(reprise_applicable(&zone, None, Some("99999")), None);
+        assert_eq!(reprise_applicable(&zone, None, None), None);
+    }
+
+    /// Rien en lecture : il n'y a pas de piste à laquelle rattacher la position.
+    #[test]
+    fn sans_piste_restauree_aucune_reprise() {
+        let zone = ZoneState {
+            zone_id: 1,
+            pending_resume_ms: Some(151_000),
+            ..Default::default()
+        };
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
     }
 }

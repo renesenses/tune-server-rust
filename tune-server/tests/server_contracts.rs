@@ -69,6 +69,8 @@ mod radios_validation_url;
 mod rbac;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
+#[path = "reprise_position_au_demarrage.rs"]
+mod reprise_position_au_demarrage;
 #[path = "rustsec_allowlists.rs"]
 mod rustsec_allowlists;
 #[path = "smb_dialect_seam.rs"]
