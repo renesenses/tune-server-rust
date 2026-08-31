@@ -1411,6 +1411,44 @@ struct CreatePlaylistFromFavBody {
     limit: Option<usize>,
 }
 
+/// Les trois compteurs que l'écran « Favoris radio → Créer une playlist »
+/// affiche : `matched` / `approximate` / `not_found`.
+///
+/// ⚠ Ils manquaient de la réponse, et c'est TOUT le défaut de #3022. Le
+/// panneau lisait `createResult.matched || 0`, `.approximate || 0`,
+/// `.not_found || 0` (`RadioFavoritesView.svelte:145-147`) et le serveur ne
+/// rendait que `matched_tracks` + le rapport par favori. Les trois lectures
+/// retombaient sur `|| 0` : **0 trouvés / 0 approximatifs / 0 non trouvés en
+/// toutes circonstances**, playlist Qobuz créée et remplie ou pas (Reivax66,
+/// fil 1628). Même motif exact que #3002 et #2574 : rien n'échoue, tout ment.
+///
+/// L'information existait déjà — chaque entrée du rapport porte son `status`.
+/// On l'agrège ici, à partir de la MÊME source que le rapport rendu, pour
+/// qu'un compteur ne puisse pas diverger de la ligne qu'il résume.
+///
+/// La répartition couvre l'intégralité des favoris (`matched + approximate +
+/// not_found == favorites.len()`), parce que c'est ce que le panneau à trois
+/// cases laisse entendre :
+/// - `matched` : `matched`, et `duplicate` — le favori EST dans la playlist,
+///   simplement déjà mis là par un favori précédent ;
+/// - `approximate` : la bande 0,6–0,7 de la cible streaming ;
+/// - `not_found` : tout le reste — `not_found`, `rejected` (candidat refusé au
+///   seuil), `search_failed`, `add_failed`. Le détail par favori reste dans le
+///   rapport, qui seul distingue ces quatre raisons.
+fn compter_par_statut(rapport: &[Value]) -> (usize, usize, usize) {
+    let mut matched = 0usize;
+    let mut approximate = 0usize;
+    let mut not_found = 0usize;
+    for entree in rapport {
+        match entree.get("status").and_then(|s| s.as_str()).unwrap_or("") {
+            "matched" | "duplicate" => matched += 1,
+            "approximate" => approximate += 1,
+            _ => not_found += 1,
+        }
+    }
+    (matched, approximate, not_found)
+}
+
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
@@ -1608,14 +1646,28 @@ async fn create_playlist_from_favorites(
         "radio_fav_local_playlist_done"
     );
 
+    let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&report);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": playlist_id,
+            // `playlist_id` sous le nom que l'écran lit pour son bandeau
+            // « Playlist créée avec succès ! » (`{#if createResult.playlist_id}`).
+            // `id` reste, personne ne casse.
+            "playlist_id": playlist_id,
             "name": name,
             "favorites_count": favorites.len(),
             "matched_tracks": matched,
-            "results": report,
+            "matched": nb_matched,
+            "approximate": nb_approx,
+            "not_found": nb_not_found,
+            // Le rapport par favori sortait sous DEUX noms selon `service` :
+            // `results` ici, `details` sur la cible streaming — même route, même
+            // contenu, deux clés. On rend les deux des deux côtés ; un seul nom
+            // suffit désormais à un client, quelle que soit la cible.
+            "results": report.clone(),
+            "details": report,
         })),
     )
         .into_response())
@@ -1779,12 +1831,17 @@ async fn create_streaming_playlist_from_favorites(
                     error = %e,
                     "radio_fav_create_playlist_failed (service may not support write)"
                 );
+                let (m, a, nf) = compter_par_statut(&details);
                 return Ok((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({
                         "error": format!("could not create playlist on '{service}': {e}"),
                         "matched_tracks": matched_ids.len(),
-                        "details": details,
+                        "matched": m,
+                        "approximate": a,
+                        "not_found": nf,
+                        "details": details.clone(),
+                        "results": details,
                     })),
                 )
                     .into_response());
@@ -1792,15 +1849,26 @@ async fn create_streaming_playlist_from_favorites(
         }
     }
 
+    let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&details);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "service": service,
             "name": name,
             "favorites_count": favorites.len(),
+            // `matched_tracks` = ce qui a été POUSSÉ dans la playlist distante,
+            // sûrs ET approximatifs confondus. `matched` ci-dessous ne compte
+            // que les sûrs : les deux nombres diffèrent légitimement dès qu'un
+            // favori tombe dans la bande 0,6–0,7.
             "matched_tracks": matched_ids.len(),
-            "remote_playlist_id": remote_playlist_id,
-            "details": details,
+            "matched": nb_matched,
+            "approximate": nb_approx,
+            "not_found": nb_not_found,
+            "remote_playlist_id": remote_playlist_id.clone(),
+            "playlist_id": remote_playlist_id,
+            "details": details.clone(),
+            "results": details,
         })),
     )
         .into_response())
