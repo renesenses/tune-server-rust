@@ -59,6 +59,8 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
+#[path = "playlists_cloisonnement_par_profil.rs"]
+mod playlists_cloisonnement_par_profil;
 #[path = "playlists_ecritures_partielles.rs"]
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]

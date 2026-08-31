@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::tag_repo::{TagRepo, is_taggable_item_type, item_type_rejette};
 
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -240,14 +241,28 @@ async fn list_tag_artists(State(state): State<AppState>, Path(id): Path<i64>) ->
 /// La playlist locale porte un `INTEGER PRIMARY KEY` : contrairement au label,
 /// elle entre dans `item_tags` telle quelle. C'est la même frontière que celle
 /// tracée par `favorite_facets_repo` pour les favoris.
-async fn list_tag_playlists(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+///
+/// Les étiquettes, elles, sont communes au foyer : sans filtre, cette route
+/// résolvait le nom et le nombre de pistes des playlists des AUTRES profils
+/// (#2794). Un profil ne peut étiqueter que ce qu'il voit, donc restreindre la
+/// résolution à ses propres playlists ne lui retire rien.
+async fn list_tag_playlists(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> Json<Value> {
     let tag_repo = TagRepo::with_backend(state.backend.clone());
     let playlist_ids = tag_repo.items_by_tag(id, "playlist").unwrap_or_default();
     let playlist_repo =
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let playlists: Vec<Value> = playlist_ids
         .into_iter()
-        .filter_map(|pid| playlist_repo.get(pid).ok().flatten())
+        .filter_map(|pid| {
+            playlist_repo
+                .get_for_profile(pid, profile.id())
+                .ok()
+                .flatten()
+        })
         .map(|p| {
             json!({
                 "id": p.id,
