@@ -78,6 +78,46 @@ struct ConvertJob {
 
 type JobStore = Arc<Mutex<HashMap<String, Arc<Mutex<ConvertJob>>>>>;
 
+/// Root of the per-job scratch directories the converter writes into.
+///
+/// Single source of truth: the directory `start_job` creates and the one
+/// `/capabilities` announces must never drift apart (#2943).
+const CONVERT_OUTPUT_ROOT: &str = "/tmp/tune-convert";
+
+/// Where one job's converted files land. Nothing is ever written outside of
+/// this directory — not into the library, not next to the source files.
+fn job_output_dir(job_id: &str) -> PathBuf {
+    PathBuf::from(CONVERT_OUTPUT_ROOT).join(job_id)
+}
+
+/// What the converter does with the result, and what it promises not to touch.
+///
+/// #2943 (Bilou, fil forum 1095): « On ne sait d'ailleurs pas comment se
+/// réalise la conversion proprement dit : duplication de l'album ?,
+/// remplacement ? ». He had to ask on the forum, and wait five weeks, because
+/// the server never stated it anywhere — the screen had nothing truthful to
+/// display before launching a job that touches music files.
+///
+/// Everything below is knowable here and only here:
+/// - `run_conversion` writes exclusively into `job_output_dir(job_id)`;
+/// - the only way out is the ZIP built by `download_job`/`build_zip`;
+/// - sources are opened read-only (decode, plus `copy_tags`, which reads the
+///   source tags and saves them onto the *destination* file).
+///
+/// Declaring it lets the screen quote the server instead of hardcoding a claim
+/// that a future destination setting (#2944) would silently turn into a lie.
+fn delivery_descriptor() -> Value {
+    json!({
+        // The result leaves the server as a single downloadable archive.
+        "mode": "zip_download",
+        // Server-side scratch root; per job, a `{output_root}/{job_id}` dir.
+        "output_root": CONVERT_OUTPUT_ROOT,
+        // The two questions the screen must be able to answer up front.
+        "writes_to_library": false,
+        "modifies_sources": false,
+    })
+}
+
 /// Lazily initialised per-process job store.  We store it as a layer extension
 /// so it lives as long as the router.
 fn job_store() -> JobStore {
@@ -116,6 +156,12 @@ pub fn router() -> Router<AppState> {
 /// carries only the `aac` encoder (no libmp3lame), so mp3 must be answered
 /// from what the resolved binary actually encodes.
 async fn capabilities() -> impl IntoResponse {
+    Json(capabilities_payload().await)
+}
+
+/// The payload behind `GET /capabilities`, split out so the contract can be
+/// asserted without going through an HTTP response body.
+async fn capabilities_payload() -> Value {
     let ffmpeg = resolve_tool("ffmpeg");
     let lame = resolve_tool("lame");
     let encoders = match &ffmpeg {
@@ -123,7 +169,7 @@ async fn capabilities() -> impl IntoResponse {
         None => std::collections::HashSet::new(),
     };
 
-    Json(json!({
+    json!({
         // Native formats are always available: flac/wav/opus (#1525),
         // alac via Apple's vendored encoder (#1526), aac via the OS
         // encoder where one exists (#1527 — AudioToolbox on macOS).
@@ -141,7 +187,9 @@ async fn capabilities() -> impl IntoResponse {
             "ffmpeg": ffmpeg.map(|p| p.display().to_string()),
             "lame": lame.map(|p| p.display().to_string()),
         },
-    }))
+        // Where the result goes and what stays untouched (#2943).
+        "delivery": delivery_descriptor(),
+    })
 }
 
 /// Ask the resolved ffmpeg what it can encode (`ffmpeg -encoders`), cached
@@ -259,7 +307,7 @@ async fn start_job(
 
     let total = file_paths.len();
     let job_id = uuid::Uuid::new_v4().to_string();
-    let output_dir = PathBuf::from(format!("/tmp/tune-convert/{}", job_id));
+    let output_dir = job_output_dir(&job_id);
     tokio::fs::create_dir_all(&output_dir)
         .await
         .map_err(|e| AppError::internal(format!("failed to create output dir: {e}")))?;
@@ -1427,6 +1475,64 @@ mod tests {
         );
         // The minimal bundled build ships exactly aac+alac: mp3 must NOT be
         // inferred from ffmpeg's mere presence.
+    }
+
+    #[test]
+    fn la_destination_et_ce_qui_nest_pas_touche_sont_annonces() {
+        // #2943 : la question de Bilou — « duplication de l'album ?,
+        // remplacement ? » — doit trouver sa réponse dans le contrat serveur.
+        let d = delivery_descriptor();
+        assert_eq!(
+            d["mode"], "zip_download",
+            "le résultat sort en archive téléchargeable, l'écran doit pouvoir le dire"
+        );
+        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
+        assert_eq!(
+            d["writes_to_library"], false,
+            "la bibliothèque n'est ni modifiée ni dupliquée"
+        );
+        assert_eq!(
+            d["modifies_sources"], false,
+            "les fichiers d'origine ne sont ouverts qu'en lecture"
+        );
+    }
+
+    #[test]
+    fn le_dossier_dun_travail_reste_sous_la_racine_annoncee() {
+        // Témoin anti-dérive : si quelqu'un déplace la sortie sans corriger
+        // l'annonce, l'écran mentirait. Ce test devient rouge d'abord.
+        let announced = delivery_descriptor()["output_root"]
+            .as_str()
+            .expect("output_root est une chaîne")
+            .to_string();
+        let dir = job_output_dir("11111111-2222-3333-4444-555555555555");
+        assert!(
+            dir.starts_with(&announced),
+            "sortie {} hors de la racine annoncée {announced}",
+            dir.display()
+        );
+        assert_ne!(
+            dir,
+            PathBuf::from(&announced),
+            "chaque travail a son propre sous-dossier"
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_conserve_formats_et_outils_en_plus_de_la_destination() {
+        // Témoin anti-régression : l'ajout de `delivery` ne doit rien retirer
+        // du contrat de #1524 (grisage des formats indisponibles).
+        let payload = capabilities_payload().await;
+        assert!(payload["formats"]["flac"].is_boolean());
+        assert!(payload["formats"]["mp3"].is_boolean());
+        assert!(payload["tools"].is_object(), "bloc tools conservé");
+        assert!(
+            payload["tools"]
+                .as_object()
+                .is_some_and(|t| t.contains_key("ffmpeg")),
+            "diagnostic ffmpeg conservé"
+        );
+        assert_eq!(payload["delivery"], delivery_descriptor());
     }
 
     #[test]
