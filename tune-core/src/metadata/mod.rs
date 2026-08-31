@@ -4,6 +4,7 @@ pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
 pub mod credit_enricher;
+pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
 pub mod lastfm;

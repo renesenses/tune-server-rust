@@ -6,7 +6,7 @@
 //! confrontent la réponse à la carte commitée.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -148,6 +148,43 @@ async fn post_json(app: &axum::Router, chemin: &str) -> Result<Value, String> {
     })
 }
 
+async fn mutation_json(
+    app: &axum::Router,
+    methode: axum::http::Method,
+    chemin: &str,
+    body: Value,
+    statut_attendu: StatusCode,
+) -> Result<Value, String> {
+    let reponse = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(methode)
+                .uri(chemin)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .map_err(|erreur| format!("{chemin}: routeur en echec: {erreur}"))?;
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .map_err(|erreur| format!("{chemin}: corps illisible: {erreur}"))?;
+    if statut != statut_attendu {
+        return Err(format!(
+            "{chemin}: statut {statut}, attendu {statut_attendu}, corps {}",
+            String::from_utf8_lossy(&octets)
+        ));
+    }
+    serde_json::from_slice(&octets).map_err(|erreur| {
+        format!(
+            "{chemin}: JSON invalide ({erreur}), corps {}",
+            String::from_utf8_lossy(&octets)
+        )
+    })
+}
+
 /// Routes sans secret, matériel ni service tiers. La vague commence par les
 /// écrans les plus centraux (accueil, bibliothèque, diagnostics et réglages).
 const VAGUE_INITIALE: &[(&str, &str)] = &[
@@ -186,6 +223,10 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ),
     ("/offline/status", "/api/v1/offline/status"),
     ("/onboarding/status", "/api/v1/onboarding/status"),
+    // La recherche de stations ne rend plus un tableau nu : son corps doit
+    // porter de quoi distinguer « aucune station de ce nom » d'une panne
+    // (#2119). `fip` touche le catalogue livré, donc l'issue « résultats ».
+    ("/radios/search", "/api/v1/radios/search?q=fip"),
     ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
     (
         "/streaming/youtube/auth/status",
@@ -207,10 +248,11 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     ("/system/scan/status", "/api/v1/system/scan/status"),
     ("/system/stats", "/api/v1/system/stats"),
     ("/system/youtube/status", "/api/v1/system/youtube/status"),
+    ("/zones", "/api/v1/zones"),
 ];
 
 #[tokio::test]
-async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
+async fn trente_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
@@ -220,6 +262,10 @@ async fn vingt_neuf_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     pistes
         .create(&piste_douteuse)
         .expect("piste temoin sans artiste ni album");
+    let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(etat.backend.clone());
+    zones
+        .create("Zone du contrat", Some("browser"), Some("browser-contract"))
+        .expect("zone temoin pour prouver le contrat de liste");
     let app = tune_server::routes::router(etat);
 
     for (route_contrat, chemin_reel) in VAGUE_INITIALE {
@@ -251,6 +297,266 @@ async fn desactiver_spotify_connect_rend_le_statut_complet_annonce_au_web() {
         .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
 }
 
+#[tokio::test]
+async fn objets_persistes_respectent_leurs_contrats_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let piste_id = pistes
+        .create(&tune_core::db::models::Track::new(
+            "Piste du contrat persiste".into(),
+        ))
+        .expect("creation de la piste temoin");
+    let app = tune_server::routes::router(etat);
+
+    let playlist = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/playlists",
+        serde_json::json!({"name": "Contrat initial", "description": "Temoin"}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la playlist temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/playlists", &playlist)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/playlists: {erreur}; payload={playlist}"));
+    let playlist_id = playlist["id"].as_i64().expect("id de playlist");
+
+    let playlist = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/playlists/{playlist_id}"),
+        serde_json::json!({"name": "Contrat renomme"}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la playlist temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/playlists/{}", &playlist).unwrap_or_else(
+        |erreur| panic!("PUT /api/v1/playlists/{{id}}: {erreur}; payload={playlist}"),
+    );
+    assert_eq!(playlist["name"], "Contrat renomme");
+
+    let playlist = mutation_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/playlists/{playlist_id}/tracks"),
+        serde_json::json!({"track_ids": [piste_id]}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("ajout de la piste temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/playlists/{}/tracks", &playlist).unwrap_or_else(
+        |erreur| panic!("POST /playlists/{{id}}/tracks: {erreur}; payload={playlist}"),
+    );
+    assert_eq!(playlist["track_count"], 1);
+
+    for (route_contrat, chemin_reel) in [
+        ("/playlists", "/api/v1/playlists".to_string()),
+        ("/playlists/{}", format!("/api/v1/playlists/{playlist_id}")),
+        (
+            "/playlists/{}/tracks",
+            format!("/api/v1/playlists/{playlist_id}/tracks"),
+        ),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let radio = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/radios",
+        serde_json::json!({
+            "name": "Radio contrat",
+            "stream_url": "https://example.invalid/contrat.aac",
+            "genre": "Test"
+        }),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la radio temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/radios", &radio)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/radios: {erreur}; payload={radio}"));
+    let radio_id = radio["id"].as_i64().expect("id de radio");
+
+    let radio = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/radios/{radio_id}"),
+        serde_json::json!({"favorite": true}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la radio temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/radios/{}", &radio)
+        .unwrap_or_else(|erreur| panic!("PUT /api/v1/radios/{{id}}: {erreur}; payload={radio}"));
+    assert_eq!(radio["favorite"], true);
+
+    for (route_contrat, chemin_reel) in [
+        ("/radios{}", "/api/v1/radios".to_string()),
+        ("/radios/{}", format!("/api/v1/radios/{radio_id}")),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let tag = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/tags",
+        serde_json::json!({"name": "Tag contrat", "color": "#123456"}),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation du tag temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/tags", &tag)
+        .unwrap_or_else(|erreur| panic!("POST /api/v1/tags: {erreur}; payload={tag}"));
+    let tag_id = tag["id"].as_i64().expect("id de tag");
+
+    let ajout = mutation_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/tags/{tag_id}/items/batch"),
+        serde_json::json!({"item_type": "track", "item_ids": [piste_id]}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("etiquetage de la piste temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/tags/{}/items/batch", &ajout).unwrap_or_else(
+        |erreur| panic!("POST /tags/{{id}}/items/batch: {erreur}; payload={ajout}"),
+    );
+
+    for (route_contrat, chemin_reel) in [
+        ("/tags/{}", "/api/v1/tags?item_type=track".to_string()),
+        ("/tags/search", "/api/v1/tags/search?q=contrat".to_string()),
+        (
+            "/tags/for/{}/{}",
+            format!("/api/v1/tags/for/track/{piste_id}"),
+        ),
+        ("/tags/{}/albums", format!("/api/v1/tags/{tag_id}/albums")),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+}
+
+#[tokio::test]
+async fn smart_collections_conservent_la_limite_du_contrat_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let app = tune_server::routes::router(etat);
+
+    let collection = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/library/smart-collections",
+        serde_json::json!({
+            "name": "Contrat borne",
+            "description": "Collection témoin",
+            "icon": "folder",
+            "color": "#123456",
+            "rules": [],
+            "match_mode": "all",
+            "sort_by": "title",
+            "sort_order": "asc",
+            "max_limit": 7
+        }),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("creation de la smart collection temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/library/smart-collections", &collection)
+        .unwrap_or_else(|erreur| panic!("POST smart collection: {erreur}; payload={collection}"));
+    assert_eq!(collection["max_limit"], 7);
+    assert!(collection["created_at"].is_string());
+    let id = collection["id"].as_i64().expect("id de smart collection");
+
+    let collection = mutation_json(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/library/smart-collections/{id}"),
+        serde_json::json!({"name": "Contrat borne relu", "max_limit": 3}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("mise a jour de la smart collection temoin");
+    respecte_tous_les_contrats(&carte, "PUT", "/library/smart-collections/{}", &collection)
+        .unwrap_or_else(|erreur| panic!("PUT smart collection: {erreur}; payload={collection}"));
+    assert_eq!(collection["max_limit"], 3);
+
+    for (route_contrat, chemin_reel) in [
+        (
+            "/library/smart-collections",
+            "/api/v1/library/smart-collections".to_string(),
+        ),
+        (
+            "/library/smart-collections/{}",
+            format!("/api/v1/library/smart-collections/{id}"),
+        ),
+    ] {
+        let payload = get_json(&app, &chemin_reel)
+            .await
+            .unwrap_or_else(|erreur| panic!("{erreur}"));
+        respecte_tous_les_contrats(&carte, "GET", route_contrat, &payload)
+            .unwrap_or_else(|erreur| panic!("{chemin_reel}: {erreur}; payload={payload}"));
+    }
+
+    let preview = mutation_json(
+        &app,
+        Method::POST,
+        "/api/v1/library/smart-collections/preview",
+        serde_json::json!({"rules": [], "max_limit": 1}),
+        StatusCode::OK,
+    )
+    .await
+    .expect("preview de la smart collection temoin");
+    respecte_tous_les_contrats(
+        &carte,
+        "POST",
+        "/library/smart-collections/preview",
+        &preview,
+    )
+    .unwrap_or_else(|erreur| panic!("POST preview smart collection: {erreur}; payload={preview}"));
+}
+
+#[tokio::test]
+async fn les_alertes_de_sante_sont_la_liste_annoncee_au_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+
+    // Produit une vraie alerte sans dépendre de la mémoire ou du disque de la
+    // machine qui exécute le test. Quinze erreurs récentes dépassent le seuil
+    // du moniteur et garantissent une liste non vide, nécessaire pour prouver
+    // aussi les champs de chaque élément du contrat TypeScript.
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("horloge système")
+        .as_secs();
+    etat.health_monitor
+        .check_error_spike(&[maintenant; 15])
+        .await;
+
+    let app = tune_server::routes::router(etat);
+    let payload = get_json(&app, "/api/v1/system/health/alerts")
+        .await
+        .expect("réponse des alertes de santé");
+
+    respecte_tous_les_contrats(&carte, "GET", "/system/health/alerts", &payload)
+        .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
+}
+
 #[test]
 fn la_contre_epreuve_refuse_un_champ_obligatoire_absent() {
     let contrat = ContratRoute {
@@ -263,6 +569,24 @@ fn la_contre_epreuve_refuse_un_champ_obligatoire_absent() {
     let erreur = respecte_contrat(&serde_json::json!({"items": []}), &contrat)
         .expect_err("une reponse sans total doit casser le contrat");
     assert!(erreur.contains("champ obligatoire absent: total"));
+}
+
+#[test]
+fn la_contre_epreuve_refuse_l_ancienne_enveloppe_des_alertes() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let ancienne_reponse = serde_json::json!({
+        "alerts": [{
+            "timestamp": "2026-08-29T00:00:00Z",
+            "level": "warning",
+            "category": "errors",
+            "message": "alerte témoin"
+        }]
+    });
+
+    let erreur =
+        respecte_tous_les_contrats(&carte, "GET", "/system/health/alerts", &ancienne_reponse)
+            .expect_err("une enveloppe objet ne doit pas satisfaire un contrat de liste");
+    assert!(erreur.contains("tableau JSON attendu"));
 }
 
 #[test]

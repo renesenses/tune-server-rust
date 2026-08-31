@@ -202,6 +202,10 @@ pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
                 tune_core::playback::PlayState::Stopped => "stopped",
             },
             "volume": if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 },
+            // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(
+                if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 },
+            ),
             "muted": z.muted,
             "current_track": ps.now_playing,
             "position_ms": ps.position_ms,

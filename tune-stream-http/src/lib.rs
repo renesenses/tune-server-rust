@@ -518,10 +518,20 @@ pub async fn handle_stream(
         // Le bloc à insérer : le titre courant s'il a été publié par le poller,
         // sinon celui de la connexion. Relu à CHAQUE insertion — c'est la seule
         // chose que le renderer verra changer sans qu'on relance quoi que ce soit.
+        //
+        // La POCHETTE se relit ici au même titre que l'artiste. Elle était prise
+        // sur `session.cover_url`, capturé une fois hors de la boucle — un champ
+        // qui vaut TOUJOURS `None` (posé par `StreamSession::new`, écrit nulle
+        // part), donc `StreamUrl='…'` ne partait jamais et l'écran du renderer
+        // gardait la première image (Serge Asselin, RS250A, fil 1529). Le repli
+        // sur `icy_cover` reste pour les sessions non-radio, le jour où ce champ
+        // sera renseigné.
         let bloc_icy_courant = || match tune_core::http::streamer::radio_now(&icy_stream_id) {
-            Some((artist, title)) => {
-                build_icy_metadata(artist.as_deref(), Some(&title), icy_cover.as_deref())
-            }
+            Some(np) => build_icy_metadata(
+                np.artist.as_deref(),
+                Some(&np.title),
+                np.cover.as_deref().or(icy_cover.as_deref()),
+            ),
             None => icy_block.clone(),
         };
 
@@ -1925,7 +1935,7 @@ mod tests {
 
         let sid = "i2161-fenetre";
         forget_radio_now(sid);
-        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into());
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into(), None);
 
         let (_, corps) = corps_radio(
             sid,
@@ -1967,6 +1977,80 @@ mod tests {
         assert!(
             texte.contains("StreamTitle='Miles Davis - So What';"),
             "le bloc doit porter le titre courant, pas celui de la connexion : {texte:?}"
+        );
+    }
+
+    /// La POCHETTE du morceau courant doit partir dans le bloc, au même titre
+    /// que son titre.
+    ///
+    /// C'est le second témoignage de #2161 : « la pochette et le titre ne
+    /// change pas sur le RS250A […] demeure avec la pochette et le titre de la
+    /// première écoute » (Serge Asselin, fil 1529). La pochette était lue sur
+    /// `session.cover_url`, capturé UNE FOIS hors de la boucle — et ce champ
+    /// vaut toujours `None` : posé par `StreamSession::new`, écrit nulle part
+    /// du dépôt, exactement comme `track_title` l'était. `StreamUrl='…'` ne
+    /// quittait donc jamais ce serveur.
+    #[tokio::test]
+    async fn le_bloc_icy_porte_la_pochette_courante() {
+        use tune_core::http::streamer::{forget_radio_now, publish_radio_now};
+
+        let sid = "i2161-pochette";
+        forget_radio_now(sid);
+        publish_radio_now(
+            sid,
+            Some("Miles Davis".into()),
+            "So What".into(),
+            Some("https://img.radioparadise.com/covers/l/sowhat.jpg".into()),
+        );
+
+        let (_, corps) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            20_000,
+        )
+        .await;
+        forget_radio_now(sid);
+
+        let longueur = corps[16_384] as usize;
+        let charge = &corps[16_385..16_385 + longueur * 16];
+        let texte = String::from_utf8_lossy(charge);
+        assert!(
+            texte.contains("StreamUrl='https://img.radioparadise.com/covers/l/sowhat.jpg';"),
+            "le bloc doit porter la pochette publiée par le poller : {texte:?}"
+        );
+        assert!(
+            texte.contains("StreamTitle='Miles Davis - So What';"),
+            "le titre doit rester présent à côté de la pochette : {texte:?}"
+        );
+    }
+
+    /// Sans pochette publiée, le bloc reste ce qu'il était : un `StreamTitle`
+    /// seul. On n'invente pas d'URL, et un `StreamUrl=''` vide serait pire que
+    /// pas de champ du tout — le renderer effacerait l'image qu'il affiche.
+    #[tokio::test]
+    async fn sans_pochette_publiee_le_bloc_ne_porte_aucun_streamurl() {
+        use tune_core::http::streamer::{forget_radio_now, publish_radio_now};
+
+        let sid = "i2161-sans-pochette";
+        forget_radio_now(sid);
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into(), None);
+
+        let (_, corps) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            20_000,
+        )
+        .await;
+        forget_radio_now(sid);
+
+        let longueur = corps[16_384] as usize;
+        let charge = &corps[16_385..16_385 + longueur * 16];
+        let texte = String::from_utf8_lossy(charge);
+        assert!(
+            !texte.contains("StreamUrl"),
+            "aucun StreamUrl ne doit partir quand la station n'en donne pas : {texte:?}"
         );
     }
 

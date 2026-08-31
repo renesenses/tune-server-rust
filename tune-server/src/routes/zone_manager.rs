@@ -141,6 +141,8 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
             "output_type": z.output_type,
             "output_device_id": z.output_device_id,
             "volume": z.volume as f64 / 100.0,
+            // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume as f64 / 100.0),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",
@@ -193,6 +195,8 @@ async fn list_managed_zones(State(state): State<AppState>) -> Json<Value> {
             "output_type": z.output_type,
             "output_device_id": z.output_device_id,
             "volume": z.volume as f64 / 100.0,
+            // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(z.volume as f64 / 100.0),
             "muted": z.muted,
             "state": match ps.state {
                 tune_core::playback::PlayState::Playing => "playing",

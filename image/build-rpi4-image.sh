@@ -11,6 +11,8 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 TUNE_VERSION="${1:---version}"
 if [[ "$TUNE_VERSION" == "--version" ]]; then
     TUNE_VERSION="${2:-latest}"
@@ -138,11 +140,28 @@ EOF
 
 sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS}/etc/nsswitch.conf"
 
+# Password login is kept for headless support, but the account is locked in
+# the image. A first-boot service generates and expires a unique credential
+# before sshd is allowed to start.
+mkdir -p "${ROOTFS}/etc/ssh/sshd_config.d"
+cat > "${ROOTFS}/etc/ssh/sshd_config.d/tune.conf" <<EOF
+PermitRootLogin no
+PasswordAuthentication yes
+EOF
+
 chroot "$ROOTFS" bash -c "
     useradd -m -s /bin/bash -G sudo,audio,plugdev tune
-    echo 'tune:tune' | chpasswd
     echo 'tune ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tune
 "
+
+install -D -m 0755 "${SCRIPT_DIR}/tune-os-password.sh" \
+    "${ROOTFS}/usr/local/sbin/tune-os-password"
+cat > "${ROOTFS}/etc/profile.d/tune-password-notice.sh" <<'EOF'
+if [ "${USER:-}" = tune ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n /usr/local/sbin/tune-os-password --acknowledge >/dev/null 2>&1 || true
+fi
+EOF
+chmod 0644 "${ROOTFS}/etc/profile.d/tune-password-notice.sh"
 
 # Audio priority
 cat > "${ROOTFS}/etc/security/limits.d/tune-audio.conf" <<EOF
@@ -235,6 +254,28 @@ chroot "$ROOTFS" systemctl enable avahi-daemon
 chroot "$ROOTFS" systemctl enable ssh
 chroot "$ROOTFS" systemctl enable tune-web80.socket
 
+cat > "${ROOTFS}/etc/systemd/system/tune-first-boot-password.service" <<EOF
+[Unit]
+Description=Tune OS First Boot SSH Password
+After=local-fs.target
+Before=ssh.service getty@tty1.service
+ConditionPathExists=!/var/lib/tune-os/ssh-password-v2
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tune-os-password --first-boot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+mkdir -p "${ROOTFS}/etc/systemd/system/ssh.service.d"
+cat > "${ROOTFS}/etc/systemd/system/ssh.service.d/tune-password.conf" <<EOF
+[Unit]
+Requires=tune-first-boot-password.service
+After=tune-first-boot-password.service
+EOF
+chroot "$ROOTFS" systemctl enable tune-first-boot-password.service
+
 cat > "${ROOTFS}/etc/motd" <<EOF
 
   ♫  Tune OS v${TUNE_VERSION} (Raspberry Pi)
@@ -243,7 +284,7 @@ cat > "${ROOTFS}/etc/motd" <<EOF
   Music:     /mnt/music
   Config:    /opt/tune/tune.toml
   Logs:      journalctl -u tune -f
-  User:      tune / tune
+  SSH user:  tune (temporary password shown on the physical console at first boot)
 
 EOF
 
@@ -275,5 +316,5 @@ echo "  Image:  ${FINAL_IMG} ($(du -h "$FINAL_IMG" | cut -f1))"
 echo "  GZ:     ${FINAL_IMG}.gz ($(du -h "${FINAL_IMG}.gz" | cut -f1))"
 echo ""
 echo "  Flash:  sudo dd if=${FINAL_IMG} of=/dev/sdX bs=4M status=progress"
-echo "  Login:  tune / tune"
+echo "  Login:  tune / temporary password generated on first boot"
 echo "  Web:    http://tune.local"

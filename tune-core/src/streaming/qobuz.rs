@@ -53,6 +53,22 @@ pub struct QobuzService {
     /// n'a jamais existé. `featured_cache` y est défini, lu à deux endroits, et
     /// JAMAIS écrit. Ne pas recopier ce modèle.
     cache_editorial: Mutex<HashMap<String, EntreeCache>>,
+    /// Réponses de `/album/get`, par identifiant d'album.
+    ///
+    /// Cache SÉPARÉ de l'éditorial, et non une clé de plus dedans, pour deux
+    /// raisons qui tiennent toutes les deux au volume : le détail d'un album
+    /// porte sa liste de pistes complète — un ordre de grandeur au-dessus
+    /// d'une liste de genres — et `retirer_les_chevrons_dementis` relit le
+    /// cache éditorial par la clé. Y verser les albums d'une navigation en
+    /// chasserait les démentis de genre qu'il est le seul à porter.
+    cache_album: Mutex<HashMap<String, EntreeCache>>,
+    /// Base d'API forcée, pour brancher les LECTURES sur un serveur simulé.
+    ///
+    /// `None` en production : l'ordre direct/proxy habituel s'applique. Seul
+    /// `api_get` la consulte — le login et les écritures gardent l'ordre de
+    /// production, de sorte qu'une base d'essai ne puisse jamais recevoir
+    /// d'identifiants.
+    base_forcee: Option<String>,
 }
 
 /// Une réponse éditoriale, et l'instant où elle a été obtenue.
@@ -70,6 +86,23 @@ const TTL_EDITORIAL: Duration = Duration::from_secs(1800);
 /// la page découverte ; ce plafond n'existe que pour qu'un cache oublié ne
 /// grossisse pas indéfiniment.
 const MAX_ENTREES_CACHE: usize = 64;
+
+/// Durée de vie du détail d'album en cache.
+///
+/// Cinq minutes, et non les trente de l'éditorial : ce cache n'existe pas pour
+/// épargner du réseau à la journée, mais pour qu'UNE ouverture d'album ne
+/// paie qu'UN aller-retour au lieu de quatre (#2190). Cinq minutes couvrent
+/// largement l'ouverture, la lecture qui suit, et un aller-retour dans la
+/// vue ; au-delà, rien ne justifie de garder une liste de pistes en mémoire.
+const TTL_ALBUM: Duration = Duration::from_secs(300);
+
+/// Nombre d'albums gardés en mémoire.
+///
+/// Ce plafond est TENU, contrairement à [`MAX_ENTREES_CACHE`] qui ne purge que
+/// les entrées expirées et peut donc croître si elles sont toutes fraîches.
+/// Une liste de pistes pèse, et une navigation d'une heure traverse facilement
+/// des centaines d'albums : ici on évince la plus ancienne.
+const MAX_ALBUMS_CACHE: usize = 32;
 
 /// (primary, fallback) API bases for the given endpoint order.
 ///
@@ -132,33 +165,56 @@ fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
 }
 
 /// Traduit le type de favori du client (pluriel) en paramètre attendu par
-/// l'API Qobuz.
+/// `/favorite/create` et `/favorite/delete`.
 ///
-/// `playlists` est traité à part : le type est parfaitement connu du
-/// connecteur — il lit `/playlist/getUserPlaylists`, `/playlist/get`,
-/// `/playlist/getFeatured` — mais **aucun appel de souscription à une
-/// playlist tierce n'est établi dans ce dépôt**. `/favorite/create` n'accepte,
-/// pour ce que le code démontre, que `track_ids`, `album_ids` et `artist_ids`.
-/// Rendre « unknown favorite type » ferait chercher une faute de frappe là où il
-/// y a une fonction à écrire (#2370).
+/// `playlists` n'a PAS de clé ici, et c'est le contrat de Qobuz, pas un oubli :
+/// `/favorite/create` ne porte que `track_ids`, `album_ids` et `artist_ids`.
+/// Suivre une playlist qui ne vous appartient pas passe par un endpoint
+/// distinct — [`ENDPOINT_SOUSCRIPTION_PLAYLIST`]. Le refus le dit, pour que
+/// personne n'ajoute ici une quatrième clé qui n'existe pas (#2370).
 fn favorite_key(fav_type: &str) -> Result<&'static str, TuneError> {
     match fav_type {
         "tracks" => Ok("track_ids"),
         "albums" => Ok("album_ids"),
         "artists" => Ok("artist_ids"),
-        "playlists" => Err(MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE.into()),
+        "playlists" => Err(MOTIF_PLAYLIST_HORS_FAVORITE_CREATE.into()),
         _ => Err(format!("unknown favorite type: {fav_type}").into()),
     }
 }
 
-/// Motif de refus d'un favori de playlist Qobuz.
+/// Pourquoi une playlist ne passe pas par `/favorite/create`.
+const MOTIF_PLAYLIST_HORS_FAVORITE_CREATE: &str = "qobuz: une playlist ne se met pas en favori via /favorite/create — elle passe \
+     par /playlist/subscribe (#2370)";
+
+/// Souscrire à une playlist Qobuz — l'équivalent du « cœur » pour une playlist
+/// qui ne vous appartient pas.
 ///
-/// Il nomme ce qui manque plutôt que de déclarer le type inconnu : l'appel de
-/// souscription à une playlist qui n'appartient pas à l'utilisateur n'est
-/// documenté nulle part dans ce dépôt, et on n'invente pas un endpoint Qobuz.
-const MOTIF_PLAYLIST_NON_SOUSCRIPTIBLE: &str = "qobuz: favori de playlist non pris en charge — l'appel de souscription à une \
-     playlist tierce n'est pas établi contre l'API Qobuz (#2370). La LECTURE des \
-     playlists de l'utilisateur reste disponible via /playlist/getUserPlaylists.";
+/// Le ticket #2370 laissait ce point ouvert : « rien dans ce dépôt ne dit que
+/// `/favorite/create` accepte un quatrième type ». Il n'en accepte pas. La
+/// playlist a son endpoint propre, établi contre **deux** clients Qobuz publics
+/// et indépendants :
+///
+/// * `tidalf/plugin.audio.qobuz` — `resources/lib/qobuz/api/raw.py` :
+///   `playlist_subscribe` exige `playlist_id` et POSTe sur `/playlist/subscribe` ;
+///   `favorite_create` n'y énumère que `artist_ids`, `album_ids`, `track_ids`.
+/// * `bbye98/minim` — `src/minim/qobuz.py` : `favorite_playlist(playlist_id)`
+///   POSTe sur `/playlist/subscribe` avec `data={"playlist_id": ...}`.
+///
+/// Aucun endpoint n'est deviné ici, et aucun test ne touche l'API réelle.
+const ENDPOINT_SOUSCRIPTION_PLAYLIST: &str = "/playlist/subscribe";
+
+/// Symétrique de [`ENDPOINT_SOUSCRIPTION_PLAYLIST`] — mêmes sources.
+const ENDPOINT_DESOUSCRIPTION_PLAYLIST: &str = "/playlist/unsubscribe";
+
+/// Le seul paramètre porté par les deux endpoints de souscription.
+///
+/// Au SINGULIER, contrairement aux clés de `/favorite/create` qui sont des
+/// listes d'identifiants (`album_ids`). Confondre les deux formes est l'erreur
+/// que le test de souscription surveille.
+const PARAM_PLAYLIST_ID: &str = "playlist_id";
+
+/// Le type de favori, côté client, qui désigne une playlist.
+const TYPE_FAVORI_PLAYLISTS: &str = "playlists";
 
 /// Offsets des pages restant à charger après la première page d'un endpoint
 /// paginé Qobuz.
@@ -192,6 +248,72 @@ fn remaining_page_offsets_bornees(
     (page_size..borne).step_by(page_size).collect()
 }
 
+/// Les quatre catégories que `/catalog/search` rend dans une même réponse.
+const CATEGORIES_RECHERCHE: [&str; 4] = ["tracks", "albums", "artists", "playlists"];
+
+/// Taille de page de `/catalog/search`.
+///
+/// Qobuz ne rend jamais plus de 50 éléments par catégorie et par requête, quel
+/// que soit le `limit` demandé : au-delà, il faut un `offset`, pas un plus
+/// grand `limit`.
+const TAILLE_PAGE_RECHERCHE: usize = 50;
+
+/// Plafond d'une recherche « Tous » (#2160).
+///
+/// « Tous » ne peut pas vouloir dire « tout le catalogue » : une requête
+/// courante annonce des dizaines de milliers de titres, soit des centaines
+/// d'allers-retours et une limitation Akamai assurée. 500 par catégorie — dix
+/// pages — reprend le plafond déjà retenu pour les sélections éditoriales
+/// (#1969).
+const PLAFOND_RECHERCHE: usize = 500;
+
+/// Combien d'éléments par catégorie une recherche doit réellement ramener.
+///
+/// `0` est le « Tous » du client, même convention que les facettes Oxygen. Et
+/// toute valeur est bornée : un client qui demanderait 100 000 ne doit pas se
+/// traduire en deux mille requêtes chez Qobuz.
+fn plafond_recherche(limite: usize) -> usize {
+    if limite == 0 {
+        PLAFOND_RECHERCHE
+    } else {
+        limite.min(PLAFOND_RECHERCHE)
+    }
+}
+
+/// Un volume DÉJÀ borné par `plafond_recherche` demande-t-il plusieurs pages ?
+///
+/// Prend le plafond et non la limite brute : le seul appelant en production
+/// tient déjà le plafond, et lui faire repasser par `plafond_recherche`
+/// laisserait deux traductions « Tous » → 500 vivre côte à côte.
+fn recherche_paginee(plafond: usize) -> bool {
+    plafond > TAILLE_PAGE_RECHERCHE
+}
+
+/// Décalages des pages restantes d'une recherche, après la première.
+///
+/// Une seule requête `/catalog/search` rend les quatre catégories : on ne
+/// pagine donc pas quatre fois, on pagine une fois jusqu'à ce que la catégorie
+/// la PLUS fournie soit épuisée ou que le plafond soit atteint. Les catégories
+/// déjà épuisées rendront simplement des pages vides, que la fusion ignore.
+///
+/// `depart` est le curseur du client (#2160) : le plafond se compte À PARTIR
+/// de lui, pas depuis le début du catalogue. Un « Charger plus » à `depart =
+/// 500` demandant 200 doit rendre les 200 suivants, pas zéro.
+fn offsets_recherche(
+    comptes: &[usize],
+    totaux: &[usize],
+    plafond: usize,
+    depart: usize,
+) -> Vec<usize> {
+    let compte_max = comptes.iter().copied().max().unwrap_or(0);
+    let total_max = totaux.iter().copied().max().unwrap_or(0);
+    let restant = total_max.saturating_sub(depart);
+    remaining_page_offsets_bornees(compte_max, restant, TAILLE_PAGE_RECHERCHE, plafond)
+        .into_iter()
+        .map(|relatif| relatif + depart)
+        .collect()
+}
+
 /// Trace le résultat d'une écriture de favori chez Qobuz.
 ///
 /// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
@@ -222,6 +344,29 @@ impl QobuzService {
         Ok(())
     }
 
+    /// Souscrire ou désouscrire une playlist Qobuz.
+    ///
+    /// Chemin volontairement distinct de `/favorite/{create,delete}` : Qobuz
+    /// range la playlist sous `/playlist/{,un}subscribe`, avec `playlist_id`
+    /// au singulier — pas sous une quatrième clé de `/favorite/create`
+    /// (#2370). Le jeton utilisateur est exigé d'emblée, pour la même raison
+    /// que sur les autres favoris : sans lui Qobuz répond OK sans rien
+    /// enregistrer.
+    async fn souscription_playlist(
+        &self,
+        endpoint: &'static str,
+        op: &str,
+        playlist_id: &str,
+    ) -> Result<(), TuneError> {
+        self.require_user_token(endpoint)?;
+        let res = self
+            .api_post(endpoint, &[(PARAM_PLAYLIST_ID, playlist_id)])
+            .await;
+        log_favorite_result(op, TYPE_FAVORI_PLAYLISTS, playlist_id, &res);
+        res?;
+        Ok(())
+    }
+
     pub fn new(app_id: String, app_secret: String) -> Self {
         Self {
             client: crate::http::client::builder()
@@ -242,6 +387,30 @@ impl QobuzService {
             needs_token_rewrite: false,
             session_expired: false,
             cache_editorial: Mutex::new(HashMap::new()),
+            cache_album: Mutex::new(HashMap::new()),
+            base_forcee: None,
+        }
+    }
+
+    /// Même service, mais dont les LECTURES tapent sur `base` au lieu de
+    /// l'API Qobuz. Réservé aux essais : il n'existe aucun chemin de
+    /// production qui construise un service ainsi.
+    #[cfg(test)]
+    fn avec_base_forcee(base: impl Into<String>) -> Self {
+        let mut svc = Self::new(String::from("app-id-essai"), String::from("secret-essai"));
+        svc.base_forcee = Some(base.into());
+        svc
+    }
+
+    /// (primaire, secours) pour un appel API — lecture comme ecriture.
+    ///
+    /// Une seule fonction pour les deux : un `base_forcee` qui ne vaudrait que
+    /// pour les GET rendrait les POST intestables, et c'est exactement ce qui
+    /// manquait pour prouver la souscription d'une playlist (#2370).
+    fn bases_api(&self) -> (&str, &str) {
+        match self.base_forcee {
+            Some(ref base) => (base.as_str(), base.as_str()),
+            None => endpoint_order(self.proxy_first),
         }
     }
 
@@ -279,7 +448,7 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let (primary, fallback) = self.bases_api();
         match self.api_get_at(primary, path, params).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
@@ -428,6 +597,82 @@ impl QobuzService {
         Ok(donnees)
     }
 
+    /// La réponse de `/album/get` pour cet album — une seule fois par album.
+    ///
+    /// **Le défaut que ceci corrige (#2190).** Ouvrir un album déclenche
+    /// jusqu'à QUATRE requêtes HTTP côté client — `/albums/{id}`,
+    /// `/albums/{id}/tracks`, `/albums/{id}/context`, `/albums/{id}/label` —
+    /// et chacune repartait chercher auprès de Qobuz **exactement la même**
+    /// réponse `/album/get?album_id={id}`. La lecture qui suit en ajoutait une
+    /// cinquième (`playback.rs` refait `get_album_tracks`). Cinq allers-retours
+    /// pour une donnée, sur un service dont un aller-retour coûte des
+    /// centaines de millisecondes : c'est le « slow to load » d'Alex Campbell.
+    ///
+    /// **Pourquoi c'est cachable.** Tout ce que nous lisons de cette réponse
+    /// est du CATALOGUE : `map_album` (titre, artiste, pochette, année,
+    /// qualité), `map_track` (titre, interprète, ISRC, numéro de piste),
+    /// `get_album_context` (genre, label), `get_album_label` (label). **Aucun
+    /// champ propre au compte n'est consulté** — ni `favorited_at`, ni
+    /// `purchasable`, ni `streamable`. Contrairement aux favoris ou aux
+    /// playlists de l'utilisateur, resservir cette réponse ne peut donc pas
+    /// faire réapparaître ce qu'il vient de retirer. Si un jour un mappeur se
+    /// met à lire un champ dépendant du compte, ce cache devra sauter — c'est
+    /// la seule condition, et elle est ici pour être relue.
+    async fn detail_album(&self, album_id: &str) -> Result<serde_json::Value, String> {
+        if let Some(donnees) = self.album_en_cache(album_id) {
+            debug!(album_id, "qobuz_album_cache_hit");
+            return Ok(donnees);
+        }
+        let donnees = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
+        self.memoriser_album(album_id, donnees.clone());
+        Ok(donnees)
+    }
+
+    /// Le détail d'album mémorisé s'il est encore frais, sinon rien.
+    fn album_en_cache(&self, album_id: &str) -> Option<serde_json::Value> {
+        let cache = self.cache_album.lock().ok()?;
+        cache.get(album_id).and_then(|e| {
+            if e.cree.elapsed() < TTL_ALBUM {
+                Some(e.donnees.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Mémorise un détail d'album, en tenant le plafond.
+    ///
+    /// On retire d'abord les périmés ; s'il n'en restait aucun, on évince la
+    /// plus ANCIENNE entrée. Se contenter de la purge des périmés — ce que
+    /// fait `cache_set` — laisserait la table croître sans borne pendant une
+    /// navigation soutenue, chaque entrée portant une liste de pistes.
+    fn memoriser_album(&self, album_id: &str, donnees: serde_json::Value) {
+        let Ok(mut cache) = self.cache_album.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_ALBUMS_CACHE {
+            cache.retain(|_, e| e.cree.elapsed() < TTL_ALBUM);
+        }
+        if cache.len() >= MAX_ALBUMS_CACHE {
+            if let Some(plus_ancienne) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.cree)
+                .map(|(cle, _)| cle.clone())
+            {
+                cache.remove(&plus_ancienne);
+            }
+        }
+        cache.insert(
+            album_id.to_string(),
+            EntreeCache {
+                donnees,
+                cree: Instant::now(),
+            },
+        );
+    }
+
     /// Une collection de titres rattachée à un artiste, lue sous la clé qui
     /// porte le nom de l'`extra` demandé (#2568).
     ///
@@ -566,16 +811,154 @@ impl QobuzService {
         Ok(all_items)
     }
 
+    /// Rôles Qobuz d'écriture pure (comparés sans espaces) : un intervenant qui
+    /// n'a que ceux-là est l'auteur de l'œuvre, pas son interprète.
+    fn role_d_ecriture(role: &str) -> bool {
+        matches!(
+            role.replace(' ', "").as_str(),
+            "Composer" | "ComposerLyricist" | "Lyricist" | "Author" | "Writer" | "MusicPublisher"
+        )
+    }
+
+    /// Les rôles crédités à `nom` dans la chaîne Qobuz `performers`
+    /// (« Nom, Rôle1, Rôle2 - Nom2, Rôle3 »). `None` si le nom n'y figure pas.
+    /// Le préfixe est comparé tel quel, ce qui tolère les noms contenant une
+    /// virgule (« Blood, Sweat & Tears, MainArtist »).
+    fn roles_credites<'a>(performers: &'a str, nom: &str) -> Option<Vec<&'a str>> {
+        performers.split(" - ").find_map(|entree| {
+            let reste = entree.trim().strip_prefix(nom)?;
+            if reste.is_empty() {
+                return Some(Vec::new());
+            }
+            let roles = reste.strip_prefix(", ")?;
+            Some(roles.split(", ").map(str::trim).collect())
+        })
+    }
+
+    /// Le premier intervenant crédité `MainArtist` dans la chaîne `performers`.
+    fn main_artist_des_roles(performers: &str) -> Option<String> {
+        performers.split(" - ").find_map(|entree| {
+            let mut segments = entree.trim().split(", ");
+            let nom = segments.next()?.trim();
+            (!nom.is_empty() && segments.any(|r| r.trim().replace(' ', "") == "MainArtist"))
+                .then(|| nom.to_string())
+        })
+    }
+
+    /// L'interprète à afficher comme « artiste » d'une piste Qobuz (#1407).
+    ///
+    /// En classique, Qobuz place souvent le compositeur dans `performer` (voire
+    /// dans l'artiste d'album), et « Lecture en cours » affichait Chopin au lieu
+    /// de la pianiste. Priorité : interprète d'abord — le compositeur ne sert
+    /// JAMAIS de valeur d'« artiste » quand un interprète est identifiable.
+    ///
+    /// 1. `performer.name`, sauf si la chaîne de rôles `performers` (ou, à
+    ///    défaut, l'égalité avec `composer.name`) le désigne comme auteur pur ;
+    /// 2. le premier `MainArtist` de la chaîne de rôles (rôle d'interprète
+    ///    prouvé, même s'il est aussi le compositeur — cas de l'auteur qui joue
+    ///    ses propres œuvres) ;
+    /// 3. `artist.name` de la piste puis `album.artist.name`, hors compositeur
+    ///    et hors « Various Artists » (qui n'apprend rien à l'auditeur) ;
+    /// 4. repli historique inchangé : `performer.name` puis `artist.name`.
+    fn artiste_interprete(item: &serde_json::Value) -> String {
+        let vide = |s: &&str| !s.trim().is_empty();
+        let compositeur = item["composer"]["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let performer = item["performer"]["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let roles = item["performers"].as_str().unwrap_or("");
+
+        if let Some(p) = performer {
+            let auteur_pur = match Self::roles_credites(roles, p) {
+                Some(credits) if !credits.is_empty() => {
+                    credits.iter().all(|r| Self::role_d_ecriture(r))
+                }
+                // Pas d'info de rôle exploitable : on ne l'écarte que si son nom
+                // est exactement celui du compositeur.
+                _ => compositeur == Some(p),
+            };
+            if !auteur_pur {
+                return p.into();
+            }
+        }
+        if let Some(main) = Self::main_artist_des_roles(roles) {
+            return main;
+        }
+        for candidat in [
+            item["artist"]["name"].as_str(),
+            item["album"]["artist"]["name"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        {
+            if !candidat.is_empty()
+                && compositeur != Some(candidat)
+                && !candidat.eq_ignore_ascii_case("various artists")
+            {
+                return candidat.into();
+            }
+        }
+        performer
+            .or_else(|| item["artist"]["name"].as_str().filter(vide))
+            .unwrap_or("")
+            .into()
+    }
+
+    /// L'identifiant Qobuz de l'artiste que `artiste_interprete` vient de
+    /// nommer — et de personne d'autre (#1361).
+    ///
+    /// La chaîne de priorité au-dessus rend un NOM, parfois extrait de la
+    /// chaîne de rôles `performers`, qui ne porte aucun identifiant. Rejouer la
+    /// chaîne pour en tirer un id produirait donc des désaccords silencieux :
+    /// le nom viendrait des rôles, l'id d'un nœud voisin, et le clic ouvrirait
+    /// la fiche de quelqu'un d'autre.
+    ///
+    /// On procède donc dans l'autre sens : on part du nom retenu et on ne
+    /// retient un identifiant que d'un nœud qui porte EXACTEMENT ce nom. Aucun
+    /// nœud ne correspond ⇒ `None`. C'est la même règle que pour `composer` :
+    /// une donnée qu'on ne peut pas prouver ne s'écrit pas.
+    fn identifiant_interprete(item: &serde_json::Value) -> Option<String> {
+        let nom = Self::artiste_interprete(item);
+        if nom.is_empty() {
+            return None;
+        }
+        [
+            &item["performer"],
+            &item["artist"],
+            &item["album"]["artist"],
+        ]
+        .into_iter()
+        .find_map(|noeud| {
+            (noeud["name"].as_str().map(str::trim) == Some(nom.as_str()))
+                .then(|| {
+                    noeud["id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| noeud["id"].as_u64().map(|id| id.to_string()))
+                })
+                .flatten()
+        })
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["performer"]["name"]
+            artist: Self::artiste_interprete(item),
+            // L'identifiant de CET artiste-là, pour que « Lecture en cours »
+            // puisse ouvrir sa fiche sans rechercher son nom (#1361).
+            artist_id: Self::identifiant_interprete(item),
+            composer: item["composer"]["name"]
                 .as_str()
-                .or_else(|| item["artist"]["name"].as_str())
-                .unwrap_or("")
-                .into(),
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(Into::into),
             album: album["title"].as_str().map(Into::into),
             album_id: album["id"]
                 .as_str()
@@ -642,10 +1025,186 @@ impl QobuzService {
     /// `/catalog/search` renvoie ses playlists dans la même forme que les
     /// sélections éditoriales, d'où le convertisseur partagé.
     fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
-        data["playlists"]["items"]
+        Self::elements(data, "playlists")
+            .iter()
+            .map(Self::map_featured_playlist)
+            .collect()
+    }
+
+    /// Le tableau `items` d'une catégorie, vide si la catégorie est absente.
+    fn elements<'a>(data: &'a serde_json::Value, categorie: &str) -> &'a [serde_json::Value] {
+        data[categorie]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Ce qu'une page rend pour une catégorie, et ce que Qobuz annonce en tout.
+    fn compte_et_total(data: &serde_json::Value, categorie: &str) -> (usize, usize) {
+        (
+            Self::elements(data, categorie).len(),
+            data[categorie]["total"].as_u64().unwrap_or(0) as usize,
+        )
+    }
+
+    /// Concatène les pages d'une recherche, dans l'ordre des décalages, et
+    /// borne CHAQUE catégorie au plafond demandé.
+    ///
+    /// Le plafond s'applique catégorie par catégorie, comme le demande #2160 :
+    /// « 200 » veut dire deux cents albums ET deux cents artistes ET deux
+    /// cents titres, pas deux cents éléments toutes catégories confondues.
+    /// Une catégorie épuisée avant les autres reste plus courte — on ne
+    /// complète pas, on ne tronque pas les autres pour autant.
+    fn fusionner_recherche(pages: &[serde_json::Value], plafond: usize) -> SearchResults {
+        let mut resultats = SearchResults {
+            tracks: Vec::new(),
+            albums: Vec::new(),
+            artists: Vec::new(),
+            playlists: Vec::new(),
+        };
+        for page in pages {
+            resultats
+                .tracks
+                .extend(Self::elements(page, "tracks").iter().map(Self::map_track));
+            resultats
+                .albums
+                .extend(Self::elements(page, "albums").iter().map(Self::map_album));
+            resultats
+                .artists
+                .extend(Self::elements(page, "artists").iter().map(Self::map_artist));
+            resultats.playlists.extend(Self::search_playlists(page));
+        }
+        resultats.tracks.truncate(plafond);
+        resultats.albums.truncate(plafond);
+        resultats.artists.truncate(plafond);
+        resultats.playlists.truncate(plafond);
+        resultats
+    }
+
+    /// Les pages brutes d'une recherche, à partir de `depart`.
+    ///
+    /// La première apprend les `total`, les suivantes sont demandées par
+    /// `offset` de 50 en 50. Avant #2160, `search` n'émettait qu'un seul
+    /// `/catalog/search` avec le `limit` demandé. Or Qobuz plafonne une page à
+    /// 50 : demander 200 rendait 50, et les 150 autres n'étaient jamais
+    /// récupérés.
+    ///
+    /// À `depart = 0` et pour une page ou moins, la requête émise est
+    /// exactement celle d'avant #2160 — sans paramètre `offset`. Ce n'est pas
+    /// de la coquetterie : c'est le chemin que prennent la transfert de
+    /// playlist (10), les sondes (5) et le défaut de route (20).
+    async fn pages_de_recherche(
+        &self,
+        query: &str,
+        plafond: usize,
+        depart: usize,
+    ) -> Result<Vec<serde_json::Value>, TuneError> {
+        use futures_util::StreamExt;
+        const MAX_CONCURRENT_PAGES: usize = 4;
+
+        let base_params: [(&str, &str); 1] = [("query", query)];
+        let taille_premiere = plafond.min(TAILLE_PAGE_RECHERCHE);
+        let premiere = if depart == 0 {
+            self.api_get(
+                "/catalog/search",
+                &[("query", query), ("limit", &taille_premiere.to_string())],
+            )
+            .await?
+        } else {
+            self.api_get_page("/catalog/search", &base_params, depart, taille_premiere)
+                .await?
+        };
+
+        let mut pages = vec![premiere];
+        if !recherche_paginee(plafond) {
+            return Ok(pages);
+        }
+
+        let (comptes, totaux): (Vec<usize>, Vec<usize>) = CATEGORIES_RECHERCHE
+            .iter()
+            .map(|categorie| Self::compte_et_total(&pages[0], categorie))
+            .unzip();
+        let offsets = offsets_recherche(&comptes, &totaux, plafond, depart);
+        info!(
+            plafond,
+            depart,
+            pages = offsets.len() + 1,
+            totaux = ?totaux,
+            "qobuz_search_paginate"
+        );
+
+        if !offsets.is_empty() {
+            // `buffered` conserve l'ordre des pages : la liste fusionnée est
+            // celle qu'une boucle séquentielle aurait produite.
+            let suivantes: Vec<Result<serde_json::Value, String>> =
+                futures_util::stream::iter(offsets.into_iter().map(|offset| {
+                    let base_params = &base_params;
+                    async move {
+                        self.api_get_page(
+                            "/catalog/search",
+                            base_params,
+                            offset,
+                            TAILLE_PAGE_RECHERCHE,
+                        )
+                        .await
+                    }
+                }))
+                .buffered(MAX_CONCURRENT_PAGES)
+                .collect()
+                .await;
+            for page in suivantes {
+                pages.push(page?);
+            }
+        }
+
+        Ok(pages)
+    }
+
+    /// Les totaux annoncés par Qobuz, lus sur la première page.
+    fn totaux_recherche(page: &serde_json::Value) -> SearchTotals {
+        SearchTotals {
+            tracks: Self::compte_et_total(page, "tracks").1,
+            albums: Self::compte_et_total(page, "albums").1,
+            artists: Self::compte_et_total(page, "artists").1,
+            playlists: Self::compte_et_total(page, "playlists").1,
+        }
+    }
+
+    /// Fusionne les pages ET dit ce qu'il reste derrière (#2160).
+    ///
+    /// `has_more` vaut pour AU MOINS une catégorie : un écran en onglets
+    /// affiche « Charger plus » dès qu'un onglet a une suite, pas seulement
+    /// quand les quatre en ont une.
+    ///
+    /// `truncated` sépare deux fins de liste que le client ne peut pas
+    /// distinguer autrement : « Qobuz n'a plus rien » et « NOTRE plafond a
+    /// coupé ». Sans lui, un « Tous » rendant 500 sur 5 000 passerait pour
+    /// exhaustif.
+    fn page_de_recherche(pages: &[serde_json::Value], plafond: usize, depart: usize) -> SearchPage {
+        let results = Self::fusionner_recherche(pages, plafond);
+        let totals = pages
+            .first()
+            .map(Self::totaux_recherche)
+            .unwrap_or_default();
+        let par_categorie = [
+            (results.tracks.len(), totals.tracks),
+            (results.albums.len(), totals.albums),
+            (results.artists.len(), totals.artists),
+            (results.playlists.len(), totals.playlists),
+        ];
+        let has_more = par_categorie
+            .iter()
+            .any(|(rendu, total)| depart + rendu < *total);
+        let truncated = par_categorie
+            .iter()
+            .any(|(rendu, total)| *rendu == plafond && depart + rendu < *total);
+        SearchPage {
+            results,
+            offset: depart,
+            totals,
+            has_more,
+            truncated,
+        }
     }
 
     /// Pochette d'une playlist Qobuz, quel que soit le champ qui la porte.
@@ -810,7 +1369,7 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let (primary, fallback) = endpoint_order(self.proxy_first);
+        let (primary, fallback) = self.bases_api();
         match self.api_post_at(primary, path, params).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
@@ -1110,33 +1669,30 @@ impl StreamingService for QobuzService {
         Ok(())
     }
 
+    /// `limit` est un nombre d'éléments PAR CATÉGORIE. `0` vaut « Tous »,
+    /// borné par `PLAFOND_RECHERCHE` (#2160). Jusqu'à 50, une seule requête —
+    /// exactement ce que faisait la recherche avant ; au-delà, on pagine.
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
-        let data = self
-            .api_get(
-                "/catalog/search",
-                &[("query", query), ("limit", &limit.to_string())],
-            )
-            .await?;
+        let plafond = plafond_recherche(limit);
+        let pages = self.pages_de_recherche(query, plafond, 0).await?;
+        Ok(Self::fusionner_recherche(&pages, plafond))
+    }
 
-        let tracks = data["tracks"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        let albums = data["albums"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_album).collect())
-            .unwrap_or_default();
-        let artists = data["artists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_artist).collect())
-            .unwrap_or_default();
-
-        Ok(SearchResults {
-            tracks,
-            albums,
-            artists,
-            playlists: Self::search_playlists(&data),
-        })
+    /// `offset` est un curseur PAR CATÉGORIE, en éléments (#2160) : c'est ce
+    /// qu'un « Charger plus » renvoie après avoir affiché `offset` lignes.
+    ///
+    /// Le plafond se compte à partir du curseur — `offset=500&limit=200` rend
+    /// les 200 suivants, il ne rend pas zéro sous prétexte que 500 est déjà le
+    /// plafond d'une requête.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let plafond = plafond_recherche(limit);
+        let pages = self.pages_de_recherche(query, plafond, offset).await?;
+        Ok(Self::page_de_recherche(&pages, plafond, offset))
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
@@ -1195,16 +1751,12 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
-        let data = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let data = self.detail_album(album_id).await?;
         Ok(Self::map_album(&data))
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let data = self.detail_album(album_id).await?;
         // Qobuz album/get returns album metadata at the top level while
         // individual track items inside tracks.items do NOT carry an
         // "album" sub-object.  Extract the album-level title, image and
@@ -1218,6 +1770,14 @@ impl StreamingService for QobuzService {
             .as_str()
             .map(String::from)
             .or_else(|| data["id"].as_u64().map(|id| id.to_string()));
+        let album_artist = data["artist"]["name"].as_str().map(String::from);
+        // Injecté avec le nom, sinon `identifiant_interprete` (#1361) ne
+        // trouverait rien à rattacher à un artiste d'album qui n'existe, dans
+        // ces items, que parce qu'on vient de l'y écrire.
+        let album_artist_id = data["artist"]["id"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| data["artist"]["id"].as_u64().map(|id| id.to_string()));
 
         let tracks = data["tracks"]["items"]
             .as_array()
@@ -1225,7 +1785,22 @@ impl StreamingService for QobuzService {
                 items
                     .iter()
                     .map(|item| {
-                        let mut t = Self::map_track(item);
+                        // Les items d'album/get n'ont pas de sous-objet "album" :
+                        // sans injection, artiste_interprete (#1407) ne voit pas
+                        // l'artiste d'album comme repli face au compositeur.
+                        let item_enrichi =
+                            match (&album_artist, item["album"]["artist"]["name"].as_str()) {
+                                (Some(nom), None) => {
+                                    let mut clone = item.clone();
+                                    clone["album"]["artist"]["name"] = nom.as_str().into();
+                                    if let Some(ref id) = album_artist_id {
+                                        clone["album"]["artist"]["id"] = id.as_str().into();
+                                    }
+                                    Some(clone)
+                                }
+                                _ => None,
+                            };
+                        let mut t = Self::map_track(item_enrichi.as_ref().unwrap_or(item));
                         // Inject album-level metadata when the track lacks it
                         if t.album.is_none() {
                             t.album = album_title.clone();
@@ -1392,9 +1967,7 @@ impl StreamingService for QobuzService {
 
     async fn get_album_label(&self, album_id: &str) -> Result<LabelInfo, TuneError> {
         // Resolve the album's label (id + name come straight from album/get).
-        let album = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let album = self.detail_album(album_id).await?;
         let label_id = album["label"]["id"]
             .as_u64()
             .map(|id| id.to_string())
@@ -1608,9 +2181,7 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_album_context(&self, album_id: &str) -> Result<AlbumContext, TuneError> {
-        let album = self
-            .api_get("/album/get", &[("album_id", album_id)])
-            .await?;
+        let album = self.detail_album(album_id).await?;
         Ok(AlbumContext {
             genre_id: album["genre"]["id"]
                 .as_u64()
@@ -1637,6 +2208,11 @@ impl StreamingService for QobuzService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        if fav_type == TYPE_FAVORI_PLAYLISTS {
+            return self
+                .souscription_playlist(ENDPOINT_SOUSCRIPTION_PLAYLIST, "subscribe", item_id)
+                .await;
+        }
         let key = favorite_key(fav_type)?;
         self.require_user_token("favorite/create")?;
         let res = self.api_post("/favorite/create", &[(key, item_id)]).await;
@@ -1646,6 +2222,11 @@ impl StreamingService for QobuzService {
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
+        if fav_type == TYPE_FAVORI_PLAYLISTS {
+            return self
+                .souscription_playlist(ENDPOINT_DESOUSCRIPTION_PLAYLIST, "unsubscribe", item_id)
+                .await;
+        }
         let key = favorite_key(fav_type)?;
         self.require_user_token("favorite/delete")?;
         let res = self.api_post("/favorite/delete", &[(key, item_id)]).await;
@@ -2142,29 +2723,25 @@ mod tests {
         );
     }
 
-    /// #2370 — Gros Bidon (fil 1541). `favorite_key("playlists")` rend
-    /// aujourd'hui « unknown favorite type: playlists », ce qui est FAUX : le
-    /// type existe et le connecteur le manipule partout ailleurs
-    /// (`/playlist/getUserPlaylists`, `/playlist/get`…). Ce qui manque, c'est
-    /// l'appel de souscription a une playlist tierce, qui n'est etabli nulle
-    /// part dans ce depot. Le message doit dire cela, et pas mentir sur la
-    /// nature du blocage — sans quoi le prochain lecteur cherche une faute de
-    /// frappe la ou il y a une fonction a ecrire.
+    /// #2370 — Gros Bidon (fil 1541). `favorite_key` est le tableau de
+    /// correspondance de `/favorite/create` UNIQUEMENT, et cet endpoint ne
+    /// porte pas les playlists. Le refus doit rester — mais en nommant
+    /// l'endpoint qui, lui, les porte, pour que personne n'invente ici une
+    /// quatrieme cle `playlist_ids` qui n'existe pas chez Qobuz.
     #[test]
-    fn le_type_playlists_n_est_pas_un_type_inconnu() {
+    fn le_type_playlists_n_est_pas_une_cle_de_favorite_create() {
         let err = favorite_key("playlists")
-            .expect_err(
-                "l'appel de souscription Qobuz n'est pas etabli : ca doit rester une erreur",
-            )
+            .expect_err("/favorite/create ne porte pas les playlists : ca reste une erreur")
             .to_string();
         assert!(
             !err.contains("unknown favorite type"),
-            "le type playlist est connu du connecteur : le refus doit nommer \
-             l'appel manquant, pas pretendre que le type est inconnu. Message rendu : {err}"
+            "le type playlist est connu du connecteur : le refus ne doit pas \
+             pretendre que le type est inconnu. Message rendu : {err}"
         );
         assert!(
-            err.to_lowercase().contains("playlist"),
-            "le message doit nommer la playlist. Message rendu : {err}"
+            err.contains(ENDPOINT_SOUSCRIPTION_PLAYLIST),
+            "le refus doit renvoyer vers l'endpoint qui porte les playlists. \
+             Message rendu : {err}"
         );
     }
 
@@ -2314,6 +2891,324 @@ mod tests {
         let q = track.quality.unwrap();
         assert_eq!(q.sample_rate, 44100);
         assert_eq!(q.bit_depth, 16);
+    }
+
+    // ── #1407 : « Lecture en cours » affichait le compositeur ─────────────
+
+    /// Le cas du fil forum : en classique, Qobuz met le compositeur dans
+    /// `performer`. La chaîne de rôles désigne l'interprète réel — c'est elle
+    /// qui doit gagner, et le compositeur rejoint son propre champ.
+    #[test]
+    fn le_compositeur_place_dans_performer_cede_a_l_interprete_des_roles() {
+        let json = json!({
+            "id": 1,
+            "title": "Nocturne No. 2",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+            "album": {"title": "Chopin: Nocturnes", "artist": {"name": "Martha Argerich"}},
+            "duration": 271,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Martha Argerich");
+        assert_eq!(track.composer.as_deref(), Some("Frédéric Chopin"));
+    }
+
+    /// Même sans objet `composer`, un performer crédité uniquement à
+    /// l'écriture dans la chaîne de rôles n'est pas l'interprète.
+    #[test]
+    fn un_performer_credite_auteur_seul_cede_au_main_artist_meme_sans_champ_composer() {
+        let json = json!({
+            "id": 2,
+            "title": "Main Title",
+            "performer": {"name": "John Williams"},
+            "performers": "John Williams, Composer, ComposerLyricist - Boston Pops Orchestra, Orchestra, MainArtist",
+            "album": {"title": "Star Wars"},
+            "duration": 300,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Boston Pops Orchestra");
+    }
+
+    /// Le compositeur qui joue ses propres œuvres EST l'interprète : le rôle
+    /// MainArtist/Piano dans la chaîne le prouve, il reste l'artiste affiché.
+    #[test]
+    fn le_compositeur_interprete_de_ses_oeuvres_reste_l_artiste() {
+        let json = json!({
+            "id": 3,
+            "title": "Nuvole Bianche",
+            "performer": {"name": "Ludovico Einaudi"},
+            "composer": {"name": "Ludovico Einaudi"},
+            "performers": "Ludovico Einaudi, Composer, MainArtist, Piano",
+            "album": {"title": "Una Mattina", "artist": {"name": "Various Artists"}},
+            "duration": 358,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Ludovico Einaudi");
+    }
+
+    /// Sans chaîne de rôles, l'égalité performer = compositeur suffit à
+    /// écarter le performer : l'artiste d'album (l'interprète) le remplace.
+    #[test]
+    fn sans_roles_le_performer_egal_au_compositeur_replie_sur_l_artiste_d_album() {
+        let json = json!({
+            "id": 4,
+            "title": "Violin Concerto in D",
+            "performer": {"name": "Jean Sibelius"},
+            "composer": {"name": "Jean Sibelius"},
+            "album": {"title": "Sibelius", "artist": {"name": "Hilary Hahn"}},
+            "duration": 512,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Hilary Hahn");
+        assert_eq!(track.composer.as_deref(), Some("Jean Sibelius"));
+    }
+
+    /// Quand AUCUN interprète distinct n'existe (l'album du compositeur, tout
+    /// le monde porte son nom), le repli historique garde le performer plutôt
+    /// que de rendre une chaîne vide — et jamais « Various Artists ».
+    #[test]
+    fn sans_interprete_distinct_le_performer_reste_plutot_que_vide_ou_various() {
+        let tout_chopin = json!({
+            "id": 5,
+            "title": "Prélude",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "artist": {"name": "Frédéric Chopin"},
+            "album": {"title": "Chopin", "artist": {"name": "Frédéric Chopin"}},
+            "duration": 100,
+        });
+        assert_eq!(
+            QobuzService::map_track(&tout_chopin).artist,
+            "Frédéric Chopin"
+        );
+
+        let compilation = json!({
+            "id": 6,
+            "title": "Prélude",
+            "performer": {"name": "Frédéric Chopin"},
+            "composer": {"name": "Frédéric Chopin"},
+            "album": {"title": "100 Classical Hits", "artist": {"name": "Various Artists"}},
+            "duration": 100,
+        });
+        assert_eq!(
+            QobuzService::map_track(&compilation).artist,
+            "Frédéric Chopin",
+            "« Various Artists » n'apprend rien : mieux vaut le repli historique"
+        );
+    }
+
+    /// Hors classique rien ne change : performer distinct du compositeur,
+    /// il reste l'artiste — le compositeur va dans son champ à lui.
+    #[test]
+    fn un_performer_distinct_du_compositeur_garde_la_main() {
+        let json = json!({
+            "id": 7,
+            "title": "Take Five",
+            "performer": {"name": "The Dave Brubeck Quartet"},
+            "composer": {"name": "Paul Desmond"},
+            "album": {"title": "Time Out"},
+            "duration": 324,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "The Dave Brubeck Quartet");
+        assert_eq!(track.composer.as_deref(), Some("Paul Desmond"));
+    }
+
+    // ── #1361 : l'identifiant de l'artiste affiché ────────────────────────
+
+    /// Le cas courant : l'artiste affiché est le `performer`, son identifiant
+    /// part avec lui. Sans ça, « Lecture en cours » ne pouvait ouvrir sa fiche
+    /// qu'en RECHERCHANT son nom.
+    #[test]
+    fn l_identifiant_du_performer_accompagne_son_nom() {
+        let json = json!({
+            "id": 12345,
+            "title": "Take Five",
+            "performer": {"id": 998, "name": "Dave Brubeck"},
+            "album": {"title": "Time Out", "id": 678},
+            "duration": 324,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Dave Brubeck");
+        assert_eq!(track.artist_id.as_deref(), Some("998"));
+        assert_eq!(track.album_id.as_deref(), Some("678"));
+    }
+
+    /// LE piège de #1407, transposé aux identifiants : Qobuz range le
+    /// compositeur dans `performer`, l'interprète gagne l'affichage — et
+    /// l'identifiant DOIT suivre l'affichage. Rendre `performer.id` ici
+    /// enverrait l'auditeur sur la fiche de Chopin en cliquant « Martha
+    /// Argerich ».
+    #[test]
+    fn l_identifiant_suit_l_interprete_affiche_et_non_le_compositeur() {
+        let json = json!({
+            "id": 1,
+            "title": "Nocturne No. 2",
+            "performer": {"id": 111, "name": "Frédéric Chopin"},
+            "composer": {"id": 111, "name": "Frédéric Chopin"},
+            "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+            "album": {"title": "Chopin: Nocturnes", "artist": {"id": 222, "name": "Martha Argerich"}},
+            "duration": 271,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Martha Argerich");
+        assert_eq!(
+            track.artist_id.as_deref(),
+            Some("222"),
+            "l'identifiant doit désigner l'artiste AFFICHÉ, pas le compositeur"
+        );
+    }
+
+    /// Quand le nom vient de la seule chaîne de rôles, aucun nœud ne le porte :
+    /// on rend `None`. Une absence se dit — deviner un identifiant voisin
+    /// serait exactement le défaut que le test précédent interdit.
+    #[test]
+    fn aucun_identifiant_quand_le_nom_ne_vient_d_aucun_noeud() {
+        let json = json!({
+            "id": 2,
+            "title": "Main Title",
+            "performer": {"id": 333, "name": "John Williams"},
+            "performers": "John Williams, Composer, ComposerLyricist - Boston Pops Orchestra, Orchestra, MainArtist",
+            "album": {"title": "Star Wars"},
+            "duration": 300,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Boston Pops Orchestra");
+        assert_eq!(
+            track.artist_id, None,
+            "aucun nœud ne porte ce nom : rendre 333 dirigerait vers John Williams"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE. La règle ne se vérifie pas cas par cas : dès
+    /// qu'un identifiant est rendu, un nœud du JSON doit porter à la fois cet
+    /// identifiant ET, mot pour mot, le nom affiché. Ce test rejoue la règle
+    /// sur toutes les formes rencontrées jusqu'ici ; toute évolution de la
+    /// chaîne de priorité (#1407) qui désaccorderait nom et identifiant le
+    /// fait tomber.
+    #[test]
+    fn tout_identifiant_rendu_appartient_au_nom_affiche() {
+        let cas = [
+            json!({
+                "id": 1, "title": "T",
+                "performer": {"id": 111, "name": "Frédéric Chopin"},
+                "composer": {"id": 111, "name": "Frédéric Chopin"},
+                "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+                "album": {"artist": {"id": 222, "name": "Martha Argerich"}},
+            }),
+            json!({
+                "id": 2, "title": "T",
+                "performer": {"id": 333, "name": "John Williams"},
+                "performers": "John Williams, Composer - Boston Pops Orchestra, Orchestra, MainArtist",
+                "album": {"title": "Star Wars"},
+            }),
+            json!({
+                "id": 3, "title": "T",
+                "performer": {"id": 444, "name": "Ludovico Einaudi"},
+                "composer": {"id": 444, "name": "Ludovico Einaudi"},
+                "performers": "Ludovico Einaudi, Composer, MainArtist, Piano",
+                "album": {"artist": {"id": 555, "name": "Various Artists"}},
+            }),
+            json!({
+                "id": 4, "title": "T",
+                "performer": {"id": 666, "name": "Jean Sibelius"},
+                "composer": {"id": 666, "name": "Jean Sibelius"},
+                "album": {"artist": {"id": 777, "name": "Hilary Hahn"}},
+            }),
+            json!({
+                "id": 5, "title": "T",
+                "artist": {"id": 888, "name": "The Cure"},
+                "album": {"artist": {"id": 999, "name": "The Cure"}},
+            }),
+            json!({"id": 6, "title": "T", "album": {"title": "Sans artiste"}}),
+        ];
+
+        for item in cas {
+            let piste = QobuzService::map_track(&item);
+            let Some(ref id) = piste.artist_id else {
+                continue;
+            };
+            let accorde = [
+                &item["performer"],
+                &item["artist"],
+                &item["album"]["artist"],
+            ]
+            .into_iter()
+            .any(|n| {
+                n["name"].as_str() == Some(piste.artist.as_str())
+                    && n["id"].as_u64().map(|v| v.to_string()).as_deref() == Some(id.as_str())
+            });
+            assert!(
+                accorde,
+                "artist_id={id} rendu pour « {} » sans nœud qui porte les deux",
+                piste.artist
+            );
+        }
+    }
+
+    /// La chaîne de rôles tolère un nom d'interprète contenant une virgule.
+    #[test]
+    fn un_nom_d_interprete_avec_virgule_est_reconnu_dans_les_roles() {
+        let roles = "Blood, Sweat & Tears, MainArtist - Steve Katz, Composer";
+        assert_eq!(
+            QobuzService::roles_credites(roles, "Blood, Sweat & Tears"),
+            Some(vec!["MainArtist"])
+        );
+    }
+
+    /// Les items d'album/get n'ont pas de sous-objet `album` : l'artiste
+    /// d'album (l'interprète, en tête de réponse) doit être injecté pour que
+    /// le compositeur placé dans `performer` ne gagne pas faute de repli.
+    #[tokio::test]
+    async fn get_album_tracks_replie_sur_l_artiste_d_album_face_au_compositeur() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/album/get",
+            get(|| async {
+                Json(json!({
+                    "id": "abc123",
+                    "title": "Bach: Suites pour violoncelle",
+                    "artist": {"name": "Ophélie Gaillard"},
+                    "image": {"large": "http://img.qobuz.com/bach.jpg"},
+                    "tracks": {"items": [
+                        {
+                            "id": 11,
+                            "title": "Suite No. 1: Prélude",
+                            "performer": {"name": "Johann Sebastian Bach"},
+                            "composer": {"name": "Johann Sebastian Bach"},
+                            "duration": 150,
+                        },
+                    ]},
+                }))
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+        let pistes = svc
+            .get_album_tracks("abc123")
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(pistes.len(), 1);
+        assert_eq!(
+            pistes[0].artist, "Ophélie Gaillard",
+            "l'interprète de l'album, pas le compositeur logé dans performer"
+        );
+        assert_eq!(pistes[0].composer.as_deref(), Some("Johann Sebastian Bach"));
+        assert_eq!(
+            pistes[0].album.as_deref(),
+            Some("Bach: Suites pour violoncelle")
+        );
     }
 
     #[test]
@@ -3035,5 +3930,789 @@ mod tests {
         assert_eq!(pistes.len(), 2, "2 participations en cache, 2 servies");
         assert_eq!(pistes[0].title, "So What");
         assert_eq!(pistes[1].title, "Blue in Green");
+    }
+}
+
+/// Ouverture d'un album : un seul aller-retour amont, pas quatre (#2190).
+///
+/// Aucun de ces essais ne touche l'API Qobuz : ils parlent à un serveur simulé
+/// lié sur `127.0.0.1:0`, qui COMPTE les `/album/get` qu'il reçoit. C'est ce
+/// compteur qui est la mesure — la durée en découle.
+#[cfg(test)]
+mod tests_cache_album {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Un Qobuz simulé qui rend un album complet et compte ses `/album/get`.
+    ///
+    /// `latence` simule le coût réel d'un aller-retour vers Qobuz : c'est lui
+    /// qu'on paie quatre fois quand rien n'est partagé.
+    async fn qobuz_album_simule(latence: Duration) -> (String, Arc<AtomicUsize>) {
+        let appels = Arc::new(AtomicUsize::new(0));
+        let compteur = appels.clone();
+
+        let app = Router::new()
+            .route(
+                "/album/get",
+                get(move |Query(q): Query<Carte<String, String>>| {
+                    let compteur = compteur.clone();
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        if !latence.is_zero() {
+                            tokio::time::sleep(latence).await;
+                        }
+                        let id = q.get("album_id").cloned().unwrap_or_default();
+                        Json(json!({
+                            "id": id,
+                            "title": format!("album-{id}"),
+                            "artist": {"name": "Ella Fitzgerald"},
+                            "image": {"large": "http://img.qobuz.test/a.jpg"},
+                            "genre": {"id": 64, "name": "Jazz"},
+                            "label": {"id": 7, "name": "Verve"},
+                            "tracks_count": 1,
+                            "tracks": {"items": [
+                                {"id": 11, "title": "Summertime", "duration": 200}
+                            ]},
+                        }))
+                    }
+                }),
+            )
+            // `get_album_label` pagine ensuite le catalogue du label ; il n'est
+            // pas le sujet ici, donc le simulé le rend vide en une page.
+            .route(
+                "/label/get",
+                get(|| async { Json(json!({"albums": {"items": [], "total": 0}})) }),
+            );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels)
+    }
+
+    /// LE défaut de la #2190. Le client demande quatre choses à l'ouverture
+    /// d'un album ; le serveur repartait quatre fois chercher la MÊME réponse.
+    #[tokio::test]
+    async fn une_ouverture_d_album_ne_paie_qu_un_aller_retour() {
+        let (base, appels) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let album = svc.get_album("42").await.expect("serveur simulé");
+        let pistes = svc.get_album_tracks("42").await.expect("serveur simulé");
+        let contexte = svc.get_album_context("42").await.expect("serveur simulé");
+        let label = svc.get_album_label("42").await.expect("serveur simulé");
+
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "quatre routes, une seule lecture amont — c'est le défaut de la #2190"
+        );
+
+        // Et les quatre réponses restent justes : le cache ne dégrade rien.
+        assert_eq!(album.title, "album-42");
+        assert_eq!(album.artist, "Ella Fitzgerald");
+        assert_eq!(pistes.len(), 1);
+        assert_eq!(pistes[0].title, "Summertime");
+        assert_eq!(contexte.genre_name.as_deref(), Some("Jazz"));
+        assert_eq!(contexte.label_name.as_deref(), Some("Verve"));
+        assert_eq!(label.name, "Verve");
+    }
+
+    /// Le cache est par album : deux albums ne peuvent pas se confondre.
+    #[tokio::test]
+    async fn deux_albums_distincts_gardent_chacun_leur_reponse() {
+        let (base, appels) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let premier = svc.get_album("1").await.expect("serveur simulé");
+        let second = svc.get_album("2").await.expect("serveur simulé");
+        let relecture = svc.get_album("1").await.expect("serveur simulé");
+
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            2,
+            "deux albums = deux lectures ; la relecture du premier est servie du cache"
+        );
+        assert_eq!(premier.title, "album-1");
+        assert_eq!(second.title, "album-2");
+        assert_eq!(relecture.title, "album-1", "pas de confusion entre albums");
+    }
+
+    /// La mesure, sur une latence amont réaliste : l'ouverture ne paie plus
+    /// qu'UN aller-retour, pas la somme de trois.
+    #[tokio::test]
+    async fn l_ouverture_ne_paie_plus_qu_une_latence_amont() {
+        const LATENCE: Duration = Duration::from_millis(200);
+        let (base, appels) = qobuz_album_simule(LATENCE).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let debut = Instant::now();
+        svc.get_album("7").await.expect("serveur simulé");
+        svc.get_album_tracks("7").await.expect("serveur simulé");
+        svc.get_album_context("7").await.expect("serveur simulé");
+        let ecoule = debut.elapsed();
+
+        assert_eq!(appels.load(Ordering::SeqCst), 1);
+        assert!(
+            ecoule < LATENCE * 2,
+            "l'ouverture a pris {ecoule:?} ; avant le correctif elle payait 3 × {LATENCE:?}"
+        );
+    }
+
+    /// Une navigation longue ne doit pas faire enfler la mémoire : chaque
+    /// entrée porte une liste de pistes complète.
+    #[tokio::test]
+    async fn le_cache_d_albums_tient_son_plafond() {
+        let (base, _) = qobuz_album_simule(Duration::ZERO).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        for i in 0..(MAX_ALBUMS_CACHE + 8) {
+            svc.get_album(&i.to_string()).await.expect("serveur simulé");
+        }
+
+        let gardes = svc.cache_album.lock().expect("verrou d'essai").len();
+        assert!(
+            gardes <= MAX_ALBUMS_CACHE,
+            "{gardes} albums gardés pour un plafond de {MAX_ALBUMS_CACHE}"
+        );
+    }
+}
+
+/// Pagination de la recherche Qobuz (#2160).
+///
+/// Aucun de ces essais n'appelle l'API Qobuz : les décisions de pagination et
+/// la fusion sont des fonctions pures, et le seul aller-retour HTTP se fait
+/// contre un serveur simulé lié sur `127.0.0.1:0`.
+#[cfg(test)]
+mod tests_recherche_paginee {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+
+    #[test]
+    fn plafond_recherche_traduit_tous_et_borne_les_demandes_extravagantes() {
+        // Les quatre choix offerts par l'écran.
+        assert_eq!(plafond_recherche(50), 50);
+        assert_eq!(plafond_recherche(100), 100);
+        assert_eq!(plafond_recherche(200), 200);
+        // « Tous » : 0 est la convention du client, bornée ici.
+        assert_eq!(plafond_recherche(0), PLAFOND_RECHERCHE);
+        // Et un client qui demanderait n'importe quoi ne déclenche pas deux
+        // mille requêtes chez Qobuz.
+        assert_eq!(plafond_recherche(100_000), PLAFOND_RECHERCHE);
+        // Non-régression : les appels internes existants (recherche fédérée à
+        // 30, sonde de santé à 10, défaut de route à 20) restent inchangés.
+        assert_eq!(plafond_recherche(30), 30);
+        assert_eq!(plafond_recherche(20), 20);
+        assert_eq!(plafond_recherche(10), 10);
+    }
+
+    #[test]
+    fn seules_les_demandes_au_dela_d_une_page_paginent() {
+        // Composé avec `plafond_recherche` : c'est l'enchaînement exact de la
+        // production, y compris la traduction de « Tous ».
+        let pagine = |limite: usize| recherche_paginee(plafond_recherche(limite));
+        assert!(!pagine(10));
+        assert!(!pagine(20));
+        assert!(!pagine(30));
+        assert!(!pagine(50), "50 tient dans une page Qobuz");
+        assert!(pagine(51));
+        assert!(pagine(100));
+        assert!(pagine(200));
+        assert!(pagine(0), "« Tous » pagine");
+    }
+
+    #[test]
+    fn offsets_recherche_couvre_exactement_le_volume_demande() {
+        // Première page pleine partout, Qobuz annonce beaucoup plus.
+        let comptes = [50, 50, 50, 50];
+        let totaux = [5000, 3000, 900, 120];
+        assert_eq!(offsets_recherche(&comptes, &totaux, 100, 0), vec![50]);
+        assert_eq!(
+            offsets_recherche(&comptes, &totaux, 200, 0),
+            vec![50, 100, 150]
+        );
+        assert_eq!(
+            offsets_recherche(&comptes, &totaux, PLAFOND_RECHERCHE, 0).len(),
+            9,
+            "500 par catégorie = dix pages, dont une déjà chargée"
+        );
+    }
+
+    #[test]
+    fn offsets_recherche_s_arrete_a_la_categorie_la_plus_fournie() {
+        // Une seule requête sert les quatre catégories : c'est le plus gros
+        // `total` qui commande, pas le premier.
+        let comptes = [50, 7, 0, 0];
+        let totaux = [60, 7, 0, 0];
+        assert_eq!(offsets_recherche(&comptes, &totaux, 500, 0), vec![50]);
+    }
+
+    #[test]
+    fn offsets_recherche_ne_pagine_pas_derriere_une_premiere_page_incomplete() {
+        // Page incomplète = Qobuz n'a plus rien, quel que soit le plafond.
+        assert!(offsets_recherche(&[12, 3, 0, 0], &[12, 3, 0, 0], 500, 0).is_empty());
+        assert!(offsets_recherche(&[0, 0, 0, 0], &[0, 0, 0, 0], 500, 0).is_empty());
+    }
+
+    /// Une page de recherche : `n` éléments par catégorie, numérotés à partir
+    /// de `depart`, et le `total` que Qobuz annonce.
+    fn page(depart: usize, n: usize, total: usize) -> serde_json::Value {
+        let elements = |prefixe: &str| -> Vec<serde_json::Value> {
+            (depart..depart + n)
+                .map(|i| {
+                    json!({
+                        "id": i as u64,
+                        "title": format!("{prefixe}-{i}"),
+                        "name": format!("{prefixe}-{i}"),
+                    })
+                })
+                .collect()
+        };
+        json!({
+            "tracks": {"items": elements("piste"), "total": total},
+            "albums": {"items": elements("album"), "total": total},
+            "artists": {"items": elements("artiste"), "total": total},
+            "playlists": {"items": elements("liste"), "total": total},
+        })
+    }
+
+    #[test]
+    fn fusionner_recherche_concatene_les_pages_dans_l_ordre_recu() {
+        let pages = [page(0, 50, 200), page(50, 50, 200), page(100, 50, 200)];
+        let r = QobuzService::fusionner_recherche(&pages, 200);
+        assert_eq!(r.tracks.len(), 150);
+        assert_eq!(r.tracks[0].id, "0");
+        assert_eq!(r.tracks[49].id, "49");
+        assert_eq!(r.tracks[50].id, "50", "la 2e page suit la 1re, sans trou");
+        assert_eq!(r.tracks[149].id, "149");
+        assert_eq!(r.albums.len(), 150);
+        assert_eq!(r.artists.len(), 150);
+        assert_eq!(r.playlists.len(), 150);
+    }
+
+    #[test]
+    fn fusionner_recherche_borne_chaque_categorie_au_plafond() {
+        let pages = [page(0, 50, 500), page(50, 50, 500), page(100, 50, 500)];
+        let r = QobuzService::fusionner_recherche(&pages, 100);
+        assert_eq!(r.tracks.len(), 100, "100 demandés, 100 rendus");
+        assert_eq!(r.tracks[99].id, "99");
+        assert_eq!(r.albums.len(), 100);
+    }
+
+    #[test]
+    fn fusionner_recherche_ne_complete_pas_une_categorie_courte() {
+        // Le plafond est un maximum PAR catégorie, pas un quota : une
+        // catégorie épuisée reste courte, les autres ne sont pas tronquées.
+        let page_mixte = json!({
+            "tracks": {"items": (0..50).map(|i| json!({"id": i as u64, "title": "t"})).collect::<Vec<_>>(), "total": 50},
+            "artists": {"items": [{"id": 1, "name": "Miles Davis"}], "total": 1},
+        });
+        let r = QobuzService::fusionner_recherche(&[page_mixte], 200);
+        assert_eq!(r.tracks.len(), 50);
+        assert_eq!(r.artists.len(), 1);
+        assert!(r.albums.is_empty(), "catégorie absente = liste vide");
+        assert!(r.playlists.is_empty());
+    }
+
+    /// Serveur qui imite `/catalog/search` : il rend `limit` éléments par
+    /// catégorie à partir de `offset` — jamais au-delà du `total` annoncé — et
+    /// NOTE chaque décalage reçu, ce qui est la preuve cherchée.
+    async fn qobuz_simule(totaux: Carte<&'static str, usize>) -> (String, Arc<Mutex<Vec<usize>>>) {
+        qobuz_simule_interne(totaux, false).await
+    }
+
+    /// Comme `qobuz_simule`, mais chaque page repond d'autant plus vite que son
+    /// decalage est grand : les reponses arrivent donc dans l'ordre INVERSE de
+    /// celui ou elles ont ete demandees. Sans ce decalage artificiel, un
+    /// serveur local repond toujours dans l'ordre de la demande et un essai
+    /// d'ordre ne prouve rien.
+    async fn qobuz_simule_desordre(
+        totaux: Carte<&'static str, usize>,
+    ) -> (String, Arc<Mutex<Vec<usize>>>) {
+        qobuz_simule_interne(totaux, true).await
+    }
+
+    async fn qobuz_simule_interne(
+        totaux: Carte<&'static str, usize>,
+        desordre: bool,
+    ) -> (String, Arc<Mutex<Vec<usize>>>) {
+        use axum::extract::Query as ExtraitQuery;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let vus: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let vus_srv = vus.clone();
+        let totaux = Arc::new(totaux);
+
+        let app = Router::new().route(
+            "/catalog/search",
+            get(
+                move |ExtraitQuery(p): ExtraitQuery<Carte<String, String>>| {
+                    let vus = vus_srv.clone();
+                    let totaux = totaux.clone();
+                    async move {
+                        let offset: usize =
+                            p.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let limit: usize = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        vus.lock().expect("verrou d'essai").push(offset);
+                        if desordre {
+                            let attente = 400u64.saturating_sub(offset as u64);
+                            tokio::time::sleep(Duration::from_millis(attente)).await;
+                        }
+
+                        let mut corps = serde_json::Map::new();
+                        for (categorie, total) in totaux.iter() {
+                            let fin = (offset + limit).min(*total);
+                            let items: Vec<serde_json::Value> = (offset..fin)
+                                .map(|i| {
+                                    json!({
+                                        "id": i as u64,
+                                        "title": format!("{categorie}-{i}"),
+                                        "name": format!("{categorie}-{i}"),
+                                    })
+                                })
+                                .collect();
+                            corps.insert(
+                                (*categorie).to_string(),
+                                json!({"items": items, "total": *total}),
+                            );
+                        }
+                        Json(serde_json::Value::Object(corps))
+                    }
+                },
+            ),
+        );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), vus)
+    }
+
+    fn decalages(vus: &Arc<Mutex<Vec<usize>>>) -> Vec<usize> {
+        let mut v = vus.lock().expect("verrou d'essai").clone();
+        v.sort_unstable();
+        v
+    }
+
+    #[tokio::test]
+    async fn au_dela_de_cinquante_la_recherche_demande_les_pages_suivantes() {
+        let (base, vus) = qobuz_simule(Carte::from([
+            ("tracks", 200usize),
+            ("albums", 200),
+            ("artists", 200),
+            ("playlists", 200),
+        ]))
+        .await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc
+            .search("miles davis", 200)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![0, 50, 100, 150],
+            "quatre pages par offset — c'est le défaut de la #2160"
+        );
+        assert_eq!(r.tracks.len(), 200);
+        assert_eq!(r.albums.len(), 200);
+        assert_eq!(r.artists.len(), 200);
+        assert_eq!(r.tracks[0].id, "0");
+        assert_eq!(r.tracks[199].id, "199", "les pages arrivent dans l'ordre");
+    }
+
+    #[tokio::test]
+    async fn les_pages_sont_rangees_par_decalage_et_non_par_ordre_d_arrivee() {
+        // Le serveur rend ici la DERNIERE page en premier. Si les reponses
+        // etaient concatenees dans l'ordre ou elles arrivent, l'ecran
+        // afficherait le titre 150 en 51e position.
+        let (base, vus) = qobuz_simule_desordre(Carte::from([("tracks", 200usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc
+            .search("miles davis", 200)
+            .await
+            .expect("serveur simule");
+
+        assert_eq!(decalages(&vus), vec![0, 50, 100, 150]);
+        assert_eq!(r.tracks.len(), 200);
+        let ids: Vec<String> = r.tracks.iter().map(|t| t.id.clone()).collect();
+        let attendus: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "les pages lentes ne doublent pas les rapides"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_recherche_de_cinquante_tient_en_un_seul_aller_retour() {
+        // Non-régression : le comportement d'avant la #2160 pour tout ce qui
+        // demande une page ou moins.
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 200usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("miles davis", 50).await.expect("serveur simulé");
+
+        assert_eq!(decalages(&vus), vec![0], "une seule requête");
+        assert_eq!(r.tracks.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn tous_pagine_jusqu_au_plafond_documente_et_pas_au_dela() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("jazz", 0).await.expect("serveur simulé");
+
+        assert_eq!(r.tracks.len(), PLAFOND_RECHERCHE);
+        assert_eq!(
+            decalages(&vus).len(),
+            PLAFOND_RECHERCHE / TAILLE_PAGE_RECHERCHE,
+            "dix pages, pas cent : « Tous » est borné"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_pagination_s_arrete_quand_qobuz_n_a_plus_rien() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 60usize), ("albums", 10)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let r = svc.search("obscur", 200).await.expect("serveur simulé");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![0, 50],
+            "200 demandés mais 60 existants : deux pages, pas quatre"
+        );
+        assert_eq!(r.tracks.len(), 60);
+        assert_eq!(r.albums.len(), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Curseur et compte-rendu de page (#2160, second lot)
+    //
+    // La #2754 avait livré la pagination INTERNE : une demande de 200 va
+    // chercher quatre pages. Restaient deux choses sans lesquelles un écran ne
+    // peut pas construire un « Charger plus » : un CURSEUR pour demander la
+    // suite, et un compte-rendu disant s'il en reste.
+
+    #[tokio::test]
+    async fn un_curseur_decale_les_pages_demandees_a_qobuz() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("jazz", 100, 500)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![500, 550],
+            "le curseur décale les décalages : on reprend où l'écran s'est arrêté"
+        );
+        assert_eq!(p.offset, 500, "la page se nomme elle-même");
+        assert_eq!(p.results.tracks.len(), 100);
+        assert_eq!(
+            p.results.tracks[0].id, "500",
+            "la suite commence au curseur, pas au début"
+        );
+        assert_eq!(p.results.tracks[99].id, "599");
+    }
+
+    #[tokio::test]
+    async fn le_plafond_se_compte_a_partir_du_curseur_et_non_du_debut() {
+        // Le piège : `PLAFOND_RECHERCHE` vaut 500. Un « Charger plus » posté à
+        // 500 rendrait ZÉRO si le plafond se comptait depuis le début du
+        // catalogue — l'écran resterait bloqué sur sa cinquième page.
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("jazz", 0, 500)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(p.results.tracks.len(), PLAFOND_RECHERCHE);
+        assert_eq!(p.results.tracks[0].id, "500");
+        assert_eq!(p.results.tracks[499].id, "999");
+    }
+
+    #[tokio::test]
+    async fn la_page_annonce_les_totaux_de_qobuz_et_qu_il_en_reste() {
+        let (base, _vus) = qobuz_simule(Carte::from([
+            ("tracks", 5000usize),
+            ("albums", 300),
+            ("artists", 12),
+            ("playlists", 0),
+        ]))
+        .await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("jazz", 50, 0)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(
+            p.totals,
+            SearchTotals {
+                tracks: 5000,
+                albums: 300,
+                artists: 12,
+                playlists: 0,
+            },
+            "les totaux sont ceux annoncés par Qobuz, pas la taille du tableau rendu"
+        );
+        assert_eq!(p.results.tracks.len(), 50);
+        assert_eq!(
+            p.results.artists.len(),
+            12,
+            "une catégorie courte reste courte"
+        );
+        assert!(p.has_more, "50 rendus sur 5000 : il en reste");
+    }
+
+    #[tokio::test]
+    async fn tous_se_declare_tronque_quand_le_plafond_a_coupe() {
+        // Sans ce drapeau, un écran prendrait 500 titres sur 5000 pour la
+        // totalité — c'est la question posée par FabienM sur le fil 1611.
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc.search_page("jazz", 0, 0).await.expect("serveur simulé");
+
+        assert_eq!(p.results.tracks.len(), PLAFOND_RECHERCHE);
+        assert!(p.truncated, "« Tous » borné à 500 sur 5000 annoncés");
+        assert!(p.has_more);
+        assert_eq!(p.totals.tracks, 5000);
+    }
+
+    #[tokio::test]
+    async fn une_page_qui_epuise_le_catalogue_n_annonce_aucune_suite() {
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 30usize), ("albums", 7)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("obscur", 50, 0)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(p.results.tracks.len(), 30);
+        assert!(!p.has_more, "tout est rendu : pas de « Charger plus »");
+        assert!(!p.truncated, "c'est Qobuz qui s'arrête, pas notre plafond");
+    }
+
+    #[tokio::test]
+    async fn la_derniere_page_d_un_catalogue_epuise_ne_rappelle_pas_a_la_suite() {
+        // 120 titres, l'écran en a déjà 100 : la page suivante rend les 20
+        // derniers et referme.
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 120usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("jazz", 100, 100)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(p.results.tracks.len(), 20);
+        assert_eq!(p.offset, 100);
+        assert!(!p.has_more, "100 + 20 = 120 = le total annoncé");
+    }
+
+    #[tokio::test]
+    async fn sans_curseur_une_page_de_cinquante_tient_toujours_en_un_aller_retour() {
+        // Non-régression du chemin d'avant #2160 à travers la NOUVELLE méthode :
+        // c'est celui qu'empruntent le défaut de route (20), les sondes (5) et
+        // le transfert de playlist (10).
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 200usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let p = svc
+            .search_page("miles", 50, 0)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(decalages(&vus), vec![0], "une seule requête");
+        assert_eq!(p.results.tracks.len(), 50);
+        assert_eq!(p.offset, 0);
+    }
+
+    /// `search()` et `search_page(.., 0)` doivent rendre les MÊMES éléments :
+    /// deux chemins qui divergeraient laisseraient l'ancien client et le
+    /// nouveau afficher deux listes différentes pour la même requête.
+    #[tokio::test]
+    async fn la_page_et_la_recherche_historique_rendent_la_meme_liste() {
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 300usize), ("albums", 80)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let ancienne = svc.search("jazz", 200).await.expect("serveur simulé");
+        let page = svc
+            .search_page("jazz", 200, 0)
+            .await
+            .expect("serveur simulé");
+
+        let ids = |v: &[StreamTrack]| v.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&ancienne.tracks), ids(&page.results.tracks));
+        assert_eq!(ancienne.albums.len(), page.results.albums.len());
+    }
+}
+
+/// #2370 — « Ajouter une playlist Qobuz en favori » (Gros Bidon, fil 1541).
+///
+/// Ces essais prouvent que l'ÉCRITURE d'un favori de playlist part bien sur
+/// `/playlist/subscribe` avec `playlist_id`, et non sur `/favorite/create`.
+/// Serveur simulé en local : **aucun appel n'atteint l'API Qobuz**, et aucun
+/// identifiant Qobuz n'apparaît ici.
+#[cfg(test)]
+mod tests_souscription_playlist {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Ce que le serveur simulé a reçu : (chemin, corps urlencodé).
+    type Recus = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Serveur qui accepte n'importe quelle écriture, note le chemin et le
+    /// corps, et répond `{"status":"success"}` comme Qobuz.
+    async fn qobuz_ecriture_simulee() -> (String, Recus) {
+        use axum::{Json, Router};
+
+        let recus: Recus = Arc::new(Mutex::new(Vec::new()));
+        let vus = recus.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri, corps: String| {
+            let vus = vus.clone();
+            async move {
+                vus.lock()
+                    .expect("verrou d'essai")
+                    .push((uri.path().to_string(), corps));
+                Json(json!({"status": "success"}))
+            }
+        });
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), recus)
+    }
+
+    /// Service d'essai pointant sur le serveur simulé, avec un jeton
+    /// utilisateur factice — sans jeton, `require_user_token` refuse avant
+    /// d'émettre et l'essai ne prouverait rien du chemin réseau.
+    fn service_essai(base: String) -> QobuzService {
+        let mut svc = QobuzService::avec_base_forcee(base);
+        svc.user_auth_token = Some(String::from("jeton-essai"));
+        svc
+    }
+
+    fn seul_appel(recus: &Recus) -> (String, String) {
+        let v = recus.lock().expect("verrou d'essai").clone();
+        assert_eq!(v.len(), 1, "un seul aller-retour attendu, reçu : {v:?}");
+        v[0].clone()
+    }
+
+    #[tokio::test]
+    async fn mettre_une_playlist_en_favori_appelle_playlist_subscribe() {
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.add_favorite("playlists", "15732665")
+            .await
+            .expect("serveur simulé : la souscription doit aboutir");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(
+            chemin, "/playlist/subscribe",
+            "une playlist ne se met pas en favori via /favorite/create : Qobuz \
+             lui donne son propre endpoint (#2370)"
+        );
+        assert!(
+            corps.contains("playlist_id=15732665"),
+            "le paramètre est `playlist_id`, au SINGULIER, pas une liste \
+             d'identifiants comme les clés de /favorite/create. Corps : {corps}"
+        );
+        assert!(
+            !corps.contains("playlist_ids"),
+            "`playlist_ids` n'existe pas chez Qobuz. Corps : {corps}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirer_une_playlist_des_favoris_appelle_playlist_unsubscribe() {
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.remove_favorite("playlists", "15732665")
+            .await
+            .expect("serveur simulé : la désouscription doit aboutir");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(
+            chemin, "/playlist/unsubscribe",
+            "le retrait doit être le symétrique de la souscription, pas \
+             /favorite/delete"
+        );
+        assert!(corps.contains("playlist_id=15732665"), "corps : {corps}");
+    }
+
+    #[tokio::test]
+    async fn les_trois_autres_types_passent_toujours_par_favorite_create() {
+        // Non-régression : la souscription playlist est un chemin EN PLUS, elle
+        // ne détourne pas les favoris qui marchaient déjà.
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = service_essai(base);
+
+        svc.add_favorite("albums", "0060254776343")
+            .await
+            .expect("serveur simulé");
+
+        let (chemin, corps) = seul_appel(&recus);
+        assert_eq!(chemin, "/favorite/create");
+        assert!(corps.contains("album_ids=0060254776343"), "corps : {corps}");
+    }
+
+    #[tokio::test]
+    async fn une_souscription_sans_jeton_utilisateur_n_emet_rien() {
+        // Même garde que sur les autres favoris : sans jeton, Qobuz répond OK
+        // sans rien enregistrer. On refuse avant d'émettre.
+        let (base, recus) = qobuz_ecriture_simulee().await;
+        let mut svc = QobuzService::avec_base_forcee(base); // pas de jeton
+
+        let err = svc
+            .add_favorite("playlists", "15732665")
+            .await
+            .expect_err("sans jeton utilisateur, la souscription doit être refusée")
+            .to_string();
+
+        assert!(
+            err.to_lowercase().contains("qobuz"),
+            "le message doit nommer la session Qobuz. Message rendu : {err}"
+        );
+        assert!(
+            recus.lock().expect("verrou d'essai").is_empty(),
+            "aucune requête ne doit partir sans jeton utilisateur"
+        );
     }
 }

@@ -814,6 +814,47 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto_scan_favorites_reconcile_failed"),
             }
+            // Les albums masqués (#1391) suivent la même mécanique : un
+            // rowid renouvelé est re-rattaché par identité, et un marqueur
+            // vraiment introuvable n'est purgé que sur un scan COMPLET sain
+            // (même garde `full_scan_ok`, #1943).
+            match tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(h) if h.changed() > 0 || h.unresolved > 0 => {
+                    info!(
+                        scanned = h.scanned,
+                        relinked = h.relinked,
+                        deduplicated = h.deduplicated,
+                        deleted = h.deleted,
+                        unresolved = h.unresolved,
+                        "auto_scan_hidden_albums_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto_scan_hidden_albums_reconcile_failed"),
+            }
+            // Les paires « pas des doublons » (#1276) : même mécanique, même
+            // garde `full_scan_ok`. Un arbitrage perdu ne se voit pas — il se
+            // paie à la fusion suivante, qui supprime la ligne perdante.
+            match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(d) if d.changed() > 0 || d.unresolved > 0 => {
+                    info!(
+                        scanned = d.scanned,
+                        relinked = d.relinked,
+                        deduplicated = d.deduplicated,
+                        deleted = d.deleted,
+                        unresolved = d.unresolved,
+                        "auto_scan_album_distinct_pairs_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "auto_scan_album_distinct_pairs_reconcile_failed")
+                }
+            }
         }
 
         info!(

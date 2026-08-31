@@ -6,6 +6,60 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
+/// Les types d'objet qu'une étiquette peut porter — la liste **fermée** contre
+/// laquelle tout chemin d'écriture est vérifié.
+///
+/// `item_tags(tag_id, item_type, item_id)` est générique par construction, et
+/// c'est bien : le modèle veut qu'une étiquette se pose sur n'importe quel
+/// objet musical. Mais générique ne veut pas dire *non vérifié*. Rien ne
+/// validait `item_type` : un `POST` portant `"albums"` au pluriel s'insérait
+/// sans un mot, créait un type parallèle que **aucune** route de lecture ne
+/// nomme, et la pose devenait invisible pour toujours — l'étiquette comptée
+/// dans `/tags` (le `COUNT(*)` ne filtre pas) mais introuvable dans
+/// `/tags/{id}/albums`. Une faute de frappe côté client suffisait.
+///
+/// La liste est triée : elle sert aussi de message d'erreur, et un ordre
+/// stable rend ce message diffable.
+///
+/// # Pourquoi `label` n'y est pas
+///
+/// **Un label n'a pas d'identité numérique dans ce dépôt.** Il n'existe ni
+/// table `labels`, ni `label_id` local : l'onglet Labels lit la colonne libre
+/// `tracks.label` en *facette* et sélectionne par CHAÎNE — c'est exactement ce
+/// que constate [`favorite_facets_repo`](super::favorite_facets_repo), qui a
+/// dû se donner une table à part (`favorite_facets`, `facet = 'label'`,
+/// `value TEXT`) pour mettre un label en favori.
+///
+/// Or `item_tags.item_id` est `INTEGER NOT NULL`. Il ne peut pas porter une
+/// chaîne. Accepter `item_type = "label"` reviendrait donc à écrire un entier
+/// qui ne désigne rien, et à rendre l'écriture illisible par construction :
+/// c'est précisément la panne silencieuse que cette liste ferme. Étiqueter un
+/// label demande une décision de modèle — l'aligner sur `favorite_facets`, ou
+/// donner enfin une identité aux labels — qui n'appartient pas à ce correctif.
+pub const TAGGABLE_ITEM_TYPES: [&str; 4] = ["album", "artist", "playlist", "track"];
+
+/// Vrai si `item_type` est un type d'objet étiquetable connu.
+pub fn is_taggable_item_type(item_type: &str) -> bool {
+    TAGGABLE_ITEM_TYPES.contains(&item_type)
+}
+
+/// Message d'erreur d'un `item_type` refusé — il **nomme les types admis**,
+/// sans quoi le client ne peut pas corriger sa faute de frappe.
+pub fn item_type_rejette(item_type: &str) -> String {
+    format!(
+        "item_type inconnu : « {item_type} » — types admis : {}",
+        TAGGABLE_ITEM_TYPES.join(", ")
+    )
+}
+
+fn verifier_item_type(item_type: &str) -> Result<(), String> {
+    if is_taggable_item_type(item_type) {
+        Ok(())
+    } else {
+        Err(item_type_rejette(item_type))
+    }
+}
+
 /// Engine-agnostic SQL builders for tag_repo.
 pub mod sql {
     use super::SqlDialect;
@@ -234,13 +288,26 @@ impl TagRepo {
             .collect())
     }
 
+    /// Pose une étiquette sur un objet.
+    ///
+    /// La vérification d'`item_type` est ici, au **dépôt**, et non dans la
+    /// route : c'est le seul point que tous les chemins d'écriture traversent.
+    /// Une règle posée dans un handler ne protège que ce handler-là — le
+    /// suivant qu'on ajoutera l'oubliera.
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
+        verifier_item_type(item_type)?;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
+    /// Retire une étiquette d'un objet.
+    ///
+    /// **Volontairement sans vérification d'`item_type`** : la suppression doit
+    /// rester capable d'atteindre une ligne d'un type qui n'est plus admis,
+    /// sinon un enregistrement écrit avant ce garde-fou deviendrait
+    /// indéracinable.
     pub fn untag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
         let sql = self.dialect_sql(sql::untag_item, sql::untag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
@@ -302,6 +369,11 @@ impl TagRepo {
         item_type: &str,
         item_ids: &[i64],
     ) -> Result<usize, String> {
+        // Vérifié AVANT la boucle : un lot refusé ne doit rien laisser derrière
+        // lui. `batch_tag` ne passe pas par `tag_item` (il bâtit son SQL une
+        // fois pour toutes) — sans cette ligne, le lot serait le trou par
+        // lequel un type inconnu entrerait quand même, par centaines.
+        verifier_item_type(item_type)?;
         let mut count = 0;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         for &item_id in item_ids {
@@ -542,6 +614,109 @@ mod tests {
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0].name, "Alpha");
         assert_eq!(tags[2].name, "Zebra");
+    }
+
+    /// Le défaut du chantier : un `item_type` mal orthographié entrait sans un
+    /// mot. Il doit désormais être refusé, et **ne rien laisser en base** — un
+    /// refus qui aurait quand même inséré serait pire que l'absence de règle,
+    /// puisque le client croirait avoir échoué.
+    #[test]
+    fn tag_item_refuse_un_type_inconnu_et_n_ecrit_rien() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Jazz", None).unwrap();
+
+        let erreur = repo.tag_item(tag_id, "albums", 1).unwrap_err();
+        assert!(
+            erreur.contains("albums"),
+            "le message doit citer le type refusé, il dit : {erreur}"
+        );
+        assert!(
+            erreur.contains("album") && erreur.contains("playlist"),
+            "le message doit nommer les types admis, il dit : {erreur}"
+        );
+
+        assert!(
+            repo.all_items_by_tag(tag_id).unwrap().is_empty(),
+            "un type refusé ne doit rien écrire"
+        );
+    }
+
+    /// Les cinq types du modèle, moins `label` : quatre acceptés, `label`
+    /// refusé **tant qu'il n'a pas d'identité numérique** (voir la note de
+    /// [`TAGGABLE_ITEM_TYPES`]).
+    #[test]
+    fn les_quatre_types_a_identifiant_passent_et_label_est_refuse() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Test", None).unwrap();
+
+        for (n, t) in ["album", "artist", "playlist", "track"].iter().enumerate() {
+            repo.tag_item(tag_id, t, n as i64 + 1)
+                .unwrap_or_else(|e| panic!("{t} doit être accepté : {e}"));
+        }
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 4);
+
+        assert!(
+            repo.tag_item(tag_id, "label", 1).is_err(),
+            "`label` n'a pas d'identifiant numérique : item_id INTEGER ne peut pas le porter"
+        );
+    }
+
+    /// `batch_tag` ne passe pas par `tag_item`. Sans vérification propre, il
+    /// serait le trou du garde-fou — et un lot écrit **par centaines**.
+    /// Le refus doit tomber AVANT la première insertion.
+    #[test]
+    fn batch_tag_refuse_le_lot_entier_sans_ecriture_partielle() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Lot", None).unwrap();
+
+        assert!(repo.batch_tag(tag_id, "Album", &[1, 2, 3]).is_err());
+        assert!(
+            repo.all_items_by_tag(tag_id).unwrap().is_empty(),
+            "aucune ligne du lot refusé ne doit rester"
+        );
+
+        assert_eq!(repo.batch_tag(tag_id, "album", &[1, 2, 3]).unwrap(), 3);
+    }
+
+    /// La suppression reste ouverte à un type qui n'est plus admis, sinon une
+    /// ligne écrite avant ce garde-fou serait indéracinable.
+    #[test]
+    fn untag_item_atteint_encore_une_ligne_de_type_hors_liste() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Ancien", None).unwrap();
+
+        // Écrite comme l'aurait fait la version sans garde-fou : par l'INSERT,
+        // sans passer par `tag_item`.
+        let params: [&dyn ToSqlValue; 1] = [&tag_id];
+        repo.db
+            .execute(
+                "INSERT INTO item_tags (tag_id, item_type, item_id) VALUES (?, 'albums', 7)",
+                &params,
+            )
+            .unwrap();
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 1);
+
+        repo.untag_item(tag_id, "albums", 7).unwrap();
+        assert!(
+            repo.all_items_by_tag(tag_id).unwrap().is_empty(),
+            "une ligne héritée doit rester supprimable"
+        );
     }
 
     #[test]

@@ -77,6 +77,76 @@ struct Identity {
     path: String,
 }
 
+/// Identité vivante (titre, artiste) d'un album, ou `None` s'il n'existe plus.
+///
+/// Écrite une seule fois pour les trois tables de marqueurs sans clé
+/// étrangère — favoris, albums masqués (`hidden_repo`), paires déclarées
+/// distinctes (`album_distinct_repo`) : c'est le pendant en lecture de
+/// [`find_album_by_identity`], et le recopier a déjà produit des divergences
+/// (#2848).
+pub(crate) fn album_live_identity(
+    db: &dyn DbBackend,
+    album_id: i64,
+) -> Result<Option<(String, String)>, String> {
+    let params: [&dyn ToSqlValue; 1] = [&album_id];
+    Ok(db
+        .query_one(
+            "SELECT a.title, COALESCE(ar.name, '') FROM albums a \
+             LEFT JOIN artists ar ON ar.id = a.artist_id WHERE a.id = ?",
+            &params,
+        )?
+        .map(|cols| {
+            (
+                cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+            )
+        }))
+}
+
+/// Retrouve l'album VIVANT correspondant à une identité (titre, artiste).
+///
+/// Règles de re-rattachement identiques pour les favoris et pour les albums
+/// masqués (`hidden_repo`) — c'est exactement le genre de logique qu'on
+/// recopie une fois de trop :
+/// * artiste connu : titre + artiste, l'album le plus peuplé gagne ; AUCUN
+///   repli titre seul (un homonyme d'un autre artiste serait re-rattaché —
+///   constaté sur .18 : « ok » de daoud disparu vs « OK » de Talvin Singh) ;
+/// * artiste inconnu : titre seul, UNIQUEMENT si non ambigu.
+pub(crate) fn find_album_by_identity(
+    db: &dyn DbBackend,
+    name: &str,
+    artist: &str,
+) -> Result<Option<i64>, String> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if !artist.is_empty() {
+        let params: [&dyn ToSqlValue; 2] = [&name, &artist];
+        let rows = db.query_many(
+            "SELECT a.id FROM albums a LEFT JOIN artists ar ON ar.id = a.artist_id \
+             WHERE LOWER(a.title) = LOWER(?) AND LOWER(COALESCE(ar.name, '')) = LOWER(?) \
+             ORDER BY COALESCE(a.track_count, 0) DESC, a.id ASC",
+            &params,
+        )?;
+        return Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_i64()));
+    }
+    let params: [&dyn ToSqlValue; 1] = [&name];
+    let rows = db.query_many(
+        "SELECT id FROM albums WHERE LOWER(title) = LOWER(?)",
+        &params,
+    )?;
+    if rows.len() == 1 {
+        return Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_i64()));
+    }
+    Ok(None)
+}
+
 pub struct FavoritesReconciler {
     db: Arc<dyn DbBackend>,
 }
@@ -301,37 +371,7 @@ impl FavoritesReconciler {
     }
 
     fn find_album(&self, ident: &Identity) -> Result<Option<i64>, String> {
-        if ident.name.is_empty() {
-            return Ok(None);
-        }
-        if !ident.artist.is_empty() {
-            let params: [&dyn ToSqlValue; 2] = [&ident.name, &ident.artist];
-            let rows = self.db.query_many(
-                "SELECT a.id FROM albums a LEFT JOIN artists ar ON ar.id = a.artist_id \
-                 WHERE LOWER(a.title) = LOWER(?) AND LOWER(COALESCE(ar.name, '')) = LOWER(?) \
-                 ORDER BY COALESCE(a.track_count, 0) DESC, a.id ASC",
-                &params,
-            )?;
-            if let Some(id) = Self::first_id(&rows) {
-                return Ok(Some(id));
-            }
-            // Artiste CONNU mais aucun album vivant de cet artiste ne porte ce
-            // titre : on s'arrête là. Un repli titre seul re-rattacherait un
-            // homonyme d'un AUTRE artiste (constaté sur .18 : « ok » de daoud
-            // disparu vs « OK » de Talvin Singh vivant).
-            return Ok(None);
-        }
-        // Repli titre seul (artiste inconnu), uniquement si non ambigu — un
-        // seul album vivant porte ce titre ; on ne re-rattache jamais au hasard.
-        let params: [&dyn ToSqlValue; 1] = [&ident.name];
-        let rows = self.db.query_many(
-            "SELECT id FROM albums WHERE LOWER(title) = LOWER(?)",
-            &params,
-        )?;
-        if rows.len() == 1 {
-            return Ok(Self::first_id(&rows));
-        }
-        Ok(None)
+        find_album_by_identity(self.db.as_ref(), &ident.name, &ident.artist)
     }
 
     fn find_track(&self, ident: &Identity) -> Result<Option<i64>, String> {

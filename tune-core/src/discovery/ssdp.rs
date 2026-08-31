@@ -1117,6 +1117,7 @@ async fn process_responses(
                         info!(
                             id = %dev_id,
                             name = %ms.name,
+                            location = %ms.location,
                             cd_url = %ms.content_directory_url,
                             "ssdp_media_server_discovered"
                         );
@@ -1885,6 +1886,102 @@ mod tests {
 <meta charset=\"utf-8\">\
 </head><body>Tune</body></html>";
 
+    /// Description minimale d'un MediaServer : assez riche pour emprunter le
+    /// chemin `ssdp_media_server_discovered`, sans AVTransport afin que la
+    /// sonde MinimalDMR d'un premier échec ne le transforme pas en renderer.
+    const MEDIA_SERVER_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>Tune Server</friendlyName>
+    <manufacturer>MozAIk Labs</manufacturer>
+    <modelName>Tune</modelName>
+    <UDN>uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>
+        <controlURL>/upnp/ContentDirectory/control</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    #[derive(Clone, Copy)]
+    enum LocationScenario {
+        /// La même URL rend d'abord du HTML, puis un descripteur valide.
+        Intermittent,
+        /// Deux URL portent le même UUID : l'une échoue, l'autre réussit.
+        DeuxLocations,
+    }
+
+    /// Serveur déterministe des deux scénarios que le journal de #2417 ne
+    /// permettait pas de séparer. Toute route non décrite rend 404, notamment
+    /// les sondes MinimalDMR : aucun repli ne doit court-circuiter les traces.
+    async fn spawn_location_scenario_server(scenario: LocationScenario) -> std::net::SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let intermittent_requests = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let intermittent_requests = intermittent_requests.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let tete = String::from_utf8_lossy(&req);
+                    let chemin = tete
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+
+                    let reponse = match (scenario, chemin) {
+                        (LocationScenario::Intermittent, "/intermittent.xml") => {
+                            if intermittent_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Some(("text/html", PAGE_HTML))
+                            } else {
+                                Some(("text/xml", MEDIA_SERVER_XML))
+                            }
+                        }
+                        (LocationScenario::DeuxLocations, "/mauvaise.xml") => {
+                            Some(("text/html", PAGE_HTML))
+                        }
+                        (LocationScenario::DeuxLocations, "/bonne.xml") => {
+                            Some(("text/xml", MEDIA_SERVER_XML))
+                        }
+                        _ => None,
+                    };
+
+                    let resp = if let Some((content_type, body)) = reponse {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
     /// Un serveur web ordinaire à l'adresse annoncée en LOCATION : il rend
     /// `PAGE_HTML` sur `description_path`, et **404 partout ailleurs**.
     ///
@@ -2066,6 +2163,104 @@ mod tests {
              sans elle on ne peut pas savoir quelle adresse rend du HTML.\n\
              attendu quelque part dans la ligne : {location}\n\
              ligne obtenue : {ligne}"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_location_intermittente_est_identique_sur_l_echec_et_le_succes() {
+        use tracing::instrument::WithSubscriber;
+
+        let addr = spawn_location_scenario_server(LocationScenario::Intermittent).await;
+        let location = format!("http://{addr}/intermittent.xml");
+        let annonce = || {
+            announcement(
+                &location,
+                "uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67::urn:schemas-upnp-org:device:MediaServer:1",
+            )
+        };
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        async {
+            // Premier passage : HTML, donc échec. La sonde MinimalDMR relit la
+            // même URL mais ne trouve aucun AVTransport. Deuxième passage :
+            // descripteur MediaServer valide, donc succès.
+            process_responses(&state, &tx, vec![annonce()]).await;
+            process_responses(&state, &tx, vec![annonce()]).await;
+        }
+        .with_subscriber(abonne)
+        .await;
+
+        let texte = journal.texte();
+        let echec = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_create_failed"))
+            .unwrap_or_else(|| panic!("aucune trace d'échec :\n{texte}"));
+        let succes = texte
+            .lines()
+            .find(|l| l.contains("ssdp_media_server_discovered"))
+            .unwrap_or_else(|| panic!("aucune trace de succès :\n{texte}"));
+
+        assert!(
+            echec.contains(&location) && succes.contains(&location),
+            "une URL intermittente doit ressortir IDENTIQUE sur les deux traces.\n\
+             attendu : {location}\n\
+             échec   : {echec}\n\
+             succès  : {succes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deux_locations_du_meme_uuid_restent_distinctes_dans_les_traces() {
+        use tracing::instrument::WithSubscriber;
+
+        let addr = spawn_location_scenario_server(LocationScenario::DeuxLocations).await;
+        let mauvaise = format!("http://{addr}/mauvaise.xml");
+        let bonne = format!("http://{addr}/bonne.xml");
+        let usn =
+            "uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67::urn:schemas-upnp-org:device:MediaServer:1";
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        process_responses(
+            &state,
+            &tx,
+            vec![announcement(&mauvaise, usn), announcement(&bonne, usn)],
+        )
+        .with_subscriber(abonne)
+        .await;
+
+        let texte = journal.texte();
+        let echec = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_create_failed"))
+            .unwrap_or_else(|| panic!("aucune trace d'échec :\n{texte}"));
+        let succes = texte
+            .lines()
+            .find(|l| l.contains("ssdp_media_server_discovered"))
+            .unwrap_or_else(|| panic!("aucune trace de succès :\n{texte}"));
+
+        assert!(
+            echec.contains(&mauvaise) && !echec.contains(&bonne),
+            "l'échec doit nommer seulement sa LOCATION.\n\
+             mauvaise : {mauvaise}\nbonne : {bonne}\nligne : {echec}"
+        );
+        assert!(
+            succes.contains(&bonne) && !succes.contains(&mauvaise),
+            "le succès doit nommer seulement sa LOCATION.\n\
+             bonne : {bonne}\nmauvaise : {mauvaise}\nligne : {succes}"
         );
     }
 

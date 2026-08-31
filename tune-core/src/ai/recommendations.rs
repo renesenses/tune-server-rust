@@ -373,8 +373,24 @@ pub fn smart_radio(
     // cosine. This is the strongest continuity signal, so it goes first. Empty
     // when the seed has no embedding (un-analysed library), leaving the metadata
     // paths below as the fallback — zero regression.
+    //
+    // Le cosinus seul ne suffit pas (#1820) : dans l'espace CLAP courant, les
+    // dix premiers voisins tiennent dans une bande de ~0,09 et dix-sept
+    // candidats se pressent à moins de 0,02 sous le dixième — le rang y est
+    // quasi arbitraire, et CLAP encode le timbre, pas l'humeur. On traite donc
+    // le cosinus comme une PRÉSÉLECTION large, puis on re-classe la file sur
+    // des grandeurs déjà en base : le saut d'énergie (ReplayGain) et de tempo
+    // (BPM) entre pistes consécutives.
     if let Some(tid) = seed_track_id {
-        let neigh = crate::audio::embedding_store::acoustic_neighbors(backend, tid, count);
+        let pool = count.saturating_mul(3).max(50);
+        let mut neigh = crate::audio::embedding_store::acoustic_neighbors(backend, tid, pool);
+        if !neigh.is_empty() {
+            let mut ids: Vec<i64> = neigh.iter().map(|(id, _)| *id).collect();
+            ids.push(tid);
+            let feats = load_queue_features(backend, &ids);
+            let seed_feat = feats.get(&tid).cloned().unwrap_or_default();
+            neigh = rerank_acoustic_queue(neigh, &seed_feat, &feats, count);
+        }
         if !neigh.is_empty() {
             let ids: Vec<i64> = neigh.iter().map(|(id, _)| *id).collect();
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -561,6 +577,130 @@ pub fn smart_radio(
     results
 }
 
+// ---------------------------------------------------------------------------
+// Re-classement de la file acoustique (#1820)
+// ---------------------------------------------------------------------------
+
+/// Grandeurs auxiliaires d'une piste pour le re-classement de file : ce que la
+/// bibliothèque sait DÉJÀ, sans nouveau modèle. `gain_db` vient du ReplayGain
+/// mesuré (`rg_track_gain`), approximation grossière mais réelle de l'énergie ;
+/// `bpm` vient des tags quand ils le portent.
+#[derive(Debug, Clone, Default)]
+struct QueueFeatures {
+    gain_db: Option<f64>,
+    bpm: Option<f64>,
+}
+
+/// Coût d'un saut d'énergie, en équivalent-cosinus par dB d'écart ReplayGain.
+///
+/// Étalonné sur la mesure du ticket : les dix premiers voisins d'une piste
+/// tiennent dans une bande de ~0,09 de cosinus, et l'écart 10ᵉ/11ᵉ est < 0,02.
+/// À 0,01/dB, un saut de 9 dB (un vrai retournement d'ambiance) coûte toute la
+/// largeur de la bande, quand 1–2 dB de variation normale restent sous le
+/// bruit du classement.
+const ENERGY_WEIGHT_PER_DB: f32 = 0.01;
+
+/// Coût d'un saut de tempo, en équivalent-cosinus par BPM d'écart : une
+/// ballade à 70 BPM suivie d'un morceau à 130 coûte 0,06 — de quoi dominer un
+/// écart de cosinus insignifiant, sans jamais écraser un vrai voisin.
+const TEMPO_WEIGHT_PER_BPM: f32 = 0.001;
+
+/// Charge les grandeurs auxiliaires d'un lot de pistes en une requête.
+fn load_queue_features(
+    backend: &Arc<dyn DbBackend>,
+    ids: &[i64],
+) -> std::collections::HashMap<i64, QueueFeatures> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT t.id, t.bpm, m.value \
+         FROM tracks t \
+         LEFT JOIN track_metadata m \
+           ON m.track_id = t.id AND m.key = 'rg_track_gain' \
+         WHERE t.id IN ({placeholders})"
+    );
+    let params: Vec<&dyn ToSqlValue> = ids.iter().map(|id| id as &dyn ToSqlValue).collect();
+    if let Ok(rows) = backend.query_many(&sql, &params) {
+        for r in &rows {
+            let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            out.insert(
+                id,
+                QueueFeatures {
+                    bpm: r.get(1).and_then(|v| v.as_f64()).filter(|b| *b > 0.0),
+                    gain_db: r
+                        .get(2)
+                        .and_then(|v| v.as_string())
+                        .and_then(crate::audio::replaygain::parse_gain_db),
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Pénalité de transition entre deux pistes consécutives, en équivalent-cosinus.
+///
+/// Une grandeur absente d'un des deux côtés ne pénalise pas : une bibliothèque
+/// sans ReplayGain ni BPM retombe exactement sur l'ordre cosinus d'avant —
+/// zéro régression.
+fn transition_penalty(prev: &QueueFeatures, next: &QueueFeatures) -> f32 {
+    let energy = match (prev.gain_db, next.gain_db) {
+        (Some(a), Some(b)) => (a - b).abs() as f32 * ENERGY_WEIGHT_PER_DB,
+        _ => 0.0,
+    };
+    let tempo = match (prev.bpm, next.bpm) {
+        (Some(a), Some(b)) => (a - b).abs() as f32 * TEMPO_WEIGHT_PER_BPM,
+        _ => 0.0,
+    };
+    energy + tempo
+}
+
+/// Re-classe une présélection cosinus en file cohérente (#1820).
+///
+/// Le cosinus CLAP constitue le vivier — il sait dire « plausible », pas
+/// ordonner : le rang dans le top-10 est quasi arbitraire (bande de ~0,09,
+/// dix-sept candidats à < 0,02 du dernier élu). Ici, chaîne gloutonne : à
+/// chaque pas, la piste retenue est celle qui maximise
+/// `cosinus − pénalité de transition` avec la piste PRÉCÉDENTE de la file
+/// (la graine au premier pas). Déterministe : égalité tranchée par cosinus
+/// décroissant puis id croissant.
+fn rerank_acoustic_queue(
+    mut pool: Vec<(i64, f32)>,
+    seed: &QueueFeatures,
+    feats: &std::collections::HashMap<i64, QueueFeatures>,
+    count: usize,
+) -> Vec<(i64, f32)> {
+    let mut out = Vec::with_capacity(count.min(pool.len()));
+    let mut prev = seed.clone();
+    while out.len() < count && !pool.is_empty() {
+        let default = QueueFeatures::default();
+        let best = pool
+            .iter()
+            .enumerate()
+            .map(|(i, (id, cos))| {
+                let f = feats.get(id).unwrap_or(&default);
+                (i, *cos - transition_penalty(&prev, f))
+            })
+            .max_by(|(ia, sa), (ib, sb)| {
+                sa.total_cmp(sb)
+                    // Égalité de score : plus fort cosinus, puis plus petit id.
+                    .then(pool[*ia].1.total_cmp(&pool[*ib].1))
+                    .then(pool[*ib].0.cmp(&pool[*ia].0))
+            })
+            .map(|(i, _)| i);
+        let Some(i) = best else { break };
+        let picked = pool.remove(i);
+        prev = feats.get(&picked.0).cloned().unwrap_or_default();
+        out.push(picked);
+    }
+    out
+}
+
 /// Deduplicate a radio queue in place, preserving priority order, then cap it.
 ///
 /// Two keys are collapsed: the track id, and a normalised `artist \u{1} title`
@@ -630,6 +770,100 @@ mod tests {
         }
     }
 
+    fn qf(gain_db: Option<f64>, bpm: Option<f64>) -> QueueFeatures {
+        QueueFeatures { gain_db, bpm }
+    }
+
+    fn feats(
+        entries: &[(i64, Option<f64>, Option<f64>)],
+    ) -> std::collections::HashMap<i64, QueueFeatures> {
+        entries.iter().map(|(id, g, b)| (*id, qf(*g, *b))).collect()
+    }
+
+    // Le cas du ticket : deux candidats indiscernables au cosinus (0,91 vs
+    // 0,90 — sous la largeur de bande mesurée), mais l'un saute de 12 dB
+    // d'énergie. Le cosinus brut mettait l'intrus en tête ; le re-classement
+    // met la piste d'énergie voisine d'abord.
+    #[test]
+    fn rerank_demotes_the_opposite_energy_intruder() {
+        let pool = vec![(2, 0.91_f32), (1, 0.90_f32)];
+        let seed = qf(Some(-5.0), None);
+        let f = feats(&[(1, Some(-5.0), None), (2, Some(-17.0), None)]);
+        let out = rerank_acoustic_queue(pool, &seed, &f, 2);
+        assert_eq!(out.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    // Même chose sur le tempo : ballade (70 BPM) comme graine, un voisin à
+    // 72 BPM passe devant un voisin à 140 BPM au cosinus à peine supérieur.
+    #[test]
+    fn rerank_demotes_the_opposite_tempo_intruder() {
+        let pool = vec![(2, 0.91_f32), (1, 0.90_f32)];
+        let seed = qf(None, Some(70.0));
+        let f = feats(&[(1, None, Some(72.0)), (2, None, Some(140.0))]);
+        let out = rerank_acoustic_queue(pool, &seed, &f, 2);
+        assert_eq!(out.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    // La pénalité se calcule contre la piste PRÉCÉDENTE, pas seulement la
+    // graine : la chaîne regroupe les énergies voisines au lieu d'alterner.
+    #[test]
+    fn rerank_chains_on_the_previous_track_not_the_seed() {
+        // Graine calme (-15 dB). Deux fortes (0 dB), deux calmes (-15 dB).
+        let pool = vec![
+            (10, 0.95_f32), // forte
+            (11, 0.94_f32), // calme
+            (12, 0.93_f32), // forte
+            (13, 0.92_f32), // calme
+        ];
+        let seed = qf(Some(-15.0), None);
+        let f = feats(&[
+            (10, Some(0.0), None),
+            (11, Some(-15.0), None),
+            (12, Some(0.0), None),
+            (13, Some(-15.0), None),
+        ]);
+        let out = rerank_acoustic_queue(pool, &seed, &f, 4);
+        // Les calmes d'abord (proches de la graine), puis les fortes par
+        // cosinus — une fois la file passée côté fort, elle y reste.
+        assert_eq!(
+            out.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [11, 13, 10, 12]
+        );
+    }
+
+    // Sans aucune grandeur auxiliaire (bibliothèque sans ReplayGain ni BPM),
+    // l'ordre cosinus d'origine est conservé à l'identique — zéro régression.
+    #[test]
+    fn rerank_without_features_is_the_cosine_order() {
+        let pool = vec![(7, 0.93_f32), (3, 0.91_f32), (9, 0.90_f32)];
+        let out = rerank_acoustic_queue(pool.clone(), &QueueFeatures::default(), &feats(&[]), 3);
+        assert_eq!(out, pool);
+    }
+
+    // Une grandeur absente d'UN côté ne pénalise pas : une piste non analysée
+    // n'est pas punie face à une piste analysée.
+    #[test]
+    fn missing_feature_on_one_side_costs_nothing() {
+        assert_eq!(
+            transition_penalty(&qf(Some(-5.0), None), &qf(None, Some(120.0))),
+            0.0
+        );
+    }
+
+    // Déterministe : deux exécutions sur le même vivier donnent la même file,
+    // et le vivier est tronqué à la demande.
+    #[test]
+    fn rerank_is_deterministic_and_caps_at_count() {
+        let pool = vec![(5, 0.90_f32), (2, 0.90_f32), (8, 0.90_f32)];
+        let f = feats(&[]);
+        let a = rerank_acoustic_queue(pool.clone(), &QueueFeatures::default(), &f, 2);
+        let b = rerank_acoustic_queue(pool.clone(), &QueueFeatures::default(), &f, 2);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        // Égalité parfaite de score et de cosinus : le plus petit id gagne.
+        assert_eq!(a.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [2, 5]);
+    }
+
     #[test]
     fn dedup_collapses_duplicate_rips_by_content_key() {
         // Same recording imported twice → distinct ids, identical artist/title.
@@ -682,5 +916,127 @@ mod tests {
         ];
         dedup_and_cap(&mut v, 2);
         assert_eq!(v.iter().map(|t| t.track_id).collect::<Vec<_>>(), vec![1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod smart_radio_rerank_tests {
+    use super::*;
+    use crate::audio::embedding_store::{EMBED_DIM, MODEL_ID, to_bytes};
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_metadata_repo::TrackMetadataRepo;
+    use crate::db::track_repo::TrackRepo;
+
+    fn setup() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Une piste analysée : embedding normé `[cos θ, sin θ, 0, …]` (cosinus
+    /// exact avec la graine `[1, 0, …]`) + ReplayGain mesuré.
+    fn mk_analysed(backend: &Arc<dyn DbBackend>, title: &str, cos: f32, gain: &str) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new(title.into());
+        t.format = Some("flac".into());
+        t.duration_ms = 200_000;
+        t.file_path = Some(format!("/m/{title}.flac"));
+        let id = repo.create(&t).unwrap();
+
+        let mut v = vec![0.0f32; EMBED_DIM];
+        v[0] = cos;
+        v[1] = (1.0 - cos * cos).max(0.0).sqrt();
+        let blob = Some(to_bytes(&v));
+        let params: [&dyn ToSqlValue; 3] = [&id, &MODEL_ID, &blob];
+        backend
+            .execute(
+                "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                 VALUES (?, ?, ?, 42)",
+                &params,
+            )
+            .unwrap();
+        TrackMetadataRepo::with_backend(backend.clone())
+            .set(id, "rg_track_gain", gain)
+            .unwrap();
+        id
+    }
+
+    // Bout en bout, le cas de DEvir (#1820) : deux voisins indiscernables au
+    // cosinus (0,91 vs 0,90) dont l'un saute de 12 dB d'énergie. Le tri
+    // cosinus brut met l'intrus en tête ; la file de la radio le repousse
+    // derrière la piste d'énergie voisine.
+    #[test]
+    fn smart_radio_reorders_the_opposite_energy_neighbor() {
+        let backend = setup();
+        let seed = mk_analysed(&backend, "graine", 1.0, "-5.00 dB");
+        let close = mk_analysed(&backend, "meme energie", 0.90, "-5.00 dB");
+        let intruder = mk_analysed(&backend, "energie opposee", 0.91, "-17.00 dB");
+
+        // Contre-épreuve interne : la présélection cosinus, elle, met bien
+        // l'intrus d'abord — c'est le comportement que le ticket décrit.
+        let raw = crate::audio::embedding_store::acoustic_neighbors(&backend, seed, 2);
+        assert_eq!(
+            raw.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [intruder, close],
+            "le cosinus brut doit préférer l'intrus, sinon le test ne prouve rien"
+        );
+
+        let queue = smart_radio(&backend, Some(seed), None, None, 2);
+        assert_eq!(
+            queue.iter().map(|t| t.track_id).collect::<Vec<_>>(),
+            [close, intruder],
+            "la file re-classée doit enchaîner les énergies voisines"
+        );
+        assert!(queue.iter().all(|t| t.reason == "acoustic"));
+    }
+
+    // Bibliothèque analysée mais sans ReplayGain : l'ordre cosinus est
+    // conservé tel quel — le re-classement n'invente rien.
+    #[test]
+    fn smart_radio_without_replaygain_keeps_cosine_order() {
+        let backend = setup();
+        let repo = TrackRepo::with_backend(backend.clone());
+        let seed = {
+            let mut t = Track::new("graine".into());
+            t.format = Some("flac".into());
+            t.file_path = Some("/m/graine.flac".into());
+            let id = repo.create(&t).unwrap();
+            let mut v = vec![0.0f32; EMBED_DIM];
+            v[0] = 1.0;
+            let blob = Some(to_bytes(&v));
+            let params: [&dyn ToSqlValue; 3] = [&id, &MODEL_ID, &blob];
+            backend
+                .execute(
+                    "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                     VALUES (?, ?, ?, 42)",
+                    &params,
+                )
+                .unwrap();
+            id
+        };
+        // Pas de rg_track_gain nulle part : mk_analysed non utilisé.
+        for (title, cos) in [("premier", 0.95f32), ("second", 0.85f32)] {
+            let mut t = Track::new(title.into());
+            t.format = Some("flac".into());
+            t.file_path = Some(format!("/m/{title}.flac"));
+            let id = repo.create(&t).unwrap();
+            let mut v = vec![0.0f32; EMBED_DIM];
+            v[0] = cos;
+            v[1] = (1.0 - cos * cos).sqrt();
+            let blob = Some(to_bytes(&v));
+            let params: [&dyn ToSqlValue; 3] = [&id, &MODEL_ID, &blob];
+            backend
+                .execute(
+                    "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                     VALUES (?, ?, ?, 42)",
+                    &params,
+                )
+                .unwrap();
+        }
+        let queue = smart_radio(&backend, Some(seed), None, None, 2);
+        let titles: Vec<_> = queue.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["premier", "second"]);
     }
 }

@@ -140,10 +140,16 @@ pub(super) async fn upload_album_artwork(
     };
 
     let cache_dir = artwork_cache_dir();
-    std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::library::artwork::artwork_hash(&format!("album-upload-{id}"));
-    let path = cache_dir.join(format!("{hash}.{ext}"));
-    if std::fs::write(&path, &data).is_err() {
+    // Condensat de CONTENU, plus d'identité figée (#1444). Sous
+    // `artwork_hash("album-upload-{id}")`, remplacer la pochette gardait la
+    // même URL alors que la route sert `immutable, max-age=31536000` : les
+    // clients affichaient l'ancienne image pendant un an — et si l'extension
+    // changeait (`.png` après un `.jpg`), les deux fichiers coexistaient et
+    // `find_cached` servait l'ancien `.jpg` pour toujours. Une image
+    // différente obtient désormais forcément une adresse différente, et
+    // l'écriture passe par `save_to_cache` (extension canonique, #2567).
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, &ext).is_none() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to save image"})),
@@ -418,6 +424,20 @@ pub(super) fn compter_artistes_sans_image(
     }
 }
 
+/// Libellé affiché à côté du compteur d'avancement, d'après la passe en cours.
+///
+/// La passe par nom (Discogs / Last.fm) tombait dans le cas par défaut et
+/// s'annonçait « MusicBrainz » — la seule des trois qui n'interroge justement
+/// pas MusicBrainz. Le nom de la passe vient de `tune-core`, pas d'une chaîne
+/// recopiée ici.
+pub(super) fn libelle_phase(phase: Option<&str>) -> &'static str {
+    match phase {
+        Some("images") => "Images",
+        Some(p) if p == tune_core::library::artwork::PHASE_PAR_NOM => "Discogs / Last.fm",
+        _ => "MusicBrainz",
+    }
+}
+
 pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -483,10 +503,7 @@ pub(super) async fn batch_enrich_artist_artwork(
                 }
                 let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
                 let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
-                let detail = match v.get("phase").and_then(|s| s.as_str()) {
-                    Some("images") => "Images",
-                    _ => "MusicBrainz",
-                };
+                let detail = libelle_phase(v.get("phase").and_then(|s| s.as_str()));
                 bg_tasks.update_progress("artist_artwork", processed, total, detail);
             }
         });
@@ -647,9 +664,61 @@ pub(super) async fn rescan_album_artwork(
     .into_response()
 }
 
+/// Ce que la reprise des pochettes a fait, a un instant donne.
+///
+/// UNE seule source pour les DEUX annonces (`library.artwork.progress` et
+/// `library.artwork.completed`) : deux `json!` recopies auraient diverge au
+/// premier champ ajoute — c'est la lecon du rapport de fin de scan (#2827).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AvancementPochettes {
+    /// Albums deja examines.
+    traites: usize,
+    /// Albums a examiner. Connu des le depart : la requete les compte tous.
+    total: usize,
+    /// Albums pour lesquels une pochette a ete posee pendant CETTE passe.
+    trouvees: usize,
+}
+
+impl AvancementPochettes {
+    /// Les trois champs, et RIEN d'autre, que `SettingsView.svelte` rend dans
+    /// `settings.coversProgress` — « Covers {current}/{total} ({found}
+    /// trouvées) ». Le client fait foi sur le nom et sur la charge utile.
+    fn charge(self) -> Value {
+        json!({
+            "current": self.traites,
+            "total": self.total,
+            "found": self.trouvees,
+        })
+    }
+}
+
+/// Garantit que `library.artwork.completed` part, quoi qu'il arrive.
+///
+/// C'est le SEUL evenement qui fasse retomber `artworkScanning` cote client :
+/// sans lui, le bouton « Rechercher les pochettes » reste grise jusqu'au
+/// rechargement de la page — exactement le symptome de #2870. Un abandon en
+/// cours de route (panique dans la tache) doit donc l'annoncer aussi : un
+/// compte incomplet vaut mieux qu'un ecran bloque. Meme principe que le
+/// superviseur de fin d'enrichissement (#2840), applique par `Drop` puisqu'il
+/// n'y a ici qu'une seule tache a surveiller.
+struct FinDeReprise {
+    bus: std::sync::Arc<tune_core::event_bus::EventBus>,
+    avancement: AvancementPochettes,
+}
+
+impl Drop for FinDeReprise {
+    fn drop(&mut self) {
+        self.bus.emit_typed(
+            tune_core::event_types::EventType::ArtworkComplete,
+            self.avancement.charge(),
+        );
+    }
+}
+
 pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
     let backend = state.backend.clone();
+    let event_bus = state.event_bus.clone();
 
     tokio::spawn(async move {
         let albums: Vec<i64> = backend
@@ -661,7 +730,25 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
 
         let track_repo = TrackRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend);
-        let mut updated = 0i32;
+        let mut fin = FinDeReprise {
+            bus: event_bus.clone(),
+            avancement: AvancementPochettes {
+                traites: 0,
+                total: albums.len(),
+                trouvees: 0,
+            },
+        };
+        // Une passe sur une grande bibliotheque lit chaque fichier : emettre par
+        // album inonderait le bus. Meme discipline que `library.scan.progress` —
+        // la premiere annonce part tout de suite (la barre doit apparaitre), les
+        // suivantes au plus toutes les deux secondes.
+        let mut cadence = tune_core::cadence::Cadence::avancement();
+        if cadence.autorise() {
+            event_bus.emit_typed(
+                tune_core::event_types::EventType::ArtworkProgress,
+                fin.avancement.charge(),
+            );
+        }
         for album_id in &albums {
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
             for track in &tracks {
@@ -671,13 +758,25 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
                         &cache_dir,
                     ) {
                         album_repo.force_update_cover_path(*album_id, &hash).ok();
-                        updated += 1;
+                        fin.avancement.trouvees += 1;
                         break;
                     }
                 }
             }
+            fin.avancement.traites += 1;
+            if cadence.autorise() {
+                event_bus.emit_typed(
+                    tune_core::event_types::EventType::ArtworkProgress,
+                    fin.avancement.charge(),
+                );
+            }
         }
-        tracing::info!(updated, total = albums.len(), "rescan_all_artwork done");
+        tracing::info!(
+            updated = fin.avancement.trouvees,
+            total = fin.avancement.total,
+            "rescan_all_artwork done"
+        );
+        // `fin` tombe ici : `library.artwork.completed` part avec le compte final.
     });
 
     (
@@ -881,6 +980,19 @@ mod tests_service_pochette {
         );
     }
 
+    /// Une entrée adressée par le CONTENU (#1444) — SHA-256, 64 hexdigits —
+    /// est servie exactement comme une entrée héritée en 32 : la route ne
+    /// distingue pas les deux formes.
+    #[tokio::test]
+    async fn une_entree_adressee_par_le_contenu_est_servie() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = tune_core::library::artwork::content_hash(b"NOUVELLE-POCHETTE");
+        assert_eq!(hash.len(), 64);
+        ecrire(cache.path(), &format!("{hash}.jpg"), b"NOUVELLE-POCHETTE");
+        let reponse = serve_artwork_from(cache.path(), &hash).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+    }
+
     /// Garde-fou : un condensat sans fichier reste un 404. Servir un octet de
     /// remplacement à sa place ferait croire à une pochette et empêcherait de
     /// jamais la reconstruire.
@@ -913,5 +1025,125 @@ mod tests_service_pochette {
                 .unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_avancement_pochettes {
+    use super::*;
+    use std::sync::Arc;
+    use tune_core::event_bus::EventBus;
+
+    /// Contrat INTER-DEPOTS (#2870). `SettingsView.svelte` declare
+    /// `artworkProgress: { current: number; total: number; found: number }` et
+    /// rend `settings.coversProgress` — « Covers {current}/{total} ({found}
+    /// trouvées) ». Renommer un de ces trois champs affiche « undefined ».
+    #[test]
+    fn la_charge_porte_exactement_current_total_found() {
+        let a = AvancementPochettes {
+            traites: 12,
+            total: 400,
+            trouvees: 7,
+        };
+        let charge = a.charge();
+        assert_eq!(charge["current"], 12);
+        assert_eq!(charge["total"], 400);
+        assert_eq!(charge["found"], 7);
+        assert_eq!(
+            charge.as_object().map(|o| o.len()),
+            Some(3),
+            "pas un champ de plus : le client n'en lit que trois"
+        );
+    }
+
+    /// `library.artwork.completed` est le SEUL evenement qui fasse retomber
+    /// `artworkScanning`. Il doit donc partir meme quand la passe est
+    /// interrompue — sinon le bouton reste grise jusqu'au rechargement de la
+    /// page, ce qui est exactement le defaut d'origine.
+    #[tokio::test]
+    async fn la_fin_est_annoncee_meme_si_la_passe_est_interrompue() {
+        let bus = Arc::new(EventBus::new());
+        let mut evenements = bus.subscribe();
+        {
+            let mut fin = FinDeReprise {
+                bus: bus.clone(),
+                avancement: AvancementPochettes {
+                    traites: 0,
+                    total: 900,
+                    trouvees: 0,
+                },
+            };
+            fin.avancement.traites = 3;
+            fin.avancement.trouvees = 1;
+            // On sort du bloc sans atteindre la fin de la boucle : c'est le
+            // scenario « la tache s'arrete en cours de route ».
+        }
+        let ev = evenements.recv().await.expect("fin de reprise attendue");
+        assert_eq!(ev.event_type, "library.artwork.completed");
+        assert_eq!(ev.data["current"], 3, "le compte partiel, pas un mensonge");
+        assert_eq!(ev.data["total"], 900);
+        assert_eq!(ev.data["found"], 1);
+    }
+
+    /// Une bibliotheque VIDE doit quand meme annoncer la fin : sinon le bouton
+    /// reste grise pour toujours chez qui n'a pas encore scanne.
+    #[tokio::test]
+    async fn une_bibliotheque_vide_annonce_quand_meme_la_fin() {
+        let bus = Arc::new(EventBus::new());
+        let mut evenements = bus.subscribe();
+        drop(FinDeReprise {
+            bus: bus.clone(),
+            avancement: AvancementPochettes::default(),
+        });
+        let ev = evenements.recv().await.expect("fin de reprise attendue");
+        assert_eq!(ev.event_type, "library.artwork.completed");
+        assert_eq!(ev.data["total"], 0);
+    }
+
+    /// Contre-epreuve de la cadence : sur mille albums, l'avancement ne doit PAS
+    /// produire mille evenements. Une emission par album noierait le bus et
+    /// ferait prendre du retard aux clients (`Lagged`) — c'est le defaut que la
+    /// discipline de `library.scan.progress` evite depuis toujours.
+    #[test]
+    fn mille_albums_ne_font_pas_mille_annonces() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut cadence = tune_core::cadence::Cadence::avancement();
+        let mut annonces = 0usize;
+        for i in 0..1000u64 {
+            // Un album toutes les 10 ms : 10 s de passe.
+            if cadence.autorise_a(t0 + Duration::from_millis(i * 10)) {
+                annonces += 1;
+            }
+        }
+        assert_eq!(
+            annonces, 5,
+            "1000 albums a 10 ms couvrent 0..9,99 s : annonces a 0, 2, 4, 6 et 8 s"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chaque passe doit s'annoncer sous son propre nom. La passe par nom
+    /// n'appelle pas MusicBrainz : l'afficher ainsi désigne le mauvais service
+    /// quand la recherche échoue (#2227, #2257).
+    #[test]
+    fn chaque_passe_porte_son_propre_libelle() {
+        assert_eq!(libelle_phase(Some("mbid")), "MusicBrainz");
+        assert_eq!(libelle_phase(Some("images")), "Images");
+        assert_eq!(
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            "Discogs / Last.fm"
+        );
+        assert_ne!(
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            "MusicBrainz",
+            "la passe par nom n'interroge pas MusicBrainz"
+        );
+        // Une passe inconnue garde le repli historique.
+        assert_eq!(libelle_phase(None), "MusicBrainz");
     }
 }

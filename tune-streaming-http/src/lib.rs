@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -11,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
+use tune_core::favorites_sort::TriFavoris;
 use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
@@ -143,6 +146,92 @@ fn svc_response_editorial<R: serde::Serialize, E: std::fmt::Display>(
     response
 }
 
+// ---------------------------------------------------------------------------
+// Cache TTL du contenu UTILISATEUR — playlists et favoris (#1621, lot 5)
+// ---------------------------------------------------------------------------
+
+/// Durée de vie des listes UTILISATEUR (playlists, favoris) en cache.
+///
+/// Chaque retour dans la vue streaming relançait la totalité des requêtes —
+/// dont les favoris, repaginés en entier auprès du service (#1621). 120 s
+/// suffit à absorber ces allers-retours de navigation, et reste assez court
+/// pour qu'une modification faite HORS de Tune (l'app Qobuz du téléphone)
+/// apparaisse vite. Les mutations faites PAR Tune n'attendent pas ce délai :
+/// elles purgent le cache du service ([`purge_contenu_utilisateur`]).
+///
+/// Ce cache est SERVEUR uniquement — la réponse reste sous le `no-cache` du
+/// middleware, contrairement à l'éditorial ([`CACHE_EDITORIAL`]) : un
+/// navigateur qui resservirait un favori retiré n'aurait aucun moyen d'être
+/// purgé, lui.
+const TTL_CONTENU_UTILISATEUR: Duration = Duration::from_secs(120);
+
+/// Une liste utilisateur mémorisée, datée pour l'expiration.
+struct EntreeUtilisateur {
+    cree: Instant,
+    donnees: Value,
+}
+
+/// Clé = (service, ressource) — ex. `("qobuz", "favorites/tracks")`.
+///
+/// `static` et non un champ de [`StreamingHttpState`] : l'état est RECONSTRUIT
+/// à chaque requête par `FromRef` (`tune-server/src/state.rs`), un champ n'y
+/// survivrait pas d'une requête à l'autre — même raison que
+/// [`services_snapshot_cache`].
+fn cache_contenu_utilisateur()
+-> &'static std::sync::Mutex<HashMap<(String, String), EntreeUtilisateur>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(String, String), EntreeUtilisateur>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// La liste en cache si elle est fraîche, sinon rien.
+fn contenu_utilisateur_frais(service: &str, ressource: &str) -> Option<Value> {
+    let cache = cache_contenu_utilisateur().lock().ok()?;
+    cache
+        .get(&(service.to_string(), ressource.to_string()))
+        .and_then(|e| {
+            if e.cree.elapsed() < TTL_CONTENU_UTILISATEUR {
+                tracing::debug!(service, ressource, "streaming_user_cache_hit");
+                Some(e.donnees.clone())
+            } else {
+                None
+            }
+        })
+}
+
+/// Mémorise une liste utilisateur. Les erreurs ne sont JAMAIS mémorisées :
+/// c'est à l'appelant de ne passer ici que des succès.
+fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value) {
+    let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
+        return;
+    };
+    cache.insert(
+        (service.to_string(), ressource.to_string()),
+        EntreeUtilisateur {
+            cree: Instant::now(),
+            donnees,
+        },
+    );
+}
+
+/// Oublie TOUT le contenu utilisateur d'un service.
+///
+/// Appelée après chaque mutation — favori ajouté/retiré (y compris la
+/// souscription de playlist, qui entre par la même route), playlist
+/// créée/supprimée/modifiée — et après tout changement de session (login,
+/// logout) : le cache d'un compte ne doit jamais être servi à un autre.
+///
+/// Sans condition sur le succès : une mutation en échec côté HTTP peut avoir
+/// abouti côté service (délai dépassé), et le prix d'une purge de trop est un
+/// seul rechargement.
+fn purge_contenu_utilisateur(service: &str) {
+    let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
+        return;
+    };
+    cache.retain(|(svc, _), _| svc != service);
+}
+
 /// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
 macro_rules! with_svc {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
@@ -192,6 +281,9 @@ macro_rules! with_svc_mut {
 struct SearchQuery {
     q: String,
     limit: Option<usize>,
+    /// Curseur, en éléments et PAR CATÉGORIE (#2160). Absent = première page,
+    /// ce que tous les clients antérieurs envoient.
+    offset: Option<usize>,
 }
 
 pub fn router<S>() -> Router<S>
@@ -298,20 +390,47 @@ where
 
 // ---------------------------------------------------------------------------
 
+/// `?limit=` est un nombre d'éléments PAR CATÉGORIE (albums, artistes, titres,
+/// playlists), pas un total. `limit=0` demande « Tous », à la charge du service
+/// de le borner — la recherche Qobuz pagine et s'arrête au plafond documenté
+/// dans `qobuz.rs` (#2160). Absent, la valeur reste 20, ce que les clients
+/// antérieurs obtenaient déjà.
+///
+/// `?offset=` est le curseur d'un « Charger plus » : le rang, par catégorie, du
+/// premier élément voulu. Absent = 0.
+///
+/// La réponse ajoute `offset`, `totals`, `has_more` et `truncated` À CÔTÉ des
+/// quatre clés existantes — un client antérieur lit `.albums` comme avant.
+/// `truncated` est ce qui empêche de prendre un « Tous » borné à 500 pour un
+/// catalogue épuisé.
+///
+/// **Pas de cache ici, et c'est délibéré.** Le cache de 120 s des listes
+/// utilisateur (#2818) est indexé par `(service, ressource)` : une clé de
+/// recherche devrait porter la requête, la limite ET le décalage, soit une
+/// entrée par frappe de clavier et par page. On ne mémorise donc rien, comme
+/// avant.
 async fn service_search(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(20);
-    with_svc!(&state, &service, |svc| svc.search(&q.q, limit).await)
+    let offset = q.offset.unwrap_or(0);
+    with_svc!(&state, &service, |svc| svc
+        .search_page(&q.q, limit, offset)
+        .await)
 }
 
 async fn service_albums(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_user_albums().await)
+    if let Some(donnees) = contenu_utilisateur_frais(&service, "albums") {
+        return Json(donnees).into_response();
+    }
+    with_svc!(&state, &service, |svc| svc.get_user_albums().await.inspect(
+        |a| memoriser_contenu_utilisateur(&service, "albums", json!(a))
+    ))
 }
 
 async fn service_album(
@@ -402,7 +521,17 @@ async fn service_playlists(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_user_playlists().await)
+    if let Some(donnees) = contenu_utilisateur_frais(&service, "playlists") {
+        return Json(donnees).into_response();
+    }
+    with_svc!(&state, &service, |svc| svc
+        .get_user_playlists()
+        .await
+        .inspect(|p| memoriser_contenu_utilisateur(
+            &service,
+            "playlists",
+            json!(p)
+        )))
 }
 
 async fn service_playlist(
@@ -432,10 +561,12 @@ async fn service_create_playlist(
     Path(service): Path<String>,
     Json(body): Json<CreatePlaylistBody>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let reponse = with_svc!(&state, &service, |svc| svc
         .create_playlist(&body.name, body.description.as_deref())
         .await
-        .map(|id| json!({ "id": id })))
+        .map(|id| json!({ "id": id })));
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 #[derive(Deserialize)]
@@ -448,20 +579,24 @@ async fn service_add_tracks(
     Path((service, playlist_id)): Path<(String, String)>,
     Json(body): Json<AddTracksBody>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let reponse = with_svc!(&state, &service, |svc| svc
         .add_tracks_to_playlist(&playlist_id, &body.track_ids)
         .await
-        .map(|n| json!({ "added": n })))
+        .map(|n| json!({ "added": n })));
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 async fn service_delete_playlist(
     State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let reponse = with_svc!(&state, &service, |svc| svc
         .delete_playlist(&playlist_id)
         .await
-        .map(|_| json!({ "ok": true })))
+        .map(|_| json!({ "ok": true })));
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 async fn service_remove_tracks(
@@ -469,10 +604,12 @@ async fn service_remove_tracks(
     Path((service, playlist_id)): Path<(String, String)>,
     Json(body): Json<AddTracksBody>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
+    let reponse = with_svc!(&state, &service, |svc| svc
         .remove_tracks_from_playlist(&playlist_id, &body.track_ids)
         .await
-        .map(|n| json!({ "removed": n })))
+        .map(|n| json!({ "removed": n })));
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 async fn service_track(
@@ -603,18 +740,25 @@ async fn service_add_favorite(
     State(state): State<StreamingHttpState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
-    with_svc_mut!(&state, &service, |svc| svc
+    let reponse = with_svc_mut!(&state, &service, |svc| svc
         .add_favorite(&fav_type, &item_id)
-        .await)
+        .await);
+    // Toute écriture de favori passe par ici — y compris une souscription de
+    // playlist, quel que soit l'endpoint amont que le connecteur choisit : la
+    // purge n'a pas à connaître ce détail.
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 async fn service_remove_favorite(
     State(state): State<StreamingHttpState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
-    with_svc_mut!(&state, &service, |svc| svc
+    let reponse = with_svc_mut!(&state, &service, |svc| svc
         .remove_favorite(&fav_type, &item_id)
-        .await)
+        .await);
+    purge_contenu_utilisateur(&service);
+    reponse
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +832,7 @@ async fn service_status(
         status = poll_status;
         drop(svc);
         state.save_tokens().await;
+        purge_contenu_utilisateur(&service);
     }
     Json(json!({
         "service": service,
@@ -722,6 +867,8 @@ async fn service_auth(
         Ok(status) => {
             drop(svc);
             state.save_tokens().await;
+            // Nouveau compte possible : les listes de l'ancien ne valent plus.
+            purge_contenu_utilisateur(&service);
             if status.authenticated {
                 state.event_bus.emit(
                     "streaming.auth.success",
@@ -779,6 +926,7 @@ async fn auth_poll_status(
             if authenticated {
                 drop(svc);
                 state.save_tokens().await;
+                purge_contenu_utilisateur(&service);
             }
             Json(json!({
                 "service": service,
@@ -813,6 +961,8 @@ async fn service_logout(
     svc.logout().await.ok();
     drop(svc);
     state.save_tokens().await;
+    // Le compte change : ses listes ne doivent pas survivre à la session.
+    purge_contenu_utilisateur(&service);
     Json(json!({ "service": service, "status": "logged_out" })).into_response()
 }
 
@@ -855,26 +1005,13 @@ async fn service_track_url(
     }
 }
 
-async fn service_favorites(
-    State(state): State<StreamingHttpState>,
-    Path((service, fav_type)): Path<(String, String)>,
-) -> Response {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
-        // items) has no streaming favorites. Return an empty list (200) rather
-        // than a plain-text 404 so the web client's `.json()` doesn't blow up
-        // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
-        // GET /streaming/upnp/favorites/tracks 404).
-        Err(_) => {
-            let cle = TypeFavori::parse(&fav_type)
-                .map(TypeFavori::cle)
-                .unwrap_or("tracks");
-            return Json(json!({ cle: [] })).into_response();
-        }
-    };
-    let mut svc = svc.write().await;
-    let result = match TypeFavori::parse(&fav_type) {
+/// Le dispatch de lecture des favoris, partagé entre l'aller et la reprise
+/// après rafraîchissement du jeton — deux copies divergeaient déjà (#2370).
+async fn lire_favoris(
+    svc: &dyn StreamingService,
+    fav_type: &str,
+) -> Result<Value, tune_core::TuneError> {
+    match TypeFavori::parse(fav_type) {
         Some(TypeFavori::Tracks) => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
         Some(TypeFavori::Albums) => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
         Some(TypeFavori::Artists) => svc
@@ -890,9 +1027,72 @@ async fn service_favorites(
             .await
             .map(|p| json!({ "playlists": p })),
         None => Err(format!("unknown favorite type: {fav_type}").into()),
+    }
+}
+
+/// `sort` / `order` sur la liste des favoris d'un service (#2001).
+///
+/// Facultatifs : absents, la réponse est celle d'avant, dans l'ordre du
+/// service.
+#[derive(Deserialize)]
+struct TriQuery {
+    sort: Option<String>,
+    order: Option<String>,
+}
+
+/// Pose le tri demandé sur une réponse de favoris, **après** le cache.
+///
+/// Le cache de contenu utilisateur (#1621, PR #2818) mémorise la réponse brute
+/// du service sous la clé `(service, "favorites/{type}")`. Trier ici, sur la
+/// copie qui part au client, laisse cette clé intacte : quatre tris successifs
+/// se servent de la même entrée au lieu d'en fabriquer quatre, et aucune des
+/// douze purges n'a de raison de changer.
+fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
+    if let Some(tri) = TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        tune_core::favorites_sort::trier_liste_json(&mut donnees, tri);
+    }
+    donnees
+}
+
+async fn service_favorites(
+    State(state): State<StreamingHttpState>,
+    Path((service, fav_type)): Path<(String, String)>,
+    Query(tri): Query<TriQuery>,
+) -> Response {
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
+        // items) has no streaming favorites. Return an empty list (200) rather
+        // than a plain-text 404 so the web client's `.json()` doesn't blow up
+        // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
+        // GET /streaming/upnp/favorites/tracks 404).
+        Err(_) => {
+            let cle = TypeFavori::parse(&fav_type)
+                .map(TypeFavori::cle)
+                .unwrap_or("tracks");
+            return Json(json!({ cle: [] })).into_response();
+        }
+    };
+    let ressource = format!("favorites/{fav_type}");
+    if let Some(donnees) = contenu_utilisateur_frais(&service, &ressource) {
+        return Json(poser_le_tri(donnees, &tri)).into_response();
+    }
+    // Verrou de LECTURE pour l'aller : le client web demande les trois types
+    // de favoris en parallèle (`Promise.all`), et le verrou d'écriture que ce
+    // gestionnaire prenait les sérialisait — temps total = somme des trois,
+    // pas le max (#1621). Le dispatch n'appelle que des méthodes `&self` ;
+    // seul le rafraîchissement de jeton, plus bas, exige l'écriture.
+    let result = {
+        let svc = arc.read().await;
+        lire_favoris(&**svc, &fav_type).await
     };
     match result {
-        Ok(data) => Json(data).into_response(),
+        Ok(data) => {
+            // Le cache reçoit la réponse BRUTE ; le tri ne porte que sur la
+            // copie rendue au client.
+            memoriser_contenu_utilisateur(&service, &ressource, data.clone());
+            Json(poser_le_tri(data, &tri)).into_response()
+        }
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -900,33 +1100,22 @@ async fn service_favorites(
             } =>
         {
             // Token expired — attempt refresh and retry
-            if svc.refresh_if_needed().await.unwrap_or(false) {
-                drop(svc);
+            let rafraichi = {
+                let mut svc = arc.write().await;
+                svc.refresh_if_needed().await.unwrap_or(false)
+            };
+            if rafraichi {
                 state.save_tokens().await;
-                let svc = match get_svc(&state, &service).await {
+                let arc = match get_svc(&state, &service).await {
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
-                let svc = svc.read().await;
-                let retry = match TypeFavori::parse(&fav_type) {
-                    Some(TypeFavori::Tracks) => {
-                        svc.get_user_tracks().await.map(|t| json!({ "tracks": t }))
+                let svc = arc.read().await;
+                match lire_favoris(&**svc, &fav_type).await {
+                    Ok(data) => {
+                        memoriser_contenu_utilisateur(&service, &ressource, data.clone());
+                        Json(poser_le_tri(data, &tri)).into_response()
                     }
-                    Some(TypeFavori::Albums) => {
-                        svc.get_user_albums().await.map(|a| json!({ "albums": a }))
-                    }
-                    Some(TypeFavori::Artists) => svc
-                        .get_user_artists()
-                        .await
-                        .map(|a| json!({ "artists": a })),
-                    Some(TypeFavori::Playlists) => svc
-                        .get_user_playlists()
-                        .await
-                        .map(|p| json!({ "playlists": p })),
-                    None => Err("unknown favorite type".into()),
-                };
-                match retry {
-                    Ok(data) => Json(data).into_response(),
                     Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
@@ -1037,6 +1226,7 @@ async fn spotify_callback(
         Ok(status) => {
             drop(svc);
             state.save_tokens().await;
+            purge_contenu_utilisateur("spotify");
             Json(json!({
                 "authenticated": status.authenticated,
                 "username": status.username,
@@ -1092,6 +1282,7 @@ async fn tidal_callback(
             let username = status.username.clone().unwrap_or_default();
             drop(svc);
             state.save_tokens().await;
+            purge_contenu_utilisateur("tidal");
             if status.authenticated {
                 state.event_bus.emit(
                     "streaming.auth.success",
@@ -1314,5 +1505,551 @@ mod tests_cache_editorial {
     fn le_cache_editorial_est_prive() {
         assert!(CACHE_EDITORIAL.starts_with("private"));
         assert!(!CACHE_EDITORIAL.contains("public"));
+    }
+}
+
+/// #1621 — lenteur des playlists et favoris Qobuz pour les grosses
+/// bibliothèques. Deux mécanismes serveur restaient à livrer après la
+/// pagination concurrente (#1623) et le RwLock du registre (#2124) :
+///
+/// * le cache TTL des listes UTILISATEUR, purgé sur mutation (lot 5) ;
+/// * l'aller des favoris sous verrou de LECTURE — le verrou d'écriture
+///   sérialisait les trois requêtes parallèles du client (résidu du lot 6).
+///
+/// Service simulé en mémoire : AUCUN appel réseau. Le cache étant un
+/// `static` partagé par tout le processus de test, chaque essai emploie un
+/// nom de service qui n'appartient qu'à lui.
+#[cfg(test)]
+mod tests_cache_utilisateur {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchPage, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    fn piste(id: &str, titre: &str, artiste: &str) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: artiste.to_string(),
+            album: None,
+            album_id: None,
+            duration_ms: 0,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    /// Ce que la route a passé à `search_page` : (requête, limite, décalage).
+    /// #2160 — sert de témoin au module `tests_route_recherche`.
+    pub(super) type RecherchesVues = Arc<std::sync::Mutex<Vec<(String, usize, usize)>>>;
+
+    /// Un connecteur qui compte ses lectures amont et sait les ralentir.
+    pub(super) struct ServiceCompteur {
+        pub(super) nom: String,
+        pub(super) lectures: Arc<AtomicUsize>,
+        pub(super) delai: Duration,
+        pub(super) recherches: RecherchesVues,
+    }
+
+    impl ServiceCompteur {
+        fn lit(&self) {
+            self.lectures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceCompteur {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err("hors sujet".into())
+        }
+        /// Note ce que la route a réellement transmis, puis rend une page vide.
+        async fn search_page(
+            &self,
+            query: &str,
+            limit: usize,
+            offset: usize,
+        ) -> Result<SearchPage, TuneError> {
+            self.recherches.lock().expect("verrou d'essai").push((
+                query.to_string(),
+                limit,
+                offset,
+            ));
+            Ok(SearchPage::page_unique(SearchResults {
+                tracks: vec![],
+                albums: vec![],
+                artists: vec![],
+                playlists: vec![],
+            }))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            self.lit();
+            tokio::time::sleep(self.delai).await;
+            Ok(vec![])
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            self.lit();
+            tokio::time::sleep(self.delai).await;
+            Ok(vec![])
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            self.lit();
+            tokio::time::sleep(self.delai).await;
+            Ok(vec![])
+        }
+        /// Trois pistes dans un ordre qu'aucun tri ne rend par hasard : le
+        /// service les donne « 10, 2, Zorro », l'ordre d'ajout que #2001
+        /// reproche.
+        async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+            self.lit();
+            tokio::time::sleep(self.delai).await;
+            Ok(vec![
+                piste("t1", "Volume 10", "Éric Zimmer"),
+                piste("t2", "volume 2", "aaron Zed"),
+                piste("t3", "Zorro", "Erik Satie"),
+            ])
+        }
+        async fn add_favorite(&mut self, _f: &str, _i: &str) -> Result<(), TuneError> {
+            Ok(())
+        }
+    }
+
+    fn etat_essai(nom: &str, lectures: Arc<AtomicUsize>, delai: Duration) -> StreamingHttpState {
+        etat_essai_complet(nom, lectures, delai, RecherchesVues::default())
+    }
+
+    pub(super) fn etat_essai_complet(
+        nom: &str,
+        lectures: Arc<AtomicUsize>,
+        delai: Duration,
+        recherches: RecherchesVues,
+    ) -> StreamingHttpState {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceCompteur {
+            nom: nom.to_string(),
+            lectures,
+            delai,
+            recherches,
+        }));
+        StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        )
+    }
+
+    /// Aucun tri demandé — le cas de tous les appels d'avant #2001.
+    fn sans_tri() -> Query<TriQuery> {
+        Query(TriQuery {
+            sort: None,
+            order: None,
+        })
+    }
+
+    /// Lot 5 : dans le TTL, la deuxième lecture ne repart PAS vers le service.
+    /// C'était le « rechargement intégral » de l'issue : chaque retour dans la
+    /// vue repaginait toute la bibliothèque de favoris.
+    #[tokio::test]
+    async fn dans_le_ttl_la_relecture_ne_retourne_pas_au_service() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai("essai-ttl-relecture", lectures.clone(), Duration::ZERO);
+
+        for _ in 0..2 {
+            let r = service_playlists(
+                State(etat.clone()),
+                Path(String::from("essai-ttl-relecture")),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            lectures.load(Ordering::SeqCst),
+            1,
+            "la deuxieme lecture dans le TTL doit etre servie du cache"
+        );
+
+        let r = service_favorites(
+            State(etat.clone()),
+            Path((String::from("essai-ttl-relecture"), String::from("tracks"))),
+            sans_tri(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = service_favorites(
+            State(etat),
+            Path((String::from("essai-ttl-relecture"), String::from("tracks"))),
+            sans_tri(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            lectures.load(Ordering::SeqCst),
+            2,
+            "les favoris aussi doivent etre servis du cache dans le TTL"
+        );
+    }
+
+    /// Lot 5, invalidation : un favori ajouté purge le cache du service — la
+    /// lecture suivante repart au service, elle ne ressort pas la liste d'avant
+    /// la mutation. La purge passe par la ROUTE d'écriture, donc une
+    /// souscription de playlist (#2370/#2765) la déclenchera aussi, quel que
+    /// soit l'endpoint amont choisi par le connecteur.
+    #[tokio::test]
+    async fn une_mutation_de_favori_purge_le_cache_du_service() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai("essai-purge-mutation", lectures.clone(), Duration::ZERO);
+
+        let r = service_playlists(
+            State(etat.clone()),
+            Path(String::from("essai-purge-mutation")),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let r = service_add_favorite(
+            State(etat.clone()),
+            Path((
+                String::from("essai-purge-mutation"),
+                String::from("tracks"),
+                String::from("42"),
+            )),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let r = service_playlists(State(etat), Path(String::from("essai-purge-mutation"))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            lectures.load(Ordering::SeqCst),
+            2,
+            "apres une mutation, la lecture doit repartir au service"
+        );
+    }
+
+    /// La purge est PAR SERVICE : muter Qobuz ne jette pas le cache de Tidal.
+    #[test]
+    fn la_purge_ne_touche_que_le_service_mute() {
+        memoriser_contenu_utilisateur("essai-purge-a", "playlists", json!([1]));
+        memoriser_contenu_utilisateur("essai-purge-b", "playlists", json!([2]));
+        purge_contenu_utilisateur("essai-purge-a");
+        assert!(contenu_utilisateur_frais("essai-purge-a", "playlists").is_none());
+        assert_eq!(
+            contenu_utilisateur_frais("essai-purge-b", "playlists"),
+            Some(json!([2]))
+        );
+    }
+
+    /// Une entrée plus vieille que le TTL n'est jamais servie.
+    #[test]
+    fn une_entree_perimee_n_est_pas_servie() {
+        let Some(passe) =
+            Instant::now().checked_sub(TTL_CONTENU_UTILISATEUR + Duration::from_secs(1))
+        else {
+            // Horloge trop jeune pour reculer d'autant : rien à prouver ici.
+            return;
+        };
+        cache_contenu_utilisateur()
+            .lock()
+            .expect("verrou d'essai")
+            .insert(
+                (String::from("essai-ttl-perime"), String::from("playlists")),
+                EntreeUtilisateur {
+                    cree: passe,
+                    donnees: json!([1]),
+                },
+            );
+        assert!(
+            contenu_utilisateur_frais("essai-ttl-perime", "playlists").is_none(),
+            "une entree perimee doit etre ignoree"
+        );
+    }
+
+    /// Résidu du lot 6 : les trois types de favoris demandés EN PARALLÈLE par
+    /// le client doivent se charger en parallèle. L'ancien verrou d'écriture
+    /// les sérialisait : temps total = somme des trois lectures amont.
+    ///
+    /// Trois lectures de 200 ms : en parallèle ≈ 200 ms, sérialisées = 600 ms.
+    /// Le seuil de 450 ms distingue nettement les deux régimes tout en tolérant
+    /// un ordonnanceur chargé.
+    #[tokio::test]
+    async fn les_trois_types_de_favoris_se_chargent_en_parallele() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai(
+            "essai-parallele",
+            lectures.clone(),
+            Duration::from_millis(200),
+        );
+
+        let depart = Instant::now();
+        let (a, b, c) = tokio::join!(
+            service_favorites(
+                State(etat.clone()),
+                Path((String::from("essai-parallele"), String::from("tracks"))),
+                sans_tri(),
+            ),
+            service_favorites(
+                State(etat.clone()),
+                Path((String::from("essai-parallele"), String::from("albums"))),
+                sans_tri(),
+            ),
+            service_favorites(
+                State(etat),
+                Path((String::from("essai-parallele"), String::from("artists"))),
+                sans_tri(),
+            ),
+        );
+        let duree = depart.elapsed();
+
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        assert_eq!(c.status(), StatusCode::OK);
+        assert_eq!(lectures.load(Ordering::SeqCst), 3);
+        assert!(
+            duree < Duration::from_millis(450),
+            "trois lectures de 200 ms sous verrou de lecture doivent se \
+             recouvrir (~200 ms), pas se suivre (600 ms). Mesure : {duree:?}"
+        );
+    }
+
+    /// Les identifiants des favoris rendus par la route, dans l'ordre.
+    async fn identifiants(
+        etat: &StreamingHttpState,
+        service: &str,
+        sort: Option<&str>,
+        order: Option<&str>,
+    ) -> Vec<String> {
+        let r = service_favorites(
+            State(etat.clone()),
+            Path((service.to_string(), String::from("tracks"))),
+            Query(TriQuery {
+                sort: sort.map(str::to_string),
+                order: order.map(str::to_string),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&octets).unwrap();
+        v["tracks"]
+            .as_array()
+            .expect("la reponse porte une liste `tracks`")
+            .iter()
+            .map(|t| t["source_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #2001 : le tri se pose APRÈS le cache de #1621/#2818.
+    ///
+    /// Deux choses à la fois, et c'est voulu : quatre tris différents ne font
+    /// qu'une seule lecture amont — la clé `(service, ressource)` ne porte pas
+    /// le tri — et la lecture SANS tri, faite en dernier, ressort l'ordre du
+    /// service : le cache a bien mémorisé la réponse brute, pas une réponse
+    /// déjà rangée.
+    #[tokio::test]
+    async fn le_tri_des_favoris_se_pose_apres_le_cache_sans_le_multiplier() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai("essai-tri-favoris", lectures.clone(), Duration::ZERO);
+        let svc = "essai-tri-favoris";
+
+        // « volume 2 » avant « Volume 10 » : tri naturel, casse ignoree.
+        assert_eq!(
+            identifiants(&etat, svc, Some("title"), Some("asc")).await,
+            ["t2", "t1", "t3"]
+        );
+        assert_eq!(
+            identifiants(&etat, svc, Some("title"), Some("desc")).await,
+            ["t3", "t1", "t2"]
+        );
+        // « Éric Zimmer » se range entre « aaron Zed » et « Erik Satie ».
+        assert_eq!(
+            identifiants(&etat, svc, Some("artist"), Some("asc")).await,
+            ["t2", "t1", "t3"]
+        );
+        // Une cle inconnue ne trie pas et ne casse rien.
+        assert_eq!(
+            identifiants(&etat, svc, Some("bpm"), Some("asc")).await,
+            ["t1", "t2", "t3"]
+        );
+        // Sans parametre : l'ordre du service, intact dans le cache.
+        assert_eq!(
+            identifiants(&etat, svc, None, None).await,
+            ["t1", "t2", "t3"]
+        );
+
+        assert_eq!(
+            lectures.load(Ordering::SeqCst),
+            1,
+            "cinq lectures, un seul aller au service : la cle du cache ne doit \
+             pas porter le tri"
+        );
+    }
+
+    /// Le logout purge : les listes d'un compte ne survivent pas à sa session.
+    #[tokio::test]
+    async fn le_logout_purge_le_cache_du_service() {
+        let lectures = Arc::new(AtomicUsize::new(0));
+        let etat = etat_essai("essai-purge-logout", lectures.clone(), Duration::ZERO);
+
+        let r = service_playlists(
+            State(etat.clone()),
+            Path(String::from("essai-purge-logout")),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(contenu_utilisateur_frais("essai-purge-logout", "playlists").is_some());
+
+        let r = service_logout(State(etat), Path(String::from("essai-purge-logout"))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(
+            contenu_utilisateur_frais("essai-purge-logout", "playlists").is_none(),
+            "apres logout, aucune liste de l'ancien compte ne doit rester servable"
+        );
+    }
+}
+
+/// #2160 — le curseur et la taille de page de la recherche traversent la route.
+///
+/// La #2754 a livré la pagination interne du connecteur Qobuz ; ce module
+/// vérifie l'autre moitié serveur : que `?limit=` et `?offset=` arrivent bien
+/// jusqu'au service, et que leur absence rend exactement ce que rendaient les
+/// clients d'avant.
+#[cfg(test)]
+mod tests_route_recherche {
+    use super::tests_cache_utilisateur::{RecherchesVues, etat_essai_complet};
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn requete(q: &str, limit: Option<usize>, offset: Option<usize>) -> Query<SearchQuery> {
+        Query(SearchQuery {
+            q: q.to_string(),
+            limit,
+            offset,
+        })
+    }
+
+    async fn appelle(
+        nom: &str,
+        requete: Query<SearchQuery>,
+    ) -> (StatusCode, Vec<(String, usize, usize)>) {
+        let vues = RecherchesVues::default();
+        let etat = etat_essai_complet(
+            nom,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+            vues.clone(),
+        );
+        let r = service_search(State(etat), Path(nom.to_string()), requete).await;
+        let statut = r.status();
+        let notees = vues.lock().expect("verrou d'essai").clone();
+        (statut, notees)
+    }
+
+    #[tokio::test]
+    async fn le_decalage_de_la_requete_arrive_au_service() {
+        let (statut, vues) = appelle(
+            "essai-recherche-offset",
+            requete("somebody", Some(200), Some(400)),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(
+            vues,
+            vec![(String::from("somebody"), 200, 400)],
+            "`?limit=` et `?offset=` doivent parvenir intacts au connecteur"
+        );
+    }
+
+    /// Non-régression : la requête que tous les clients installés envoient.
+    #[tokio::test]
+    async fn sans_parametres_la_route_garde_ses_valeurs_d_avant() {
+        let (statut, vues) =
+            appelle("essai-recherche-defaut", requete("somebody", None, None)).await;
+
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(
+            vues,
+            vec![(String::from("somebody"), 20, 0)],
+            "défaut inchangé : 20 par catégorie, première page"
+        );
+    }
+
+    /// « Tous » reste `limit=0` — la convention des facettes Oxygen, déjà
+    /// bornée par le connecteur.
+    #[tokio::test]
+    async fn tous_passe_par_limit_zero() {
+        let (_, vues) = appelle("essai-recherche-tous", requete("jazz", Some(0), None)).await;
+        assert_eq!(vues, vec![(String::from("jazz"), 0, 0)]);
+    }
+
+    /// La recherche n'entre PAS dans le cache des listes utilisateur (#2818) :
+    /// sa clé devrait porter la requête, la limite et le décalage, soit une
+    /// entrée par frappe et par page.
+    #[tokio::test]
+    async fn la_recherche_ne_peuple_pas_le_cache_des_listes_utilisateur() {
+        let nom = "essai-recherche-sans-cache";
+        let (_, _) = appelle(nom, requete("somebody", Some(50), None)).await;
+        for ressource in ["playlists", "albums", "tracks", "artists", "search"] {
+            assert!(
+                contenu_utilisateur_frais(nom, ressource).is_none(),
+                "la recherche ne doit rien mémoriser sous `{ressource}`"
+            );
+        }
     }
 }

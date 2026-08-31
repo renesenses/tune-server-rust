@@ -294,6 +294,45 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
     Some(matrix)
 }
 
+/// Replier un flux stéréo entrelacé en mono, **sur ses deux voies** — sur
+/// place, sans allocation.
+///
+/// `M = (L + R) / 2`, puis `M` est réémis sur la voie gauche ET sur la voie
+/// droite. Le nombre de canaux, la fréquence et la profondeur ne changent
+/// pas : seul le contenu des échantillons change. C'est ce que demande #2362,
+/// et c'est ce qui le distingue du bras `(2, 1)` de [`build_downmix_matrix`] :
+/// celui-là produit UNE voie, et le serveur ne demande jamais une cible mono à
+/// un DAC qui annonce deux canaux. Une seule enceinte câblée sur le canal
+/// gauche n'entendrait donc jamais rien de ce qui est panné à droite.
+///
+/// ## Pourquoi `/2` et pas `L + R`
+///
+/// `|0,5·(L+R)| <= 0,5·(|L| + |R|) <= 1,0` pour du PCM normalisé : la somme
+/// atténuée ne peut PAS écrêter, même sur deux voies corrélées à pleine
+/// échelle. Une somme brute atteindrait `+6 dBFS` sur du contenu mono — le
+/// piège nommé au point 5 de la section « Ce qui n'est PAS établi » de #2362.
+/// C'est le même coefficient que le bras `(2, 1)`, pour la même raison.
+///
+/// ## Pourquoi la somme passe par `f64`
+///
+/// `0,5` est une puissance de deux, donc la multiplication est exacte ; la
+/// seule erreur possible vient de l'addition. En accumulant en `f64` puis en
+/// arrondissant une seule fois vers `f32`, le résultat est l'arrondi correct
+/// de `(L+R)/2`. Le surcoût est de deux conversions par trame — négligeable
+/// devant le reste de la chaîne, et le chemin temps réel n'alloue rien.
+///
+/// Une longueur impaire (trame incomplète en fin de tampon) laisse le dernier
+/// échantillon intact : `chunks_exact_mut` l'ignore. C'est volontaire — la
+/// trame suivante arrivera complète au prochain tampon.
+#[inline]
+pub fn fold_stereo_to_mono_in_place(samples: &mut [f32]) {
+    for frame in samples.chunks_exact_mut(2) {
+        let mono = ((f64::from(frame[0]) + f64::from(frame[1])) * 0.5) as f32;
+        frame[0] = mono;
+        frame[1] = mono;
+    }
+}
+
 /// Adapt interleaved floating-point PCM to an exact channel count.
 ///
 /// Mono to stereo is the only implicit duplication. Wider upmixes retain the
@@ -419,6 +458,55 @@ pub fn adapt_channels_i32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2362 — la sommation est JUSTE sur des échantillons connus, et elle
+    /// arrive sur les DEUX voies.
+    ///
+    /// Mutation discriminante : garder la voie gauche (`frame[1] = frame[0]`
+    /// sans somme) rendrait ce test rouge sur la deuxième trame, où la voie
+    /// droite est la seule à porter du signal — exactement le cas de Nicolas
+    /// Tardif, dont l'unique enceinte est câblée à gauche.
+    #[test]
+    fn sommation_mono_juste_sur_les_deux_voies() {
+        //                     L     R  |  L     R  |   L     R
+        let mut pcm = vec![0.5, 0.3, 0.0, 0.8, -0.4, 0.4];
+        fold_stereo_to_mono_in_place(&mut pcm);
+        assert_eq!(pcm, vec![0.4, 0.4, 0.4, 0.4, 0.0, 0.0]);
+    }
+
+    /// Deux voies à pleine échelle, corrélées : le pire cas d'écrêtage. La
+    /// sortie reste EXACTEMENT à pleine échelle, jamais au-delà.
+    ///
+    /// Mutation discriminante : une somme brute `L + R` rendrait `±2,0`.
+    #[test]
+    fn pleine_echelle_correlee_ne_secrete_pas() {
+        let mut pcm = vec![1.0, 1.0, -1.0, -1.0, 1.0, -1.0];
+        fold_stereo_to_mono_in_place(&mut pcm);
+        assert_eq!(pcm, vec![1.0, 1.0, -1.0, -1.0, 0.0, 0.0]);
+        assert!(
+            pcm.iter().all(|s| s.abs() <= 1.0),
+            "aucun échantillon ne doit sortir de [-1, 1] : {pcm:?}"
+        );
+    }
+
+    /// Une trame incomplète en fin de tampon reste intacte plutôt que d'être
+    /// sommée avec un voisin qui n'existe pas.
+    #[test]
+    fn trame_incomplete_laissee_intacte() {
+        let mut pcm = vec![0.5, 0.3, 0.9];
+        fold_stereo_to_mono_in_place(&mut pcm);
+        assert_eq!(pcm, vec![0.4, 0.4, 0.9]);
+    }
+
+    /// Le repli ne change ni le nombre d'échantillons ni, par conséquent, le
+    /// nombre de canaux ou la cadence : seul leur CONTENU change. C'est ce qui
+    /// permet de garder le contrat du DAC (deux canaux) intact.
+    #[test]
+    fn le_repli_ne_change_pas_le_nombre_dechantillons() {
+        let mut pcm = vec![0.1f32; 1024];
+        fold_stereo_to_mono_in_place(&mut pcm);
+        assert_eq!(pcm.len(), 1024);
+    }
 
     #[test]
     fn channel_layout_counts() {

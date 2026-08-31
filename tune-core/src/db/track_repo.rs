@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{Placeholders, any_of, favorite_condition, untagged_condition};
+use super::facet_filter::{
+    Placeholders, any_of, favorite_condition, hidden_tracks_excluded, untagged_condition,
+};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -226,6 +228,15 @@ pub mod sql {
         "SELECT COUNT(*) FROM tracks"
     }
 
+    /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
+    /// la liste qu'il pagine (#1391). `count()` reste le compte COMPLET.
+    pub fn count_visible() -> String {
+        format!(
+            "SELECT COUNT(*) FROM tracks t WHERE {}",
+            crate::db::facet_filter::hidden_tracks_excluded()
+        )
+    }
+
     pub fn list_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} ORDER BY t.id LIMIT {} OFFSET {}",
@@ -243,11 +254,15 @@ pub mod sql {
         )
     }
 
+    /// Vue « pistes de l'artiste » : les pistes d'un album masqué en sortent
+    /// aussi (#1391) — contrairement à `list_by_album`, qui reste ENTIER pour
+    /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
 
@@ -380,15 +395,19 @@ pub mod sql {
     }
 
     /// Engine-agnostic search.
+    /// Le OU des critères est PARENTHÉSÉ pour recevoir le filtre « pas dans
+    /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
+    /// `tracks_fts` contiennent tout (#1391).
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {} LIMIT {}",
+            "{} WHERE ({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} LIMIT {}",
             select_track(),
             d.fts_where("tracks", "t", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
+            crate::db::facet_filter::hidden_tracks_excluded(),
             d.placeholder(6),
         )
     }
@@ -426,6 +445,21 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
     }
     out
 }
+
+/// Nombre d'ids inlinés par requête `WHERE t.id IN (…)`.
+///
+/// Les ids sont des `i64` issus de nos propres requêtes : les inliner ne
+/// consomme **aucun** paramètre lié, donc aucune requête ne peut atteindre la
+/// limite de paramètres d'un moteur — SQLite `SQLITE_MAX_VARIABLE_NUMBER`
+/// (999 avant 3.32, 32766 depuis) ni PostgreSQL (65535 paramètres par message
+/// Bind, le champ de comptage étant un entier 16 bits non signé).
+///
+/// Reste la limite de *longueur* d'instruction de SQLite (`SQLITE_MAX_SQL_LENGTH`,
+/// 1 Mo par défaut) : d'où le découpage. 5000 ids × 20 caractères ≈ 100 Ko au
+/// pire, soit un ordre de grandeur de marge. Même valeur que la matérialisation
+/// de page d'`AlbumRepo::list_filtered` (#1269), pour ne pas multiplier les
+/// constantes de découpage dans le dépôt.
+pub(crate) const ID_INLINE_BATCH: usize = 5_000;
 
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
@@ -659,6 +693,38 @@ impl TrackRepo {
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
+    /// ordre que [`Self::list`], moins les pistes d'albums masqués — le
+    /// miroir du prédicat que `list_filtered` pose toujours, sans quoi la vue
+    /// par défaut fuirait ce que la vue facettée cache (#1391). `list` reste
+    /// ENTIER pour la maintenance (export, résolutions internes).
+    pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
+        let sql = format!(
+            "{} WHERE {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
+            sql::select_track(),
+            hidden_tracks_excluded(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            },
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(2),
+                Engine::Postgres => PostgresDialect.placeholder(2),
+            }
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// Compteur de la vue pistes : exclut comme [`Self::list_visible`].
+    pub fn count_visible(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(&sql::count_visible(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 
     /// Filtered track listing with optional WHERE clauses.
@@ -914,6 +980,13 @@ impl TrackRepo {
             owned_params.push(SqlValue::Text(like.clone()));
             owned_params.push(SqlValue::Text(like));
         }
+
+        // Albums masqués (#1391) : leurs pistes sortent de la vue filtrée,
+        // TOUJOURS — ce prédicat n'est pas une facette (il n'entre pas dans
+        // `is_active`), c'est le socle de la vue. Le compteur juste en
+        // dessous partage `where_clause`, donc liste et total ne peuvent pas
+        // diverger.
+        conditions.push(hidden_tracks_excluded().to_string());
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1201,32 +1274,53 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Hydrate tracks for `ids`, **in the caller's order**, duplicates kept.
+    ///
+    /// Deux défauts corrigés (#2797) :
+    ///
+    /// 1. **Quadratique.** La réindexation faisait un
+    ///    `tracks.iter().find(...)` par id demandé : O(n²) comparaisons sur
+    ///    une grosse playlist. Elle passe par une `HashMap<i64, Track>`,
+    ///    donc une seule passe, O(n).
+    /// 2. **Limite de paramètres SQL.** Un placeholder par id faisait
+    ///    échouer la requête au-delà de la limite du moteur — SQLite
+    ///    `SQLITE_MAX_VARIABLE_NUMBER` (999 avant 3.32, 32766 depuis),
+    ///    PostgreSQL 65535 paramètres par message Bind — et les routes
+    ///    playlists rendaient alors une liste vide. Les ids sont des `i64`
+    ///    issus de nos propres requêtes : ils sont **inlinés** (zéro
+    ///    paramètre lié, même rationale que `list_by_ids`), ce qui met la
+    ///    requête hors d'atteinte des deux limites, et découpés en lots pour
+    ///    rester sous la limite de *longueur* d'instruction de SQLite (1 Mo
+    ///    par défaut) : `ID_INLINE_BATCH` ids × 20 caractères au pire.
+    ///
+    /// Contrat inchangé : ordre du tableau d'entrée, doublons reproduits,
+    /// ids absents simplement omis.
     pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let make_ph = |i: usize| match self.db.engine() {
-            Engine::Sqlite => SqliteDialect.placeholder(i),
-            Engine::Postgres => PostgresDialect.placeholder(i),
-        };
-        let placeholders: Vec<String> = (1..=ids.len()).map(make_ph).collect();
-        let sql = format!(
-            "{} WHERE t.id IN ({})",
-            sql::select_track(),
-            placeholders.join(",")
-        );
-        let owned: Vec<SqlValue> = ids.iter().map(|id| SqlValue::Int(*id)).collect();
-        let refs: Vec<&dyn ToSqlValue> = owned.iter().map(|v| v as &dyn ToSqlValue).collect();
-        let rows = self.db.query_many(&sql, &refs)?;
-        let tracks: Vec<Track> = rows.iter().map(row_to_track).collect();
-        // Preserve caller's ordering
-        let mut ordered = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
-                ordered.push(t.clone());
+        // 1er temps : hydrater chaque id DISTINCT une seule fois, par lots.
+        let mut wanted: Vec<i64> = ids.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut by_id: HashMap<i64, Track> = HashMap::with_capacity(wanted.len());
+        for chunk in wanted.chunks(ID_INLINE_BATCH) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
+            let rows = self.db.query_many(&sql, &[])?;
+            for row in &rows {
+                let track = row_to_track(row);
+                if let Some(id) = track.id {
+                    by_id.insert(id, track);
+                }
             }
         }
-        Ok(ordered)
+        // 2e temps : réordonner en mémoire — un accès haché par id, O(n).
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     // ─── Group B/C: write_tx + simple inline ──────────────────────
@@ -1664,6 +1758,76 @@ mod tests {
         db
     }
 
+    /// #1391 — les pistes d'un album masqué sortent de la vue pistes (les
+    /// deux chemins de `GET /library/tracks`), de la recherche et de la vue
+    /// artiste ; une piste SANS album reste visible ; `list_by_album` reste
+    /// ENTIER pour que l'album masqué demeure jouable.
+    #[test]
+    fn les_pistes_d_un_album_masque_sortent_des_vues() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Massive Attack".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("Mezzanine", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+
+        let mut cachee = Track::new("Teardrop".into());
+        cachee.album_id = Some(album_id);
+        cachee.artist_id = Some(artist_id);
+        cachee.file_path = Some("/music/Mezzanine/teardrop.flac".into());
+        let cachee_id = repo.create(&cachee).unwrap();
+
+        // Une piste sans album : le filtre ne doit PAS l'avaler (piège du
+        // `t.album_id` NULL).
+        let mut libre = Track::new("Sans album".into());
+        libre.artist_id = Some(artist_id);
+        libre.file_path = Some("/music/loose.flac".into());
+        let libre_id = repo.create(&libre).unwrap();
+
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(album_id)
+            .unwrap();
+
+        // Chemin non facetté.
+        let visibles = repo.list_visible(100, 0).unwrap();
+        assert_eq!(
+            visibles.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
+            vec![libre_id],
+            "seule la piste sans album reste visible"
+        );
+        assert_eq!(repo.count_visible().unwrap(), 1);
+        assert_eq!(repo.count().unwrap(), 2, "le compte COMPLET reste entier");
+
+        // Chemin facetté : même exclusion, et le total suit la liste.
+        let filtre = crate::db::facet_filter::TrackFilter {
+            artists: vec!["Massive Attack".into()],
+            ..Default::default()
+        };
+        let (pistes, total) = repo.list_filtered(&filtre, 100, 0).unwrap();
+        assert!(pistes.iter().all(|t| t.id != Some(cachee_id)));
+        assert_eq!(total, pistes.len() as i64);
+
+        // Recherche et vue artiste.
+        assert!(
+            repo.search("Teardrop", 10).unwrap().is_empty(),
+            "la recherche ne doit pas trahir la piste masquée"
+        );
+        assert!(
+            repo.list_by_artist(artist_id)
+                .unwrap()
+                .iter()
+                .all(|t| t.id != Some(cachee_id))
+        );
+
+        // Masqué n'est pas supprimé : l'album se joue toujours.
+        assert_eq!(repo.list_by_album(album_id).unwrap().len(), 1);
+    }
+
     /// Forum #1312. A track filed under a folder-named album must be able to
     /// carry its own artwork, and a track without one must still show its
     /// album's — the fallback is what keeps every normal album unchanged.
@@ -1990,6 +2154,157 @@ mod tests {
         assert_eq!(result[0].title, "Gamma");
         assert_eq!(result[1].title, "Alpha");
         assert_eq!(result[2].title, "Beta");
+    }
+
+    /// Sème `n` pistes d'ids 1..=n en quelques `execute_batch`, sans passer par
+    /// `create` (une transaction par piste serait le coût dominant du test).
+    fn seed_pistes(db: &SqliteDb, n: usize) {
+        let mut sql = String::with_capacity(1 << 22);
+        sql.push_str("BEGIN;\n");
+        for id in 1..=n {
+            sql.push_str(&format!(
+                "INSERT INTO tracks (id, title, file_path, duration_ms) \
+                 VALUES ({id}, 'piste {id}', '/musique/{id}.flac', {id});\n"
+            ));
+            if sql.len() > (1 << 22) {
+                sql.push_str("COMMIT;\n");
+                db.execute_batch(&sql).unwrap();
+                sql.clear();
+                sql.push_str("BEGIN;\n");
+            }
+        }
+        sql.push_str("COMMIT;\n");
+        db.execute_batch(&sql).unwrap();
+    }
+
+    /// #2797, défaut n°2 — la limite de paramètres SQL.
+    ///
+    /// L'ancienne forme posait UN placeholder par id. Au-delà de la limite du
+    /// moteur (SQLite `SQLITE_MAX_VARIABLE_NUMBER` : 999 avant 3.32, 32766
+    /// depuis ; PostgreSQL : 65535), la requête est refusée et les routes
+    /// playlists rendaient une liste VIDE. 40 000 ids dépassent les deux
+    /// seuils SQLite, quelle que soit la version liée.
+    ///
+    /// Contre-épreuve : en réinjectant la forme à placeholders, ce test
+    /// échoue avec « too many SQL variables ».
+    #[test]
+    fn get_multiple_tient_au_dela_de_la_limite_de_parametres_2797() {
+        let db = test_db();
+        seed_pistes(&db, 6);
+        let repo = TrackRepo::new(db);
+
+        // 40 000 ids demandés, dont 6 seulement existent, disséminés.
+        let mut ids: Vec<i64> = (1_000_000..1_040_000).collect();
+        ids[0] = 4;
+        ids[9_999] = 1;
+        ids[19_999] = 6;
+        ids[29_999] = 3;
+        ids[39_998] = 5;
+        ids[39_999] = 2;
+        assert!(ids.len() > 32_766, "le test doit dépasser les deux seuils");
+
+        let result = repo.get_multiple(&ids).expect("aucune erreur de moteur");
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 4", "piste 1", "piste 6", "piste 3", "piste 5", "piste 2"
+            ],
+            "résultat complet, dans l'ordre demandé, ids absents omis"
+        );
+    }
+
+    /// #2797 — le contrat de sortie : ordre d'entrée, doublons reproduits,
+    /// ids absents omis. La réindexation par `HashMap` ne doit rien changer
+    /// à ce qu'observaient les appelants (positions de playlist, rang
+    /// acoustique de `library/search`).
+    #[test]
+    fn get_multiple_reproduit_les_doublons_et_omet_les_absents_2797() {
+        let db = test_db();
+        seed_pistes(&db, 3);
+        let repo = TrackRepo::new(db);
+
+        let result = repo.get_multiple(&[3, 1, 999, 1, 2, 3, 1]).unwrap();
+        let titles: Vec<&str> = result.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "piste 3", "piste 1", "piste 1", "piste 2", "piste 3", "piste 1"
+            ]
+        );
+        assert!(repo.get_multiple(&[]).unwrap().is_empty());
+    }
+
+    /// #2797, défaut n°1 — la réindexation était quadratique
+    /// (`tracks.iter().find(...)` par id demandé).
+    ///
+    /// Contre-épreuve de complexité : on mesure le même appel à `n` puis à
+    /// `4n`. Un coût linéaire multiplie le temps par ~4 ; un coût quadratique
+    /// par ~16. Le seuil est à 8× — à mi-chemin en échelle log, donc ~2×
+    /// de marge de chaque côté pour ne pas devenir instable sur une machine
+    /// de CI chargée. Meilleure de 3 passes, pour la même raison.
+    #[test]
+    fn get_multiple_ne_coute_pas_de_maniere_quadratique_2797() {
+        use std::time::Instant;
+
+        const N: usize = 4_000;
+        let db = test_db();
+        seed_pistes(&db, 4 * N);
+        let repo = TrackRepo::new(db);
+
+        let petit: Vec<i64> = (1..=N as i64).collect();
+        let grand: Vec<i64> = (1..=(4 * N) as i64).collect();
+
+        let mesure = |ids: &[i64]| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(ids).unwrap();
+                let dt = t0.elapsed().as_secs_f64();
+                assert_eq!(out.len(), ids.len());
+                best = best.min(dt);
+            }
+            best
+        };
+
+        let t_petit = mesure(&petit);
+        let t_grand = mesure(&grand);
+        let ratio = t_grand / t_petit.max(1e-6);
+        assert!(
+            ratio < 8.0,
+            "coût quadratique : n={N} {:.1} ms, 4n={} {:.1} ms → ×{ratio:.1} (linéaire ≈ ×4)",
+            t_petit * 1e3,
+            4 * N,
+            t_grand * 1e3,
+        );
+    }
+
+    /// Mesure de référence pour #2797 : le coût par piste doit rester plat.
+    /// `--ignored`, hors CI (build release, plusieurs dizaines de milliers de
+    /// lignes semées) — c'est la table de preuve de la PR, pas un garde-fou.
+    #[test]
+    #[ignore]
+    fn bench_get_multiple_2797() {
+        use std::time::Instant;
+
+        let db = test_db();
+        seed_pistes(&db, 100_000);
+        let repo = TrackRepo::new(db);
+        for n in [1_000usize, 5_000, 20_000, 50_000, 100_000] {
+            let ids: Vec<i64> = (1..=n as i64).collect();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let out = repo.get_multiple(&ids).unwrap();
+                assert_eq!(out.len(), n);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "BENCH2797 n={n:>7} total={:>9.1} ms par_piste={:>7.3} µs",
+                best * 1e3,
+                best * 1e6 / n as f64
+            );
+        }
     }
 
     #[test]

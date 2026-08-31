@@ -47,6 +47,100 @@ fn ph(engine: Engine, idx: usize) -> String {
     }
 }
 
+/// Rapproche une ligne d'historique (`lh`) de son album (`a`).
+///
+/// Le titre SEUL ne designe pas un album : un « Live » de Police et un
+/// « Live » de Pulp portent le meme titre et se retrouvaient comptes pour un
+/// seul disque — un album jamais ecoute remontait dans « Continuer l'ecoute »,
+/// et le compteur d'avancement additionnait les pistes des deux (#2731,
+/// Tades, fil 1600).
+///
+/// L'identifiant fait foi quand il est ecrit. Il ne l'est PAS toujours :
+/// `record_listen` le tire de la piste locale, donc toute ecoute en flux
+/// (track_id absent) et toute ligne anterieure a la migration
+/// `add_listen_history_source_id_album_id` l'ont a NULL. Joindre sur le seul
+/// `album_id` viderait la section pour ces gens-la ; d'ou le repli sur
+/// titre ET artiste.
+///
+/// Le repli suit la regle de `find_album_by_identity`
+/// (`tune-core/src/db/favorites_reconcile.rs`), deja partagee par les favoris
+/// et par les albums masques (#1391 / PR #2817) — pas une seconde regle de
+/// rapprochement inventee ici, la meme, a une reserve pres (la casse, voir
+/// plus bas) :
+/// * artiste connu — NULL **et** chaine vide valent « inconnu », comme
+///   `artist.is_empty()` la-bas : titre + artiste, l'artiste absent de
+///   l'album valant chaine vide ;
+/// * artiste inconnu : titre seul, et UNIQUEMENT s'il ne designe qu'un
+///   album. Un titre partage par deux disques ne rattache plus rien —
+///   c'est le cas de Tades par l'autre porte, et la doctrine de
+///   `find_album_by_identity` (« AUCUN repli titre seul » quand ca peut
+///   designer l'homonyme d'un autre artiste).
+///
+/// RESERVE MESUREE — la casse reste significative ici, alors que
+/// `find_album_by_identity` compare en `LOWER`. Transposer le `LOWER` dans
+/// CETTE jointure coute la section : mesure sur 45 000 albums / 5 000 lignes
+/// d'historique (dont 20 % sans `album_id`), meme machine, meme jeu de
+/// donnees, `fetch_continue_listening` seul :
+///
+/// ```text
+///   titre compare tel quel   :    19 ms
+///   LOWER(...) des deux cotes : 83 662 ms
+/// ```
+///
+/// Quatre mille fois plus cher, sur le chemin de l'accueil. La cause est
+/// l'index : `idx_albums_title ON albums(title COLLATE NOCASE)` sert la
+/// comparaison directe, aucun index ne sert `LOWER(title)`. Le rendre
+/// gratuit demanderait un index d'expression AUX QUATRE endroits du schema
+/// (CORE_SCHEMA, migration SQLite, PG_FULL_SCHEMA, migration PG) — et
+/// PostgreSQL, lui, n'a pas d'equivalent de `COLLATE NOCASE` a portee de
+/// main. Hors du perimetre de #2731 : c'est un chantier de schema, pas la
+/// confusion de deux albums. Le test
+/// `la_casse_separe_encore_une_ecoute_de_son_album` fige la limite pour
+/// qu'on ne la redecouvre pas une troisieme fois.
+///
+/// Le sous-select sur `artists` evite de dependre de l'ordre des jointures —
+/// `ar` n'existe pas encore quand cette condition est evaluee, et le
+/// GROUP BY de PostgreSQL n'accepte pas qu'on enveloppe `albums` dans une
+/// table derivee (la dependance fonctionnelle ne vaut que pour la cle
+/// primaire d'une vraie table).
+///
+/// Cout : les deux sous-selects ne sont atteints QUE par les lignes a
+/// `album_id` NULL dont le titre d'album tombe deja juste ; le chemin
+/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus.
+const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
+     OR (lh.album_id IS NULL AND lh.album_title = a.title \
+         AND ((COALESCE(lh.artist_name, '') <> '' \
+               AND lh.artist_name \
+                   = (SELECT ar_hist.name FROM artists ar_hist \
+                      WHERE ar_hist.id = a.artist_id)) \
+              OR (COALESCE(lh.artist_name, '') = '' \
+                  AND NOT EXISTS (SELECT 1 FROM albums a_hom \
+                                  WHERE a_hom.title = a.title \
+                                    AND a_hom.id <> a.id)))))";
+
+/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
+/// celui de l'album. Partage entre les recommandations et les « top mixes »,
+/// qui prenaient tous deux le genre d'un album homonyme (#2731).
+///
+/// ATTENTION : telle quelle, cette requete ECHOUE sur les deux moteurs —
+/// `WHERE genre IS NOT NULL` est ambigu entre `t.genre` et `a.genre`, et
+/// l'erreur est avalee par le `unwrap_or_default` des appelants. La jointure
+/// est corrigee ici pour le jour ou la requete sera reveillee ; la reveiller
+/// releve d'un arbitrage produit (cf. le test
+/// `les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre`), pas du
+/// defaut d'homonymie.
+fn sql_top_genres() -> String {
+    format!(
+        "SELECT genre, COUNT(*) as cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) as genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
+               WHERE genre IS NOT NULL AND genre != '') \
+         GROUP BY genre ORDER BY cnt DESC LIMIT 5"
+    )
+}
+
 /// Aggregated home page: returns all sections in a single response.
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // No zone filter for the aggregated home page — show all zones.
@@ -151,7 +245,7 @@ fn fetch_continue_listening(
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
         FROM listen_history lh \
-        JOIN albums a ON lh.album_title = a.title \
+        JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
         WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
         {zone_filter}\
@@ -180,6 +274,243 @@ fn fetch_continue_listening(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests_homonymes {
+    use super::*;
+
+    /// Les deux disques de Tades : un « Live » de Police et un « Live » de
+    /// Pulp, meme titre au caractere pres, cinq pistes chacun.
+    /// Rend `(id du Live de Police, id du Live de Pulp)`.
+    fn deux_live(state: &AppState, genre: Option<&str>) -> (i64, i64) {
+        let b = &state.backend;
+        let poser = |artiste: &str| -> i64 {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            let artiste_id = b.last_insert_rowid();
+            b.execute(
+                "INSERT INTO albums (title, artist_id, track_count, genre) \
+                 VALUES ('Live', ?1, 5, ?2)",
+                &[&artiste_id as &dyn ToSqlValue, &genre as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let police = poser("The Police");
+        let pulp = poser("Pulp");
+        (police, pulp)
+    }
+
+    fn ecoute(state: &AppState, titre: &str, artiste: Option<&str>, album_id: Option<i64>) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES (?1, ?2, 'Live', ?3, '2026-08-28T22:45:00Z')",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Le defaut de Tades (#2731, fil 1600) : ecouter le « Live » de Pulp
+    /// faisait remonter celui de Police, et le compteur d'avancement
+    /// additionnait les pistes des deux.
+    #[test]
+    fn le_live_de_pulp_ne_fait_pas_remonter_celui_de_police() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        ecoute(&state, "Disco 2000", Some("Pulp"), Some(pulp));
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+        assert_eq!(
+            items[0]["listened_tracks"].as_i64(),
+            Some(2),
+            "le compteur ne doit compter que les pistes de CET album"
+        );
+        assert_ne!(items[0]["album_id"].as_i64(), Some(police));
+    }
+
+    /// `record_listen` ne connait l'album que par la piste locale : une ecoute
+    /// en flux (`track_id` absent) et toute ligne anterieure a la migration
+    /// `add_listen_history_source_id_album_id` ont `album_id` a NULL. Joindre
+    /// sur le seul identifiant VIDERAIT la section pour ces gens-la — le repli
+    /// titre + artiste doit tenir.
+    #[test]
+    fn une_ecoute_sans_album_id_reste_rattachee_par_titre_et_artiste() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+    }
+
+    /// Sans artiste NI identifiant, un titre qui ne designe QU'UN album reste
+    /// rattache : perdre l'entree serait pire que la garder. C'est la seconde
+    /// branche de `find_album_by_identity` — titre seul, mais non ambigu.
+    #[test]
+    fn une_ecoute_sans_artiste_ni_identifiant_n_est_pas_perdue() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            1,
+            "la section ne doit pas se vider : {items:?}"
+        );
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// Sans artiste NI identifiant, un titre PARTAGE par deux disques ne
+    /// designe rien. Le rattacher aux deux, c'est le defaut de Tades par
+    /// l'autre porte : le « Live » de Police remontait sans avoir ete joue.
+    /// `find_album_by_identity` refuse ce repli depuis #1391 (« ok » de daoud
+    /// vs « OK » de Talvin Singh) ; la section s'aligne.
+    #[test]
+    fn une_ecoute_sans_artiste_sur_un_titre_ambigu_ne_rattache_rien() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        deux_live(&state, None);
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "un titre partage par deux albums ne designe aucun des deux : {items:?}"
+        );
+    }
+
+    /// Une chaine vide n'est pas un artiste. Traitee comme une valeur, elle ne
+    /// s'egalait a rien : l'album disparaissait de la section au lieu de
+    /// retomber sur le titre seul. `find_album_by_identity` teste
+    /// `artist.is_empty()`, pas la nullite.
+    #[test]
+    fn un_artiste_vide_vaut_artiste_inconnu() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", Some(""), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// LIMITE FIGEE, pas un comportement souhaite. `record_listen` ecrit le
+    /// titre d'album tel que le fournisseur de flux le rend ; `albums` le
+    /// porte tel que le scanner l'a lu des etiquettes. Les favoris
+    /// rapprochent « Live » et « LIVE » depuis #1391 ; cette section, non —
+    /// elle compare octet a octet et perd l'ecoute.
+    ///
+    /// Ce n'est pas un oubli : le `LOWER` a ete ecrit, puis MESURE. Sur
+    /// 45 000 albums et 5 000 lignes d'historique, `fetch_continue_listening`
+    /// passe de **19 ms a 83 662 ms** — l'index
+    /// `idx_albums_title ON albums(title COLLATE NOCASE)` ne sert plus la
+    /// comparaison. Le rendre gratuit demande un index d'expression aux
+    /// quatre endroits du schema, et PostgreSQL n'a pas de `COLLATE NOCASE`.
+    /// C'est un chantier de schema, pas la confusion de deux albums (#2731).
+    ///
+    /// Si ce test se met a echouer, c'est que quelqu'un a rendu la casse
+    /// indifferente : verifier d'abord qu'il a paye l'index, sinon l'accueil
+    /// met une minute et demie a s'afficher.
+    #[test]
+    fn la_casse_separe_encore_une_ecoute_de_son_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, _pulp) = deux_live(&state, None);
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
+                 VALUES ('Common People', 'pulp', 'LIVE', '2026-08-28T22:45:00Z')",
+                &[],
+            )
+            .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "limite connue : « LIVE » ne rejoint pas « Live » — voir le cout \
+             mesure sur HISTORIQUE_VERS_ALBUM avant de changer ceci : {items:?}"
+        );
+    }
+
+    /// Constat de bordure, releve en voulant eprouver le meme defaut du cote
+    /// des recommandations : `sql_top_genres` ne rend RIEN, sur les deux
+    /// moteurs. `WHERE genre IS NOT NULL` se heurte a `t.genre` et `a.genre`
+    /// — « ambiguous column name: genre » — et l'erreur est avalee par le
+    /// `unwrap_or_default` de l'appelant. « A decouvrir » tire donc toujours
+    /// au hasard, et « top mixes » est toujours vide.
+    ///
+    /// Consequence pour #2731 : la jointure corrigee dans `sql_top_genres` et
+    /// le `NOT EXISTS` des recommandations sont ecrits juste, mais aucun test
+    /// ne peut les atteindre tant que cette requete ne s'execute pas. Reveiller
+    /// la requete change ce que l'accueil AFFICHE (le hasard cede la place aux
+    /// albums d'un genre, qui peuvent etre zero) : c'est un arbitrage produit,
+    /// pas le defaut de Tades. Il est laisse hors de ce correctif, et ce test
+    /// le fige pour qu'on ne le decouvre pas deux fois.
+    #[test]
+    fn les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, Some("Rock"));
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+
+        assert!(
+            state.backend.query_many(&sql_top_genres(), &[]).is_err(),
+            "si cette requete se met a repondre, les deux jointures corrigees \
+             deviennent testables — et « A decouvrir » cesse d'etre aleatoire"
+        );
+    }
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
@@ -257,16 +588,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     // Find top genres from listen history
     let top_genres: Vec<String> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
+        .query_many(&sql_top_genres(), &[])
         .unwrap_or_default()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
@@ -312,7 +634,8 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
          WHERE a.genre IN ({genre_placeholders}) \
-           AND a.title NOT IN (SELECT DISTINCT album_title FROM listen_history WHERE album_title IS NOT NULL) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE {HISTORIQUE_VERS_ALBUM}) \
          ORDER BY RANDOM() \
          LIMIT {limit_ph}"
     );
@@ -353,16 +676,7 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
+        .query_many(&sql_top_genres(), &[])
         .unwrap_or_default()
         .into_iter()
         .filter_map(|cols| {

@@ -77,6 +77,91 @@ const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
 /// Attente entre deux vérifications quand la machine est trop chaude (#1576).
 const THERMAL_RETRY_SECS: u64 = 120;
 
+/// Cadence à laquelle on regarde si une zone s'est mise à jouer PENDANT
+/// l'analyse d'un fichier (#2495).
+///
+/// 250 ms est court devant le temps de démarrage qu'on protège (Thierry
+/// Clemont : 6 782 ms pour résoudre une piste locale pendant le balayage,
+/// contre 149 ms pour une piste Qobuz dans le même journal) et long devant le
+/// coût de la vérification, un `SELECT ... LIMIT 1` sur `zones` — quatre
+/// requêtes par seconde et par fichier en cours, uniquement pendant qu'un
+/// fichier est effectivement en cours d'analyse.
+const VEILLE_LECTURE_MS: u64 = 250;
+
+/// Ce qu'il advient d'une analyse qui peut être abandonnée au profit de la
+/// lecture.
+///
+/// Le point n'est pas le type, c'est le contrat qu'il impose au site d'appel :
+/// il devient impossible d'écrire la suite sans dire ce qu'on fait du cas
+/// « cédée ». C'est précisément ce qui manquait — une piste abandonnée ne doit
+/// SURTOUT pas être estampillée `rg_analyzed`, sinon elle sort du balayage pour
+/// toujours et ne sera jamais mesurée.
+pub(crate) enum Issue<T> {
+    Terminee(T),
+    CedeeALaLecture,
+}
+
+/// Attendre qu'une zone se mette à jouer.
+///
+/// Vérifie AVANT de dormir : entre le garde-fou d'entrée de fichier et le
+/// premier octet décodé, il y a la résolution du chemin — trois `stat` qui,
+/// sur un montage réseau endormi, ne sont pas instantanés. La lecture peut
+/// démarrer dans cette fenêtre-là aussi.
+async fn veiller_lecture(backend: Arc<dyn DbBackend>) {
+    loop {
+        if let Some(zone) = playing_zone_name(&backend) {
+            debug!(zone = %zone, "replaygain_veille_lecture — zone passee a playing");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(VEILLE_LECTURE_MS)).await;
+    }
+}
+
+/// Courir l'analyse d'UN fichier contre l'arrivée de la lecture.
+///
+/// `biased` n'est pas cosmétique : quand les deux futurs sont prêts au même
+/// réveil, la lecture doit gagner. Sans lui, `select!` tirerait au sort, et le
+/// garde-fou serait probabiliste.
+///
+/// Ce qu'on gagne, et rien de plus : `spawn_blocking` ne se rétracte pas. Le
+/// segment de 30 s déjà parti dans le pool bloquant ira jusqu'à son terme dans
+/// le vide. Ce qu'on cesse de faire, c'est de l'ATTENDRE — et surtout
+/// d'enchaîner les segments suivants, puis le fichier suivant. La fenêtre
+/// passe donc d'un fichier entier (borné à
+/// [`PER_TRACK_ANALYSIS_TIMEOUT_SECS`], soit 180 s) à un segment. Le journal ne
+/// doit pas laisser croire à une interruption immédiate.
+pub(crate) async fn analyser_ou_ceder<T>(
+    travail: impl std::future::Future<Output = T>,
+    ceder: impl std::future::Future<Output = ()>,
+) -> Issue<T> {
+    tokio::select! {
+        biased;
+        () = ceder => Issue::CedeeALaLecture,
+        resultat = travail => Issue::Terminee(resultat),
+    }
+}
+
+/// Mesurer une piste sans jamais faire attendre la lecture (#2495).
+///
+/// Le site d'appel passait par un simple `tokio::time::timeout` : une fois
+/// `measure_loudness_and_peak` lancée, plus rien ne pouvait la rendre avant
+/// 180 s. Le garde-fou existait bien, mais il ne s'exerçait qu'ENTRE deux
+/// fichiers — inutile quand un seul fichier de 4,5 Go sur partage réseau tient
+/// le chemin d'E/S pendant des minutes.
+pub(crate) async fn mesurer_en_cedant_a_la_lecture<T>(
+    backend: &Arc<dyn DbBackend>,
+    travail: impl std::future::Future<Output = T>,
+) -> Issue<Result<T, tokio::time::error::Elapsed>> {
+    analyser_ou_ceder(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+            travail,
+        ),
+        veiller_lecture(backend.clone()),
+    )
+    .await
+}
+
 /// How long the sweep backs off after finding a zone actively playing. The
 /// track pass fully decodes files — often over a network (SMB/NAS) mount — and
 /// on a busy link that starves the same disk/network the player reads from,
@@ -298,6 +383,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                         analyze_track_batch(&backend).await
                     }
                 };
+                // La lecture peut avoir démarré PENDANT le lot, qui a alors
+                // cédé et rendu 0 sans avoir fini son travail (#2495). Relire
+                // l'état ici : sinon ce 0 se lirait « plus rien à analyser »,
+                // la boucle inscrirait au registre un « rien à faire » faux et
+                // dormirait 15 minutes au lieu des 30 s de report lecture.
+                let playing = playing || any_zone_playing(&backend);
                 let albums = analyze_album_batch(&backend);
 
                 if did > 0 || albums > 0 {
@@ -415,6 +506,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     let mut deferred = 0usize;
+    let mut cedees = 0usize;
     for r in &rows {
         // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à 180 s
         // chacun, c'est plus d'une heure de décodage après un « Désactivé » si
@@ -496,16 +588,51 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // `sur_disque`, PAS `path` : c'est la graphie que le système a
         // reconnue. Le chemin de la base reste ce qu'il est — on ne le
         // réécrit pas, on ne le normalise pas non plus (#1865).
-        let measured = tokio::time::timeout(
-            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+        //
+        // La course contre la lecture est ici, pas seulement au tour de boucle
+        // au-dessus (#2495) : le contrôle d'entrée ne sert à rien quand UN
+        // fichier monopolise le disque pendant des minutes.
+        let measured = match mesurer_en_cedant_a_la_lecture(
+            backend,
             crate::audio::analyzer::measure_loudness_and_peak(&sur_disque),
         )
-        .await;
+        .await
+        {
+            Issue::Terminee(m) => m,
+            Issue::CedeeALaLecture => {
+                cedees += 1;
+                // AUCUN `rg_analyzed` ici, et c'est tout l'enjeu : on n'a pas
+                // essayé, on a renoncé. Estampiller sortirait la piste du
+                // balayage pour toujours — le défaut #1865 exactement, mais
+                // déclenché par un simple appui sur « Lecture ».
+                info!(
+                    track_id,
+                    path = %path,
+                    "replaygain_cede_en_cours_d_analyse — lecture demarree, fichier \
+                     abandonne SANS temoin (il sera repris) ; le segment deja parti \
+                     finit dans le vide, il n'est pas annulable (#2495)"
+                );
+                break;
+            }
+        };
         match measured {
-            Ok(Some((lufs, peak))) => {
+            Ok(Some((lufs, peak, true_peak))) => {
                 let gain = track_gain_db(lufs);
                 let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
                 let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
+                // True peak inter-échantillons 4× (#1694). Clé à part :
+                // `rg_track_peak` garde sa sémantique sample-peak (compat
+                // tags, #1382) ; `prevent_clipping` PRÉFÈRE celle-ci quand
+                // elle existe. Peut dépasser 1.0 — c'est l'information.
+                let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
+                // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en
+                // base un gain MESURÉ ici d'un gain lu dans les tags du
+                // fichier : les deux s'écrivent sous `rg_track_gain`, et c'est
+                // voulu (interchangeables à la lecture). Mais le chemin du
+                // signal doit pouvoir dire d'où vient le gain qu'il applique,
+                // et « tags du fichier » affiché sur une mesure Tune serait un
+                // affichage inventé.
+                let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -554,10 +681,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     }
 
     // `deferred` est porté par la ligne de journal : sans lui, un lot où tout
-    // est introuvable ressemblerait à un lot analysé (#1865).
+    // est introuvable ressemblerait à un lot analysé (#1865). `cedees` dit la
+    // même chose pour l'abandon au profit de la lecture (#2495) : sans elle,
+    // un lot rendu à zéro serait indistinguable d'une bibliothèque finie.
     info!(
         analyzed = done - deferred,
-        deferred, "replaygain_track_batch"
+        deferred, cedees, "replaygain_track_batch"
     );
     done
 }
@@ -594,7 +723,8 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let rows = match backend.query_many(
         "SELECT t.id, t.duration_ms, \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_gain'), \
-                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak') \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak') \
          FROM tracks t WHERE t.album_id = ?",
         &[&album_id as &dyn ToSqlValue],
     ) {
@@ -608,6 +738,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let mut energy_sum = 0.0f64; // duration-weighted linear energy
     let mut dur_sum = 0.0f64;
     let mut peak_max = 0.0f64;
+    // True peak d'album (#1694) : max des true peaks de pistes — mais
+    // SEULEMENT si toutes les pistes en ont un. Un max partiel pourrait
+    // rater la piste la plus chaude, et `prevent_clipping` s'y fierait.
+    let mut true_peak_max = 0.0f64;
+    let mut true_peak_complete = true;
     let mut n = 0usize;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut track_ids: Vec<i64> = Vec::new();
@@ -633,6 +768,16 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         {
             peak_max = peak_max.max(p);
         }
+        match r
+            .get(4)
+            .and_then(|v| v.as_string())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(tp) => true_peak_max = true_peak_max.max(tp),
+            // Piste analysée avant #1694 : pas de true peak. L'album n'en
+            // reçoit pas non plus tant qu'elle n'est pas ré-analysée.
+            None => true_peak_complete = false,
+        }
     }
 
     if n == 0 || dur_sum <= 0.0 {
@@ -643,16 +788,27 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let gain_str = format_gain(album_gain);
     let peak_str = format_peak(peak_max);
 
+    let true_peak_str =
+        (true_peak_complete && true_peak_max > 0.0).then(|| format_peak(true_peak_max));
+
     for tid in &track_ids {
         let _ = repo.set(*tid, "rg_album_gain", &gain_str);
         let _ = repo.set(*tid, "rg_album_peak", &peak_str);
+        if let Some(tp) = &true_peak_str {
+            let _ = repo.set(*tid, "rg_album_true_peak", tp);
+        }
+        // Provenance (#1627) : ce gain d'album n'est dans AUCUN fichier. Il
+        // vient d'être calculé ici, à partir des gains de piste — que ceux-ci
+        // soient eux-mêmes des tags ou des mesures ne change rien : la valeur
+        // d'album, elle, est de Tune.
+        let _ = repo.set(*tid, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS);
     }
     info!(album_id, tracks = track_ids.len(), gain = %gain_str, "replaygain_album");
     1
 }
 
 /// Parse a ReplayGain gain string ("-6.50 dB", "+3.2", "-6.50dB") to dB.
-fn parse_gain_db(s: String) -> Option<f64> {
+pub(crate) fn parse_gain_db(s: String) -> Option<f64> {
     s.to_lowercase()
         .replace("db", "")
         .trim()
@@ -674,6 +830,104 @@ pub const MODE_KEY: &str = "replaygain_mode";
 pub const PREAMP_KEY: &str = "replaygain_preamp_db";
 /// Setting: pull the gain back when the tagged peak says it would clip.
 pub const PREVENT_CLIPPING_KEY: &str = "replaygain_prevent_clipping";
+/// Setting (#1694) : plafond dBTP de l'anti-écrêtage — `0` (défaut, plein
+/// niveau, comportement historique), `-0.5` ou `-1`. N'agit que si
+/// `prevent_clipping` est actif : le facteur est tiré pour que
+/// `peak × factor` ne dépasse pas `10^(plafond/20)`. Avec le true peak
+/// stocké, cela laisse la marge inter-échantillons aux DAC qui la demandent.
+pub const TRUE_PEAK_CEILING_KEY: &str = "replaygain_true_peak_ceiling_db";
+
+/// Témoin de provenance du gain de PISTE (#1627) : posé par la passe d'analyse
+/// à côté de `rg_track_gain`. Absent ⇒ la valeur vient des tags du fichier.
+pub const TRACK_SOURCE_KEY: &str = "rg_track_source";
+/// Idem pour le gain d'ALBUM, posé par `analyze_album_batch`.
+pub const ALBUM_SOURCE_KEY: &str = "rg_album_source";
+/// Seule valeur écrite dans ces deux témoins : la mesure vient de Tune.
+/// « Tags du fichier » ne s'écrit pas — c'est l'ABSENCE de témoin.
+pub const SOURCE_ANALYSIS: &str = "analysis";
+/// Sentinelle « on a essayé d'analyser cette piste » (voir `spawn`).
+const ANALYZED_KEY: &str = "rg_analyzed";
+
+/// D'où vient le gain qui s'applique réellement à une piste (#1627).
+///
+/// Les deux sources s'écrivent sous les MÊMES clés (`rg_track_gain`…) et sont
+/// volontairement interchangeables à la lecture. Cet enum ne change rien à ce
+/// qui est appliqué : il permet seulement de le DIRE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainSource {
+    /// Lu tel quel dans les tags du fichier au scan (rsgain, foobar, …).
+    /// Ceux-ci priment toujours : ils ne sont jamais recalculés (#1382).
+    FileTags,
+    /// Mesuré par la passe EBU R128 de Tune, ou calculé par elle
+    /// (gain d'album dérivé des gains de piste).
+    Analysis,
+}
+
+impl GainSource {
+    /// Valeur stable pour l'API et l'affichage — jamais traduite.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FileTags => "file_tags",
+            Self::Analysis => "analysis",
+        }
+    }
+
+    /// Libellé français court, tel qu'il apparaît dans le chemin du signal.
+    pub fn label_fr(self) -> &'static str {
+        match self {
+            Self::FileTags => "tags du fichier",
+            Self::Analysis => "analyse Tune",
+        }
+    }
+}
+
+/// Les TROIS modes de la demande initiale (#1627), vus comme UN seul choix.
+///
+/// Le serveur n'a jamais eu de réglage à trois valeurs, et n'en gagne pas un
+/// ici : c'est une LECTURE dérivée des deux axes existants
+/// (`replaygain_mode` × `replaygain_analysis_enabled`), sans migration et sans
+/// changement de sémantique. Un enum unique en base coûterait soit la
+/// distinction piste/album, soit cinq valeurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayGainSourceMode {
+    /// « 1- néant » : aucun gain appliqué, et depuis #2496 aucune analyse.
+    Off,
+    /// « 2- fichier » : on applique ce que les fichiers portent, rien d'autre.
+    FileTagsOnly,
+    /// « 3- calcul » : les tags priment, l'analyse ne COMBLE que les manques.
+    /// Jamais d'écrasement — c'est la réponse à #1382.
+    TagsThenAnalysis,
+}
+
+impl ReplayGainSourceMode {
+    /// Valeur stable pour l'API — jamais traduite, jamais persistée.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::FileTagsOnly => "file_tags",
+            Self::TagsThenAnalysis => "tags_then_analysis",
+        }
+    }
+}
+
+/// Lequel des trois modes est ACTIF, dérivé des deux réglages existants.
+///
+/// Rien n'est lu ni écrit d'autre que ce que lisaient déjà
+/// [`ReplayGainSettings::load`] et [`analysis_enabled`] : les deux axes restent
+/// la seule vérité, cette fonction ne fait que les nommer ensemble.
+pub fn active_source_mode(backend: &Arc<dyn DbBackend>) -> ReplayGainSourceMode {
+    let mode = ReplayGainSettings::load(backend).mode;
+    if mode == ReplayGainMode::Off {
+        // `analysis_enabled` rend déjà `false` dans ce cas (#2496) ; on ne
+        // dépend pas de cette coïncidence, on l'énonce.
+        return ReplayGainSourceMode::Off;
+    }
+    if analysis_enabled(backend) {
+        ReplayGainSourceMode::TagsThenAnalysis
+    } else {
+        ReplayGainSourceMode::FileTagsOnly
+    }
+}
 
 /// How the gain is chosen for a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +964,10 @@ pub struct ReplayGainSettings {
     pub mode: ReplayGainMode,
     pub preamp_db: f64,
     pub prevent_clipping: bool,
+    /// Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut) = pleine
+    /// échelle, comportement historique ; −0.5 ou −1 laissent une marge.
+    /// Toujours ≤ 0 — un plafond positif serait une demande d'écrêter.
+    pub true_peak_ceiling_db: f64,
 }
 
 impl Default for ReplayGainSettings {
@@ -718,6 +976,7 @@ impl Default for ReplayGainSettings {
             mode: ReplayGainMode::Off,
             preamp_db: 0.0,
             prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
         }
     }
 }
@@ -739,6 +998,12 @@ impl ReplayGainSettings {
             prevent_clipping: get(PREVENT_CLIPPING_KEY)
                 .map(|v| v != "false")
                 .unwrap_or(true),
+            // Borné à [−1, 0] : l'UI ne propose que 0 / −0.5 / −1, et une
+            // valeur cassée en base ne doit jamais creuser le niveau.
+            true_peak_ceiling_db: get(TRUE_PEAK_CEILING_KEY)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(-1.0, 0.0),
         }
     }
 }
@@ -770,20 +1035,80 @@ pub fn stored_gain_detail(
     let meta = TrackMetadataRepo::with_backend(backend.clone())
         .get_all(track_id)
         .ok()?;
-    let pick = |gain_key: &str, peak_key: &str| -> Option<TrackGain> {
+    let pick = |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<TrackGain> {
         let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
-        let peak = meta
-            .get(peak_key)
-            .and_then(|p| p.trim().parse::<f64>().ok())
-            .filter(|p| *p > 0.0);
+        let read_peak = |key: &str| {
+            meta.get(key)
+                .and_then(|p| p.trim().parse::<f64>().ok())
+                .filter(|p| *p > 0.0)
+        };
+        // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
+        // c'est lui qui voit les overs que le sample peak rate, et c'est
+        // contre lui que `prevent_clipping` et le plafond dBTP doivent tirer.
+        let peak = read_peak(true_peak_key).or_else(|| read_peak(peak_key));
         Some(TrackGain { gain_db, peak })
     };
     match mode {
-        ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak")
+        ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak", "rg_album_true_peak")
             .map(|g| (g, ReplayGainMode::Album))
-            .or_else(|| pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track))),
-        _ => pick("rg_track_gain", "rg_track_peak").map(|g| (g, ReplayGainMode::Track)),
+            .or_else(|| {
+                pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
+                    .map(|g| (g, ReplayGainMode::Track))
+            }),
+        _ => pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
+            .map(|g| (g, ReplayGainMode::Track)),
     }
+}
+
+/// D'où vient le gain que [`stored_gain_detail`] vient de rendre (#1627).
+///
+/// `granularity` est celle qui a effectivement FOURNI la valeur — la seconde
+/// composante de [`stored_gain_detail`], pas le mode demandé : en mode album
+/// sans tags d'album, c'est la provenance du gain de PISTE qu'il faut nommer.
+///
+/// Rend `None` quand la piste n'a aucun gain à cette granularité : ne rien
+/// afficher vaut mieux qu'affirmer une origine pour une valeur absente.
+pub fn stored_gain_source(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    granularity: ReplayGainMode,
+) -> Option<GainSource> {
+    let meta = TrackMetadataRepo::with_backend(backend.clone())
+        .get_all(track_id)
+        .ok()?;
+    gain_source_from_meta(&meta, granularity)
+}
+
+/// Cœur testable de [`stored_gain_source`], sur une carte déjà lue.
+fn gain_source_from_meta(
+    meta: &std::collections::HashMap<String, String>,
+    granularity: ReplayGainMode,
+) -> Option<GainSource> {
+    let (gain_key, source_key) = match granularity {
+        ReplayGainMode::Album => ("rg_album_gain", ALBUM_SOURCE_KEY),
+        // `Off` n'atteint pas ce point via `stored_gain_detail`, qui rend
+        // `None` avant. Le traiter comme `Track` évite un cas mort.
+        _ => ("rg_track_gain", TRACK_SOURCE_KEY),
+    };
+    meta.get(gain_key)?;
+    if meta
+        .get(source_key)
+        .is_some_and(|v| v.trim() == SOURCE_ANALYSIS)
+    {
+        return Some(GainSource::Analysis);
+    }
+    // Repli pour les bibliothèques analysées AVANT que ce témoin existe — la
+    // quasi-totalité du parc installé. La passe n'analyse QUE les pistes
+    // dépourvues de `rg_track_gain` (double `NOT EXISTS` du balayage) : un
+    // gain présent sur une piste estampillée `rg_analyzed` a donc été mesuré
+    // ici. Le seul cas où ce repli se trompe est celui d'un fichier analysé,
+    // puis retagué et rescané depuis (et, en granularité album, celui d'un
+    // fichier portant des tags d'album sans tags de piste) — le témoin
+    // explicite ci-dessus tranche pour tout ce qui sera analysé désormais.
+    if meta.contains_key(ANALYZED_KEY) {
+        return Some(GainSource::Analysis);
+    }
+    Some(GainSource::FileTags)
 }
 
 /// The linear factor to multiply samples by: `1.0` means "leave the audio
@@ -801,9 +1126,14 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
     let total_db = (gain.gain_db + settings.preamp_db).clamp(-30.0, 30.0);
     let mut factor = 10f64.powf(total_db / 20.0);
     if settings.prevent_clipping {
+        // Plafond dBTP (#1694) : 0 dB = pleine échelle (comportement
+        // historique, à l'identique) ; −0.5 / −1 laissent une marge
+        // inter-échantillons. Le peak stocké est le true peak quand
+        // l'analyse l'a mesuré (`stored_gain_detail` le préfère).
+        let ceiling = 10f64.powf(settings.true_peak_ceiling_db.min(0.0) / 20.0);
         if let Some(peak) = gain.peak {
-            if peak > 0.0 && factor * peak > 1.0 {
-                factor = 1.0 / peak;
+            if peak > 0.0 && factor * peak > ceiling {
+                factor = ceiling / peak;
             }
         }
     }
@@ -1298,6 +1628,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 6.0206,
             prevent_clipping: false,
+            ..Default::default()
         };
         // -6 dB tag + 6 dB pre-amp ⇒ unity.
         let f = gain_factor(
@@ -1316,6 +1647,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 0.0,
             prevent_clipping: true,
+            ..Default::default()
         };
         // +6 dB on a track already peaking at 0.95 would reach 1.9 — clipped.
         let f = gain_factor(
@@ -1343,6 +1675,252 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // #1694 — plafond dBTP optionnel + préférence au true peak stocké.
+    // ------------------------------------------------------------------
+
+    /// Plafond à 0 dBTP (défaut) : STRICTEMENT le comportement historique.
+    /// Un réglage absent ne doit changer aucun facteur déjà en production.
+    #[test]
+    fn ceiling_zero_is_the_historical_behavior() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let g = TrackGain {
+            gain_db: 6.0,
+            peak: Some(0.95),
+        };
+        let f = gain_factor(g, s);
+        assert!((f - 1.0 / 0.95).abs() < 1e-9, "{f}");
+    }
+
+    /// Plafond −1 dBTP : le facteur est tiré pour que `peak × factor` ne
+    /// dépasse pas 10^(−1/20) — la marge inter-échantillons demandée.
+    #[test]
+    fn dbtp_ceiling_pulls_the_factor_under_the_ceiling() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let ceiling = 10f64.powf(-1.0 / 20.0);
+        // Un master loudness-war : true peak au-delà de la pleine échelle.
+        let g = TrackGain {
+            gain_db: 2.0,
+            peak: Some(1.20),
+        };
+        let f = gain_factor(g, s);
+        assert!((f * 1.20 - ceiling).abs() < 1e-9, "{f}");
+
+        // Sans `prevent_clipping`, le plafond n'agit pas : c'est un mode de
+        // l'anti-écrêtage, pas un limiteur indépendant.
+        let loose = ReplayGainSettings {
+            prevent_clipping: false,
+            ..s
+        };
+        assert!(gain_factor(g, loose) * 1.20 > 1.0);
+    }
+
+    /// Le plafond ne touche jamais une piste qui reste dessous : ce n'est pas
+    /// une normalisation vers −1 dBTP, c'est un plafond.
+    #[test]
+    fn dbtp_ceiling_leaves_quiet_results_alone() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let g = TrackGain {
+            gain_db: -6.0,
+            peak: Some(0.9),
+        };
+        let f = gain_factor(g, s);
+        // -6 dB sur un pic 0.9 : résultat ~0.45, loin sous 10^(-1/20).
+        assert!((f - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9, "{f}");
+    }
+
+    /// Le réglage relu de la base est borné à [−1, 0] : une valeur cassée ne
+    /// doit ni creuser le niveau ni écrêter.
+    #[test]
+    fn ceiling_setting_is_parsed_and_clamped() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        assert_eq!(ReplayGainSettings::load(&backend).true_peak_ceiling_db, 0.0);
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "-0.5").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            -0.5
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "-12").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            -1.0,
+            "borne basse : jamais plus d'un dB de marge"
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "3").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            0.0,
+            "borne haute : un plafond positif n'existe pas"
+        );
+
+        settings.set(TRUE_PEAK_CEILING_KEY, "junk").unwrap();
+        assert_eq!(
+            ReplayGainSettings::load(&backend).true_peak_ceiling_db,
+            0.0,
+            "illisible ⇒ défaut, jamais une surprise sonore"
+        );
+    }
+
+    /// `prevent_clipping` PRÉFÈRE le true peak stocké : c'est lui qui voit
+    /// les overs inter-échantillons. Le sample peak reste le repli des
+    /// bibliothèques analysées avant #1694.
+    #[test]
+    fn stored_gain_prefers_the_true_peak_when_present() {
+        let (_db, backend) = sweep_db(1);
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        meta.set(1, "rg_track_gain", "-3.00 dB").unwrap();
+        meta.set(1, "rg_track_peak", "0.950000").unwrap();
+
+        // Sans true peak : repli sur le sample peak (compat, #1382).
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Track).unwrap();
+        assert_eq!(g.peak, Some(0.95));
+
+        // Avec true peak : c'est LUI qui arme l'anti-écrêtage.
+        meta.set(1, "rg_track_true_peak", "1.230000").unwrap();
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Track).unwrap();
+        assert_eq!(g.peak, Some(1.23));
+
+        // Mode album : même préférence sur les clés d'album.
+        meta.set(1, "rg_album_gain", "-2.00 dB").unwrap();
+        meta.set(1, "rg_album_peak", "0.900000").unwrap();
+        meta.set(1, "rg_album_true_peak", "1.100000").unwrap();
+        let g = stored_gain_for(&backend, 1, ReplayGainMode::Album).unwrap();
+        assert_eq!(g.peak, Some(1.10));
+    }
+
+    // ---- #1627 : les trois modes, et d'où vient le gain ---------------------
+
+    /// Les TROIS modes de la demande, lus sur les deux réglages existants.
+    ///
+    /// Aucune valeur nouvelle n'est persistée : le test écrit `replaygain_mode`
+    /// et `replaygain_analysis_enabled`, rien d'autre. Si un jour quelqu'un
+    /// introduit un troisième réglage, ce test le dira.
+    #[test]
+    fn les_trois_modes_se_lisent_sur_les_deux_reglages_existants() {
+        let (_db, backend) = sweep_db(1);
+        let settings = SettingsRepo::with_backend(backend.clone());
+
+        // 1- néant : c'est le défaut, sans qu'aucune clé n'ait été écrite.
+        assert_eq!(active_source_mode(&backend), ReplayGainSourceMode::Off);
+
+        // 3- calcul : mode armé, analyse au défaut (activée).
+        settings.set(MODE_KEY, "track").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // 2- fichier : mode armé, analyse explicitement coupée.
+        settings.set(ANALYSIS_ENABLED_KEY, "false").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+
+        // La granularité album ne change pas de MODE : c'est l'autre axe.
+        settings.set(MODE_KEY, "album").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::FileTagsOnly
+        );
+        settings.set(ANALYSIS_ENABLED_KEY, "true").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::TagsThenAnalysis
+        );
+
+        // Retour à « Désactivé » : la coche seule ne rouvre rien (#2496).
+        settings.set(MODE_KEY, "off").unwrap();
+        assert_eq!(
+            active_source_mode(&backend),
+            ReplayGainSourceMode::Off,
+            "mode off ⇒ néant, quelle que soit la coche d'analyse"
+        );
+
+        // Valeurs stables de l'API : elles voyagent dans GET /config.
+        assert_eq!(ReplayGainSourceMode::Off.as_str(), "off");
+        assert_eq!(ReplayGainSourceMode::FileTagsOnly.as_str(), "file_tags");
+        assert_eq!(
+            ReplayGainSourceMode::TagsThenAnalysis.as_str(),
+            "tags_then_analysis"
+        );
+    }
+
+    /// La provenance du gain, sur les trois configurations qui existent en base.
+    #[test]
+    fn la_provenance_distingue_un_tag_de_fichier_d_une_mesure_tune() {
+        let (_db, backend) = sweep_db(3);
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+
+        // Piste 1 — tags du fichier seuls (le cas rsgain de #1382).
+        meta.set(1, "rg_track_gain", "-4.20 dB").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 1, ReplayGainMode::Track),
+            Some(GainSource::FileTags)
+        );
+
+        // Piste 2 — mesurée ici, témoin explicite.
+        meta.set(2, "rg_track_gain", "-6.50 dB").unwrap();
+        meta.set(2, TRACK_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Track),
+            Some(GainSource::Analysis)
+        );
+
+        // Piste 3 — bibliothèque analysée AVANT que le témoin existe : le
+        // repli sur `rg_analyzed` tranche, parce que le balayage n'analyse que
+        // les pistes dépourvues de `rg_track_gain`.
+        meta.set(3, "rg_track_gain", "-2.00 dB").unwrap();
+        meta.set(3, ANALYZED_KEY, "1700000000").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 3, ReplayGainMode::Track),
+            Some(GainSource::Analysis)
+        );
+
+        // Aucun gain à cette granularité ⇒ rien à dire, surtout pas une
+        // origine inventée. La piste 1 n'a pas de gain d'album.
+        assert_eq!(stored_gain_source(&backend, 1, ReplayGainMode::Album), None);
+
+        // Un gain d'album lu dans le fichier reste « tags du fichier », même
+        // sur une piste dont le gain de PISTE, lui, a été mesuré ici : les deux
+        // granularités ont leur propre témoin et ne décident pas l'une pour
+        // l'autre.
+        meta.set(2, "rg_album_gain", "-3.00 dB").unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Album),
+            Some(GainSource::FileTags),
+            "le témoin de piste ne doit pas décider de l'origine du gain d'album"
+        );
+        meta.set(2, ALBUM_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        assert_eq!(
+            stored_gain_source(&backend, 2, ReplayGainMode::Album),
+            Some(GainSource::Analysis)
+        );
+
+        // Valeurs stables de l'API.
+        assert_eq!(GainSource::FileTags.as_str(), "file_tags");
+        assert_eq!(GainSource::Analysis.as_str(), "analysis");
+    }
+
     #[test]
     fn clipping_prevention_never_boosts_a_quiet_track() {
         // A track peaking at 0.2 with a -3 dB tag must still be attenuated:
@@ -1351,6 +1929,7 @@ mod tests {
             mode: ReplayGainMode::Track,
             preamp_db: 0.0,
             prevent_clipping: true,
+            ..Default::default()
         };
         let f = gain_factor(
             TrackGain {
@@ -1650,5 +2229,361 @@ mod tests {
             !meta.get_all(4).unwrap().contains_key("rg_analyzed"),
             "la dernière piste du lot ne devait jamais être décodée après la coupure"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2495 — céder PENDANT le décodage, pas seulement entre deux fichiers.
+    // ---------------------------------------------------------------------
+
+    /// Base de test dont la zone se met à jouer d'elle-même, à un rang de
+    /// lecture CHOISI.
+    ///
+    /// Le déclencheur n'est pas une horloge mais un compteur de requêtes : le
+    /// garde-fou d'entrée de fichier et la veille interrogent la même table,
+    /// et faire dépendre le test d'un `sleep` bien placé le rendrait
+    /// intermittent — donc muet le jour où il aurait quelque chose à dire.
+    /// Ici, « la lecture démarre juste après la N-ième vérification » est un
+    /// fait, pas une chance.
+    struct ZoneQuiDemarre {
+        interne: Arc<dyn DbBackend>,
+        lectures: std::sync::atomic::AtomicUsize,
+        demarre_apres: usize,
+    }
+
+    impl ZoneQuiDemarre {
+        fn poser(interne: Arc<dyn DbBackend>, demarre_apres: usize) -> Arc<dyn DbBackend> {
+            Arc::new(Self {
+                interne,
+                lectures: std::sync::atomic::AtomicUsize::new(0),
+                demarre_apres,
+            })
+        }
+        fn lectures(&self) -> usize {
+            self.lectures.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DbBackend for ZoneQuiDemarre {
+        fn engine(&self) -> crate::db::engine::Engine {
+            self.interne.engine()
+        }
+        fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+            self.interne.execute(sql, p)
+        }
+        fn last_insert_rowid(&self) -> i64 {
+            self.interne.last_insert_rowid()
+        }
+        fn query_one(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            if sql.contains("last_play_state = 'playing'") {
+                let rang = self
+                    .lectures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                return Ok((rang > self.demarre_apres)
+                    .then(|| vec![crate::db::backend::SqlValue::Text("Salon".to_string())]));
+            }
+            self.interne.query_one(sql, p)
+        }
+        fn query_many(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many(sql, p)
+        }
+        fn write_tx(
+            &self,
+            f: &mut dyn FnMut(&dyn crate::db::backend::DbTxHandle) -> Result<(), String>,
+        ) -> Result<(), String> {
+            self.interne.write_tx(f)
+        }
+        fn execute_batch(&self, sql: &str) -> Result<(), String> {
+            self.interne.execute_batch(sql)
+        }
+        // Les variantes « strong » de SQLite lisent par la connexion
+        // d'écriture. Laisser l'implémentation par défaut les rabattrait sur
+        // la lecture faible et ferait mentir le test sur autre chose que ce
+        // qu'il examine.
+        fn query_one_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            if sql.contains("last_play_state = 'playing'") {
+                return self.query_one(sql, p);
+            }
+            self.interne.query_one_strong(sql, p)
+        }
+        fn query_many_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many_strong(sql, p)
+        }
+    }
+
+    /// LE défaut de #2495, mesuré. Le garde-fou ne s'exerçait qu'entre deux
+    /// fichiers : une fois `measure_loudness_and_peak` lancée, la seule borne
+    /// était le délai par piste — 180 s. Un décodage de 4,5 Go sur partage
+    /// réseau tenait donc le chemin d'E/S bien après l'appui sur « Lecture »
+    /// (6 782 ms pour démarrer, journal de Thierry Clemont).
+    ///
+    /// La contre-épreuve est DANS le test : le même travail est chronométré
+    /// avec l'ancienne forme (un simple `timeout`) puis avec la nouvelle. Si le
+    /// correctif est retiré, les deux durées se rejoignent et le test tombe.
+    #[tokio::test]
+    async fn l_analyse_cede_pendant_le_travail_pas_seulement_entre_deux_fichiers() {
+        /// Tient lieu du décodage interminable. Court devant les 180 s réelles,
+        /// long devant la veille (250 ms) : le rapport est ce qu'on mesure.
+        const TRAVAIL_LONG: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let (_db, interne) = sweep_db(1);
+
+        // AVANT — l'ancien site d'appel, tel quel : rien ne peut le rendre.
+        let t0 = std::time::Instant::now();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
+            tokio::time::sleep(TRAVAIL_LONG),
+        )
+        .await;
+        let avant = t0.elapsed();
+
+        // APRÈS — la même attente, mise en course avec la lecture. La zone
+        // passe à `playing` juste après la première vérification de la veille,
+        // c'est-à-dire ALORS QUE le travail est déjà en cours.
+        let backend = ZoneQuiDemarre::poser(interne, 1);
+        let t0 = std::time::Instant::now();
+        let issue =
+            mesurer_en_cedant_a_la_lecture(&backend, tokio::time::sleep(TRAVAIL_LONG)).await;
+        let apres = t0.elapsed();
+
+        assert!(
+            matches!(issue, Issue::CedeeALaLecture),
+            "l'analyse devait être abandonnée au profit de la lecture (avant={avant:?}, après={apres:?})"
+        );
+        assert!(
+            avant >= TRAVAIL_LONG,
+            "la mesure « avant » ne prouve rien si elle n'a pas attendu : {avant:?}"
+        );
+        // Une tolérance large : ce qui est démontré est l'ordre de grandeur,
+        // pas la milliseconde. La veille rend la main au premier réveil après
+        // VEILLE_LECTURE_MS.
+        assert!(
+            apres < std::time::Duration::from_millis(1_000),
+            "la lecture a attendu la fin du travail : avant={avant:?}, après={apres:?}"
+        );
+        assert!(
+            apres * 3 < avant,
+            "aucun effondrement du temps de démarrage : avant={avant:?}, après={apres:?}"
+        );
+    }
+
+    /// L'autre moitié du contrat, et la plus dangereuse à rater : une piste
+    /// ABANDONNÉE n'a pas été analysée. L'estampiller `rg_analyzed` la sortirait
+    /// du balayage pour toujours — 114 pistes avaient déjà été gelées ainsi
+    /// (#1865), et un simple appui sur « Lecture » suffirait à en geler d'autres.
+    ///
+    /// Contre-épreuve intégrée : le MÊME lot, sur le MÊME fichier, sans zone qui
+    /// démarre — la piste y est bien estampillée. L'absence de témoin dans le
+    /// premier cas vient donc de la cession, pas d'un fichier écarté pour une
+    /// autre raison.
+    #[tokio::test]
+    async fn une_piste_cedee_n_est_pas_estampillee_analysee() {
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+
+        // La zone démarre après le garde-fou d'entrée de fichier (1re lecture) :
+        // la passe est donc engagée sur ce fichier quand la lecture arrive.
+        let veilleur = Arc::new(ZoneQuiDemarre {
+            interne: interne.clone(),
+            lectures: std::sync::atomic::AtomicUsize::new(0),
+            demarre_apres: 1,
+        });
+        let backend: Arc<dyn DbBackend> = veilleur.clone();
+
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            0,
+            "le lot a cédé sur son premier fichier : il n'a rien accompli"
+        );
+        assert!(
+            veilleur.lectures() >= 2,
+            "le test ne prouve rien si la veille n'a jamais interrogé les zones"
+        );
+
+        let meta = TrackMetadataRepo::with_backend(interne.clone());
+        let temoins = meta.get_all(1).unwrap();
+        assert!(
+            !temoins.contains_key("rg_analyzed"),
+            "une piste cédée doit rester CANDIDATE ; témoins = {temoins:?}"
+        );
+        assert!(
+            !temoins.contains_key(PATH_UNRESOLVED_KEY),
+            "le fichier répond : céder n'est pas le reporter ; témoins = {temoins:?}"
+        );
+
+        // Contre-épreuve : sans zone qui démarre, ce même fichier est traité.
+        assert_eq!(
+            analyze_track_batch(&interne).await,
+            1,
+            "la piste devait rester candidate et être reprise au lot suivant"
+        );
+        assert!(
+            meta.get_all(1).unwrap().contains_key("rg_analyzed"),
+            "sans cession, ce fichier est bel et bien estampillé — c'est ce qui \
+             donne son sens à l'absence de témoin ci-dessus"
+        );
+    }
+
+    /// La démonstration en vraie grandeur : un VRAI décodage, déjà en vol,
+    /// abandonné en cours de route.
+    ///
+    /// Les deux tests précédents isolent chacun une moitié du contrat sur un
+    /// travail simulé. Celui-ci ne simule rien : le fichier est un WAV assez
+    /// long pour que `measure_loudness_and_peak` enchaîne plusieurs segments,
+    /// et la zone se met à jouer APRÈS la première vérification de la veille —
+    /// donc alors que le décodeur tourne déjà dans le pool bloquant. C'est
+    /// exactement la situation de #2495, en petit.
+    #[tokio::test]
+    async fn un_decodage_reel_deja_en_vol_est_abandonne_en_cours_de_route() {
+        let (tmp, _db, interne) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        // Un fichier réellement décodable, et assez long pour occuper le
+        // décodeur plus d'un tour de veille.
+        // 60 s de 96 kHz/24 bits : ~3,4 s d'analyse mesurees sur la machine de
+        // compilation, soit plus de dix tours de veille de marge. Le test ne
+        // depend donc pas de la vitesse de la machine — et s'il finissait quand
+        // meme avant la cession, le premier `assert_eq!` le dirait.
+        let wav = tmp.path().join("i2495.wav");
+        ecrire_wav_long(&wav, 60);
+        interne
+            .execute(
+                "UPDATE tracks SET file_path = ?, duration_ms = 60000, sample_rate = 96000 \
+                 WHERE id = 1",
+                &[&wav.to_string_lossy().to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        // 2 lectures avant que ça joue : le garde-fou d'entrée de fichier, puis
+        // la première vérification de la veille. La suivante n'arrive qu'un
+        // tour de VEILLE_LECTURE_MS plus tard — le décodage est parti.
+        let veilleur = Arc::new(ZoneQuiDemarre {
+            interne: interne.clone(),
+            lectures: std::sync::atomic::AtomicUsize::new(0),
+            demarre_apres: 2,
+        });
+        let backend: Arc<dyn DbBackend> = veilleur.clone();
+
+        let t0 = std::time::Instant::now();
+        let traites = analyze_track_batch(&backend).await;
+        let cession = t0.elapsed();
+
+        assert_eq!(traites, 0, "le lot a cédé sur son unique fichier");
+        assert!(
+            cession >= std::time::Duration::from_millis(VEILLE_LECTURE_MS),
+            "la cession est arrivée avant le premier tour de veille : le décodage              n'avait pas commencé, le test ne prouve pas ce qu'il annonce ({cession:?})"
+        );
+        let temoins = TrackMetadataRepo::with_backend(interne.clone())
+            .get_all(1)
+            .unwrap();
+        assert!(
+            !temoins.contains_key("rg_analyzed"),
+            "décodage abandonné ⇒ piste toujours candidate ; témoins = {temoins:?}"
+        );
+        assert!(
+            !temoins.contains_key("rg_track_gain"),
+            "aucun gain ne peut sortir d'une analyse abandonnée ; témoins = {temoins:?}"
+        );
+    }
+
+    /// #1627 — une analyse RÉELLE laisse derrière elle de quoi dire qu'elle a
+    /// eu lieu.
+    ///
+    /// Le test ne pose aucun témoin lui-même : il fait décoder un vrai fichier
+    /// par `analyze_track_batch`, puis relit la base par l'API publique
+    /// [`stored_gain_source`]. Sans le `repo.set(TRACK_SOURCE_KEY, …)` de la
+    /// passe, le gain mesuré serait indiscernable d'un tag rsgain et le chemin
+    /// du signal afficherait « tags du fichier » sur une mesure Tune.
+    #[tokio::test]
+    async fn une_analyse_reelle_laisse_le_temoin_de_provenance() {
+        let (tmp, _db, backend) = sweep_db_fichiers_presents(1);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let wav = tmp.path().join("i1627.wav");
+        ecrire_wav_long(&wav, 2);
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = ?, duration_ms = 2000, sample_rate = 96000 \
+                 WHERE id = 1",
+                &[&wav.to_string_lossy().to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "le fichier devait être analysé pour de bon"
+        );
+
+        let temoins = TrackMetadataRepo::with_backend(backend.clone())
+            .get_all(1)
+            .unwrap();
+        assert!(
+            temoins.contains_key("rg_track_gain"),
+            "sans gain mesuré, le test ne prouverait rien ; témoins = {temoins:?}"
+        );
+        // Le témoin EXPLICITE, et pas seulement la relecture : `rg_analyzed`
+        // suffirait à faire passer l'assertion suivante par le repli, et le
+        // test ne dirait alors plus rien de la ligne qu'il est censé garder.
+        assert_eq!(
+            temoins.get(TRACK_SOURCE_KEY).map(String::as_str),
+            Some(SOURCE_ANALYSIS),
+            "la passe doit estampiller la provenance ; témoins = {temoins:?}"
+        );
+        assert_eq!(
+            stored_gain_source(&backend, 1, ReplayGainMode::Track),
+            Some(GainSource::Analysis),
+            "un gain mesuré ici doit se relire comme mesuré ici ; témoins = {temoins:?}"
+        );
+    }
+
+    /// Un WAV 96 kHz / 24 bits / stéréo de `secondes` secondes — assez de
+    /// matière pour que l'analyse enchaîne plusieurs segments de 30 s au lieu
+    /// de rendre la main en une poignée de millisecondes.
+    fn ecrire_wav_long(path: &std::path::Path, secondes: usize) {
+        const HZ: usize = 96_000;
+        let frames = HZ * secondes;
+        let mut donnees = Vec::with_capacity(frames * 6);
+        for frame in 0..frames {
+            let g = ((frame as i32 % 200) - 100) * 40_000;
+            for e in [g, g / 2] {
+                donnees.extend_from_slice(&e.to_le_bytes()[..3]);
+            }
+        }
+        let mut w = Vec::with_capacity(donnees.len() + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&(HZ as u32).to_le_bytes());
+        w.extend_from_slice(&((HZ * 6) as u32).to_le_bytes());
+        w.extend_from_slice(&6u16.to_le_bytes());
+        w.extend_from_slice(&24u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(path, w).unwrap();
     }
 }
