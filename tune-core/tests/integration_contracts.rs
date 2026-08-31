@@ -15,6 +15,8 @@ mod migration_on_real_db;
 mod no_blind_ffmpeg;
 #[path = "oaat_negociation.rs"]
 mod oaat_negociation;
+#[path = "pochette_radio_source_unique.rs"]
+mod pochette_radio_source_unique;
 #[path = "poller_bascule.rs"]
 mod poller_bascule;
 // Refuse tout fichier de tests/ que ni le manifeste ni cet agrégateur n'atteint

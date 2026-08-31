@@ -1135,6 +1135,10 @@ mod tests {
         assert!(radio_now(sid).is_none());
     }
 
+    /// L'attribut `#[test]` manquait : la fonction compilait, ne s'exécutait
+    /// jamais, et couvrait pourtant le seul bloc ICY qui parte vers l'écran
+    /// d'un lecteur réseau (#3018). Ses deux voisines l'avaient.
+    #[test]
     fn icy_metadata_block() {
         let block = build_icy_metadata(Some("Artist"), Some("Title"), None);
         assert!(block.len() > 1);
