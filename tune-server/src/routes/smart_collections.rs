@@ -455,9 +455,18 @@ pub(crate) fn build_album_query(
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                     {
+                        // MÊME canonisation qu'à l'écriture des crédits
+                        // (#2799 §4). L'enrichissement range désormais
+                        // « grand piano » / « electric piano » sous `piano` ;
+                        // si la règle cherchait le libellé brut saisi par
+                        // l'utilisateur, une collection `instrument: Grand
+                        // Piano` ne trouverait plus rien alors que les lignes
+                        // existent. Deux normalisations, deux résultats.
+                        let canon = crate::routes::library::credits_mb::canoniser_instrument(instr);
+                        let motif = if canon.is_empty() { instr } else { &canon };
                         sub_conds.push(format!(
                             "LOWER(tc.instrument) LIKE LOWER('%{}%')",
-                            instr.replace('\'', "''")
+                            motif.replace('\'', "''")
                         ));
                     }
                     if !sub_conds.is_empty() {
@@ -849,6 +858,50 @@ mod tests {
             "added_at rule must compile: {where_clause}"
         );
         assert!(where_clause.contains(">="));
+    }
+
+    /// #2799 §4 — la règle `credit`/`instrument` doit chercher le MÊME libellé
+    /// que celui que l'enrichissement écrit.
+    ///
+    /// L'enrichissement range désormais `grand piano` sous `piano` : une règle
+    /// qui compilerait le libellé BRUT (`%grand piano%`) ne trouverait plus
+    /// aucune ligne, alors que les crédits sont bien là. Deux normalisations
+    /// des deux côtés, et la collection reste vide sans rien signaler.
+    #[test]
+    fn regle_credit_instrument_canonisee_comme_a_l_ecriture() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"credit","operator":"has","value":{"instrument":"Grand Piano"}}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            where_clause.contains("LOWER(tc.instrument) LIKE LOWER('%piano%')"),
+            "l'instrument doit etre canonise avant compilation : {where_clause}"
+        );
+        assert!(
+            !where_clause.contains("grand piano"),
+            "le libelle brut ne doit plus servir de motif : {where_clause}"
+        );
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION : les deux autres clés de la règle `credit` sont
+    /// intactes — seul `instrument` est canonisé. Un nom d'artiste passé à la
+    /// moulinette des instruments serait détruit.
+    #[test]
+    fn temoin_regle_credit_role_et_artiste_inchanges() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let rules = r#"[{"field":"credit","operator":"has","value":{"role":"producer","artist_name":"Teo Macero"}}]"#;
+        let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
+        assert!(
+            where_clause.contains("LOWER(tc.role) LIKE LOWER('%producer%')"),
+            "{where_clause}"
+        );
+        assert!(
+            where_clause.contains("LOWER(tc.artist_name) LIKE LOWER('%Teo Macero%')"),
+            "{where_clause}"
+        );
+        assert!(
+            where_clause.contains("JOIN track_credits tc ON tc.track_id = t2.id"),
+            "{where_clause}"
+        );
     }
 
     #[test]

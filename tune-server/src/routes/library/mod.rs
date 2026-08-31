@@ -8,6 +8,7 @@ mod better_quality;
 mod browse;
 mod collections;
 mod credits;
+pub(crate) mod credits_mb;
 mod duplicates;
 mod enrich;
 mod facets;
@@ -254,6 +255,13 @@ pub fn router() -> Router<AppState> {
             post(credits::enrich_album_credits),
         )
         .route("/enrich-credits", post(credits::enrich_all_credits))
+        // Avancement de la passe ci-dessus (#2799). Même forme que
+        // `/enrich-all/status` : sans elle, le `task_id` rendu par le 202
+        // n'était interrogeable nulle part et l'écran ne pouvait qu'espérer.
+        .route(
+            "/enrich-credits/status",
+            get(credits::enrich_credits_status),
+        )
         // Generic metadata reports (wrong cover / credit / bio / image).
         .route(
             "/reports",
