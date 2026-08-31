@@ -31,6 +31,8 @@ pub mod opus_ogg;
 pub mod pipeline;
 pub mod replaygain;
 pub mod resample;
+/// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
+pub mod soft_mute;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;

@@ -1308,6 +1308,19 @@ pub struct LocalOutput {
     /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
     /// signal » affiche l'étape « Mono » et le verdict tombe.
     mono_downmix: Arc<AtomicBool>,
+    /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
+    /// pause, à la reprise et à l'arrêt (#1590).
+    ///
+    /// `0` = coupure franche, c'est-à-dire le comportement d'avant #1590 au bit
+    /// près. Posée par piste par l'orchestrateur comme `pure_bypass` et
+    /// `mono_downmix` ; l'orchestrateur y met déjà `0` pour une zone PURE.
+    ///
+    /// Ce n'est **pas** le seul verrou : les callbacks relisent aussi
+    /// `dop_active` et `pure_bypass` à chaque tampon, parce qu'un DoP se
+    /// découvre en cours de piste et que le mode PURE se bascule en vol. Le
+    /// verdict est tranché en un point unique,
+    /// [`crate::audio::soft_mute::armed_ms`].
+    soft_mute_ms: Arc<AtomicU32>,
     /// True while the PCM currently flowing through this output is a **DoP**
     /// (DSD over PCM) payload, as detected on the bytes themselves by
     /// [`is_dop_pcm`].
@@ -1483,6 +1496,10 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
+            // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
+            // zone : une sortie construite hors chemin de lecture se comporte
+            // exactement comme avant #1590.
+            soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -1657,6 +1674,45 @@ impl LocalOutput {
     /// Le repli mono est-il armé sur cette sortie ?
     pub fn has_mono_downmix(&self) -> bool {
         self.mono_downmix.load(Ordering::Relaxed)
+    }
+
+    /// Régler la durée de la rampe anti-« ploc » de la zone qui joue sur cette
+    /// sortie (#1590). `0` désarme et rétablit la coupure franche.
+    ///
+    /// Comme `set_mono_downmix`, un `store` suffit et se fait aussi bien en
+    /// début de piste qu'en pleine lecture : la rampe n'a pas d'état à
+    /// reconstruire, et [`crate::audio::soft_mute::SoftMuteRamp::arm`] ne
+    /// recalcule son incrément que si la durée a changé.
+    ///
+    /// La valeur est bornée ici aussi, et pas seulement chez l'appelant : c'est
+    /// la sortie qui doit garantir qu'un réglage aberrant ne rend pas la pause
+    /// molle.
+    pub fn set_soft_mute_ms(&self, ms: u32) {
+        self.soft_mute_ms.store(
+            ms.min(crate::audio::soft_mute::SOFT_MUTE_MAX_MS),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Durée de rampe **réellement applicable** en cet instant, gardes
+    /// bit-perfect comprises. C'est ce que lisent les callbacks et `stop()`.
+    fn armed_soft_mute_ms(&self) -> u32 {
+        crate::audio::soft_mute::armed_ms(
+            self.soft_mute_ms.load(Ordering::Relaxed),
+            self.dop_active.load(Ordering::Relaxed),
+            self.pure_bypass.load(Ordering::Relaxed),
+            self.exclusive_mode,
+        )
+    }
+
+    /// La porte que les callbacks de rendu relisent à chaque tampon.
+    fn soft_mute_gate(&self) -> crate::audio::soft_mute::SoftMuteGate {
+        crate::audio::soft_mute::SoftMuteGate::new(
+            self.soft_mute_ms.clone(),
+            self.dop_active.clone(),
+            self.pure_bypass.clone(),
+            self.exclusive_mode,
+        )
     }
 
     /// Install (or clear with `None`) the headphone crossfeed processor for the
@@ -3849,6 +3905,10 @@ impl OutputTarget for LocalOutput {
         let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
+        // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
+        // plutôt que trois atomiques de plus dans des fermetures qui en portent
+        // déjà huit.
+        let soft_mute = self.soft_mute_gate();
         // Les deux composantes du volume effectif, pour pouvoir le recalculer
         // depuis la boucle d'alimentation quand le flux entre ou sort du DoP —
         // `recompute_effective_volume` est une méthode et n'est pas atteignable
@@ -4048,6 +4108,8 @@ impl OutputTarget for LocalOutput {
                 let vol_cb = volume.clone();
                 let paused_cb = paused.clone();
                 let silent_cb = force_silent.clone();
+                let soft_mute_cb = soft_mute.clone();
+                let mut ramp_cb = soft_mute_cb.ramp(output_sr, output_ch);
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
                 // Minimum: ~500ms of audio at the output sample rate.
@@ -4060,7 +4122,17 @@ impl OutputTarget for LocalOutput {
                 let stream = match device.build_output_stream(
                     &output_config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                        // Rampe anti-« ploc » (#1590) : au lieu de sauter de
+                        // l'amplitude courante à zéro, le gain glisse sur
+                        // quelques dizaines de millisecondes. `arm(0)` — DoP,
+                        // PURE, sortie exclusive — rend exactement la coupure
+                        // franche d'avant.
+                        ramp_cb.arm(soft_mute_cb.armed_ms());
+                        let silence = paused_cb.load(Ordering::Relaxed)
+                            || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence)
+                            == crate::audio::soft_mute::Rendering::Silent
+                        {
                             data.fill(0.0);
                             return;
                         }
@@ -4077,9 +4149,7 @@ impl OutputTarget for LocalOutput {
                         }
                         let read = ring_cb.pop(data);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for sample in &mut data[..read] {
-                            *sample *= v;
-                        }
+                        ramp_cb.apply(&mut data[..read], v);
                         if read < data.len() {
                             data[read..].fill(0.0);
                         }
@@ -5586,11 +5656,21 @@ impl OutputTarget for LocalOutput {
                                 _finished_cb: Arc<AtomicBool>,
                                 silent_cb: Arc<AtomicBool>,
                                 ds_cb: Arc<AtomicBool>,
-                                min_buf: usize| {
+                                min_buf: usize,
+                                soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
+                let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                        // Rampe anti-« ploc » (#1590) — voir le callback du
+                        // chemin compressé pour le détail. `arm(0)` rétablit la
+                        // coupure franche sur DoP, PURE et sortie exclusive.
+                        ramp_cb.arm(soft_mute_cb.armed_ms());
+                        let silence = paused_cb.load(Ordering::Relaxed)
+                            || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence)
+                            == crate::audio::soft_mute::Rendering::Silent
+                        {
                             data.fill(0.0);
                             return;
                         }
@@ -5607,9 +5687,7 @@ impl OutputTarget for LocalOutput {
                         }
                         let read = ring_cb.pop(data);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        for sample in &mut data[..read] {
-                            *sample *= v;
-                        }
+                        ramp_cb.apply(&mut data[..read], v);
                         if read < data.len() {
                             data[read..].fill(0.0);
                         }
@@ -5637,6 +5715,7 @@ impl OutputTarget for LocalOutput {
                 ds_cb: Arc<AtomicBool>,
                 min_buf: usize,
                 device_gone: Arc<AtomicBool>,
+                soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
             ) -> Result<cpal::Stream, cpal::BuildStreamError>
             where
                 T: cpal::SizedSample + Send + 'static,
@@ -5645,11 +5724,21 @@ impl OutputTarget for LocalOutput {
                 use symphonia::core::audio::conv::IntoSample;
                 let zero: T = 0.0f32.into_sample();
                 let mut scratch: Vec<f32> = Vec::new();
+                let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                         let n = data.len();
-                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                        // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC
+                        // qui refusent le flottant : la rampe y est armée par la
+                        // même porte, donc toujours désarmée sur DoP, en PURE et
+                        // en sortie exclusive.
+                        ramp_cb.arm(soft_mute_cb.armed_ms());
+                        let silence = paused_cb.load(Ordering::Relaxed)
+                            || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence)
+                            == crate::audio::soft_mute::Rendering::Silent
+                        {
                             data.fill(zero);
                             return;
                         }
@@ -5666,8 +5755,13 @@ impl OutputTarget for LocalOutput {
                         let buf = &mut scratch[..n];
                         let read = ring_cb.pop(buf);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        // La rampe module le tampon f32 AVANT la conversion en
+                        // mot entier : convertir puis multiplier ferait le
+                        // produit dans le format du DAC, hors du contrat de
+                        // `IntoSample`.
+                        ramp_cb.apply(&mut buf[..read], v);
                         for (o, s) in data[..read].iter_mut().zip(&buf[..read]) {
-                            *o = (*s * v).into_sample();
+                            *o = (*s).into_sample();
                         }
                         data[read..].fill(zero);
                     },
@@ -5695,6 +5789,7 @@ impl OutputTarget for LocalOutput {
                 silent_cb_outer.clone(),
                 data_started_shared.clone(),
                 min_buffer,
+                soft_mute.clone(),
             );
 
             let (stream, actual_config, ring) = match stream_result {
@@ -5723,6 +5818,7 @@ impl OutputTarget for LocalOutput {
                         silent_cb_outer.clone(),
                         data_started_shared.clone(),
                         min_buffer_fb,
+                        soft_mute.clone(),
                     ) {
                         Ok(s) => {
                             info!(
@@ -5768,6 +5864,7 @@ impl OutputTarget for LocalOutput {
                                             data_started_shared.clone(),
                                             min_buf,
                                             device_gone.clone(),
+                                            soft_mute.clone(),
                                         )
                                     } else {
                                         build_int_stream::<i16>(
@@ -5780,6 +5877,7 @@ impl OutputTarget for LocalOutput {
                                             data_started_shared.clone(),
                                             min_buf,
                                             device_gone.clone(),
+                                            soft_mute.clone(),
                                         )
                                     };
                                     if let Ok(s) = res {
@@ -6887,6 +6985,24 @@ impl OutputTarget for LocalOutput {
             .lock()
             .unwrap()
             .store(true, Ordering::SeqCst);
+        // Laisser la rampe anti-« ploc » finir sa descente avant de relâcher le
+        // flux (#1590). `force_silent` vient d'être armé : le callback est déjà
+        // en train de descendre. Sans cette attente, le fil de lecture peut
+        // détruire le flux cpal au milieu de la rampe et le clic revient — le
+        // fondu à l'arrêt serait alors une loterie.
+        //
+        // L'attente est bornée par la rampe elle-même : nulle quand elle est
+        // désarmée (DoP, PURE, sortie exclusive, réglage à zéro), nulle quand
+        // rien ne joue, et jamais plus que `SOFT_MUTE_MAX_MS`. À la valeur par
+        // défaut cela fait 20 ms, à comparer aux 2 000 ms que `stop()` accepte
+        // déjà d'attendre juste après pour la sortie du fil.
+        let drain_ms = crate::audio::soft_mute::stop_drain_ms(
+            self.armed_soft_mute_ms(),
+            self.playing.load(Ordering::SeqCst),
+        );
+        if drain_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
+        }
         // Send the stop signal via channel (belt-and-suspenders with force_silent)
         if let Some(tx) = self.stop_tx.lock().unwrap().take() {
             let _ = tx.send(());
