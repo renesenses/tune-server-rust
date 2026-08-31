@@ -1818,7 +1818,24 @@ pub fn save_embedded_cover(
     if find_cached(cache_dir, &legacy).is_some() {
         return Some(legacy);
     }
+    cache_embedded_cover(audio_path, cache_dir, cover)
+}
 
+/// [`save_embedded_cover`] **sans la sonde héritée** : met en cache les octets
+/// reçus et rend leur condensat de CONTENU, quoi que porte déjà le cache sous
+/// l'adresse dérivée du chemin.
+///
+/// Réservé aux gestes où l'utilisateur demande explicitement de relire ses
+/// fichiers — « Scan complet » et les deux routes `/artwork/rescan`. Sur ces
+/// chemins-là, la sonde héritée est précisément ce qui rendait l'ancienne
+/// image : elle est adressée par le CHEMIN, donc remplacer la pochette ne la
+/// déplace pas (#3028). Les passes automatiques (scan incrémental, surveillant
+/// de fichiers) gardent [`save_embedded_cover`] et ses URL stables (#1444).
+pub fn cache_embedded_cover(
+    audio_path: &Path,
+    cache_dir: &Path,
+    cover: &(Vec<u8>, String),
+) -> Option<String> {
     let (data, mime) = cover;
     // Nouvelle écriture : adressée par le CONTENU (#1444). Mêmes octets dans
     // N fichiers = une seule entrée, et un rescan retombe sur elle sans rien
@@ -1937,7 +1954,30 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     if find_cached(cache_dir, &legacy).is_some() {
         return Some(legacy);
     }
+    refresh_cover_hash(audio_path, cache_dir)
+}
 
+/// [`get_or_extract`] **sans la sonde héritée** : relit toujours la source
+/// (jaquette intégrée, puis pochette du dossier) et rend le condensat de son
+/// CONTENU.
+///
+/// C'est le seul chemin capable de rafraîchir la pochette d'un album qui en a
+/// déjà une (#3028). `get_or_extract` commence par sonder l'entrée héritée,
+/// adressée par le CHEMIN de la piste (`artwork_hash`) : remplacer `cover.jpg`
+/// dans le dossier ne change pas ce chemin, donc la sonde trouvait l'ancienne
+/// entrée et rendait l'ancienne image sans jamais rouvrir le fichier — y
+/// compris depuis les deux routes `/artwork/rescan`, écrites pour ce
+/// rattrapage et neutralisées par cette même sonde.
+///
+/// Le condensat rendu changeant avec les octets, l'URL servie change aussi :
+/// le `Cache-Control: immutable` de la route ne retient plus l'ancienne image
+/// côté navigateur. Aucune entrée existante n'est supprimée — les URL déjà
+/// distribuées restent servies.
+///
+/// À n'appeler que sur un geste explicite de l'utilisateur. Les passes
+/// automatiques gardent [`get_or_extract`], dont la sonde héritée épargne la
+/// relecture du fichier et fige les URL (#1444).
+pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     // Try embedded cover art from the audio file tags.
     // Nouvelle écriture : adressée par le CONTENU (#1444) — la même jaquette
     // intégrée à N pistes ne peuple le cache que d'UNE entrée.
@@ -2488,6 +2528,128 @@ mod tests {
             1,
             "aucune entrée de contenu en doublon"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #3028 — remplacer sa pochette dans la bibliothèque.
+    // ------------------------------------------------------------------
+
+    /// Le défaut, nu. L'utilisateur remplace `cover.jpg` par une autre image :
+    /// la sonde héritée est adressée par le CHEMIN, qui n'a pas bougé, donc
+    /// `get_or_extract` rend l'ANCIENNE entrée sans jamais rouvrir le fichier.
+    ///
+    /// Ce test est le TÉMOIN : il fige le comportement des passes automatiques
+    /// (URL stables, #1444), qui ne doit pas changer.
+    #[test]
+    fn temoin_get_or_extract_garde_l_ancienne_pochette_apres_remplacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let pochette = dossier.join("cover.jpg");
+        std::fs::write(&pochette, b"ANCIENNE-POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        // Cache tel que le laisse une bibliothèque antérieure à la v0.9.127 :
+        // l'entrée est adressée par le chemin de la PISTE.
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-POCHETTE").unwrap();
+
+        // L'utilisateur remplace l'image sur son disque.
+        std::fs::write(&pochette, b"NOUVELLE-POCHETTE").unwrap();
+
+        let h = get_or_extract(&piste, &cache).unwrap();
+        assert_eq!(h, legacy, "la sonde héritée court-circuite la relecture");
+        assert_eq!(
+            std::fs::read(cache.join(format!("{legacy}.jpg"))).unwrap(),
+            b"ANCIENNE-POCHETTE",
+            "les octets servis sont ceux de l'ancienne image"
+        );
+    }
+
+    /// La correction : sur un geste explicite (« Scan complet », les deux
+    /// routes `/artwork/rescan`), la relecture saute la sonde héritée, rend le
+    /// condensat du CONTENU de la nouvelle image — donc une autre URL — et
+    /// écrit les nouveaux octets dans le cache.
+    #[test]
+    fn refresh_cover_hash_rend_la_nouvelle_pochette_et_une_autre_adresse() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let pochette = dossier.join("cover.jpg");
+        std::fs::write(&pochette, b"ANCIENNE-POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-POCHETTE").unwrap();
+
+        std::fs::write(&pochette, b"NOUVELLE-POCHETTE").unwrap();
+
+        let h = refresh_cover_hash(&piste, &cache).unwrap();
+        assert_ne!(h, legacy, "l'adresse change avec le contenu");
+        assert_eq!(h, content_hash(b"NOUVELLE-POCHETTE"));
+        let (chemin, _) = find_cached(&cache, &h).expect("la nouvelle entrée est écrite");
+        assert_eq!(
+            std::fs::read(chemin).unwrap(),
+            b"NOUVELLE-POCHETTE",
+            "ce sont bien les octets neufs qui seront servis"
+        );
+        // L'entrée héritée n'est pas supprimée : les URL déjà distribuées
+        // restent servies, elles ne partent pas en 404 (#1444).
+        assert!(
+            find_cached(&cache, &legacy).is_some(),
+            "l'entrée héritée survit"
+        );
+    }
+
+    /// Contre-épreuve : à fichier INCHANGÉ, la relecture forcée ne fabrique
+    /// aucune entrée de plus à chaque passe. Deux « Scan complet » de suite ne
+    /// doivent pas gonfler le cache.
+    #[test]
+    fn refresh_cover_hash_est_idempotent_a_fichier_inchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        std::fs::write(dossier.join("cover.jpg"), b"POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let h1 = refresh_cover_hash(&piste, &cache).unwrap();
+        let h2 = refresh_cover_hash(&piste, &cache).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(nb_fichiers(&cache), 1, "aucune entrée en doublon");
+    }
+
+    /// Même contrat pour la jaquette INTÉGRÉE, dont les octets sont déjà lus :
+    /// `save_embedded_cover` garde l'entrée héritée, `cache_embedded_cover`
+    /// adresse par le contenu.
+    #[test]
+    fn cache_embedded_cover_ignore_l_entree_heritee() {
+        let dir = tempfile::tempdir().unwrap();
+        let piste = dir.path().join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-JAQUETTE").unwrap();
+
+        let neuve = (b"NOUVELLE-JAQUETTE".to_vec(), "image/jpeg".to_string());
+
+        // Témoin : la passe automatique ne bouge pas.
+        assert_eq!(
+            save_embedded_cover(&piste, &cache, &neuve).unwrap(),
+            legacy,
+            "sans geste explicite, l'URL distribuée est conservée"
+        );
+
+        let h = cache_embedded_cover(&piste, &cache, &neuve).unwrap();
+        assert_eq!(h, content_hash(b"NOUVELLE-JAQUETTE"));
+        let (chemin, _) = find_cached(&cache, &h).expect("la nouvelle entrée est écrite");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"NOUVELLE-JAQUETTE");
     }
 
     // ------------------------------------------------------------------

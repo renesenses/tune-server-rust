@@ -1307,8 +1307,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // startup + watcher scans. Owns the cross-batch caches (artist, album,
         // covers, per-folder album-artist pinning), the per-batch compilation
         // decision, and the artwork-extracted counter.
+        // `force` commande aussi la relecture des POCHETTES : sans lui, le
+        // « Scan complet » relit bien les fichiers mais la sonde héritée du
+        // cache (adressée par le chemin) rend l'ancienne image et le `COALESCE`
+        // de `update_cover_path` refuse de la remplacer en base. Remplacer sa
+        // `cover.jpg` n'avait alors aucun chemin vers l'écran (#3028). Même
+        // arbitrage que le genre d'album plus bas : un scan forcé est une
+        // demande explicite de reconstruire depuis les fichiers.
         let mut importer =
-            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
+            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone())
+                .with_force_artwork(force);
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
