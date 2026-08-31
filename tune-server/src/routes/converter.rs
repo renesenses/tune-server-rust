@@ -40,6 +40,17 @@ pub struct StartJobRequest {
     pub quality: Option<String>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
+    /// Dossier de travail SUR LE SERVEUR où ranger le résultat (#2944).
+    ///
+    /// `None` — le cas par défaut, et celui de tous les clients existants —
+    /// laisse le comportement historique intact : sortie dans
+    /// `job_output_dir(job_id)`, archive ZIP à télécharger. Rien de ce qui
+    /// suit ne s'exécute alors.
+    ///
+    /// `Some(_)` fait de `/start` une route d'ÉCRITURE DISQUE choisie par le
+    /// client. Elle est alors gardée deux fois, et les deux gardes sont
+    /// nécessaires — voir [`crate::routes::convert_destination`].
+    pub destination: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +115,11 @@ struct ConvertJob {
     /// du MP3 ou de l'AAC déjà compressés, `zip` ne gagne quasiment rien, donc
     /// l'écart se compte en pour mille.
     output_bytes: u64,
+    /// Le travail a-t-il été rangé dans un dossier du serveur choisi par
+    /// l'appelant (#2944) ? Dans ce cas il n'y a pas d'archive à télécharger :
+    /// les fichiers sont déjà à leur place, et les zipper reviendrait à
+    /// empaqueter le dossier de l'utilisateur.
+    destination_serveur: bool,
 }
 
 type JobStore = Arc<Mutex<HashMap<String, Arc<Mutex<ConvertJob>>>>>;
@@ -136,7 +152,15 @@ fn job_output_dir(job_id: &str) -> PathBuf {
 ///
 /// Declaring it lets the screen quote the server instead of hardcoding a claim
 /// that a future destination setting (#2944) would silently turn into a lie.
-fn delivery_descriptor() -> Value {
+///
+/// #2944 est arrivée, et la mise en garde ci-dessus a été tenue plutôt que
+/// contournée : les quatre champs historiques décrivent le mode PAR DÉFAUT —
+/// celui d'un travail lancé sans `destination`, qui n'a pas changé d'un octet —
+/// et le bloc `destination` décrit le mode facultatif où l'appelant range le
+/// résultat lui-même. `racines` est la liste, calculée sur ce serveur, des
+/// seuls endroits où il s'autorise à écrire : l'écran n'a donc rien à deviner,
+/// et n'a plus à proposer un dossier qui serait refusé après coup.
+fn delivery_descriptor(racines: &[String]) -> Value {
     json!({
         // The result leaves the server as a single downloadable archive.
         "mode": "zip_download",
@@ -145,6 +169,33 @@ fn delivery_descriptor() -> Value {
         // The two questions the screen must be able to answer up front.
         "writes_to_library": false,
         "modifies_sources": false,
+        // #2944 — le mode facultatif, et ce qu'il coûte.
+        "destination": {
+            // Le champ `destination` de `POST /start` est reconnu.
+            "supported": true,
+            // Les seuls dossiers acceptés. Vide ⇒ toute destination est
+            // refusée : un serveur qui n'a rien déclaré n'écrit nulle part.
+            "roots": racines,
+            // Le réglage par lequel l'exploitant ouvre un dossier de travail
+            // HORS bibliothèque — la demande de Bilou, qui ne veut pas
+            // déverser les conversions au milieu de ses albums.
+            "root_setting": crate::routes::convert_destination::CLE_RACINE_DE_TRAVAIL,
+            // Le rôle exigé. Attention : sur une installation par défaut
+            // (`auth_enabled` absent) `RequireAdmin` laisse passer — c'est
+            // `roots` qui borne, indépendamment de l'authentification.
+            "requires_admin": true,
+            // Un fichier déjà présent n'est JAMAIS écrasé : le travail note
+            // une erreur pour cette piste et poursuit. C'est ce qui rend
+            // `modifies_sources: false` vrai même quand la destination est la
+            // bibliothèque elle-même.
+            "overwrites_existing": false,
+            // « un répertoire à créer ou existant » (Bilou, fil 1095).
+            "creates_missing_dirs": true,
+            // Le résultat étant déjà rangé, `GET /download/{job_id}` refuse :
+            // il n'y a pas d'archive, et en fabriquer une empaquetterait le
+            // dossier de l'utilisateur.
+            "zip_download_available": false,
+        },
     })
 }
 
@@ -185,13 +236,27 @@ pub fn router() -> Router<AppState> {
 /// ffmpeg presence is not enough: the minimal build bundled with the release
 /// carries only the `aac` encoder (no libmp3lame), so mp3 must be answered
 /// from what the resolved binary actually encodes.
-async fn capabilities() -> impl IntoResponse {
-    Json(capabilities_payload().await)
+async fn capabilities(State(state): State<AppState>) -> impl IntoResponse {
+    Json(capabilities_payload(&racines_d_ecriture(&state)).await)
+}
+
+/// Les dossiers dans lesquels CE serveur s'autorise à ranger un résultat.
+///
+/// Racines de bibliothèque déjà déclarées par l'exploitant, plus le dossier de
+/// travail facultatif du réglage `converter_output_root`. Rien d'autre — et
+/// rien du tout si l'exploitant n'a rien déclaré.
+fn racines_d_ecriture(state: &AppState) -> Vec<String> {
+    let bibliotheque = crate::routes::system::get_music_dirs_list(&state.backend);
+    let travail = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(crate::routes::convert_destination::CLE_RACINE_DE_TRAVAIL)
+        .ok()
+        .flatten();
+    crate::routes::convert_destination::racines_autorisees(&bibliotheque, travail.as_deref())
 }
 
 /// The payload behind `GET /capabilities`, split out so the contract can be
 /// asserted without going through an HTTP response body.
-async fn capabilities_payload() -> Value {
+async fn capabilities_payload(racines: &[String]) -> Value {
     let ffmpeg = resolve_tool("ffmpeg");
     let lame = resolve_tool("lame");
     let encoders = match &ffmpeg {
@@ -217,8 +282,8 @@ async fn capabilities_payload() -> Value {
             "ffmpeg": ffmpeg.map(|p| p.display().to_string()),
             "lame": lame.map(|p| p.display().to_string()),
         },
-        // Where the result goes and what stays untouched (#2943).
-        "delivery": delivery_descriptor(),
+        // Where the result goes and what stays untouched (#2943, #2944).
+        "delivery": delivery_descriptor(racines),
     })
 }
 
@@ -262,6 +327,12 @@ fn parse_ffmpeg_encoders(stdout: &str) -> std::collections::HashSet<String> {
 
 async fn start_job(
     State(state): State<AppState>,
+    // `Result<…>` et non `RequireAdmin` : exiger le rôle sur TOUTE la route
+    // retirerait le convertisseur historique aux comptes non-administrateurs
+    // des installations authentifiées — une régression. Le rôle n'est exigé
+    // que lorsque l'appelant demande une destination, c'est-à-dire lorsque
+    // `/start` devient une route d'écriture disque (#2944).
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
     // Premium gate: batch converter requires Premium
@@ -337,10 +408,42 @@ async fn start_job(
 
     let total = file_paths.len();
     let job_id = uuid::Uuid::new_v4().to_string();
-    let output_dir = job_output_dir(&job_id);
+
+    // #2944 — la destination. Sans elle, la ligne suivante est exactement
+    // celle d'avant : `job_output_dir(job_id)`, puis l'archive ZIP.
+    let (output_dir, destination_serveur) = match body.destination.as_deref() {
+        None => (job_output_dir(&job_id), false),
+        Some(demande) => (resoudre_la_destination(&state, admin, demande).await?, true),
+    };
+
     tokio::fs::create_dir_all(&output_dir)
         .await
         .map_err(|e| AppError::internal(format!("failed to create output dir: {e}")))?;
+
+    // Le dossier EXISTE désormais : on revoit sa cible. La vérification a déjà
+    // eu lieu AVANT la création (c'est là qu'elle compte — `create_dir_all`
+    // suit les liens et créerait des dossiers de l'autre côté) ; celle-ci ne
+    // fait que refermer la fenêtre entre les deux.
+    if destination_serveur {
+        let racines = racines_d_ecriture(&state);
+        if !crate::routes::convert_destination::la_cible_reste_dans_le_perimetre(
+            &output_dir,
+            &racines,
+        ) {
+            warn!(
+                destination = %output_dir.display(),
+                "convertisseur_destination_refusee_cible_hors_perimetre"
+            );
+            return Err(AppError::bad_request(
+                crate::routes::convert_destination::RefusDestination::HorsPerimetre.libelle(),
+            ));
+        }
+        info!(
+            job_id = %job_id,
+            destination = %output_dir.display(),
+            "convertisseur_travail_range_sur_le_serveur"
+        );
+    }
 
     let job = Arc::new(Mutex::new(ConvertJob {
         status: JobStatus::Running,
@@ -350,6 +453,7 @@ async fn start_job(
         errors: Vec::new(),
         output_dir: output_dir.clone(),
         output_bytes: 0,
+        destination_serveur,
     }));
 
     let store = job_store();
@@ -374,6 +478,7 @@ async fn start_job(
             target_sr,
             target_bd,
             &output_dir,
+            destination_serveur,
         )
         .await;
         info!(job_id = %jid, "converter_job_finished");
@@ -387,6 +492,66 @@ async fn start_job(
         })),
     )
         .into_response())
+}
+
+/// Les deux gardes du mode « dossier de travail » (#2944), dans l'ordre, AVANT
+/// que quoi que ce soit ne soit créé sur le disque.
+///
+/// 1. **Le rôle.** `RequireAdmin`, comme la route sœur `POST
+///    /system/music-dirs` qui désigne les racines de bibliothèque. La demande
+///    est ici du même ordre : choisir un endroit du disque du serveur.
+/// 2. **Le périmètre.** Le rôle NE SUFFIT PAS : sur une installation par
+///    défaut, `auth_enabled` est absent, `RequireAdmin` laisse passer, et la
+///    route redevient anonyme sur le réseau local. Le périmètre tient donc
+///    indépendamment de l'authentification — c'est lui, et lui seul, qui
+///    empêche un appelant du LAN d'écrire dans `/etc` ou dans le dossier
+///    personnel de quelqu'un.
+///
+/// La vérification de la CIBLE (lien symbolique) se fait ici, pas après la
+/// création : `create_dir_all` suit les liens, et créerait l'arborescence de
+/// l'autre côté avant même qu'on ait pu la refuser.
+async fn resoudre_la_destination(
+    state: &AppState,
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
+    demande: &str,
+) -> Result<PathBuf, AppError> {
+    use crate::routes::convert_destination as perimetre;
+
+    if let Err((statut, Json(corps))) = admin {
+        warn!(destination = %demande, "convertisseur_destination_refusee_role");
+        let motif = corps
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("admin role required")
+            .to_string();
+        // Le statut de `RequireAdmin` est repris tel quel : 403 pour un jeton
+        // valide mais non administrateur, 401 pour un jeton manquant ou
+        // invalide. Les confondre enverrait l'utilisateur se reconnecter alors
+        // qu'il lui manque un rôle.
+        return Err(AppError {
+            status: statut,
+            message: motif,
+            code: Some("forbidden".into()),
+        });
+    }
+
+    let racines = racines_d_ecriture(state);
+    let destination = perimetre::verifier_la_destination(demande, &racines).map_err(|refus| {
+        warn!(destination = %demande, motif = ?refus, "convertisseur_destination_refusee");
+        AppError::bad_request(refus.libelle())
+    })?;
+
+    if !perimetre::la_cible_reste_dans_le_perimetre(&destination, &racines) {
+        warn!(
+            destination = %demande,
+            "convertisseur_destination_refusee_cible_hors_perimetre"
+        );
+        return Err(AppError::bad_request(
+            perimetre::RefusDestination::HorsPerimetre.libelle(),
+        ));
+    }
+
+    Ok(destination)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +600,15 @@ fn taille_lisible(octets: u64) -> String {
 /// Fonction pure et séparée du gestionnaire pour être éprouvable sans routeur,
 /// sans licence premium et sans fichier audio — voir les tests en fin de
 /// fichier, qui confrontent ce corps à `docs/contrat-web.json`.
+///
+/// ⚠️ **Un seul endroit construit ce corps.** #3002 et #2944 sont arrivés dans
+/// le même lot, chacun avec son propre `json!({…})` dans ce gestionnaire. Garder
+/// l'une ou l'autre version compilait parfaitement et rendait silencieusement
+/// muet le correctif de l'autre : soit l'écran repartait à 0 % sans bouton de
+/// téléchargement (#3002), soit il ne savait plus où le serveur avait rangé le
+/// résultat ni s'il existait une archive (#2944). D'où la fusion en **une seule**
+/// construction, et le test `le_statut_porte_les_deux_correctifs_du_lot` qui
+/// rougit dès qu'un champ de l'un OU de l'autre disparaît.
 fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
     let errors: Vec<Value> = job
         .errors
@@ -475,6 +649,11 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
         "converted": job.completed,
         "download_size": taille_lisible(job.output_bytes),
         "error": error,
+        // #2944 — où le résultat est rangé, et s'il y a une archive au bout.
+        // L'écran n'a pas à déduire d'un champ de la requête ce que le serveur
+        // a réellement fait : il le lit.
+        "destination": job.destination_serveur.then(|| job.output_dir.display().to_string()),
+        "zip_download_available": !job.destination_serveur,
     })
 }
 
@@ -505,6 +684,16 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
 
     if job.status == JobStatus::Running {
         return Err(AppError::bad_request("job is still running"));
+    }
+
+    // #2944 — un travail rangé sur le serveur n'a pas d'archive. En fabriquer
+    // une empaquetterait le dossier de l'utilisateur, y compris ce qui s'y
+    // trouvait déjà et que le convertisseur n'a jamais touché.
+    if job.destination_serveur {
+        let ou = job.output_dir.display().to_string();
+        return Err(AppError::bad_request(format!(
+            "job wrote directly to {ou}; there is no archive to download"
+        )));
     }
 
     let output_dir = job.output_dir.clone();
@@ -655,6 +844,8 @@ async fn run_conversion(
     target_sr: Option<u32>,
     target_bd: Option<u16>,
     output_dir: &Path,
+    // #2944 — le travail range-t-il dans un dossier de l'utilisateur ?
+    destination_serveur: bool,
 ) {
     for file_path in &files {
         // Check if cancelled
@@ -682,6 +873,33 @@ async fn run_conversion(
 
         let ext = output_extension(format);
         let out_path = output_dir.join(format!("{filename}.{ext}"));
+
+        // ON N'ÉCRASE JAMAIS (#2944). Dans le dossier de l'utilisateur, un
+        // fichier déjà présent est soit une conversion précédente, soit — si
+        // la destination est la bibliothèque et le format celui de la source —
+        // LE FICHIER D'ORIGINE LUI-MÊME. Le convertisseur note l'erreur et
+        // passe : c'est ce qui rend `modifies_sources: false` encore vrai dans
+        // ce mode, et ce qui rend un travail interrompu rejouable sans perte.
+        //
+        // La garde ne vaut QUE pour ce mode : le dossier temporaire d'un
+        // travail ZIP est neuf à chaque fois, et y appliquer la règle
+        // changerait le comportement historique de deux pistes homonymes.
+        if destination_serveur && out_path.exists() {
+            warn!(
+                dst = %out_path.display(),
+                "converter_skip_destination_exists"
+            );
+            let mut j = job.lock().await;
+            j.completed += 1;
+            j.errors.push(JobError {
+                file: file_path.display().to_string(),
+                message: format!(
+                    "destination file already exists, left untouched: {}",
+                    out_path.display()
+                ),
+            });
+            continue;
+        }
 
         match convert_single_file(file_path, &out_path, format, quality, target_sr, target_bd).await
         {
@@ -1594,7 +1812,7 @@ mod tests {
     fn la_destination_et_ce_qui_nest_pas_touche_sont_annonces() {
         // #2943 : la question de Bilou — « duplication de l'album ?,
         // remplacement ? » — doit trouver sa réponse dans le contrat serveur.
-        let d = delivery_descriptor();
+        let d = delivery_descriptor(&[]);
         assert_eq!(
             d["mode"], "zip_download",
             "le résultat sort en archive téléchargeable, l'écran doit pouvoir le dire"
@@ -1614,7 +1832,7 @@ mod tests {
     fn le_dossier_dun_travail_reste_sous_la_racine_annoncee() {
         // Témoin anti-dérive : si quelqu'un déplace la sortie sans corriger
         // l'annonce, l'écran mentirait. Ce test devient rouge d'abord.
-        let announced = delivery_descriptor()["output_root"]
+        let announced = delivery_descriptor(&[])["output_root"]
             .as_str()
             .expect("output_root est une chaîne")
             .to_string();
@@ -1635,7 +1853,8 @@ mod tests {
     async fn capabilities_conserve_formats_et_outils_en_plus_de_la_destination() {
         // Témoin anti-régression : l'ajout de `delivery` ne doit rien retirer
         // du contrat de #1524 (grisage des formats indisponibles).
-        let payload = capabilities_payload().await;
+        let racines = vec!["/mnt/musique".to_string()];
+        let payload = capabilities_payload(&racines).await;
         assert!(payload["formats"]["flac"].is_boolean());
         assert!(payload["formats"]["mp3"].is_boolean());
         assert!(payload["tools"].is_object(), "bloc tools conservé");
@@ -1645,7 +1864,60 @@ mod tests {
                 .is_some_and(|t| t.contains_key("ffmpeg")),
             "diagnostic ffmpeg conservé"
         );
-        assert_eq!(payload["delivery"], delivery_descriptor());
+        assert_eq!(payload["delivery"], delivery_descriptor(&racines));
+    }
+
+    /// #2944 — LE témoin anti-régression du ticket : sans `destination`, le
+    /// mode historique ne bouge pas d'un octet. Même dossier de sortie, même
+    /// racine annoncée, mêmes quatre champs de #2943.
+    ///
+    /// C'est la promesse la plus importante de ce changement : la très grande
+    /// majorité des travaux (« traiter des albums au fil de l'eau », l'usage
+    /// n° 2 de l'issue) continue de passer par l'archive.
+    #[test]
+    fn sans_destination_le_mode_historique_ne_change_pas() {
+        let job_id = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(
+            job_output_dir(job_id),
+            PathBuf::from(CONVERT_OUTPUT_ROOT).join(job_id),
+            "la sortie par défaut a bougé"
+        );
+        let d = delivery_descriptor(&[]);
+        assert_eq!(d["mode"], "zip_download");
+        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
+        assert_eq!(d["writes_to_library"], false);
+        assert_eq!(d["modifies_sources"], false);
+    }
+
+    /// Un serveur sans racine déclarée annonce un périmètre VIDE — et une liste
+    /// vide n'est pas une absence de champ : l'écran doit pouvoir dire « ce
+    /// serveur n'accepte aucune destination », au lieu de proposer un dossier
+    /// que le serveur refusera après coup.
+    #[test]
+    fn le_perimetre_d_ecriture_est_annonce_et_vide_par_defaut() {
+        let d = delivery_descriptor(&[]);
+        assert_eq!(d["destination"]["supported"], true);
+        assert_eq!(
+            d["destination"]["roots"],
+            json!([]),
+            "aucune racine déclarée ⇒ aucune destination acceptée"
+        );
+        assert_eq!(d["destination"]["requires_admin"], true);
+        assert_eq!(
+            d["destination"]["overwrites_existing"], false,
+            "un fichier déjà présent n'est jamais écrasé"
+        );
+        assert_eq!(d["destination"]["zip_download_available"], false);
+        assert_eq!(
+            d["destination"]["root_setting"],
+            crate::routes::convert_destination::CLE_RACINE_DE_TRAVAIL
+        );
+
+        let d = delivery_descriptor(&["/mnt/musique".to_string()]);
+        assert_eq!(d["destination"]["roots"], json!(["/mnt/musique"]));
+        // Et le mode par défaut n'a pas bougé pour autant.
+        assert_eq!(d["mode"], "zip_download");
+        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
     }
 
     /// La carte web commitée, la même que lit `tests/web_response_contracts.rs`.
@@ -1687,6 +1959,7 @@ mod tests {
             errors: Vec::new(),
             output_dir: PathBuf::from("/tmp/tune-convert/temoin"),
             output_bytes: 128_400_000,
+            destination_serveur: false,
         }
     }
 
@@ -1779,6 +2052,63 @@ mod tests {
         assert_eq!(taille_lisible(1_000), "1.0 kB");
         assert_eq!(taille_lisible(128_400_000), "128.4 MB");
         assert_eq!(taille_lisible(2_500_000_000), "2.5 GB");
+    }
+
+    /// Le garde-fou de la fusion : #3002 et #2944 tiennent dans le MÊME corps.
+    ///
+    /// Les deux correctifs sont arrivés dans le lot `batch/p2-recentes-1` en
+    /// partant chacun de son propre `json!({…})` dans `job_status`. Résoudre le
+    /// conflit en gardant l'une ou l'autre version **compile parfaitement** et
+    /// rend l'autre silencieusement muet — aucune porte existante ne s'en
+    /// apercevait : le contrat web (`docs/contrat-web.json`) ne connaît que les
+    /// champs de #3002, et les tests de #2944 portaient sur les gardes de
+    /// destination, pas sur le corps du statut.
+    ///
+    /// Ce test est la seule chose qui rougit si l'un des deux jeux de champs
+    /// disparaît d'une future résolution. Il les nomme donc explicitement,
+    /// plutôt que de compter des clés.
+    #[test]
+    fn le_statut_porte_les_deux_correctifs_du_lot() {
+        // Mode historique : sortie dans /tmp, archive ZIP disponible.
+        let zip = payload_statut("j", &job_temoin(JobStatus::Completed, 4));
+        for champ in ["state", "progress", "converted", "download_size", "error"] {
+            assert!(
+                zip.get(champ).is_some(),
+                "#3002 perdu à la fusion : `{champ}` absent du corps — la barre \
+                 repart à 0 % et le bouton de téléchargement ne s'affiche plus \
+                 jamais. corps={zip}"
+            );
+        }
+        for champ in ["destination", "zip_download_available"] {
+            assert!(
+                zip.get(champ).is_some(),
+                "#2944 perdu à la fusion : `{champ}` absent du corps — l'écran ne \
+                 sait plus où le serveur a rangé le résultat ni s'il existe une \
+                 archive. corps={zip}"
+            );
+        }
+        assert!(
+            zip["destination"].is_null(),
+            "sans destination serveur, il n'y a rien à publier : `null`"
+        );
+        assert_eq!(zip["zip_download_available"], true);
+
+        // Mode #2944 : le serveur a rangé le résultat lui-même, pas d'archive.
+        let mut range = job_temoin(JobStatus::Completed, 4);
+        range.destination_serveur = true;
+        range.output_dir = PathBuf::from("/mnt/musique/converti");
+        let range = payload_statut("j", &range);
+        assert_eq!(range["destination"], "/mnt/musique/converti");
+        assert_eq!(
+            range["zip_download_available"], false,
+            "un travail rangé sur le serveur n'a pas d'archive : le dire est \
+             tout l'objet de #2944"
+        );
+        // …et les champs de #3002 restent renseignés dans ce mode-là aussi :
+        // la progression et l'état ne dépendent pas du mode de livraison.
+        assert_eq!(range["state"], "done");
+        assert_eq!(range["progress"], 100.0);
+        assert_eq!(range["converted"], 4);
     }
 
     #[test]

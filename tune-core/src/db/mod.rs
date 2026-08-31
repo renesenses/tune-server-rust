@@ -24,6 +24,8 @@ pub mod models;
 pub mod pg_migrate;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_schema_parity;
+#[cfg(all(test, feature = "postgres"))]
+mod pg_sqlite_type_parity;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 #[cfg(feature = "postgres")]

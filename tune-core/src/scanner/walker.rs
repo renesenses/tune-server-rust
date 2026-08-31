@@ -565,6 +565,10 @@ pub fn list_audio_files_avec_progression(
     // trouble (NAS died mid-walk) — protect the entire root instead of
     // accumulating an unbounded list.
     const MAX_ERROR_SCOPES: usize = 50;
+    // Lignes nominatives émises pour les ISO SACD non extraits avant de passer
+    // au récapitulatif. Même valeur que le plafond des erreurs de parcours :
+    // assez pour montrer des exemples, pas assez pour noyer le journal.
+    const MAX_ISO_WARN: usize = 5;
     // Horloge des annonces de progression, partagée par TOUTES les racines :
     // la cadence doit valoir pour le parcours entier, pas se réarmer à chaque
     // racine. Initialisée dans le passé pour qu'une première annonce parte
@@ -632,6 +636,7 @@ pub fn list_audio_files_avec_progression(
 
         let mut dir_file_count = 0usize;
         let mut dir_error_count = 0usize;
+        let mut dir_iso_error_count = 0usize;
 
         let walker = WalkDir::new(&normalized)
             .follow_links(true)
@@ -733,18 +738,83 @@ pub fn list_audio_files_avec_progression(
 
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         // ISO SACD: extract DSF tracks instead of adding the ISO directly
-                        if ext.eq_ignore_ascii_case("iso")
-                            && crate::audio::iso_sacd::is_sacd_iso(path)
-                        {
-                            match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
-                                Ok(dsf_files) => {
-                                    dir_file_count += dsf_files.len();
-                                    files.extend(dsf_files);
+                        if ext.eq_ignore_ascii_case("iso") {
+                            if crate::audio::iso_sacd::is_sacd_iso(path) {
+                                match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
+                                    Ok(dsf_files) => {
+                                        dir_file_count += dsf_files.len();
+                                        files.extend(dsf_files);
+                                    }
+                                    Err(e) => {
+                                        // Le fichier n'entre en base par AUCUN
+                                        // chemin : ni comme ISO, ni comme
+                                        // pistes extraites. Il doit donc être
+                                        // COMPTÉ et NOMMÉ dans le rapport de
+                                        // scan, faute de quoi l'album
+                                        // disparaît sans qu'aucun écran ne le
+                                        // dise — 22 albums SACD chez JeromeQ,
+                                        // pour la seule trace d'un `warn!`
+                                        // dans un fichier de journal (#2992).
+                                        dir_iso_error_count += 1;
+                                        // Quelques lignes détaillées, puis un
+                                        // récapitulatif : un `warn!` par
+                                        // fichier noierait le journal.
+                                        if dir_iso_error_count <= MAX_ISO_WARN {
+                                            warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
+                                        }
+                                        *skipped_by_ext
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert(0) += 1;
+                                        // Le motif technique exact accompagne
+                                        // le CHEMIN — « sacd_extract not
+                                        // found » et « sacd_extract failed »
+                                        // ne demandent pas le même geste.
+                                        pousser_chemin_ecarte(
+                                            &mut skipped_paths,
+                                            format!("{} ({e})", path.display()),
+                                        );
+                                        skipped_reasons
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert_with(|| {
+                                                crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
+                                                    .to_string()
+                                            });
+                                        dir_error_count += 1;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
-                                    dir_error_count += 1;
-                                }
+                            } else {
+                                // `.iso` sans zone SACD : une image de données.
+                                // Elle ne devient pas une piste — la pousser
+                                // dans `files` enverrait une image
+                                // d'installation de 5 Go traverser la phase de
+                                // métadonnées pour finir en piste fantôme.
+                                // Elle est écartée, mais NOMMÉE (#2992).
+                                *skipped_by_ext
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert(0) += 1;
+                                pousser_chemin_ecarte(
+                                    &mut skipped_paths,
+                                    format!(
+                                        "{} ({})",
+                                        path.display(),
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD
+                                    ),
+                                );
+                                skipped_reasons
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert_with(|| {
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD.to_string()
+                                    });
                             }
                         } else {
                             files.push(path.to_path_buf());
@@ -786,6 +856,17 @@ pub fn list_audio_files_avec_progression(
                 dir = %normalized,
                 total_errors = dir_error_count,
                 "scan_walk_errors_truncated — additional walk errors suppressed"
+            );
+        }
+
+        // Même patron que ci-dessus : quelques lignes nominatives plafonnées,
+        // puis une ligne qui porte le TOTAL. Sans elle, le journal de JeromeQ
+        // aurait montré cinq ISO là où vingt-deux albums manquaient (#2992).
+        if dir_iso_error_count > MAX_ISO_WARN {
+            warn!(
+                dir = %normalized,
+                total_errors = dir_iso_error_count,
+                "sacd_iso_extract_errors_truncated — additional SACD ISO failures suppressed"
             );
         }
 
@@ -1466,6 +1547,159 @@ mod tests {
             !ecartes.contains("temoin.flac"),
             "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
         );
+    }
+
+    /// Écrit une image `.iso` creuse de plus de 4 Mo, avec ou sans Master TOC.
+    ///
+    /// Plus de 4 Mo à dessein : c'est le seuil de l'ancien `is_sacd_iso`, celui
+    /// qui prenait toute image de données pour un SACD. Une fixture plus petite
+    /// laisserait la contre-épreuve passer par un autre chemin que celui du
+    /// défaut (#2992).
+    fn image_iso_de_test(dossier: &std::path::Path, nom: &str, sacd: bool) -> std::path::PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        fichier.seek(SeekFrom::Start(0x800 * 510)).unwrap();
+        fichier
+            .write_all(if sacd { b"SACDMTOC" } else { b"CD001\0\0\0" })
+            .unwrap();
+        // Fichier creux : la taille est annoncée, les octets ne sont pas
+        // écrits — le test ne consomme pas 4 Mo sur disque.
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin
+    }
+
+    /// Un ISO qui n'entre pas en base doit être COMPTÉ et NOMMÉ (#2992).
+    ///
+    /// Vingt-deux albums SACD de JeromeQ ont disparu de sa bibliothèque sans
+    /// qu'aucun écran ne le dise : la branche `Err` de l'extraction émettait un
+    /// `warn!` et n'alimentait aucun compteur du rapport de scan. Un scan qui
+    /// rend « fichiers=N, erreurs=0 » alors que vingt-deux fichiers ne sont
+    /// jamais entrés est un mensonge.
+    #[test]
+    fn les_iso_ecartes_sont_comptes_et_nommes_dans_le_rapport() {
+        // Sous `target/`, jamais sous `/tmp` : `is_tune_temp_file` écarte tout
+        // ce qui vit dans le dossier temporaire du système, et une fixture
+        // posée là ne serait jamais parcourue. Nom suffixé de la clé de tâche
+        // pour ne pas détruire la fixture d'un autre agent.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_iso_ecartes_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.as_path();
+
+        // Une image portant bien un Master TOC SACD. L'extraction échouera —
+        // `sacd_extract` n'est pas fourni avec Tune, et le contenu est creux —
+        // et c'est exactement le cas du journal de JeromeQ.
+        image_iso_de_test(base, "Breakfast In America.iso", true);
+        // Le faux positif du même journal : une image d'installation.
+        image_iso_de_test(base, "ubuntu-26.04-desktop-amd64.iso", false);
+        std::fs::write(base.join("temoin.flac"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(base);
+
+        // Aucun des deux ISO ne devient une piste : ni comme ISO brut, ni comme
+        // pistes extraites. C'est le fait à expliquer, pas à taire.
+        assert_eq!(
+            result.files.len(),
+            1,
+            "seul le .flac est une piste ; les deux ISO doivent rester dehors.\n\
+             Fichiers retenus : {:?}",
+            result.files
+        );
+        assert!(result.files[0].ends_with("temoin.flac"));
+
+        // 1) L'ISO SACD non extrait est compté sous sa propre clé.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD),
+            Some(&1),
+            "sans ce compteur, le rapport annonce « erreurs : 0 » et l'album \
+             disparaît en silence.\nCompteurs obtenus : {:?}",
+            result.skipped_by_ext
+        );
+        // 2) L'image de données est comptée à part : ce n'est pas le même
+        //    problème et ce n'est pas le même geste pour l'utilisateur.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES),
+            Some(&1),
+            "une image ISO sans zone SACD doit être signalée comme non audio, \
+             pas confondue avec un SACD illisible.\nCompteurs : {:?}",
+            result.skipped_by_ext
+        );
+
+        // 3) Les motifs sont rendus en clair : « sacd_extract » ne dit rien à
+        //    qui lit un rapport de scan.
+        let motif_sacd = result
+            .skipped_reasons
+            .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            motif_sacd.contains("ISO SACD"),
+            "le motif doit nommer le format concerné : {motif_sacd:?}"
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES)
+                .is_some_and(|motif| motif.contains("pas de l'audio")),
+            "motifs obtenus : {:?}",
+            result.skipped_reasons
+        );
+
+        // 4) LESQUELS, pas seulement COMBIEN — « 22 ISO écartés » ne permet pas
+        //    de retrouver un album.
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("Breakfast In America.iso"),
+            "le chemin du SACD écarté doit figurer au rapport\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("ubuntu-26.04-desktop-amd64.iso"),
+            "le chemin de l'image de données doit y figurer aussi\n{ecartes}"
+        );
+        // Le motif technique exact accompagne le chemin : « outil absent » et
+        // « extraction en échec » n'appellent pas la même réponse.
+        assert!(
+            ecartes.contains("sacd_extract"),
+            "la cause technique doit accompagner le chemin\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Témoin anti-régression : sans ISO, le parcours rend exactement ce qu'il
+    /// rendait — aucun compteur d'écart n'apparaît de nulle part (#2992).
+    #[test]
+    fn une_bibliotheque_sans_iso_ne_gagne_aucun_ecart() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_iso_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for nom in ["a.flac", "b.mp3", "c.dsf"] {
+            std::fs::write(base.join(nom), b"fixture").unwrap();
+        }
+        std::fs::write(base.join("cover.jpg"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 3);
+        assert!(
+            result.skipped_by_ext.is_empty(),
+            "aucun écart ne doit être inventé sur une bibliothèque saine : {:?}",
+            result.skipped_by_ext
+        );
+        assert!(result.skipped_paths.is_empty());
+        assert!(result.error_dirs.is_empty());
     }
 
     /// Le plafond borne la liste, et le compteur reste exhaustif (#2050).

@@ -1,0 +1,98 @@
+# .mailmap — table de correspondance des identités Git du dépôt
+#
+# POURQUOI CE FICHIER (issue #2781)
+#
+# 551 commits du dépôt portent le couple `Bertrand <jp@robbe.net>` : le NOM
+# est celui de Bertrand, l'ADRESSE est celle de Jean-Philippe. GitHub et
+# `git shortlog` attribuent par l'adresse, donc ces 551 commits — dont les
+# commits de bump `chore(release): 0.9.xxx` de chaque train — apparaissent
+# au nom de Jean-Philippe. La preuve la plus nette tient dans un seul train :
+# le commit de bump de la v0.9.125 est signé `Bertrand <jp@robbe.net>` alors
+# que le TAG annoté du même train, posé dans la foulée par la même personne,
+# porte `renesenses <renesenses@gmail.com>`.
+#
+# La cause est une configuration `user.email` héritée dans le clone (ou des
+# variables GIT_AUTHOR_*/GIT_COMMITTER_*) au moment du `git commit` de bump.
+# Aucun workflow n'est en cause : `changelog.yml`, `release.yml` et
+# `rollback.yml` commitent tous sous `renesenses-bot@users.noreply.github.com`.
+# Le marqueur `Co-Authored-By: Claude` est hors de cause : c'est un trailer de
+# message, il ne touche jamais les en-têtes `author`/`committer`.
+#
+# La RÉCIDIVE est déjà bloquée par la PR #2789 (garde-fou dans
+# `scripts/bump-all.sh` et contrôle `release_identity` du preflight).
+# Ce fichier traite l'autre moitié : l'HISTORIQUE DÉJÀ PUBLIÉ.
+#
+# POURQUOI UN .mailmap ET PAS UNE RÉÉCRITURE
+#
+# Corriger 551 commits par `filter-repo` réécrirait tous les SHA d'une ligne
+# de release partagée : tags cassés, clones divergents, opération
+# irréversible. Le `.mailmap` corrige l'AFFICHAGE (`git log`, `git shortlog`,
+# `git blame`, et tout outil bâti sur Git) sans toucher un seul objet.
+#
+# PORTÉE EXACTE — À NE PAS SURESTIMER
+#
+# Git applique ce fichier aux marqueurs MAJUSCULES (`%aN`, `%aE`, `%cN`,
+# `%cE`) ; les marqueurs minuscules (`%an`, `%ae`…) restent bruts. C'est
+# voulu, et c'est ce qui préserve le garde-fou de la PR #2789 : le contrôle
+# `release_identity` du preflight lit `--format=%an%x00%ae%x00%cn%x00%ce`,
+# donc il continue de VOIR les couples mélangés et de refuser un train.
+# Ce fichier répare l'affichage ; il n'aveugle pas la garde.
+#
+# En revanche l'interface web de GitHub n'implémente PAS `.mailmap` : elle
+# relie un commit à un compte par l'adresse enregistrée. Les 551 commits
+# resteront donc rattachés à `jprobbe` sur github.com. Seule une réécriture
+# d'historique changerait cela, et elle est hors de question sur une ligne
+# de release partagée. La correction est donc réelle côté Git et locale à
+# Git — la dire complète serait mentir.
+#
+# LA FORME EST CRITIQUE
+#
+# `jp@robbe.net` est une adresse LÉGITIME : 318 commits de
+# `Jean-Philippe ROBBE <jp@robbe.net>` en dépendent. Une ligne qui
+# remapperait l'adresse seule (`<jp@robbe.net>`) réaffecterait donc à tort
+# le travail réel de Jean-Philippe à Bertrand — elle transformerait une
+# erreur d'attribution en une autre, symétrique.
+#
+# Toutes les lignes ci-dessous utilisent donc la forme la plus étroite,
+#     Nom canonique <adresse canonique> Ancien nom <ancienne adresse>
+# qui n'apparie QUE le couple (nom, adresse) exact et laisse intacts tous
+# les autres porteurs de la même adresse.
+#
+# Ce fichier ne fusionne pas les alias honnêtes des autres contributeurs
+# (Xavijol, herisson-88) : ils ne relèvent pas d'une attribution fautive.
+
+
+# ── Bertrand Clech — compte GitHub « renesenses » ────────────────────────
+#
+# Les deux premières lignes réparent l'attribution fautive de #2781 : nom de
+# Bertrand, adresse de Jean-Philippe. Elles sont la raison d'être du fichier.
+renesenses <renesenses@gmail.com> Bertrand <jp@robbe.net>
+renesenses <renesenses@gmail.com> renesenses <jp@robbe.net>
+#
+# Alias honnêtes du même auteur, regroupés pour que `git shortlog -sne` cesse
+# de le compter comme quatre personnes.
+renesenses <renesenses@gmail.com> <bertrand.clech@oclock.school>
+renesenses <renesenses@gmail.com> <renesenses@users.noreply.github.com>
+renesenses <renesenses@gmail.com> Bertrand <renesenses@gmail.com>
+
+
+# ── Jean-Philippe ROBBE — compte GitHub « jprobbe » ──────────────────────
+#
+# Aucune de ces lignes ne retire de commit à Jean-Philippe : elles unifient
+# ses propres variantes de nom et ses adresses professionnelles.
+Jean-Philippe ROBBE <jp@robbe.net> <jp@cogenio.com>
+Jean-Philippe ROBBE <jp@robbe.net> <jean-philippe.robbe-ext@odealim.fr>
+Jean-Philippe ROBBE <jp@robbe.net> jprobbe <jp@robbe.net>
+Jean-Philippe ROBBE <jp@robbe.net> Jean-Philippe Robbe <jp@robbe.net>
+
+
+# ── Claude ───────────────────────────────────────────────────────────────
+#
+# Même défaut, même remède : 7 commits signés `Claude` portent l'adresse de
+# Jean-Philippe et lui sont donc attribués. Ils sont ramenés à l'identité
+# canonique de Claude, sans être fusionnés dans une identité humaine.
+#
+# La signature `Claude - Mozaiklabs` n'est délibérément PAS fusionnée : elle
+# distingue un contexte de travail. Et la question éditoriale « qui signe les
+# notes de version » relève de l'issue #2779, pas de ce fichier.
+Claude <noreply@anthropic.com> Claude <jp@robbe.net>

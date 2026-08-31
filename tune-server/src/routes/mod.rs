@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
 pub mod connect;
+pub(crate) mod convert_destination;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;

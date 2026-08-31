@@ -201,6 +201,115 @@ pub fn find_cached(cache_dir: &Path, hash: &str) -> Option<(PathBuf, &'static st
     None
 }
 
+/// Tailles de vignette réellement servables.
+///
+/// C'est une liste **fermée**, et c'est le point important : la taille arrive
+/// du client, qui l'interpole telle quelle dans l'URL (`?size=${size}`, sans
+/// borne ni contrôle côté client). Une taille reçue ne choisit donc jamais une
+/// allocation, elle choisit une case dans cette liste. `?size=100000` ne peut
+/// pas faire décoder ni allouer une image de 100 000 pixels de côté.
+///
+/// Les trois premières valeurs sont celles que le client émet réellement
+/// (80 sur le tableau de bord, 128 pour l'icône de notification, 200 sur
+/// toutes les grilles) ; 400 donne la marge pour les vignettes de détail.
+pub const THUMB_SIZES: &[u32] = &[80, 128, 200, 400];
+
+/// Case de vignette pour une taille demandée : la plus petite case qui couvre
+/// la demande. `None` au-delà de la dernière case — on sert alors l'original,
+/// c'est-à-dire exactement le comportement d'avant.
+pub fn thumb_bucket(requested: u32) -> Option<u32> {
+    THUMB_SIZES.iter().copied().find(|&b| b >= requested)
+}
+
+/// Répertoire des vignettes d'une case.
+///
+/// La taille est un **composant de chemin** pris dans [`THUMB_SIZES`], jamais
+/// concaténée au condensat dans un nom de fichier. Deux cases écrivent donc
+/// dans deux répertoires distincts et deux condensats dans deux fichiers
+/// distincts : aucune paire (condensat, taille) ne peut produire le chemin
+/// d'une autre. C'est la leçon de #1444 — une clé dérivée par concaténation se
+/// collisionne, une clé structurée par le système de fichiers non.
+///
+/// Le sous-répertoire `resized/` reste sous le cache : purger le cache purge
+/// les vignettes avec lui, sans quoi une vignette survivrait à son original.
+pub fn thumb_dir(cache_dir: &Path, bucket: u32) -> PathBuf {
+    cache_dir.join("resized").join(bucket.to_string())
+}
+
+/// Chemin de la vignette d'un condensat dans une case.
+pub fn thumb_path(cache_dir: &Path, bucket: u32, hash: &str) -> PathBuf {
+    thumb_dir(cache_dir, bucket).join(format!("{hash}.jpg"))
+}
+
+/// Fabrique la vignette JPEG d'une image, ou `None` s'il ne faut pas la servir.
+///
+/// `None` dans trois cas, tous « servir l'original » et non « erreur » :
+/// - format non décodable (WebP et BMP sont dans [`CACHE_EXTENSIONS`] mais
+///   `image` n'est compilé qu'avec `jpeg` et `png`) ;
+/// - image déjà plus petite ou égale à la case — on n'agrandit jamais, une
+///   vignette plus lourde que son original n'aurait aucun sens ;
+/// - image hors bornes de décodage.
+///
+/// Les bornes de décodage sont explicites : au-delà de 8192 pixels de côté ou
+/// de 256 Mio d'allocation, on refuse de décoder plutôt que de laisser une
+/// entrée de cache inattendue dicter la mémoire du processus.
+pub fn make_thumbnail(src: &[u8], bucket: u32) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+
+    let mut reader = image::ImageReader::new(Cursor::new(src))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+
+    if img.width().max(img.height()) <= bucket {
+        return None;
+    }
+
+    let vignette = img.thumbnail(bucket, bucket).to_rgb8();
+    let mut out = Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 82)
+        .encode(
+            vignette.as_raw(),
+            vignette.width(),
+            vignette.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(out.into_inner())
+}
+
+/// Écrit une vignette dans le cache, par fichier temporaire puis `rename`.
+///
+/// Deux requêtes concurrentes sur la même pochette fabriquent la même vignette
+/// en même temps ; sans le `rename`, la seconde lirait ce que la première est
+/// en train d'écrire. Le `rename` est atomique, la lecture voit donc soit rien,
+/// soit un fichier complet. Un échec d'écriture n'est pas une erreur de
+/// service : la vignette est déjà en main, seule sa mise en cache est perdue.
+pub fn store_thumbnail(cache_dir: &Path, bucket: u32, hash: &str, bytes: &[u8]) {
+    let dir = thumb_dir(cache_dir, bucket);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!(
+        "{hash}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::write(&tmp, bytes).is_ok()
+        && std::fs::rename(&tmp, thumb_path(cache_dir, bucket, hash)).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         warn!(

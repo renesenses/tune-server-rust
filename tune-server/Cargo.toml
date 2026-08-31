@@ -99,6 +99,10 @@ chrono = { workspace = true }
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+# Test-only : fabriquer de vraies pochettes JPEG/PNG et relire les dimensions
+# servies, pour que la contre-épreuve de `?size=` porte sur des pixels et non
+# sur une longueur d'octets (#2996).
+image = { workspace = true }
 # Test-only : `#[tokio::test(start_paused = true)]`. La sonde d'avancement des
 # images d'artistes se relit toutes les trois secondes et la passe qu'elle
 # observe dure des heures — sans horloge virtuelle, l'éprouver coûterait ce
