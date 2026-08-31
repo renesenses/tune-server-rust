@@ -1412,19 +1412,16 @@ impl AlbumRepo {
     /// chaque piste, donc n'importe laquelle répond — encore faut-il qu'elle
     /// réponde TOUJOURS LA MÊME, sans quoi deux pages successives trieraient
     /// le même album à deux places différentes.
+    ///
+    /// ⚠️ La règle elle-même (clé, gardes, `MAX`) vit désormais dans
+    /// [`crate::db::facet_filter::dr_album_source`] : le rail de facettes et la
+    /// liste de pistes filtrée en ont besoin MOT POUR MOT (#2144). Recopiée,
+    /// elle aurait fatalement dérivé, et une facette qui compte autrement que
+    /// la liste qu'elle filtre est pire qu'une facette absente.
     pub(crate) fn dr_album_join(engine: Engine) -> String {
-        let only_digits = match engine {
-            // SQLite n'a pas de `~` ; GLOB est son motif sensible à la casse,
-            // et `[^0-9]` y est une classe de caractères niée.
-            Engine::Sqlite => "tm.value NOT GLOB '*[^0-9]*'",
-            Engine::Postgres => "tm.value ~ '^[0-9]+$'",
-        };
         format!(
-            "LEFT JOIN (SELECT t.album_id AS album_id, MAX(CAST(tm.value AS INTEGER)) AS dr \
-               FROM track_metadata tm JOIN tracks t ON t.id = tm.track_id \
-              WHERE tm.key = 'dr_album' AND tm.value <> '' \
-                AND LENGTH(tm.value) <= 3 AND {only_digits} \
-              GROUP BY t.album_id) dr ON dr.album_id = a.id"
+            "LEFT JOIN ({}) dr ON dr.album_id = a.id",
+            crate::db::facet_filter::dr_album_source(engine)
         )
     }
 
@@ -3666,7 +3663,12 @@ mod tests {
         );
 
         for sql in [&sqlite, &pg] {
-            assert!(sql.contains("GROUP BY t.album_id"), "{sql}");
+            // ⚠️ `tdr` et non `t` depuis #2144 : la même table dérivée sert
+            // maintenant le rail de facettes, dont la requête ENGLOBANTE a
+            // déjà `t` pour alias de `tracks`. Un `t` interne l'aurait masqué,
+            // et le prédicat serait devenu toujours vrai.
+            assert!(sql.contains("GROUP BY tdr.album_id"), "{sql}");
+            assert!(!sql.contains("tracks t "), "alias interne réservé : {sql}");
             assert!(sql.contains("CAST(tm.value AS INTEGER)"), "{sql}");
             assert!(
                 sql.contains("LENGTH(tm.value) <= 3"),
