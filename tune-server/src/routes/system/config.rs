@@ -252,10 +252,27 @@ pub(super) async fn get_config(
             serde_json::to_value(tune_core::outputs::local::supported_backends())
                 .unwrap_or_else(|_| json!([])),
         );
+        // #2868 — la CAPACITÉ, à côté du RÉGLAGE `local_exclusive_mode` publié
+        // plus haut. Même intention que `supported_audio_backends` (#1268) : le
+        // client n'a pas à déduire d'un nom de plateforme si la bascule « mode
+        // exclusif » a un sens, il le lit.
+        //
+        // Le prédicat lui-même était faux : il exigeait la feature `asio`,
+        // alors que la branche WASAPI exclusive est compilée sur TOUT Windows.
+        // Un Windows sans `asio` s'entendait donc répondre « non supporté »
+        // pour une capacité qu'il avait.
+        config.insert(
+            "local_exclusive_mode_supported".to_string(),
+            json!(tune_core::outputs::local::LocalOutput::supports_exclusive_mode()),
+        );
     }
     #[cfg(not(feature = "local-audio"))]
     {
         config.insert("supported_audio_backends".to_string(), json!([]));
+        // Sans `local-audio`, il n'y a pas de sortie locale du tout — donc pas
+        // de mode exclusif. On le dit au lieu d'omettre la clé : une clé
+        // absente se lit « je ne sais pas », pas « non ».
+        config.insert("local_exclusive_mode_supported".to_string(), json!(false));
     }
     config
         .entry("server_version".to_string())

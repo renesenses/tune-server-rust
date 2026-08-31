@@ -1702,9 +1702,16 @@ impl LocalOutput {
         self.convolver_config.lock().unwrap().is_some()
     }
 
-    /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
+    /// Le mode exclusif / bit-perfect est-il disponible sur CETTE cible ?
+    ///
+    /// Le verdict vient de [`exclusive_mode_support`], à qui la plateforme est
+    /// **passée** : sans cela la décision Windows ne serait compilée que sous
+    /// Windows et aucun test joué ailleurs ne pourrait la contredire — même
+    /// raison que pour [`sample_rate_evidence`] (#2862), même angle mort que
+    /// #1837 et #2056. Ce site est le seul à lire la valeur réelle de la
+    /// machine.
     pub fn supports_exclusive_mode() -> bool {
-        cfg!(target_os = "macos") || cfg!(all(target_os = "windows", feature = "asio"))
+        exclusive_mode_support(std::env::consts::OS, cfg!(feature = "asio")).any()
     }
 
     pub fn set_pending_start_position_ms(&self, position_ms: u64) {
@@ -7573,6 +7580,80 @@ pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
     }
 }
 
+/// Quels chemins de sortie **exclusive** sont réellement COMPILÉS pour une
+/// cible donnée.
+///
+/// Ce n'est pas une opinion : chaque champ correspond à un `#[cfg]` de ce
+/// fichier, et à un seul.
+///
+/// | champ | branche | garde exacte |
+/// |---|---|---|
+/// | `coreaudio` | `coreaudio_exclusive::ExclusiveOutput` | `#[cfg(target_os = "macos")]` |
+/// | `asio` | `asio_exclusive::AsioExclusiveOutput` | `#[cfg(all(target_os = "windows", feature = "asio"))]` |
+/// | `wasapi` | `wasapi_exclusive::WasapiExclusiveOutput` | `#[cfg(target_os = "windows")]` — **sans condition de feature** |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExclusiveModeSupport {
+    /// macOS : hog mode CoreAudio.
+    pub coreaudio: bool,
+    /// Windows compilé avec la feature `asio`.
+    pub asio: bool,
+    /// Windows, quelle que soit la feature `asio`.
+    pub wasapi: bool,
+}
+
+impl ExclusiveModeSupport {
+    /// Aucun chemin exclusif compilé — le cas de Linux.
+    const AUCUN: Self = Self {
+        coreaudio: false,
+        asio: false,
+        wasapi: false,
+    };
+
+    /// Au moins un chemin exclusif existe sur cette cible.
+    pub fn any(self) -> bool {
+        self.coreaudio || self.asio || self.wasapi
+    }
+}
+
+/// Le mode exclusif est-il compilé, pour ce couple (système, feature `asio`) ?
+///
+/// La plateforme est un **paramètre**, jamais un `cfg!` refermé dans le corps —
+/// même raison que [`sample_rate_evidence`] : une décision Windows enfermée
+/// dans un `cfg!` n'est pas compilée sur Linux, et le test qui l'interroge y
+/// serait vert pour la mauvaise raison (l'angle mort de #1837 et #2056). Un
+/// seul appelant, [`LocalOutput::supports_exclusive_mode`], passe la valeur
+/// réelle de la machine.
+///
+/// **#2868** : la règle précédente était
+/// `cfg!(macos) || cfg!(all(windows, asio))`. Elle rendait `false` sur un
+/// Windows bâti **sans** la feature `asio` — alors que la branche WASAPI
+/// exclusive vit sous `#[cfg(target_os = "windows")]` seul et se prend dès que
+/// `exclusive_mode && audio_backend != "asio"`. L'utilisateur se voyait donc
+/// refuser une capacité que son binaire portait.
+///
+/// `target_os` est ce que rend `std::env::consts::OS`, c'est-à-dire le nom de
+/// cible (`"windows"`, `"macos"`, `"linux"`), en minuscules. Un système inconnu
+/// est classé sans mode exclusif : on ne prête pas un chemin à une cible dont
+/// on n'a pas écrit la branche.
+pub fn exclusive_mode_support(target_os: &str, asio_feature: bool) -> ExclusiveModeSupport {
+    match target_os {
+        "macos" => ExclusiveModeSupport {
+            coreaudio: true,
+            ..ExclusiveModeSupport::AUCUN
+        },
+        // La feature `asio` AJOUTE un chemin ; elle n'en conditionne aucun.
+        // WASAPI exclusif est là dans les deux cas.
+        "windows" => ExclusiveModeSupport {
+            coreaudio: false,
+            asio: asio_feature,
+            wasapi: true,
+        },
+        // Linux inclus : `asio_feature` seule ne compile RIEN, sa garde exige
+        // `target_os = "windows"` en plus.
+        _ => ExclusiveModeSupport::AUCUN,
+    }
+}
+
 /// Find a cpal StreamConfig that matches the desired channels and sample rate.
 ///
 /// When `supported_output_configs()` fails (PipeWire ALSA compat), falls back
@@ -8784,6 +8865,134 @@ mod tests {
              est toujours prise, needs_resample reste faux et rubato ne tourne \
              jamais. Elle doit au moins journaliser d'où vient cette \
              supposition (#2862)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2868 — Windows sans feature `asio` : le mode exclusif EXISTE
+    //
+    // Même famille que #2862 : ce que l'écran dit d'une capacité ne
+    // correspondait pas à ce que le binaire porte. La branche WASAPI exclusive
+    // vit sous `#[cfg(target_os = "windows")]` SEUL ; `supports_exclusive_mode`
+    // exigeait pourtant `feature = "asio"` pour l'admettre.
+    //
+    // Ces tests portent sur une fonction PURE dont la plateforme est un
+    // paramètre : ils contredisent réellement la décision Windows depuis Linux,
+    // au lieu d'être verts parce que la branche n'y est pas compilée (#1837,
+    // #2056).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn windows_sans_asio_garde_son_mode_exclusif_wasapi() {
+        let sans_asio = exclusive_mode_support("windows", false);
+        assert!(
+            sans_asio.wasapi,
+            "`WasapiExclusiveOutput` est gardé par `#[cfg(target_os = \
+             \"windows\")]` seul et se prend dès que `exclusive_mode && \
+             audio_backend != \"asio\"` : la feature `asio` ne le conditionne \
+             pas (#2868)"
+        );
+        assert!(
+            !sans_asio.asio,
+            "sans la feature, `AsioExclusiveOutput` n'est pas dans le binaire"
+        );
+        assert!(
+            sans_asio.any(),
+            "c'est le cœur de #2868 : un Windows bâti sans `asio` se voyait \
+             répondre « mode exclusif non supporté » alors que le chemin WASAPI \
+             exclusif était compilé et fonctionnel"
+        );
+
+        // Avec la feature, les DEUX chemins coexistent : ASIO ne remplace pas
+        // WASAPI exclusif, il s'y ajoute (le choix se fait sur `audio_backend`).
+        let avec_asio = exclusive_mode_support("windows", true);
+        assert!(avec_asio.asio && avec_asio.wasapi);
+        assert!(avec_asio.any());
+    }
+
+    /// Témoin anti-régression : les deux plateformes qui répondaient JUSTE
+    /// avant #2868 doivent répondre exactement pareil après.
+    #[test]
+    fn macos_et_linux_ne_bougent_pas_d_un_iota() {
+        for asio in [false, true] {
+            assert!(
+                exclusive_mode_support("macos", asio).coreaudio,
+                "macOS ouvre le hog mode CoreAudio sous `#[cfg(target_os = \
+                 \"macos\")]`, sans condition de feature"
+            );
+            assert!(exclusive_mode_support("macos", asio).any());
+
+            assert!(
+                !exclusive_mode_support("linux", asio).any(),
+                "aucune branche exclusive n'est compilée pour Linux : \
+                 l'annoncer serait la promesse fantôme que #2868 corrige, à \
+                 l'envers. `asio = {asio}` n'y change rien — la garde de la \
+                 branche ASIO exige `target_os = \"windows\"` EN PLUS de la \
+                 feature"
+            );
+        }
+
+        // Une cible dont personne n'a écrit la branche ne se voit pas prêter
+        // un chemin exclusif.
+        assert!(!exclusive_mode_support("freebsd", true).any());
+        assert!(!exclusive_mode_support("", true).any());
+    }
+
+    /// `std::env::consts::OS` est le seul vocabulaire que comprend
+    /// `exclusive_mode_support`. S'il rendait « Windows » ou « win32 », le
+    /// correctif retomberait silencieusement dans le bras « inconnu » et
+    /// n'aurait plus aucun effet — exactement le piège de casse relevé sur
+    /// `HostId::name()` en #2862. Ce test l'attrape sur la machine qui compile.
+    #[test]
+    fn le_nom_de_systeme_lu_est_celui_que_la_table_indexe() {
+        let os = std::env::consts::OS;
+        assert!(
+            ["linux", "macos", "windows"].contains(&os),
+            "`std::env::consts::OS` rend « {os} », absent de la table de \
+             exclusive_mode_support. Tant qu'il n'y figure pas, cette cible est \
+             classée « sans mode exclusif » — prudent, mais faux si elle porte \
+             une branche"
+        );
+        assert_eq!(
+            LocalOutput::supports_exclusive_mode(),
+            exclusive_mode_support(os, cfg!(feature = "asio")).any(),
+            "le prédicat public doit dire ce que dit la fonction pure, sinon \
+             la preuve ci-dessus ne parle pas du code appelé"
+        );
+    }
+
+    /// La règle ne doit pas se recomposer en `cfg!` dans le corps du prédicat :
+    /// elle redeviendrait invisible depuis Linux, et #2868 pourrait revenir
+    /// sans qu'aucun test ne rougisse.
+    ///
+    /// Les aiguilles sont assemblées à l'exécution — écrites en clair, elles
+    /// figureraient dans ce fichier et le test serait vert grâce à sa propre
+    /// source.
+    #[test]
+    fn le_predicat_de_mode_exclusif_ne_se_recompose_pas_en_cfg() {
+        let source = include_str!("local.rs");
+
+        let entete = ["pub fn supports_exclusive_mode()", " -> bool {"].concat();
+        let apres = source
+            .split_once(entete.as_str())
+            .expect("le prédicat public de mode exclusif a disparu")
+            .1;
+        // Découpe en CARACTÈRES : ce fichier est accentué, une coupe à l'octet
+        // près tomberait au milieu d'un caractère et paniquerait.
+        let corps: String = apres.chars().take(200).collect();
+
+        let appel = ["exclusive_mode_support(", "std::env::consts::OS"].concat();
+        assert!(
+            corps.contains(&appel),
+            "le prédicat doit déléguer à la fonction pure en lui PASSANT le \
+             système ; reçu : {corps}"
+        );
+        let cfg_os = ["cfg!(target_os", " = "].concat();
+        assert!(
+            !corps.contains(&cfg_os),
+            "un `cfg!(target_os …)` ici enferme à nouveau la décision Windows \
+             dans une branche non compilée ailleurs : c'est exactement ce qui a \
+             laissé passer #2868. Reçu : {corps}"
         );
     }
 

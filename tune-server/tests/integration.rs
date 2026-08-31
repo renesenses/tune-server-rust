@@ -927,6 +927,68 @@ async fn les_backends_audio_proposes_suivent_la_plateforme_du_serveur() {
     }
 }
 
+// #2868 — la capacité « mode exclusif » doit être LISIBLE, et dire vrai.
+//
+// `/system/config` publiait le réglage `local_exclusive_mode` mais pas la
+// capacité correspondante : le client ne pouvait que la deviner d'un nom de
+// plateforme. Et le prédicat qui l'établissait était faux — il exigeait la
+// feature `asio`, alors que la branche WASAPI exclusive est compilée sur TOUT
+// Windows.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_capacite_de_mode_exclusif_est_publiee_et_suit_la_plateforme() {
+    let app = make_app();
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+
+    let supporte = config
+        .get("local_exclusive_mode_supported")
+        .and_then(|v| v.as_bool())
+        .expect(
+            "/system/config doit publier `local_exclusive_mode_supported` : le \
+             réglage `local_exclusive_mode` est déjà là, la capacité qui dit \
+             s'il a un sens ne l'était pas (#2868)",
+        );
+
+    // Le réglage, lui, reste écrit et écrivable — on ajoute une lecture, on ne
+    // déplace rien.
+    assert!(
+        config.get("local_exclusive_mode").is_some(),
+        "le RÉGLAGE reste publié à côté de la CAPACITÉ"
+    );
+
+    // Le champ doit être BRANCHÉ sur le prédicat, pas recopié à côté : une
+    // constante posée là redirait « supporté » partout sans que rien ne rougisse.
+    assert_eq!(
+        supporte,
+        tune_core::outputs::local::LocalOutput::supports_exclusive_mode(),
+        "la charge utile doit dire ce que dit le prédicat, sur la MÊME cible et \
+         avec les MÊMES features"
+    );
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        !supporte,
+        "aucune branche exclusive n'est compilée pour Linux : l'annoncer \
+         serait une promesse fantôme"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        supporte,
+        "macOS ouvre le hog mode CoreAudio : la capacité existait avant #2868 \
+         et ne doit pas avoir bougé"
+    );
+    // Windows : la branche WASAPI exclusive est là même sans la feature `asio`
+    // — c'est précisément ce que #2868 corrige.
+    #[cfg(target_os = "windows")]
+    assert!(
+        supporte,
+        "sur Windows, `WasapiExclusiveOutput` est compilé sans condition de \
+         feature : répondre « non supporté » prive l'utilisateur d'une \
+         capacité qu'il a (#2868)"
+    );
+}
+
 // #1268, volet compatibilité : une bibliothèque migrée d'une machine Windows
 // peut arriver avec `local_audio_backend = "wasapi"` en base. Sur un serveur
 // non-Windows, la lecture joue déjà via le host par défaut (repli de
