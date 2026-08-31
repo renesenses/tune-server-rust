@@ -31,24 +31,24 @@ fn new_state() -> AppState {
 
 /// Base de travail jetable, à un chemin unique par test — jamais un nom fixe
 /// dans `temp_dir()`, deux tests en parallèle se marcheraient dessus.
-fn scratch_db() -> std::path::PathBuf {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("tune-i1999-{}-{nanos}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("library.db")
+///
+/// Le garde est rendu avec le chemin : tant qu'il vit, la base vit ; quand il
+/// sort de portée — panique comprise — le dossier disparaît. La composition à
+/// la main laissait un `tune-i1999-*` par exécution (#3030).
+fn scratch_db() -> (tune_core::test_scratch::ScratchDir, std::path::PathBuf) {
+    let dir = tune_core::test_scratch::scratch_dir("tune-i1999");
+    let db = dir.join("library.db");
+    (dir, db)
 }
 
 /// Écrit l'état d'une machine premium dont la dernière validation en ligne
 /// remonte à `days` jours, puis rend un routeur qui le relit **au démarrage**.
 /// Rien ne sort sur le réseau : c'est exactement le chemin du démarrage hors
 /// ligne, celui que personne n'avait relu.
-fn app_premium_validated_days_ago(days: i64) -> axum::Router {
-    let db_path = scratch_db();
+fn app_premium_validated_days_ago(
+    days: i64,
+) -> (axum::Router, tune_core::test_scratch::ScratchDir) {
+    let (base, db_path) = scratch_db();
     let db_path = db_path.to_str().unwrap().to_string();
 
     {
@@ -64,7 +64,7 @@ fn app_premium_validated_days_ago(days: i64) -> axum::Router {
     // Le LicenseManager lit les settings à sa construction : rouvrir la MÊME
     // base rejoue le démarrage d'une machine restée hors ligne.
     let state = AppState::new(&db_path, 0, Default::default()).unwrap();
-    tune_server::routes::router(state)
+    (tune_server::routes::router(state), base)
 }
 
 async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
@@ -104,7 +104,7 @@ async fn le_statut_porte_toujours_le_champ_de_grace() {
 
 #[tokio::test]
 async fn une_machine_hors_ligne_depuis_trois_jours_le_dit_et_reste_premium() {
-    let app = app_premium_validated_days_ago(3);
+    let (app, _base) = app_premium_validated_days_ago(3);
     let (_, body) = get_json(&app, STATUS).await;
     let g = &body["offline_grace"];
 
@@ -124,7 +124,7 @@ async fn une_machine_hors_ligne_depuis_trois_jours_le_dit_et_reste_premium() {
 async fn le_dernier_jour_annonce_encore_un_jour_entier() {
     // Un arrondi vers le bas afficherait « 0 jour » à un utilisateur encore
     // parfaitement premium.
-    let app = app_premium_validated_days_ago(13);
+    let (app, _base) = app_premium_validated_days_ago(13);
     let (_, body) = get_json(&app, STATUS).await;
     assert_eq!(body["offline_grace"]["days_remaining"], 1);
     assert_eq!(body["offline_grace"]["phase"], "grace");
@@ -133,7 +133,7 @@ async fn le_dernier_jour_annonce_encore_un_jour_entier() {
 
 #[tokio::test]
 async fn au_dela_de_quatorze_jours_la_reponse_explique_la_retombee() {
-    let app = app_premium_validated_days_ago(20);
+    let (app, _base) = app_premium_validated_days_ago(20);
     let (_, body) = get_json(&app, STATUS).await;
     assert_eq!(body["offline_grace"]["phase"], "expired");
     assert_eq!(body["offline_grace"]["days_remaining"], 0);
@@ -147,7 +147,7 @@ async fn la_reponse_de_grace_ne_contient_aucune_donnee_de_licence() {
     // La clé est un secret d'authentification (elle ouvre le support premium
     // côté mozaiklabs). Le bloc de grâce ne doit porter que des dates et des
     // compteurs.
-    let app = app_premium_validated_days_ago(3);
+    let (app, _base) = app_premium_validated_days_ago(3);
     let (_, body) = get_json(&app, STATUS).await;
     let brut = body["offline_grace"].to_string();
     assert!(

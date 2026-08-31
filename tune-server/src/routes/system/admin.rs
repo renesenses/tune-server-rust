@@ -444,12 +444,8 @@ FATAL meltdown";
 
     #[test]
     fn tail_window_drops_partial_first_line() {
-        // Unique temp path without external crates.
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "{}.log",
-            tune_core::test_scratch::scratch_name("tune_admin_errors_test")
-        ));
+        // Unique temp path without external crates, removed on drop (#3030).
+        let path = tune_core::test_scratch::scratch_file("tune_admin_errors_test", ".log");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "ERROR very-old-should-be-cut-by-window").unwrap();
         writeln!(f, "ERROR recent-one").unwrap();
@@ -466,8 +462,6 @@ FATAL meltdown";
             "partial first line must be dropped, got {lines:?}"
         );
         assert!(lines.iter().any(|l| l.contains("recent-one")));
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]

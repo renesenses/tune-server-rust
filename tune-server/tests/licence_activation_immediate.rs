@@ -32,16 +32,14 @@ const STATUS: &str = "/api/v1/cloud/license/status";
 
 /// Base de travail jetable, à un chemin unique par test — jamais un nom fixe
 /// dans `temp_dir()`, deux tests en parallèle se marcheraient dessus.
-fn scratch_db() -> std::path::PathBuf {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("tune-i1279-{}-{nanos}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("library.db")
+///
+/// Le garde est rendu avec le chemin : tant qu'il vit, la base vit ; quand il
+/// sort de portée — panique comprise — le dossier disparaît. La composition à
+/// la main laissait un `tune-i1279-*` par exécution (#3030).
+fn scratch_db() -> (tune_core::test_scratch::ScratchDir, std::path::PathBuf) {
+    let dir = tune_core::test_scratch::scratch_dir("tune-i1279");
+    let db = dir.join("library.db");
+    (dir, db)
 }
 
 /// Verdict que rend le faux serveur de licences.
@@ -89,8 +87,8 @@ async fn faux_serveur_de_licences(verdict: Verdict) -> (String, Arc<AtomicUsize>
 
 /// Un serveur Tune **froid** : base neuve, aucune clé, palier Free, et le
 /// serveur de licences redirigé vers le bouchon.
-fn serveur_froid(base_url: &str) -> axum::Router {
-    let db_path = scratch_db();
+fn serveur_froid(base_url: &str) -> (axum::Router, tune_core::test_scratch::ScratchDir) {
+    let (base, db_path) = scratch_db();
     let state = AppState::new(db_path.to_str().unwrap(), 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("mozaik_base_url", base_url).unwrap();
@@ -99,7 +97,7 @@ fn serveur_froid(base_url: &str) -> axum::Router {
         None,
         "l'état de départ doit être froid : aucune clé enregistrée"
     );
-    tune_server::routes::router(state)
+    (tune_server::routes::router(state), base)
 }
 
 async fn appeler(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -127,7 +125,7 @@ async fn activer(app: &axum::Router, cle: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn le_premier_essai_suffit_a_debloquer_premium() {
     let (base, appels) = faux_serveur_de_licences(Verdict::Premium).await;
-    let app = serveur_froid(&base);
+    let (app, _base) = serveur_froid(&base);
 
     let (status, body) = activer(&app, CLE).await;
 
@@ -151,7 +149,7 @@ async fn le_premier_essai_suffit_a_debloquer_premium() {
 #[tokio::test]
 async fn apres_le_premier_essai_plus_aucune_fonction_n_est_cadenassee() {
     let (base, _) = faux_serveur_de_licences(Verdict::Premium).await;
-    let app = serveur_froid(&base);
+    let (app, _base) = serveur_froid(&base);
 
     let (status, _) = activer(&app, CLE).await;
     assert_eq!(status, StatusCode::OK);
@@ -179,7 +177,7 @@ async fn apres_le_premier_essai_plus_aucune_fonction_n_est_cadenassee() {
 #[tokio::test]
 async fn une_cle_refusee_ne_debloque_toujours_rien() {
     let (base, appels) = faux_serveur_de_licences(Verdict::Refusee).await;
-    let app = serveur_froid(&base);
+    let (app, _base) = serveur_froid(&base);
 
     let (status, body) = activer(&app, "PAS-UNE-VRAIE-CLE").await;
 

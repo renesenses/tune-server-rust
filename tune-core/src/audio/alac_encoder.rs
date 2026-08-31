@@ -157,7 +157,11 @@ mod tests {
     /// `crate::test_scratch` (#2864) pour que les autres tests du dépôt
     /// s'appuient sur le même mécanisme au lieu de le réinventer — ou de
     /// l'oublier.
-    fn scratch_dir(bit_depth: u16, channels: u16, sample_rate: u32) -> std::path::PathBuf {
+    fn scratch_dir(
+        bit_depth: u16,
+        channels: u16,
+        sample_rate: u32,
+    ) -> crate::test_scratch::ScratchDir {
         crate::test_scratch::scratch_dir(&format!(
             "tune-alac-test-{bit_depth}-{channels}-{sample_rate}"
         ))
@@ -173,16 +177,12 @@ mod tests {
         let m4a = encode_alac_m4a(&samples, bit_depth, channels, sample_rate).expect("encode");
 
         let dir = scratch_dir(bit_depth, channels, sample_rate);
-        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("round-trip.m4a");
         std::fs::write(&path, &m4a).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        // Remove the whole directory: the old code only unlinked the file and
-        // left one empty directory per process behind in /tmp, for ever.
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(decoded.sample_rate, sample_rate);
         assert_eq!(decoded.channels as u16, channels);
@@ -227,7 +227,11 @@ mod tests {
     fn two_round_trips_of_the_same_shape_never_share_a_file() {
         let a = scratch_dir(16, 2, 44100);
         let b = scratch_dir(16, 2, 44100);
-        assert_ne!(a, b, "deux appels de même forme partagent un dossier");
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "deux appels de même forme partagent un dossier"
+        );
         assert_ne!(
             a.join("round-trip.m4a"),
             b.join("round-trip.m4a"),

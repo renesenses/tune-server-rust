@@ -1091,7 +1091,6 @@ mod tests {
     #[test]
     fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
         let dir = crate::test_scratch::scratch_dir("tune-fir");
-        std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("gauche.wav");
         let d = dir.join("droite.wav");
         let out = dir.join("combine.wav");
@@ -1122,8 +1121,6 @@ mod tests {
             "le canal droit doit porter le filtre droit, complete de zeros — un \
              zero est neutre pour une convolution, contrairement a une repetition"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Des cadences differentes sont un refus, pas un rattrapage silencieux :
@@ -1131,7 +1128,6 @@ mod tests {
     #[test]
     fn deux_cadences_differentes_sont_refusees() {
         let dir = crate::test_scratch::scratch_dir("tune-fir-sr");
-        std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
         let out = dir.join("o.wav");
@@ -1149,8 +1145,6 @@ mod tests {
             "le refus doit NOMMER les deux cadences, sinon l'utilisateur ne sait \
              pas lequel de ses deux fichiers reexporter — recu : {e}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Le fichier combine doit vraiment traverser le convolveur : deux
@@ -1158,7 +1152,6 @@ mod tests {
     #[test]
     fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
         let dir = crate::test_scratch::scratch_dir("tune-fir-conv");
-        std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
         let out = dir.join("o.wav");
@@ -1193,7 +1186,5 @@ mod tests {
              gauche, les deux canaux partagent le meme filtre : {}",
             sortie[i + 1]
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

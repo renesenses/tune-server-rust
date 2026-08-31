@@ -184,19 +184,16 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn temp(name: &str) -> String {
-        std::env::temp_dir()
-            .join(format!(
-                "{}.bin",
-                crate::test_scratch::scratch_name(&format!("tune-stagegrow-{name}"))
-            ))
-            .to_string_lossy()
-            .to_string()
+    /// Le garde est rendu à l'appelant : c'est lui qui supprime le fichier en
+    /// sortant, panique comprise (#3030).
+    fn temp(name: &str) -> crate::test_scratch::ScratchFile {
+        crate::test_scratch::scratch_file(&format!("tune-stagegrow-{name}"), ".bin")
     }
 
     #[test]
     fn lecture_sequentielle_bloque_a_la_frontiere_puis_lit_tout() {
-        let path = temp("seq");
+        let fichier = temp("seq");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"AAAA").unwrap();
         let growth = StageGrowth::new(10);
         growth.advance(4);
@@ -229,12 +226,12 @@ mod tests {
         growth.finish();
 
         assert_eq!(reader.join().unwrap(), b"AAAABBBBBB");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn seek_dans_la_zone_copiee_est_immediat_seek_au_dela_bloque() {
-        let path = temp("seek");
+        let fichier = temp("seek");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"0123456789").unwrap();
         let growth = StageGrowth::new(10);
         growth.advance(5); // seuls "01234" sont disponibles
@@ -262,12 +259,12 @@ mod tests {
         growth.finish();
 
         assert_eq!(&reader.join().unwrap(), b"89");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn une_copie_en_echec_remonte_une_erreur_pas_un_eof_muet() {
-        let path = temp("fail");
+        let fichier = temp("fail");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"AAAA").unwrap();
         let growth = StageGrowth::new(10);
         growth.advance(4);
@@ -276,12 +273,12 @@ mod tests {
         assert_eq!(src.read(&mut buf).unwrap(), 4);
         growth.fail();
         assert!(src.read(&mut buf).is_err());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn seekable_et_taille_connue() {
-        let path = temp("meta");
+        let fichier = temp("meta");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"xxxxx").unwrap();
         let growth = StageGrowth::new(5);
         growth.advance(5);
@@ -289,6 +286,5 @@ mod tests {
         let src = SeekableGrowingSource::open(&path, growth).unwrap();
         assert!(src.is_seekable());
         assert_eq!(src.byte_len(), Some(5));
-        let _ = std::fs::remove_file(&path);
     }
 }

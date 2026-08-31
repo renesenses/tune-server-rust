@@ -3655,17 +3655,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "{}.ogg",
-            crate::test_scratch::scratch_name("tune_chained_vorbis")
-        ));
+        let path = crate::test_scratch::scratch_file("tune_chained_vorbis", ".ogg");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).
@@ -3720,17 +3715,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // replays the head of the track: the same « boucle de 2-3 s » of
         // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
         let single = std::fs::read(fixture_path("test.opus")).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "{}.opus",
-            crate::test_scratch::scratch_name("tune_chained_opus")
-        ));
+        let path = crate::test_scratch::scratch_file("tune_chained_opus", ".opus");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).

@@ -449,10 +449,8 @@ mod tests {
         // `/tmp` et non `std::env::temp_dir()` : sous macOS ce dernier vit sous
         // `/private/var`, donc DÉJÀ hors périmètre, et le test passerait pour
         // la mauvaise raison.
-        let base = PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
-            "tune-convert-destination-i2944",
-        ));
-        std::fs::remove_dir_all(&base).ok();
+        let base =
+            tune_core::test_scratch::scratch_dir_in("/tmp", "tune-convert-destination-i2944");
         let racine = base.join("bibliotheque");
         let dehors = base.join("dehors");
         std::fs::create_dir_all(&racine).expect("racine de test");
@@ -489,8 +487,6 @@ mod tests {
             &racines
         ));
         assert!(la_cible_reste_dans_le_perimetre(&racine, &racines));
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Un lien qui vise un ARBRE SYSTÈME est refusé par la règle des arbres
@@ -498,19 +494,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn un_lien_qui_vise_un_arbre_systeme_est_refuse() {
-        let base = PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
-            "tune-convert-destination-sys-i2944",
-        ));
-        std::fs::remove_dir_all(&base).ok();
-        std::fs::create_dir_all(&base).expect("racine de test");
+        let base =
+            tune_core::test_scratch::scratch_dir_in("/tmp", "tune-convert-destination-sys-i2944");
         let racines = vec![base.to_string_lossy().into_owned()];
         let lien = base.join("sys");
         std::os::unix::fs::symlink("/etc", &lien).expect("lien de test");
 
         assert!(verifier_la_destination(&lien.to_string_lossy(), &racines).is_ok());
         assert!(!la_cible_reste_dans_le_perimetre(&lien, &racines));
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// La polarité du doute : un chemin dont AUCUN ancêtre n'existe ne peut pas
@@ -540,17 +531,13 @@ mod tests {
         // sous-dossier encore inexistant est accepté.
         #[cfg(unix)]
         {
-            let base = PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
-                "tune-convert-a-creer-i2944",
-            ));
-            std::fs::remove_dir_all(&base).ok();
-            std::fs::create_dir_all(&base).expect("racine de test");
+            let base =
+                tune_core::test_scratch::scratch_dir_in("/tmp", "tune-convert-a-creer-i2944");
             let racines = vec![base.to_string_lossy().into_owned()];
             assert!(
                 la_cible_reste_dans_le_perimetre(&base.join("pas/encore/la"), &racines),
                 "« un répertoire à créer » a été refusé"
             );
-            std::fs::remove_dir_all(&base).ok();
         }
     }
 }

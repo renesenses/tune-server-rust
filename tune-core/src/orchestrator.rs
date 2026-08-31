@@ -15389,15 +15389,11 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
     }
 
     /// Un dossier par test ET par processus : plusieurs agents travaillent sur
-    /// la même machine de compilation.
-    fn dossier(nom: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "tune-i1437-{nom}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&d).expect("dossier de test");
-        d
+    /// la même machine de compilation. Le garde le supprime en sortant, y
+    /// compris quand le test panique (#3030) — la construction à la main
+    /// laissait un `tune-i1437-*` de plus à chaque exécution.
+    fn dossier(nom: &str) -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::scratch_dir(&format!("tune-i1437-{nom}"))
     }
 
     fn source_alac(dossier: &std::path::Path, profondeur: u16) -> String {
@@ -15486,7 +15482,6 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
         assert!(
             anomalies.is_empty(),
             "la profondeur annoncée n'est pas celle qui est écrite :\n  {}",
@@ -15526,6 +15521,5 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
                 "source {profondeur_source} bits : le WAV 16 bits est SILENCIEUX"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

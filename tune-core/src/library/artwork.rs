@@ -2845,8 +2845,6 @@ mod tests {
             filled_again, 0,
             "backfill must not re-process covered albums"
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
