@@ -3221,6 +3221,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "zones_volume_a_virgule",
         include_str!("../../migrations/postgres/048_zones_volume_a_virgule.sql"),
     ),
+    (
+        49,
+        "profile_id_bigint",
+        include_str!("../../migrations/postgres/049_profile_id_bigint.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4821,7 +4826,16 @@ mod tests {
         // INTEGER : sous 0,005 linéaire (−46,0205999133 dB) la valeur
         // persistée tombait à 0 et la zone se rallumait MUETTE. PAS de jumelle
         // SQLite — voir le commentaire de l'entrée 48 dans PG_MIGRATIONS.
-        assert_eq!(pg_latest_version(), 48, "latest PG migration must be 48");
+        // 49 : `profile_id_bigint` (#2995). `listen_history.profile_id` et
+        // `playlists.profile_id` étaient TEXT sur toute installation
+        // PostgreSQL NATIVE, contre `profiles.id` BIGINT et un `i64` lié :
+        // `PlaylistRepo::list()` rendait `operator does not exist: text =
+        // bigint`, donc liste de playlists vide. Même cause que la 47 —
+        // les colonnes n'arrivent par aucun script numéroté, seulement par
+        // `ENSURE_COLUMNS`, et la 012 qui les vise ne les a jamais vues.
+        // Ce sont les DEUX dernières colonnes dans ce cas : la mesure de
+        // #2995 en compte cinq, dont trois déjà réparées.
+        assert_eq!(pg_latest_version(), 49, "latest PG migration must be 49");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
