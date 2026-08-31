@@ -1014,6 +1014,141 @@ async fn une_valeur_windows_persistee_retombe_sur_auto_hors_windows() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #2265 — « le client doit préférer local_audio_backend ».
+//
+// `audio_backend` n'est pas un réglage : dans cette API il nomme le backend
+// RÉELLEMENT ouvert, après un éventuel repli ASIO → WASAPI. Le réglage
+// s'appelle `local_audio_backend`, et c'est le seul nom que la lecture
+// consulte (`AppState::effective_audio_backend`).
+//
+// Mais `PATCH /system/config` persistait n'importe quelle clé et
+// `GET /system/config` renvoyait la table `settings` telle quelle : une ligne
+// `audio_backend` s'y installait donc et repartait dans la réponse comme si
+// elle était le réglage. Le client web livré lit
+// `data.audio_backend ?? data.local_audio_backend` — l'ANCIEN nom d'abord —,
+// et affichait donc un backend que le serveur n'ouvre jamais.
+
+/// L'écriture est refusée, et le refus DIT quoi envoyer à la place.
+#[tokio::test]
+async fn le_nom_du_backend_actif_est_refuse_comme_reglage() {
+    let app = make_app();
+    let (status, corps) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "audio_backend": "asio" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "`audio_backend` est le backend ACTIF, pas un réglage : l'accepter \
+         inscrit une ligne que la lecture ne lit jamais"
+    );
+    let message = corps.to_string();
+    assert!(
+        message.contains("local_audio_backend"),
+        "le refus doit nommer le réglage à employer, sinon il renvoie le \
+         client à la devinette : {message}"
+    );
+    assert!(
+        message.contains("supported_audio_backends"),
+        "le refus doit dire où lire les valeurs acceptées par CETTE \
+         plateforme : {message}"
+    );
+
+    // Rien n'a été écrit : le refus est total, pas partiel.
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert!(
+        config.get("audio_backend").is_none(),
+        "une clé refusée ne doit pas apparaître dans la config"
+    );
+}
+
+/// Un refus ne doit pas emporter le reste du lot : le témoin anti-régression.
+#[tokio::test]
+async fn le_refus_ne_bloque_pas_l_ecriture_du_vrai_reglage() {
+    let app = make_app();
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "local_audio_backend": "auto", "local_exclusive_mode": true }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "le vrai réglage doit rester écrivable : {status}"
+    );
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config.get("local_audio_backend").and_then(|v| v.as_str()),
+        Some("auto")
+    );
+    assert_eq!(
+        config.get("local_exclusive_mode").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// Une ligne déjà en base — écrite avant cette garde, ou à la main — ne doit
+/// plus masquer le réglage dans la réponse.
+///
+/// L'assertion est écrite avec l'expression EXACTE du client livré
+/// (`audio_backend ?? local_audio_backend`) : c'est elle qui doit atterrir
+/// sur le nom canonique, sans rien changer côté client.
+#[tokio::test]
+async fn une_ligne_heritee_ne_masque_plus_le_reglage_canonique() {
+    let (app, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    // Écriture directe : la route la refuse désormais, mais une base existante
+    // peut parfaitement la contenir.
+    settings.set("audio_backend", "asio").unwrap();
+    settings.set("local_audio_backend", "auto").unwrap();
+
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+    assert!(
+        config.get("audio_backend").is_none(),
+        "la ligne héritée ne doit pas être publiée : le client livré la lit \
+         AVANT `local_audio_backend` et afficherait un backend que le serveur \
+         n'ouvre jamais"
+    );
+
+    // `data.audio_backend ?? data.local_audio_backend`, à la lettre.
+    let lu_par_le_client = config
+        .get("audio_backend")
+        .or_else(|| config.get("local_audio_backend"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        lu_par_le_client,
+        Some("auto"),
+        "le client livré doit atterrir sur le réglage canonique"
+    );
+
+    // Le contenu de la table n'est pas réécrit : on corrige la RÉPONSE.
+    assert_eq!(
+        settings.get("audio_backend").unwrap().as_deref(),
+        Some("asio"),
+        "on ne réécrit pas la base derrière l'utilisateur"
+    );
+}
+
+/// Témoin de vocabulaire : `audio_backend` garde son sens — le backend ACTIF —
+/// là où il le porte. Le retirer de `/system/config` ne doit pas le retirer du
+/// diagnostic, sinon le correctif aurait effacé l'information au lieu de la
+/// ranger.
+#[tokio::test]
+async fn le_backend_actif_reste_publie_la_ou_il_a_un_sens() {
+    let app = make_app();
+    let (status, diag) = get(&app, "/api/v1/system/diagnostics").await;
+    assert!(status.is_success(), "statut {status}");
+    assert!(
+        diag.get("audio_backend").is_some(),
+        "`/system/diagnostics` publie le backend ACTIF sous ce nom : #2265 \
+         sépare les deux informations, il n'en supprime aucune"
+    );
+}
+
 #[tokio::test]
 async fn le_nom_annonce_aux_autres_serveurs_suit_le_nom_choisi() {
     let app = make_app();
