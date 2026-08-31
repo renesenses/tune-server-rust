@@ -607,7 +607,10 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        17,
+        16,
+        // 1 côté natif (`zones.is_hidden`), 15 côté migré. Compte MESURÉ par
+        // `parite_des_types_pg_sqlite` et `aucune_exception_perimee` sur le
+        // PostgreSQL 16 de la CI, pas estimé à la lecture des sources.
         "le nombre d'écarts tolérés a changé — mettre à jour ce compte ET #2995"
     );
 }
