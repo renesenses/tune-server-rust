@@ -92,6 +92,37 @@ pub fn asio_device_is_busy() -> bool {
 /// runs.
 const ASIO_TEARDOWN_SETTLE_BASE: Duration = Duration::from_millis(200);
 
+/// Le zéro 24 bits, en constante. `cpal::I24::new(0)` rend un `Option`, et
+/// l'écrire dans un rappel temps réel obligeait à un `.expect()` — une
+/// panique potentielle sur le fil audio du pilote.
+///
+/// ⚠️ Forme QUALIFIÉE : `EQUILIBRIUM` vient du trait `Sample`, pas d'une
+/// constante inhérente. `cpal::I24::EQUILIBRIUM` ne compile pas ici, le trait
+/// n'étant pas importé — et ce fichier est sous
+/// `#[cfg(all(target_os = "windows", feature = "asio"))]`, donc AUCUNE porte
+/// Linux ne l'aurait dit.
+const I24_ZERO: cpal::I24 = <cpal::I24 as cpal::Sample>::EQUILIBRIUM;
+
+/// Conversion TOTALE vers 24 bits : elle ne panique jamais.
+///
+/// ⚠️ Les cinq `.expect()` qu'elle remplace étaient dans les **rappels
+/// temps réel** ASIO. Une panique y est bien pire qu'ailleurs : elle traverse
+/// le fil du pilote, et sur les plateformes sans hook de panique (toutes sauf
+/// Windows) elle ne laisse même pas de trace. Aucun de ces cinq cas n'était
+/// atteignable — `0` tient sur 24 bits, `i32 >> 8` aussi par construction, et
+/// la valeur du chemin traité est bornée juste avant — mais un `.expect()`
+/// dans un rappel audio est un pari, pas une garantie.
+///
+/// ⛔ **Ne pas utiliser `I24::from(i32)`** : ce `From` fait un
+/// `wrap_overflow()`. Un échantillon hors borne y basculerait en polarité
+/// opposée — un claquement à pleine échelle, exactement ce qu'un dépassement
+/// ne doit pas produire. On borne, puis on se replie sur le silence.
+#[inline]
+fn i24_borne(valeur: i32) -> cpal::I24 {
+    let borne = valeur.clamp(-8_388_608, 8_388_607);
+    cpal::I24::new(borne).unwrap_or(I24_ZERO)
+}
+
 /// Settle time before releasing the device lock, scaled with the stream's
 /// sample rate. High-rate streams (e.g. 176.4 / 192 kHz) need a longer clock
 /// re-lock/release on the driver: with a flat 200 ms, a rapid Repeat-One /
@@ -484,17 +515,15 @@ impl AsioExclusiveOutput {
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
                             if paused.load(Ordering::Relaxed) {
-                                data.fill(cpal::I24::new(0).expect("zero tient sur 24 bits"));
+                                data.fill(I24_ZERO);
                                 return;
                             }
-                            let read = native_ring.pop_mapped(data, |sample| {
-                                cpal::I24::new(sample >> 8)
-                                    .expect("un mot natif décalé tient sur 24 bits")
-                            });
+                            let read =
+                                native_ring.pop_mapped(data, |sample| i24_borne(sample >> 8));
                             if read < data.len() {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
-                            data[read..].fill(cpal::I24::new(0).expect("zero tient sur 24 bits"));
+                            data[read..].fill(I24_ZERO);
                         },
                         move |_| {
                             errors.callback_errors.fetch_add(1, Ordering::Relaxed);
@@ -562,7 +591,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
-                            let zero = cpal::I24::new(0).expect("zero tient sur 24 bits");
+                            let zero = I24_ZERO;
                             if paused.load(Ordering::Relaxed) {
                                 data.fill(zero);
                                 return;
@@ -573,7 +602,7 @@ impl AsioExclusiveOutput {
                                     .round()
                                     .clamp(-8_388_608.0, 8_388_607.0)
                                     as i32;
-                                cpal::I24::new(scaled).expect("la valeur bornée tient sur 24 bits")
+                                i24_borne(scaled)
                             });
                             if read < data.len() {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
@@ -806,5 +835,74 @@ mod tests {
                 .bit_perfect_unavailable_reason()
                 .is_some()
         );
+    }
+
+    // ── i24_borne : la conversion des rappels temps réel ──────────────────
+    //
+    // Ces tests remplacent cinq `.expect()` qui vivaient dans les rappels
+    // ASIO. Ils ne prouvent pas qu'une valeur hors borne arrive — aucune ne
+    // peut arriver — ils prouvent que la conversion est TOTALE si elle
+    // arrivait, au lieu de tuer le fil du pilote.
+
+    /// Le témoin : sur tout ce que les rappels produisent réellement, la
+    /// conversion rend la valeur EXACTE. Un correctif qui se contenterait de
+    /// rendre le silence partout passerait le test de totalité et casserait
+    /// l'audio — celui-ci l'attrape.
+    #[test]
+    fn i24_borne_rend_la_valeur_exacte_sur_le_domaine_reel() {
+        for v in [0, 1, -1, 8_388_607, -8_388_608, 4_194_304, -4_194_304] {
+            assert_eq!(i24_borne(v).inner(), v, "valeur dans le domaine 24 bits");
+        }
+        // `sample >> 8`, le mot natif décalé du chemin NativeI24 : il tient
+        // par construction, aux deux extrêmes de i32.
+        assert_eq!(i24_borne(i32::MAX >> 8).inner(), 8_388_607);
+        assert_eq!(i24_borne(i32::MIN >> 8).inner(), -8_388_608);
+    }
+
+    /// La totalité : aucune entrée i32 ne peut faire paniquer un rappel.
+    #[test]
+    fn i24_borne_ne_panique_sur_aucune_valeur_i32() {
+        for v in [
+            i32::MIN,
+            i32::MIN + 1,
+            -8_388_609,
+            8_388_608,
+            i32::MAX - 1,
+            i32::MAX,
+        ] {
+            let sortie = i24_borne(v).inner();
+            assert!(
+                (-8_388_608..=8_388_607).contains(&sortie),
+                "hors borne rendait {sortie} au lieu de rester dans 24 bits"
+            );
+        }
+    }
+
+    /// ⛔ Ce qu'on refuse : `I24::from(i32)` fait un `wrap_overflow()`. Une
+    /// valeur au-dessus du maximum y ressort NÉGATIVE — un claquement à pleine
+    /// échelle. Ce test fige le contraste : `i24_borne` sature du bon côté.
+    #[test]
+    fn i24_borne_sature_au_lieu_de_replier_la_polarite() {
+        let trop_haut = 8_388_608_i32;
+        assert_eq!(
+            i24_borne(trop_haut).inner(),
+            8_388_607,
+            "doit saturer en haut"
+        );
+        assert!(
+            i24_borne(trop_haut).inner() > 0,
+            "un dépassement positif ne doit jamais ressortir négatif"
+        );
+        assert_eq!(
+            i24_borne(-8_388_609).inner(),
+            -8_388_608,
+            "doit saturer en bas"
+        );
+    }
+
+    /// Le zéro des rappels est bien le silence, pas une valeur arbitraire.
+    #[test]
+    fn i24_zero_est_le_silence() {
+        assert_eq!(I24_ZERO.inner(), 0);
     }
 }
