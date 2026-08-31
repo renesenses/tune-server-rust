@@ -59,8 +59,8 @@
 //! repos à l'unité : [`SoftMuteRamp::apply`] ressort le tampon inchangé,
 //! bit à bit, quand `gain == target == 1.0` et que le gain de base vaut 1.0.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Durée par défaut de la rampe, en millisecondes. Voir la justification en tête
 /// de module : ≥ 800 trames à 44,1 kHz, soit une marche résiduelle sous

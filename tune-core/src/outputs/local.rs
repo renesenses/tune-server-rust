@@ -4128,11 +4128,9 @@ impl OutputTarget for LocalOutput {
                         // PURE, sortie exclusive — rend exactement la coupure
                         // franche d'avant.
                         ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence = paused_cb.load(Ordering::Relaxed)
-                            || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence)
-                            == crate::audio::soft_mute::Rendering::Silent
-                        {
+                        let silence =
+                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
                             data.fill(0.0);
                             return;
                         }
@@ -5649,53 +5647,53 @@ impl OutputTarget for LocalOutput {
             // has been buffered in the ring buffer.  This prevents stale or
             // garbage audio from reaching the DAC during track transitions.
             let data_started_shared = Arc::new(AtomicBool::new(false));
-            let build_stream = |cfg: &cpal::StreamConfig,
-                                ring_cb: Arc<RingBuf>,
-                                vol_cb: Arc<AtomicU32>,
-                                paused_cb: Arc<AtomicBool>,
-                                _finished_cb: Arc<AtomicBool>,
-                                silent_cb: Arc<AtomicBool>,
-                                ds_cb: Arc<AtomicBool>,
-                                min_buf: usize,
-                                soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
-                let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
-                device.build_output_stream(
-                    cfg,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        // Rampe anti-« ploc » (#1590) — voir le callback du
-                        // chemin compressé pour le détail. `arm(0)` rétablit la
-                        // coupure franche sur DoP, PURE et sortie exclusive.
-                        ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence = paused_cb.load(Ordering::Relaxed)
-                            || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence)
-                            == crate::audio::soft_mute::Rendering::Silent
-                        {
-                            data.fill(0.0);
-                            return;
-                        }
-                        // Wait for a minimum amount of data before starting
-                        // to read from the ring buffer. This prevents the
-                        // audio device from playing stale/garbage samples
-                        // during track transitions.
-                        if !ds_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buf {
+            let build_stream =
+                |cfg: &cpal::StreamConfig,
+                 ring_cb: Arc<RingBuf>,
+                 vol_cb: Arc<AtomicU32>,
+                 paused_cb: Arc<AtomicBool>,
+                 _finished_cb: Arc<AtomicBool>,
+                 silent_cb: Arc<AtomicBool>,
+                 ds_cb: Arc<AtomicBool>,
+                 min_buf: usize,
+                 soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
+                    let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
+                    device.build_output_stream(
+                        cfg,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            // Rampe anti-« ploc » (#1590) — voir le callback du
+                            // chemin compressé pour le détail. `arm(0)` rétablit la
+                            // coupure franche sur DoP, PURE et sortie exclusive.
+                            ramp_cb.arm(soft_mute_cb.armed_ms());
+                            let silence = paused_cb.load(Ordering::Relaxed)
+                                || silent_cb.load(Ordering::Relaxed);
+                            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent
+                            {
                                 data.fill(0.0);
                                 return;
                             }
-                            ds_cb.store(true, Ordering::Release);
-                        }
-                        let read = ring_cb.pop(data);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        ramp_cb.apply(&mut data[..read], v);
-                        if read < data.len() {
-                            data[read..].fill(0.0);
-                        }
-                    },
-                    make_stream_error_cb(device_gone.clone()),
-                    None,
-                )
-            };
+                            // Wait for a minimum amount of data before starting
+                            // to read from the ring buffer. This prevents the
+                            // audio device from playing stale/garbage samples
+                            // during track transitions.
+                            if !ds_cb.load(Ordering::Acquire) {
+                                if ring_cb.available() < min_buf {
+                                    data.fill(0.0);
+                                    return;
+                                }
+                                ds_cb.store(true, Ordering::Release);
+                            }
+                            let read = ring_cb.pop(data);
+                            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                            ramp_cb.apply(&mut data[..read], v);
+                            if read < data.len() {
+                                data[read..].fill(0.0);
+                            }
+                        },
+                        make_stream_error_cb(device_gone.clone()),
+                        None,
+                    )
+                };
 
             // Bit-perfect USB DACs (XMOS/Totaldac, Nagra, …) frequently reject
             // float and only accept integer PCM: cpal's f32 build_output_stream
@@ -5734,11 +5732,9 @@ impl OutputTarget for LocalOutput {
                         // même porte, donc toujours désarmée sur DoP, en PURE et
                         // en sortie exclusive.
                         ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence = paused_cb.load(Ordering::Relaxed)
-                            || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence)
-                            == crate::audio::soft_mute::Rendering::Silent
-                        {
+                        let silence =
+                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
+                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
                             data.fill(zero);
                             return;
                         }
