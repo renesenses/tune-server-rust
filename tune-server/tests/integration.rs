@@ -1772,7 +1772,6 @@ async fn lyrics_track_without_any_source_is_404_no_lyrics() {
 #[tokio::test]
 async fn lyrics_sidecar_lrc_is_synced() {
     let dir = tune_core::test_scratch::scratch_dir("tune_lyrics_it");
-    std::fs::create_dir_all(&dir).unwrap();
     let audio = dir.join("Ma Chanson.flac");
     // Multi-timestamps on one line + metadata tags to ignore.
     std::fs::write(
@@ -1785,7 +1784,6 @@ async fn lyrics_sidecar_lrc_is_synced() {
     let tid = insert_track_with_file(&state, "Ma Chanson", audio.to_str().unwrap());
 
     let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
-    std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["synced"], true);

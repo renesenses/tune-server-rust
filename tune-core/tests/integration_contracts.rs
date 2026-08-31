@@ -3,6 +3,8 @@
 //! Les cas restent séparés par module et conservent leurs fixtures. Les réunir
 //! évite de lier sept fois la même crate de 185 000 lignes.
 
+#[path = "aucune_fuite_de_temporaires.rs"]
+mod aucune_fuite_de_temporaires;
 #[path = "audio_integration.rs"]
 mod audio_integration;
 #[path = "dsd_streaming_repro.rs"]

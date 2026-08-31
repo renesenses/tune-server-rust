@@ -453,8 +453,6 @@ mod browse_path_tests {
                 "forme non résolue : {form:?}"
             );
         }
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// La suite du cas Yves, laissée nue par #1329 : le dossier s'ouvrait, mais
@@ -469,11 +467,7 @@ mod browse_path_tests {
     /// n'en porterait qu'une laisserait l'autre nue.
     #[test]
     fn les_pistes_d_un_dossier_decompose_sont_cherchees_en_forme_composee() {
-        let tmp = std::env::temp_dir().join(format!(
-            "tune-browse-nfd-pistes-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-browse-nfd-pistes");
         // Chostakovitch dirigé par Bernstein : accent porté par le DOSSIER.
         let nfd_nom: String = "Chostakovitch dirigé par Bernstein".nfd().collect();
         let nfc_nom: String = "Chostakovitch dirigé par Bernstein".nfc().collect();
@@ -516,8 +510,6 @@ mod browse_path_tests {
             super::est_enfant_direct(&en_base_nfd, &repertoire_nfc),
             "une ligne décomposée en base doit être reconnue"
         );
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Le motif `LIKE` est confronté à `tracks.file_path`, que le scanner écrit

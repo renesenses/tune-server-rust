@@ -46,10 +46,12 @@ async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, 
     (status, serde_json::from_slice(&body).unwrap_or(json!(null)))
 }
 
-fn write_nmcli_stub() -> std::path::PathBuf {
+/// Le garde du dossier est rendu AVEC le chemin du bouchon : sans lui, le
+/// dossier serait supprimé à la sortie de cette fonction et le bouchon
+/// disparaîtrait avant que `nmcli` ne soit appelé (#3030).
+fn write_nmcli_stub() -> (tune_core::test_scratch::ScratchDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let dir = tune_core::test_scratch::scratch_dir("tune-appliance-test");
-    std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("nmcli-stub.sh");
     let script = r#"#!/bin/bash
 args="$*"
@@ -78,7 +80,7 @@ esac
 "#;
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    (dir, path)
 }
 
 #[tokio::test]
@@ -99,7 +101,7 @@ async fn appliance_endpoints_full_flow() {
     assert_eq!(config["appliance"], json!(false));
 
     // 2) Appliance mode with stubbed nmcli.
-    let stub = write_nmcli_stub();
+    let (_dossier_stub, stub) = write_nmcli_stub();
     unsafe {
         std::env::set_var("TUNE_APPLIANCE", "1");
         std::env::set_var("TUNE_NMCLI_BIN", &stub);

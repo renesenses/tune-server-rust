@@ -201,13 +201,8 @@ mod tests {
     fn growing_source_blocks_then_reads_all() {
         // Writer appends in two bursts; a reader thread must see every byte and
         // only hit EOF after finish(), never mid-stream.
-        let path = std::env::temp_dir()
-            .join(format!(
-                "{}.bin",
-                crate::test_scratch::scratch_name("tune-growtest")
-            ))
-            .to_string_lossy()
-            .to_string();
+        let fichier = crate::test_scratch::scratch_file("tune-growtest", ".bin");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"AAAA").unwrap(); // 4 initial bytes
         let growth = DashGrowth::new(4);
 
@@ -241,18 +236,12 @@ mod tests {
 
         let out = reader.join().unwrap();
         assert_eq!(out, b"AAAABBBBBB");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn failed_download_surfaces_error_not_silent_eof() {
-        let path = std::env::temp_dir()
-            .join(format!(
-                "{}.bin",
-                crate::test_scratch::scratch_name("tune-growtest-fail")
-            ))
-            .to_string_lossy()
-            .to_string();
+        let fichier = crate::test_scratch::scratch_file("tune-growtest-fail", ".bin");
+        let path = fichier.to_string_lossy().to_string();
         std::fs::write(&path, b"AAAA").unwrap();
         let growth = DashGrowth::new(4);
         let mut src = GrowingFileSource::open(&path, growth.clone()).unwrap();
@@ -262,7 +251,6 @@ mod tests {
         // Reader now at the frontier; a failed download must error, not EOF.
         growth.fail();
         assert!(src.read(&mut buf).is_err());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

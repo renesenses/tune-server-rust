@@ -212,13 +212,11 @@ mod tests {
     #[test]
     fn un_repertoire_avec_des_residus_n_est_pas_un_point_de_montage() {
         let base = tune_core::test_scratch::scratch_dir("tune_smb_test");
-        std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("residu.flac"), b"x").unwrap();
         assert!(
             !est_un_point_de_montage(&base),
             "un repertoire ordinaire portant des fichiers a ete pris pour un montage"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]
