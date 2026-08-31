@@ -138,6 +138,30 @@ pub(crate) async fn write_tags_to_files(
         taches.update_progress(TACHE_WRITE_TAGS, 0, total as u64, "Étiquettes");
 
         for row in &track_rows {
+            // Avancement au registre, en TÊTE de boucle — sur le nombre de
+            // pistes RÉELLEMENT traitées, `skipped` compris.
+            //
+            // Deux raisons, et les deux comptent :
+            //
+            // - deux branches de ce corps sortent par `continue` (colonne
+            //   `file_path` nulle, fichier introuvable sur le disque). Un jalon
+            //   placé en queue les manquerait toutes ;
+            // - le jalon du réglage, plus bas, ne compte que `written + errors`.
+            //   Une bibliothèque dont les fichiers sont introuvables — chemins
+            //   NFD, disque démonté — les compte tous en `skipped` : une barre
+            //   indexée sur ce jalon-là resterait figée à 0 du début à la fin,
+            //   c'est-à-dire précisément dans le cas où l'on a besoin de voir
+            //   que la passe tourne.
+            let traitees = written + skipped + errors;
+            if traitees % JALON_AVANCEMENT == 0 {
+                taches.update_progress(
+                    TACHE_WRITE_TAGS,
+                    traitees.max(0) as u64,
+                    total as u64,
+                    "Étiquettes",
+                );
+            }
+
             let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             let file_path = match row.get(1).and_then(|v| v.as_string()) {
                 Some(fp) => fp,
@@ -320,22 +344,6 @@ pub(crate) async fn write_tags_to_files(
                         .to_string(),
                     )
                     .ok();
-            }
-
-            // Avancement au registre — sur le nombre de pistes RÉELLEMENT
-            // traitées, `skipped` compris. Le jalon du réglage ci-dessus ne
-            // compte que `written + errors` : une bibliothèque dont les
-            // fichiers sont introuvables (chemins NFD, disque démonté) les
-            // compte tous en `skipped`, et une barre indexée sur ce jalon-là
-            // resterait figée à 0 du début à la fin de la passe.
-            let traitees = written + skipped + errors;
-            if traitees % JALON_AVANCEMENT == 0 {
-                taches.update_progress(
-                    TACHE_WRITE_TAGS,
-                    traitees.max(0) as u64,
-                    total as u64,
-                    "Étiquettes",
-                );
             }
         }
 
