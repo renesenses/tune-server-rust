@@ -1163,6 +1163,7 @@ mod filtre_actif_tests {
             ("mood", "mood=calme"),
             ("source_media", "source_media=CD"),
             ("original_year", "original_year=1969"),
+            ("dr", "dr=14"),
             ("rating", "rating=4"),
             ("favorite", "favorite=track"),
             ("playlist", "playlist=Ma+liste"),

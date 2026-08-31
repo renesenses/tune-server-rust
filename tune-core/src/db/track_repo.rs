@@ -955,6 +955,21 @@ impl TrackRepo {
             }
         }
 
+        // Dynamic Range (#2144) : le tag décrit l'ALBUM mais vit dans le
+        // magasin ouvert `track_metadata`, donc ni colonne ni jointure directe.
+        // La règle de lecture est celle de la grille d'albums, mot pour mot —
+        // voir `facet_filter::dr_album_in`. Le JUMEAU de ce prédicat est dans
+        // `facets::build_facet_conditions`.
+        if let Some(c) = ph.in_list(
+            crate::db::facet_filter::DR_ALBUM_VALUE,
+            f.dynamic_ranges.len(),
+        ) {
+            conditions.push(crate::db::facet_filter::dr_album_in(engine, &c));
+            for v in &f.dynamic_ranges {
+                owned_params.push(SqlValue::Int(*v));
+            }
+        }
+
         // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
         // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
         if let Some(c) = any_of(
