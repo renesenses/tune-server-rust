@@ -6590,26 +6590,67 @@ mod charge_utile_zone_guard {
         &TOUT[..fin]
     }
 
+    /// 🔴 Le point aveugle qui a laissé passer la troisième copie (#2055).
+    ///
+    /// Ce garde-fou affirmait « TOUTE charge utile de zone » en ne lisant qu'un
+    /// seul fichier. La charge utile est pourtant construite dans deux : les
+    /// deux `obj.insert(…)` de `zones.rs`, et le `json!` de `build_zone_json`
+    /// (`playback.rs`) — celui que rendent une vingtaine de routes de lecture.
+    /// Cette troisième copie portait `queue_length`, `queue_position` et
+    /// `can_skip_next`, mais ni `shuffle` ni `repeat` : exactement la
+    /// divergence que ce contrôle prétendait interdire, un fichier plus loin.
+    ///
+    /// On ne rend ici que le CORPS de `build_zone_json`. Le fichier entier
+    /// apporterait `Json(json!({ "shuffle": enabled }))` de `toggle_shuffle` et
+    /// son jumeau `"repeat"` de `toggle_repeat` — deux réponses qui ne décrivent
+    /// pas une zone — et les compteurs ne diraient plus rien.
+    fn corps_de_build_zone_json() -> &'static str {
+        const TOUT: &str = include_str!("playback.rs");
+        const DEBUT: &str = "pub(crate) async fn build_zone_json(";
+        const FIN: &str = "\nasync fn build_zone_json_with_result(";
+        let debut = TOUT.find(DEBUT).unwrap_or_else(|| {
+            panic!("`build_zone_json` renommée : la découpe ne garde plus rien")
+        });
+        let fin = TOUT[debut..]
+            .find(FIN)
+            .map(|i| debut + i)
+            .unwrap_or_else(|| panic!("`build_zone_json_with_result` renommée : découpe perdue"));
+        &TOUT[debut..fin]
+    }
+
     /// `queue_length` sert de marqueur : c'est le champ que porte toute charge
     /// utile décrivant l'état de lecture d'une zone. Chacune doit porter aussi
     /// l'aléatoire, la répétition et la décision autoritaire « suivant ».
     #[test]
     fn toute_charge_utile_de_zone_porte_le_transport_et_la_decision_suivant() {
-        let src = code_de_production();
+        // Les deux fichiers qui construisent la charge utile. Compter sur un
+        // seul, c'était garder la moitié du code en croyant tout tenir (#2055).
+        let src = format!("{}{}", code_de_production(), corps_de_build_zone_json());
         // Les motifs ne portent PAS le `obj.insert(` qui les précède : rustfmt
         // coupe un appel long sur trois lignes dès que ses arguments grossissent,
         // et le compteur retomberait alors à zéro sans qu'une seule charge utile
         // ait changé. Un garde-fou sensible à la mise en forme lâche en silence,
         // au pire moment — c'est la première version de celui-ci qui l'a montré.
-        let etats = src.matches(r#""queue_length".into()"#).count();
-        let aleatoire = src.matches(r#""shuffle".into()"#).count();
-        let repetition = src.matches(r#""repeat".into()"#).count();
-        let suivant = src.matches(r#""can_skip_next".into()"#).count();
+        //
+        // Deux écritures possibles pour la même clé : `"x".into()` dans un
+        // `Map` (zones.rs) et `"x":` dans un `json!` (build_zone_json). Les
+        // compter toutes les deux, sinon ajouter le champ dans la mauvaise
+        // syntaxe laisserait le contrôle rouge sans faute — ou vert avec.
+        let compter = |cle: &str| {
+            src.matches(&format!(r#""{cle}".into()"#)).count()
+                + src.matches(&format!(r#""{cle}":"#)).count()
+        };
+        let etats = compter("queue_length");
+        let aleatoire = compter("shuffle");
+        let repetition = compter("repeat");
+        let suivant = compter("can_skip_next");
 
         assert!(
-            etats >= 2,
+            etats >= 3,
             "le marqueur `queue_length` n'apparaît que {etats} fois — la forme \
-             des charges utiles a changé, et ce contrôle ne garde plus rien."
+             des charges utiles a changé, et ce contrôle ne garde plus rien. \
+             Il en faut au moins TROIS : les deux de `zones.rs` et celle de \
+             `build_zone_json` (#2055)."
         );
         assert_eq!(
             aleatoire, etats,
@@ -6705,6 +6746,67 @@ mod contrat_des_retours_anticipes {
                 "{champ} absent : le client garderait la valeur d'une autre zone"
             );
         }
+    }
+
+    /// #2055 / #2092 — la charge utile rendue par les routes de LECTURE doit
+    /// dire l'aléatoire et la répétition du moteur, pas les taire.
+    ///
+    /// Tades, quatre messages le 20/08 : « lecture aléatoire non demandée de
+    /// l'album », « quand j'appuie sur suivant, il choisit une piste au
+    /// hasard », « je ne pense pas avoir paramétré cela ». Le correctif #2153 a
+    /// rendu ces deux champs aux charges utiles de `zones.rs` ; celle de
+    /// `build_zone_json` — `play`, `pause`, `resume`, `stop`, `queue/jump`,
+    /// `pins/{i}/invoke` — ne les portait toujours pas, alors qu'elle porte déjà
+    /// `can_skip_next`, la décision qui DÉPEND de l'aléatoire (#2337).
+    ///
+    /// La présence seule ne prouve rien : deux constantes en dur passeraient.
+    /// On arme donc le moteur et on exige que la charge utile le répète.
+    #[tokio::test]
+    async fn le_contrat_de_lecture_dit_l_aleatoire_et_la_repetition_du_moteur() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let id = repo
+            .create("Salon", Some("dlna"), Some("uuid:abcd"))
+            .unwrap();
+
+        // Zone au repos : les deux réglages sortent à leur valeur de départ,
+        // et pas en `null` ni en champ absent.
+        let v = crate::routes::playback::build_zone_json(&state, id).await;
+        assert_eq!(
+            v.get("shuffle"),
+            Some(&serde_json::json!(false)),
+            "l'aléatoire est absent de la charge utile de lecture : le client \
+             naîtrait de nouveau à « éteint » sans moyen d'apprendre le \
+             contraire (#2092)"
+        );
+        assert_eq!(
+            v.get("repeat"),
+            Some(&serde_json::json!("off")),
+            "la répétition est absente de la charge utile de lecture"
+        );
+
+        // Moteur armé — la file compte, sinon `set_shuffle` ne fabrique aucune
+        // permutation et `can_skip_next` resterait faux pour une autre raison.
+        state.playback.update_queue_info(id, 0, 5).await;
+        state
+            .playback
+            .set_repeat(id, tune_core::playback::RepeatMode::All)
+            .await;
+        state.playback.set_shuffle(id, true).await;
+
+        let v = crate::routes::playback::build_zone_json(&state, id).await;
+        assert_eq!(
+            v.get("shuffle"),
+            Some(&serde_json::json!(true)),
+            "le moteur tire au sort et la charge utile dit « non » : c'est \
+             exactement l'écart vécu par Tades (#2055)"
+        );
+        assert_eq!(
+            v.get("repeat"),
+            Some(&serde_json::json!("all")),
+            "`repeat` doit sortir en variante sérialisée (« all »), comme dans \
+             `zones.rs` et sur le WebSocket — pas en « All » ni en nombre"
+        );
     }
 
     /// #1281 — buchardt A700 : un appareil annoncé sous DEUX identités SSDP

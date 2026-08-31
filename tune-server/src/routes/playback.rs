@@ -229,6 +229,27 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
         "can_skip_next": can_skip_next(&zone_state),
+        // #2092 / #2055 — TROISIÈME construction de la charge utile d'une zone,
+        // et la dernière qui ne portait pas le transport.
+        //
+        // Le correctif #2153 avait rendu `shuffle` et `repeat` aux DEUX charges
+        // utiles de `zones.rs` (liste et fiche) ; le WebSocket les envoyait déjà
+        // (`ws.rs`), et la zone tout juste créée les pose aussi
+        // (`zone_repo::…`, « même divergence que #2092, en plus discret »).
+        // Celle-ci, rendue par une vingtaine de retours — `play` et ses neuf
+        // sorties anticipées, `pause`, `resume`, `stop`, `queue/jump`,
+        // `pins/{i}/invoke` —, portait `queue_length`, `queue_position` et
+        // `can_skip_next` mais pas les deux réglages dont `can_skip_next`
+        // DÉPEND : sous aléatoire, la fin de file suit la permutation (#2337).
+        //
+        // Le garde-fou écrit pour #2092 ne pouvait pas le voir : son
+        // `code_de_production()` ne lisait que `zones.rs`. La divergence qu'il
+        // devait empêcher s'était produite un fichier plus loin. Il lit
+        // désormais ce corps-ci aussi.
+        "shuffle": zone_state.shuffle,
+        // Le TYPE et non la chaîne « off » : un renommage de variante suit ici
+        // tout seul.
+        "repeat": zone_state.repeat,
         "muted": zone_state.muted,
     });
     // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
