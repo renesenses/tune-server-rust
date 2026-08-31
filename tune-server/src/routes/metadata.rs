@@ -54,6 +54,24 @@ fn auto_fix_unavailable() -> axum::response::Response {
 pub(crate) struct TrackEdit {
     title: Option<String>,
     artist: Option<String>,
+    /// Rattacher la piste à un artiste EXISTANT par son id.
+    ///
+    /// Jumeau non corrigé d'`album_id` ci-dessous, et même défaut exactement
+    /// (#2574). `MetadataView.svelte` appelle `api.updateTrack(id, {
+    /// artist_id })` à trois endroits — l. 338 (`applyArtistAndAlbum`),
+    /// l. 1042 et l. 1135 — et `artist_id` y est la SEULE clé du corps.
+    /// `api.ts:1579` le déclare d'ailleurs dans la signature de `updateTrack`.
+    ///
+    /// Le champ n'étant pas déclaré ici, serde l'écartait en silence : les
+    /// onze champs restaient `None`, `edit_track` réécrivait la piste
+    /// INCHANGÉE et répondait quand même `200 {"status":"ok"}`. L'écran, qui
+    /// met sa liste à jour de façon optimiste, affichait l'artiste assigné —
+    /// un rechargement le remettait à « Unknown ».
+    ///
+    /// Rien ne s'y opposait côté base : `Track::artist_id` existe
+    /// (`tune-core/src/db/models.rs`) et `TrackRepo::update` écrit bien
+    /// `artist_id` (`track_repo.rs`, `UPDATE tracks SET … artist_id = …`).
+    artist_id: Option<i64>,
     album: Option<String>,
     /// Reattach the track to an existing album by id. The web Metadata
     /// Manager has always sent this (grouping loose tracks under a new
@@ -523,6 +541,30 @@ pub(crate) async fn edit_track(
     if let Some(ref v) = body.album {
         track.album_title = Some(v.clone());
     }
+    // #2574 — même geste que pour `album_id` juste en dessous : on rattache, et
+    // on rafraîchit le nom porté par la piste pour que l'écran qui la relit
+    // affiche l'artiste réellement enregistré, pas l'ancien.
+    //
+    // Un id d'artiste inconnu est REFUSÉ plutôt que rattaché : écrire une clé
+    // étrangère qui ne désigne rien ferait disparaître la piste de la
+    // bibliothèque, et le client verrait encore un `200`. C'est le défaut que
+    // cette correction combat, on ne le réintroduit pas par l'autre bout.
+    if let Some(aid) = body.artist_id {
+        match ArtistRepo::with_backend(state.backend.clone()).get(aid) {
+            Ok(Some(artist)) => {
+                track.artist_id = Some(aid);
+                track.artist_name = Some(artist.name);
+            }
+            _ => {
+                tracing::warn!(track_id = id, artist_id = aid, "edit_track_unknown_artist");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Aucun artiste ne porte l'identifiant {aid}."),
+                )
+                    .into_response();
+            }
+        }
+    }
     if let Some(aid) = body.album_id {
         track.album_id = Some(aid);
         if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
@@ -548,7 +590,18 @@ pub(crate) async fn edit_track(
         track.label = Some(v.clone());
     }
 
-    repo.update(&track).ok();
+    // `.ok()` jetait l'erreur d'écriture et laissait passer le `"status": "ok"`
+    // juste en dessous : une base en lecture seule, ou un disque plein,
+    // répondaient « c'est fait » (#2574). Même motif que le champ ignoré
+    // ci-dessus, à l'autre bout de la route.
+    if let Err(e) = repo.update(&track) {
+        tracing::warn!(track_id = id, error = %e, "edit_track_update_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Enregistrement de la piste impossible : {e}"),
+        )
+            .into_response();
+    }
 
     Json(json!({ "status": "ok", "track_id": id })).into_response()
 }

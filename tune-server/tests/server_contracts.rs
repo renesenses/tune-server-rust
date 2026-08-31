@@ -53,6 +53,8 @@ mod output_provider_seam;
 mod paroles_ecriture_fichiers;
 #[path = "paroles_source_lrclib.rs"]
 mod paroles_source_lrclib;
+#[path = "piste_artiste_par_id.rs"]
+mod piste_artiste_par_id;
 #[path = "playlists_ecritures_partielles.rs"]
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
