@@ -3,7 +3,22 @@ pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
-pub mod radio_handler;
+// `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
+// métadonnées radio, sans aucun appelant depuis sa création : un
+// `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`
+// homonyme de la vraie, dont `fetch_icy_metadata` rendait `cover_url: None`
+// sans condition. La lecture vivante est `crate::radio_metadata` — elle relit
+// `visual` (Radio France), `cover` (Radio Paradise) et `StreamUrl` (ICY), et
+// c'est `crate::poller::vignette_du_pas_radio` qui arbitre pochette du titre
+// contre logo de la station.
+//
+// Pourquoi la suppression compte : le 30/08/2026, une réponse au fil forum 104
+// se réclamant explicitement d'une lecture du code a affirmé au testeur
+// Reivax66 que « rien n'est allé chercher la pochette du disque », huit jours
+// après la livraison de #2109 et quatre heures après la publication de la
+// v0.9.127 qui la contient. Ce fichier mort disait exactement cela, en Rust.
+// Le garde `tests/pochette_radio_source_unique.rs` empêche qu'un deuxième
+// réapparaisse.
 
 use std::collections::HashMap;
 use std::sync::Arc;
