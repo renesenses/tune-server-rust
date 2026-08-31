@@ -24,6 +24,96 @@ pub fn router() -> Router<AppState> {
         .route("/players/{id}/pause", post(pause_player))
         .route("/players/{id}/volume", post(set_player_volume))
         .route("/players/{id}/power", post(power_player))
+        .route("/players/{id}/create-zone", post(create_zone_for_player))
+}
+
+/// La forme d'UN lecteur telle que le client web la lit (`SqueezeboxPlayer`).
+///
+/// Le panneau « Squeezebox / Lyrion » des réglages lit `id`, `name`, `model`,
+/// `ip` et `connected`. Le serveur n'émettait que `playerid` et `name` : côté
+/// navigateur `player.id` et `player.connected` valaient `undefined`, donc la
+/// pastille affichait **« Déconnecté »** et le bouton « Créer une zone »
+/// (`disabled={!player.connected}`) restait grisé pour TOUS les lecteurs, quel
+/// que soit l'état réel de LMS. C'est le « Lyrion non connecté » du fil (#2066).
+///
+/// `model` et `ip` restent VIDES, et c'est délibéré : Tune n'interroge que
+/// `player count ?`, `player id N ?` et `player name N ?`. Ajouter deux
+/// commandes CLI de plus sans trace réelle sous les yeux serait deviner le
+/// protocole. `connected` dit exactement ce que Tune sait — LMS a énuméré ce
+/// lecteur à cet instant précis ; un lecteur que LMS ne cite pas n'apparaît pas
+/// du tout dans la liste.
+fn joueur_json(player_id: &str, player_name: &str) -> Value {
+    json!({
+        // `id` est ce que lit la carte du panneau ; `playerid` est conservé
+        // parce que `discover_and_register` s'en sert déjà.
+        "id": player_id,
+        "playerid": player_id,
+        "name": player_name,
+        "model": "",
+        "ip": "",
+        "connected": true,
+        "power": true,
+    })
+}
+
+/// La forme de l'ÉTAT complet telle que le client web la lit
+/// (`SqueezeboxStatus` : `enabled`, `lms_host`, `lms_discovered`, `players`).
+///
+/// `players` manquait entièrement dans la réponse de `/squeezebox/status` : le
+/// panneau retombait donc sur « Aucun lecteur Squeezebox trouvé » même quand
+/// LMS répondait parfaitement. C'est le « pas de platine » du même fil.
+fn statut_json(enabled: bool, lms_host: &str, lms_discovered: bool, players: Vec<Value>) -> Value {
+    json!({
+        "enabled": enabled,
+        "lms_host": lms_host,
+        "lms_discovered": lms_discovered,
+        "players": players,
+    })
+}
+
+/// Lit un réglage booléen stocké en texte (`"true"` / `"1"`).
+fn drapeau(settings: &SettingsRepo, cle: &str) -> bool {
+    settings
+        .get(cle)
+        .ok()
+        .flatten()
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        })
+        .unwrap_or(false)
+}
+
+/// Les deux drapeaux que le panneau affiche à côté de la liste des lecteurs.
+///
+/// `lms_host_auto` retient l'adresse posée par l'auto-configuration mDNS ;
+/// sans lui, `lms_discovered` valait toujours `undefined` et l'indication
+/// « Auto-détecté : … » ne s'affichait jamais. On compare les deux adresses
+/// plutôt que de lire un booléen : dès que l'utilisateur saisit autre chose,
+/// l'indication disparaît d'elle-même, sans second écrivain à tenir à jour.
+fn drapeaux_reglages(state: &AppState) -> (bool, bool) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let courant = settings
+        .get("lms_host")
+        .ok()
+        .flatten()
+        .or_else(|| settings.get("squeezebox_host").ok().flatten())
+        .unwrap_or_default();
+    let auto = settings.get("lms_host_auto").ok().flatten();
+    (
+        drapeau(&settings, "squeezebox_enabled"),
+        adresse_auto_detectee(auto.as_deref(), &courant),
+    )
+}
+
+/// L'adresse en vigueur est-elle celle que la découverte mDNS avait posée ?
+///
+/// Fonction pure pour que la règle se teste sans base ni réseau.
+fn adresse_auto_detectee(auto: Option<&str>, courant: &str) -> bool {
+    match auto {
+        Some(a) if !a.trim().is_empty() => a.trim() == courant.trim(),
+        _ => false,
+    }
 }
 
 /// Parse the LMS host setting into (host, port).
@@ -142,18 +232,37 @@ fn lms_player_command(host: &str, port: u16, player_id: &str, cmd: &str) -> Resu
 
 async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
     let (host, port) = parse_lms_host(&state);
+    let (enabled, lms_discovered) = drapeaux_reglages(&state);
     let lms_host_display = if port == LMS_CLI_PORT {
         host.clone()
     } else {
         format!("{host}:{port}")
     };
     match lms_cli_command(&host, port, "serverstatus 0 100") {
-        Ok(resp) => Json(json!({
-            "status": "ok",
-            "response": resp,
-            "lms_host": lms_host_display,
-        }))
-        .into_response(),
+        Ok(resp) => {
+            // Le panneau des réglages ne lit QUE `players` : sans cette liste il
+            // affiche « Aucun lecteur Squeezebox trouvé » alors que LMS vient de
+            // répondre. Le recensement qui échoue ne fait pas échouer l'état —
+            // le serveur répond bien, ce sont ses lecteurs qu'on n'a pas su lire,
+            // et c'est une ligne de journal, pas un 502.
+            let players = match list_players_cli(&host, port) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        host = %host, port, error = %e,
+                        "squeezebox_status: player listing failed"
+                    );
+                    Vec::new()
+                }
+            };
+            let mut body = statut_json(enabled, &lms_host_display, lms_discovered, players);
+            if let Some(obj) = body.as_object_mut() {
+                // Champs historiques conservés : d'autres clients les lisent.
+                obj.insert("status".into(), json!("ok"));
+                obj.insert("response".into(), json!(resp));
+            }
+            Json(body).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": e, "lms_host": lms_host_display})),
@@ -202,10 +311,7 @@ fn list_players_cli(host: &str, port: u16) -> Result<Vec<Value>, String> {
         };
 
         if !player_id.is_empty() {
-            players.push(json!({
-                "playerid": player_id,
-                "name": player_name,
-            }));
+            players.push(joueur_json(&player_id, &player_name));
         }
     }
     Ok(players)
@@ -268,13 +374,83 @@ async fn power_player(
 }
 
 async fn discover_players(State(state): State<AppState>) -> impl IntoResponse {
+    let (host, port) = parse_lms_host(&state);
+    let (enabled, lms_discovered) = drapeaux_reglages(&state);
+    let lms_host_display = if port == LMS_CLI_PORT {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     match discover_and_register(&state).await {
-        Ok(registered) => Json(json!({
-            "discovered": registered.len(),
-            "players": registered,
-        }))
-        .into_response(),
+        // Le client attend ici la MÊME forme que sur `/status` : c'est le
+        // résultat du bouton « Actualiser », et il remplace `squeezeboxStatus`
+        // en entier. Rendre une forme différente sur deux routes qui alimentent
+        // le même écran, c'est se garantir qu'une des deux vues sera vide.
+        Ok(registered) => {
+            let mut body = statut_json(
+                enabled,
+                &lms_host_display,
+                lms_discovered,
+                registered.clone(),
+            );
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("discovered".into(), json!(registered.len()));
+            }
+            Json(body).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateZoneBody {
+    /// Accepté pour ne pas rejeter le corps que le client envoie. Le nom de la
+    /// zone reste celui que LMS donne au lecteur : deux sources de vérité pour
+    /// un même libellé finissent toujours par diverger.
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+}
+
+/// `POST /squeezebox/players/{id}/create-zone` — le bouton « Créer une zone ».
+///
+/// **La route n'existait pas.** Le client l'appelle depuis la v0.8 ; le serveur
+/// répondait 404. Le trou était masqué par le bouton lui-même, grisé tant que
+/// `player.connected` était `undefined` — c'est-à-dire toujours. Rendre
+/// `connected` sans ouvrir la route aurait transformé un bouton mort en 404 :
+/// les deux vont ensemble (#2066).
+///
+/// `{id}` est l'identifiant LMS du lecteur (son adresse MAC), comme sur les
+/// routes sœurs `play` / `pause` / `volume` / `power` de ce même routeur.
+async fn create_zone_for_player(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(_body): Json<CreateZoneBody>,
+) -> impl IntoResponse {
+    let device_id = format!("squeezebox-{id}");
+    // On passe par la découverte complète plutôt que par un enregistrement ad
+    // hoc : c'est elle qui pose la SORTIE puis la zone, et un second chemin
+    // d'enregistrement finirait par diverger du premier.
+    if let Err(e) = discover_and_register(&state).await {
+        return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+    }
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    match zone_repo.get_by_device_id(&device_id) {
+        Ok(Some(zone)) => {
+            tracing::info!(id = %device_id, "squeezebox_zone_created_on_demand");
+            Json(zone).into_response()
+        }
+        Ok(None) => {
+            tracing::warn!(id = %device_id, "squeezebox_create_zone: player unknown to LMS");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": format!("Le lecteur {id} n'est pas (ou plus) annonce par LMS.")
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
@@ -385,11 +561,16 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             }
         }
 
-        registered.push(json!({
-            "id": device_id,
-            "name": player_name,
-            "playerid": player_id,
-        }));
+        // Même forme que sur `/status` : `id` désigne le lecteur LMS, comme sur
+        // toutes les routes `/players/{id}/…` de ce routeur. L'identifiant de
+        // sortie interne reste disponible sous `device_id` — il valait `id`
+        // auparavant, ce qui donnait deux sens à la même clé selon la route et
+        // aurait envoyé le bouton « Créer une zone » sur `squeezebox-squeezebox-…`.
+        let mut entry = joueur_json(&player_id, &player_name);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("device_id".into(), json!(device_id));
+        }
+        registered.push(entry);
     }
 
     Ok(registered)
@@ -397,7 +578,110 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{LMS_CLI_PORT, split_lms_host};
+    use super::{
+        LMS_CLI_PORT, adresse_auto_detectee, list_players_cli, split_lms_host, statut_json,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// Un LMS bouchonné : il accepte une connexion par commande, lit la ligne
+    /// et rend la réponse prévue. Aucun trafic ne sort de la boucle locale.
+    fn faux_lms(reponses: Vec<&'static str>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind du faux LMS");
+        let port = listener.local_addr().expect("adresse locale").port();
+        std::thread::spawn(move || {
+            for reponse in reponses {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut lecteur = BufReader::new(stream.try_clone().expect("clone"));
+                let mut demande = String::new();
+                let _ = lecteur.read_line(&mut demande);
+                let mut ecrivain = stream;
+                let _ = ecrivain.write_all(format!("{reponse}\n").as_bytes());
+                let _ = ecrivain.flush();
+            }
+        });
+        port
+    }
+
+    /// Le panneau « Squeezebox / Lyrion » lit `id` et `connected`. Le serveur
+    /// n'émettait que `playerid` : la pastille disait « Déconnecté » et
+    /// « Créer une zone » restait grisé pour tous les lecteurs (#2066).
+    #[test]
+    fn un_lecteur_recense_porte_id_et_connected() {
+        let port = faux_lms(vec![
+            "player count 1",
+            "player id 0 00:04:20:ab:cd:ef",
+            "player name 0 Salon",
+        ]);
+        let joueurs = list_players_cli("127.0.0.1", port).expect("le faux LMS repond");
+        assert_eq!(joueurs.len(), 1);
+        let j = &joueurs[0];
+        assert_eq!(
+            j["id"], "00:04:20:ab:cd:ef",
+            "le client lit `id`, pas `playerid`"
+        );
+        assert_eq!(j["name"], "Salon");
+        assert_eq!(
+            j["connected"], true,
+            "sans `connected`, la pastille affiche « Deconnecte »"
+        );
+        assert!(
+            j.get("model").is_some() && j.get("ip").is_some(),
+            "la carte affiche `model` et `ip` : absents, elle ecrit « undefined »"
+        );
+        // Le champ historique reste, `discover_and_register` s'en sert.
+        assert_eq!(j["playerid"], "00:04:20:ab:cd:ef");
+    }
+
+    /// `/squeezebox/status` ne portait aucune liste de lecteurs : le panneau
+    /// retombait sur « Aucun lecteur Squeezebox trouve » meme quand LMS
+    /// repondait parfaitement.
+    #[test]
+    fn l_etat_porte_toujours_la_liste_des_lecteurs() {
+        let vide = statut_json(true, "192.168.0.34", false, Vec::new());
+        assert!(
+            vide.get("players").is_some_and(|p| p.is_array()),
+            "`players` doit exister meme vide, sinon le panneau ne sait rien afficher"
+        );
+        assert_eq!(vide["enabled"], true);
+        assert_eq!(vide["lms_host"], "192.168.0.34");
+        assert_eq!(vide["lms_discovered"], false);
+    }
+
+    /// L'indication « Auto-detecte : … » ne doit plus s'afficher des que
+    /// l'utilisateur a saisi une autre adresse a la main.
+    #[test]
+    fn une_adresse_saisie_a_la_main_n_est_plus_dite_auto_detectee() {
+        assert!(adresse_auto_detectee(
+            Some("192.168.0.34:9090"),
+            "192.168.0.34:9090"
+        ));
+        assert!(adresse_auto_detectee(
+            Some(" 192.168.0.34:9090 "),
+            "192.168.0.34:9090"
+        ));
+        assert!(!adresse_auto_detectee(
+            Some("192.168.0.34:9090"),
+            "192.168.0.99:9090"
+        ));
+        assert!(!adresse_auto_detectee(None, "192.168.0.34:9090"));
+        assert!(!adresse_auto_detectee(Some(""), ""));
+    }
+
+    /// Toute route appelee par le client web doit exister ici. `create-zone`
+    /// manquait depuis la v0.8 : le bouton du panneau tombait sur un 404 (#2066).
+    #[test]
+    fn le_routeur_declare_toutes_les_routes_appelees_par_le_client() {
+        let source = include_str!("squeezebox.rs");
+        for chemin in ["/status", "/discover", "/players/{id}/create-zone"] {
+            assert!(
+                source.contains(&format!(".route(\"{chemin}\"")),
+                "route absente du routeur : {chemin}"
+            );
+        }
+    }
 
     #[test]
     fn plain_host_gets_the_default_cli_port() {

@@ -5,7 +5,7 @@ use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use super::didl::DidlBuilder;
-use super::oh_events::{EventState, OpenHomeEventListener};
+use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const SOAP_MAX_RETRIES: usize = 2;
@@ -23,7 +23,7 @@ pub struct OpenHomeOutput {
     host_addr: String,
     service_urls: HashMap<String, String>,
     event_sub_urls: HashMap<String, String>,
-    event_listener: Option<Arc<OpenHomeEventListener>>,
+    event_listener: Option<Arc<UpnpEventListener>>,
     event_state: Arc<tokio::sync::Mutex<EventState>>,
     event_sub_ids: tokio::sync::Mutex<Vec<String>>,
     client: Client,
@@ -37,7 +37,7 @@ impl OpenHomeOutput {
         host: String,
         port: u16,
         service_paths: HashMap<String, String>,
-        event_listener: Option<Arc<OpenHomeEventListener>>,
+        event_listener: Option<Arc<UpnpEventListener>>,
         event_sub_paths: HashMap<String, String>,
     ) -> Self {
         let base = format!("http://{}:{}", host, port);

@@ -111,7 +111,13 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 /// et la largeur annoncée redevient celle des octets réellement écrits — c'est
 /// ce désaccord-là qui faisait lire des trames de 32 bits dans des octets de
 /// 16 (#2157).
-fn container_bit_depth(bd: u16) -> u16 {
+///
+/// La même règle vaut pour la profondeur **de sortie** négociée par
+/// l'orchestrateur : `encode_wav`, `pcm_to_i32` (FLAC) et `convert_pcm_bit_depth`
+/// n'écrivent que 16, 24 ou 32 bits. Une cible hors de cet ensemble n'est pas
+/// « approximative », elle est ININSCRIPTIBLE — voir `transcode_source_to_file`
+/// (#1437).
+pub(crate) fn container_bit_depth(bd: u16) -> u16 {
     match bd {
         0..=16 => 16,
         17..=24 => 24,
@@ -3642,8 +3648,10 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "{}.ogg",
+            crate::test_scratch::scratch_name("tune_chained_vorbis")
+        ));
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
@@ -3705,8 +3713,10 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // replays the head of the track: the same « boucle de 2-3 s » of
         // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
         let single = std::fs::read(fixture_path("test.opus")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_opus_{}.opus", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "{}.opus",
+            crate::test_scratch::scratch_name("tune_chained_opus")
+        ));
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();

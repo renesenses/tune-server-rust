@@ -18,7 +18,7 @@ Tune est un **serveur audio multiroom haute-fidélité** entièrement écrit en 
 | **Langage** | Rust (100%) |
 | **Modules** | 6 composants principaux |
 | **Formats audio** | FLAC, WAV, DSD, AIFF, MP3, AAC, ALAC, APE, WavPack, Opus |
-| **Sorties supportées** | 15 types (DLNA, AirPlay, Chromecast, Sonos, ASIO...) |
+| **Sorties supportées** | 15 types (DLNA, OpenHome, AirPlay, Chromecast, ASIO...) |
 | **Services streaming** | 7 plateformes (Qobuz, Tidal, Spotify, Deezer...) |
 
 ---
@@ -122,7 +122,7 @@ graph TB
 
     subgraph "SORTIES AUDIO — 15 types"
         LOCAL["<b>Sortie locale</b><br/>USB, ASIO, WASAPI<br/>CoreAudio (macOS)"]
-        RESEAU["<b>Réseau</b><br/>DLNA, AirPlay, Chromecast<br/>Sonos, BluOS, OpenHome<br/>Squeezebox, HQPlayer"]
+        RESEAU["<b>Réseau</b><br/>DLNA, AirPlay, Chromecast<br/>BluOS, OpenHome<br/>Squeezebox, HQPlayer"]
         MULTI["<b>Multiroom</b><br/>OAAT (Open Advanced<br/>Audio Transport)<br/>Groupes de zones"]
     end
 
@@ -292,14 +292,23 @@ Tune peut envoyer le son vers 15 types d'appareils différents :
 
 | Protocole | Exemples d'appareils | Gapless | Volume | DSD |
 |-----------|---------------------|---------|--------|-----|
-| **DLNA/UPnP** | Denon, Marantz, HiFi Rose, Micromega | Oui | Oui | Passthrough |
+| **DLNA/UPnP** | Denon, Marantz, HiFi Rose, Micromega, Sonos | Oui | Oui | Passthrough |
 | **OpenHome** | Linn, Naim, dCS | Oui | Oui | Passthrough |
-| **Sonos** | Toute la gamme Sonos | Oui | Oui | Non |
 | **AirPlay** | Apple TV, HomePod, enceintes AirPlay | Non | Oui | Non |
 | **Chromecast** | Google Nest, enceintes Cast | Non | Oui | Non |
 | **BluOS** | Bluesound Node, NAD | Non | Oui | Non |
 | **Squeezebox** | Logitech Squeezebox, Squeezelite | Oui | Oui | Non |
 | **HQPlayer** | Signalyst HQPlayer | Non | Oui | Natif |
+
+> **Sonos.** Une enceinte Sonos joue par le chemin **DLNA/UPnP générique**,
+> comme n'importe quel renderer : c'est de là que viennent le gapless et le
+> volume. Il n'existe **pas** de protocole Sonos dédié dans ce serveur —
+> `OutputType` ne comporte aucune variante `Sonos`, et `sonos` n'est pas une
+> valeur acceptée pour l'`output_type` d'une zone. Ce que le chemin DLNA ne
+> sait donc pas faire : le **groupage multi-pièces** (service UPnP
+> `ZoneGroupTopology`), qui n'est pas implémenté. Les routes `/sonos/*`
+> filtrent la découverte DLNA sur le fabricant ; `/sonos/rooms/{id}/group`
+> est un gabarit qui ne groupe rien.
 
 ### Multiroom
 

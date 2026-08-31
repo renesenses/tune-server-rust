@@ -61,6 +61,27 @@
       ]
     },
     {
+      "route": "/converter/status/{}",
+      "methode": "GET",
+      "type": "(retour de fonction)",
+      "liste": false,
+      "note": "#3002 — l'ecran Convertisseur lisait `state`, `progress`, `converted` et `download_size`, qu'aucune reponse serveur ne portait : barre a 0 %, compteur a 0/N, bouton de telechargement jamais affiche. Absente de la carte parce que `getConversionStatus` ecrit son type sur l'annotation de retour et appelle `fetchJSON()` NU — forme que le cartographe ne voyait pas (corrigee dans le meme lot). Les cinq champs historiques restent exiges : on ajoute, on ne renomme pas.",
+      "champs_obligatoires": [
+        "job_id",
+        "status",
+        "total",
+        "completed",
+        "current_file",
+        "errors",
+        "state",
+        "progress",
+        "converted",
+        "download_size",
+        "error"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/devices",
       "methode": "GET",
       "type": "DiscoveredDevice",
@@ -1263,10 +1284,11 @@
       "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
+      "note": "#3002 — exigeait `lyrics`, que le serveur n'envoie pas : il rend `lines`. L'exigence venait de `api.ts:getTrackLyrics`, une fonction SANS AUCUN APPELANT dont `lib/lyrics.ts` documente lui-meme le type comme la forme « historique ». Les vrais consommateurs (NowPlaying, TvView) lisent `data.lines` via `fetchTrackLyrics`. Le serveur avait raison, la carte recopiait un type mort.",
       "champs_obligatoires": [
-        "lyrics",
         "synced",
-        "source"
+        "source",
+        "lines"
       ],
       "champs_optionnels": []
     },
@@ -4855,7 +4877,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 236,
+    "routes_cartographiees": 238,
     "appels_non_resolus": 138
   }
 }

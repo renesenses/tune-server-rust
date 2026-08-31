@@ -157,6 +157,25 @@ struct PatchZone {
     /// `zone_{id}_upnp_renderer` ; défaut off. L'activation réveille
     /// l'annonceur SSDP pour une annonce immédiate.
     upnp_renderer: Option<bool>,
+    /// « Silence UPnP » : ne plus rien demander du tout au renderer DLNA
+    /// pendant la lecture (#2263). Persisté en setting
+    /// `zone_{id}_upnp_silence` ; défaut off, STRICTEMENT opt-in.
+    ///
+    /// Par défaut, une zone DLNA abonnée aux évènements coûte déjà UNE action
+    /// SOAP par seconde au lieu de trois — l'état, le volume et la coupure
+    /// arrivent poussés, seule la position est encore mesurée. Cette option
+    /// supprime cette dernière mesure et fait tomber le trafic à zéro.
+    ///
+    /// **Elle dégrade deux choses, et les deux se lisent dans
+    /// `GET /api/devices/{id}/status` :**
+    /// * la position devient une ESTIMATION (dernière position connue +
+    ///   horloge murale), plus une valeur lue sur l'appareil ;
+    /// * un déplacement fait sur la FAÇADE de l'appareil (télécommande,
+    ///   molette) n'est vu qu'au prochain évènement du renderer.
+    ///
+    /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
+    /// sondage complet plutôt que de servir un état inventé.
+    upnp_silence: Option<bool>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -234,6 +253,25 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_renderer".into(), json!(upnp_renderer));
+    // #2263 — « silence UPnP ». L'interrupteur ne part JAMAIS seul : ce qu'il
+    // coûte part avec lui, pour qu'un client ne puisse pas le présenter comme
+    // une simple économie. Les deux effets sont nommés en clair ; un client qui
+    // ne lit que le booléen affiche au moins l'interrupteur au bon état.
+    let upnp_silence = settings
+        .get(&crate::config::cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    obj.insert("upnp_silence".into(), json!(upnp_silence));
+    obj.insert(
+        "upnp_silence_effets".into(),
+        json!({
+            "position_estimee": upnp_silence,
+            "deplacement_facade_differe": upnp_silence,
+            "texte": "Le serveur ne demande plus rien au lecteur réseau : la position affichée est estimée, et une avance faite sur l'appareil lui-même n'apparaît qu'au prochain changement qu'il signale."
+        }),
+    );
     // Sortie mono (#2362). Lue telle qu'elle est PERSISTÉE, sans la garde PURE :
     // c'est l'état de l'interrupteur que le client doit afficher. Ce que le
     // signal subit RÉELLEMENT est dit par le chemin du signal, qui applique la
@@ -829,6 +867,45 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
         track.insert("metadata_changed_at".into(), json!(ts));
         track.insert("metadata_age_ms".into(), json!(age));
     }
+}
+/// La nature et l'identifiant de ce que l'auditeur a DEMANDÉ, dits au client.
+///
+/// `POST /zones/:id/play` les déduit déjà du corps de la requête
+/// (`contexte_de_lecture`) et les pose sur la session de la zone
+/// (`set_session_context`, #2441). Jusqu'ici l'unique lecteur était
+/// l'orchestrateur, au moment de tamponner `listen_history` : le serveur
+/// savait quel album Qobuz jouait sur quelle zone, et ne le disait à personne.
+///
+/// Le client ne POUVAIT donc pas bâtir le « Retour à l'album en cours » que
+/// Cyrille Moutia réclame depuis le 30/06/2026 (#1361).
+/// `current_track.album_id` / `artist_id` sont des `i64` de BIBLIOTHÈQUE :
+/// toujours `null` sur une piste de service, faute de ligne en base. Il ne
+/// restait que `source` + `source_id`, l'identifiant de la PISTE — d'où un
+/// aller-retour `GET /streaming/{service}/tracks/{track_id}` à chaque
+/// changement de piste pour seulement en retrouver l'album.
+///
+/// Au niveau de la ZONE, pas de `current_track` : le contexte décrit le geste,
+/// pas la piste. Il survit aux avances automatiques — la deuxième piste d'un
+/// album reste une écoute « album » — là où `current_track` change à chaque
+/// piste. C'est exactement ce qui fait un « retour à l'album » stable.
+///
+/// Toujours écrits, `null` compris. Un champ ABSENT dit « ce serveur ne
+/// connaît pas la notion » ; un champ `null` dit « aucun contexte sur cette
+/// session ». Le client doit distinguer les deux pour MASQUER le raccourci ou
+/// le GRISER, et un défaut silencieux côté client masquerait la disparition du
+/// champ au lieu de la signaler (leçon de `volume_db`, #1274).
+///
+/// `GET /zones/{id}/status` les publiait déjà — il sérialise le `ZoneState`
+/// entier — mais sous une charge de forme différente (`now_playing`). Les
+/// trois surfaces qui portent `current_track` restaient muettes ; ce
+/// fabricant les aligne, à l'identique de `inject_metadata_anchor`, et aux
+/// mêmes trois points d'appel, pour qu'elles ne puissent plus diverger.
+pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
+    obj.insert(
+        "session_context_type".into(),
+        json!(ps.session_context_type),
+    );
+    obj.insert("session_context_id".into(), json!(ps.session_context_id));
 }
 
 /// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
@@ -1550,7 +1627,7 @@ fn build_signal_path(
     // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
     // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
     // Bebelalu55 #1480). Une seule source pour les deux affichages.
-    let ui_volume = (zone.volume as f64 / 100.0).clamp(0.0, 1.0);
+    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
     let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
@@ -2112,6 +2189,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            inject_session_context(obj, &ps);
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
             obj.insert(
@@ -2150,7 +2228,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 if ps.volume > 0.0 {
                     ps.volume
                 } else {
-                    z.volume as f64 / 100.0
+                    z.volume / 100.0
                 },
             );
             let renderer_label = z
@@ -2325,6 +2403,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 inject_metadata_anchor(obj, &ps);
+                inject_session_context(obj, &ps);
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 // Expose the queue index too so the client can refresh the
@@ -2342,7 +2421,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("repeat".into(), json!(ps.repeat));
                 // #1274 — même paire qu'au-dessus, depuis la même source :
                 // ici la colonne `zones.volume`, arrondie au pour-cent.
-                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume as f64 / 100.0);
+                tune_core::audio::volume_scale::inserer_volume(obj, zone.volume / 100.0);
                 let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
@@ -2741,7 +2820,7 @@ async fn patch_zone(
         ecrire!("fixed_volume", fixed, repo.update_fixed_volume(id, fixed));
         // When enabling fixed_volume, pin volume to 100% in DB and in-memory
         if fixed {
-            repo.update_volume(id, 100).ok();
+            repo.update_volume(id, 100.0).ok();
             state.playback.set_volume(id, 1.0).await;
         }
     }
@@ -2868,6 +2947,39 @@ async fn patch_zone(
         // Annonce (ou retrait de l'annonce) sans attendre le cycle de 10 min.
         crate::routes::upnp_media_renderer::advertiser_wakeup().notify_one();
     }
+    // Silence UPnP (#2263) → setting zone_{id}_upnp_silence. Même forme que
+    // `upnp_renderer` : clé supprimée à la désactivation.
+    if let Some(enabled) = body.upnp_silence {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = crate::config::cle_silence_upnp(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("upnp_silence", enabled, r);
+        // Appliqué en DIRECT à la sortie déjà enregistrée : persister ne suffit
+        // pas, sans cela cocher la case en écoutant ne changerait rien avant la
+        // piste suivante — même piège que le `dlna_play_delay_ms` ci-dessus.
+        if let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id) {
+            let output = { state.outputs.lock().await.get(&device_id) };
+            if let Some(output) = output {
+                let guard = output.lock().await;
+                if let Some(dlna) = guard.as_any().downcast_ref::<DlnaOutput>() {
+                    dlna.set_upnp_silence(enabled);
+                    // Ce que l'utilisateur vient d'accepter, écrit noir sur
+                    // blanc dans le journal : l'option n'est pas muette.
+                    info!(
+                        zone = id,
+                        device = %device_id,
+                        silence = enabled,
+                        abonnable = dlna.peut_s_abonner(),
+                        "zone_silence_upnp — position estimée et déplacement façade différé quand armé"
+                    );
+                }
+            }
+        }
+    }
     // Sortie mono (#2362) → setting zone_{id}_mono_downmix. Même forme que
     // `upnp_renderer` juste au-dessus : la clé est supprimée à la désactivation
     // plutôt qu'écrite à « false », pour que l'absence de clé et le défaut
@@ -2905,7 +3017,7 @@ async fn patch_zone(
                 if let Some(ref did) = z.output_device_id {
                     if let Err(error) = state
                         .orchestrator
-                        .set_volume(id, f64::from(z.volume) / 100.0, Some(did))
+                        .set_volume(id, z.volume / 100.0, Some(did))
                         .await
                     {
                         warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
@@ -2971,6 +3083,18 @@ fn renderer_settings_snapshot(state: &AppState, zone_id: i64) -> serde_json::Map
     let delay = repo.get_dlna_play_delay_ms(zone_id);
     if delay > 0 {
         out.insert("dlna_play_delay_ms".into(), json!(delay));
+    }
+    // #2263 — même famille que `dlna_play_delay_ms` : un réglage qu'on garde
+    // parce que CET appareil-là le demande. Absent du relevé tant qu'il est au
+    // défaut, comme tous ses voisins ici.
+    if settings
+        .get(&crate::config::cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+    {
+        out.insert("upnp_silence".into(), json!(true));
     }
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
@@ -3571,6 +3695,13 @@ async fn register_dlna_output_from_device(
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
         let delay =
             crate::config::resolve_play_delay(&state.backend, &state.config, &dev.id, &dev.name);
+        let evt_urls = dev
+            .capabilities
+            .get("event_sub_urls")
+            .and_then(|v| {
+                serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+            })
+            .unwrap_or_default();
         let dlna = DlnaOutput::new(
             dev.name.clone(),
             dev.id.clone(),
@@ -3579,7 +3710,12 @@ async fn register_dlna_output_from_device(
             rc,
             cm_url,
         )
-        .with_play_delay(delay);
+        .with_play_delay(delay)
+        .with_upnp_events(
+            crate::startup::create_oh_listener().await,
+            crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
+        )
+        .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &dev.id));
         let mut outputs = state.outputs.lock().await;
         outputs.register(Box::new(dlna));
         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
@@ -3614,7 +3750,18 @@ async fn register_dlna_output_from_device(
                             format!("{base}{rc_path}"),
                             cm_path,
                         )
-                        .with_play_delay(delay);
+                        .with_play_delay(delay)
+                        .with_upnp_events(
+                            crate::startup::create_oh_listener().await,
+                            crate::discovery_setup::urls_evenements_dlna(
+                                &dev.host,
+                                dev.port,
+                                &desc.event_sub_urls(),
+                            ),
+                        )
+                        .with_upnp_silence(
+                            crate::config::resolve_upnp_silence(&state.backend, &dev.id),
+                        );
                         let mut outputs = state.outputs.lock().await;
                         outputs.register(Box::new(dlna));
                         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_via_description");
@@ -4624,7 +4771,7 @@ mod signal_path_tests {
 
     /// Monte une zone locale Windows dont la sonde a publié `reasons`.
     fn local_runtime_zone(
-        volume_percent: i32,
+        volume_percent: f64,
         volume: tune_core::outputs::traits::OutputVolumeState,
         reasons: Vec<OutputSignalReason>,
     ) -> (Zone, ZoneState, std::sync::Arc<dyn DbBackend>) {
@@ -4669,7 +4816,7 @@ mod signal_path_tests {
     #[test]
     fn software_volume_alone_does_not_announce_a_transcode() {
         let (zone, ps, backend) = local_runtime_zone(
-            85,
+            85.0,
             OutputVolumeState::Applied,
             vec![OutputSignalReason::SoftwareVolume],
         );
@@ -4706,7 +4853,7 @@ mod signal_path_tests {
     #[test]
     fn a_second_cause_beside_volume_keeps_the_negative_verdict() {
         let (zone, ps, backend) = local_runtime_zone(
-            85,
+            85.0,
             OutputVolumeState::Applied,
             vec![
                 OutputSignalReason::FloatTransport,
@@ -4727,7 +4874,7 @@ mod signal_path_tests {
     /// l'exemption exige la liste explicite, jamais une liste vide.
     #[test]
     fn an_unexplained_negative_verdict_is_never_upgraded() {
-        let (zone, ps, backend) = local_runtime_zone(85, OutputVolumeState::Applied, vec![]);
+        let (zone, ps, backend) = local_runtime_zone(85.0, OutputVolumeState::Applied, vec![]);
 
         let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
 
@@ -5143,7 +5290,7 @@ mod signal_path_tests {
         let (backend, zone) = dlna_zone();
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = zone.id.unwrap();
-        repo.update_volume(id, 20).unwrap();
+        repo.update_volume(id, 20.0).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
 
         // Copie mémoire périmée : le défaut 0,5 d'un ZoneState jamais resemé.
@@ -5161,7 +5308,7 @@ mod signal_path_tests {
         let (backend, zone) = dlna_zone();
         let repo = ZoneRepo::with_backend(backend.clone());
         let id = zone.id.unwrap();
-        repo.update_volume(id, 100).unwrap();
+        repo.update_volume(id, 100.0).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
 
         let mut ps = alac_hires_playing();
@@ -6004,7 +6151,7 @@ mod patch_zone_deserialize_tests {
             name: "Salon".into(),
             output_type: output_type.map(str::to_string),
             output_device_id: Some("renderer-1".into()),
-            volume: 37,
+            volume: 37.0,
             muted: false,
             online: true,
             gapless_enabled: false,
@@ -6134,7 +6281,7 @@ mod zone_group_tests {
             name: name.to_string(),
             output_type: Some("local".into()),
             output_device_id: device.map(str::to_string),
-            volume: 50,
+            volume: 50.0,
             muted: false,
             online: true,
             gapless_enabled: false,
@@ -6538,7 +6685,7 @@ mod contrat_des_retours_anticipes {
         let id = repo
             .create("Salon", Some("dlna"), Some("uuid:abcd"))
             .unwrap();
-        repo.update_volume(id, 50).unwrap();
+        repo.update_volume(id, 50.0).unwrap();
 
         let v = crate::routes::playback::build_zone_json(&state, id).await;
 

@@ -48,12 +48,25 @@ pub fn router() -> Router<AppState> {
         .route("/tickets/{id}/read", post(mark_read))
 }
 
+/// Corps JSON d'un ticket sans pièce jointe manuelle.
+///
+/// ⚠️ `zone`, `system` et `logs` doivent y figurer : le client les envoie sur
+/// CE chemin comme sur le multipart (case « joindre les journaux », cochée par
+/// défaut). Tant qu'ils manquaient ici, serde les jetait en silence, mozaiklabs
+/// ne recevait aucun `logs`, ne créait donc aucun `diagnostic.md` — et le ticket
+/// arrivait quand même en 201, le client annonçant « envoyé ».
 #[derive(Deserialize)]
 struct CreateBody {
     subject: String,
     body: String,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(default)]
+    system: Option<Value>,
+    #[serde(default)]
+    logs: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -115,9 +128,14 @@ async fn create_json(
         support::create_ticket(
             &state.http_client,
             &auth,
-            &payload.subject,
-            &payload.body,
-            payload.category.as_deref(),
+            &support::NewTicket {
+                subject: payload.subject,
+                body: payload.body,
+                category: payload.category,
+                zone: payload.zone,
+                system: payload.system,
+                logs: payload.logs,
+            },
         )
         .await,
         &headers,
@@ -314,6 +332,47 @@ mod tests {
         assert!(MAX_TOTAL_BYTES > MAX_FILES * MAX_FILE_BYTES);
         // …et rester au-dessus du DefaultBodyLimit global (50 Mo).
         assert!(MAX_TOTAL_BYTES > 50 * 1024 * 1024);
+    }
+
+    /// Le corps que le client web envoie réellement quand il n'y a AUCUNE pièce
+    /// jointe manuelle (`SupportView.submitTicket`, chemin JSON) : il porte
+    /// `logs` et `system`. `CreateBody` doit les retenir — serde jette en
+    /// silence tout champ absent de la structure, et c'est ainsi que le
+    /// diagnostic disparaissait sans une seule ligne de journal.
+    #[test]
+    fn le_corps_json_du_client_conserve_le_diagnostic() {
+        let brut = r##"{
+            "subject": "Coupure DLNA",
+            "body": "Le salon s'arrête au bout de dix secondes.",
+            "category": "bug",
+            "zone": "Salon",
+            "logs": "# Tune Bug Report\n\nERROR dlna_stall",
+            "system": { "os": "linux", "zones": 3 }
+        }"##;
+
+        let parsed: CreateBody = serde_json::from_str(brut).expect("corps client valide");
+
+        assert_eq!(
+            parsed.logs.as_deref(),
+            Some("# Tune Bug Report\n\nERROR dlna_stall"),
+            "le diagnostic doit survivre à la désérialisation"
+        );
+        assert_eq!(parsed.zone.as_deref(), Some("Salon"));
+        assert_eq!(
+            parsed.system.as_ref().map(|s| s["os"].clone()),
+            Some(json!("linux"))
+        );
+    }
+
+    /// Un client plus ancien n'envoie ni `logs` ni `system` : le ticket doit
+    /// s'ouvrir quand même (rétro-compatibilité, #1073).
+    #[test]
+    fn un_corps_sans_diagnostic_reste_accepte() {
+        let parsed: CreateBody = serde_json::from_str(r#"{"subject":"Question","body":"DSD ?"}"#)
+            .expect("corps minimal");
+        assert!(parsed.logs.is_none());
+        assert!(parsed.system.is_none());
+        assert!(parsed.category.is_none());
     }
 
     // -----------------------------------------------------------------------

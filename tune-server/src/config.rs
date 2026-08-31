@@ -96,6 +96,42 @@ pub fn resolve_play_delay(
     zone_override.unwrap_or_else(|| config.play_delay_for(device_name))
 }
 
+/// Clé du réglage « silence UPnP » d'une zone. Même forme que
+/// `zone_{id}_upnp_renderer` : la clé est SUPPRIMÉE à la désactivation, pour
+/// que l'absence de clé et le défaut désarmé soient un seul et même état.
+pub fn cle_silence_upnp(zone_id: i64) -> String {
+    format!("zone_{zone_id}_upnp_silence")
+}
+
+/// L'option « silence UPnP » est-elle armée sur la zone qui porte cet appareil ?
+///
+/// Strictement opt-in : sans zone, sans réglage, ou sur un réglage illisible,
+/// la réponse est `false` et la sortie garde le régime par défaut (évènements
+/// + position mesurée). Relu à CHAQUE construction de `DlnaOutput`, comme
+/// `resolve_play_delay`, pour que le choix survive à un redémarrage et à une
+/// redécouverte — pas seulement à un PATCH en direct.
+pub fn resolve_upnp_silence(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    device_id: &str,
+) -> bool {
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::zone_repo::ZoneRepo;
+    let Some(zone_id) = ZoneRepo::with_backend(db.clone())
+        .get_by_device_id(device_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.id)
+    else {
+        return false;
+    };
+    SettingsRepo::with_backend(db.clone())
+        .get(&cle_silence_upnp(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
 impl Default for TuneConfig {
     fn default() -> Self {
         Self {

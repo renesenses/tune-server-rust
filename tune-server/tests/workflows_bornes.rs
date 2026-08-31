@@ -724,3 +724,147 @@ fn le_tamponnage_du_dmg_reessaie() {
         "la boucle de reprises n'attend pas entre deux essais"
     );
 }
+
+/// Garde-fou : toute feature declaree par le serveur est activee par une porte
+/// clippy — la liste des features de `ci.yml` est un INVENTAIRE, pas un
+/// echantillon.
+///
+/// La porte clippy est lancee avec `--no-default-features` et une liste
+/// explicite. Une feature absente de cette liste n'est donc lue par AUCUN
+/// lint : le code qu'elle garde n'est verifie que quand un humain y pense.
+///
+/// Mesure du 31/08/2026, avant ce garde-fou (#2865) — quatre features nues :
+///
+/// | feature | fichiers gardes | lignes du plus gros fichier |
+/// |---|---|---|
+/// | `local-audio` | 16 | `outputs/local.rs`, 10 826 |
+/// | `postgres` | 11 | `db/pg_migrate.rs`, 1 285 |
+/// | `audio-embedding` | 3 | `audio/embedding.rs`, 2 199 |
+/// | `asio` | 3 | (Windows seulement) |
+///
+/// L'issue #2865 ne citait que `audio-embedding`. Le trou le plus gros etait
+/// ailleurs : `--no-default-features` RETIRE `local-audio`, qui est pourtant
+/// dans le `default` des deux crates. Corriger le seul cas cite aurait laisse
+/// dix mille lignes nues — d'ou ce test, qui compte au lieu de citer.
+///
+/// Le test ne credite QUE les features nommees explicitement sur une ligne
+/// `cargo clippy`. Une feature amenee par `default` ne compte pas : c'est
+/// exactement l'illusion qui a coute Bandcamp en 0.9.82 (#1768), ou une
+/// feature posee dans `default` n'atteignait aucun binaire publie.
+#[test]
+fn toute_feature_declaree_est_activee_par_une_porte_clippy() {
+    // Une feature hors porte doit etre INSCRITE ici avec sa raison. La liste
+    // se relit ; un oubli, non.
+    const HORS_PORTE: &[(&str, &str)] = &[
+        (
+            "asio",
+            "`cpal/asio` ne se compile que sous Windows (SDK Steinberg). Les \
+             runners de la porte clippy sont ubuntu-latest. Couverte par le job \
+             `windows-pr`, qui la compile en `cargo check`.",
+        ),
+        (
+            "plugin-http",
+            "activee EN DUR par la declaration de dependance de tune-server \
+             (`tune-core = { …, features = [\"plugin-http\"] }`). Toute porte \
+             qui compile tune-server la compile : elle ne peut pas etre nue.",
+        ),
+    ];
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. Les features declarees par les deux crates qui portent du code garde.
+    let mut declarees: Vec<String> = Vec::new();
+    for manifeste in ["Cargo.toml", "../tune-core/Cargo.toml"] {
+        let source = fs::read_to_string(racine.join(manifeste))
+            .unwrap_or_else(|e| panic!("{manifeste} illisible : {e}"));
+        let mut dedans = false;
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('[') {
+                dedans = t == "[features]";
+                continue;
+            }
+            if !dedans || t.starts_with('#') {
+                continue;
+            }
+            let Some((nom, _)) = t.split_once(" = [") else {
+                continue;
+            };
+            let nom = nom.trim();
+            if nom == "default" || nom.is_empty() {
+                continue;
+            }
+            if !declarees.iter().any(|d| d.as_str() == nom) {
+                declarees.push(nom.to_string());
+            }
+        }
+    }
+    assert!(
+        declarees.len() >= 8,
+        "le garde-fou n'a reconnu que {} feature(s) — la forme `nom = [\"…\"]` \
+         des manifestes a change, et ce test ne garde plus rien : {declarees:?}",
+        declarees.len()
+    );
+
+    // 2. Les features activees explicitement par une ligne `cargo clippy`.
+    let ci = workflow("ci.yml");
+    let mut lignes_clippy = 0usize;
+    let mut couvertes: Vec<String> = Vec::new();
+    for ligne in ci.lines() {
+        let t = ligne.trim();
+        if !t.contains("cargo clippy") {
+            continue;
+        }
+        lignes_clippy += 1;
+        let Some(reste) = t.split("--features").nth(1) else {
+            continue;
+        };
+        let Some(liste) = reste.split_whitespace().next() else {
+            continue;
+        };
+        for f in liste.split(',') {
+            let f = f.trim();
+            if !f.is_empty() && !couvertes.iter().any(|c| c.as_str() == f) {
+                couvertes.push(f.to_string());
+            }
+        }
+    }
+    assert!(
+        lignes_clippy > 0,
+        "aucune ligne `cargo clippy` dans ci.yml — le garde-fou ne garde plus rien"
+    );
+
+    // 3. Le verdict.
+    let nues: Vec<&str> = declarees
+        .iter()
+        .map(|f| f.as_str())
+        .filter(|f| !couvertes.iter().any(|c| c.as_str() == *f))
+        .filter(|f| !HORS_PORTE.iter().any(|(nom, _)| *nom == *f))
+        .collect();
+
+    assert!(
+        nues.is_empty(),
+        "ces features ne sont activees par AUCUNE porte clippy de ci.yml : \
+         {nues:?}\n\
+         Le code qu'elles gardent n'est lu par aucun lint — il n'est verifie \
+         que quand un agent y pense a la main (#2865).\n\
+         Deux issues seulement :\n\
+           1. les ajouter a la liste `--features` du job `clippy` ;\n\
+           2. les inscrire dans HORS_PORTE ci-dessus AVEC leur raison, si la \
+         porte ne PEUT pas les compiler (OS, materiel).\n\
+         Features couvertes aujourd'hui : {couvertes:?}"
+    );
+
+    // Une entree de HORS_PORTE qui ne correspond a aucune feature declaree est
+    // une justification perimee : elle rassure sans rien couvrir.
+    let perimees: Vec<&str> = HORS_PORTE
+        .iter()
+        .map(|(nom, _)| *nom)
+        .filter(|nom| !declarees.iter().any(|d| d.as_str() == *nom))
+        .collect();
+    assert!(
+        perimees.is_empty(),
+        "HORS_PORTE justifie des features qui n'existent plus : {perimees:?} — \
+         retirer l'entree plutot que la laisser rassurer"
+    );
+}

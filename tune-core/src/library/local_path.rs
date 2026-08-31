@@ -157,8 +157,62 @@ pub fn resolve_local_path(stored: &str) -> LocalPath {
 ///   répondu, un `read_dir` ne trouverait rien de plus ;
 /// - **chemin relatif** — la descente part de la racine, elle n'a pas de point
 ///   de départ ici (et les passes de fond ne manipulent que de l'absolu).
+///
+/// ⚠️ L'absolu ne s'écrit pas `/…` partout. Le garde-fou testait
+/// `starts_with('/')`, ce qui refusait **tout chemin Windows** —
+/// `C:\Musique\…` comme `\\NAS\Musique\…`. Le rattrapage par composant de
+/// #1837 n'a donc jamais tourné sous Windows, alors que c'est précisément là
+/// qu'une bibliothèque rapatriée d'un Mac ou d'un NAS mélange les graphies
+/// d'un composant à l'autre : l'album accentué restait `Missing`, la lecture
+/// rendait `file_not_found:` (404) et l'album voisin en ASCII partait sans
+/// broncher. Voir [`racine_et_reste`] pour les trois écritures reconnues.
 fn merite_un_parcours(stored: &str) -> bool {
-    !stored.is_ascii() && stored.starts_with('/')
+    !stored.is_ascii() && racine_et_reste(stored).is_some()
+}
+
+/// Sépare un chemin **absolu** en `(racine, reste, séparateur)`.
+///
+/// Trois écritures, reconnues quelle que soit la plateforme qui compile :
+///
+/// | écriture | racine rendue | séparateur |
+/// |---|---|---|
+/// | `/musique/…` (POSIX) | `/` | `/` |
+/// | `C:\Musique\…` ou `C:/Musique/…` (lettre de lecteur) | `C:\` | `\` |
+/// | `\\NAS\Musique\…` (UNC) | `\\NAS\Musique` | `\` |
+///
+/// **Pourquoi ne pas s'en remettre à `Path::is_absolute()`** : il répond selon
+/// l'hôte qui compile. Sous Linux — donc sur toute la CI — il déclare
+/// `C:\Musique\…` relatif, et le garde-fou resterait vert pendant que Windows
+/// perd le rattrapage. C'est exactement l'angle mort qui a laissé passer le
+/// défaut. Une fonction pure, indépendante de l'hôte, se teste.
+///
+/// `None` pour tout ce qui n'est pas absolu, `C:Musique` (relatif au
+/// répertoire courant du lecteur) compris.
+fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
+    if let Some(reste) = stored.strip_prefix('/') {
+        return Some(("/".to_string(), reste, '/'));
+    }
+    // UNC : la racine atteignable par `read_dir` est `\\serveur\partage`, pas
+    // `\\serveur` — les deux premiers composants font donc partie de la racine.
+    if let Some(reste) = stored.strip_prefix("\\\\") {
+        let mut morceaux = reste.splitn(3, ['\\', '/']);
+        let serveur = morceaux.next().filter(|s| !s.is_empty())?;
+        let partage = morceaux.next().filter(|s| !s.is_empty())?;
+        return Some((
+            format!("\\\\{serveur}\\{partage}"),
+            morceaux.next().unwrap_or(""),
+            '\\',
+        ));
+    }
+    let mut caracteres = stored.chars();
+    let lettre = caracteres.next()?;
+    if lettre.is_ascii_alphabetic() && caracteres.next() == Some(':') {
+        // `C:Musique` est relatif au répertoire courant DU LECTEUR : il n'a pas
+        // de point de départ ici, au même titre qu'un chemin relatif POSIX.
+        let reste = stored.get(2..)?.strip_prefix(['\\', '/'])?;
+        return Some((format!("{lettre}:\\"), reste, '\\'));
+    }
+    None
 }
 
 /// Nombre d'entrées lues au plus dans un répertoire pendant la descente.
@@ -181,28 +235,36 @@ const MAX_ENTREES_PARCOURUES: usize = 50_000;
 fn resolve_par_composant(stored: &str) -> Option<String> {
     // Chemins absolus seulement : la descente part d'une racine connue, et les
     // passes de fond ne manipulent que des chemins absolus.
-    let reste = stored.strip_prefix('/')?;
-    let mut courant = String::from("/");
-    for composant in reste.split('/') {
+    let (racine, reste, sep) = racine_et_reste(stored)?;
+    let mut courant = racine;
+    // Sous Windows les deux séparateurs sont acceptés par l'API et se mélangent
+    // dans une même chaîne ; sous POSIX la barre inverse est un caractère de
+    // nom de fichier parfaitement légal et ne doit surtout pas découper.
+    let composants: Vec<&str> = if sep == '\\' {
+        reste.split(['\\', '/']).collect()
+    } else {
+        reste.split('/').collect()
+    };
+    for composant in composants {
         if composant.is_empty() {
             continue;
         }
-        let tel_quel = joindre(&courant, composant);
+        let tel_quel = joindre(&courant, composant, sep);
         if std::path::Path::new(&tel_quel).exists() {
             courant = tel_quel;
             continue;
         }
-        courant = joindre(&courant, &entree_equivalente(&courant, composant)?);
+        courant = joindre(&courant, &entree_equivalente(&courant, composant)?, sep);
     }
     Some(courant)
 }
 
 /// Concaténation sans doubler le séparateur quand le préfixe est la racine.
-fn joindre(prefixe: &str, composant: &str) -> String {
-    if prefixe.ends_with('/') {
+fn joindre(prefixe: &str, composant: &str, sep: char) -> String {
+    if prefixe.ends_with(['/', '\\']) {
         format!("{prefixe}{composant}")
     } else {
-        format!("{prefixe}/{composant}")
+        format!("{prefixe}{sep}{composant}")
     }
 }
 
@@ -627,6 +689,121 @@ mod tests {
         assert!(
             !merite_un_parcours("Bj\u{00f6}rk/01.flac"),
             "relatif : la descente n'a pas de racine d'ou partir"
+        );
+    }
+
+    /// Le cas de Tades, sous Windows : l'album accentué ne partait pas quand
+    /// l'album voisin en ASCII partait.
+    ///
+    /// `starts_with('/')` refusait `C:\…` et `\\NAS\…` : le rattrapage par
+    /// composant ne tournait que sous POSIX, et la seule plateforme où une
+    /// bibliothèque arrive couramment d'un Mac ou d'un NAS — donc avec des
+    /// graphies mélangées — en était exclue.
+    ///
+    /// Les **deux** écritures Unicode sont construites pour chaque couple : un
+    /// test qui n'en porterait qu'une laisserait l'autre nue, et c'est
+    /// précisément le défaut qu'on traque.
+    #[test]
+    fn un_chemin_windows_accentue_merite_le_parcours_au_meme_titre_quun_chemin_posix() {
+        for (nfc, nfd) in COUPLES {
+            for graphie in [nfc, nfd] {
+                for absolu in [
+                    format!("C:\\Musique\\{graphie}\\01.flac"),
+                    format!("C:/Musique/{graphie}/01.flac"),
+                    format!("c:\\Musique\\{graphie}\\01.flac"),
+                    format!("\\\\NAS\\Musique\\{graphie}\\01.flac"),
+                    format!("/music/{graphie}/01.flac"),
+                ] {
+                    assert!(
+                        merite_un_parcours(&absolu),
+                        "chemin absolu accentué refusé : {absolu:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Le garde-fou de coût reste entier : ni l'ASCII ni le relatif n'ouvrent
+    /// un `read_dir`, dans l'écriture Windows comme dans l'écriture POSIX.
+    #[test]
+    fn les_deux_refus_du_garde_fou_valent_aussi_pour_lecriture_windows() {
+        for refuse in [
+            // ASCII : une seule graphie possible.
+            "C:\\Musique\\Gramophone\\01.flac",
+            "\\\\NAS\\Musique\\Gramophone\\01.flac",
+            // Relatif : aucune racine d'où partir.
+            "Musique\\Bj\u{00f6}rk\\01.flac",
+            // Relatif au répertoire courant DU LECTEUR — absent de racine lui aussi.
+            "C:Musique\\Bj\u{00f6}rk\\01.flac",
+            // UNC tronqué : un serveur SANS partage n'est pas une racine
+            // lisible — `\\serveur` seul ne s'énumère pas.
+            "\\\\Bj\u{00f6}rk",
+            "\\\\Bj\u{00f6}rk\\",
+        ] {
+            assert!(
+                !merite_un_parcours(refuse),
+                "ce chemin ne doit PAS ouvrir de read_dir : {refuse:?}"
+            );
+        }
+    }
+
+    /// La racine que la descente prend pour point de départ — la partie que
+    /// `read_dir` doit pouvoir ouvrir telle quelle.
+    #[test]
+    fn la_racine_est_celle_que_read_dir_peut_ouvrir() {
+        assert_eq!(
+            racine_et_reste("/music/Bj\u{00f6}rk/01.flac"),
+            Some(("/".to_string(), "music/Bj\u{00f6}rk/01.flac", '/'))
+        );
+        assert_eq!(
+            racine_et_reste("C:\\Musique\\Bj\u{00f6}rk\\01.flac"),
+            Some(("C:\\".to_string(), "Musique\\Bj\u{00f6}rk\\01.flac", '\\'))
+        );
+        // Le partage fait partie de la racine : `\\NAS` seul ne s'ouvre pas.
+        assert_eq!(
+            racine_et_reste("\\\\NAS\\Musique\\Bj\u{00f6}rk\\01.flac"),
+            Some((
+                "\\\\NAS\\Musique".to_string(),
+                "Bj\u{00f6}rk\\01.flac",
+                '\\'
+            ))
+        );
+        assert_eq!(racine_et_reste("Musique\\Bj\u{00f6}rk"), None);
+        assert_eq!(racine_et_reste("C:Musique"), None);
+    }
+
+    /// Sous POSIX, la barre inverse est un caractère de nom de fichier
+    /// parfaitement légal : elle ne doit jamais découper un composant. Le
+    /// découpage sur les deux séparateurs est réservé aux racines Windows.
+    #[cfg(unix)]
+    #[test]
+    fn une_barre_inverse_dans_un_nom_posix_ne_decoupe_pas_le_chemin() {
+        // Le répertoire est en NFC, le fichier en NFD : aucune des trois
+        // graphies GLOBALES ne peut produire le disque, la descente par
+        // composant est donc réellement engagée — sans quoi ce test passerait
+        // sans rien prouver.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repertoire_nfc = "AC\\DC \u{00e9}dition";
+        let fichier_nfd = "01 - Nu\u{0301}n\u{0303}ez.flac";
+        let sur_disque = tmp.path().join(repertoire_nfc);
+        std::fs::create_dir_all(&sur_disque).unwrap();
+        std::fs::write(sur_disque.join(fichier_nfd), b"x").unwrap();
+
+        let demande = format!(
+            "{}/{repertoire_nfc}/01 - N\u{00fa}\u{00f1}ez.flac",
+            tmp.path().to_string_lossy()
+        );
+        // Contre-épreuve du test : le chemin demandé ne doit PAS exister tel
+        // quel, ni dans l'une des deux formes globales.
+        for graphie in local_path_candidates(&demande) {
+            assert!(
+                !std::path::Path::new(&graphie).exists(),
+                "une graphie globale suffit : le test n'exerce pas la descente"
+            );
+        }
+        assert!(
+            !resolve_local_path(&demande).is_missing(),
+            "le composant contenant une barre inverse doit rester entier"
         );
     }
 

@@ -73,6 +73,23 @@ jobs:
           echo "x86=$X86" >> "$GITHUB_OUTPUT"
           echo "arm=$ARM" >> "$GITHUB_OUTPUT"
 
+      # ⚠️ `GET /releases/tags/{tag}` rend 404 sur une release BROUILLON : un
+      # brouillon n'a pas de tag git, il n'est donc joignable que par la liste.
+      # Mesure du 31/08/2026 sur tune-os-rpi-v0.9.128 : l'API par tag repondait
+      # 404 alors que le brouillon existait avec 4 artefacts.
+      #
+      # Consequences, toutes vecues sur la v0.9.128 :
+      #   - la branche `else` etait prise A CHAQUE TENTATIVE -> un brouillon
+      #     HOMONYME de plus a chaque relance (trois pour cette release, dont
+      #     deux vides). `gh release upload` en choisit alors un au hasard :
+      #     on pouvait publier une release OS SANS IMAGE.
+      #   - le garde « release OS deja publique » etait du code MORT : il ne
+      #     pouvait s'executer que pour une release deja publiee.
+      #   - « Verifier la matrice OS staged », plus bas, interrogeait le meme
+      #     point d'entree : il ne pouvait donc jamais reussir.
+      #
+      # On passe donc par la LISTE, et on refuse explicitement le doublon
+      # plutot que d'en ajouter un.
       - name: Creer ou verifier la release OS de staging
         env:
           TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
@@ -83,12 +100,26 @@ jobs:
           [ -n "$TOKEN" ] || { echo "::error::TUNE_OS_DISPATCH_TOKEN absent"; exit 1; }
           TAG_SHA="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/git/ref/tags/$OS_TAG" --jq .object.sha)"
           [ "$TAG_SHA" = "$OS_SHA" ] || { echo "::error::$OS_TAG pointe sur $TAG_SHA, attendu $OS_SHA"; exit 1; }
-          if RELEASE="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" 2>/dev/null)"; then
-            [ "$(jq -r .draft <<<"$RELEASE")" = true ] || { echo "::error::release OS deja publique"; exit 1; }
+
+          RELEASES="$(GH_TOKEN="$TOKEN" gh api --paginate "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {id, draft}]" | jq -s 'add // []')"
+          COMBIEN="$(jq 'length' <<<"$RELEASES")"
+
+          if [ "$COMBIEN" -gt 1 ]; then
+            echo "::error::$COMBIEN releases portent deja le tag $OS_TAG. Un depot ne peut pas trancher a leur place :"
+            jq -r '.[] | "::error::  id=\(.id) draft=\(.draft)"' <<<"$RELEASES"
+            echo "::error::Supprimer les homonymes vides a la main, puis relancer."
+            exit 1
+          fi
+
+          if [ "$COMBIEN" -eq 1 ]; then
+            [ "$(jq -r '.[0].draft' <<<"$RELEASES")" = true ] || { echo "::error::release OS deja publique"; exit 1; }
+            echo "brouillon OS existant reutilise (id=$(jq -r '.[0].id' <<<"$RELEASES"))"
           else
             GH_TOKEN="$TOKEN" gh api --method POST repos/renesenses/tune-os/releases \
               -f tag_name="$OS_TAG" -f target_commitish="$OS_SHA" \
               -f name="Tune OS v${{ steps.v.outputs.version }}" -F draft=true >/dev/null
+            echo "brouillon OS cree pour $OS_TAG"
           fi
 
       - name: Dispatcher et attendre les trois builds OS
@@ -113,17 +144,54 @@ jobs:
             "https://api.github.com/repos/renesenses/tune-os/dispatches" \
             -d "$PAYLOAD"
 
+          # ⚠️ Le guetteur DOIT dire pourquoi il abandonne. Vecu sur la
+          # v0.9.128 : les trois sondages ont pris un
+          # « HTTP 403 Resource not accessible by personal access token » sur
+          # /actions/workflows/*/runs — TUNE_OS_DISPATCH_TOKEN sait depecher et
+          # gerer les releases, mais ne peut pas LIRE les Actions de tune-os.
+          # `gh` sortait alors sans rien ecrire sur stdout, `read` recevait EOF
+          # et rendait non nul, et `set -e` tuait le pas en 0,64 s — sans un
+          # seul `::error::`. Le train paraissait victime d'une course de
+          # synchronisation alors qu'il lui manquait un DROIT. Trois heures
+          # perdues a chercher au mauvais endroit.
+          #
+          # On separe donc les trois etats : l'API refuse (on le dit et on
+          # s'arrete tout de suite), aucun run encore visible (on patiente),
+          # un run existe (on le suit).
+          sonder() {
+            local workflow="$1" sortie
+            if ! sortie="$(GH_TOKEN="$TOKEN" gh api \
+                  "repos/renesenses/tune-os/actions/workflows/$workflow/runs?event=repository_dispatch&per_page=20" \
+                  --jq ".workflow_runs | map(select(.created_at >= \"$STARTED_AT\")) | sort_by(.created_at) | last | [.status, (.conclusion // \"\"), .html_url] | @tsv" 2>&1)"; then
+              echo "::error::lecture des runs de $workflow refusee par l'API : $sortie" >&2
+              echo "::error::TUNE_OS_DISPATCH_TOKEN doit porter « Actions: read » sur renesenses/tune-os" >&2
+              return 2
+            fi
+            printf '%s\n' "$sortie"
+          }
+
           wait_workflow() {
-            local workflow="$1" status conclusion url
+            local workflow="$1" ligne rc status conclusion url attente=0
             for _ in $(seq 1 700); do
-              IFS=$'\t' read -r status conclusion url < <(
-                GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/actions/workflows/$workflow/runs?event=repository_dispatch&per_page=20" \
-                  --jq ".workflow_runs | map(select(.created_at >= \"$STARTED_AT\")) | sort_by(.created_at) | last | [.status, (.conclusion // \"\"), .html_url] | @tsv"
-              )
+              ligne="$(sonder "$workflow")"; rc=$?
+              # rc=2 : l'API a refuse. Inutile d'attendre 350 minutes.
+              [ "$rc" -eq 2 ] && return 1
+              IFS=$'\t' read -r status conclusion url <<<"$ligne" || true
               if [ "$status" = completed ]; then
                 [ "$conclusion" = success ] || { echo "::error::$workflow: $conclusion ($url)"; return 1; }
                 echo "$workflow: success ($url)"
                 return 0
+              fi
+              # Aucun run visible : normal les premieres secondes, anormal au
+              # bout de dix minutes — le dispatch n'a alors rien declenche.
+              if [ -z "$status" ]; then
+                attente=$((attente + 30))
+                if [ "$attente" -ge 600 ]; then
+                  echo "::error::$workflow : aucun run repository_dispatch depuis $STARTED_AT apres 10 minutes — le dispatch n'a rien declenche"
+                  return 1
+                fi
+              else
+                attente=0
               fi
               sleep 30
             done
@@ -142,7 +210,13 @@ jobs:
           OS_TAG: ${{ steps.v.outputs.os_tag }}
         run: |
           set -euo pipefail
-          ASSETS="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq '.assets[].name')"
+          # Meme piege que plus haut : un brouillon n'est PAS joignable par
+          # /releases/tags/{tag} (404). Cette etape ne pouvait donc jamais
+          # reussir sur une release de staging.
+          REL_ID="$(GH_TOKEN="$TOKEN" gh api --paginate "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\")] | .[0].id // empty" | head -1)"
+          [ -n "$REL_ID" ] || { echo "::error::aucune release ne porte le tag $OS_TAG"; exit 1; }
+          ASSETS="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/$REL_ID" --jq '.assets[].name')"
           grep -Eq 'x86_64.*\.iso$' <<<"$ASSETS" || { echo "::error::ISO x86_64 absente"; exit 1; }
           grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image x86_64 absente"; exit 1; }
           grep -Eq 'aarch64.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image aarch64 absente"; exit 1; }

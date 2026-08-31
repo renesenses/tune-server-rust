@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -201,7 +202,7 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -271,7 +272,15 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let total_artists = artist_repo.count().unwrap_or(0);
     let total_albums = album_repo.count().unwrap_or(0);
 
-    // Artists with bios
+    // Artists with bios — par soustraction, ce chiffre ne vaut que ce que vaut
+    // la requête retranchée.
+    //
+    // `list_without_bio` exigeait un identifiant MusicBrainz non vide : tout
+    // artiste sans MBID sortait de `v` et se retrouvait donc compté ICI, du
+    // côté des artistes « pourvus d'une biographie ». Avec 0,9 % de couverture
+    // MBID mesurée sur une bibliothèque réelle, le panneau annonçait ~99 % de
+    // biographies devant des fiches vides (#1311). La requête ne filtre plus
+    // sur le MBID ; ce calcul devient exact sans changer de forme.
     let artists_with_bio = artist_repo
         .list_without_bio()
         .map(|v| total_artists - v.len() as i64)
@@ -324,6 +333,22 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     // Last enrichment run timestamp
     let last_run = settings.get("enrichment_last_run").ok().flatten();
 
+    // Le bilan des deux passes de biographies (#1311).
+    //
+    // `bio_batch` rangeait déjà ces deux clés à la fin de chaque passe, et
+    // **personne ne les relisait** : une recherche de `artist_bio_enrich_result`
+    // dans tout le dépôt ne rendait que la ligne de l'écriture. Le serveur
+    // savait donc dire pourquoi une passe était rentrée à vide, et ne le disait
+    // à personne — c'est le vrai défaut derrière « les bios ne sont pas
+    // disponibles » : pas un décompte faux, une absence de retour.
+    //
+    // Les voici, sous une clé qui leur est propre pour ne rien déplacer de ce
+    // que `stats` promet déjà.
+    let bio_last_run = json!({
+        "artists": bilan_bio(&settings, "artist_bio_enrich_result"),
+        "albums": bilan_bio(&settings, "album_bio_enrich_result"),
+    });
+
     Json(json!({
         "premium": is_premium,
         "daily_used": daily_used,
@@ -339,7 +364,24 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
             "albums_with_bio": albums_with_bio,
         },
         "last_run": last_run,
+        "bio_last_run": bio_last_run,
     }))
+}
+
+/// Le bilan de la dernière passe de biographies rangé sous `cle`, tel que
+/// `tune_core::metadata::bio_batch::bilan_de_passe` l'a écrit.
+///
+/// Rend `null` quand la clé est absente (aucune passe n'a encore tourné) ou
+/// quand sa valeur n'est pas du JSON lisible : un bilan illisible ne doit pas
+/// faire tomber tout le panneau d'enrichissement, qui porte aussi les
+/// décomptes de la bibliothèque.
+fn bilan_bio(settings: &SettingsRepo, cle: &str) -> Value {
+    settings
+        .get(cle)
+        .ok()
+        .flatten()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .unwrap_or(Value::Null)
 }
 
 /// Helper to produce a JSON null for the daily_limit field on Premium.
@@ -400,7 +442,11 @@ pub(super) struct EnrichmentRunBody {
 /// garde que le scan ciblé, mais en REFUS franc plutôt qu'en repli silencieux :
 /// ici un repli enrichirait toute la bibliothèque, exactement ce que
 /// l'utilisateur demandait d'éviter (#1660).
-fn resoudre_portee(
+///
+/// `pub(crate)` : `/library/enrich-all` — la route que le bouton
+/// « Enrichir les métadonnées » de `SettingsView.svelte` appelle réellement —
+/// valide son `path` avec CETTE fonction, pas une copie.
+pub(crate) fn resoudre_portee(
     state: &AppState,
     path: &str,
 ) -> Result<tune_core::metadata::enrich_scope::EnrichScope, (StatusCode, Json<Value>)> {
@@ -550,7 +596,7 @@ pub(super) async fn enrichment_run(
                 "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
                 &[],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first()?.as_i64()?;
@@ -693,7 +739,7 @@ fn merge_duplicate_albums(
     let dupe_rows = db.query_many(
         "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
         &[],
-    ).unwrap_or_default();
+    ).ou_defaut_journalise();
     let dupes: Vec<(String, String)> = dupe_rows
         .iter()
         .map(|r| {
@@ -756,7 +802,7 @@ fn cleanup_orphan_artwork(
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
         if let Some(path) = r[0].as_string() {

@@ -362,6 +362,38 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Assemble la liste des genres d'une piste à partir des valeurs BRUTES du tag.
+///
+/// Un fichier peut porter ses genres de DEUX façons, selon le logiciel qui l'a
+/// gravé, et les deux sont légitimes :
+///
+///   * **plusieurs valeurs** — Vorbis Comment répète le champ (`GENRE=Jazz`,
+///     `GENRE=Fusion`), MP4 répète l'atome `©gen`, ID3v2.4 sépare les valeurs
+///     d'un `TCON` par un octet nul ;
+///   * **une seule chaîne** — ID3v2.3 n'a pas de multivaleur, l'étiqueteur
+///     écrit `TCON = "Jazz; Fusion"` ou `"Jazz/Fusion"`.
+///
+/// Chaque valeur brute est donc redécoupée par `split_genre_tag`, ce qui couvre
+/// aussi les fichiers qui mêlent les deux conventions. Le dédoublonnage passe
+/// par `genre_key` — la clé canonique de la bibliothèque, pas un
+/// `to_lowercase()` réécrit sur place — pour que « Hip-Hop » et « Hip Hop »,
+/// écrits par deux marchands sur le même disque, ne comptent qu'une fois.
+///
+/// L'ordre d'apparition est conservé : le premier genre reste le genre
+/// principal (colonne `tracks.genre`).
+pub fn genres_from_tag_values<S: AsRef<str>>(values: &[S]) -> Vec<String> {
+    let mut vus = std::collections::HashSet::new();
+    let mut sortie = Vec::new();
+    for valeur in values {
+        for g in split_genre_tag(valeur.as_ref()) {
+            if vus.insert(genre_key(&g)) {
+                sortie.push(g);
+            }
+        }
+    }
+    sortie
+}
+
 /// Canonical grouping key for a genre label, insensitive to case AND to the
 /// space-vs-hyphen separator, so "Trip Hop" and "Trip-Hop" (or "trip hop")
 /// collapse to a single key ("trip hop"). Used to dedup the library genre
@@ -660,6 +692,21 @@ impl Id3v2Tags {
     }
     fn genre(&self) -> Option<&str> {
         self.get("TCON")
+    }
+
+    /// TOUTES les trames `TCON`, dans l'ordre du fichier.
+    ///
+    /// `get()` ne rend que la première, ce qui suffit à la plupart des trames
+    /// mais pas au genre : un étiqueteur peut écrire une trame `TCON` par
+    /// genre au lieu d'une seule chaîne séparée. Jumeau du chemin lofty, qui
+    /// lit lui aussi toutes les valeurs depuis #1821 — les deux doivent rendre
+    /// la même liste pour le même fichier.
+    fn genres(&self) -> Vec<&str> {
+        self.text_frames
+            .iter()
+            .filter(|(id, _)| id == "TCON")
+            .map(|(_, v)| v.as_str())
+            .collect()
     }
 
     /// Parse track number from TRCK frame ("7" or "7/11").
@@ -1295,12 +1342,13 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         compilation,
         credits,
     ) = if let Some(ref tags) = id3_tags {
-        let raw_genre = tags.genre().map(|s| s.to_string());
-        let genres = raw_genre
-            .as_deref()
-            .map(split_genre_tag)
-            .unwrap_or_default();
-        let genre = genres.first().cloned().or(raw_genre);
+        // Toutes les trames `TCON`, comme le chemin lofty (#1821).
+        let raw_genres: Vec<&str> = tags.genres();
+        let genres = genres_from_tag_values(&raw_genres);
+        let genre = genres
+            .first()
+            .cloned()
+            .or_else(|| raw_genres.first().map(|s| s.to_string()));
 
         let compilation_str = tags.get("TCMP").unwrap_or("");
         let compilation = matches!(compilation_str, "1" | "true" | "True");
@@ -2126,7 +2174,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 
     let credits = parse_credits(tag);
 
-    let mut raw_genre = tag.genre().map(|s| s.to_string());
+    // TOUTES les valeurs du tag de genre, pas seulement la première (#1821).
+    // `Accessor::genre()` ne rend que la première : un FLAC gravé avec deux
+    // champs `GENRE`, ou un M4A avec deux atomes `©gen`, perdait tous ses
+    // genres secondaires — alors que le MÊME disque, acheté chez un marchand
+    // qui écrit « Jazz; Fusion » dans un unique `TCON`, les gardait tous les
+    // deux. Le classement dépendait donc du logiciel de gravure, pas de la
+    // musique (DEvir, #1821).
+    let mut raw_genres: Vec<String> = tag
+        .get_strings(ItemKey::Genre)
+        .map(|s| s.to_string())
+        .collect();
     // MP3s carrying two prepended ID3v2 tags (iTunes M4A→MP3 leftover + Mp3Tag
     // re-tag) make lofty merge last-wins, so a stale genre overrides the user's.
     // Read the first tag like every standard player does — no-op unless a second
@@ -2137,14 +2195,16 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
     {
         if let Some(g) = mp3_first_tag_genre_if_dual(path) {
-            raw_genre = Some(g);
+            // Le premier tag REMPLACE la fusion de lofty : c'est tout ce que
+            // lisent les autres lecteurs, valeurs multiples comprises.
+            raw_genres = vec![g];
         }
     }
-    let genres = raw_genre
-        .as_deref()
-        .map(split_genre_tag)
-        .unwrap_or_default();
-    let genre = genres.first().cloned().or(raw_genre);
+    let genres = genres_from_tag_values(&raw_genres);
+    let genre = genres
+        .first()
+        .cloned()
+        .or_else(|| raw_genres.first().cloned());
 
     // lofty can't distinguish ALAC (lossless) from AAC (lossy) in an M4A/MP4
     // container and reports no bit depth for either, so a tagged ALAC file was
@@ -4305,5 +4365,181 @@ mod tests {
         let taille = 4_800_000u64;
         let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
         assert_eq!(duree_reelle_a_320k, taille / 40);
+    }
+}
+
+/// #1821 — le genre ne doit pas dépendre du logiciel qui a gravé le fichier.
+///
+/// DEvir : « songs purchased from different platforms or labels end up being
+/// categorized under different genres ». La cause mesurée n'est pas le
+/// vocabulaire des marchands, c'est l'ENCODAGE : la même intention « ce disque
+/// est du Jazz ET de la Fusion » s'écrit de deux façons légitimes selon le
+/// format et l'étiqueteur, et Tune n'en lisait qu'une.
+///
+/// Ces épreuves construisent de VRAIS fichiers dans les trois conteneurs qui
+/// couvrent la bibliothèque d'un testeur — FLAC (Vorbis Comment), M4A (atomes
+/// MP4) et MP3 (trames ID3v2) — parce qu'un garde-fou qui ne monterait qu'un
+/// seul format ne dirait rien des deux autres : chacun a sa propre façon de
+/// porter plusieurs valeurs.
+#[cfg(test)]
+mod genres_multivalues_i1821 {
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::prelude::*;
+    use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+    /// Copie d'un gabarit sous un nom qui porte À LA FOIS la clé de l'agent et
+    /// le nom de l'épreuve : deux tests du même binaire ne peuvent pas se voler
+    /// leur fichier, et un nettoyage par glob commun ne peut pas emporter
+    /// celui d'un autre.
+    ///
+    /// ⚠️ Le nom de l'épreuve ne suffisait PAS (#2864) : sans pid, deux
+    /// binaires de test concurrents — deux agents sur la même machine de
+    /// compilation, `/tmp` partagé — visaient le même `i1821-<épreuve>-<nom>`.
+    /// `scratch_name` ajoute le pid ET un compteur ; l'étiquette ne sert plus
+    /// qu'à la lisibilité d'un résidu dans `/tmp`.
+    fn gabarit(nom: &str, epreuve: &str) -> std::path::PathBuf {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(nom);
+        // `nom` porte l'EXTENSION, et lofty choisit son analyseur dessus :
+        // elle doit rester en dernier. Le suffixe unique se glisse donc
+        // avant, jamais après.
+        let copie = std::env::temp_dir().join(format!(
+            "{}-{nom}",
+            crate::test_scratch::scratch_name(&format!("i1821-{epreuve}"))
+        ));
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        copie
+    }
+
+    /// Écrit N valeurs de genre en tant qu'ÉLÉMENTS SÉPARÉS du tag — la façon
+    /// native de Vorbis Comment (champ `GENRE` répété), de MP4 (atome `©gen`
+    /// répété) et d'ID3v2.4 (`TCON` multivalué).
+    fn ecrire_genres_separes(chemin: &std::path::Path, genres: &[&str]) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        for g in genres {
+            tag.push(TagItem::new(
+                ItemKey::Genre,
+                ItemValue::Text((*g).to_string()),
+            ));
+        }
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    /// Écrit les mêmes genres en UNE SEULE chaîne séparée — ce qu'écrit un
+    /// étiqueteur limité à ID3v2.3, qui n'a pas de multivaleur.
+    fn ecrire_genres_en_une_chaine(chemin: &std::path::Path, chaine: &str) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        tag.push(TagItem::new(
+            ItemKey::Genre,
+            ItemValue::Text(chaine.to_string()),
+        ));
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    #[test]
+    fn les_trois_conteneurs_rendent_tous_les_genres_du_tag() {
+        // On récolte les TROIS lectures avant d'affirmer quoi que ce soit :
+        // une assertion posée dans la boucle s'arrêterait au premier format et
+        // ne dirait rien des deux autres — le faux garde-fou exact qu'on veut
+        // éviter ici. Sans le correctif, le message rouge nomme les trois.
+        let lu: Vec<(&str, Vec<String>, Option<String>)> = ["test.flac", "test.m4a", "test.mp3"]
+            .into_iter()
+            .map(|nom| {
+                let chemin = gabarit(nom, "trois-conteneurs");
+                ecrire_genres_separes(&chemin, &["Jazz", "Fusion"]);
+                let meta = super::read_metadata(&chemin).expect("lecture des métadonnées");
+                let _ = std::fs::remove_file(&chemin);
+                (nom, meta.genres, meta.genre)
+            })
+            .collect();
+
+        let attendu = vec!["Jazz".to_string(), "Fusion".to_string()];
+        let perdus: Vec<&str> = lu
+            .iter()
+            .filter(|(_, genres, _)| *genres != attendu)
+            .map(|(nom, _, _)| *nom)
+            .collect();
+        assert!(
+            perdus.is_empty(),
+            "les genres secondaires du tag sont perdus sur {perdus:?} — lu : {lu:?}"
+        );
+        for (nom, _, genre) in &lu {
+            assert_eq!(
+                genre.as_deref(),
+                Some("Jazz"),
+                "{nom} : le genre principal reste le premier du tag"
+            );
+        }
+    }
+
+    #[test]
+    fn les_deux_conventions_decrivent_la_meme_musique() {
+        // Le cœur de #1821 : le même disque, gravé une fois en valeurs
+        // séparées et une fois en chaîne unique, doit se ranger IDENTIQUEMENT.
+        // Avant le correctif, la chaîne unique rendait deux genres et les
+        // valeurs séparées un seul — d'où deux classements pour un seul disque.
+        let separe = gabarit("test.flac", "deux-conventions-separe");
+        ecrire_genres_separes(&separe, &["Jazz", "Fusion"]);
+
+        let unique = gabarit("test.mp3", "deux-conventions-unique");
+        ecrire_genres_en_une_chaine(&unique, "Jazz; Fusion");
+
+        let a = super::read_metadata(&separe).expect("FLAC à valeurs séparées");
+        let b = super::read_metadata(&unique).expect("MP3 à chaîne unique");
+        assert_eq!(
+            a.genres, b.genres,
+            "deux gravures de la même intention donnent deux classements"
+        );
+        assert_eq!(a.genre, b.genre);
+
+        let _ = std::fs::remove_file(&separe);
+        let _ = std::fs::remove_file(&unique);
+    }
+
+    #[test]
+    fn un_genre_unique_reste_intact() {
+        // Contre-garde : le cas courant — un seul genre — ne bouge pas.
+        for nom in ["test.flac", "test.m4a", "test.mp3"] {
+            let chemin = gabarit(nom, "genre-unique");
+            ecrire_genres_separes(&chemin, &["Rock"]);
+            let meta = super::read_metadata(&chemin).expect("lecture");
+            assert_eq!(meta.genres, vec!["Rock".to_string()], "{nom}");
+            assert_eq!(meta.genre.as_deref(), Some("Rock"), "{nom}");
+            let _ = std::fs::remove_file(&chemin);
+        }
+    }
+
+    #[test]
+    fn deux_orthographes_du_meme_genre_ne_comptent_quune_fois() {
+        // Un marchand écrit « Hip-Hop », l'autre « Hip Hop ». Un fichier
+        // regravé peut porter les deux ; `genre_key` — la clé canonique de la
+        // bibliothèque, pas un `to_lowercase()` réécrit sur place — les
+        // ramène à un seul genre.
+        assert_eq!(
+            super::genres_from_tag_values(&["Hip-Hop", "hip hop", "Trip Hop"]),
+            vec!["Hip-Hop".to_string(), "Trip Hop".to_string()]
+        );
+    }
+
+    #[test]
+    fn une_valeur_peut_elle_meme_etre_separee() {
+        // Les deux conventions se mêlent dans un même fichier : deux champs
+        // `GENRE`, dont l'un porte encore un séparateur.
+        assert_eq!(
+            super::genres_from_tag_values(&["Jazz", "Fusion; Latin Jazz"]),
+            vec![
+                "Jazz".to_string(),
+                "Fusion".to_string(),
+                "Latin Jazz".to_string()
+            ]
+        );
     }
 }

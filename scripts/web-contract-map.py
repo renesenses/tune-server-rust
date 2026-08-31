@@ -49,6 +49,34 @@ MOTIF_APPEL = re.compile(
     re.S,
 )
 
+# SECONDE forme d'appel : le type ne porte pas sur `fetchJSON<>`, mais sur
+# l'annotation de retour de la fonction qui l'enveloppe.
+#
+#     export function getConversionStatus(jobId: string): Promise<{
+#       state: 'converting' | 'done' | 'error';
+#       progress: number; converted: number; download_size?: string;
+#     }> {
+#       return fetchJSON(`${BASE}/converter/status/${encodeURIComponent(jobId)}`);
+#     }
+#
+# `MOTIF_APPEL` exige `fetchJSON<`. Ces appels-là étaient donc TOTALEMENT
+# invisibles : ni cartographiés, ni même rangés dans `non_resolus` — la carte
+# se taisait au lieu de dire qu'elle ne savait pas, ce qui est le pire des
+# deux : on lit « 236 routes cartographiées » et on croit le compte complet.
+#
+# Quarante appels d'`api.ts` écrivent leur type ainsi, dont
+# `/converter/status/{}`. C'est ce trou qui a laissé passer #3002 : l'écran
+# Convertisseur lit `state`, `progress`, `converted` et `download_size`, que le
+# serveur n'envoyait pas — quatre champs fantômes qu'aucun contrôle ne pouvait
+# voir, puisque la route elle-même n'entrait pas dans la carte.
+MOTIF_RETOUR_PROMESSE = re.compile(r"\)\s*:\s*Promise<\s*(?P<liste>Array<\s*)?\{")
+
+# L'appel SANS type, celui que `MOTIF_APPEL` ignore. Reprendre ici la forme
+# typée la dédoublerait.
+MOTIF_APPEL_NU = re.compile(
+    r"fetchJSON\(\s*(?P<q>[`'\"])\$\{BASE\}(?P<route>(?:(?!(?P=q)).)*)", re.S
+)
+
 MOTIF_INTERFACE = re.compile(r"^\s*export\s+(?:interface|type)\s+(?P<nom>[A-Z][A-Za-z0-9_]*)\s*=?\s*\{", re.M)
 
 
@@ -151,6 +179,45 @@ def normaliser_route(route: str) -> str:
     return route.rstrip("/") or "/"
 
 
+def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool]]:
+    """La seconde forme d'appel : `(route brute, méthode, corps du type, liste)`.
+
+    Voir `MOTIF_RETOUR_PROMESSE`. On ne retient que les appels **non typés** :
+    une fonction peut parfaitement annoncer son retour ET écrire
+    `fetchJSON<T>(…)`, auquel cas `MOTIF_APPEL` la cartographie déjà.
+    """
+    trouves: list[tuple[str, str, str, bool]] = []
+    for m in MOTIF_RETOUR_PROMESSE.finditer(api_ts):
+        debut = m.end() - 1  # l'accolade ouvrante du type en ligne
+        corps = corps_apres_accolade(api_ts, debut)
+        if corps is None:
+            continue
+
+        # Le corps de la FONCTION commence après le type. On borne la recherche
+        # à la déclaration exportée suivante : sans cette borne, une fonction
+        # sans appel s'attribuerait la route de sa voisine.
+        apres = api_ts[debut + len(corps) + 1 :]
+        fin = apres.find("\nexport ")
+        if fin != -1:
+            apres = apres[:fin]
+
+        m_appel = MOTIF_APPEL_NU.search(apres)
+        if m_appel is None:
+            continue
+
+        # La méthode vit dans les options, juste après l'URL — même fenêtre
+        # bornée que pour la forme typée.
+        suite = apres[m_appel.end() : m_appel.end() + 400]
+        m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
+        trouves.append((
+            m_appel.group("route"),
+            m_meth.group(1).upper() if m_meth else "GET",
+            corps,
+            bool(m.group("liste")),
+        ))
+    return trouves
+
+
 def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]:
     """Construit la carte, et la liste de ce qui n'a pas pu être résolu."""
     types = dictionnaire_des_types(sources)
@@ -215,6 +282,30 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             "champs_optionnels": connu["optionnels"],
         })
 
+    # Seconde forme : le type est sur l'annotation de retour (#3002).
+    for route_brute, methode, corps, liste in appels_types_par_le_retour(api_ts):
+        route = normaliser_route(route_brute)
+        if not route:
+            non_resolus.append({
+                "route": route_brute[:60], "type": "(retour de fonction)",
+                "raison": "interpolation non fermée — route non fiable",
+            })
+            continue
+        obligatoires, optionnels = champs_du_bloc(corps)
+        if not obligatoires and not optionnels:
+            # `Promise<{ [k: string]: unknown }>` et consorts : la carte ne
+            # doit annoncer AUCUN champ obligatoire plutôt qu'un champ faux.
+            non_resolus.append({
+                "route": route, "type": "(retour de fonction)",
+                "raison": "type en ligne sans champ de premier niveau",
+            })
+            continue
+        entrees.append({
+            "route": route, "methode": methode, "type": "(retour de fonction)",
+            "liste": liste,
+            "champs_obligatoires": obligatoires, "champs_optionnels": optionnels,
+        })
+
     # Dédoublonner : la même route peut être appelée plusieurs fois.
     vues, uniques = set(), []
     for e in entrees:
@@ -251,6 +342,22 @@ def self_test() -> int:
       export const dev = (id) => fetchJSON<Zone>(`${BASE}/devices/${encodeURIComponent(id)}?x=1`);
       export const listP = () => fetchJSON<{ presets: Zone[] }>(`${BASE}/eq/presets`);
       export const newP = (b) => fetchJSON<Zone>(`${BASE}/eq/presets`, { method: 'POST', body: b });
+
+      export function statutConv(jobId: string): Promise<{
+        state: 'converting' | 'done' | 'error';
+        progress: number;
+        download_size?: string;
+      }> {
+        return fetchJSON(`${BASE}/converter/status/${encodeURIComponent(jobId)}`);
+      }
+
+      export function annulerConv(jobId: string): Promise<{ status: string }> {
+        return fetchJSON(`${BASE}/converter/jobs/${jobId}`, { method: 'DELETE' });
+      }
+
+      export function opaque(): Promise<{ [k: string]: unknown }> {
+        return fetchJSON(`${BASE}/sans/champ`);
+      }
     """
     entrees, non_resolus = carte(types_src, api)
     par_route = {e["route"]: e for e in entrees}
@@ -281,6 +388,34 @@ def self_test() -> int:
     if "/devices/{}" not in par_route:
         echecs.append(f"encodeURIComponent tronque la route : {sorted(par_route)}")
 
+    # Seconde forme : type sur l'annotation de retour, appel `fetchJSON()` nu.
+    # C'est le trou par lequel `/converter/status/{}` a échappé à la carte,
+    # donc au banc d'essai, donc à #3002.
+    if "/converter/status/{}" not in par_route:
+        echecs.append(
+            "un type porté par l'annotation de retour n'est pas cartographié "
+            f"— routes vues : {sorted(par_route)}"
+        )
+    else:
+        conv = par_route["/converter/status/{}"]
+        if conv["champs_obligatoires"] != ["state", "progress"]:
+            echecs.append(f"champs du retour de fonction mal lus : {conv['champs_obligatoires']}")
+        elif conv["champs_optionnels"] != ["download_size"]:
+            echecs.append("`download_size?` est compté comme obligatoire")
+        elif conv["liste"]:
+            echecs.append("un objet nu est marqué comme liste")
+
+    annul = [e for e in entrees if e["route"] == "/converter/jobs/{}"]
+    if not annul:
+        echecs.append("la seconde forme perd la route quand le type tient sur une ligne")
+    elif annul[0]["methode"] != "DELETE":
+        echecs.append(f"la méthode de la seconde forme est fausse : {annul[0]['methode']}")
+
+    if "/sans/champ" in par_route:
+        echecs.append("un type sans champ de premier niveau est cartographié comme un contrat")
+    elif not any(nr.get("route") == "/sans/champ" for nr in non_resolus):
+        echecs.append("un type sans champ n'est même pas signalé comme non résolu")
+
     eq = {e["methode"]: e for e in entrees if e["route"] == "/eq/presets"}
     if set(eq) != {"GET", "POST"}:
         echecs.append(f"GET et POST sur la même route ne sont pas distingués : {sorted(eq)}")
@@ -298,9 +433,10 @@ def self_test() -> int:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 12 garanties (déclaration générique ignorée, type nommé, "
+    print("SELF-TEST: ok — 16 garanties (déclaration générique ignorée, type nommé, "
           "optionnels, liste, paramètre d'URL, type en ligne, import en ligne, route "
-          "à parenthèses, méthode HTTP, et les deux non-résolutions)")
+          "à parenthèses, méthode HTTP, les deux non-résolutions, et les quatre du "
+          "type porté par l'annotation de retour)")
     return 0
 
 

@@ -64,6 +64,15 @@ pub mod social;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;
+/// Chemins temporaires uniques par appel — voir le module pour le pourquoi
+/// (issue #2864 : deux tests du même binaire se volaient leur fichier).
+///
+/// `pub` et non `#[cfg(test)]` : `cfg(test)` ne traverse PAS les frontières
+/// de caisse. Les binaires de test de `tune-server` — y compris les cibles
+/// agrégées `server_contracts` et `appliance_contracts` — en ont besoin
+/// aussi, et une seconde copie du compteur ne protégerait plus rien.
+#[doc(hidden)]
+pub mod test_scratch;
 pub mod transcode_cache;
 pub mod updater;
 pub mod upnp_renderer;

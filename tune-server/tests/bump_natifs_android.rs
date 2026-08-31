@@ -53,8 +53,7 @@ struct FauxDev {
 
 impl FauxDev {
     fn nouveau(nom: &str, version_pubspec: &str, version_manifeste: &str) -> Self {
-        let racine =
-            std::env::temp_dir().join(format!("tune-bump-natifs-{}-{}", nom, std::process::id()));
+        let racine = tune_core::test_scratch::scratch_dir(&format!("tune-bump-natifs-{nom}"));
         let _ = fs::remove_dir_all(&racine);
 
         let rust = racine.join("tune-server-rust");

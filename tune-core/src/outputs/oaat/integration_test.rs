@@ -1780,7 +1780,7 @@ mod tests {
     /// des en-têtes sont cohérents avec la position réelle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_bytes_reach_the_endpoint_unaltered() {
-        let dir = std::env::temp_dir().join(format!("tune-dsd-proof-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-dsd-proof");
         std::fs::create_dir_all(&dir).unwrap();
         let dsf_path = dir.join("proof.dsf");
         // 9 blocs/canal ≈ 0,21 s de DSD64 : assez court pour un test,
@@ -1853,7 +1853,7 @@ mod tests {
     /// le second flux doit rester exact au bit près malgré l'abort du premier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_second_play_is_bit_exact_after_aborting_the_first() {
-        let dir = std::env::temp_dir().join(format!("tune-dsd-proof2-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-dsd-proof2");
         std::fs::create_dir_all(&dir).unwrap();
         let path_a = dir.join("a.dsf");
         let path_b = dir.join("b.dsf");

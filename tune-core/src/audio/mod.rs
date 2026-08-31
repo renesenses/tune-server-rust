@@ -34,6 +34,8 @@ pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
+pub mod soft_mute;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;

@@ -211,10 +211,27 @@ async fn pg_zones_round_trip() {
         .unwrap();
     let z = repo.get(id).unwrap().unwrap();
     assert_eq!(z.name, "Living Room");
-    assert_eq!(z.volume, 50);
+    assert_eq!(z.volume, 50.0);
 
-    repo.update_volume(id, 75).unwrap();
-    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75);
+    repo.update_volume(id, 75.0).unwrap();
+    assert_eq!(repo.get(id).unwrap().unwrap().volume, 75.0);
+    // #2886 — la colonne est a virgule des DEUX cotes. Sur PG c'est la
+    // migration 048 qui le garantit : sans elle, ecrire un f64 dans une
+    // colonne `integer` echoue purement et simplement.
+    repo.update_volume(id, 0.398_107_170_553_497_2 * 100.0)
+        .unwrap();
+    let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+    assert!(
+        (relu - 0.398_107_170_553_497_2).abs() < 1e-12,
+        "-8 dB persiste puis relu a {relu}"
+    );
+    repo.update_volume(id, 10f64.powf(-48.0 / 20.0) * 100.0)
+        .unwrap();
+    assert!(
+        repo.get(id).unwrap().unwrap().volume > 0.0,
+        "-48 dB : la zone se rallumerait MUETTE sur PostgreSQL"
+    );
+    repo.update_volume(id, 75.0).unwrap();
 
     // The WAL fallback `query_many_strong` doesn't change behavior on
     // PG (same pool either way) — confirm list() works.
@@ -274,6 +291,7 @@ async fn pg_history_round_trip() {
         profile_id: None,
         context_type: None,
         context_id: None,
+        context_position: None,
     };
     repo.record(&rec).unwrap();
     repo.record(&rec).unwrap();
@@ -348,7 +366,8 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         // 011 (listen_history)
         ("listen_history", "duration_ms", &["bigint"]),
         // 013 (the rest)
-        ("zones", "volume", &["integer"]),
+        // #2886 — a virgule : l'entier coupait le son sous -46,02 dB.
+        ("zones", "volume", &["double precision"]),
         ("zones", "last_position_ms", &["bigint"]),
         ("queue_items", "position", &["integer"]),
         ("track_source_links", "confidence", &["double precision"]),
@@ -557,4 +576,197 @@ async fn pg_1706_ensure_schema_heals_queue_items_numbering() {
         .execute(db.pool())
         .await
         .ok();
+}
+
+/// #2860 — « Continuer l'écoute » et « Ajoutés récemment » étaient vides sur
+/// TOUTE installation PostgreSQL, et sans un seul message.
+///
+/// Les trois défauts, mesurés sur une base réelle. Chacun porte ici sa
+/// contre-épreuve : on rejoue la forme d'AVANT et on exige l'erreur exacte,
+/// pour qu'un retour en arrière ne puisse pas passer inaperçu.
+///
+/// 1. `listen_history.album_id` TEXT contre `albums.id` BIGINT —
+///    `operator does not exist: text = bigint`. La migration 012 convertit
+///    déjà cette colonne, mais elle ne l'a JAMAIS vue : `album_id` n'arrive
+///    par aucun script numéroté, seulement par `ENSURE_COLUMNS`, rejoué APRÈS.
+///    Réparé par la 047.
+/// 2. `GROUP BY a.id` en sélectionnant `ar.name` —
+///    `column "ar.name" must appear in the GROUP BY clause…`.
+/// 3. `HAVING listened_tracks < …` — un alias de la liste SELECT n'existe pas
+///    quand le HAVING est évalué : `column "listened_tracks" does not exist`.
+///
+/// Les trois erreurs étaient avalées par le `unwrap_or_default()` de
+/// `tune-server/src/routes/home.rs` : la section ne s'expliquait pas, elle
+/// disparaissait.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2860_continuer_lecoute_et_ajouts_recents() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{continue_listening_albums_deduits, recently_added};
+    use crate::db::migrations::PG_MIGRATIONS;
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    // Le pool brut EN PLUS du backend : `execute_batch` decoupe sur les
+    // point-virgules, ce qui hacherait le bloc `DO $migration$ … $migration$`
+    // de la 047. Les scripts numerotes passent par `raw_sql`, comme le fait
+    // deja le test #1706.
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    reset_schema(&db);
+
+    let type_album_id = |db: &Arc<dyn DbBackend>| -> String {
+        db.query_many(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'listen_history' AND column_name = 'album_id'",
+            &[],
+        )
+        .unwrap()
+        .first()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_else(|| "<absente>".into())
+    };
+
+    // ── Reconstituer la dérive : la colonne telle qu'ENSURE_COLUMNS la posait ──
+    db.execute(
+        "ALTER TABLE listen_history DROP COLUMN IF EXISTS album_id",
+        &[],
+    )
+    .unwrap();
+    db.execute("ALTER TABLE listen_history ADD COLUMN album_id TEXT", &[])
+        .unwrap();
+    assert_eq!(type_album_id(&db), "text", "la dérive n'a pas été reposée");
+
+    let limite: i64 = 10;
+    let sql_cl = continue_listening_albums_deduits(Engine::Postgres, "");
+    let sql_ra = recently_added(Engine::Postgres);
+
+    // ── CONTRE-ÉPREUVE 1 — sans la migration 047, la requête ne compile même pas.
+    let err = db
+        .query_many(&sql_cl, &[&limite as &dyn ToSqlValue])
+        .expect_err("`text = bigint` doit être refusé par PostgreSQL");
+    assert!(
+        err.contains("operator does not exist") && err.contains("text") && err.contains("bigint"),
+        "erreur attendue « operator does not exist: text = bigint », obtenue : {err}"
+    );
+
+    // ── La migration 047, rejouée telle quelle (elle est idempotente) ──
+    let (_, _, sql_047) = PG_MIGRATIONS
+        .iter()
+        .find(|(v, _, _)| *v == 47)
+        .expect("la migration 047 doit être inscrite dans PG_MIGRATIONS");
+    sqlx::raw_sql(*sql_047)
+        .execute(&pool)
+        .await
+        .expect("la migration 047 doit être rejouable");
+    assert_eq!(
+        type_album_id(&db),
+        "bigint",
+        "la 047 n'a pas converti listen_history.album_id"
+    );
+
+    // ── Les données : les deux « Live » de Tades, dont un seul est écouté ──
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    let police = id_de("INSERT INTO artists (name) VALUES ('The Police') RETURNING id");
+    let pulp = id_de("INSERT INTO artists (name) VALUES ('Pulp') RETURNING id");
+    let live_police = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {police}, 5) RETURNING id"
+    ));
+    let live_pulp = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {pulp}, 5) RETURNING id"
+    ));
+    for piste in ["Piste 1", "Piste 2"] {
+        db.execute(
+            &format!(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('{piste}', 'Pulp', 'Live', {live_pulp}, '2026-08-28T22:45:00Z')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+
+    // ── « Continuer l'écoute » rend le disque de Pulp, 2 pistes sur 5 ──
+    let lignes = db
+        .query_many(&sql_cl, &[&limite as &dyn ToSqlValue])
+        .expect("la requête corrigée doit s'exécuter sur PostgreSQL");
+    assert_eq!(
+        lignes.len(),
+        1,
+        "un seul album écouté et non fini était attendu, obtenu : {lignes:?}"
+    );
+    let l = &lignes[0];
+    assert_eq!(
+        l[0].as_i64(),
+        Some(live_pulp),
+        "ce n'est pas le Live de Pulp"
+    );
+    assert_ne!(
+        l[0].as_i64(),
+        Some(live_police),
+        "l'homonyme de Police est remonté (#2731)"
+    );
+    assert_eq!(l[1].as_string().as_deref(), Some("Live"));
+    assert_eq!(
+        l[2].as_string().as_deref(),
+        Some("Pulp"),
+        "`ar.name` doit être rendue — c'est la colonne qui faisait tomber la requête"
+    );
+    assert_eq!(l[6].as_i64(), Some(2), "2 pistes distinctes écoutées");
+    assert_eq!(l[7].as_i64(), Some(5), "sur 5");
+
+    // ── « Ajoutés récemment » : même défaut, même écran ──
+    let piste = id_de(&format!(
+        "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime) \
+         VALUES ('Piste 1', {live_pulp}, {pulp}, '/x/1.flac', 9999999999) RETURNING id"
+    ));
+    assert!(piste > 0);
+    let depuis: i64 = 0;
+    let recents = db
+        .query_many(
+            &sql_ra,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .expect("« Ajoutés récemment » doit s'exécuter sur PostgreSQL");
+    assert_eq!(recents.len(), 1, "obtenu : {recents:?}");
+    assert_eq!(recents[0][2].as_string().as_deref(), Some("Pulp"));
+
+    // ── CONTRE-ÉPREUVE 2 — `GROUP BY a.id` seul, la forme d'avant ──
+    let avant_group_by = sql_cl.replace(
+        "GROUP BY a.id, a.title, ar.name, a.year, a.cover_path, a.genre, a.track_count",
+        "GROUP BY a.id",
+    );
+    assert_ne!(avant_group_by, sql_cl, "la substitution n'a rien remplacé");
+    let err = db
+        .query_many(&avant_group_by, &[&limite as &dyn ToSqlValue])
+        .expect_err("`GROUP BY a.id` avec `ar.name` doit être refusé");
+    assert!(
+        err.contains("ar.name") && err.contains("GROUP BY"),
+        "erreur attendue sur « ar.name », obtenue : {err}"
+    );
+
+    // ── CONTRE-ÉPREUVE 3 — l'alias de la liste SELECT dans le HAVING ──
+    let avant_having = sql_cl.replace(
+        "HAVING COUNT(DISTINCT lh.title) < a.track_count",
+        "HAVING listened_tracks < a.track_count",
+    );
+    assert_ne!(avant_having, sql_cl, "la substitution n'a rien remplacé");
+    let err = db
+        .query_many(&avant_having, &[&limite as &dyn ToSqlValue])
+        .expect_err("un alias de la liste SELECT dans le HAVING doit être refusé");
+    assert!(
+        err.contains("listened_tracks") && err.contains("does not exist"),
+        "erreur attendue « column \"listened_tracks\" does not exist », obtenue : {err}"
+    );
 }

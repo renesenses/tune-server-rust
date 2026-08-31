@@ -452,12 +452,29 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  # La liste `--features` de cette porte est un INVENTAIRE, pas un echantillon :
+  # avec `--no-default-features`, une feature absente d'ici n'est lue par AUCUN
+  # lint. Le test `toute_feature_declaree_est_activee_par_une_porte_clippy`
+  # (tune-server/tests/workflows_bornes.rs) refuse desormais toute feature
+  # declaree qui n'y figure pas — ou qui n'est pas inscrite avec sa raison.
+  #
+  # Mesure du 31/08/2026 (#2865), avant cet elargissement — quatre features
+  # nues : `local-audio` (16 fichiers, dont `outputs/local.rs` et ses 10 826
+  # lignes), `postgres` (11), `audio-embedding` (3), `asio` (3).
+  #
+  # L'issue ne citait que `audio-embedding`. Le plus gros trou etait ailleurs :
+  # `local-audio` est dans le `default` des deux crates, et c'est precisement
+  # `--no-default-features` qui la retirait. Deux agents ont du relancer clippy
+  # a la main sur `local.rs` dans la nuit du 30 au 31/08.
+  #
+  # `asio` reste dehors — `cpal/asio` ne se compile que sous Windows ; le job
+  # `windows-pr` la couvre en `cargo check`.
   clippy:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # clippy — 2 min observe
+    timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -465,7 +482,23 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      # `local-audio` tire cpal, qui lie ALSA : sans ce paquet la porte s'arrete
+      # sur « Package alsa was not found in the pkg-config search path ».
+      # Meme boucle de reprises que les autres jobs — cf release.yml.
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit

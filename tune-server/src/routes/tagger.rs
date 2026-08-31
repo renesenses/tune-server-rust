@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -255,7 +256,7 @@ async fn auto_number_album(
             "SELECT id, path, title FROM tracks WHERE album_id = $1 ORDER BY path ASC",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     let tracks: Vec<(i64, String, Option<String>)> = rows
         .into_iter()
@@ -332,7 +333,7 @@ async fn set_album_genre(
             "SELECT id, path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {
@@ -394,7 +395,7 @@ async fn set_album_year(
             "SELECT id, path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {

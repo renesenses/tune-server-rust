@@ -725,7 +725,7 @@ mod daemon_path_tests {
     fn resolves_daemon_bundled_next_to_executable() {
         // The primary native-install path: the daemon sits in the same directory
         // as the tune-server binary, wherever the archive was extracted.
-        let dir = std::env::temp_dir().join(format!("tune_daemon_test_{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune_daemon_test");
         std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);
@@ -745,8 +745,7 @@ mod daemon_path_tests {
         // arm64 Docker ships a 0-byte placeholder so AirPlay 2 falls back to
         // legacy. An existence-only check would pick it and fail to exec (#700):
         // a zero-length candidate must be treated as "no daemon".
-        let dir =
-            std::env::temp_dir().join(format!("tune_daemon_empty_test_{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune_daemon_empty_test");
         std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);
