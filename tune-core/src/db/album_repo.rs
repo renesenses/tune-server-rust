@@ -1876,6 +1876,95 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// Les genres RÉELLEMENT ouvrables, et le nombre d'albums que chacun ouvre.
+    ///
+    /// C'est la liste que le serveur média publie sous « Genres », et le
+    /// `childCount` de chaque dossier (#2299).
+    ///
+    /// ## Pourquoi un `SELECT DISTINCT genre` ne peut pas la donner
+    ///
+    /// La colonne porte des valeurs COMPOSÉES — « Jazz; Blues », « Folk/Rock »
+    /// — que [`Self::list_by_genre`] découpe AVANT de comparer. Un dossier
+    /// nommé d'après la valeur brute ne s'ouvre donc jamais. Mesuré sur cinq
+    /// albums de test : deux des cinq dossiers publiés ouvraient zéro album,
+    /// et « Blues », « Folk » et « Rock » n'avaient aucun dossier du tout.
+    ///
+    /// ## La règle : l'étiquette publiée est celle qui ouvre
+    ///
+    /// Chaque étiquette rendue ici est un jeton que `list_by_genre` sait
+    /// retrouver, parce qu'elle sort de la MÊME découpe :
+    ///
+    ///   * colonne `genre` — la chaîne de `REPLACE` de `list_by_genre`
+    ///     (« ; », « ; », « / », « / » → virgule), puis découpe sur la virgule,
+    ///     ce qui reproduit exactement le `LIKE '%,jeton,%'` ;
+    ///   * colonne `genres` — chaque élément du tableau JSON tel quel, que
+    ///     `json_array_contains_lower` compare par égalité insensible à la
+    ///     casse.
+    ///
+    /// Les jetons ne sont PAS rognés. Le prédicat compare des tranches
+    /// délimitées par des virgules : rogner le « Folk » d'un « Folk / Rock »
+    /// donnerait une étiquette qui n'ouvre plus rien. Un dossier au cadrage
+    /// approximatif vaut mieux qu'un dossier vide — c'est la règle que
+    /// `ROOT_CONTAINERS` pose et que le compteur doit tenir.
+    ///
+    /// Le compte est celui des albums VISIBLES : `list_by_genre` exclut les
+    /// masqués (#1391), le compteur doit l'exclure aussi, sinon il annonce ce
+    /// qu'il n'ouvrira pas. Un genre dont tous les albums sont masqués
+    /// disparaît de la liste, au lieu d'y rester comme dossier vide.
+    ///
+    /// ## Une seule requête
+    ///
+    /// Une par genre ferait plusieurs centaines de balayages de la table à
+    /// CHAQUE `Browse` de la racine — le compteur du rayon « Genres » passe
+    /// par ici. Les deux colonnes sont donc lues d'un coup et regroupées en
+    /// mémoire, comme le fait déjà la route `/library/genres`.
+    ///
+    /// Les étiquettes sortent triées par jeton en minuscules : le même ordre
+    /// que le `ORDER BY LOWER(genre)` qu'elles remplacent.
+    pub fn genre_counts(&self) -> Result<Vec<(String, i64)>, TuneError> {
+        let sql = format!(
+            "SELECT a.genre, a.genres FROM albums a WHERE (\
+             (a.genre IS NOT NULL AND a.genre != '') \
+             OR (a.genres IS NOT NULL AND a.genres != '')) AND {}",
+            crate::db::facet_filter::hidden_albums_excluded()
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+
+        // Clé = le jeton en minuscules, c'est-à-dire EXACTEMENT ce que le SQL
+        // de `list_by_genre` compare. Valeur = les orthographes rencontrées
+        // (la plus petite fait l'étiquette, pour un choix déterministe : le
+        // SQL passe le besoin par `LOWER`, donc toutes ouvrent la même liste)
+        // et le nombre d'albums.
+        let mut par_cle: std::collections::BTreeMap<
+            String,
+            (std::collections::BTreeSet<String>, i64),
+        > = std::collections::BTreeMap::new();
+
+        for cols in &rows {
+            let genre = cols.first().and_then(|v| v.as_string());
+            let genres = cols.get(1).and_then(|v| v.as_string());
+            // Un album compte UNE fois par genre, même s'il l'écrit deux fois
+            // (colonne héritée ET tableau JSON, ou deux casses différentes).
+            let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for jeton in jetons_de_genre(genre.as_deref(), genres.as_deref()) {
+                let cle = jeton.to_lowercase();
+                if cle.is_empty() || !vus.insert(cle.clone()) {
+                    continue;
+                }
+                let entree = par_cle.entry(cle).or_default();
+                entree.0.insert(jeton);
+                entree.1 += 1;
+            }
+        }
+
+        Ok(par_cle
+            .into_values()
+            .filter_map(|(orthographes, n)| {
+                orthographes.into_iter().next().map(|label| (label, n))
+            })
+            .collect())
+    }
+
     /// Return all local albums that have no cover art set.
     /// Each entry is (album_id, title, artist_name, musicbrainz_release_id).
     #[allow(clippy::type_complexity)]
@@ -2021,6 +2110,45 @@ impl AlbumRepo {
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
+}
+
+/// Les jetons de genre d'UN album, tels que `AlbumRepo::list_by_genre` les
+/// comparera.
+///
+/// Ce n'est pas un découpage « raisonnable » de plus : c'est la transcription
+/// LITTÉRALE des deux moitiés du prédicat SQL. Toute liberté prise ici
+/// produirait une étiquette que la requête n'ouvre pas — le défaut même que
+/// [`AlbumRepo::genre_counts`] corrige.
+///
+///   * `genre` : la chaîne de `REPLACE` du `LIKE`, dans le MÊME ordre
+///     (« ; » avant « ; », « / » avant « / » — l'inverse laisserait un espace
+///     collé au jeton suivant), puis découpe sur la virgule. Les tranches
+///     vides sont écartées : un genre sans nom n'est pas un dossier.
+///   * `genres` : le tableau JSON, comparé élément par élément et sans
+///     découpe par `json_array_contains_lower`. Un contenu qui n'est pas un
+///     tableau de chaînes ne rend rien, comme `json_each` sur une valeur
+///     illisible.
+fn jetons_de_genre(genre: Option<&str>, genres_json: Option<&str>) -> Vec<String> {
+    let mut jetons = Vec::new();
+    if let Some(brut) = genre {
+        let decoupe = brut
+            .replace("; ", ",")
+            .replace(';', ",")
+            .replace("/ ", ",")
+            .replace('/', ",");
+        jetons.extend(
+            decoupe
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(json) = genres_json {
+        if let Ok(tableau) = serde_json::from_str::<Vec<String>>(json) {
+            jetons.extend(tableau.into_iter().filter(|s| !s.is_empty()));
+        }
+    }
+    jetons
 }
 
 fn row_to_album(cols: &Vec<SqlValue>) -> Album {

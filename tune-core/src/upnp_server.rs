@@ -16,7 +16,6 @@ use crate::db::radio_repo::RadioRepo;
 use std::sync::Arc;
 
 use crate::db::backend::DbBackend;
-use crate::db::engine::Engine;
 use crate::db::track_repo::TrackRepo;
 use crate::discovery::ssdp;
 
@@ -1067,7 +1066,7 @@ fn search_containers_in_container(
         }
         CibleRecherche::Genres => {
             let genres = lire_genres(state);
-            let retenus = retenir_par_titre(genres, titres, |g| g.as_str());
+            let retenus = retenir_par_titre(genres, titres, |g| g.0.as_str());
             let (page, total) = paginer(retenus, start, count);
             let mut didl = didl_genres(&page);
             didl.total = total;
@@ -1556,13 +1555,23 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
         // Un genre est un conteneur comme un autre : sans cette branche, un
         // point de contrôle strict qui décrit l'objet avant de l'ouvrir
         // n'obtenait rien et abandonnait la navigation.
+        //
+        // Sa taille est celle que la LISTE annonce, prise à la même source :
+        // deux vues d'un même genre ne doivent pas donner deux tailles. Un
+        // identifiant qui n'est pas un genre publié n'a pas de compteur —
+        // l'absence d'attribut vaut mieux qu'un zéro, qui se lirait « dossier
+        // vide » alors qu'il s'agit d'un dossier inconnu.
         id if id.starts_with("genre/") => decode_genre_id(id).map(|genre| {
+            let nb = lire_genres(state)
+                .into_iter()
+                .find(|(publie, _)| *publie == genre)
+                .map(|(_, nb)| nb);
             didl_container(
                 id,
                 "genres",
                 &genre,
                 "object.container.genre.musicGenre",
-                None,
+                nb,
             )
         }),
         // Même règle que `genre/` : une année est un conteneur comme un autre,
@@ -2065,16 +2074,21 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
 }
 
 /// Le DIDL d'une liste de genres. `Browse` et `Search` passent par ici.
-fn didl_genres(genres: &[String]) -> DidlResult {
+///
+/// Chaque genre annonce le nombre d'albums qu'il OUVRE : c'est la moitié que
+/// #2941 avait laissée dehors, faute d'un compteur qui ne mente pas. Il tient
+/// maintenant parce que l'étiquette et le compte sortent du même appel
+/// ([`AlbumRepo::genre_counts`]), lui-même calé sur `list_by_genre`.
+fn didl_genres(genres: &[(String, u64)]) -> DidlResult {
     let mut inner = String::new();
-    for genre in genres {
+    for (genre, nb) in genres {
         let id = format!("genre/{}", urlencoding::encode(genre));
         inner.push_str(&didl_container(
             &id,
             "genres",
             genre,
             "object.container.genre.musicGenre",
-            None,
+            Some(*nb),
         ));
     }
 
@@ -2086,30 +2100,29 @@ fn didl_genres(genres: &[String]) -> DidlResult {
     }
 }
 
-fn lire_genres(state: &UpnpState) -> Vec<String> {
-    // Fetch distinct genres from the albums table.
-    //
-    // `COLLATE NOCASE` is SQLite-only — PostgreSQL rejects it — so the sort is
-    // dialect-specific. `LOWER(genre)` is the portable equivalent and gives
-    // the same ordering on both.
-    let order = match state.backend.engine() {
-        Engine::Postgres => "LOWER(genre)",
-        Engine::Sqlite => "genre COLLATE NOCASE",
-    };
-    let genres: Vec<String> = state
-        .backend
-        .query_many(
-            &format!(
-                "SELECT DISTINCT genre FROM albums \
-                 WHERE genre IS NOT NULL AND genre != '' ORDER BY {order}"
-            ),
-            &[],
-        )
+/// Les genres publiés sous le rayon « Genres », chacun avec sa taille.
+///
+/// Ce n'est PAS `SELECT DISTINCT genre`. Cette requête-là rendait la valeur
+/// BRUTE de la colonne, alors que [`browse_genre_albums`] passe par
+/// `AlbumRepo::list_by_genre`, qui la DÉCOUPE avant de comparer. Un album
+/// étiqueté « Jazz; Blues » publiait donc un dossier « Jazz; Blues » qui
+/// n'ouvrait rien, et ni « Blues » ni aucun autre composant n'avait de
+/// dossier. Mesuré sur cinq albums de test, deux des cinq dossiers publiés
+/// ouvraient zéro album — exactement le reproche de #2299 : ça se parcourt
+/// comme un dossier, et le dossier est vide.
+///
+/// [`AlbumRepo::genre_counts`] rend les jetons que `list_by_genre` sait
+/// retrouver, et leur nombre d'albums visibles. Un genre qui n'ouvre rien n'en
+/// sort pas : la règle de [`ROOT_CONTAINERS`] — aucun conteneur annoncé qui
+/// s'ouvre vide — descend ainsi d'un niveau, comme elle le fait déjà pour les
+/// listes de lecture.
+fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
+    AlbumRepo::with_backend(state.backend.clone())
+        .genre_counts()
         .unwrap_or_default()
-        .iter()
-        .filter_map(|row| row.first().and_then(|v| v.as_string()))
-        .collect();
-    genres
+        .into_iter()
+        .filter_map(|(genre, nb)| u64::try_from(nb).ok().map(|nb| (genre, nb)))
+        .collect()
 }
 
 /// Les albums d'un genre.
@@ -2775,6 +2788,123 @@ mod tests {
         assert!(
             res.xml.contains("parentID=\"genre/Jazz\""),
             "le parentID doit ramener au conteneur de genre, pas à la racine"
+        );
+    }
+
+    /// Une bibliothèque étiquetée comme le sont les vraies : valeurs composées
+    /// par point-virgule ET par barre oblique, tableau JSON structuré, et un
+    /// album masqué (#1391) dont le genre ne doit plus paraître.
+    fn state_des_genres_composes() -> UpnpState {
+        use crate::db::hidden_repo::HiddenRepo;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        repo.create(&album_with_genre("Kind of Blue", "Jazz; Blues"))
+            .unwrap();
+        repo.create(&album_with_genre("Bitches Brew", "Jazz"))
+            .unwrap();
+        repo.create(&album_with_genre("Liege & Lief", "Folk/Rock"))
+            .unwrap();
+        // Étiquetage moderne : rien dans la colonne héritée, tout dans le
+        // tableau JSON — que `list_by_genre` sait lire et que le
+        // `SELECT DISTINCT genre` ignorait complètement.
+        let mut structure = album_with_genre("Music for Airports", "");
+        structure.genre = None;
+        structure.genres = Some("[\"Ambient\"]".into());
+        repo.create(&structure).unwrap();
+        let masque = repo.create(&album_with_genre("Brouillon", "Zouk")).unwrap();
+        HiddenRepo::with_backend(backend.clone())
+            .hide_album(masque)
+            .unwrap();
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #2299 — TOUT dossier de genre publié doit s'ouvrir, et sur exactement
+    /// ce qu'il annonce.
+    ///
+    /// Le rayon « Genres » publiait la valeur BRUTE de la colonne, alors que
+    /// `browse_genre_albums` passe par `list_by_genre`, qui la DÉCOUPE avant
+    /// de comparer. Relevé sur Shrek AVANT correctif, avec ce même jeu :
+    ///
+    /// ```text
+    ///   "Folk/Rock"   -> genre/Folk%2FRock     ouvre 0 album(s)
+    ///   "Jazz; Blues" -> genre/Jazz%3B%20Blues ouvre 0 album(s)
+    /// ```
+    ///
+    /// Deux dossiers sur cinq ouvraient le vide : « ça se parcourt comme un
+    /// dossier », et le dossier ne contient rien.
+    #[test]
+    fn chaque_genre_publie_ouvre_ce_qu_il_annonce() {
+        let state = state_des_genres_composes();
+        let publies = lire_genres(&state);
+        assert!(
+            !publies.is_empty(),
+            "une bibliothèque étiquetée doit publier des genres"
+        );
+        let liste = browse_genres(&state);
+        for (genre, annonce) in &publies {
+            let id = format!("genre/{}", urlencoding::encode(genre));
+            let ouvert = browse_direct_children(&state, &id, 0, 0).total;
+            assert!(ouvert > 0, "le dossier {genre:?} s'ouvre VIDE");
+            assert_eq!(
+                *annonce, ouvert,
+                "le dossier {genre:?} annonce {annonce} et ouvre {ouvert}"
+            );
+            // Le nombre doit être DANS le DIDL, porté par ce conteneur-là.
+            let attendu = format!("id=\"{id}\" parentID=\"genres\" childCount=\"{ouvert}\"");
+            assert!(
+                liste.xml.contains(&attendu),
+                "la liste n'annonce pas la taille de {genre:?} : {}",
+                liste.xml
+            );
+            assert!(
+                browse_metadata(&state, &id).xml.contains(&attendu),
+                "BrowseMetadata({id}) et la liste ne disent pas la même taille"
+            );
+        }
+        assert_eq!(
+            compter_enfants_racine(&state, "genres"),
+            Some(publies.len() as u64),
+            "le rayon racine doit compter comme la liste qu'il ouvre"
+        );
+    }
+
+    /// #2299 — chaque COMPOSANT d'un genre composé a son propre dossier, et la
+    /// valeur brute n'est plus publiée telle quelle.
+    #[test]
+    fn un_genre_compose_publie_ses_composants() {
+        let state = state_des_genres_composes();
+        let noms: Vec<String> = lire_genres(&state).into_iter().map(|(g, _)| g).collect();
+        for attendu in ["Jazz", "Blues", "Folk", "Rock"] {
+            assert!(
+                noms.iter().any(|g| g == attendu),
+                "« {attendu} » doit avoir son dossier : {noms:?}"
+            );
+        }
+        assert!(
+            !noms.iter().any(|g| g.contains(';') || g.contains('/')),
+            "aucune valeur composée ne doit être publiée telle quelle : {noms:?}"
+        );
+        // « Jazz » ouvre les DEUX albums qui le portent, le composé compris.
+        assert_eq!(
+            browse_direct_children(&state, "genre/Jazz", 0, 0).total,
+            2,
+            "Jazz doit ouvrir l'album simple ET l'album composé"
+        );
+        // Un genre porté par le seul tableau JSON existe aussi : le
+        // `SELECT DISTINCT genre` l'ignorait.
+        assert!(
+            noms.iter().any(|g| g == "Ambient"),
+            "le genre du tableau JSON manque : {noms:?}"
+        );
+        // Un genre dont tous les albums sont masqués (#1391) DISPARAÎT, au
+        // lieu de rester comme dossier vide.
+        assert!(
+            !noms.iter().any(|g| g == "Zouk"),
+            "un genre entièrement masqué ne doit plus être publié : {noms:?}"
         );
     }
 
