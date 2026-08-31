@@ -3327,6 +3327,243 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #2971 — le contrat vu depuis le POINT DE CONTRÔLE, pas depuis l'intérieur
+    // -----------------------------------------------------------------------
+
+    /// Un corps SOAP `Browse` tel qu'un point de contrôle l'envoie.
+    fn corps_browse(object_id: &str, browse_flag: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+    <ObjectID>{object_id}</ObjectID>
+    <BrowseFlag>{browse_flag}</BrowseFlag>
+    <Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount>
+    <SortCriteria></SortCriteria>
+  </u:Browse></s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    /// Le texte d'une balise de la `BrowseResponse`, brut.
+    fn champ_reponse(soap: &str, balise: &str) -> String {
+        let ouvrant = format!("<{balise}>");
+        let fermant = format!("</{balise}>");
+        let debut = soap
+            .find(&ouvrant)
+            .unwrap_or_else(|| panic!("réponse sans <{balise}> : {soap}"))
+            + ouvrant.len();
+        let fin = soap[debut..]
+            .find(&fermant)
+            .unwrap_or_else(|| panic!("réponse sans </{balise}> : {soap}"))
+            + debut;
+        soap[debut..fin].to_string()
+    }
+
+    /// Le DIDL **tel que le point de contrôle le lit** : extrait de `<Result>`
+    /// puis déséchappé. Passer par ce chemin est le tout l'intérêt du test —
+    /// `browse_root` peut être juste et la réponse SOAP fausse.
+    fn didl_de_la_reponse(soap: &str) -> String {
+        unescape(&champ_reponse(soap, "Result"))
+            .expect("le <Result> doit se déséchapper")
+            .into_owned()
+    }
+
+    /// Les `(balise, id)` des enfants directs d'un DIDL — conteneurs ET items.
+    fn enfants_du_didl(didl: &str) -> Vec<(String, String)> {
+        let mut reader = quick_xml::Reader::from_str(didl);
+        let mut buf = Vec::new();
+        let mut sortie = Vec::new();
+        loop {
+            let (nom, id) = match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => (
+                    String::from_utf8_lossy(e.name().as_ref()).into_owned(),
+                    e.attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref() == b"id")
+                        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                        .unwrap_or_default(),
+                ),
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("DIDL mal formé : {e} — {didl}"),
+                _ => {
+                    buf.clear();
+                    continue;
+                }
+            };
+            if nom == "container" || nom == "item" {
+                sortie.push((nom, id));
+            }
+            buf.clear();
+        }
+        sortie
+    }
+
+    /// #2971 — Jean Valjean, fil 1625 : « on voit seulement Artistes, Albums,
+    /// Genres, Pistes et Radio live », alors que la racine du serveur en
+    /// montre sept.
+    ///
+    /// Les cinq raccourcis manquants sont une liste **codée en dur dans le
+    /// client web** (`tune-web-client`, qui livre depuis `main`) ; ce dépôt-ci
+    /// n'a rien à corriger. Ce que ce test verrouille est l'autre moitié du
+    /// contrat, celle qui vit ici : **la réponse SOAP** que le client parse
+    /// annonce bien SEPT rayons, et chacun des sept s'ouvre.
+    ///
+    /// Les tests voisins ([`la_racine_n_annonce_aucun_conteneur_impossible_a_ouvrir`],
+    /// [`chaque_rayon_racine_annonce_la_taille_qu_il_ouvre`]) travaillent sur
+    /// `browse_root`/`browse_direct_children` — des fonctions internes. Entre
+    /// elles et le point de contrôle il reste `browse_action_response`, qui
+    /// **échappe** le DIDL dans `<Result>` et publie `NumberReturned` /
+    /// `TotalMatches`. Un double échappement, une troncature par
+    /// `RequestedCount`, un compteur désaccordé : rien de tout cela n'est vu
+    /// par les tests internes, et tout cela se lit chez le testeur comme des
+    /// rayons manquants — exactement le symptôme de ce fil.
+    #[test]
+    fn la_reponse_soap_de_la_racine_annonce_les_sept_rayons() {
+        let (state, _, _, _, _) = state_complet();
+
+        let soap = build_browse_response(&state, &corps_browse("0", "BrowseDirectChildren"));
+        assert!(!is_soap_fault(&soap), "la racine rend un fault : {soap}");
+
+        let attendu = ROOT_CONTAINERS.len().to_string();
+        assert_eq!(
+            champ_reponse(&soap, "NumberReturned"),
+            attendu,
+            "NumberReturned ne compte pas les sept rayons : {soap}"
+        );
+        assert_eq!(
+            champ_reponse(&soap, "TotalMatches"),
+            attendu,
+            "TotalMatches ne compte pas les sept rayons : {soap}"
+        );
+
+        // Et le DIDL réellement transporté en contient autant — c'est ce
+        // nombre-là, pas l'annonce, que le client compte pour dessiner ses
+        // rayons.
+        let didl = didl_de_la_reponse(&soap);
+        let enfants = enfants_du_didl(&didl);
+        assert_eq!(
+            enfants.len(),
+            ROOT_CONTAINERS.len(),
+            "la racine transporte {} conteneurs pour {} annoncés : {didl}",
+            enfants.len(),
+            ROOT_CONTAINERS.len()
+        );
+        for (balise, _) in &enfants {
+            assert_eq!(balise, "container", "la racine ne publie que des dossiers");
+        }
+
+        // Chaque rayon attendu est là, adressable, et dans l'ordre déclaré :
+        // le client web ouvre par cet identifiant-là, pas par le titre.
+        let ids: Vec<&str> = enfants.iter().map(|(_, id)| id.as_str()).collect();
+        let voulus: Vec<&str> = ROOT_CONTAINERS.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, voulus, "les rayons de la racine ont changé : {didl}");
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            assert!(
+                didl.contains(&format!("<dc:title>{titre}</dc:title>")),
+                "le rayon {id} arrive sans titre lisible : {didl}"
+            );
+        }
+    }
+
+    /// #2971, seconde moitié : un rayon annoncé doit s'OUVRIR par SOAP.
+    ///
+    /// « Un rayon listé mais non navigable est pire qu'un rayon absent » — la
+    /// règle est déjà écrite en tête de [`ROOT_CONTAINERS`], elle n'était
+    /// vérifiée qu'en interne. Ici on descend dans les sept par le même
+    /// chemin que le testeur, et on exige de chaque enfant un identifiant non
+    /// vide : **une entrée sans `id` est impubliable en DIDL** — un point de
+    /// contrôle n'a alors rien à renvoyer au `Browse` suivant, et le dossier
+    /// se lit comme cassé.
+    #[test]
+    fn chaque_rayon_de_la_racine_s_ouvre_par_soap() {
+        let (state, _, _, _, _) = state_complet();
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let soap = build_browse_response(&state, &corps_browse(id, "BrowseDirectChildren"));
+            assert!(
+                !is_soap_fault(&soap),
+                "le rayon {id} ({titre}) rend un fault : {soap}"
+            );
+
+            let didl = didl_de_la_reponse(&soap);
+            let enfants = enfants_du_didl(&didl);
+            assert!(
+                !enfants.is_empty(),
+                "le rayon {id} ({titre}) s'ouvre vide par SOAP sur une \
+                 bibliothèque peuplée : {didl}"
+            );
+            assert_eq!(
+                champ_reponse(&soap, "NumberReturned"),
+                enfants.len().to_string(),
+                "le rayon {id} ({titre}) annonce autre chose que ce qu'il \
+                 transporte : {soap}"
+            );
+
+            for (balise, enfant_id) in &enfants {
+                assert!(
+                    !enfant_id.is_empty(),
+                    "un <{balise}> du rayon {id} ({titre}) est publié sans \
+                     identifiant : il est inatteignable au Browse suivant — {didl}"
+                );
+                if balise != "container" {
+                    // Un `<item>` est terminal : il porte son `<res>`, le point
+                    // de contrôle le lit dans la liste. `browse_metadata` ne
+                    // décrit AUJOURD'HUI que des conteneurs — `track/N` et
+                    // `radio/N` y tombent dans le bras par défaut et rendent un
+                    // DIDL vide. C'est un trou réel du contrat CDS:1, mais
+                    // c'est un AUTRE sujet que #2971 : l'élargir ici toucherait
+                    // le chemin de lecture que des testeurs utilisent en ce
+                    // moment. Constaté, pas corrigé.
+                    continue;
+                }
+                let fils =
+                    build_browse_response(&state, &corps_browse(enfant_id, "BrowseMetadata"));
+                assert!(
+                    !is_soap_fault(&fils),
+                    "l'enfant {enfant_id} du rayon {id} rend un fault : {fils}"
+                );
+                assert_eq!(
+                    champ_reponse(&fils, "NumberReturned"),
+                    "1",
+                    "le conteneur {enfant_id} du rayon {id} ({titre}) est \
+                     annoncé mais ne sait pas se décrire : {fils}"
+                );
+            }
+        }
+    }
+
+    /// Témoin anti-régression : le trajet SOAP ne doit RIEN changer au DIDL.
+    ///
+    /// C'est la garde qui manquait le plus. Un correctif DLNA « qui élargit »
+    /// (un filtre, un échappement, une pagination) passerait les deux tests
+    /// ci-dessus tout en modifiant ce que des testeurs écoutent en ce moment.
+    /// On compare donc caractère pour caractère, pour la racine et pour les
+    /// sept rayons, le DIDL sorti de `<Result>` avec celui que rend
+    /// `browse_direct_children` — le sérialiseur SOAP transporte, il ne
+    /// réécrit pas.
+    #[test]
+    fn le_trajet_soap_ne_reecrit_pas_le_didl_des_rayons() {
+        let (state, _, _, _, _) = state_complet();
+
+        let racine = build_browse_response(&state, &corps_browse("0", "BrowseDirectChildren"));
+        assert_eq!(
+            didl_de_la_reponse(&racine),
+            browse_direct_children(&state, "0", 0, UNLIMITED_BROWSE_COUNT).xml,
+            "le trajet SOAP a réécrit le DIDL de la racine"
+        );
+
+        for (id, titre, _) in ROOT_CONTAINERS.iter() {
+            let soap = build_browse_response(&state, &corps_browse(id, "BrowseDirectChildren"));
+            assert_eq!(
+                didl_de_la_reponse(&soap),
+                browse_direct_children(&state, id, 0, UNLIMITED_BROWSE_COUNT).xml,
+                "le trajet SOAP a réécrit le DIDL du rayon {id} ({titre})"
+            );
+        }
+    }
+
     #[test]
     fn description_publie_les_urls_sous_le_prefixe_upnp() {
         // Régression #1613 : les URLs de contrôle publiées doivent porter le
