@@ -7,7 +7,7 @@ mod database;
 mod diagnostics;
 mod enrich;
 /// Périmètre de l'explorateur de dossiers (#1275).
-mod explorateur;
+pub(crate) mod explorateur;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 pub(crate) use enrich::gate_enrichment;

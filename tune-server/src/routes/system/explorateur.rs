@@ -34,7 +34,7 @@ use tune_core::metadata::enrich_scope::sous_le_dossier;
 /// `/run` et `/media` en sont volontairement ABSENTS : c'est là que Linux
 /// monte les disques amovibles (`/run/media/<user>/<clé>`), donc là que vit
 /// souvent la bibliothèque qu'on vient désigner.
-pub(super) const ARBRES_SYSTEME: &[&str] = &[
+pub(crate) const ARBRES_SYSTEME: &[&str] = &[
     // Linux / BSD
     "/bin",
     "/boot",
@@ -61,7 +61,7 @@ pub(super) const ARBRES_SYSTEME: &[&str] = &[
 
 /// Dossiers système de Windows, nommés RELATIVEMENT à la racine de leur
 /// lecteur : ils existent sur `C:` comme sur `D:`.
-pub(super) const DOSSIERS_SYSTEME_WINDOWS: &[&str] = &[
+pub(crate) const DOSSIERS_SYSTEME_WINDOWS: &[&str] = &[
     "Windows",
     "Program Files",
     "Program Files (x86)",
@@ -79,7 +79,7 @@ pub(super) const DOSSIERS_SYSTEME_WINDOWS: &[&str] = &[
 /// existe mais je le refuse » de « ce dossier n'existe pas » — cette
 /// différence-là est déjà un oracle de reconnaissance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Refus {
+pub(crate) enum Refus {
     /// Chemin relatif, ou vide : l'explorateur ne travaille qu'en absolu.
     PasAbsolu,
     /// Le chemin contient un `..`. Il n'est jamais nécessaire — le client
@@ -91,7 +91,7 @@ pub(super) enum Refus {
 }
 
 impl Refus {
-    pub(super) fn libelle(self) -> &'static str {
+    pub(crate) fn libelle(self) -> &'static str {
         match self {
             Refus::PasAbsolu => "path must be absolute",
             Refus::RemonteVersLeParent => "path must not contain '..'",
@@ -105,7 +105,7 @@ impl Refus {
 /// `Path::is_absolute()` ne convient pas : sur l'hôte Linux du CI il déclare
 /// `D:\Musique` RELATIF, la garde refuserait donc tout chemin Windows tout en
 /// restant verte. Le même angle mort a coûté #1837 et #2056.
-pub(super) fn est_absolu(chemin: &str) -> bool {
+pub(crate) fn est_absolu(chemin: &str) -> bool {
     chemin.starts_with('/')
         || crate::chemin_inaccessible::est_un_chemin_unc(chemin)
         || crate::chemin_inaccessible::lettre_de_lecteur(chemin).is_some()
@@ -116,7 +116,7 @@ pub(super) fn est_absolu(chemin: &str) -> bool {
 /// Le découpage prend les DEUX séparateurs. `Path::components()` ne suffirait
 /// pas : sur un hôte POSIX, `D:\Musique\..\..\etc` est UN seul composant
 /// `Normal`, le `..` y est invisible, et la garde passerait.
-pub(super) fn remonte_vers_le_parent(chemin: &str) -> bool {
+pub(crate) fn remonte_vers_le_parent(chemin: &str) -> bool {
     chemin.split(['/', '\\']).any(|segment| segment == "..")
 }
 
@@ -137,7 +137,7 @@ fn dossier_de_tete_windows(chemin: &str) -> Option<&str> {
 /// Les deux jeux de règles sont évalués sur TOUTES les plateformes. Les
 /// enfermer derrière un `cfg` rendrait la règle Windows intestable ailleurs
 /// que sous Windows, où personne ne la fait tourner.
-pub(super) fn dans_un_arbre_systeme(chemin: &str) -> bool {
+pub(crate) fn dans_un_arbre_systeme(chemin: &str) -> bool {
     if ARBRES_SYSTEME
         .iter()
         .any(|systeme| sous_le_dossier(chemin, systeme))
@@ -159,7 +159,7 @@ pub(super) fn dans_un_arbre_systeme(chemin: &str) -> bool {
 /// Sert à voir la CIBLE d'un lien symbolique : sans elle, un lien
 /// `~/Musique/sys → /sys` posé dans une racine de bibliothèque ouvrirait
 /// l'arbre système par un chemin dont le texte, lui, est irréprochable.
-pub(super) fn forme_canonique(chemin: &std::path::Path) -> Option<String> {
+pub(crate) fn forme_canonique(chemin: &std::path::Path) -> Option<String> {
     let canonique = std::fs::canonicalize(chemin).ok()?;
     let texte = canonique.to_string_lossy().into_owned();
     if let Some(reste) = texte.strip_prefix(r"\\?\UNC\") {
@@ -172,7 +172,7 @@ pub(super) fn forme_canonique(chemin: &std::path::Path) -> Option<String> {
 }
 
 /// La garde complète appliquée au chemin DEMANDÉ, avant toute lecture disque.
-pub(super) fn verifier_le_chemin_demande(chemin: &str) -> Result<(), Refus> {
+pub(crate) fn verifier_le_chemin_demande(chemin: &str) -> Result<(), Refus> {
     if !est_absolu(chemin) {
         return Err(Refus::PasAbsolu);
     }
@@ -188,7 +188,7 @@ pub(super) fn verifier_le_chemin_demande(chemin: &str) -> Result<(), Refus> {
 /// Ce chemin, une fois résolu sur le disque, reste-t-il hors des arbres
 /// système ? Complète [`verifier_le_chemin_demande`] pour le cas du lien
 /// symbolique, où le texte et la cible divergent.
-pub(super) fn la_cible_reste_dans_le_perimetre(chemin: &std::path::Path) -> bool {
+pub(crate) fn la_cible_reste_dans_le_perimetre(chemin: &std::path::Path) -> bool {
     match forme_canonique(chemin) {
         // Un chemin illisible ne prouve rien : c'est la lecture qui tranchera,
         // et elle rendra sa propre erreur.
