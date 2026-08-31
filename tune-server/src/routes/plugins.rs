@@ -341,11 +341,62 @@ struct InstallRequest {
     version: Option<String>,
 }
 
+/// Can flipping `plugin_{name}_installed` ever make something run here?
+///
+/// Only two kinds of name can: a plugin compiled into this binary — which is
+/// the whole registered set, dormant and uncatalogued included, see
+/// [`AppState::plugin_names`] — and a wasm plugin already unpacked in the
+/// plugins directory, which `load_wasm_plugins` picks up at the next boot.
+///
+/// Anything else names nothing: the two settings get written, the startup gate
+/// finds no such plugin, and nothing ever loads. Le catalogue distant sert
+/// encore 24 fiches de l'ère Python (`platforms: "python"`, `pip install …`) ;
+/// `MarketplacePlugin::is_installable` les retire de ce que le serveur PROPOSE,
+/// mais le nom d'une de ces fiches — ou le nom hérité d'une bibliothèque
+/// migrée, qui ressort de la clé `plugins` de la table des réglages — arrive
+/// encore ici par la ligne locale du gestionnaire, et repartait avec
+/// « installé » et « redémarrage requis » (#2132).
+async fn peut_etre_installe(state: &AppState, name: &str) -> bool {
+    if state
+        .plugin_names
+        .get()
+        .is_some_and(|noms| noms.iter().any(|n| n == name))
+    {
+        return true;
+    }
+
+    // Un greffon wasm déjà posé sur le disque : ses réglages le gouvernent
+    // vraiment, donc (ré)installer par son identifiant a un sens.
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return false;
+    };
+    let manager = tune_core::plugins::PluginManager::new(dir);
+    match manager.scan().await {
+        Ok(infos) => infos.iter().any(|i| i.manifest.id == name),
+        Err(_) => false,
+    }
+}
+
+/// 404 pour un nom que ce serveur ne porte pas — corps identique pour
+/// `install` et `update`, qui écrivaient tous les deux le même réglage.
+fn greffon_inconnu(name: &str) -> axum::response::Response {
+    tracing::info!(plugin_name = %name, "plugin_install_refused_unknown_name");
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "plugin_inconnu",
+            "name": name,
+            "detail": "no plugin by that name is compiled into this server or installed on disk — nothing would load",
+        })),
+    )
+        .into_response()
+}
+
 async fn install_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
     Json(_body): Json<InstallRequest>,
-) -> Json<Value> {
+) -> axum::response::Response {
     // No download for compiled-in plugins (Bandcamp today) — installing just
     // flips the settings the startup gate reads. Wasm marketplace installs go
     // through a separate route. `restart_required` because the gate only runs
@@ -354,21 +405,36 @@ async fn install_plugin(
     // Volontairement non filtré par `catalogued()` : un greffon hors catalogue
     // (dj, karaoke — voir #2090) n'est plus PROPOSÉ, mais reste installable par
     // qui le demande nommément. Le retrait du catalogue est une fin de
-    // promesse, pas une condamnation.
+    // promesse, pas une condamnation. C'est pourquoi le garde-fou ci-dessous
+    // porte sur le jeu REGISTRÉ et non sur le catalogue.
+    if !peut_etre_installe(&state, &name).await {
+        return greffon_inconnu(&name);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.set(&enabled_key, "true").ok();
-    Json(json!({ "name": name, "status": "installed", "restart_required": true }))
+    Json(json!({ "name": name, "status": "installed", "restart_required": true })).into_response()
 }
 
-async fn update_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
-    // Stub: Rust server doesn't use pip. Track state in settings.
+async fn update_plugin(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    // Stub: Rust server doesn't use pip. Track state in settings — but only
+    // for a name that means something here: this route writes the very same
+    // `plugin_{name}_installed` key as `install_plugin`, so leaving it open
+    // would leave the hole open through the "Update" button.
+    if !peut_etre_installe(&state, &name).await {
+        return greffon_inconnu(&name);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();
-    Json(json!({ "name": name, "status": "updated" }))
+    Json(json!({ "name": name, "status": "updated" })).into_response()
 }
 
 async fn delete_plugin(
