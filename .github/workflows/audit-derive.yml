@@ -1,0 +1,124 @@
+name: Dérive des garde-fous
+
+# Détection AUTOMATIQUE de la dérive des garde-fous (#2816, parent #2808).
+#
+# `audit-protections.yml` existe déjà et vérifie le CONTENU des règles de
+# branche, l'armement, l'absence de tag et le manifeste — mais il ne part que
+# sur `workflow_dispatch`, avec une version obligatoire en entrée. Il ne se
+# déclenche donc que si quelqu'un y pense, c'est-à-dire jamais entre deux
+# trains. Ce workflow-ci apporte ce qui manque : le DÉCLENCHEMENT SEUL, et
+# quatre angles morts que l'audit existant ne regarde pas (environnements,
+# secrets, état du gel des tags, passage effectif des portes).
+#
+# ⚠️ Une planification ne s'exécute QUE depuis la branche par défaut. Tant que
+#    ce fichier n'a pas atteint `main`, seuls le `push` et le lancement manuel
+#    fonctionnent. Ce n'est pas un détail : c'est la différence entre « livré »
+#    et « armé ».
+#
+# ⚠️ Ce workflow ne répare RIEN. Il ne modifie ni ruleset, ni protection, ni
+#    variable, ni environnement, ni secret, ni tag. Un audit qui répare efface
+#    la trace de ce qu'il a corrigé, et le verdict devient illisible.
+
+on:
+  schedule:
+    # Deux passages par jour : un le matin, un le soir. Le soir est le moment
+    # utile — c'est après les publications que les gardes restent ouvertes
+    # (armement laissé à `true`, gel des tags rouvert, environnement recréé nu).
+    - cron: "0 6 * * *"
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      depot:
+        description: "Dépôt à auditer (owner/name)"
+        required: false
+        default: ""
+        type: string
+      refs:
+        description: "Branches dont les portes requises doivent avoir un passage réussi (séparées par des espaces)"
+        required: false
+        default: ""
+        type: string
+  push:
+    branches: [main]
+    paths:
+      # Une garde peut tomber par simple modification de workflow : ajouter un
+      # `environment:` qui n'existe pas suffit à faire créer par GitHub un
+      # environnement SANS protection. L'audit doit donc repasser dès qu'un
+      # workflow bouge, pas seulement à heure fixe.
+      - ".github/workflows/**"
+      - "scripts/auditer-derive-gardefous.sh"
+  pull_request:
+    paths:
+      - "scripts/auditer-derive-gardefous.sh"
+      - "scripts/test-auditer-derive-gardefous.sh"
+      - ".github/workflows/audit-derive.yml"
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: audit-derive-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # La contre-épreuve tourne AVANT l'audit et sur chaque PR qui touche le
+  # détecteur. Un audit dont on n'a pas vu la détection rougir ne prouve rien :
+  # il faut que le test lui-même soit une porte, sinon la première régression
+  # silencieuse transforme le détecteur en générateur de vert.
+  # ───────────────────────────────────────────────────────────────────────────
+  contre-epreuve:
+    name: Contre-épreuve du détecteur
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rejouer les dérives simulées
+        run: bash scripts/test-auditer-derive-gardefous.sh
+
+  auditer:
+    name: Dérive des garde-fous
+    needs: contre-epreuve
+    # Sur une PR, seule la contre-épreuve a un sens : l'état GitHub réel n'a pas
+    # changé, et un audit rouge à cause d'une dérive préexistante ferait échouer
+    # une PR qui n'y est pour rien.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auditer la dérive
+        env:
+          # `github.token` ne peut lire NI les secrets, NI les rulesets, NI les
+          # variables, NI la liste des environnements : aucune permission de
+          # workflow ne couvre ces quatre familles. Avec lui seul, l'audit rend
+          # une série de « 403 — DROIT MANQUANT », ce qui est le comportement
+          # VOULU : mieux vaut un rouge qui nomme le droit absent qu'un vert qui
+          # n'a rien regardé. Pour un audit réellement utile, fournir un jeton
+          # en LECTURE SEULE portant `administration:read`, `environments:read`,
+          # `secrets:read` et `variables:read`.
+          GH_TOKEN: ${{ secrets.AUDIT_GOUVERNANCE_TOKEN || github.token }}
+          DEPOT: ${{ inputs.depot }}
+          REFS: ${{ inputs.refs }}
+          # Seule voie ouverte à `github.token` pour la section D : le contexte
+          # `vars` est résolu par le runner, pas par l'API. Une variable absente
+          # rend une chaîne vide — indistinguable de `false`, et c'est correct :
+          # dans les deux cas la porte est désarmée.
+          AUDIT_VARS_INJECTEES: >-
+            RELEASE_CONTROLLER_ENABLED=${{ vars.RELEASE_CONTROLLER_ENABLED }}
+            RELEASE_PROMOTION_ENABLED=${{ vars.RELEASE_PROMOTION_ENABLED }}
+        run: |
+          set -uo pipefail
+          bash scripts/auditer-derive-gardefous.sh \
+            "${DEPOT:-$GITHUB_REPOSITORY}" ${REFS:-} | tee /tmp/audit-derive.txt
+          code=${PIPESTATUS[0]}
+          {
+            echo "## Dérive des garde-fous"
+            echo
+            echo '```'
+            cat /tmp/audit-derive.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
