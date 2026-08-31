@@ -1233,53 +1233,16 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
     Ok(cols)
 }
 
-/// After migrating data with explicit IDs, the PG sequences are still
-/// at 1. Reset them to MAX(id)+1 so new inserts don't collide.
-async fn reset_sequences(pool: &PgPool) -> Result<(), String> {
-    // Tables with TEXT PRIMARY KEY named "id"
-    let tables = [
-        "artists",
-        "albums",
-        "tracks",
-        "track_credits",
-        "playlists",
-        "playlist_tracks",
-        "zones",
-        "play_queue",
-        "streaming_queue",
-        "listen_history",
-        "radio_stations",
-        "radio_favorites",
-        "profiles",
-        "favorites",
-        "tags",
-        "item_tags",
-        "album_ratings",
-        "smart_playlists",
-        "smart_collections",
-        "bookmarks",
-        "alarms",
-        "network_mounts",
-        "podcast_subscriptions",
-        "offline_cache",
-        "sync_links",
-        "sync_link_snapshots",
-        "track_source_links",
-    ];
-
-    for table in &tables {
-        let seq_name = format!("{table}_id_seq");
-        let sql = format!(
-            "SELECT setval('{seq_name}', COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
-        );
-        match sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await {
-            Ok(_) => {}
-            Err(e) => {
-                // Sequence might not exist for tables without BIGSERIAL
-                info!(table, error = %e, "pg_sequence_reset_skipped");
-            }
-        }
-    }
-
-    Ok(())
-}
+// `reset_sequences` vivait ici : après une migration qui insère des `id`
+// explicites, elle repositionnait chaque séquence PostgreSQL à MAX(id)+1.
+// Elle n'a plus d'appelant depuis « PG migration — TEXT PRIMARY KEY for all
+// tables, remove sequences » (7b947b01), et elle ne pourrait plus servir telle
+// quelle : sa liste de tables décrit le schéma BIGSERIAL d'avant, et son
+// `MAX(id) + 1` sur une colonne devenue TEXT n'a pas d'opérateur en PG — les
+// erreurs partaient en `pg_sequence_reset_skipped`, donc en silence.
+//
+// ⚠️ Il reste TROIS séquences vivantes que rien ne repositionne après une
+// migration SQLite → PG : `zones_id_seq` (ici l.350), `streaming_favorites_id_seq`
+// (ici l.569 et db/postgres.rs) et `queue_items_id_seq` (db/postgres.rs). Le
+// correctif demande un PostgreSQL réel pour être prouvé ; il n'est PAS fait ici,
+// et rebrancher cette fonction-là ne l'aurait pas fait non plus.

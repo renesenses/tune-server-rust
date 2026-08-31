@@ -1664,6 +1664,11 @@ fn spawn_memory_diagnostics(
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
 ) {
     tokio::spawn(async move {
+        // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
+        // base de comparaison suit la même portée, sinon elle est déclarée et
+        // jamais lue ailleurs. `rss_delta_mb` reste donc mesuré partout où la
+        // trace tourne — c'est-à-dire sur Linux, et nulle part ailleurs.
+        #[cfg(target_os = "linux")]
         let mut rss_initial_mb: Option<u64> = None;
         loop {
             #[cfg(target_os = "linux")]

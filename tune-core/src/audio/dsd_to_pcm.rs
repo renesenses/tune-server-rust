@@ -619,7 +619,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// #1638 : l'échelle SACD (+6 dB) doit être appliquée à la conversion.
     /// Un motif DSD à 62,5 % de uns a une moyenne de +0,25 dans le domaine
     /// ±1 ; sans le ×2 il sortait à ~25 % de la pleine échelle, il doit
