@@ -1959,9 +1959,7 @@ impl AlbumRepo {
 
         Ok(par_cle
             .into_values()
-            .filter_map(|(orthographes, n)| {
-                orthographes.into_iter().next().map(|label| (label, n))
-            })
+            .filter_map(|(orthographes, n)| orthographes.into_iter().next().map(|label| (label, n)))
             .collect())
     }
 
