@@ -26,41 +26,102 @@ pub(super) async fn version() -> Json<Value> {
     }))
 }
 
-pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
+/// Sonde de santé publique (#2796).
+///
+/// ## Ce que la route prétendait, et ce qu'elle vérifiait
+///
+/// Elle annonçait `status: "ok"` en dur, dans un `Json` donc toujours en
+/// **HTTP 200**, quel que soit l'état de la base. Le seul reflet du réel était
+/// le champ `db`, calculé sur la seule sonde `tracks` : une panne sur
+/// `albums`, ou sur la lecture du réglage `server_name`, était convertie en
+/// zéro ou en nom par défaut sans dégrader quoi que ce soit. Les trois
+/// affirmations de la réponse — code HTTP, champ `status`, détail par
+/// composant — pouvaient donc se contredire, et deux d'entre elles mentaient.
+///
+/// ## Qui lit cette route, et pourquoi le code HTTP se dose
+///
+/// Elle n'est pas seulement une sonde de supervision : c'est le **test
+/// d'existence d'un serveur Tune**. La découverte réseau du client Flutter
+/// (`server_discovery.dart`) n'enregistre un hôte que si elle obtient
+/// exactement `200`; la télécommande macOS conditionne toute sa connexion à
+/// cet appel; les clients iOS/iPadOS lèvent sur non-2xx; la barre latérale web
+/// y prend le numéro de version; `SettingsView` s'en sert pour savoir quand le
+/// serveur est revenu après un redémarrage. Un 503 rend donc le serveur
+/// **invisible**, il ne le signale pas « en peine ».
+///
+/// D'où la gradation, qui reste dans le contrat demandé sans transformer une
+/// requête malchanceuse en disparition :
+///
+/// - toutes les sondes passent → `ok`, HTTP 200 ;
+/// - une partie échoue (la base répond encore, une requête a échoué : verrou
+///   SQLite pris pendant un balayage, par exemple) → `degraded`, HTTP **200** ;
+/// - **toutes** échouent, c'est-à-dire base indisponible → `error`, HTTP 503.
+///
+/// Les conteneurs ne rebouclent pas là-dessus : les `HEALTHCHECK` des deux
+/// `Dockerfile` visent `/system/stats`, pas cette route.
+///
+/// ## Pourquoi `components` et pas un nouveau vocabulaire
+///
+/// Le détail par composant existe déjà **côté clients** et n'a jamais été
+/// servi : `SystemHealth.components: Record<string, boolean>` est déclaré dans
+/// le client web (`types.ts`), rendu en grille par `DiagnosticsView` et
+/// `SettingsView`, et déclaré dans les modèles iOS et macOS. La bannière web
+/// distingue déjà `ok` de `degraded`. On remplit ce contrat-là ; on n'en
+/// invente pas un second. La santé « avancée » (mémoire, disque, blocage de
+/// lecture) reste où elle est, sur `/system/health/monitor`, et n'entre pas
+/// ici : ses sondes lancent un sous-processus `df`, ce qu'une route sollicitée
+/// par la découverte réseau et par une boucle de 700 ms ne peut pas payer.
+pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
     let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
     let uptime_secs = state.started_at.elapsed().as_secs();
-
-    let db_status = if tracks_result.is_ok() {
-        "connected"
-    } else {
-        "error"
-    };
-    let tracks = tracks_result.unwrap_or(0);
-    let albums = albums_result.unwrap_or(0);
 
     // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
     // latérale fait déjà pour afficher « v0.9.117 » : la plainte d'origine est
     // qu'elle annonce une version sans dire de quelle machine elle parle. Les
     // séparer imposerait un second appel — et laisserait l'étiquette absente
-    // tant qu'il n'a pas répondu.
-    let server_name = resolve_server_name(
-        SettingsRepo::with_backend(state.backend.clone())
-            .get("server_name")
-            .ok()
-            .flatten()
-            .as_deref(),
-    );
+    // tant qu'il n'a pas répondu. C'est aussi la troisième sonde de la base :
+    // elle touche `settings`, une table que les deux comptages ne lisent pas.
+    let name_result = SettingsRepo::with_backend(state.backend.clone()).get("server_name");
+    let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
-    Json(json!({
-        "status": "ok",
-        "version": tune_core::version(),
-        "server_name": server_name,
-        "uptime_seconds": uptime_secs,
-        "db": db_status,
-        "tracks": tracks,
-        "albums": albums,
-    }))
+    let sondes = [
+        ("db_tracks", tracks_result.is_ok()),
+        ("db_albums", albums_result.is_ok()),
+        ("db_settings", name_result.is_ok()),
+    ];
+    let echecs = sondes.iter().filter(|(_, ok)| !*ok).count();
+
+    // Une panne SQL ne doit pas rester muette dans le journal (#2861) : les
+    // valeurs de repli partent quand même dans la réponse, mais accompagnées
+    // du `components` qui les contredit, et d'une trace côté serveur.
+    let tracks = tracks_result.ou_defaut_journalise();
+    let albums = albums_result.ou_defaut_journalise();
+
+    let (code, status, db_status) = match echecs {
+        0 => (StatusCode::OK, "ok", "connected"),
+        n if n == sondes.len() => (StatusCode::SERVICE_UNAVAILABLE, "error", "error"),
+        _ => (StatusCode::OK, "degraded", "degraded"),
+    };
+
+    let components: serde_json::Map<String, Value> = sondes
+        .iter()
+        .map(|(nom, ok)| ((*nom).to_string(), Value::Bool(*ok)))
+        .collect();
+
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "version": tune_core::version(),
+            "server_name": server_name,
+            "uptime_seconds": uptime_secs,
+            "db": db_status,
+            "tracks": tracks,
+            "albums": albums,
+            "components": components,
+        })),
+    )
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
