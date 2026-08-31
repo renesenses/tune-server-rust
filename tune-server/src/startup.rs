@@ -310,9 +310,14 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
     "enrich_all_status",
     "artist_artwork_enrich_result",
+    // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une
+    // grosse bibliothèque à 1 req/s : un arrêt en cours de route est le cas
+    // NORMAL, pas l'exception. Sans cette ligne, `running` resterait en base
+    // pour toujours — le défaut #2002, à l'identique.
+    crate::routes::library::credits_mb::REGLAGE_AVANCEMENT_CREDITS,
     // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
     // de passe laisserait `status: "running"` en base pour toujours et le
     // bouton de relance grisé — exactement le défaut #2002. La constante

@@ -21,6 +21,8 @@ mod bump_natifs_android;
 mod collections_ordre_albums;
 #[path = "contexte_de_session.rs"]
 mod contexte_de_session;
+#[path = "credits_enrichissement_statut.rs"]
+mod credits_enrichissement_statut;
 #[path = "enrich_artiste_langue_entete.rs"]
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
