@@ -732,6 +732,12 @@ fn cible_unique(cibles: &[CibleRecherche]) -> Option<CibleRecherche> {
 ///
 /// Forme historique conservée : c'est elle qui porte l'invariant de #2312 —
 /// n'annoncer que ce qu'on évalue — et les tests qui le tiennent.
+///
+/// La recherche de production passe désormais par [`evaluer_criteres`], qui
+/// intersecte TOUTES les rubriques publiées puis conclut par [`cible_unique`] ;
+/// ce raccourci « est-ce des pistes ? » n'y a plus d'appelant. Portée `test`
+/// pour le dire, plutôt que de laisser croire à une seconde porte d'entrée.
+#[cfg(test)]
 fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
     Ok(cibles_du_predicat(criteria)?.contains(&CibleRecherche::Pistes))
 }

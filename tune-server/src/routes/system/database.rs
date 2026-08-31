@@ -606,6 +606,13 @@ fn persist_database_url(url: &str) -> Result<std::path::PathBuf, String> {
 /// PostgreSQL. Unlike the update flow there is no binary swap involved, so
 /// spawning the SAME executable is safe on Windows too (the update path must
 /// NOT spawn — see update.rs — but here no .bat is waiting on our exit).
+///
+/// Même portée que [`persist_database_url`] juste au-dessus : la migration
+/// SQLite → PostgreSQL n'existe que sous `postgres`, et son unique appelant
+/// vit dans le bloc `#[cfg(feature = "postgres")]` de `migrate_database`.
+/// L'attribut manquait ici seul — d'où une fonction sans appelant dans toutes
+/// les configurations de la CI, qui ne compile pas `postgres`.
+#[cfg(feature = "postgres")]
 fn restart_after_migration() {
     tokio::spawn(async {
         // Let the HTTP response flush to the client first.
