@@ -1,3 +1,27 @@
+//! Générateur de playlists — déterministe, par critères. **Aucune IA ici.**
+//!
+//! Fabien, forum : « Quelle est la différence entre les playlists Smart AI et
+//! le bouton flottant Tune AI ? » (#1360). La réponse : tout. Le bouton
+//! flottant (`POST /ai/query`) est un vrai assistant adossé à Claude ; ce
+//! module-ci repère des mots-clés et construit des **conditions SQL** sur la
+//! bibliothèque locale. Les cinq variantes — ambiance, invite, historique,
+//! découverte, tempo — sont des générateurs déterministes.
+//!
+//! Le nom retenu côté produit est **« Générateur de playlists » / "Playlist
+//! generator"** : c'est celui que le client web livre déjà (tune-web-client
+//! PR #384, sur `main`, dans les onze locales sous la clé `smartai.title`). Ne
+//! pas en inventer un autre — deux noms pour la même chose est le défaut
+//! qu'on corrige.
+//!
+//! ⚠️ **Le préfixe de route `/smart-ai` reste tel quel, volontairement.** Ce
+//! n'est pas un libellé, c'est l'IDENTIFIANT que trois bases de code clientes
+//! comparent littéralement — `tune-web-client/src/lib/api.ts` (les cinq
+//! appels), `tune-server-flutter/lib/services/tune_api_client.dart:1425`,
+//! `tune-server-ipados/…/TuneAPIClient+SmartAutoPlay.swift:14` — et qu'un
+//! contrat publié fige (`docs/contrat-web.json`). Le renommer casserait les
+//! cinq écrans sans rien gagner : aucun utilisateur ne lit une URL d'API. On
+//! garde la valeur, on change le libellé.
+
 use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::State;
 use axum::routing::post;
@@ -227,8 +251,13 @@ async fn generate_smart_playlist(
         })
         .collect();
 
+    // `name` est un LIBELLÉ affiché, pas un identifiant : il portait « AI: … »
+    // alors que rien ici n'appelle un modèle (#1360). On rend l'invite telle
+    // quelle — exactement ce que l'écran web affiche déjà
+    // (`SmartAIView.svelte`, `playlistName = prompt`), pour qu'une même
+    // génération porte un seul nom sur tous les clients.
     Ok(Json(json!({
-        "name": format!("AI: {}", body.prompt),
+        "name": body.prompt.clone(),
         "prompt": body.prompt,
         "tracks": tracks,
         "total": tracks.len(),
