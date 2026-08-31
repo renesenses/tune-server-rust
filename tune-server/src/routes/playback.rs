@@ -1401,9 +1401,17 @@ async fn play(
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
         resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id)
     } else if let Some(playlist_id) = body.playlist_id {
-        tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
-            .get_track_ids(playlist_id)
-            .unwrap_or_default()
+        // Un `playlist_id` dans le corps versait les pistes de N'IMPORTE
+        // QUELLE playlist du foyer dans la file de la zone, puis les jouait :
+        // la lecture par énumération d'ids, sans jamais passer par
+        // `/playlists` (#2794, #3073). Même refus qu'ailleurs — 404, jamais
+        // 403 : distinguer « existe mais pas à vous » rendrait l'énumération
+        // utile.
+        let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
+        match crate::routes::playlists::owned_or_404_response(&repo, playlist_id, profile.id()) {
+            Ok(_) => repo.get_track_ids(playlist_id).unwrap_or_default(),
+            Err(r) => return r,
+        }
     } else if let Some(ids) = body.track_ids {
         ids
     } else if let Some(id) = body.track_id {
