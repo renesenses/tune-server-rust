@@ -3601,6 +3601,15 @@ async fn set_audio_profile(
 // Shuffle All (global playback)
 // ---------------------------------------------------------------------------
 
+/// Le contexte de filtrage que l'écran transmet à la lecture aléatoire.
+///
+/// `folder` est la portée de RÉPERTOIRE — le même `folder=<chemin absolu>` que
+/// `/library/tracks` et que les facettes Oxygen, appliqué au sous-arbre entier.
+/// Il manquait ici : la pastille de répertoire de la Bibliothèque n'avait
+/// aucun champ où se transmettre, et la lecture aléatoire retombait sur sa
+/// dernière branche — un tirage dans TOUTE la table `tracks` (#2801, Marco
+/// Polo : « il semble s'alimenter de toute la bibliothèque, pas seulement de la
+/// sélection à l'écran »).
 #[derive(serde::Deserialize)]
 pub struct ShuffleAllQuery {
     zone_id: Option<i64>,
@@ -3608,6 +3617,9 @@ pub struct ShuffleAllQuery {
     genre: Option<String>,
     album_id: Option<i64>,
     artist_id: Option<i64>,
+    /// Répertoire (chemin absolu) : la lecture aléatoire se limite à son
+    /// sous-arbre, récursivement.
+    folder: Option<String>,
 }
 
 // Combien de pistes une lecture aléatoire enfile au maximum.
@@ -3724,6 +3736,34 @@ pub async fn shuffle_all(
             .unwrap_or_default();
         let n = ids.len() as i64;
         (ids, Some(n))
+    } else if let Some(fld) = q.folder.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // La portée de répertoire passe AVANT la recherche et le genre parce
+        // que c'est ce que fait l'écran : pastille active, la Bibliothèque ne
+        // charge plus que le sous-arbre (`loadScopedAlbums/Artists/Tracks` →
+        // `/library/tracks?folder=`), et la zone de recherche ne fait que le
+        // RESTREINDRE, côté client. `random_ids_in_folder` reprend les deux
+        // mêmes prédicats, dans le même ordre.
+        //
+        // Le genre n'entre pas ici : sur cet écran il vit dans l'onglet
+        // Genres, qui n'a pas de pastille de répertoire — les deux portées ne
+        // coexistent pas. Un client qui enverrait les deux verra le
+        // répertoire l'emporter, ce que ce commentaire et le champ `folder`
+        // disent explicitement plutôt que de le laisser deviner.
+        let terme = q
+            .search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match track_repo.random_ids_in_folder(fld, terme, plafond) {
+            Ok((ids, total)) => (ids, Some(total)),
+            Err(e) => {
+                // Ne PAS retomber sur la bibliothèque entière : c'est
+                // exactement le défaut que ce ticket ferme. Une sélection vide
+                // se conclut plus bas par un 400 explicite.
+                tracing::error!(error = %e, folder = fld, "shuffle_all_folder_query_failed");
+                (Vec::new(), None)
+            }
+        }
     } else if let Some(sq) = q
         .search_query
         .as_deref()
@@ -3966,6 +4006,67 @@ mod contrat_suivant_tests {
         };
 
         assert!(can_skip_next(&state));
+    }
+}
+
+/// #2801 — la portée de répertoire doit TRAVERSER la barrière HTTP.
+///
+/// Le défaut n'était pas dans la lecture : il était dans le contrat. Le client
+/// n'avait aucun champ où mettre `scopedFolder`, et `ShuffleAllQuery` n'en
+/// avait aucun pour le recevoir — un `?folder=…` était accepté, silencieusement
+/// jeté par serde, et la lecture aléatoire retombait sur la bibliothèque
+/// entière. Un « 200 pour rien » : la route répondait, la portée disparaissait.
+///
+/// Ce test garde l'ARRIVÉE du champ, sur une vraie chaîne de requête, avec
+/// l'extracteur réellement employé par la route.
+#[cfg(test)]
+mod portee_repertoire_tests {
+    use super::ShuffleAllQuery;
+    use axum::extract::Query;
+
+    fn depuis(query: &str) -> ShuffleAllQuery {
+        let uri: axum::http::Uri = format!("/playback/shuffle-all?{query}").parse().unwrap();
+        Query::<ShuffleAllQuery>::try_from_uri(&uri)
+            .expect("la chaîne de requête doit se désérialiser")
+            .0
+    }
+
+    /// Le chemin est absolu, contient des espaces et des chiffres — c'est le
+    /// répertoire de Marco Polo, tel que la pastille le porte.
+    #[test]
+    fn le_repertoire_arrive_jusqua_la_route() {
+        let q = depuis("zone_id=3&folder=%2Fmnt%2Fmusic%2F80s%2012%20INCH%20COLLECTION");
+        assert_eq!(q.zone_id, Some(3));
+        assert_eq!(
+            q.folder.as_deref(),
+            Some("/mnt/music/80s 12 INCH COLLECTION"),
+            "sans ce champ, serde jetait `folder` en silence et la lecture \
+             aléatoire puisait dans toute la bibliothèque (#2801)"
+        );
+    }
+
+    /// Témoin anti-régression : les cinq champs qui traversaient déjà doivent
+    /// continuer de traverser. Ajouter `folder` ne doit rien déplacer.
+    #[test]
+    fn les_champs_deja_transmis_traversent_toujours() {
+        let q = depuis("zone_id=1&search_query=miles&genre=Jazz&album_id=7&artist_id=9");
+        assert_eq!(q.zone_id, Some(1));
+        assert_eq!(q.search_query.as_deref(), Some("miles"));
+        assert_eq!(q.genre.as_deref(), Some("Jazz"));
+        assert_eq!(q.album_id, Some(7));
+        assert_eq!(q.artist_id, Some(9));
+        assert_eq!(q.folder, None, "aucun répertoire demandé, aucun inventé");
+    }
+
+    /// La pastille de répertoire et la zone de recherche cohabitent à l'écran :
+    /// la seconde ne fait que restreindre la première. Les deux doivent donc
+    /// arriver ensemble — c'est ce qui permet à la branche `folder` de passer
+    /// le terme à `random_ids_in_folder` au lieu de l'ignorer.
+    #[test]
+    fn le_repertoire_et_la_recherche_arrivent_ensemble() {
+        let q = depuis("zone_id=2&folder=%2Fmnt%2Fmusic%2FDisco%20Pack&search_query=funky");
+        assert_eq!(q.folder.as_deref(), Some("/mnt/music/Disco Pack"));
+        assert_eq!(q.search_query.as_deref(), Some("funky"));
     }
 }
 

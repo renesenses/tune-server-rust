@@ -1287,6 +1287,115 @@ impl TrackRepo {
             .collect())
     }
 
+    /// Tirage aléatoire borné DANS un répertoire, avec le total MESURÉ de ce
+    /// répertoire : `(ids, total)`.
+    ///
+    /// C'est le jumeau, restreint à un sous-arbre, du couple
+    /// `random_ids(plafond)` + `count()` que la lecture aléatoire emploie pour
+    /// la bibliothèque entière. Deux propriétés en découlent, et ce sont elles
+    /// qui justifient une méthode plutôt qu'un appel à `list_filtered` :
+    ///
+    /// 1. **Le tirage est aléatoire, pas un préfixe.** `list_filtered` trie par
+    ///    artiste/album/disque/piste puis coupe à `LIMIT` : un répertoire de
+    ///    2 473 pistes plafonné à 500 rendrait TOUJOURS les mêmes 500, et
+    ///    « lecture aléatoire » deux fois de suite jouerait le même cinquième
+    ///    du répertoire dans un ordre différent.
+    /// 2. **Le total est compté, jamais deviné.** `COUNT(*)` ignore le plafond,
+    ///    donc la réponse peut dire « 500 sur 2 473 » — la règle de #2250 et de
+    ///    `compte_rendu_selection` : la valeur mesurée, ou rien.
+    ///
+    /// Les TROIS prédicats sont les JUMEAUX de ceux de `list_filtered` (mot
+    /// pour mot) : c'est la route `/library/tracks?folder=` qui alimente la
+    /// liste affichée quand la pastille de répertoire est active, et une
+    /// lecture aléatoire qui sélectionnerait autrement que la liste qu'elle
+    /// prétend jouer serait pire qu'une portée absente. Le test
+    /// `le_tirage_par_repertoire_selectionne_exactement_ce_que_list_filtered_rend`
+    /// tient cette égalité, y compris sur les deux pièges qu'on ne voit pas :
+    ///
+    /// * **Les albums masqués (#1391) sortent aussi d'ici.** Ils ne sont pas
+    ///   une facette : ils sont le socle de la vue filtrée. Les oublier ferait
+    ///   jouer à la lecture aléatoire des pistes que l'écran refuse d'afficher.
+    /// * **La recherche libre lie DEUX valeurs, pas une réutilisée.** En SQLite
+    ///   chaque `?` consomme un indice ; un marqueur écrit deux fois pour une
+    ///   seule valeur empilée fait échouer la requête entière
+    ///   (`InvalidParameterCount`) — le défaut préexistant relevé et corrigé
+    ///   dans `list_filtered`, à ne pas réintroduire par recopie.
+    ///
+    /// Le compteur de marqueurs est le `Placeholders` partagé, pour la raison
+    /// donnée dans `facet_filter` : en SQLite seul l'ORDRE de liaison compte,
+    /// donc un compteur tenu à la main donne du SQL juste sur SQLite et FAUX
+    /// sur PostgreSQL.
+    ///
+    /// `terme` est la recherche libre de l'écran, qui ne fait que RESTREINDRE
+    /// le sous-arbre affiché ; `None` ou vide = tout le sous-arbre.
+    pub fn random_ids_in_folder(
+        &self,
+        folder: &str,
+        terme: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<i64>, i64), TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut owned_params: Vec<SqlValue> = Vec::new();
+
+        // Jumeau du prédicat `folder` de `list_filtered`.
+        conditions.push(format!(
+            "t.file_path LIKE {}{}",
+            ph.take(),
+            like_escape_clause(engine)
+        ));
+        owned_params.push(SqlValue::Text(folder_like_pattern(folder)));
+
+        // Jumeau du prédicat `q` de `list_filtered` — deux marqueurs, deux
+        // valeurs liées.
+        if let Some(query) = terme.filter(|s| !s.is_empty()) {
+            let like = format!("%{query}%");
+            let p = ph.take();
+            let p2 = ph.take();
+            conditions.push(format!(
+                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
+            ));
+            owned_params.push(SqlValue::Text(like.clone()));
+            owned_params.push(SqlValue::Text(like));
+        }
+
+        // Jumeau du socle de la vue filtrée : les albums masqués n'en sont pas.
+        conditions.push(hidden_tracks_excluded().to_string());
+
+        // La jointure `artists` est inconditionnelle — comme dans
+        // `list_filtered` — pour que le compte et le tirage lisent la MÊME
+        // forme de requête, avec ou sans terme de recherche.
+        let from = "FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id";
+        let where_clause = format!(" WHERE {}", conditions.join(" AND "));
+
+        let count_sql = format!("SELECT COUNT(*) {from}{where_clause}");
+        let refs: Vec<&dyn ToSqlValue> =
+            owned_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let total = self
+            .db
+            .query_one(&count_sql, &refs)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+
+        let data_sql = format!(
+            "SELECT t.id {from}{where_clause} ORDER BY random() LIMIT {}",
+            ph.take()
+        );
+        let mut all_params = owned_params;
+        all_params.push(SqlValue::Int(limit));
+        let all_refs: Vec<&dyn ToSqlValue> =
+            all_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let rows = self.db.query_many(&data_sql, &all_refs)?;
+        let ids = rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect();
+        Ok((ids, total))
+    }
+
     pub fn count_doubtful(&self) -> Result<i64, TuneError> {
         let sql = format!(
             "SELECT COUNT(*) FROM tracks t \
@@ -2525,5 +2634,218 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2801 — la portée de répertoire de la lecture aléatoire
+    // -----------------------------------------------------------------------
+
+    /// Bibliothèque de test taillée sur le signalement de Marco Polo : un
+    /// répertoire visé, un répertoire voisin dont le nom PRÉFIXE le premier
+    /// (« Disco » vs « Disco Pack » — le piège du séparateur), et un
+    /// sous-répertoire, puisque la portée est récursive.
+    ///
+    /// Les chemins sont construits avec `MAIN_SEPARATOR`, comme
+    /// `folder_like_pattern` : un test écrit en dur avec `/` passerait sur
+    /// Linux et macOS et mentirait sur Windows.
+    fn bibliotheque_de_repertoires(repo: &TrackRepo, artist_id: i64) -> Vec<(String, i64)> {
+        let s = std::path::MAIN_SEPARATOR;
+        let fichiers = [
+            format!("{s}music{s}Disco Pack{s}vol051{s}Funkytown.flac"),
+            format!("{s}music{s}Disco Pack{s}vol051{s}Le Freak.flac"),
+            format!("{s}music{s}Disco Pack{s}vol056{s}Funky Nassau.flac"),
+            // Voisin dont le nom préfixe celui du répertoire visé.
+            format!("{s}music{s}Disco Pack Live{s}Funkytown (live).flac"),
+            format!("{s}music{s}Autre{s}Funkytown (reprise).flac"),
+        ];
+        fichiers
+            .iter()
+            .map(|p| {
+                let titre = p.rsplit(s).next().unwrap().trim_end_matches(".flac");
+                let mut t = Track::new(titre.into());
+                t.artist_id = Some(artist_id);
+                t.file_path = Some(p.clone());
+                (p.clone(), repo.create(&t).unwrap())
+            })
+            .collect()
+    }
+
+    /// Le défaut de #2801 : la lecture aléatoire tirait dans TOUTE la table
+    /// `tracks`. Le tirage par répertoire ne doit rendre que le sous-arbre —
+    /// ni le voisin dont le nom le préfixe, ni le reste de la bibliothèque —
+    /// et rendre le compte EXACT du sous-arbre, pas celui de la sélection.
+    #[test]
+    fn le_tirage_par_repertoire_ne_sort_pas_du_sous_arbre() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let cree = bibliotheque_de_repertoires(&repo, artist_id);
+        assert_eq!(repo.count().unwrap(), 5, "témoin : la table entière");
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+
+        let attendus: std::collections::HashSet<i64> = cree
+            .iter()
+            .filter(|(p, _)| p.starts_with(&format!("{vise}{s}")))
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            attendus.len(),
+            3,
+            "témoin : trois pistes sous le répertoire"
+        );
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            attendus,
+            "le tirage doit rendre le sous-arbre entier, et RIEN d'autre — \
+             ni « Disco Pack Live », qui commence pourtant par le même texte"
+        );
+        assert_eq!(
+            total, 3,
+            "le total est celui du répertoire, pas de la table"
+        );
+    }
+
+    /// Le plafond borne la file, jamais le total annoncé : c'est ce qui permet
+    /// à la réponse de dire « 500 sur 2 473 » au lieu de « 500 » tout court
+    /// (#2228/#2901). Un total qui suivrait le plafond rendrait `capped` faux.
+    #[test]
+    fn le_plafond_borne_la_file_mais_pas_le_total_annonce() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 2).unwrap();
+        assert_eq!(ids.len(), 2, "la file est bornée par le plafond");
+        assert_eq!(total, 3, "le total reste celui du répertoire entier");
+    }
+
+    /// La zone de recherche ne fait que RESTREINDRE le répertoire affiché : le
+    /// terme doit s'appliquer DANS le sous-arbre, sans jamais en faire sortir
+    /// — « Funkytown » existe aussi hors du répertoire, et ne doit pas revenir.
+    #[test]
+    fn le_terme_de_recherche_restreint_le_repertoire_sans_en_sortir() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+        let (ids, total) = repo
+            .random_ids_in_folder(&vise, Some("funkytown"), 500)
+            .unwrap();
+        assert_eq!(ids.len(), 1, "une seule « Funkytown » sous ce répertoire");
+        assert_eq!(total, 1);
+
+        let titre = repo.get(ids[0]).unwrap().unwrap().title;
+        assert_eq!(
+            titre, "Funkytown",
+            "ni la version live du répertoire voisin, ni la reprise d'ailleurs"
+        );
+    }
+
+    /// Le socle de la vue filtrée, pas une facette : un album masqué (#1391) ne
+    /// s'affiche pas, donc la lecture aléatoire du répertoire ne doit pas le
+    /// jouer — ni le compter. C'est le prédicat qu'une recopie « des deux
+    /// filtres » aurait naturellement oublié.
+    #[test]
+    fn un_album_masque_ne_part_pas_en_lecture_aleatoire_de_repertoire() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let albums = AlbumRepo::new(db.clone());
+        let album_id = albums
+            .get_or_create("vol051", artist_id, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+
+        let mut visible = Track::new("Le Freak".into());
+        visible.artist_id = Some(artist_id);
+        visible.file_path = Some(format!("{vise}{s}vol056{s}Le Freak.flac"));
+        let visible_id = repo.create(&visible).unwrap();
+
+        let mut masquee = Track::new("Funkytown".into());
+        masquee.artist_id = Some(artist_id);
+        masquee.album_id = Some(album_id);
+        masquee.file_path = Some(format!("{vise}{s}vol051{s}Funkytown.flac"));
+        repo.create(&masquee).unwrap();
+
+        // Témoin : avant le masquage, les deux pistes partent.
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        assert_eq!(ids.len(), 2, "témoin : les deux pistes sont éligibles");
+        assert_eq!(total, 2);
+
+        crate::db::hidden_repo::HiddenRepo::new(db.clone())
+            .hide_album(album_id)
+            .unwrap();
+
+        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        assert_eq!(
+            ids,
+            vec![visible_id],
+            "l'album masqué ne s'affiche pas : il ne doit pas se jouer non plus"
+        );
+        assert_eq!(total, 1, "et il ne doit pas se compter non plus");
+    }
+
+    /// Le garde-fou contre la DIVERGENCE : `random_ids_in_folder` duplique les
+    /// prédicats `folder`, `q` et « albums masqués » de `list_filtered` pour
+    /// pouvoir tirer au hasard et compter au-delà du plafond. Deux copies d'un
+    /// prédicat, c'est deux occasions de se contredire — et une lecture
+    /// aléatoire qui jouerait autre chose que la liste affichée serait pire
+    /// qu'une portée absente. Ce test tient l'égalité des DEUX ensembles, avec
+    /// et sans terme de recherche.
+    #[test]
+    fn le_tirage_par_repertoire_selectionne_exactement_ce_que_list_filtered_rend() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        bibliotheque_de_repertoires(&repo, artist_id);
+
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Disco Pack");
+
+        for terme in [None, Some("funkytown")] {
+            let (ids, total) = repo.random_ids_in_folder(&vise, terme, 500).unwrap();
+            let filtre = TrackFilter {
+                folder: Some(vise.clone()),
+                q: terme.map(str::to_string),
+                ..Default::default()
+            };
+            let (items, total_liste) = repo.list_filtered(&filtre, 500, 0).unwrap();
+            let attendus: std::collections::HashSet<i64> =
+                items.into_iter().filter_map(|t| t.id).collect();
+            assert_eq!(
+                ids.into_iter().collect::<std::collections::HashSet<_>>(),
+                attendus,
+                "tirage et liste doivent porter sur le MÊME ensemble (terme = {terme:?})"
+            );
+            assert_eq!(
+                total, total_liste,
+                "et sur le même total (terme = {terme:?})"
+            );
+        }
     }
 }
