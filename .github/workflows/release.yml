@@ -45,6 +45,30 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      # Symetrique de « Verify web-client version matches release tag », plus
+      # bas. Le client web avait sa garde ; le SERVEUR n'en avait aucune.
+      # Vecu sur la v0.9.128 : le tag a ete pose alors que Cargo.toml declarait
+      # encore 0.9.127. Les artefacts sont partis, et le binaire repond DEUX
+      # versions selon qui demande — `tune_core::version()` lit TUNE_VERSION
+      # (pose depuis le tag) et dit 0.9.128, tandis que tout `env!(
+      # "CARGO_PKG_VERSION")` dit 0.9.127 : `tune-server --version`,
+      # `routes/mediasync.rs` (`server_version`) et les trois greffons. Un
+      # testeur annonce alors une version qu'il n'execute pas.
+      - name: Verify workspace version matches release tag
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # Meme regle que pour le client : on compare la base X.Y.Z, le
+          # suffixe -rcN vit sur le tag git seul.
+          TAG_BASE="${TAG_VERSION%%-*}"
+          WS_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          [ -n "$WS_VERSION" ] || { echo "::error::version introuvable dans [workspace.package] de Cargo.toml"; exit 1; }
+          if [ "$TAG_BASE" != "$WS_VERSION" ]; then
+            echo "::error::Cargo.toml [workspace.package] declare $WS_VERSION alors que le tag vaut $TAG_BASE."
+            echo "::error::Commiter le bump du workspace AVANT de taguer, puis relancer cette release."
+            exit 1
+          fi
+          echo "workspace version $WS_VERSION == base du tag $TAG_BASE"
       - name: Lire le SHA web du manifeste
         id: web
         shell: bash
