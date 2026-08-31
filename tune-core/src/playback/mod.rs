@@ -131,6 +131,26 @@ pub struct ZoneState {
     pub state: PlayState,
     pub now_playing: Option<NowPlaying>,
     pub position_ms: i64,
+    /// Position rendue par la BASE au démarrage, en attente d'être jouée (#2876).
+    ///
+    /// `zones.last_position_ms` est écrit tout au long de la lecture par le
+    /// poller, puis réinjecté au démarrage par `restore_playback_positions` :
+    /// c'est ce qui fait que le curseur affiche déjà le bon endroit à
+    /// l'ouverture de l'interface. Mais aucun chemin de lecture ne s'en
+    /// servait, et « Lecture » repartait à 0:00 alors que l'écran annonçait
+    /// 2:31 (Sandro, fil 1610, sortie Diretta UPnP).
+    ///
+    /// Ce marqueur porte cette position-là, et elle seule : posé UNIQUEMENT par
+    /// [`PlaybackManager::restore_position`], effacé par le premier
+    /// [`PlaybackManager::play`] réel. Il ne dit donc rien de la position
+    /// conservée par un Stop en cours de session — celle-là garde son
+    /// comportement d'aujourd'hui, sans quoi un clic sur la même piste depuis
+    /// la bibliothèque (ou une file arrivée à son terme, dont la position vaut
+    /// la durée) se serait mis à sauter en avant.
+    ///
+    /// Interne au serveur : aucun client ne le lit.
+    #[serde(skip)]
+    pub pending_resume_ms: Option<i64>,
     pub volume: f64,
     pub muted: bool,
     pub shuffle: bool,
@@ -345,6 +365,7 @@ impl Default for ZoneState {
             output_signal_path: None,
             output_dsp_metrics: None,
             position_ms: 0,
+            pending_resume_ms: None,
             volume: 0.5,
             muted: false,
             shuffle: false,
@@ -491,8 +512,23 @@ impl PlaybackManager {
         // On tient une URL jouable : la recherche est finie.
         state.resolving = false;
         state.position_ms = position_ms;
+        // #2876 — armer la reprise. Sans ce marqueur, la position ci-dessus
+        // n'est plus qu'un affichage : les chemins « Lecture après arrêt »
+        // construisent leur `PlayRequest` avec `seek_ms: None` et le morceau
+        // repart de zéro. Voir `ZoneState::pending_resume_ms`.
+        state.pending_resume_ms = (position_ms > 0).then_some(position_ms);
         state.now_playing = Some(np);
         state.state = PlayState::Stopped;
+    }
+
+    /// La position rendue par la base au démarrage, tant qu'elle n'a pas été
+    /// jouée. Voir [`ZoneState::pending_resume_ms`].
+    pub async fn pending_resume_ms(&self, zone_id: i64) -> Option<i64> {
+        self.zones
+            .lock()
+            .await
+            .get(&zone_id)
+            .and_then(|s| s.pending_resume_ms)
     }
 
     pub async fn all_states(&self) -> Vec<ZoneState> {
@@ -625,6 +661,10 @@ impl PlaybackManager {
         if !is_recent_seek {
             state.position_ms = 0;
         }
+        // La position restaurée au démarrage est à usage unique : ce flux-ci
+        // l'a consommée (si l'appelant l'a demandée) ou l'a rendue caduque (il
+        // joue autre chose). Dans les deux cas elle ne vaut plus (#2876).
+        state.pending_resume_ms = None;
         // Stamp the (re)start instant so the orchestrator can coalesce a
         // redundant controller double-dispatch of this same track (#1271).
         state.last_play_started_at = Some(Instant::now());
@@ -717,6 +757,8 @@ impl PlaybackManager {
             state.paused_at = None;
             state.now_playing = None;
             state.position_ms = 0;
+            // La file est vide : il n'y a plus rien à reprendre (#2876).
+            state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
         }
         self.sync_sleep_inhibition(&zones);
@@ -1071,6 +1113,7 @@ mod tests {
                 ..Default::default()
             }),
             position_ms: 0,
+            pending_resume_ms: None,
             volume: 1.0,
             muted: false,
             shuffle: false,
@@ -1428,5 +1471,64 @@ mod tests {
         assert!(pm.sleep_inhibitor.requested());
         pm.stop_and_clear(1).await;
         assert!(!pm.sleep_inhibitor.requested());
+    }
+
+    /// #2876 — le marqueur de reprise vit exactement le temps qu'il faut.
+    ///
+    /// Posé par la restauration du démarrage, effacé par la première lecture
+    /// réelle. Un Stop en cours de session ne le pose PAS : la position qu'il
+    /// conserve sert l'affichage, et la faire rejouer ferait sauter en avant un
+    /// clic sur la même piste depuis la bibliothèque, ou une file arrivée à son
+    /// terme (dont la position vaut la durée).
+    #[tokio::test]
+    async fn le_marqueur_de_reprise_est_a_usage_unique() {
+        let pm = super::PlaybackManager::new();
+        let np = super::NowPlaying {
+            track_id: Some(42),
+            duration_ms: 300_000,
+            ..Default::default()
+        };
+
+        pm.restore_position(1, 151_000, np.clone()).await;
+        assert_eq!(
+            pm.pending_resume_ms(1).await,
+            Some(151_000),
+            "la position rendue par la base doit être offerte à la première lecture (#2876)"
+        );
+        assert_eq!(pm.get_state(1).await.position_ms, 151_000);
+
+        pm.play(1, np.clone()).await;
+        assert_eq!(
+            pm.pending_resume_ms(1).await,
+            None,
+            "le flux est parti : la position restaurée est consommée, pas rejouable"
+        );
+
+        // Témoin : un Stop en session conserve la position pour l'écran mais
+        // n'arme aucune reprise.
+        pm.stop(1).await;
+        assert_eq!(pm.pending_resume_ms(1).await, None);
+
+        // Une position nulle n'arme rien non plus.
+        pm.restore_position(2, 0, np.clone()).await;
+        assert_eq!(pm.pending_resume_ms(2).await, None);
+
+        // File vidée : plus rien à reprendre.
+        pm.restore_position(3, 90_000, np.clone()).await;
+        assert_eq!(pm.pending_resume_ms(3).await, Some(90_000));
+        pm.stop_and_clear(3).await;
+        assert_eq!(pm.pending_resume_ms(3).await, None);
+
+        // L'ancrage que fait la route avant de demander la lecture : sans le
+        // `seek()`, `play()` remettrait le curseur à zéro et l'écran
+        // recommencerait à mentir — dans l'autre sens cette fois.
+        pm.restore_position(4, 151_000, np.clone()).await;
+        pm.seek(4, 151_000).await;
+        pm.play(4, np).await;
+        assert_eq!(
+            pm.get_state(4).await.position_ms,
+            151_000,
+            "le curseur doit suivre le son, pas retomber à 0:00 (#2876)"
+        );
     }
 }
