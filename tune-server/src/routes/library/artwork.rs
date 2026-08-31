@@ -21,8 +21,29 @@ pub(super) struct ProxyQuery {
     url: String,
 }
 
-pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
-    serve_artwork_from(&artwork_cache_dir(), &hash).await
+/// Le `?size=` que le client envoie sur chaque vignette.
+///
+/// Le champ est une `String` et non un `u32` **volontairement** : avec un
+/// `Option<u32>`, `?size=abc` ferait rendre un 400 par l'extracteur, alors
+/// qu'aujourd'hui cette même requête rend l'image. Une taille illisible doit
+/// dégrader vers l'original, jamais transformer une pochette en erreur.
+#[derive(Deserialize)]
+pub(super) struct ArtworkQuery {
+    size: Option<String>,
+}
+
+/// Sert une pochette, éventuellement redimensionnée.
+///
+/// Le client construit `?size=200` sur toutes les grilles et `?size=80` sur le
+/// tableau de bord (`tune-web-client/src/lib/api.ts:2593`) depuis toujours ;
+/// la route n'avait aucun extracteur `Query` et rendait le fichier d'origine.
+/// Une vignette de 80 px téléchargeait la pochette entière (#2996).
+pub(super) async fn serve_artwork(
+    Path(hash): Path<String>,
+    Query(query): Query<ArtworkQuery>,
+) -> impl IntoResponse {
+    let taille = query.size.as_deref().and_then(|s| s.parse::<u32>().ok());
+    serve_artwork_from(&artwork_cache_dir(), &hash, taille).await
 }
 
 /// Sert une entrée du cache de pochettes, répertoire donné.
@@ -35,33 +56,125 @@ pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse
 /// [`tune_core::library::artwork::CACHE_EXTENSIONS`], la même que celle sous
 /// laquelle l'écriture dépose ses fichiers. Deux listes séparées, c'était la
 /// porte ouverte à un condensat annoncé en base et introuvable ici (#2567).
-async fn serve_artwork_from(cache_dir: &std::path::Path, hash: &str) -> axum::response::Response {
+async fn serve_artwork_from(
+    cache_dir: &std::path::Path,
+    hash: &str,
+    size: Option<u32>,
+) -> axum::response::Response {
     if let Some((path, mime)) = tune_core::library::artwork::find_cached(cache_dir, hash)
         && let Ok(data) = tokio::fs::read(&path).await
     {
-        let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static(mime));
-        headers.insert(
-            "Cache-Control",
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        );
-        headers.insert(
-            "ETag",
-            HeaderValue::from_str(&format!("\"{hash}\""))
-                .unwrap_or(HeaderValue::from_static("\"artwork\"")),
-        );
-        return (StatusCode::OK, headers, data).into_response();
+        // Sans `?size=`, rien ne change : mêmes octets, même type MIME, même
+        // ETag qu'avant. C'est le chemin que prennent l'écran Lecture en cours
+        // et toutes les vues qui n'envoient pas de taille.
+        if let Some(bucket) = size.and_then(tune_core::library::artwork::thumb_bucket)
+            && let Some(vignette) = vignette(cache_dir, hash, bucket, &data).await
+        {
+            return reponse_pochette(vignette, "image/jpeg", &format!("{hash}-w{bucket}"));
+        }
+        return reponse_pochette(data, mime, hash);
     }
+    journaliser_absence(cache_dir, hash);
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn reponse_pochette(data: Vec<u8>, mime: &str, etag: &str) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(mime).unwrap_or(HeaderValue::from_static("image/jpeg")),
+    );
+    headers.insert(
+        "Cache-Control",
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    // L'ETag d'une vignette porte sa case (`{condensat}-w200`). Deux tailles de
+    // la même pochette sont deux corps différents : leur donner le même ETag
+    // sous `immutable` laisserait un cache intermédiaire servir la vignette de
+    // 80 px là où la grille demande 200. L'original, lui, garde le condensat
+    // seul — ne pas invalider d'un coup ce qui est déjà dans les navigateurs.
+    headers.insert(
+        "ETag",
+        HeaderValue::from_str(&format!("\"{etag}\""))
+            .unwrap_or(HeaderValue::from_static("\"artwork\"")),
+    );
+    (StatusCode::OK, headers, data).into_response()
+}
+
+/// Vignette d'une pochette dans une case, depuis le cache ou fabriquée.
+///
+/// `None` = servir l'original (format non décodable, image déjà plus petite
+/// que la case). Le redimensionnement est du calcul pur : il part sur
+/// `spawn_blocking` plutôt que de tenir un fil de l'exécuteur pendant les
+/// 6 à 31 ms mesurées.
+async fn vignette(
+    cache_dir: &std::path::Path,
+    hash: &str,
+    bucket: u32,
+    original: &[u8],
+) -> Option<Vec<u8>> {
+    let chemin = tune_core::library::artwork::thumb_path(cache_dir, bucket, hash);
+    if let Ok(deja) = tokio::fs::read(&chemin).await {
+        return Some(deja);
+    }
+    let octets = original.to_vec();
+    let vignette = tokio::task::spawn_blocking(move || {
+        tune_core::library::artwork::make_thumbnail(&octets, bucket)
+    })
+    .await
+    .ok()
+    .flatten()?;
+
+    let (dir, condensat, copie) = (cache_dir.to_path_buf(), hash.to_string(), vignette.clone());
+    let _ = tokio::task::spawn_blocking(move || {
+        tune_core::library::artwork::store_thumbnail(&dir, bucket, &condensat, &copie);
+    })
+    .await;
+    Some(vignette)
+}
+
+/// Condensats déjà signalés absents, pour ne les signaler qu'une fois.
+///
+/// `artwork_cache_miss` était l'un des rares journaux dont le volume suit le
+/// trafic d'interface et non la taille de la bibliothèque : un 404 n'est pas
+/// mis en cache par le navigateur, donc une grille qui affiche 50 pochettes
+/// manquantes réécrivait 50 lignes à chaque rendu, indéfiniment après la fin du
+/// scan (#2996). Le premier constat par condensat reste un `warn!` — c'est lui
+/// qui sert au diagnostic ; les suivants passent en `debug!`.
+///
+/// Le jeu est **borné** : au-delà de `PLAFOND_ABSENCES` condensats distincts on
+/// n'insère plus rien. Une mémoire qui grandit avec la bibliothèque pour tenir
+/// un journal serait le même défaut sous une autre forme, et 4096 pochettes
+/// distinctes manquantes sont déjà un signal largement suffisant.
+const PLAFOND_ABSENCES: usize = 4096;
+static ABSENCES_DEJA_SIGNALEES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn journaliser_absence(cache_dir: &std::path::Path, hash: &str) {
     // Une pochette absente n'existait jusqu'ici que dans la console du testeur :
     // la route ne journalisait ni succès ni échec, et un 404 de pochette était
     // invisible côté serveur (#2567). Le condensat suffit à retrouver l'album
     // (`SELECT id FROM albums WHERE cover_path = …`).
-    tracing::warn!(
-        hash = %hash,
-        cache_dir = %cache_dir.display(),
-        "artwork_cache_miss — condensat annoncé sans fichier servable"
-    );
-    StatusCode::NOT_FOUND.into_response()
+    let premiere_fois = {
+        let mut vus = ABSENCES_DEJA_SIGNALEES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        vus.len() < PLAFOND_ABSENCES && vus.insert(hash.to_string())
+    };
+    if premiere_fois {
+        tracing::warn!(
+            hash = %hash,
+            cache_dir = %cache_dir.display(),
+            "artwork_cache_miss — condensat annoncé sans fichier servable"
+        );
+    } else {
+        tracing::debug!(
+            hash = %hash,
+            cache_dir = %cache_dir.display(),
+            "artwork_cache_miss — déjà signalé"
+        );
+    }
 }
 
 pub(super) async fn album_artwork(
@@ -1609,7 +1722,7 @@ mod tests_service_pochette {
         let mut echecs = Vec::new();
         for (hash, ext, mime) in cas {
             ecrire(cache.path(), &format!("{hash}.{ext}"), b"IMAGE");
-            let reponse = serve_artwork_from(cache.path(), hash).await;
+            let reponse = serve_artwork_from(cache.path(), hash, None).await;
             let statut = reponse.status();
             let recu = reponse
                 .headers()
@@ -1641,7 +1754,7 @@ mod tests_service_pochette {
         let hash = tune_core::library::artwork::content_hash(b"NOUVELLE-POCHETTE");
         assert_eq!(hash.len(), 64);
         ecrire(cache.path(), &format!("{hash}.jpg"), b"NOUVELLE-POCHETTE");
-        let reponse = serve_artwork_from(cache.path(), &hash).await;
+        let reponse = serve_artwork_from(cache.path(), &hash, None).await;
         assert_eq!(reponse.status(), StatusCode::OK);
     }
 
@@ -1651,7 +1764,8 @@ mod tests_service_pochette {
     #[tokio::test]
     async fn un_condensat_sans_fichier_reste_un_404() {
         let cache = tempfile::TempDir::new().unwrap();
-        let reponse = serve_artwork_from(cache.path(), "8865c2f2e1a6f89c34ab584ec5b8e158").await;
+        let reponse =
+            serve_artwork_from(cache.path(), "8865c2f2e1a6f89c34ab584ec5b8e158", None).await;
         assert_eq!(reponse.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1662,7 +1776,7 @@ mod tests_service_pochette {
         let cache = tempfile::TempDir::new().unwrap();
         let hash = "8865c2f2e1a6f89c34ab584ec5b8e158";
         ecrire(cache.path(), &format!("{hash}.jpg"), b"IMAGE");
-        let reponse = serve_artwork_from(cache.path(), hash).await;
+        let reponse = serve_artwork_from(cache.path(), hash, None).await;
         assert_eq!(reponse.status(), StatusCode::OK);
         assert_eq!(
             reponse.headers().get("ETag").unwrap().to_str().unwrap(),
@@ -1677,6 +1791,363 @@ mod tests_service_pochette {
                 .unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+}
+
+/// Contre-épreuve de #2996 : le `?size=` que le client envoie sur chaque
+/// vignette était reçu et silencieusement ignoré.
+#[cfg(test)]
+mod tests_taille_pochette {
+    use super::*;
+
+    /// Une vraie pochette JPEG de `cote` pixels, non uniforme pour que
+    /// l'encodeur ne la réduise pas à quelques octets.
+    fn pochette(cote: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(cote, cote, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode(img.as_raw(), cote, cote, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out.into_inner()
+    }
+
+    async fn corps(reponse: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    fn cote_servi(octets: &[u8]) -> u32 {
+        image::load_from_memory(octets).unwrap().width()
+    }
+
+    fn poser(cache: &std::path::Path, hash: &str, octets: &[u8]) {
+        std::fs::write(cache.join(format!("{hash}.jpg")), octets).unwrap();
+    }
+
+    /// LE FAIT. Une grille demande `?size=200`, le tableau de bord `?size=80` :
+    /// avant le correctif, les deux recevaient la pochette d'origine intacte.
+    #[tokio::test]
+    async fn le_parametre_size_est_honore() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa01";
+        let origine = pochette(600);
+        poser(cache.path(), hash, &origine);
+
+        let mut echecs = Vec::new();
+        for (demande, case) in [
+            (80u32, 80u32),
+            (200, 200),
+            (128, 128),
+            (100, 128),
+            (300, 400),
+        ] {
+            let servi = corps(serve_artwork_from(cache.path(), hash, Some(demande)).await).await;
+            let cote = cote_servi(&servi);
+            if cote != case {
+                echecs.push(format!(
+                    "?size={demande} → {cote} px servis (case attendue {case} px), {} o contre {} o d'origine",
+                    servi.len(),
+                    origine.len()
+                ));
+            }
+            if servi.len() >= origine.len() {
+                echecs.push(format!(
+                    "?size={demande} → {} o, la pochette d'origine en fait {} : rien n'a été économisé",
+                    servi.len(),
+                    origine.len()
+                ));
+            }
+        }
+        assert!(
+            echecs.is_empty(),
+            "le ?size= envoyé par le client n'est pas honoré (#2996) : {echecs:#?}"
+        );
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION. Une requête **sans** `?size=` doit rendre
+    /// exactement les octets d'avant, le même type MIME et le même ETag :
+    /// c'est le chemin de l'écran Lecture en cours et de toutes les vues qui
+    /// n'envoient pas de taille.
+    #[tokio::test]
+    async fn sans_size_les_octets_sont_inchanges() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa02";
+        let origine = pochette(600);
+        poser(cache.path(), hash, &origine);
+
+        let reponse = serve_artwork_from(cache.path(), hash, None).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        assert_eq!(reponse.headers().get("Content-Type").unwrap(), "image/jpeg");
+        assert_eq!(
+            reponse.headers().get("ETag").unwrap().to_str().unwrap(),
+            format!("\"{hash}\"")
+        );
+        let servi = corps(reponse).await;
+        assert_eq!(
+            servi, origine,
+            "sans ?size=, les octets servis ne sont plus ceux du cache"
+        );
+    }
+
+    /// LA CLÉ. Une case est un composant de chemin, pas un morceau de nom de
+    /// fichier : on compte les COLLISIONS, pas seulement les pertes (#1444).
+    /// Toutes les paires (condensat, case) doivent produire des chemins deux à
+    /// deux distincts, et aucun ne doit tomber sur un fichier d'origine.
+    #[test]
+    fn aucune_collision_de_chemin_entre_deux_cases_ou_deux_condensats() {
+        use std::collections::HashMap;
+        let cache = std::path::Path::new("/cache");
+        let f64x = "f".repeat(64);
+        let condensats = [
+            "0000000000000000000000000000aa01",
+            "0000000000000000000000000000aa02",
+            "80000000000000000000000000000000",
+            "8865c2f2e1a6f89c34ab584ec5b8e158",
+            f64x.as_str(),
+        ];
+        let mut vus: HashMap<std::path::PathBuf, String> = HashMap::new();
+        let mut collisions = Vec::new();
+
+        // Les originaux occupent déjà le répertoire racine du cache.
+        for h in &condensats {
+            for ext in tune_core::library::artwork::CACHE_EXTENSIONS {
+                vus.insert(
+                    cache.join(format!("{h}.{ext}")),
+                    format!("original {h}.{ext}"),
+                );
+            }
+        }
+        for h in &condensats {
+            for &case in tune_core::library::artwork::THUMB_SIZES {
+                let chemin = tune_core::library::artwork::thumb_path(cache, case, h);
+                let qui = format!("vignette {h} case {case}");
+                if let Some(autre) = vus.insert(chemin.clone(), qui.clone()) {
+                    collisions.push(format!("{} == {} → {}", qui, autre, chemin.display()));
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "{} collision(s) de clé de cache sur {} chemins (#1444) : {collisions:#?}",
+            collisions.len(),
+            vus.len()
+        );
+    }
+
+    /// LA BORNE. Le client interpole la taille telle quelle dans l'URL, sans
+    /// aucun contrôle. Une taille absurde ne doit ni allouer, ni échouer :
+    /// elle retombe sur l'original, exactement comme aujourd'hui.
+    #[tokio::test]
+    async fn une_taille_hors_bornes_ne_fait_pas_allouer() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa03";
+        let origine = pochette(300);
+        poser(cache.path(), hash, &origine);
+
+        let mut echecs = Vec::new();
+        for demande in [100_000u32, 65_536, 4096, 401, u32::MAX] {
+            assert!(
+                tune_core::library::artwork::thumb_bucket(demande).is_none(),
+                "{demande} devrait être hors de toute case"
+            );
+            let reponse = serve_artwork_from(cache.path(), hash, Some(demande)).await;
+            if reponse.status() != StatusCode::OK {
+                echecs.push(format!("?size={demande} → {}", reponse.status()));
+                continue;
+            }
+            let servi = corps(reponse).await;
+            if servi != origine {
+                echecs.push(format!(
+                    "?size={demande} → {} o servis au lieu des {} o d'origine",
+                    servi.len(),
+                    origine.len()
+                ));
+            }
+        }
+        assert!(
+            echecs.is_empty(),
+            "une taille hors bornes doit dégrader vers l'original : {echecs:#?}"
+        );
+    }
+
+    /// Une taille illisible (`?size=abc`, `?size=-1`) rendait l'image avant le
+    /// correctif ; elle doit continuer à la rendre, pas devenir un 400.
+    #[tokio::test]
+    async fn une_taille_illisible_rend_toujours_l_image() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa04";
+        let origine = pochette(300);
+        poser(cache.path(), hash, &origine);
+        for brut in ["abc", "-1", "", "2.5", "1e9"] {
+            let taille = brut.parse::<u32>().ok();
+            let reponse = serve_artwork_from(cache.path(), hash, taille).await;
+            assert_eq!(
+                reponse.status(),
+                StatusCode::OK,
+                "?size={brut} ne doit pas transformer une pochette en erreur"
+            );
+            assert_eq!(corps(reponse).await, origine, "?size={brut}");
+        }
+    }
+
+    /// JAMAIS D'AGRANDISSEMENT : une pochette déjà plus petite que la case est
+    /// servie telle quelle. La ré-encoder en 200 px serait plus lourd que
+    /// l'original — l'inverse du but.
+    #[tokio::test]
+    async fn une_pochette_plus_petite_que_la_case_est_servie_telle_quelle() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa05";
+        let origine = pochette(64);
+        poser(cache.path(), hash, &origine);
+        let reponse = serve_artwork_from(cache.path(), hash, Some(200)).await;
+        assert_eq!(
+            reponse.headers().get("ETag").unwrap().to_str().unwrap(),
+            format!("\"{hash}\""),
+            "une image non redimensionnée doit garder l'ETag de l'original"
+        );
+        assert_eq!(corps(reponse).await, origine);
+    }
+
+    /// L'ETag d'une vignette porte sa case. Deux tailles servies sous le même
+    /// ETag avec `Cache-Control: immutable`, c'est un cache qui rend la
+    /// vignette de 80 px là où la grille demande 200.
+    #[tokio::test]
+    async fn deux_cases_ne_partagent_pas_un_etag() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa06";
+        poser(cache.path(), hash, &pochette(600));
+        let mut etags = std::collections::HashSet::new();
+        let mut corps_vus = std::collections::HashSet::new();
+        for case in [80u32, 128, 200, 400] {
+            let reponse = serve_artwork_from(cache.path(), hash, Some(case)).await;
+            let etag = reponse
+                .headers()
+                .get("ETag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(etag, format!("\"{hash}-w{case}\""));
+            etags.insert(etag);
+            corps_vus.insert(corps(reponse).await);
+        }
+        assert_eq!(etags.len(), 4, "quatre cases, quatre ETags distincts");
+        assert_eq!(corps_vus.len(), 4, "quatre cases, quatre corps distincts");
+    }
+
+    /// La vignette est bien écrite sur disque, sous sa case, et relue au second
+    /// appel : c'est ce qui rend le coût de calcul non récurrent.
+    #[tokio::test]
+    async fn la_vignette_est_mise_en_cache_sous_sa_case() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa07";
+        poser(cache.path(), hash, &pochette(600));
+
+        let premier = corps(serve_artwork_from(cache.path(), hash, Some(200)).await).await;
+        let sur_disque = tune_core::library::artwork::thumb_path(cache.path(), 200, hash);
+        assert!(
+            sur_disque.exists(),
+            "vignette absente de {}",
+            sur_disque.display()
+        );
+        assert_eq!(std::fs::read(&sur_disque).unwrap(), premier);
+
+        let second = corps(serve_artwork_from(cache.path(), hash, Some(200)).await).await;
+        assert_eq!(second, premier, "le second appel doit relire le cache");
+
+        // Aucun fichier temporaire ne doit survivre au `rename`.
+        let restes: Vec<_> =
+            std::fs::read_dir(tune_core::library::artwork::thumb_dir(cache.path(), 200))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect();
+        assert!(
+            restes.is_empty(),
+            "fichiers temporaires laissés : {restes:?}"
+        );
+    }
+
+    /// Un format que `image` ne sait pas décoder (WebP, BMP — présents dans
+    /// `CACHE_EXTENSIONS` mais hors des features compilées) doit dégrader vers
+    /// l'original, pas rendre une erreur.
+    #[tokio::test]
+    async fn un_format_non_decodable_degrade_vers_l_original() {
+        let cache = tempfile::TempDir::new().unwrap();
+        let hash = "0000000000000000000000000000aa08";
+        let octets = b"RIFF....WEBPpas-une-image";
+        std::fs::write(cache.path().join(format!("{hash}.webp")), octets).unwrap();
+        let reponse = serve_artwork_from(cache.path(), hash, Some(80)).await;
+        assert_eq!(reponse.status(), StatusCode::OK);
+        assert_eq!(reponse.headers().get("Content-Type").unwrap(), "image/webp");
+        assert_eq!(corps(reponse).await, octets);
+    }
+
+    /// LE JOURNAL. `artwork_cache_miss` émettait un `warn!` par requête : une
+    /// grille de 50 pochettes manquantes en réécrivait 50 à chaque rendu, et un
+    /// 404 n'est pas mis en cache par le navigateur. Le premier constat par
+    /// condensat reste un `warn!`, les suivants passent en `debug!` ; et le jeu
+    /// qui s'en souvient est borné.
+    ///
+    /// Les deux moitiés tiennent dans **un seul** test parce qu'elles écrivent
+    /// dans le même état global : séparées, la moitié « borné » remplirait le
+    /// jeu et ferait échouer l'autre selon l'ordre d'exécution.
+    #[test]
+    fn le_journal_d_absence_ne_suit_plus_le_trafic_d_interface() {
+        let cache = std::path::Path::new("/cache");
+        let hash = "0000000000000000000000000000aa09";
+
+        assert!(
+            premier_constat(cache, hash),
+            "le tout premier constat doit être signalé"
+        );
+        let mut repetitions_signalees = 0;
+        for _ in 0..49 {
+            if premier_constat(cache, hash) {
+                repetitions_signalees += 1;
+            }
+        }
+        assert_eq!(
+            repetitions_signalees, 0,
+            "{repetitions_signalees} répétition(s) sur 49 encore signalées : le journal suit toujours le trafic d'interface (#2996)"
+        );
+        assert!(
+            premier_constat(cache, "0000000000000000000000000000aa0a"),
+            "un autre condensat garde droit à son premier constat"
+        );
+
+        // Bornage : le jeu ne peut pas grandir avec la bibliothèque.
+        for i in 0..(PLAFOND_ABSENCES + 500) {
+            journaliser_absence(cache, &format!("{i:064x}"));
+        }
+        let taille = ABSENCES_DEJA_SIGNALEES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert!(
+            taille <= PLAFOND_ABSENCES,
+            "{taille} condensats retenus, plafond {PLAFOND_ABSENCES}"
+        );
+    }
+
+    /// Miroir de la décision prise dans [`journaliser_absence`], pour la rendre
+    /// observable sans lecteur de journal.
+    fn premier_constat(cache_dir: &std::path::Path, hash: &str) -> bool {
+        let avant = ABSENCES_DEJA_SIGNALEES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        journaliser_absence(cache_dir, hash);
+        let apres = ABSENCES_DEJA_SIGNALEES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        apres > avant
     }
 }
 
