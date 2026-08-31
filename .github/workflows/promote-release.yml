@@ -103,10 +103,39 @@ jobs:
           done
 
           OS_TAG="$(jq -r .components.os.tag "$PLAN")"
-          OS_DRAFT="$(GH_TOKEN="$OS_TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq .draft)"
+
+          # ⚠️ `GET /releases/tags/{tag}` rend 404 sur une release BROUILLON :
+          # un brouillon n'a pas de tag git, il n'est joignable que par la
+          # liste. Or c'est precisement un brouillon qu'on verifie ici — la
+          # promotion est justement le geste qui le publie. Ces deux appels ne
+          # pouvaient donc JAMAIS reussir. Mesure du 31/08/2026 sur
+          # tune-os-rpi-v0.9.129 : par tag -> 404, par la liste -> trouve,
+          # draft=true, 6 artefacts.
+          #
+          # Meme defaut, meme correctif que dans trigger-os-images.yml.
+          #
+          # `--paginate` avec `--jq` applique le filtre PAGE PAR PAGE : il faut
+          # agreger avec `jq -s 'add'`, sinon la seconde page ecrase la
+          # premiere par un tableau vide.
+          OS_RELEASES="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+            "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {draft, assets: [.assets[].name]}]" \
+            | jq -s 'add // []')"
+          OS_COMBIEN="$(jq 'length' <<<"$OS_RELEASES")"
+
+          # Un homonyme de plus n'est pas arbitrable par une machine : `gh
+          # release upload` en choisit un au hasard, et on pourrait publier une
+          # release OS SANS IMAGE. On refuse, on ne devine pas.
+          if [ "$OS_COMBIEN" -ne 1 ]; then
+            echo "::error::$OS_COMBIEN releases portent le tag $OS_TAG chez tune-os, il en faut exactement une"
+            jq -r '.[] | "::error::  draft=\(.draft) assets=\(.assets | length)"' <<<"$OS_RELEASES"
+            exit 1
+          fi
+
+          OS_DRAFT="$(jq -r '.[0].draft' <<<"$OS_RELEASES")"
           [ "$OS_DRAFT" = true ] || { [ "$APPLY" = true ] && [ "$OS_DRAFT" = false ]; } \
             || { echo "::error::release OS absente ou deja publique"; exit 1; }
-          OS_ASSETS="$(GH_TOKEN="$OS_TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq '.assets[].name')"
+          OS_ASSETS="$(jq -r '.[0].assets[]' <<<"$OS_RELEASES")"
           grep -Eq 'x86_64.*\.iso$' <<<"$OS_ASSETS" || { echo "::error::ISO OS absente"; exit 1; }
           grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$OS_ASSETS" || { echo "::error::image OS x86 absente"; exit 1; }
           grep -Eq 'aarch64.*\.raw\.xz$' <<<"$OS_ASSETS" || { echo "::error::image OS ARM absente"; exit 1; }
@@ -187,8 +216,45 @@ jobs:
             "renesenses/tune:staging-$TAG"
 
           OS_TAG="$(jq -r .components.os.tag "$PLAN")"
-          if [ "$(GH_TOKEN="$OS_TOKEN" gh api "repos/renesenses/tune-os/releases/tags/$OS_TAG" --jq .draft)" = true ]; then
-            GH_TOKEN="$OS_TOKEN" gh release edit "$OS_TAG" --repo renesenses/tune-os --draft=false --latest=false
+
+          # ⚠️ Meme piege que dans l'etape de verification, mais ici il etait
+          # SILENCIEUX — et c'etait le plus grave des deux.
+          #
+          # `GET /releases/tags/{tag}` rend 404 sur un BROUILLON, or c'est
+          # exactement ce qu'on s'apprete a publier. Et comme l'appel vivait
+          # dans la condition d'un `if`, `set -e` ne s'y appliquait pas : la
+          # substitution rendait une chaine vide, le test etait faux, la
+          # release OS n'etait JAMAIS publiee — et le workflow sortait en
+          # SUCCES. Verifie le 31/08/2026 :
+          #   if [ "$(gh_qui_404)" = true ]; then ... fi
+          #   -> ne publie rien, le script continue, code=0
+          # Les images OS seraient restees invisibles pendant que le serveur,
+          # Docker et Homebrew basculaient en public.
+          #
+          # On lit donc par la LISTE, dans une affectation (ou `set -e` mord),
+          # et on refuse d'avancer si le brouillon reste introuvable.
+          OS_ID="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+            "repos/renesenses/tune-os/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {id, draft}]" \
+            | jq -s 'add // []' \
+            | jq -r 'if length == 1 then (if .[0].draft then .[0].id else empty end) else empty end')"
+          if [ -n "$OS_ID" ]; then
+            GH_TOKEN="$OS_TOKEN" gh api --method PATCH \
+              "repos/renesenses/tune-os/releases/$OS_ID" \
+              -F draft=false -F make_latest=false >/dev/null
+            echo "release OS $OS_TAG publiee (id=$OS_ID)"
+          else
+            # Ni un brouillon unique, ni une release deja publique : on le DIT.
+            # Le silence d'avant est precisement ce qu'on corrige.
+            OS_ETAT="$(GH_TOKEN="$OS_TOKEN" gh api --paginate \
+              "repos/renesenses/tune-os/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name == \"$OS_TAG\") | {draft}]" | jq -s 'add // []')"
+            if [ "$(jq 'length' <<<"$OS_ETAT")" -eq 1 ] && [ "$(jq -r '.[0].draft' <<<"$OS_ETAT")" = false ]; then
+              echo "release OS $OS_TAG deja publique, rien a faire"
+            else
+              echo "::error::release OS $OS_TAG introuvable ou en double : $(jq -c . <<<"$OS_ETAT")"
+              exit 1
+            fi
           fi
 
           cd homebrew-tap
