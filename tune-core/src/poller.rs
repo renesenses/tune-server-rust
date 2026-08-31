@@ -2174,6 +2174,149 @@ pub mod fsm {
 struct IdlePollBackoff {
     consecutive_errors: u8,
     remaining: u8,
+    /// Comptabilité du journal — distincte du recul, qui lui n'est pas en cause.
+    journal: JournalSondageRepos,
+}
+
+/// Combien d'échecs consécutifs sont **détaillés** avant de passer au
+/// récapitulatif (#2566).
+///
+/// Cinq lignes suffisent à établir la cause : l'erreur est la même à chaque
+/// tour — c'est la définition d'une panne durable — et les quatre premières
+/// donnent en plus la montée du recul (`skip_ticks` 2, 4, 8, 16), donc de quoi
+/// vérifier qu'il fonctionne. Un échec isolé est le n° 1 : il reste dit.
+pub const ECHECS_SONDAGE_DETAILLES: u32 = 5;
+
+/// Ce que la comptabilité décide de faire d'un échec de plus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceEchecSondage {
+    /// Sous le plafond : la ligne complète est émise.
+    Detaille,
+    /// Au-dessus du plafond, à un palier : une ligne de récapitulatif portant
+    /// le TOTAL est émise à la place.
+    Recapitulatif,
+    /// Au-dessus du plafond, hors palier : rien n'est émis.
+    Muet,
+}
+
+/// Comptabilité du journal d'un sondage de zone au repos qui échoue (#2566).
+///
+/// ## Le défaut mesuré
+///
+/// Dimitri, macOS, v0.9.115, fil 1577 : une zone Chromecast a produit **79
+/// lignes `idle_poll_failed_backing_off` identiques**, une par tentative. Le
+/// recul exponentiel n'est pas en cause — il plafonnait correctement à
+/// `2^IDLE_BACKOFF_MAX_SHIFT` = 32 ticks, et l'extrait le montre
+/// (`skip_ticks=32`, 33 s entre deux lignes). C'est le JOURNAL qui n'avait
+/// aucun plafond : une ligne par tentative, indéfiniment.
+///
+/// Au rythme du recul saturé — 32 ticks sautés + 1 tick de tentative, à
+/// `POLL_INTERVAL_MS` = 1000 ms — cela fait **une ligne toutes les 33 s et par
+/// zone**, soit ~109 lignes par heure. Les 79 échecs de Dimitri couvrent
+/// **41 min 16 s**. Un appareil laissé éteint une nuit de 8 h en produit
+/// **~870**, et rien ne l'arrête : `consecutive_errors` est un `u8` qui sature
+/// à 255 sans jamais cesser de journaliser.
+///
+/// L'export de diagnostic borne chaque module à un quart de la fenêtre
+/// (`QUOTA_PAR_MODULE`, #1974) : 79 lignes prennent déjà un tiers du quota de
+/// `tune_core::poller` — le module qu'on lit précisément quand une lecture ne
+/// démarre pas.
+///
+/// ## Le patron, repris de #2890
+///
+/// Quelques lignes détaillées plafonnées, puis un récapitulatif portant le
+/// total — comme `track_insert_failures_truncated` dans `db::track_repo`, et
+/// `scan_walk_errors_truncated` dans `scanner::walker`. Une seule différence :
+/// là-bas la boucle a une fin (500 pistes), ici elle n'en a pas. Le
+/// récapitulatif est donc émis **aux paliers de doublement** — échecs 8, 16,
+/// 32, 64, 128… — au lieu d'une fois en sortie de boucle. Une panne coûte
+/// ainsi un nombre de lignes **logarithmique** en sa durée, et non linéaire :
+/// 79 échecs → 9 lignes, 870 échecs → 12 lignes.
+///
+/// La fin de panne, elle, est un vrai événement ponctuel : `succes` émet le
+/// récapitulatif de clôture avec le total, exactement comme #2890 en sortie de
+/// lot.
+///
+/// ## Ce que cela ne change pas
+///
+/// Ni la cadence, ni le recul, ni le nombre de tentatives : **aucune décision
+/// de sondage ne passe par ici**. Seul le volume du journal change. Un échec
+/// isolé reste dit en entier, et un sondage qui réussit sans échec préalable
+/// n'émet toujours rien.
+#[derive(Debug, Default, Clone)]
+pub struct JournalSondageRepos {
+    /// Échecs consécutifs, en `u32` : `IdlePollBackoff::consecutive_errors`
+    /// est un `u8` qui sature à 255, ce qui rendrait le total faux et les
+    /// paliers erratiques au-delà de deux heures de panne.
+    echecs: u32,
+}
+
+impl JournalSondageRepos {
+    /// Un échec de plus. Rend ce qu'il faut en dire.
+    fn compter_echec(&mut self) -> TraceEchecSondage {
+        self.echecs = self.echecs.saturating_add(1);
+        if self.echecs <= ECHECS_SONDAGE_DETAILLES {
+            TraceEchecSondage::Detaille
+        } else if self.echecs.is_power_of_two() {
+            TraceEchecSondage::Recapitulatif
+        } else {
+            TraceEchecSondage::Muet
+        }
+    }
+
+    /// Total d'échecs consécutifs en cours.
+    pub fn echecs(&self) -> u32 {
+        self.echecs
+    }
+
+    /// Un échec de plus, et la trace qui convient est **émise**.
+    ///
+    /// C'est le point d'émission réel du sondeur : le garde
+    /// `tests/journal_sondage_repos.rs` appelle cette fonction-ci, pas une
+    /// copie, et compte les lignes que `tracing` reçoit.
+    pub fn echec(
+        &mut self,
+        zone_id: i64,
+        device: &str,
+        error: &dyn std::fmt::Display,
+        skip_ticks: u8,
+    ) {
+        match self.compter_echec() {
+            TraceEchecSondage::Detaille => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                consecutive_errors = self.echecs,
+                skip_ticks,
+                "idle_poll_failed_backing_off"
+            ),
+            TraceEchecSondage::Recapitulatif => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                echecs = self.echecs,
+                detaillees = ECHECS_SONDAGE_DETAILLES,
+                skip_ticks,
+                "idle_poll_still_failing"
+            ),
+            TraceEchecSondage::Muet => {}
+        }
+    }
+
+    /// Le sondage repasse. Émet la clôture de panne s'il y en avait une à
+    /// clore, et rien du tout sinon — un sondage qui a toujours réussi ne doit
+    /// pas changer d'un iota.
+    pub fn succes(&mut self, zone_id: i64, device: &str) {
+        let echecs = std::mem::take(&mut self.echecs);
+        if echecs > ECHECS_SONDAGE_DETAILLES {
+            debug!(
+                zone_id,
+                device = %device,
+                echecs,
+                "idle_poll_recovered"
+            );
+        }
+    }
 }
 
 impl IdlePollBackoff {
@@ -2814,10 +2957,11 @@ impl PositionPoller {
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok((s, signal_path, dsp_metrics)) => {
-                        idle_backoff
-                            .entry(zone_id)
-                            .or_default()
-                            .record_success(s.state);
+                        let b = idle_backoff.entry(zone_id).or_default();
+                        b.record_success(s.state);
+                        // Clôture de panne (#2566) : muette si le sondage
+                        // n'avait jamais échoué.
+                        b.journal.succes(zone_id, &device_id);
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
@@ -2832,14 +2976,12 @@ impl PositionPoller {
                     Err(e) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_failure();
-                        debug!(
-                            zone_id,
-                            device = %device_id,
-                            error = %e,
-                            consecutive_errors = b.consecutive_errors,
-                            skip_ticks = b.remaining,
-                            "idle_poll_failed_backing_off"
-                        );
+                        // Plafonné, sur le modèle de #2890 (#2566) : une panne
+                        // durable dit sa cause quelques fois, puis se
+                        // récapitule aux paliers de doublement. Le recul
+                        // lui-même, lui, ne change pas d'un tick.
+                        let skip_ticks = b.remaining;
+                        b.journal.echec(zone_id, &device_id, &e, skip_ticks);
                         continue;
                     }
                 }

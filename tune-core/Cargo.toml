@@ -144,6 +144,13 @@ path = "tests/journal_descriptif_illisible.rs"
 name = "journal_insertion_par_lot"
 path = "tests/journal_insertion_par_lot.rs"
 
+# Meme famille, meme raison (#2566) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il compte les lignes qu une panne de sondage coute au journal —
+# 79 avant, 9 apres — sans toucher au reseau ni au recul exponentiel.
+[[test]]
+name = "journal_sondage_repos"
+path = "tests/journal_sondage_repos.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
