@@ -754,6 +754,13 @@ static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
 /// plateformes. Un bloc `cfg(linux)` ne serait ni compilé ni testé depuis
 /// macOS — c'est ainsi qu'une fonction morte a déjà été livrée (#2277).
 /// Le point de montage le plus LONG qui préfixe le chemin gagne.
+///
+/// Son unique appelant de production, [`chemin_sur_montage_reseau`], n'existe
+/// que sur Linux et Android : ailleurs (Darwin passe par `statfs`) elle n'a
+/// d'appelant que ses tests, et le compilateur la signale « never used ».
+/// L'`allow` est donc borné à ces plateformes-là — le rendre inconditionnel
+/// masquerait la mort de la fonction le jour où l'appelant Linux disparaîtrait.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
     const TYPES_RESEAU: &[&str] = &[
         "nfs",

@@ -6398,7 +6398,6 @@ mod zone_group_tests {
 
 #[cfg(test)]
 mod aac_passthrough_tests {
-    use super::*;
     use std::sync::Arc;
     use tune_core::db::backend::DbBackend;
     use tune_core::db::sqlite::SqliteDb;

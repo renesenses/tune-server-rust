@@ -338,15 +338,19 @@ fn spawn_paced_levels_forwarder(
         // piste, gratuite par construction.
         let mut peak_hold = crate::audio::levels::PeakHold::default();
         while let Some(raw) = rx.recv().await {
-            let mut reported_position_ms: i64 = 0;
-            loop {
+            // La boucle RAPPORTE la position lue au moment où la zone est
+            // effectivement en lecture : c'est cette valeur-là, et aucune autre,
+            // qui sert au rattrapage plus bas. Un `0` initial n'était jamais lu
+            // (toute sortie de boucle passe par une affectation), et le déclarer
+            // laissait croire à un repli qui n'existe pas.
+            let reported_position_ms: i64 = loop {
                 if playback.current_play_seq(zone_id).await != play_seq
                     || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
                 {
                     return;
                 }
                 let zone_state = playback.get_state(zone_id).await;
-                reported_position_ms = zone_state.position_ms;
+                let reported_position_ms = zone_state.position_ms;
                 if let Some(prev) = last_reported {
                     if reported_position_ms > prev {
                         reported_advancing = true;
@@ -356,7 +360,7 @@ fn spawn_paced_levels_forwarder(
                 match zone_state.state {
                     PlayState::Playing => {
                         started = true;
-                        break;
+                        break reported_position_ms;
                     }
                     PlayState::Stopped if started => return,
                     // Pause, ou lecture pas encore démarrée (résolution /
@@ -369,7 +373,7 @@ fn spawn_paced_levels_forwarder(
                         next_emit += LEVELS_HOLD;
                     }
                 }
-            }
+            };
             // Une première fenêtre tardive (téléchargement, transcode) ne doit
             // pas déclencher un rattrapage en rafale de tout le retard
             // accumulé : un instrument vit au présent. On recale l'horloge.
@@ -3146,24 +3150,14 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
-    /// Some radio servers (Icecast) answer HEAD with 400 Bad Request. A DLNA
-    /// renderer that HEAD-probes the stream URL before playback then refuses to
-    /// play it (Cyrille's Yamaha R-N2000A: the MP3 Icecast stations Radio
-    /// Classique / TSF Jazz stay silent while AAC stations work). Returns false
-    /// ONLY on a confirmed non-success HEAD, so we proxy just those; a transient
-    /// network error stays `true` to avoid needlessly proxying working stations.
-    async fn radio_head_ok(&self, url: &str) -> bool {
-        let probe = url.replacen("https://", "http://", 1);
-        match crate::http::client::shared()
-            .head(&probe)
-            .timeout(std::time::Duration::from_secs(4))
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => true,
-        }
-    }
+    // `radio_head_ok` vivait ici : un HEAD sur la station décidait s'il fallait
+    // la proxifier pour un renderer DLNA. Le sondage a été ABANDONNÉ par
+    // « always proxy Icecast radio to DLNA renderers » (#537) : une station liée
+    // à un renderer est désormais toujours transcodée en WAV, y compris un .mp3
+    // explicite dont le HEAD rend 200 (Cyrille, Yamaha R-N2000A — TSF Jazz
+    // envoyée en direct restait muette). `needs_proxy`, plus bas, ne consulte
+    // donc plus le réseau du tout, et la fonction est restée sans appelant.
+    // Retirée plutôt que rebranchée : la rebrancher rejouerait le défaut.
 
     /// Dereference an M3U/PLS *playlist* URL to its first real http(s) stream.
     ///

@@ -332,9 +332,13 @@ fn pcm_scale(bit_depth: u16) -> f64 {
     }
 }
 
-/// Integrated loudness (LUFS) from already-normalized interleaved samples — the
-/// pure math, shared by tests and (via [`LoudnessAccumulator`]) the streaming
-/// file path.
+/// Integrated loudness (LUFS) from already-normalized interleaved samples.
+///
+/// Enveloppe d'un seul appel autour de [`LoudnessAccumulator`], utilisée par le
+/// seul test d'équivalence « une passe = par morceaux » : le chemin fichier
+/// pilote l'accumulateur lui-même, par segments bornés (#1109). Portée `test`
+/// pour le dire — hors test, plus personne n'appelle par ici.
+#[cfg(test)]
 fn integrated_loudness_from_samples(
     samples: &[f64],
     sample_rate: usize,
