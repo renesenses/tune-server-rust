@@ -104,6 +104,46 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `audio_backend` n'est PAS le réglage de la sortie locale — et cette route
+/// ne doit jamais le laisser passer pour tel (#2265).
+///
+/// Dans cette API, `audio_backend` nomme le backend **réellement ouvert**,
+/// après un éventuel repli ASIO → WASAPI : c'est ce que rendent
+/// `/system/diagnostics`, `/system/profile`, `/zones` et l'instantané
+/// WebSocket. Le RÉGLAGE, lui, s'appelle `local_audio_backend` — c'est le seul
+/// nom que la lecture consulte (`AppState::effective_audio_backend`, qui
+/// interroge la clé `local_audio_backend` et rien d'autre).
+///
+/// Or les deux extrémités de cette route sont ouvertes : `update_config`
+/// persiste ses clés sans liste blanche, et `get_config` renvoie la table
+/// `settings` telle quelle. Une ligne `audio_backend` écrite là voyagerait
+/// donc dans la réponse **comme si elle était le réglage**, alors qu'aucun
+/// chemin de lecture ne la lit.
+///
+/// Elle aurait un lecteur, et c'est ce qui la rend coûteuse : le client web
+/// livré aujourd'hui lit `data.audio_backend ?? data.local_audio_backend` —
+/// **l'ancien nom d'abord**. Une telle ligne lui ferait afficher, et garder
+/// sélectionné, un backend que le serveur n'ouvrira jamais. C'est l'annonce
+/// fantôme que #2053 et #1315 ont déjà coûtée.
+///
+/// D'où les deux gardes, aux deux bouts : on refuse d'en créer une, et on ne
+/// publie pas celle qui existerait déjà. Rien n'est effacé en base — même
+/// discipline que le repli de `local_audio_backend` juste en dessous : on
+/// corrige la RÉPONSE, pas le contenu de la table.
+pub(super) const BACKEND_ACTIF_PAS_UN_REGLAGE: &str = "audio_backend";
+
+/// Le message rendu à qui tente d'écrire `audio_backend` : ce qui se passe,
+/// et quoi faire à la place. Un 400 muet renverrait le client à la devinette.
+pub(super) fn refus_backend_actif() -> String {
+    format!(
+        "'{BACKEND_ACTIF_PAS_UN_REGLAGE}' is not a setting: it reports the backend the local \
+         output actually opened, after any ASIO to WASAPI fallback. Writing it would store a \
+         value that playback never reads. The setting is 'local_audio_backend' — send \
+         {{\"local_audio_backend\": \"...\"}} and pick a value from 'supported_audio_backends' \
+         in GET /system/config."
+    )
+}
+
 pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
@@ -113,6 +153,17 @@ pub(super) async fn get_config(
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
+        // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
+        // n'est le réglage de personne, et la publier ici la ferait passer
+        // pour le réglage auprès du client qui lit ce nom en premier.
+        if k == BACKEND_ACTIF_PAS_UN_REGLAGE {
+            tracing::warn!(
+                cle = BACKEND_ACTIF_PAS_UN_REGLAGE,
+                valeur = %v,
+                "reglage_fantome_non_publie"
+            );
+            continue;
+        }
         if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
             config.insert(k, parsed);
         } else {
@@ -588,6 +639,15 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    // #2265 — refuser d'inscrire le nom du backend ACTIF comme s'il était un
+    // réglage. Aucun repli, aucune réinterprétation vers `local_audio_backend` :
+    // les deux informations sont différentes, et deviner laquelle est demandée
+    // reviendrait à changer la sortie audio sur un malentendu de vocabulaire.
+    // Même discipline que `replaygain_source` plus bas — on refuse en disant
+    // quoi envoyer.
+    if values.contains_key(BACKEND_ACTIF_PAS_UN_REGLAGE) {
+        return Err(AppError::bad_request(refus_backend_actif()));
+    }
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
