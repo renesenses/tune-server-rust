@@ -602,3 +602,59 @@ fn une_liste_vide_ne_peut_pas_prouver_le_contrat_de_ses_elements() {
         .expect_err("une liste vide serait une fausse preuve des champs elementaires");
     assert!(erreur.contains("tableau vide"));
 }
+
+/// `GET /library/tracks/{id}/lyrics` — la seconde dérive de #3002.
+///
+/// La carte exigeait `lyrics`, un champ que le serveur n'a jamais envoyé : il
+/// rend `lines`. L'exigence venait de `api.ts:getTrackLyrics`, dont le type
+/// annonce la forme « historique » `{lyrics, synced, source}` — et **cette
+/// fonction n'a aucun appelant**. Les vrais consommateurs (`NowPlaying`,
+/// `TvView`) passent par `lib/lyrics.ts:fetchTrackLyrics` et lisent
+/// `data.lines`. La carte recopiait donc un type mort, et personne ne s'en
+/// apercevait parce que la route n'était jouée nulle part.
+///
+/// Elle l'est désormais. La piste témoin porte ses paroles dans
+/// `track_metadata`, ce qui emprunte l'étage 2 de la cascade — ni fichier
+/// annexe, ni LRCLIB, donc aucune E/S ni réseau.
+#[tokio::test]
+async fn les_paroles_rendent_les_lignes_annoncees_au_web() {
+    let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let mut piste = tune_core::db::models::Track::new("Chelsea Girl".into());
+    piste.file_path = Some("/music/chelsea-girl.flac".into());
+    let id = pistes.create(&piste).expect("piste temoin");
+
+    let metas =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+    metas
+        .set(id, "lyrics", "Il etait une fois\nune carte qui mentait")
+        .expect("paroles posees dans track_metadata");
+
+    let app = tune_server::routes::router(etat);
+    let payload = get_json(&app, &format!("/api/v1/library/tracks/{id}/lyrics"))
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+
+    respecte_tous_les_contrats(&carte, "GET", "/library/tracks/{}/lyrics", &payload)
+        .unwrap_or_else(|erreur| panic!("{erreur}; payload={payload}"));
+
+    // Et la forme, pas seulement la présence des clés : c'est `lines` que les
+    // deux consommateurs parcourent.
+    assert_eq!(payload["synced"], false, "des paroles non horodatees");
+    assert_eq!(payload["source"], "tag");
+    assert_eq!(
+        payload["lines"]
+            .as_array()
+            .expect("`lines` est le tableau que NowPlaying et TvView parcourent")
+            .len(),
+        2
+    );
+    assert!(
+        payload.get("lyrics").is_none(),
+        "`lyrics` n'existe pas cote serveur : l'exiger etait une dette de carte, \
+         pas un defaut de reponse"
+    );
+}

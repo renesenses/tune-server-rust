@@ -59,6 +59,27 @@ impl JobStatus {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// Le vocabulaire que l'écran web attend dans `state` (#3002).
+    ///
+    /// `api.ts` déclare `state: 'converting' | 'done' | 'error'` et
+    /// `ConverterView.svelte` ne teste que `=== 'done'` et `=== 'error'`.
+    /// `status` garde son vocabulaire d'origine : on **traduit**, on ne
+    /// renomme pas — un consommateur qui lit déjà `status` ne doit rien voir
+    /// bouger.
+    ///
+    /// `cancelled` ne figure pas dans l'union déclarée par le web : l'écran
+    /// arrête son sondage avant, en local. Le rendre quand même est honnête et
+    /// sans conséquence — mieux vaut un état vrai qu'un état plié à une union
+    /// incomplète.
+    fn web_state(&self) -> &'static str {
+        match self {
+            Self::Running => "converting",
+            Self::Completed => "done",
+            Self::Failed => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +95,15 @@ struct ConvertJob {
     current_file: String,
     errors: Vec<JobError>,
     output_dir: PathBuf,
+    /// Octets écrits dans `output_dir`, cumulés au fil des conversions.
+    ///
+    /// Le web affiche « Télécharger (ZIP, 128,4 Mo) » : il lui faut une taille
+    /// AVANT de demander l'archive. La construire à chaque sondage (toutes les
+    /// 1,5 s) serait absurde ; on additionne donc ce qu'on vient d'écrire.
+    /// C'est la taille des fichiers convertis, pas celle du ZIP — pour du FLAC,
+    /// du MP3 ou de l'AAC déjà compressés, `zip` ne gagne quasiment rien, donc
+    /// l'écart se compte en pour mille.
+    output_bytes: u64,
 }
 
 type JobStore = Arc<Mutex<HashMap<String, Arc<Mutex<ConvertJob>>>>>;
@@ -319,6 +349,7 @@ async fn start_job(
         current_file: String::new(),
         errors: Vec::new(),
         output_dir: output_dir.clone(),
+        output_bytes: 0,
     }));
 
     let store = job_store();
@@ -362,6 +393,91 @@ async fn start_job(
 // GET /status/{job_id}
 // ---------------------------------------------------------------------------
 
+/// Taille lisible, telle que le web la recopie : « Télécharger (ZIP, 128.4 MB) ».
+///
+/// Unités décimales (1 kB = 1000 o), celles qu'affichent les explorateurs de
+/// fichiers et les convertisseurs audio. La chaîne est fabriquée ici parce que
+/// le web déclare `download_size?: string` : elle n'est donc PAS traduisible.
+/// D'où des unités internationales plutôt que « Mo », qui jureraient dans
+/// l'interface anglaise.
+fn taille_lisible(octets: u64) -> String {
+    const UNITES: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut valeur = octets as f64;
+    let mut rang = 0;
+    while valeur >= 1000.0 && rang < UNITES.len() - 1 {
+        valeur /= 1000.0;
+        rang += 1;
+    }
+    if rang == 0 {
+        format!("{octets} B")
+    } else {
+        format!("{valeur:.1} {}", UNITES[rang])
+    }
+}
+
+/// Le corps de `GET /converter/status/{id}`, dans la forme que l'écran
+/// Convertisseur lit réellement (#3002).
+///
+/// Le serveur ne rendait que `status`, `total`, `completed`, `current_file` et
+/// `errors`. `ConverterView.svelte` lit `state`, `progress`, `converted`,
+/// `download_size` et `error` : **deux champs sur six se rencontraient**.
+/// Chaque lecture portant un `??`, rien n'échouait — et c'est précisément ce
+/// qui rendait le défaut invisible : la barre restait à 0 %, le compteur à
+/// 0/N, `state === 'done'` n'était jamais vrai, donc le bouton de
+/// téléchargement ne s'affichait **jamais** alors que l'archive était prête.
+/// Une conversion réussie était indiscernable d'une conversion bloquée.
+///
+/// Les cinq champs historiques sont **conservés**. On ajoute, on ne renomme
+/// pas : `converted` double `completed` et `progress` se déduit de
+/// `completed/total`, mais retirer l'ancienne forme casserait tout
+/// consommateur qui la lit déjà. Le doublon est le prix de la compatibilité.
+///
+/// Fonction pure et séparée du gestionnaire pour être éprouvable sans routeur,
+/// sans licence premium et sans fichier audio — voir les tests en fin de
+/// fichier, qui confrontent ce corps à `docs/contrat-web.json`.
+fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
+    let errors: Vec<Value> = job
+        .errors
+        .iter()
+        .map(|e| json!({"file": e.file, "message": e.message}))
+        .collect();
+
+    // `start_job` refuse une liste de sources vide (400), donc `total >= 1` en
+    // pratique ; la garde évite quand même une division par zéro.
+    let progress = if job.total == 0 {
+        0.0
+    } else {
+        (job.completed as f64 / job.total as f64 * 100.0).clamp(0.0, 100.0)
+    };
+
+    // Le web fait `conversionError = status.error ?? <message par défaut>` :
+    // `null` tant que rien n'a échoué lui laisse donc son propre libellé,
+    // traduit. On ne parle que lorsqu'on a quelque chose à dire.
+    let error = match (&job.status, job.errors.first()) {
+        (JobStatus::Failed, Some(premier)) => {
+            Some(format!("{}: {}", premier.file, premier.message))
+        }
+        (JobStatus::Failed, None) => Some("conversion failed".to_string()),
+        _ => None,
+    };
+
+    json!({
+        "job_id": job_id,
+        // Forme historique — conservée telle quelle.
+        "status": job.status.as_str(),
+        "total": job.total,
+        "completed": job.completed,
+        "current_file": job.current_file,
+        "errors": errors,
+        // Forme lue par l'écran web (#3002).
+        "state": job.status.web_state(),
+        "progress": progress,
+        "converted": job.completed,
+        "download_size": taille_lisible(job.output_bytes),
+        "error": error,
+    })
+}
+
 async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, AppError> {
     let store = job_store();
     let map = store.lock().await;
@@ -371,20 +487,7 @@ async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
         .clone();
     let job = job_arc.lock().await;
 
-    let errors: Vec<Value> = job
-        .errors
-        .iter()
-        .map(|e| json!({"file": e.file, "message": e.message}))
-        .collect();
-
-    Ok(Json(json!({
-        "job_id": job_id,
-        "status": job.status.as_str(),
-        "total": job.total,
-        "completed": job.completed,
-        "current_file": job.current_file,
-        "errors": errors,
-    })))
+    Ok(Json(payload_statut(&job_id, &job)))
 }
 
 // ---------------------------------------------------------------------------
@@ -593,8 +696,18 @@ async fn run_conversion(
                     );
                 }
 
+                // Taille du fichier qu'on vient d'écrire : elle alimente le
+                // « (ZIP, …) » du bouton de téléchargement (#3002). Un
+                // `metadata` illisible ne doit rien casser — on compte 0 et on
+                // continue, la conversion, elle, a réussi.
+                let ecrits = tokio::fs::metadata(&out_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
                 let mut j = job.lock().await;
                 j.completed += 1;
+                j.output_bytes += ecrits;
             }
             Err(e) => {
                 error!(
@@ -1533,6 +1646,148 @@ mod tests {
             "diagnostic ffmpeg conservé"
         );
         assert_eq!(payload["delivery"], delivery_descriptor());
+    }
+
+    /// La carte web commitée, la même que lit `tests/web_response_contracts.rs`.
+    ///
+    /// `GET /converter/status/{id}` ne peut PAS être joué par ce banc-là : la
+    /// route amont exige une licence premium et de vrais fichiers audio. On
+    /// confronte donc le corps à la carte ici, où `payload_statut` est
+    /// atteignable sans routeur — même source de vérité, autre porte d'entrée.
+    const CARTE_WEB: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/contrat-web.json"
+    ));
+
+    fn champs_exiges_par_le_web() -> Vec<String> {
+        let carte: Value = serde_json::from_str(CARTE_WEB).expect("carte contrat web lisible");
+        let contrat = carte["routes"]
+            .as_array()
+            .expect("la carte porte un tableau `routes`")
+            .iter()
+            .find(|c| c["route"] == "/converter/status/{}" && c["methode"] == "GET")
+            .expect(
+                "GET /converter/status/{} doit figurer dans docs/contrat-web.json — \
+                 sans entrée, aucun contrôle ne peut voir la dérive (#3002)",
+            );
+        contrat["champs_obligatoires"]
+            .as_array()
+            .expect("champs_obligatoires est un tableau")
+            .iter()
+            .map(|c| c.as_str().expect("nom de champ textuel").to_string())
+            .collect()
+    }
+
+    fn job_temoin(status: JobStatus, completed: usize) -> ConvertJob {
+        ConvertJob {
+            status,
+            total: 4,
+            completed,
+            current_file: "02 - Chelsea Girl.flac".into(),
+            errors: Vec::new(),
+            output_dir: PathBuf::from("/tmp/tune-convert/temoin"),
+            output_bytes: 128_400_000,
+        }
+    }
+
+    #[test]
+    fn le_statut_porte_tous_les_champs_que_lecran_convertisseur_lit() {
+        // #3002 : le serveur rendait `status`, `total`, `completed`,
+        // `current_file`, `errors` ; `ConverterView.svelte` lit `state`,
+        // `progress`, `converted`, `download_size` et `error`. Deux champs sur
+        // six se rencontraient, chaque lecture portait un `??`, donc RIEN ne
+        // cassait — la barre restait à 0 %, le compteur à 0/N, et le bouton de
+        // téléchargement ne s'affichait jamais.
+        let exiges = champs_exiges_par_le_web();
+        assert!(
+            exiges.len() >= 11,
+            "le contrat s'est appauvri : {exiges:?} — il doit couvrir la forme \
+             historique ET celle que lit le web"
+        );
+
+        for etat in [
+            JobStatus::Running,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ] {
+            let job = job_temoin(etat.clone(), 2);
+            let payload = payload_statut("job-temoin", &job);
+            let objet = payload.as_object().expect("corps JSON objet");
+            for champ in &exiges {
+                assert!(
+                    objet.contains_key(champ),
+                    "état {} : champ obligatoire absent du corps : {champ} — \
+                     corps={payload}",
+                    etat.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn une_conversion_terminee_ne_ressemble_plus_a_une_conversion_bloquee() {
+        // Le cœur du défaut : avant, `state`, `progress` et `converted`
+        // valaient toujours undefined/0/0, donc une réussite et un blocage
+        // rendaient exactement le même écran.
+        let en_cours = payload_statut("j", &job_temoin(JobStatus::Running, 1));
+        assert_eq!(en_cours["state"], "converting");
+        assert_eq!(en_cours["progress"], 25.0);
+        assert_eq!(en_cours["converted"], 1);
+        assert!(
+            en_cours["error"].is_null(),
+            "rien n'a échoué : le web doit garder son propre libellé traduit"
+        );
+
+        let fini = payload_statut("j", &job_temoin(JobStatus::Completed, 4));
+        assert_eq!(
+            fini["state"], "done",
+            "sans `done`, le bouton de téléchargement ne s'affiche jamais"
+        );
+        assert_eq!(fini["progress"], 100.0);
+        assert_eq!(fini["converted"], 4);
+        assert_eq!(fini["download_size"], "128.4 MB");
+
+        // Les cinq champs historiques ne bougent pas : on ajoute, on ne
+        // renomme pas. Un consommateur qui lit `status`/`completed` doit
+        // continuer de fonctionner à l'identique.
+        assert_eq!(fini["status"], "completed");
+        assert_eq!(fini["completed"], 4);
+        assert!(fini["errors"].is_array());
+    }
+
+    #[test]
+    fn un_echec_est_annonce_comme_tel_et_porte_son_motif() {
+        let mut job = job_temoin(JobStatus::Failed, 4);
+        job.errors.push(JobError {
+            file: "/music/x.wma".into(),
+            message: "unsupported input".into(),
+        });
+        let payload = payload_statut("j", &job);
+        assert_eq!(
+            payload["state"], "error",
+            "`state === 'error'` est la seule voie par laquelle l'écran sort \
+             du sondage : sans lui, un échec tourne indéfiniment"
+        );
+        assert_eq!(payload["error"], "/music/x.wma: unsupported input");
+    }
+
+    #[test]
+    fn la_taille_lisible_suit_les_unites_que_le_web_recopie() {
+        assert_eq!(taille_lisible(0), "0 B");
+        assert_eq!(taille_lisible(999), "999 B");
+        assert_eq!(taille_lisible(1_000), "1.0 kB");
+        assert_eq!(taille_lisible(128_400_000), "128.4 MB");
+        assert_eq!(taille_lisible(2_500_000_000), "2.5 GB");
+    }
+
+    #[test]
+    fn un_travail_sans_source_ne_divise_pas_par_zero() {
+        // `start_job` refuse une liste vide (400), mais le corps ne doit pas
+        // dépendre de cette garde-là pour rester calculable.
+        let mut job = job_temoin(JobStatus::Completed, 0);
+        job.total = 0;
+        assert_eq!(payload_statut("j", &job)["progress"], 0.0);
     }
 
     #[test]
