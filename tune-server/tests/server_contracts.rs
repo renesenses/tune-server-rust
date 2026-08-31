@@ -35,6 +35,8 @@ mod explorateur_dossiers;
 mod facettes_multivaleurs;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "generateur_playlists_sans_ia.rs"]
+mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
 mod http_client_seam;
 #[path = "integration.rs"]

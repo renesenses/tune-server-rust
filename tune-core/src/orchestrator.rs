@@ -7393,6 +7393,10 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // Rampe anti-« ploc » à la pause / reprise / arrêt (#1590),
+                    // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
+                    // les sorties qui restent nues et pourquoi.
+                    local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
                 }
                 drop(output);
             }
@@ -8157,6 +8161,11 @@ impl PlaybackOrchestrator {
             // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+            // Même raison pour la rampe (#1590) : `zone_soft_mute_ms` rend 0 en
+            // PURE, donc une zone qui ENTRE en PURE doit la perdre dans le même
+            // geste, et une zone qui en sort doit la retrouver — sans attendre
+            // la piste suivante.
+            local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -8404,6 +8413,55 @@ impl PlaybackOrchestrator {
             .flatten()
             .as_deref()
             == Some("true")
+    }
+
+    /// Durée de la rampe anti-« ploc » à la pause, à la reprise et à l'arrêt
+    /// pour cette zone, en millisecondes (#1590).
+    ///
+    /// Demandé par Levente : « the app just stops immediately when pushing
+    /// Pause/Stop ». Ce n'est pas un fondu artistique — c'est le retrait du clic
+    /// que produit une marche de pleine amplitude à zéro en un échantillon.
+    ///
+    /// **Ne concerne que la sortie LOCALE.** Sur un renderer réseau — DLNA,
+    /// AirPlay, BluOS, Chromecast, OpenHome, Squeezebox, HQPlayer — c'est
+    /// l'appareil qui décode et qui rend : nous n'avons pas la main sur ses
+    /// échantillons. Le seul levier serait son propre volume, avec sa latence
+    /// et sa granularité à lui ; le résultat serait très inégal d'un appareil à
+    /// l'autre, parfois pire que la coupure. Ces sorties restent donc
+    /// délibérément nues, et la sortie locale exclusive aussi (voir plus bas).
+    ///
+    /// `0` en mode PURE : la rampe est une modification du signal, elle tombe
+    /// avec l'égaliseur et le repli mono. Ce n'est pas la seule garde — la
+    /// sortie redésarme d'elle-même sur un flux DoP et en mode exclusif, que
+    /// l'orchestrateur ait dit ce qu'il voulait ou non
+    /// ([`crate::audio::soft_mute::armed_ms`]).
+    ///
+    /// Réglable par zone via la clé `zone_<id>_soft_mute_ms` du magasin de
+    /// réglages — pas de migration, comme `zone_<id>_mono_downmix`. La valeur
+    /// est bornée par [`SOFT_MUTE_MAX_MS`](crate::audio::soft_mute::SOFT_MUTE_MAX_MS) :
+    /// au-delà, l'appui sur Pause cesse d'être ressenti comme une pause.
+    pub fn zone_soft_mute_ms(&self, zone_id: i64) -> u32 {
+        Self::zone_soft_mute_ms_with(&self.db, zone_id)
+    }
+
+    /// Même règle, lisible sans orchestrateur — jumelle de
+    /// [`Self::zone_mono_downmix_with`].
+    pub fn zone_soft_mute_ms_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> u32 {
+        use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
+        // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
+        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+            return 0;
+        }
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get(&format!("zone_{zone_id}_soft_mute_ms"))
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(SOFT_MUTE_DEFAULT_MS)
+            .min(SOFT_MUTE_MAX_MS)
     }
 
     /// Réappliquer le repli mono d'une zone à la sortie locale qui joue, sans
