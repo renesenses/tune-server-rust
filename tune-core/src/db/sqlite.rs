@@ -468,7 +468,17 @@ CREATE TABLE IF NOT EXISTS zones (
     name TEXT NOT NULL,
     output_type TEXT,
     output_device_id TEXT,
-    volume INTEGER DEFAULT 50,
+    -- #2886 — REAL et non INTEGER : arrondir le volume au pour-cent coute
+    -- jusqu'a 3 dB vers -37 dB et, sous 0,005 lineaire (-46,0205999133 dB),
+    -- tombe a 0 — la zone se rallumait MUETTE au redemarrage.
+    -- Echelle inchangee (0..100), seule la resolution s'elargit : aucune
+    -- ligne existante n'a besoin d'etre convertie. SQLite etant a typage
+    -- dynamique, une base deja creee avec `INTEGER` accepte deja les
+    -- decimales (affinite INTEGER = conversion SEULEMENT si elle est sans
+    -- perte) : c'est pourquoi il n'y a pas de migration SQLite ici, et
+    -- `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer` le
+    -- prouve sur une table declaree a l'ancienne.
+    volume REAL DEFAULT 50,
     muted INTEGER DEFAULT 0,
     online INTEGER DEFAULT 1,
     gapless_enabled INTEGER DEFAULT 1,

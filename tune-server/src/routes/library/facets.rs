@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
@@ -156,10 +157,13 @@ fn build_facet_conditions(
     if exclude != "genre" && !sel.genres.is_empty() {
         let n = sel.genres.len();
         let in_part = ph.in_list_ci("t.genre", n).expect("liste non vide");
-        let like_part = (0..n)
-            .map(|_| format!("t.genres LIKE {}", ph.take()))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        // ⚠️ `or_like_ci` des DEUX côtés, comme le `in_list_ci` juste au-dessus
+        // et comme les facettes sœurs (label, compositeur). Un `LIKE` nu est
+        // insensible à la casse en SQLite mais SENSIBLE en PostgreSQL : le
+        // même « JAZZ » dans `t.genres` était trouvé sur l'installation par
+        // défaut et perdu sur PostgreSQL, alors que la colonne `t.genre`, elle,
+        // était comparée sans la casse des deux côtés (#1821).
+        let like_part = ph.or_like_ci("t.genres", n).expect("liste non vide");
         conds.push(format!("({in_part} OR {like_part})"));
         for g in &sel.genres {
             params.push(SqlValue::Text(g.clone()));
@@ -462,7 +466,7 @@ pub(super) async fn library_facets(
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
-            "genre" => column_facet(&state, "genre", limit, &conds, &params),
+            "genre" => genre_facet(&state, limit, &conds, &params),
             "label" => column_facet(&state, "label", limit, &conds, &params),
             // Le classique se navigue par compositeur avant de se naviguer par
             // artiste : colonne `tracks` directe, donc même facette de colonne.
@@ -530,7 +534,7 @@ fn original_year_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -609,7 +613,7 @@ fn playlist_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -677,7 +681,7 @@ fn column_facet(
     let brut: Vec<(String, i64)> = state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -690,6 +694,86 @@ fn column_facet(
         })
         .collect();
     fusionner_les_casses(brut)
+}
+
+/// Rail « Genre » : une entrée par GENRE, pas par chaîne brute de colonne.
+///
+/// `column_facet` groupe sur la seule colonne `t.genre`. Or le filtre jumeau
+/// (`build_facet_conditions` ici, `TrackRepo::list_filtered` côté liste) retient
+/// une piste si `LOWER(t.genre) = LOWER(?)` **OU** si le tableau JSON
+/// `t.genres` contient la valeur. Le rail comptait donc STRICTEMENT MOINS que
+/// ce que son propre filtre sait trouver : tout genre SECONDAIRE restait
+/// invisible, même coché il aurait rendu des pistes.
+///
+/// C'est ce qui rendait le classement dépendant du logiciel de gravure (#1821,
+/// DEvir) : un disque gravé avec deux champs `GENRE` (Vorbis) ou deux atomes
+/// `©gen` (MP4) n'apparaissait que sous son premier genre, tandis que le même
+/// disque acheté ailleurs, avec « Jazz; Fusion » dans un unique `TCON`,
+/// apparaissait sous les deux.
+///
+/// ⚠️ On compte exactement l'UNION que le filtre teste — `{t.genre}` ∪ les
+/// éléments de `t.genres` — et RIEN de plus. En particulier on ne redécoupe
+/// PAS `t.genre` : le filtre le compare en entier, donc annoncer « Jazz » pour
+/// une ligne dont la colonne vaut « Jazz; Fusion » rendrait un compteur qui
+/// ment, précisément le défaut de #1864.
+fn genre_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    // Pas de LIMIT en SQL : l'éclatement des valeurs multiples change les
+    // effectifs, donc le classement. La troncature se fait après le compte.
+    let sql = format!(
+        "SELECT t.genre, t.genres, COUNT(*) AS n FROM tracks t \
+         WHERE ((t.genre IS NOT NULL AND t.genre <> '') \
+         OR (t.genres IS NOT NULL AND t.genres <> '')){extra} \
+         GROUP BY t.genre, t.genres ORDER BY n DESC"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    let mut brut: Vec<(String, i64)> = Vec::new();
+    for row in state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+    {
+        let mut it = row.into_iter();
+        let colonne = it.next().and_then(|v| v.as_string());
+        let tableau = it.next().and_then(|v| v.as_string());
+        let n = it.next().and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let mut valeurs: Vec<String> = Vec::new();
+        if let Some(json) = tableau.as_deref() {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
+                valeurs.extend(arr.into_iter().filter(|g| !g.trim().is_empty()));
+            }
+        }
+        if let Some(g) = colonne.as_deref().filter(|g| !g.trim().is_empty()) {
+            valeurs.push(g.to_string());
+        }
+        // Une ligne ne compte qu'une fois par genre, même si la colonne
+        // répète le premier élément du tableau (le cas courant).
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for v in valeurs {
+            if vus.insert(v.to_lowercase()) {
+                brut.push((v, n));
+            }
+        }
+    }
+    let mut sortie = fusionner_les_casses(brut);
+    sortie.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some(n) = limit {
+        sortie.truncate(n.max(0) as usize);
+    }
+    sortie
 }
 
 /// Regroupe les orthographes qui ne diffèrent que par la casse.
@@ -756,7 +840,7 @@ fn rating_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -845,7 +929,7 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
             "SELECT name, rules, match_mode FROM smart_collections ORDER BY name",
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     for row in &rows {
         let name = row.first().and_then(|v| v.as_string()).unwrap_or_default();
         if name.is_empty() || manual_names.contains(&name.to_lowercase()) {
@@ -988,7 +1072,7 @@ fn artist_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -1030,7 +1114,7 @@ fn kv_facet(
     state
         .backend
         .query_many(&sql, &bound)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let mut it = row.into_iter();
@@ -1151,7 +1235,7 @@ mod tests {
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
         );
         assert_eq!(conds[1], "t.year = $5");
         assert_eq!(
@@ -1287,7 +1371,7 @@ mod tests {
         // pas laisser de trou dans la liaison.
         assert_eq!(
             conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR t.genres LIKE $3 OR t.genres LIKE $4)"
+            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
         );
         assert_eq!(params.len(), 4);
 
@@ -1307,7 +1391,7 @@ mod tests {
         assert_eq!(
             conds,
             vec![
-                "(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)".to_string(),
+                "(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))".to_string(),
                 "t.year = $3".to_string(),
                 "LOWER(t.format) = LOWER($4)".to_string(),
                 "LOWER(t.label) LIKE LOWER($5)".to_string(),
@@ -1363,7 +1447,7 @@ mod tests {
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(
             conds,
-            vec!["(LOWER(t.genre) = LOWER($1) OR t.genres LIKE $2)"]
+            vec!["(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))"]
         );
         assert_eq!(texte(&params[0]), "Jazz, Blues");
     }

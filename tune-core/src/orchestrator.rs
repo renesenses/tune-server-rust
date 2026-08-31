@@ -116,9 +116,26 @@ async fn transcode_source_to_file(
     let mut pcm_bytes = decoded.pcm_bytes();
     let mut actual_bd = decoded.bit_depth;
 
-    // 1a. Reduce bit depth to the negotiated target when the source is deeper
-    // (e.g. 24-bit ALAC/FLAC → 16-bit LPCM for a 16-bit-only DLNA renderer).
-    if target_bd < actual_bd {
+    // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
+    //
+    // Cette étape ne descendait que (`target_bd < actual_bd`). Une cible plus
+    // PROFONDE que la source était donc ignorée en silence : le fichier écrit
+    // gardait la largeur de la source, tandis que `StreamInfo` — et par lui le
+    // `<res bitsPerSample>` du DIDL, puis le choix du profil `DLNA.ORG_PN` —
+    // annonçait la cible. Un renderer qui suit ce qu'on lui déclare lit alors
+    // des échantillons de deux octets à un pas de trois : la famille #1137,
+    // celle qui rend du silence ou du bruit sans jamais rien dire. C'est ce que
+    // fait `dlna_wav24` dès que la base annonce la source plus profonde qu'elle
+    // n'est — le réglage « Forcer le WAV » de Yves (#1437).
+    //
+    // `container_bit_depth` borne d'abord la cible à ce que la chaîne sait
+    // ÉCRIRE : 16, 24 ou 32. Une source de 20 bits — légale en ALAC, en FLAC,
+    // en AIFF et en WavPack — donnait `out_bd = 20` (`cap_output_bit_depth` ne
+    // borne qu'à 16..24), et le transcodage échouait APRÈS le décodage complet :
+    // `encode_wav` rend « unsupported bit depth: 20 », `pcm_to_i32` la même chose
+    // pour le FLAC. La piste ne démarrait jamais.
+    let target_bd = crate::audio::decode::container_bit_depth(target_bd);
+    if target_bd != actual_bd {
         pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, target_bd);
         actual_bd = target_bd;
     }
@@ -180,6 +197,53 @@ use crate::outputs::{OutputCommand, OutputCommandError, OutputCommandResult};
 use crate::playback::{NowPlaying, PlayState, PlaybackManager};
 use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
+
+/// Ce que l'auditeur avait demandé, et où il en était — les trois champs que
+/// « Continuer l'écoute » a besoin de retrouver pour ROUVRIR cet objet à la
+/// bonne place (#2441, FabienM fil 1557).
+///
+/// Regroupés plutôt qu'ajoutés un à un aux douze paramètres de `record_listen`
+/// : ils ne se lisent qu'ensemble, et le rang seul ne veut rien dire sans
+/// l'objet auquel il se rapporte.
+///
+/// C'est délibérément « objet courant + position », PAS l'instantané de la
+/// file : pour un artiste ou un label, la file est bâtie par une requête qui
+/// change d'un jour à l'autre — « conserver l'ordre » n'y aurait aucun sens —
+/// et écrire la file entière à chaque écoute coûterait un facteur dix sur le
+/// volume de `listen_history`, pour alimenter une section d'accueil.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContexteEcoute<'a> {
+    /// `track`, `album`, `playlist`, `artist` ou `label`. `None` quand
+    /// l'appelant n'a rien déclaré — une absence, jamais une déduction.
+    pub nature: Option<&'a str>,
+    /// L'identifiant de cet objet, dans le référentiel de sa source.
+    pub id: Option<&'a str>,
+    /// Le rang de la piste dans cet objet. `None` en lecture ALÉATOIRE : voir
+    /// `rang_a_retenir`.
+    pub rang: Option<i64>,
+}
+
+/// Le rang qu'il faut écrire dans `listen_history`, sachant l'état de la zone.
+///
+/// Toute la subtilité est le tirage aléatoire. En lecture séquentielle, le
+/// rang est ce qui permet de reprendre la playlist à la piste 7. En lecture
+/// aléatoire, il ne désigne plus rien de reproductible : la permutation
+/// (`shuffle_order`) est régénérée à chaque activation, donc « position 7 »
+/// dans le tirage d'hier tombera sur une autre piste demain. L'arbitrage rendu
+/// sur #2441 est de RE-TIRER plutôt que de faire semblant de rejouer le même
+/// tirage — ce que cette fonction inscrit à l'écriture, faute de quoi il
+/// faudrait redevenir l'état « aléatoire » de la zone au moment où l'accueil
+/// s'affiche, ce qui n'existe plus.
+///
+/// Un `None` en base se relit donc « rouvre au début », que ce soit parce
+/// qu'on re-tire ou parce que la ligne est antérieure à la migration 94.
+pub fn rang_a_retenir(shuffle: bool, queue_position: i64) -> Option<i64> {
+    if shuffle || queue_position < 0 {
+        None
+    } else {
+        Some(queue_position)
+    }
+}
 
 /// Le forçage WAV d'une zone s'applique-t-il à CETTE source ?
 ///
@@ -409,6 +473,22 @@ fn spawn_paced_levels_forwarder(
                     // servi — elle tombe sous 2048 sur une fenêtre courte.
                     "sample_rate": raw.sample_rate,
                     "spectrum_fft_size": lvl.spectrum_fft_size,
+                    // Trames de signal RÉEL analysées, et résolution qui en
+                    // découle — champs ADDITIFS (#2866). `spectrum_fft_size`
+                    // seul MENTAIT sur la finesse : à 44,1 kHz une fenêtre de
+                    // 1764 trames est zéro-paddée à 2048, ce qui resserre les
+                    // raies à 21,5 Hz sans rien apprendre de plus que les
+                    // 25,0 Hz que porte le signal. Un client qui gradue son
+                    // axe doit lire `spectrum_resolution_hz`.
+                    "spectrum_frames": lvl.spectrum_frames,
+                    "spectrum_resolution_hz": lvl.spectrum_resolution_hz,
+                    // Bande par bande : l'analyse la sépare-t-elle de ses
+                    // voisines ? Les bandes du grave sont plus étroites que la
+                    // résolution — 20,0 à 24,8 Hz pour la première, soit 4,8 Hz
+                    // de large contre 25 Hz de résolution. Elles existent, mais
+                    // elles recopient la raie de leur voisine : un client
+                    // honnête ne leur pose pas de repère propre.
+                    "spectrum_resolved": &*lvl.spectrum_resolved,
                 }),
             );
             next_emit += window;
@@ -1037,15 +1117,140 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// `dsd_lpcm_stream` toggle on: the streaming path already advertises an exact
 /// Content-Length (`StreamInfo::wav_content_length`), so blocking to /tmp is
 /// pointless and, on DSD256/512, fatal (the ~decode exceeds the 120s temp-file
-/// timeout → the renderer plays silence). Kept a pure function so the decision
-/// matrix is unit-testable without an orchestrator.
+/// timeout → the renderer plays silence).
+///
+/// `dsp_active` PRIME sur tout le reste. Le bras progressif appelle
+/// `decode_to_pcm_streaming_seeked`, qui ne reçoit ni égaliseur, ni convolveur,
+/// ni facteur ReplayGain : seul `transcode_source_to_file` les applique. Une
+/// zone dont un traitement est actif doit donc repasser par le fichier, sans
+/// quoi le traitement est perdu EN SILENCE — famille #1216, déjà corrigée pour
+/// le passthrough réseau, le navigateur et les sorties PULL.
+///
+/// Kept a pure function so the decision matrix is unit-testable without an
+/// orchestrator.
 fn use_file_transcode_for(
     is_network: bool,
     target_is_wav: bool,
     dlna_needs_wav: bool,
     dsd_lpcm_streams: bool,
+    dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams))
+    is_network && (!target_is_wav || (dlna_needs_wav && !dsd_lpcm_streams)) || dsp_active
+}
+
+/// Chaîne DSP d'une zone appliquée au PCM d'un bras STREAMING (Qobuz, Tidal,
+/// YouTube).
+///
+/// `resolve_streaming_url` n'appelle JAMAIS `transcode_source_to_file` : chacun
+/// de ses bras décode et ré-encode chez lui. Les trois étages n'y étaient donc
+/// appliqués nulle part — sauf l'égaliseur, sur le seul bras DASH, et encore
+/// sans le convolveur ni le ReplayGain (#2863). Ce porteur les regroupe dans
+/// l'ORDRE canonique de `transcode_source_to_file` (1b ReplayGain, 1c
+/// égaliseur, 1d convolveur FIR), pour qu'un bras ne puisse plus en oublier un.
+///
+/// Famille #1216 / #1168 / #1653 / #2950 : « un chemin corrigé, les autres nus ».
+#[derive(Default)]
+struct StreamingDsp {
+    replaygain: Option<f64>,
+    eq: Option<crate::audio::eq::EqProcessor>,
+    convolver: Option<crate::audio::convolver::Convolver>,
+}
+
+impl StreamingDsp {
+    /// Vrai dès qu'un étage est réellement actif. En mode PURE (audiophile) les
+    /// trois chargeurs rendent `None`, donc `false` — le flux reste intact.
+    fn is_active(&self) -> bool {
+        self.replaygain.is_some() || self.eq.is_some() || self.convolver.is_some()
+    }
+
+    /// Applique les trois étages EN PLACE.
+    ///
+    /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
+    /// anti-régression de l'immense majorité des zones, qui doivent continuer à
+    /// entendre exactement les mêmes échantillons qu'avant ce correctif.
+    fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        if let Some(factor) = self.replaygain {
+            crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
+        }
+        if let Some(eq) = self.eq.as_mut() {
+            eq.process_pcm(pcm, bit_depth);
+        }
+        if let Some(conv) = self.convolver.as_mut() {
+            conv.process_pcm(pcm, bit_depth);
+        }
+    }
+}
+
+/// Le bras streaming HTTPS doit-il PRÉ-TRANSCODER au lieu de servir les octets
+/// du CDN verbatim ?
+///
+/// Deux raisons, et la seconde manquait : le renderer ne sait pas lire le MIME
+/// amont (Denon, Marantz, Revox — pas d'`audio/flac` dans leur Sink), OU un
+/// traitement de zone doit entrer dans le signal. Une session proxy ne décode
+/// rien : égaliseur, convolveur et ReplayGain y sont perdus EN SILENCE. C'est
+/// le bras que ni #1168 (navigateur), ni #1653 (sorties PULL), ni #2950 (bras
+/// progressif de `play_inner`) n'atteignaient — aucun ne passe par ici.
+///
+/// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
+/// `use_file_transcode_for`.
+fn streaming_needs_pretranscode(renderer_supports_mime: bool, dsp_active: bool) -> bool {
+    !renderer_supports_mime || dsp_active
+}
+
+/// Format d'encodage du pré-transcodage streaming.
+///
+/// WAV/LPCM quand le renderer a REFUSÉ le MIME amont : c'est le profil
+/// `DLNA.ORG_PN=LPCM`, 16 bits seulement, d'où le plafond historique (#1137,
+/// Ruark R3 / LHC-62 muets en 24 bits sous ce profil).
+///
+/// FLAC quand il l'accepte et que SEUL le traitement impose le pré-transcodage :
+/// le plafond 16 bits n'a alors aucune raison d'être, et l'appliquer
+/// dégraderait un Hi-Res 24 bits pour un simple égaliseur. C'est le même
+/// arbitrage que le bras DASH, qui encode déjà en FLAC pleine profondeur quand
+/// le renderer sait le lire.
+fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
+    if renderer_supports_mime {
+        "flac"
+    } else {
+        "wav"
+    }
+}
+
+/// Insère la chaîne DSP entre le décodeur progressif et la session HTTP.
+///
+/// Le bras AAC→WAV (Tidal AAC, YouTube Opus vers un renderer DLNA) pousse le
+/// PCM décodé chunk par chunk dans un canal : aucun point de ce bras ne voit la
+/// piste entière, donc le traitement doit s'appliquer au fil de l'eau. Les
+/// trois étages sont à ÉTAT (biquads de l'égaliseur, recouvrement du
+/// convolveur), ce qui rend le découpage transparent — c'est déjà ainsi que la
+/// radio applique son égaliseur (#2063). Le relais préserve donc le démarrage
+/// immédiat conquis en 0.9.106 : rien n'est bufferisé en plus.
+///
+/// ⚠️ `skip_header` : `decode_to_pcm_streaming_inner` émet l'en-tête WAV comme
+/// PREMIER chunk, seul, avant le moindre octet de PCM (marqueur de journal
+/// `streaming_decode_wav_header_sent`). Le passer dans l'égaliseur reviendrait
+/// à filtrer les lettres « RIFF » — en-tête corrompu, donc bruit ou silence.
+fn spawn_streaming_dsp_relay(
+    mut dsp: StreamingDsp,
+    bit_depth: u16,
+    skip_header: bool,
+    downstream: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    tokio::spawn(async move {
+        let mut header_pending = skip_header;
+        while let Some(mut chunk) = up_rx.recv().await {
+            if header_pending {
+                header_pending = false;
+            } else {
+                dsp.process(&mut chunk, bit_depth);
+            }
+            if downstream.send(chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+    up_tx
 }
 
 /// Is `output_type` (from [`PlaybackOrchestrator::output_type_of`]) one of the
@@ -2447,6 +2652,10 @@ impl PlaybackOrchestrator {
             // sans y toucher.
             let etat = self.playback.get_state(req.zone_id).await;
             let session_profile_id = etat.session_profile_id;
+            // Le rang vient de la file de la zone, PAS du contexte : c'est la
+            // position reellement atteinte, avance automatique comprise. En
+            // aleatoire il reste vide — on re-tirera (#2441).
+            let rang = rang_a_retenir(etat.shuffle, etat.queue_position);
             let context = (etat.session_context_type, etat.session_context_id);
             self.record_listen(
                 &resolved.title,
@@ -2465,8 +2674,11 @@ impl PlaybackOrchestrator {
                 req.zone_id,
                 cover_path.as_deref(),
                 session_profile_id,
-                context.0.as_deref(),
-                context.1.as_deref(),
+                ContexteEcoute {
+                    nature: context.0.as_deref(),
+                    id: context.1.as_deref(),
+                    rang,
+                },
             );
         }
 
@@ -4227,6 +4439,17 @@ impl PlaybackOrchestrator {
             } else {
                 cap_output_bit_depth(bit_depth)
             };
+            // La profondeur ANNONCÉE doit être une profondeur QU'ON SAIT ÉCRIRE.
+            //
+            // `out_bd` part dans `StreamInfo`, donc dans le `<res bitsPerSample>`
+            // du DIDL et dans le choix du profil `DLNA.ORG_PN` : c'est le contrat
+            // passé au renderer. Or deux branches le laissent sortir de
+            // {16, 24, 32} — `cap_output_bit_depth` ne borne qu'à 16..24, et
+            // `dlna_wav24` prend `bit_depth_wire.min(24)`. Une source de 20 bits,
+            // légale en ALAC comme en FLAC, annonçait donc 20 bits, que rien en
+            // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
+            // au décodage : aucun bit perdu (#1437).
+            let out_bd = crate::audio::decode::container_bit_depth(out_bd);
             let out_mime = if oaat_needs_wav || local_needs_wav {
                 "audio/wav".to_string()
             } else {
@@ -4284,14 +4507,31 @@ impl PlaybackOrchestrator {
                 target_format_str == "wav",
                 dlna_needs_wav,
                 dsd_lpcm_streams,
-            )
-                // Browser zone with an active EQ: the streaming pipe does NOT
-                // run the EqProcessor (only transcode_source_to_file does), so
-                // the "forced" transcode served EQ-less audio — measured on
-                // .18: EQ'd WAV capture was byte-identical to the decoded
-                // source. Route through the temp-file path, which also gives
-                // <audio> the Content-Length + Range it wants (#1168).
-                || (is_browser_output && eq_forces_transcode);
+                // Une zone dont un TRAITEMENT est actif doit l'entendre : le
+                // bras progressif appelle `decode_to_pcm_streaming_seeked`, qui
+                // ne reçoit ni EqProcessor, ni convolveur, ni facteur
+                // ReplayGain — seul `transcode_source_to_file` les applique
+                // (voir les points 1a/1b de cette fonction). Le « transcodage
+                // forcé » servait donc un flux sans aucun des trois.
+                //
+                // Mesuré sur .18 pour le NAVIGATEUR : capture WAV avec EQ
+                // strictement identique à la source décodée (#1168). La même
+                // fuite existe sur une sortie RÉSEAU depuis que le DSD y part en
+                // WAV progressif (0cf27ade, 27/07) : une zone DLNA/OpenHome avec
+                // égaliseur, correction FIR ou ReplayGain actif lisant du DSD
+                // prend ce bras et perd les trois, en silence. C'est la famille
+                // #1216 — déjà corrigée pour le passthrough réseau, le
+                // navigateur et les sorties PULL, jamais ici.
+                //
+                // `eq_forces_transcode` est déjà borné aux sorties réseau /
+                // navigateur / PULL et aux zones où un traitement est
+                // RÉELLEMENT actif (PURE rend `None`) : une zone sans
+                // traitement — l'immense majorité, et le cas qu'arbitre #1363 —
+                // garde le bras progressif. Les sorties PULL (`oaat`,
+                // `diretta`) restent hors du champ : elles ne passent jamais par
+                // le transcodage fichier et le changement n'est pas mesuré.
+                (is_browser_output || is_network_output) && eq_forces_transcode,
+            );
 
             let info = StreamInfo {
                 format: out_ext.clone(),
@@ -5482,12 +5722,22 @@ impl PlaybackOrchestrator {
                 return Err("DASH file missing (already consumed by prior decode)".into());
             }
 
-            // Zone EQ, loaded ONCE and reused by both the warm-cache decision and
-            // the transcode below. A second load could observe a just-enabled EQ
-            // and store an EQ'd transcode under the EQ-less cache key, poisoning
-            // every later hit for this track.
-            let eq_profile_pretranscode =
-                self.load_eq_processor(req.zone_id, stream_data.quality.sample_rate, 2);
+            // Chaîne DSP de la zone, chargée UNE fois et réutilisée par la
+            // décision de cache chaud ET par le transcodage ci-dessous. Un
+            // second chargement pourrait observer un traitement tout juste
+            // activé et ranger un transcodage traité sous la clé du flux brut,
+            // empoisonnant tous les accès ultérieurs à cette piste.
+            //
+            // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
+            // correction de pièce et le ReplayGain y étaient perdus, exactement
+            // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
+            let mut dash_dsp = self.load_streaming_dsp(
+                req.zone_id,
+                req.track_id,
+                stream_data.quality.sample_rate,
+                2,
+            );
+            let dash_dsp_active = dash_dsp.is_active();
 
             // Browser (Web Audio) zones pull the stream themselves via <audio> and
             // issue arbitrary byte-Range requests to buffer/seek. Our native FLAC
@@ -5537,7 +5787,11 @@ impl PlaybackOrchestrator {
                     "wav"
                 };
                 let wkbd = if wfmt == "wav" { 16 } else { wbd };
-                if eq_profile_pretranscode.is_none() {
+                // Le traitement de zone n'entre PAS dans la clé de cache : un
+                // flux traité ne peut donc jamais partager la clé d'un flux
+                // brut. La garde ne couvrait que l'égaliseur ; le convolveur et
+                // le ReplayGain la traversaient (#2863).
+                if !dash_dsp_active {
                     Some(DashWarm {
                         cache_path: crate::transcode_cache::cache_path_streaming(
                             service_name,
@@ -5727,7 +5981,7 @@ impl PlaybackOrchestrator {
             // the dash_growth registry when TUNE_DASH_STREAM_DECODE armed the
             // background download, so playback begins on the first fragments.
             if dash_enc_format == "flac"
-                && eq_profile_pretranscode.is_none()
+                && !dash_dsp_active
                 && std::env::var("TUNE_DASH_STREAM_REMUX")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
@@ -5853,7 +6107,7 @@ impl PlaybackOrchestrator {
                 // I/O copy, bit-identical (#1146). Opt-in via TUNE_DASH_REMUX;
                 // WAV renderers and EQ zones fall through to the decode path.
                 let remux = !dash_is_wav
-                    && eq_profile_pretranscode.is_none()
+                    && !dash_dsp_active
                     && std::env::var("TUNE_DASH_REMUX")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);
@@ -5880,9 +6134,10 @@ impl PlaybackOrchestrator {
                     actual_bd = 16;
                 }
 
-                if let Some(mut eq) = eq_profile_pretranscode {
-                    eq.process_pcm(&mut pcm_bytes, actual_bd);
-                }
+                // ReplayGain, égaliseur, puis convolveur FIR — l'ordre de
+                // `transcode_source_to_file`. Ce bras n'appliquait que le
+                // deuxième (#2863).
+                dash_dsp.process(&mut pcm_bytes, actual_bd);
 
                 // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
                 if let Some(ref ltx) = dash_levels_tx {
@@ -6091,6 +6346,22 @@ impl PlaybackOrchestrator {
                 };
                 let (session_id, tx, data_ready) =
                     self.streamer.create_session(info, false, 256).await;
+                // Chaîne DSP de la zone (#2863). Ce bras servait le PCM décodé
+                // TEL QUEL : égaliseur, convolveur et ReplayGain y étaient
+                // calculés côté interface puis jetés. Le relais les applique au
+                // fil de l'eau, sans rien bufferiser de plus — le démarrage
+                // immédiat conquis en 0.9.106 est préservé. Sans traitement
+                // actif, le canal reste celui d'avant, à l'octet près.
+                let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+                let tx = if aac_dsp.is_active() {
+                    info!(
+                        zone_id = req.zone_id,
+                        "streaming_aac_channel_dsp_relay_inserted"
+                    );
+                    spawn_streaming_dsp_relay(aac_dsp, bd, true, tx)
+                } else {
+                    tx
+                };
                 {
                     let sessions = self.streamer.sessions_state();
                     let sessions = sessions.lock().await;
@@ -6189,11 +6460,26 @@ impl PlaybackOrchestrator {
                     true
                 };
 
-                if !renderer_supports_mime {
-                    // Renderer does not support FLAC — transcode to WAV (LPCM).
-                    // Same pattern as AAC pre-transcode: download → decode → encode → file session.
-                    let sr = stream_data.quality.sample_rate;
+                // Chaîne DSP de la zone (#2863). Le bras « proxy verbatim »
+                // ci-dessous ne décode RIEN : il relaie les octets du CDN. Un
+                // égaliseur, une correction de pièce ou un ReplayGain armés y
+                // étaient donc calculés puis jetés, sans une ligne de journal —
+                // « je règle mon égaliseur, j'écoute du Qobuz sur ma zone
+                // réseau, et je n'entends aucune différence ».
+                let sr = stream_data.quality.sample_rate;
+                let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+                let https_dsp_active = https_dsp.is_active();
+
+                if streaming_needs_pretranscode(renderer_supports_mime, https_dsp_active) {
+                    // Deux raisons d'arriver ici : le renderer ne sait pas lire
+                    // le FLAC (→ WAV/LPCM), ou un traitement doit entrer dans le
+                    // signal (→ FLAC pleine profondeur, le renderer sait le
+                    // lire). Même schéma que le pré-transcodage AAC :
+                    // téléchargement → décodage → traitement → encodage →
+                    // session fichier (Content-Length, pas de chunked).
                     let bd = stream_data.quality.bit_depth.max(16).min(24);
+                    let enc_format = streaming_pretranscode_format(renderer_supports_mime);
+                    let enc_is_wav = enc_format == "wav";
 
                     info!(
                         service = service_name,
@@ -6201,7 +6487,10 @@ impl PlaybackOrchestrator {
                         device = %device_id,
                         sample_rate = sr,
                         bit_depth = bd,
-                        "streaming_flac_transcode_to_wav_renderer_unsupported"
+                        enc_format,
+                        dsp_active = https_dsp_active,
+                        renderer_supports_mime,
+                        "streaming_pretranscode_for_renderer_or_dsp"
                     );
 
                     let upstream_url = stream_data.url.clone();
@@ -6214,7 +6503,11 @@ impl PlaybackOrchestrator {
                         .to_string_lossy()
                         .to_string();
                     let tmp_wav = std::env::temp_dir()
-                        .join(format!("tune-flac-to-wav-{}.wav", uuid::Uuid::new_v4()))
+                        .join(format!(
+                            "tune-stream-pretranscode-{}.{}",
+                            uuid::Uuid::new_v4(),
+                            enc_format
+                        ))
                         .to_string_lossy()
                         .to_string();
 
@@ -6250,18 +6543,31 @@ impl PlaybackOrchestrator {
                         let actual_sr = decoded.sample_rate;
                         let actual_ch = decoded.channels;
 
-                        // The renderer rejected FLAC, so we serve WAV/LPCM
-                        // (DLNA.ORG_PN=LPCM), a 16-bit-only DLNA profile. A
-                        // 24-bit Hi-Res FLAC (Qobuz/Tidal) served under it plays
-                        // SILENCE on strict renderers like the Ruark R3 / LHC-62
-                        // (Yves, #1137). Cap to 16-bit so the WAV matches the
-                        // advertised LPCM profile and is audible.
-                        if actual_bd > 16 {
+                        // Plafond 16 bits : UNIQUEMENT quand on retombe sur
+                        // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
+                        // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
+                        // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
+                        // Ruark R3 / LHC-62 (Yves, #1137).
+                        //
+                        // Quand c'est le TRAITEMENT qui impose le
+                        // pré-transcodage (#2863), le renderer sait lire le
+                        // FLAC : on ré-encode en FLAC pleine profondeur, et le
+                        // plafond n'a pas lieu d'être. Sans cette distinction,
+                        // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
+                        // à 16 bits — une dégradation jamais demandée.
+                        if enc_is_wav && actual_bd > 16 {
                             pcm_bytes =
                                 crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                             actual_bd = 16;
                         }
 
+                        // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
+                        // de `transcode_source_to_file`. Sans traitement actif,
+                        // `pcm_bytes` n'est pas touché d'un octet.
+                        https_dsp.process(&mut pcm_bytes, actual_bd);
+
+                        // Niveaux post-traitement : les VU décrivent ce qui sera
+                        // entendu, comme sur le bras DASH.
                         if let Some(ref ltx) = wav_levels_tx {
                             crate::audio::tap::send_windowed_pcm(
                                 ltx,
@@ -6272,12 +6578,12 @@ impl PlaybackOrchestrator {
                             );
                         }
 
-                        // 3. Encode to WAV
+                        // 3. Encode
                         let rt = tokio::runtime::Handle::try_current()
                             .map_err(|e| format!("no tokio runtime: {e}"))?;
                         let encoded_data = rt.block_on(async {
                             let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                                "wav",
+                                enc_format,
                                 actual_sr,
                                 actual_bd as u32,
                                 actual_ch,
@@ -6288,7 +6594,7 @@ impl PlaybackOrchestrator {
                         })?;
 
                         std::fs::write(&tmp_wav_clone, &encoded_data)
-                            .map_err(|e| format!("write wav: {e}"))?;
+                            .map_err(|e| format!("write pre-transcode: {e}"))?;
 
                         let _ = std::fs::remove_file(&tmp_dl_clone);
                         let file_size = encoded_data.len() as u64;
@@ -6308,12 +6614,18 @@ impl PlaybackOrchestrator {
                                 file_size,
                                 bit_depth = actual_bd,
                                 sample_rate = actual_sr,
-                                "streaming_flac_to_wav_transcode_complete"
+                                enc_format,
+                                "streaming_pretranscode_complete"
                             );
 
+                            let enc_mime = if enc_is_wav {
+                                "audio/wav"
+                            } else {
+                                "audio/flac"
+                            };
                             let file_info = StreamInfo {
-                                format: "wav".into(),
-                                mime_type: "audio/wav".into(),
+                                format: enc_format.into(),
+                                mime_type: enc_mime.into(),
                                 sample_rate: actual_sr,
                                 bit_depth: actual_bd,
                                 channels: actual_ch,
@@ -6327,29 +6639,29 @@ impl PlaybackOrchestrator {
                                 .await;
 
                             let server_ip = self.server_ip();
-                            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-                            (
-                                url,
-                                Some(session_id),
-                                "audio/wav".to_string(),
-                                Some(file_size),
-                            )
+                            let url =
+                                self.streamer
+                                    .get_stream_url(&session_id, &server_ip, enc_format);
+                            (url, Some(session_id), enc_mime.to_string(), Some(file_size))
                         }
                         Ok(Err(e)) => {
-                            warn!(error = %e, "streaming_flac_to_wav_transcode_failed");
+                            warn!(error = %e, "streaming_pretranscode_failed");
                             let _ = std::fs::remove_file(&tmp_dl);
                             let _ = std::fs::remove_file(&tmp_wav);
-                            return Err(format!("FLAC→WAV transcode failed: {e}"));
+                            return Err(format!("streaming pre-transcode failed: {e}"));
                         }
                         Err(e) => {
-                            warn!(error = %e, "streaming_flac_to_wav_transcode_task_panic");
+                            warn!(error = %e, "streaming_pretranscode_task_panic");
                             let _ = std::fs::remove_file(&tmp_dl);
                             let _ = std::fs::remove_file(&tmp_wav);
-                            return Err(format!("FLAC→WAV transcode task panic: {e}"));
+                            return Err(format!("streaming pre-transcode task panic: {e}"));
                         }
                     }
                 } else {
-                    // Renderer supports FLAC — proxy directly as before.
+                    // Renderer supports FLAC et AUCUN traitement actif — proxy
+                    // direct, octets du CDN verbatim, bit-perfect. C'est le
+                    // chemin de l'immense majorité des écoutes, et il ne bouge
+                    // pas d'un octet.
                     //
                     // Qobuz/Tidal signed CDN URLs carry a short TTL (Qobuz
                     // `etsp=<unix-expiry>`, ~60 min). On a long Hi-Res track the
@@ -6607,10 +6919,19 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
+        // Même règle que le bras transcodage : ce qu'on ANNONCE doit être une
+        // largeur que la chaîne sait ÉCRIRE.
+        //
+        // `bd.max(16).min(24)` est la troisième écriture à la main de
+        // `cap_output_bit_depth` — la fonction créée précisément pour qu'on
+        // cesse de la réécrire (#1610) — et elle en a le même angle mort :
+        // 17..23 passent intacts, et ni `encode_wav` ni `pcm_to_i32` ne savent
+        // les écrire. Un prefetch d'une source de 20 bits partait donc vers un
+        // encodeur qui la refuse (#1437).
         let out_bd = if is_local_stream {
             32
         } else {
-            bd.max(16).min(24)
+            crate::audio::decode::container_bit_depth(cap_output_bit_depth(bd))
         };
 
         // For DLNA/network outputs, encode prefetched PCM to a file.
@@ -7895,6 +8216,43 @@ impl PlaybackOrchestrator {
         if eq.is_enabled() { Some(eq) } else { None }
     }
 
+    /// Chaîne DSP d'une zone pour un bras STREAMING, liée au format PCM que le
+    /// bras va réellement produire.
+    ///
+    /// Les bras de `resolve_streaming_url` décodent tous avec `Some(sr)` et
+    /// `Some(2)` : les coefficients construits ici décrivent donc exactement le
+    /// PCM qui sera traité, pas une supposition.
+    ///
+    /// Le mode PURE (audiophile) est déjà refusé par les trois chargeurs, et le
+    /// ReplayGain n'est retenu que s'il change réellement les échantillons —
+    /// même seuil que `zone_replaygain_changes_audio`. Une zone sans traitement
+    /// rend donc un `StreamingDsp` inactif, et le bras garde son comportement
+    /// d'avant à l'octet près.
+    fn load_streaming_dsp(
+        &self,
+        zone_id: i64,
+        track_id: Option<i64>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> StreamingDsp {
+        let replaygain = match track_id {
+            Some(tid) if !self.zone_audiophile(zone_id) => {
+                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                if (f - 1.0).abs() > 1e-6 {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        StreamingDsp {
+            replaygain,
+            eq: self.load_eq_processor(zone_id, sample_rate, channels),
+            convolver: self.load_convolver(zone_id, sample_rate, channels),
+        }
+    }
+
     /// Profil EQ réellement actif pour une zone, sans encore le lier à un
     /// format PCM. Le décodeur radio ne connaît le taux et le nombre de canaux
     /// qu'après sa sonde ; lui transmettre le profil permet de construire les
@@ -8117,8 +8475,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
-        context_type: Option<&str>,
-        context_id: Option<&str>,
+        contexte: ContexteEcoute<'_>,
     ) {
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
@@ -8145,8 +8502,9 @@ impl PlaybackOrchestrator {
             // etablit que cette information n'etait ecrite NULLE PART — la
             // section « Continuer l'ecoute » ne pouvait donc que repartir de
             // la table `albums`.
-            context_type: context_type.map(Into::into),
-            context_id: context_id.map(Into::into),
+            context_type: contexte.nature.map(Into::into),
+            context_id: contexte.id.map(Into::into),
+            context_position: contexte.rang,
         })
         .ok();
 
@@ -8254,8 +8612,11 @@ impl PlaybackOrchestrator {
                 zone_id,
                 attente.cover_path.as_deref(),
                 etat.session_profile_id,
-                etat.session_context_type.as_deref(),
-                etat.session_context_id.as_deref(),
+                ContexteEcoute {
+                    nature: etat.session_context_type.as_deref(),
+                    id: etat.session_context_id.as_deref(),
+                    rang: rang_a_retenir(etat.shuffle, etat.queue_position),
+                },
             );
         }
 
@@ -9039,7 +9400,7 @@ impl PlaybackOrchestrator {
         if zone.as_ref().is_some_and(|z| z.fixed_volume) {
             self.playback.set_volume(zone_id, 1.0).await;
             ZoneRepo::with_backend(self.db.clone())
-                .update_volume(zone_id, 100)
+                .update_volume(zone_id, 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
             return Ok(());
         }
@@ -9096,7 +9457,9 @@ impl PlaybackOrchestrator {
         self.playback.set_volume(zone_id, volume).await;
         self.playback.mark_volume_changed(zone_id).await;
         ZoneRepo::with_backend(self.db.clone())
-            .update_volume(zone_id, (volume.clamp(0.0, 1.0) * 100.0).round() as i32)
+            // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
+            // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
+            .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
             .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
         Ok(())
     }
@@ -11324,8 +11687,9 @@ mod tests {
     use crate::streaming::registry::ServiceRegistry;
 
     use super::{
-        PlayRequest, PlaybackOrchestrator, is_push_uri_output_type, passthrough_didl_duration_ms,
-        pull_output_needs_dsp_transcode, use_file_transcode_for,
+        PlayRequest, PlaybackOrchestrator, StreamingDsp, is_push_uri_output_type,
+        passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, spawn_streaming_dsp_relay,
+        streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
     };
 
     #[test]
@@ -11417,17 +11781,212 @@ mod tests {
         // ONLY with the toggle on. Everything else keeps its prior behaviour.
 
         // DSD → WAV, renderer needs LPCM, toggle ON → stream (the fix).
-        assert!(!use_file_transcode_for(true, true, true, true));
+        assert!(!use_file_transcode_for(true, true, true, true, false));
         // Same, toggle OFF → temp file (rollback, unchanged).
-        assert!(use_file_transcode_for(true, true, true, false));
+        assert!(use_file_transcode_for(true, true, true, false, false));
         // FLAC target (non-WAV) always temp-files for Content-Length — the
         // dsd flag can't apply (dsd_lpcm_streams stays false for non-DSD/WAV).
-        assert!(use_file_transcode_for(true, false, false, false));
+        assert!(use_file_transcode_for(true, false, false, false, false));
         // WAV target a renderer is fine to stream (dlna_needs_wav false):
         // streams regardless of the flag (local/OAAT/Linn path, unchanged).
-        assert!(!use_file_transcode_for(true, true, false, false));
+        assert!(!use_file_transcode_for(true, true, false, false, false));
         // Local/OAAT (not network): never file-transcodes.
-        assert!(!use_file_transcode_for(false, true, true, false));
+        assert!(!use_file_transcode_for(false, true, true, false, false));
+    }
+
+    /// Un traitement actif RAMÈNE au fichier temporaire, quel que soit le reste.
+    ///
+    /// Le bras progressif ne branche ni égaliseur, ni convolveur, ni
+    /// ReplayGain : les y envoyer, c'est les perdre sans le dire. Les deux
+    /// premières lignes sont exactement les cas que le bras progressif gagne
+    /// aujourd'hui (renderer FLAC depuis 0cf27ade ; renderer LPCM le jour où
+    /// `dsd_lpcm_stream` deviendrait le défaut, #1363).
+    #[test]
+    fn un_traitement_actif_ramene_au_fichier() {
+        // Renderer FLAC-capable, DSD → WAV progressif : streame sans DSP…
+        assert!(!use_file_transcode_for(true, true, false, false, false));
+        // …et repasse par le fichier dès qu'un traitement est actif.
+        assert!(use_file_transcode_for(true, true, false, false, true));
+        // Renderer LPCM, bascule « Streaming continu » armée : même règle.
+        assert!(!use_file_transcode_for(true, true, true, true, false));
+        assert!(use_file_transcode_for(true, true, true, true, true));
+        // Zone navigateur (non « réseau ») avec EQ : le cas déjà couvert par
+        // #1168, qui passait par un `||` hors de cette fonction.
+        assert!(use_file_transcode_for(false, true, false, false, true));
+        // Sans traitement, une sortie non réseau ne file-transcode toujours pas.
+        assert!(!use_file_transcode_for(false, true, false, false, false));
+    }
+
+    /// #2863 — le bras streaming HTTPS servait les octets du CDN VERBATIM dès
+    /// que le renderer savait lire le FLAC, sans jamais regarder si un
+    /// traitement de zone était armé. Un auditeur Qobuz sur une zone réseau
+    /// n'entendait donc aucun effet de son égaliseur.
+    ///
+    /// La ligne qui MORD est la deuxième : renderer FLAC-capable + traitement
+    /// actif ⇒ pré-transcodage. Les deux dernières sont le comportement
+    /// historique (#1137, renderer sans `audio/flac`), qui ne doit pas bouger.
+    #[test]
+    fn un_traitement_actif_impose_le_pretranscodage_streaming() {
+        // Renderer FLAC-capable, aucun traitement : proxy verbatim, bit-perfect.
+        // C'est ce que les testeurs écoutent aujourd'hui — inchangé.
+        assert!(!streaming_needs_pretranscode(true, false));
+        // Renderer FLAC-capable, traitement armé : LE défaut #2863.
+        assert!(streaming_needs_pretranscode(true, true));
+        // Renderer qui refuse le MIME amont : pré-transcodage, comme avant.
+        assert!(streaming_needs_pretranscode(false, false));
+        assert!(streaming_needs_pretranscode(false, true));
+    }
+
+    /// Le plafond 16 bits ne doit PAS suivre le traitement.
+    ///
+    /// Il n'existe que parce que `DLNA.ORG_PN=LPCM` est un profil 16 bits
+    /// (#1137). Quand c'est le traitement seul qui impose le pré-transcodage,
+    /// le renderer sait lire le FLAC : ré-encoder en FLAC garde la pleine
+    /// profondeur. Sans ce test, armer un égaliseur ferait tomber tout le
+    /// Hi-Res Qobuz à 16 bits.
+    #[test]
+    fn le_pretranscodage_dsp_garde_la_pleine_profondeur() {
+        assert_eq!(streaming_pretranscode_format(true), "flac");
+        assert_eq!(streaming_pretranscode_format(false), "wav");
+    }
+
+    /// Un PCM de test : sinusoïde 80 Hz, stéréo 16 bits.
+    fn pcm_sinus_16(n: usize) -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let s = (2.0 * std::f64::consts::PI * 80.0 * i as f64 / 44100.0).sin() * 0.5;
+            let s16 = (s * 32767.0) as i16;
+            pcm.extend_from_slice(&s16.to_le_bytes());
+            pcm.extend_from_slice(&s16.to_le_bytes());
+        }
+        pcm
+    }
+
+    fn eq_grave_boostee() -> crate::audio::eq::EqProcessor {
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bass_gain_db: 6.0,
+            ..Default::default()
+        };
+        crate::audio::eq::EqProcessor::new(&profile, 44100, 2)
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION, au bit près.
+    ///
+    /// Une zone sans traitement — l'immense majorité, et tout ce que les
+    /// testeurs écoutent aujourd'hui — doit traverser `StreamingDsp` sans
+    /// qu'un seul octet change. Si ce test tombe, le correctif #2863 a coloré
+    /// un signal qui devait rester intact.
+    #[test]
+    fn sans_traitement_la_chaine_streaming_ne_touche_pas_un_octet() {
+        let mut dsp = StreamingDsp::default();
+        assert!(!dsp.is_active());
+        let mut pcm = pcm_sinus_16(1024);
+        let temoin = pcm.clone();
+        dsp.process(&mut pcm, 16);
+        assert_eq!(pcm, temoin, "un PCM sans traitement doit rester identique");
+    }
+
+    /// Les TROIS étages sont portés par le même objet, dans l'ordre de
+    /// `transcode_source_to_file` : ReplayGain, égaliseur, convolveur.
+    ///
+    /// Le convolveur ne peut pas être construit sans fichier d'impulsion sur
+    /// disque ; ce test couvre les deux autres et le fait que `is_active()`
+    /// s'allume sur chacun — c'est ce qui décide du pré-transcodage.
+    #[test]
+    fn la_chaine_streaming_applique_replaygain_puis_egaliseur() {
+        // ReplayGain seul : gain exact, vérifiable échantillon par échantillon.
+        let mut rg = StreamingDsp {
+            replaygain: Some(0.5),
+            ..Default::default()
+        };
+        assert!(rg.is_active());
+        let source = pcm_sinus_16(256);
+        let mut pcm = source.clone();
+        rg.process(&mut pcm, 16);
+        assert_ne!(pcm, source);
+        for (i, (a, b)) in source
+            .chunks_exact(2)
+            .zip(pcm.chunks_exact(2))
+            .enumerate()
+            .take(64)
+        {
+            let av = i16::from_le_bytes([a[0], a[1]]) as f64;
+            let bv = i16::from_le_bytes([b[0], b[1]]) as f64;
+            assert!(
+                (bv - av * 0.5).abs() <= 1.0,
+                "échantillon {i} : {bv} attendu ≈ {}",
+                av * 0.5
+            );
+        }
+
+        // Égaliseur seul : le signal change.
+        let mut eq = StreamingDsp {
+            eq: Some(eq_grave_boostee()),
+            ..Default::default()
+        };
+        assert!(eq.is_active());
+        let mut pcm = source.clone();
+        eq.process(&mut pcm, 16);
+        assert_ne!(pcm, source, "un grave +6 dB doit modifier le PCM");
+
+        // Les deux ensemble diffèrent de chacun pris seul : les deux étages
+        // sont bien traversés, pas seulement le premier.
+        let mut deux = StreamingDsp {
+            replaygain: Some(0.5),
+            eq: Some(eq_grave_boostee()),
+            convolver: None,
+        };
+        let mut pcm_deux = source.clone();
+        deux.process(&mut pcm_deux, 16);
+        assert_ne!(pcm_deux, pcm);
+        assert_ne!(pcm_deux, source);
+    }
+
+    /// Le relais du bras AAC→WAV laisse passer l'EN-TÊTE WAV intact.
+    ///
+    /// `decode_to_pcm_streaming_inner` émet l'en-tête comme PREMIER chunk, seul.
+    /// Le faire traverser l'égaliseur reviendrait à filtrer les lettres
+    /// « RIFF » : en-tête corrompu, donc bruit ou silence chez l'auditeur. Le
+    /// PCM qui suit, lui, doit bien être traité.
+    #[tokio::test]
+    async fn le_relais_dsp_streaming_epargne_l_en_tete_wav() {
+        let (aval_tx, mut aval_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let dsp = StreamingDsp {
+            replaygain: Some(0.5),
+            ..Default::default()
+        };
+        let amont = spawn_streaming_dsp_relay(dsp, 16, true, aval_tx);
+
+        let entete = crate::audio::wav::build_wav_header(2, 44100, 16).to_vec();
+        let pcm = pcm_sinus_16(64);
+        amont.send(entete.clone()).await.unwrap();
+        amont.send(pcm.clone()).await.unwrap();
+        drop(amont);
+
+        let recu_entete = aval_rx.recv().await.expect("en-tête attendu");
+        assert_eq!(recu_entete, entete, "l'en-tête WAV doit passer intact");
+        assert_eq!(&recu_entete[0..4], b"RIFF");
+
+        let recu_pcm = aval_rx.recv().await.expect("PCM attendu");
+        assert_ne!(recu_pcm, pcm, "le PCM, lui, doit être traité");
+        let a = i16::from_le_bytes([pcm[2], pcm[3]]) as f64;
+        let b = i16::from_le_bytes([recu_pcm[2], recu_pcm[3]]) as f64;
+        assert!((b - a * 0.5).abs() <= 1.0);
+    }
+
+    /// Sans traitement actif, le bras AAC→WAV n'insère aucun relais : le canal
+    /// reste celui d'avant. Contrôle symétrique du témoin ci-dessus.
+    #[test]
+    fn un_streaming_dsp_vide_n_est_pas_actif() {
+        assert!(!StreamingDsp::default().is_active());
+        assert!(
+            StreamingDsp {
+                replaygain: Some(0.5),
+                ..Default::default()
+            }
+            .is_active()
+        );
     }
 
     #[test]
@@ -12783,7 +13342,7 @@ mod tests {
 
         let persisted = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(persisted.last_position_ms, 0);
-        assert_eq!(persisted.volume, 50);
+        assert_eq!(persisted.volume, 50.0);
         assert!(!persisted.muted);
     }
 
@@ -12852,7 +13411,7 @@ mod tests {
         assert!(!state.muted);
         let persisted = zone_repo.get(zone_id).unwrap().unwrap();
         assert_eq!(persisted.last_position_ms, 0);
-        assert_eq!(persisted.volume, 50);
+        assert_eq!(persisted.volume, 50.0);
         assert!(!persisted.muted);
     }
 
@@ -13121,7 +13680,7 @@ mod tests {
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 0.8).abs() < f64::EPSILON);
         let zone = zone_repo.get(zone_id).unwrap().unwrap();
-        assert_eq!(zone.volume, 80);
+        assert_eq!(zone.volume, 80.0);
     }
 
     #[tokio::test]
@@ -13208,8 +13767,11 @@ mod tests {
             zone_id,
             None,
             Some(7),
-            Some("playlist"),
-            Some("12"),
+            crate::orchestrator::ContexteEcoute {
+                nature: Some("playlist"),
+                id: Some("12"),
+                rang: Some(4),
+            },
         );
 
         let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -13234,7 +13796,48 @@ mod tests {
         // voulu faire l'auditeur ».
         assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
         assert_eq!(history[0].context_id.as_deref(), Some("12"));
+        // Migration 94 — le RANG, sans lequel on rouvrirait la bonne playlist
+        // a sa premiere piste.
+        assert_eq!(history[0].context_position, Some(4));
         assert_eq!(history[0].source, "local");
+    }
+
+    /// #2441 — la moitie « re-tirage » de l'arbitrage, ecrite a l'ECRITURE.
+    ///
+    /// En lecture sequentielle le rang est ce qui permet de reprendre la
+    /// playlist a la piste 7. En lecture ALEATOIRE il ne designe plus rien de
+    /// reproductible : `shuffle_order` est une permutation regeneree a chaque
+    /// activation, donc « position 7 » du tirage d'hier tombera sur une autre
+    /// piste demain. On re-tire, donc on n'ecrit pas de rang.
+    ///
+    /// CONTRE-EPREUVE : remplacer le corps de `rang_a_retenir` par
+    /// `Some(queue_position)` rend ce test ROUGE sur le premier cas — et la
+    /// section rouvrirait la playlist a une piste tiree au hasard hier, en
+    /// pretendant reprendre ou l'auditeur en etait.
+    #[test]
+    fn le_rang_reste_vide_en_lecture_aleatoire() {
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(true, 7),
+            None,
+            "en aleatoire le rang n'est pas reproductible : on RE-TIRE"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, 7),
+            Some(7),
+            "en lecture sequentielle, le rang est precisement ce qu'il faut \
+             retenir pour reprendre ou l'auditeur en etait"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, 0),
+            Some(0),
+            "la premiere piste est un rang comme un autre, pas une absence"
+        );
+        assert_eq!(
+            crate::orchestrator::rang_a_retenir(false, -1),
+            None,
+            "position sentinelle d'une zone qui n'a pas commence : rien a \
+             retenir"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -14694,5 +15297,183 @@ mod stop_scope_tests {
         let a_arreter =
             PlaybackOrchestrator::sorties_a_arreter_en_repli(&enregistrees, &revendiquees);
         assert_eq!(a_arreter, vec!["uuid:eversolo-dmp-a8".to_string()]);
+    }
+}
+
+/// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
+/// doivent être le même nombre (#1437).
+///
+/// `transcode_source_to_file` ne descendait que la profondeur (`target_bd <
+/// actual_bd`) et ne la montait jamais, et personne ne bornait la cible aux
+/// trois largeurs que la chaîne sait écrire. Deux défauts, deux symptômes
+/// distincts, mesurés ici sur un vrai fichier ALAC produit par l'encodeur du
+/// dépôt :
+///
+/// - cible plus PROFONDE que la source (`dlna_wav24` sur une piste que la base
+///   annonce 24 bits alors qu'elle en fait 16) : le fichier restait à la
+///   largeur de la source pendant que le DIDL annonçait la cible — deux octets
+///   par échantillon lus à un pas de trois, la famille #1137 ;
+/// - cible ININSCRIPTIBLE (20 bits, légal en ALAC/FLAC/AIFF/WavPack et rendu
+///   tel quel par `cap_output_bit_depth`) : `encode_wav` refusait après le
+///   décodage complet, la piste ne démarrait jamais.
+#[cfg(test)]
+mod profondeur_annoncee_egale_profondeur_ecrite {
+    use super::transcode_source_to_file;
+    use crate::audio::alac_encoder::encode_alac_m4a;
+
+    const TRAMES: usize = 8_000;
+    const CANAUX: u16 = 2;
+    const CADENCE: u32 = 96_000;
+
+    fn signal(amplitude: i32) -> Vec<i32> {
+        let mut v = Vec::with_capacity(TRAMES * CANAUX as usize);
+        for i in 0..TRAMES {
+            let s = ((i as f64 * 0.05).sin() * amplitude as f64) as i32;
+            for _ in 0..CANAUX {
+                v.push(s);
+            }
+        }
+        v
+    }
+
+    /// Un dossier par test ET par processus : plusieurs agents travaillent sur
+    /// la même machine de compilation.
+    fn dossier(nom: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tune-i1437-{nom}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&d).expect("dossier de test");
+        d
+    }
+
+    fn source_alac(dossier: &std::path::Path, profondeur: u16) -> String {
+        let amplitude = if profondeur >= 24 { 4_000_000 } else { 20_000 };
+        let m4a = encode_alac_m4a(&signal(amplitude), profondeur, CANAUX, CADENCE)
+            .expect("encodage ALAC de la source");
+        let chemin = dossier.join(format!("source-{profondeur}.m4a"));
+        std::fs::write(&chemin, &m4a).expect("écriture de la source");
+        chemin.to_string_lossy().to_string()
+    }
+
+    /// `(profondeur annoncée par l'en-tête, octets du chunk data)`.
+    fn entete_wav(chemin: &str) -> (u16, u32) {
+        let w = std::fs::read(chemin).expect("relecture du WAV");
+        assert!(w.len() > 44, "WAV tronqué : {} octets", w.len());
+        assert_eq!(&w[0..4], b"RIFF");
+        (
+            u16::from_le_bytes([w[34], w[35]]),
+            u32::from_le_bytes([w[40], w[41], w[42], w[43]]),
+        )
+    }
+
+    /// Le flux est-il AUDIBLE ? Un `Vec` de zéros passerait toutes les
+    /// vérifications de format ci-dessus.
+    fn niveau_non_nul(chemin: &str, profondeur: u16) -> bool {
+        let w = std::fs::read(chemin).expect("relecture du WAV");
+        let pas = (profondeur / 8) as usize;
+        w[44..]
+            .chunks_exact(pas)
+            .any(|c| c.iter().any(|&o| o != 0 && o != 0xFF))
+    }
+
+    #[tokio::test]
+    async fn la_cible_est_toujours_une_largeur_que_la_chaine_sait_ecrire() {
+        let d = dossier("cible");
+        let src = source_alac(&d, 24);
+
+        // Les quatre cas sont joués JUSQU'AU BOUT avant de conclure : le
+        // premier `panic!` masquerait les suivants, et les deux défauts que ce
+        // test couvre ne tombent pas sur la même cible.
+        let mut anomalies: Vec<String> = Vec::new();
+
+        // (profondeur demandée par l'orchestrateur, profondeur attendue)
+        for (demande, attendu) in [(16u16, 16u16), (20, 24), (24, 24), (32, 32)] {
+            let dest = d.join(format!("sortie-{demande}.wav"));
+            let dest_s = dest.to_string_lossy().to_string();
+            match transcode_source_to_file(
+                src.clone(),
+                CADENCE,
+                CANAUX,
+                demande,
+                "wav".to_string(),
+                None,
+                None,
+                None,
+                dest_s.clone(),
+            )
+            .await
+            {
+                Err(e) => anomalies.push(format!(
+                    "cible {demande} bits : le transcodage ÉCHOUE — {e}"
+                )),
+                Ok((_taille, _pcm, ecrite)) => {
+                    if ecrite != attendu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : profondeur rendue {ecrite}, attendu {attendu}"
+                        ));
+                    }
+                    let (entete, data) = entete_wav(&dest_s);
+                    if entete != attendu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : l'en-tête WAV annonce {entete}, attendu {attendu}"
+                        ));
+                    }
+                    let voulu = TRAMES * CANAUX as usize * (attendu as usize / 8);
+                    if data as usize != voulu {
+                        anomalies.push(format!(
+                            "cible {demande} bits : chunk data de {data} octets, attendu {voulu}"
+                        ));
+                    }
+                    if !niveau_non_nul(&dest_s, entete) {
+                        anomalies.push(format!(
+                            "cible {demande} bits : le flux écrit est SILENCIEUX"
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(
+            anomalies.is_empty(),
+            "la profondeur annoncée n'est pas celle qui est écrite :\n  {}",
+            anomalies.join("\n  ")
+        );
+    }
+
+    /// Témoin anti-régression : le seul chemin que les testeurs écoutent
+    /// aujourd'hui — « Forcer le WAV 16 bits » sur une zone DLNA — ne bouge
+    /// pas d'un octet, que la source soit 16 ou 24 bits.
+    #[tokio::test]
+    async fn le_forcage_wav16_reste_identique() {
+        let d = dossier("temoin");
+        for (profondeur_source, octets_attendus) in [(16u16, 2usize), (24, 2)] {
+            let src = source_alac(&d, profondeur_source);
+            let dest = d.join(format!("wav16-{profondeur_source}.wav"));
+            let dest_s = dest.to_string_lossy().to_string();
+            let (_t, _p, ecrite) = transcode_source_to_file(
+                src,
+                CADENCE,
+                CANAUX,
+                16,
+                "wav".to_string(),
+                None,
+                None,
+                None,
+                dest_s.clone(),
+            )
+            .await
+            .expect("transcodage WAV 16 bits");
+            assert_eq!(ecrite, 16, "source {profondeur_source} bits → WAV 16 bits");
+            let (entete, data) = entete_wav(&dest_s);
+            assert_eq!(entete, 16);
+            assert_eq!(data as usize, TRAMES * CANAUX as usize * octets_attendus);
+            assert!(
+                niveau_non_nul(&dest_s, 16),
+                "source {profondeur_source} bits : le WAV 16 bits est SILENCIEUX"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

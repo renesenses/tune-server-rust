@@ -625,7 +625,11 @@ async fn navigate_unified(app: &tauri::AppHandle, full: bool) -> bool {
     // The two layouts want very different windows. Mini stays on top and out of
     // the taskbar, like the widget it replaces; full behaves like an app.
     let (w, h) = if full {
-        (1200.0, 800.0)
+        // Meme borne que a l'ouverture : sans elle, repasser en grand rendait
+        // a la fenetre les 800 points de haut qui ne tiennent pas sur un
+        // bureau de 720 (#1598).
+        let (work_area, scale) = active_work_area(app);
+        fit_to_work_area(work_area, scale, FULL_WINDOW_SIZE, FULL_WINDOW_MIN_SIZE)
     } else {
         (380.0, 560.0)
     };
@@ -710,6 +714,68 @@ fn saved_full_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Taille souhaitee de la grande fenetre, en points logiques.
+const FULL_WINDOW_SIZE: (f64, f64) = (1200.0, 800.0);
+/// Taille en deca de laquelle la grande fenetre ne descend pas.
+const FULL_WINDOW_MIN_SIZE: (f64, f64) = (900.0, 600.0);
+/// Marge laissee autour de la fenetre dans la zone de travail de l'ecran.
+const WORK_AREA_MARGIN: f64 = 48.0;
+
+/// Ramener une taille voulue a ce que l'ecran peut reellement afficher.
+///
+/// La grande fenetre demandait 1200x800 points quoi qu'il arrive. Sur un
+/// 1920x1080 regle a 150 % — la mise a l'echelle Windows la plus repandue —
+/// le bureau n'offre que 1280x720 points : les 800 de hauteur debordent et le
+/// bas de l'interface passe sous le bord de l'ecran. C'est la seconde moitie
+/// de #1598, celle que le zoom seul ne reglait pas.
+///
+/// `work_area` arrive en pixels physiques alors que `inner_size` et `set_size`
+/// parlent en points logiques : d'ou la division par le facteur d'echelle.
+///
+/// La taille minimale de la fenetre l'emporte sur la contrainte d'ecran : sur
+/// un ecran plus petit qu'elle, mieux vaut une fenetre deplacable qu'une
+/// fenetre ecrasee.
+fn fit_to_work_area(
+    work_area: Option<(u32, u32)>,
+    scale: f64,
+    want: (f64, f64),
+    min: (f64, f64),
+) -> (f64, f64) {
+    let Some((width, height)) = work_area else {
+        return want;
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return want;
+    }
+    let available_w = f64::from(width) / scale - WORK_AREA_MARGIN;
+    let available_h = f64::from(height) / scale - WORK_AREA_MARGIN;
+    (
+        want.0.min(available_w.max(min.0)),
+        want.1.min(available_h.max(min.1)),
+    )
+}
+
+/// Zone de travail de l'ecran ou la fenetre va s'ouvrir, a defaut l'ecran
+/// principal. `None` quand aucun ecran n'est identifiable : on garde alors la
+/// taille voulue plutot que d'inventer une contrainte.
+fn active_work_area(app: &tauri::AppHandle) -> (Option<(u32, u32)>, f64) {
+    let monitor = app
+        .get_webview_window("full")
+        .or_else(|| app.get_webview_window("main"))
+        .and_then(|win| win.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    match monitor {
+        Some(monitor) => {
+            let area = monitor.work_area();
+            (
+                Some((area.size.width, area.size.height)),
+                monitor.scale_factor(),
+            )
+        }
+        None => (None, 1.0),
+    }
+}
+
 /// Open (or focus) the full Tune interface in a real application window.
 ///
 /// The interface is NOT bundled: the window loads the server's own web UI over
@@ -744,12 +810,23 @@ async fn open_full_window(app: &tauri::AppHandle) {
         }
     };
 
+    let (work_area, scale) = active_work_area(app);
+    let (width, height) =
+        fit_to_work_area(work_area, scale, FULL_WINDOW_SIZE, FULL_WINDOW_MIN_SIZE);
+
     match WebviewWindowBuilder::new(app, "full", WebviewUrl::External(parsed))
         .title("Tune")
-        .inner_size(1200.0, 800.0)
-        .min_inner_size(900.0, 600.0)
+        .inner_size(width, height)
+        .min_inner_size(FULL_WINDOW_MIN_SIZE.0, FULL_WINDOW_MIN_SIZE.1)
         .resizable(true)
         .decorations(true)
+        // Ctrl/Cmd + molette et Ctrl/Cmd + « - = + ». Sans cet appel, wry passe
+        // `false` a `ICoreWebView2Settings::IsZoomControlEnabled` : sous Windows
+        // la molette est morte, exactement ce que decrit #1598. Sur macOS et
+        // Linux, c'est ce meme drapeau qui fait injecter par Tauri le script
+        // equivalent (`plugin:webview|set_webview_zoom`), d'ou la capacite
+        // `full-window` qui autorise cette commande sur cette fenetre.
+        .zoom_hotkeys_enabled(true)
         .build()
     {
         Ok(win) => {
@@ -986,7 +1063,68 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_is_stale, parse_version, MINI_LAYOUT_MIN_VERSION};
+    use super::{
+        cache_is_stale, fit_to_work_area, parse_version, FULL_WINDOW_MIN_SIZE, FULL_WINDOW_SIZE,
+        MINI_LAYOUT_MIN_VERSION,
+    };
+
+    #[test]
+    fn la_grande_fenetre_ne_depasse_plus_le_bureau() {
+        // 1920x1080 a 100 % : il y a la place, on ne rabote rien.
+        assert_eq!(
+            fit_to_work_area(
+                Some((1920, 1040)),
+                1.0,
+                FULL_WINDOW_SIZE,
+                FULL_WINDOW_MIN_SIZE
+            ),
+            (1200.0, 800.0)
+        );
+        // Le cas de Sandro : 1920x1080 a 150 %, soit 1280x720 points une fois
+        // la barre des taches deduite. Les 800 points de haut ne tiennent pas.
+        let (w, h) = fit_to_work_area(
+            Some((1920, 1040)),
+            1.5,
+            FULL_WINDOW_SIZE,
+            FULL_WINDOW_MIN_SIZE,
+        );
+        assert!(
+            h < 1040.0 / 1.5,
+            "la hauteur doit tenir dans les {} points du bureau, obtenu {h}",
+            1040.0 / 1.5
+        );
+        assert!((w - 1200.0).abs() < 0.001, "largeur inattendue : {w}");
+        assert!(
+            (h - (1040.0 / 1.5 - 48.0)).abs() < 0.001,
+            "hauteur inattendue : {h}"
+        );
+        // Ecran plus petit que la taille minimale de la fenetre : la minimale
+        // gagne, on ne fabrique pas une fenetre ecrasee.
+        assert_eq!(
+            fit_to_work_area(
+                Some((1024, 640)),
+                1.0,
+                FULL_WINDOW_SIZE,
+                FULL_WINDOW_MIN_SIZE
+            ),
+            (976.0, 600.0)
+        );
+        // Aucun ecran identifiable, ou facteur d'echelle aberrant : on garde la
+        // taille voulue plutot que d'inventer une contrainte.
+        assert_eq!(
+            fit_to_work_area(None, 1.0, FULL_WINDOW_SIZE, FULL_WINDOW_MIN_SIZE),
+            FULL_WINDOW_SIZE
+        );
+        assert_eq!(
+            fit_to_work_area(
+                Some((1920, 1040)),
+                0.0,
+                FULL_WINDOW_SIZE,
+                FULL_WINDOW_MIN_SIZE
+            ),
+            FULL_WINDOW_SIZE
+        );
+    }
 
     #[test]
     fn the_cache_is_kept_only_for_the_version_that_wrote_it() {

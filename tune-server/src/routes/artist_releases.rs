@@ -25,6 +25,7 @@
 //! l'artiste qu'on écoute, et une section qui se trompe est pire qu'une section
 //! vide.
 
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
@@ -135,7 +136,7 @@ pub(super) async fn artist_releases(
         "SELECT DISTINCT item_name FROM favorites WHERE item_type = 'artist' AND item_name IS NOT NULL",
         "SELECT DISTINCT item_artist FROM favorites WHERE item_artist IS NOT NULL AND item_artist != ''",
     ] {
-        for cols in state.backend.query_many(sql, &[]).unwrap_or_default() {
+        for cols in state.backend.query_many(sql, &[]).ou_defaut_journalise() {
             if let Some(n) = cols.first().and_then(|v| v.as_string()) {
                 let cle = nom_normalise(&n);
                 if !est_un_fourre_tout(&cle) {
@@ -185,7 +186,7 @@ pub(super) async fn artist_releases(
     for cols in state
         .backend
         .query_many(sql_biblio, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
     {
         if let Some(nom) = cols.first().and_then(|v| v.as_string()) {
             let cle = nom_normalise(&nom);

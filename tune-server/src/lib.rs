@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+/// L'adresse de première connexion, imprimée au démarrage (#1272).
+mod adresse_d_accueil;
 pub mod auth;
 pub mod auto_resume;
 pub mod auto_scan;

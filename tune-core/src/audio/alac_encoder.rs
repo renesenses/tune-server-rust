@@ -149,14 +149,17 @@ mod tests {
     /// this fix: 1 failure in 100 runs, the 8192-frame case decoding 150000
     /// samples, i.e. exactly the other test's 75000 frames.
     ///
-    /// The shape stays in the name for readability; the counter is what
-    /// makes it unique, and the pid keeps concurrent test binaries apart.
+    /// The shape stays in the name for readability; the counter inside
+    /// `test_scratch` is what makes it unique, and the pid it adds keeps
+    /// concurrent test binaries apart.
+    ///
+    /// Le compteur vivait ici en propre ; il est passé dans
+    /// `crate::test_scratch` (#2864) pour que les autres tests du dépôt
+    /// s'appuient sur le même mécanisme au lieu de le réinventer — ou de
+    /// l'oublier.
     fn scratch_dir(bit_depth: u16, channels: u16, sample_rate: u32) -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "tune-alac-test-{}-{seq}-{bit_depth}-{channels}-{sample_rate}",
-            std::process::id()
+        crate::test_scratch::scratch_dir(&format!(
+            "tune-alac-test-{bit_depth}-{channels}-{sample_rate}"
         ))
     }
 

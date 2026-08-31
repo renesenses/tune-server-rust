@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
 pub mod connect;
+pub(crate) mod convert_destination;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
@@ -41,6 +42,7 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+pub mod panne_sql;
 pub mod party;
 pub mod peers;
 pub mod playback;
@@ -88,7 +90,6 @@ pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod versions;
-pub mod visualizer;
 pub mod voice;
 pub mod widget;
 pub mod ws;
@@ -366,7 +367,6 @@ pub fn router_with_plugins(
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
         .nest("/outputs", airplay_pairing::router())
-        .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
         .nest("/siri", siri::router())

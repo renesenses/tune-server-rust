@@ -13,6 +13,7 @@
 //! (`predicat_rapprochement`), et la recherche streaming avec son cache
 //! (`versions_streaming`). Les deux routes ne gardent que leur vivier.
 
+use crate::routes::panne_sql::OuDefautJournalise;
 use serde_json::{Value, json};
 
 use tune_core::db::backend::ToSqlValue;
@@ -203,7 +204,7 @@ pub(crate) fn versions_locales(
     state
         .backend
         .query_many(&sql, &params)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({

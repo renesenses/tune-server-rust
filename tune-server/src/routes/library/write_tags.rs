@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -74,7 +75,9 @@ pub(crate) async fn write_tags_to_files(
                     .map(|id| Box::new(*id) as Box<dyn ToSqlValue>)
                     .collect();
                 let param_refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
-                backend2.query_many(&sql, &param_refs).unwrap_or_default()
+                backend2
+                    .query_many(&sql, &param_refs)
+                    .ou_defaut_journalise()
             }
         } else if let Some(aid) = album_id {
             // Single album: write tags for that album's tracks only.
@@ -88,7 +91,7 @@ pub(crate) async fn write_tags_to_files(
                      FROM tracks WHERE file_path IS NOT NULL AND album_id = ?",
                     &param_refs,
                 )
-                .unwrap_or_default()
+                .ou_defaut_journalise()
         } else {
             backend2
                 .query_many(
@@ -98,7 +101,7 @@ pub(crate) async fn write_tags_to_files(
                      FROM tracks WHERE file_path IS NOT NULL",
                     &[],
                 )
-                .unwrap_or_default()
+                .ou_defaut_journalise()
         };
 
         let total = track_rows.len();
@@ -123,8 +126,12 @@ pub(crate) async fn write_tags_to_files(
             let _label = row.get(10).and_then(|v| v.as_string());
             let comment = row.get(11).and_then(|v| v.as_string());
 
-            // Check file exists
-            if !std::path::Path::new(&file_path).exists() {
+            // Le fichier est-il là ? Pas `exists()` sur le chemin de la base :
+            // il est en NFC et le disque peut porter le nom en NFD, auquel cas
+            // la piste était comptée « sautée » alors qu'elle est présente
+            // (#1865). `tag_writer` résout de son côté ; ce pré-contrôle doit
+            // résoudre pareil, sinon il écarte avant même de l'appeler.
+            if tune_core::library::local_path::resolve_local_path(&file_path).is_missing() {
                 debug!(track_id, file_path = %file_path, "write_tags_file_not_found");
                 skipped += 1;
                 continue;

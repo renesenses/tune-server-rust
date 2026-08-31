@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::State;
 use axum::response::Html;
 use axum::routing::{get, post};
@@ -160,7 +161,7 @@ fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
             &sql,
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -210,7 +211,7 @@ fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
             &sql,
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -257,7 +258,7 @@ fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
             &sql,
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -305,7 +306,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
             &tracks_sql,
             &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|r| {
             json!({
@@ -328,7 +329,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
             &albums_sql,
             &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|r| {
             json!({
@@ -347,7 +348,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
             &artists_sql,
             &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|r| {
             json!({

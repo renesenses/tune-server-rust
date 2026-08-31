@@ -186,7 +186,10 @@ mod tests {
 
     fn temp(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("tune-stagegrow-{name}-{}.bin", std::process::id()))
+            .join(format!(
+                "{}.bin",
+                crate::test_scratch::scratch_name(&format!("tune-stagegrow-{name}"))
+            ))
             .to_string_lossy()
             .to_string()
     }

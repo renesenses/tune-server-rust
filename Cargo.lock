@@ -5230,6 +5230,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "tune-core",
 ]
 
@@ -5412,6 +5413,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures-util",
+ "image",
  "jsonwebtoken",
  "libc",
  "lofty",

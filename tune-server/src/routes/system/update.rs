@@ -1634,7 +1634,7 @@ mod web_swap_tests {
 
     #[test]
     fn swap_replaces_and_cleans() {
-        let tmp = std::env::temp_dir().join(format!("tune-swap-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-swap");
         let src = tmp.join("src");
         let target = tmp.join("web");
         std::fs::create_dir_all(src.join("assets")).unwrap();
@@ -1654,7 +1654,7 @@ mod web_swap_tests {
 
     #[test]
     fn swap_into_missing_target_works() {
-        let tmp = std::env::temp_dir().join(format!("tune-swap2-{}", std::process::id()));
+        let tmp = tune_core::test_scratch::scratch_dir("tune-swap2");
         let src = tmp.join("src");
         let target = tmp.join("web");
         std::fs::create_dir_all(&src).unwrap();

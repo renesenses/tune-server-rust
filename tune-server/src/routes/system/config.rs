@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -11,6 +12,8 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
+
+use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSourceMode};
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
@@ -156,6 +159,14 @@ pub(super) async fn get_config(
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        // Plafond de la lecture aléatoire (#2901) : combien de pistes
+        // « tout lire en aléatoire » enfile au maximum. Réglage audio
+        // comme les trois ci-dessus, même mécanisme (settings + PATCH),
+        // défaut 500 — la valeur que #2228 avait figée dans le code.
+        (
+            tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY,
+            json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_DEFAULT),
+        ),
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
@@ -182,6 +193,41 @@ pub(super) async fn get_config(
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
+
+    // Le plafond de la lecture aléatoire, tel qu'il s'APPLIQUERA (#2901).
+    //
+    // `PATCH /config` persiste sans valider : `0`, `-1` ou `99999` peuvent
+    // se trouver en base. `shuffle_all` les ramène dans les bornes à la
+    // lecture ; l'affichage doit dire la MÊME chose, sinon l'utilisateur lit
+    // un chiffre que le serveur n'honore pas. Même repli propre que
+    // `local_audio_backend` juste en dessous : corrigé dans la RÉPONSE, pas
+    // en base — on ne réécrit pas le choix de l'utilisateur derrière son dos.
+    let plafond_effectif = tune_core::playback::queue::resolve_shuffle_max_tracks(
+        config
+            .get(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY)
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            })
+            .as_deref(),
+    );
+    config.insert(
+        tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY.to_string(),
+        json!(plafond_effectif),
+    );
+    // Les bornes elles-mêmes ne sont pas un réglage : ce sont les valeurs
+    // que le contrôle doit respecter. On les publie pour que le client web
+    // n'ait pas à les écrire en dur, exactement comme `supported_audio_backends`
+    // plus bas (#1268) — le client avait codé ses trois backends à la main et
+    // les proposait sur des plateformes qui ne les avaient pas.
+    config.insert(
+        "shuffle_max_tracks_min".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_FLOOR),
+    );
+    config.insert(
+        "shuffle_max_tracks_max".to_string(),
+        json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
+    );
     // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
     // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
     // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
@@ -206,10 +252,27 @@ pub(super) async fn get_config(
             serde_json::to_value(tune_core::outputs::local::supported_backends())
                 .unwrap_or_else(|_| json!([])),
         );
+        // #2868 — la CAPACITÉ, à côté du RÉGLAGE `local_exclusive_mode` publié
+        // plus haut. Même intention que `supported_audio_backends` (#1268) : le
+        // client n'a pas à déduire d'un nom de plateforme si la bascule « mode
+        // exclusif » a un sens, il le lit.
+        //
+        // Le prédicat lui-même était faux : il exigeait la feature `asio`,
+        // alors que la branche WASAPI exclusive est compilée sur TOUT Windows.
+        // Un Windows sans `asio` s'entendait donc répondre « non supporté »
+        // pour une capacité qu'il avait.
+        config.insert(
+            "local_exclusive_mode_supported".to_string(),
+            json!(tune_core::outputs::local::LocalOutput::supports_exclusive_mode()),
+        );
     }
     #[cfg(not(feature = "local-audio"))]
     {
         config.insert("supported_audio_backends".to_string(), json!([]));
+        // Sans `local-audio`, il n'y a pas de sortie locale du tout — donc pas
+        // de mode exclusif. On le dit au lieu d'omettre la clé : une clé
+        // absente se lit « je ne sais pas », pas « non ».
+        config.insert("local_exclusive_mode_supported".to_string(), json!(false));
     }
     config
         .entry("server_version".to_string())
@@ -457,6 +520,68 @@ fn volume_lock_confirmation_required(
     enables_volume_lock(body) && !already_enabled && !confirmed
 }
 
+/// Le champ qui porte les trois modes de #1627 dans un `PATCH /config`.
+///
+/// Même nom que le bloc publié par `GET /config` : ce qui se lit se réécrit.
+const REPLAYGAIN_SOURCE_FIELD: &str = "replaygain_source";
+
+/// Traduit `replaygain_source` en les deux réglages qui EXISTENT (#1627).
+///
+/// Avant : `GET /config` savait dire lequel des trois modes était actif, mais
+/// aucune route ne savait en POSER un. Le champ tombait dans la boucle
+/// d'écriture générique de [`update_config`], qui persiste n'importe quelle
+/// clé : `{"replaygain_source": "file_tags"}` créait une ligne morte
+/// `replaygain_source = file_tags` dans `settings`, ne changeait aucun des
+/// deux axes, et répondait `{"ok": true}`. Le client était renvoyé « c'est
+/// fait » sur un réglage qui n'avait pas bougé.
+///
+/// Après : le champ est retiré du corps et remplacé par les deux clés que tout
+/// le serveur lit déjà. Rien de nouveau n'est persisté, aucune migration,
+/// aucun chemin d'application du gain n'est touché.
+///
+/// `granularite_persistee` est l'axe piste/album tel qu'il est en base ; un
+/// `replaygain_mode` explicite dans le MÊME corps prime, ce qui permet de
+/// changer la source et la granularité d'un seul appel.
+fn expand_replaygain_source(
+    values: &mut serde_json::Map<String, Value>,
+    granularite_persistee: ReplayGainMode,
+) -> Result<Option<ReplayGainSourceMode>, AppError> {
+    let Some(brut) = values.remove(REPLAYGAIN_SOURCE_FIELD) else {
+        return Ok(None);
+    };
+    // Deux formes acceptées : la chaîne (`"file_tags"`), et l'OBJET que
+    // `GET /config` publie — un client qui relit la config puis la renvoie
+    // entière nous le repasse tel quel, et ce va-et-vient honnête ne doit pas
+    // finir en 400.
+    let demande = match &brut {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) => o.get("mode").and_then(|m| m.as_str()),
+        _ => None,
+    };
+    let Some(demande) = demande else {
+        return Err(AppError::bad_request(
+            "replaygain_source expects one of: off, file_tags, tags_then_analysis",
+        ));
+    };
+    // Aucun repli : un mode inconnu est refusé, jamais réinterprété. Le
+    // ReplayGain multiplie chaque échantillon — deviner y coûterait un niveau
+    // faux envoyé vers un ampli.
+    let Some(mode) = ReplayGainSourceMode::from_setting(demande) else {
+        return Err(AppError::bad_request(format!(
+            "unknown replaygain_source '{demande}': expected off, file_tags or tags_then_analysis"
+        )));
+    };
+    let granularite = values
+        .get(tune_core::audio::replaygain::MODE_KEY)
+        .and_then(|v| v.as_str())
+        .map(ReplayGainMode::from_setting)
+        .unwrap_or(granularite_persistee);
+    for (cle, valeur) in tune_core::audio::replaygain::source_mode_settings(mode, granularite) {
+        values.insert(cle.to_string(), Value::String(valeur.to_string()));
+    }
+    Ok(Some(mode))
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
@@ -478,6 +603,14 @@ pub(super) async fn update_config(
             .into_response());
     }
 
+    // #1627 — le sélecteur à trois valeurs, traduit vers les deux axes AVANT
+    // la boucle générique. Sans ce passage, le champ serait persisté tel quel
+    // comme une ligne morte et le mode ne bougerait pas.
+    let source_appliquee = expand_replaygain_source(
+        &mut values,
+        tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+    )?;
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     for (key, value) in values {
         let str_val = if value.is_string() {
@@ -492,7 +625,13 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
     }
-    Ok(Json(json!({"ok": true})).into_response())
+    let mut reponse = json!({"ok": true});
+    // Écho du mode réellement posé : le client n'a pas à relire `GET /config`
+    // pour savoir si sa demande a été comprise.
+    if let Some(mode) = source_appliquee {
+        reponse[REPLAYGAIN_SOURCE_FIELD] = json!(mode.as_str());
+    }
+    Ok(Json(reponse).into_response())
 }
 
 #[cfg(test)]
@@ -752,7 +891,28 @@ pub(super) struct BrowseDirsQuery {
     path: Option<String>,
 }
 
-pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value> {
+/// Explorateur de dossiers servi par le serveur (#1275) — la moitié serveur du
+/// sélecteur de dossiers des réglages Bibliothèque.
+///
+/// C'est une route de LECTURE DU SYSTÈME DE FICHIERS de la machine serveur.
+/// Elle porte donc deux gardes, et pas une :
+///
+/// 1. **Le rôle.** `RequireAdmin`, comme la route d'écriture qu'elle alimente
+///    (`POST /system/music-dirs`). Elle en était dépourvue : n'importe quel
+///    porteur de jeton — y compris un compte créé par `/auth/register`, qui
+///    est public et ne crée que des non-administrateurs — pouvait énumérer le
+///    disque, alors que le geste qu'elle prépare, lui, exige admin.
+/// 2. **Le périmètre.** Le rôle ne suffit pas : sur une installation par
+///    défaut `auth_enabled` est absent, `RequireAdmin` laisse donc passer, et
+///    la route redevient anonyme sur le réseau local. Les arbres système sont
+///    refusés indépendamment de l'authentification — voir
+///    [`super::explorateur`] pour le périmètre retenu et sa justification.
+pub(super) async fn browse_dirs(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
     let base = q.path.unwrap_or_else(|| {
         if cfg!(target_os = "windows") {
             "C:\\".into()
@@ -761,10 +921,38 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
         }
     });
 
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base, "error": refus.libelle(),
+            })),
+        );
+    }
+
     let base_path = std::path::Path::new(&base);
     if !base_path.exists() || !base_path.is_dir() {
-        return Json(
-            json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+        // Un seul et même refus pour « n'existe pas » et « existe mais n'est
+        // pas un dossier » : les distinguer donnerait de quoi sonder la
+        // présence d'un fichier sans jamais le lire.
+        return (
+            StatusCode::OK,
+            Json(
+                json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+            ),
+        );
+    }
+    // Le texte du chemin est irréprochable ; sa CIBLE peut ne pas l'être — un
+    // lien symbolique posé dans une racine de bibliothèque suffit.
+    if !explorateur::la_cible_reste_dans_le_perimetre(base_path) {
+        tracing::warn!(path = %base, "browse_dirs_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "dirs": [], "parent": null, "current": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
         );
     }
 
@@ -785,7 +973,10 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
                 }));
             }
         }
-        return Json(json!({ "dirs": dirs, "parent": null, "current": base }));
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
+        );
     }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
@@ -799,6 +990,23 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             if name.starts_with('.')
                 || name == "$RECYCLE.BIN"
                 || name == "System Volume Information"
+            {
+                continue;
+            }
+            // Les arbres système disparaissent aussi de la LISTE, pas seulement
+            // de la navigation : les énumérer les nomme, et nommer `/root` ou
+            // `C:\ProgramData` sur une machine de réseau local est déjà la
+            // moitié d'une reconnaissance. Le filtre passe avant le sondage
+            // `has_children`, qui sinon irait lire `/proc` et `/sys`.
+            let texte = path.to_string_lossy();
+            if explorateur::dans_un_arbre_systeme(&texte) {
+                continue;
+            }
+            // Un lien symbolique ne coûte une forme canonique que s'il en est
+            // un : la calculer pour chaque entrée d'une racine réseau serait
+            // payer un aller-retour par dossier.
+            if entry.file_type().is_ok_and(|t| t.is_symlink())
+                && !explorateur::la_cible_reste_dans_le_perimetre(&path)
             {
                 continue;
             }
@@ -821,11 +1029,14 @@ pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value>
             .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
 
-    Json(json!({
-        "dirs": dirs,
-        "parent": parent,
-        "current": base_path.to_string_lossy(),
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "dirs": dirs,
+            "parent": parent,
+            "current": base_path.to_string_lossy(),
+        })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1275,7 +1486,7 @@ fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
             "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
             let id = r.first()?.as_i64()?;
@@ -2176,7 +2387,7 @@ pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
 /// (inutile sur Android, mais pratique partout ailleurs). L'IP est recalculée
 /// à chaque appel (elle change en cas de bascule filaire↔WiFi) ; le hostname
 /// est mis en cache.
-pub(super) fn server_urls(port: u16) -> Vec<String> {
+pub(crate) fn server_urls(port: u16) -> Vec<String> {
     let mut urls = Vec::new();
     if let Ok(ip) = std::env::var("TUNE_ADVERTISE_IP") {
         if !ip.is_empty() {
@@ -3063,5 +3274,211 @@ mod replaygain_source_tests {
         let c = get_config(h, State(state.clone())).await.0;
         assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
         assert_eq!(c["replaygain_source"]["label"], "File tags, then analysis");
+    }
+
+    // ---- l'autre moitié de #1627 : ÉCRIRE l'un des trois modes -------------
+
+    /// Rejoue EXACTEMENT ce que fait `update_config` : la traduction du champ
+    /// à trois valeurs, puis la boucle d'écriture générique, inchangée.
+    fn patch(state: &AppState, corps: serde_json::Value) -> Result<Option<String>, String> {
+        let mut values = corps.as_object().expect("objet JSON").clone();
+        let granularite =
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode;
+        let applique = super::expand_replaygain_source(&mut values, granularite)
+            .map_err(|_| "bad_request".to_string())?;
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (cle, valeur) in values {
+            let brut = match valeur.as_str() {
+                Some(s) => s.to_string(),
+                None => valeur.to_string(),
+            };
+            settings.set(&cle, &brut).unwrap();
+        }
+        Ok(applique.map(|m| m.as_str().to_string()))
+    }
+
+    /// AVANT : `{"replaygain_source": "..."}` tombait dans la boucle générique,
+    /// créait une ligne morte `replaygain_source` dans `settings`, ne touchait
+    /// NI `replaygain_mode` NI `replaygain_analysis_enabled` — et répondait
+    /// `{"ok": true}`. Le client croyait avoir posé un mode.
+    ///
+    /// APRÈS : le champ écrit les deux axes existants, et rien d'autre.
+    #[tokio::test]
+    async fn les_trois_modes_s_ecrivent_par_un_seul_champ() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert_eq!(config_de(&state).await["replaygain_source"]["mode"], "off");
+
+        // 3- calcul.
+        assert_eq!(
+            patch(
+                &state,
+                serde_json::json!({"replaygain_source": "tags_then_analysis"})
+            )
+            .unwrap(),
+            Some("tags_then_analysis".to_string()),
+            "la réponse doit dire le mode posé"
+        );
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(
+            c["replaygain_mode"], "track",
+            "depuis « néant », la granularité par défaut est la piste — \
+             réécrire `off` ne changerait rien en répondant « ok »"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], true);
+        assert_eq!(c["replaygain_source"]["analysis_effective"], true);
+
+        // Aucune clé nouvelle en base : les deux axes restent la seule vérité.
+        assert_eq!(
+            settings.get("replaygain_source").unwrap(),
+            None,
+            "`replaygain_source` ne doit JAMAIS être persisté : c'est une vue"
+        );
+
+        // 2- fichier, en conservant la granularité que l'utilisateur avait.
+        patch(&state, serde_json::json!({"replaygain_mode": "album"})).unwrap();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+        assert_eq!(
+            c["replaygain_mode"], "album",
+            "changer de source ne doit pas reculer l'album vers la piste"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+
+        // 1- néant : le gain s'arrête, la coche d'analyse n'est pas écrasée.
+        settings.set("replaygain_analysis_enabled", "true").unwrap();
+        patch(&state, serde_json::json!({"replaygain_source": "off"})).unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_source"]["mode"], "off");
+        assert_eq!(c["replaygain_mode"], "off");
+        assert_eq!(
+            c["replaygain_analysis_enabled"], true,
+            "« néant » ne touche qu'un seul des deux axes"
+        );
+        assert_eq!(c["replaygain_source"]["analysis_effective"], false);
+    }
+
+    /// Source ET granularité dans le même appel, et aller-retour du bloc que
+    /// `GET /config` publie : un client qui relit puis renvoie la config
+    /// entière ne doit pas se faire refuser.
+    #[tokio::test]
+    async fn la_granularite_du_meme_corps_prime_et_l_objet_relu_est_accepte() {
+        let state = etat();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags", "replaygain_mode": "album"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_mode"], "album");
+        assert_eq!(c["replaygain_source"]["mode"], "file_tags");
+
+        // Aller-retour : on renvoie tel quel le bloc publié.
+        let bloc = c["replaygain_source"].clone();
+        patch(&state, serde_json::json!({ "replaygain_source": bloc })).unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_source"]["mode"], "file_tags",
+            "relire puis renvoyer la config ne doit rien changer"
+        );
+        assert_eq!(c["replaygain_mode"], "album");
+    }
+
+    /// Un mode inconnu est REFUSÉ, et rien n'est écrit. Le ReplayGain
+    /// multiplie chaque échantillon : deviner y coûterait un niveau faux.
+    #[tokio::test]
+    async fn un_mode_inconnu_est_refuse_sans_rien_ecrire() {
+        let state = etat();
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "tags_then_analysis"}),
+        )
+        .unwrap();
+        let avant = config_de(&state).await;
+        assert_eq!(avant["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(avant["replaygain_mode"], "track");
+
+        for mauvais in [
+            serde_json::json!("calcul"),
+            serde_json::json!("neant"),
+            serde_json::json!("track"),
+            serde_json::json!(true),
+            serde_json::json!(3),
+            serde_json::json!({"granularity": "track"}),
+        ] {
+            let r = patch(&state, serde_json::json!({ "replaygain_source": mauvais }));
+            assert!(
+                r.is_err(),
+                "cette valeur doit être refusée, pas interprétée"
+            );
+        }
+
+        // Rien n'a bougé, et aucune ligne morte n'a été créée.
+        let apres = config_de(&state).await;
+        assert_eq!(apres["replaygain_source"]["mode"], "tags_then_analysis");
+        assert_eq!(apres["replaygain_mode"], "track");
+        assert_eq!(
+            SettingsRepo::with_backend(state.backend.clone())
+                .get("replaygain_source")
+                .unwrap(),
+            None
+        );
+
+        // Espaces et casse restent tolérés — c'est bien une valeur VALIDE.
+        patch(&state, serde_json::json!({"replaygain_source": "  OFF "})).unwrap();
+        assert_eq!(config_de(&state).await["replaygain_mode"], "off");
+    }
+
+    /// TÉMOIN ANTI-RÉGRESSION — vert avant comme après.
+    ///
+    /// Ceux qui écoutent aujourd'hui pilotent le ReplayGain par les deux
+    /// réglages historiques. Un `PATCH` sans `replaygain_source` doit se
+    /// comporter EXACTEMENT comme avant : chaque axe écrit seul, aucun autre
+    /// touché, et le niveau appliqué inchangé.
+    #[tokio::test]
+    async fn temoin_un_patch_sans_le_nouveau_champ_ne_change_rien() {
+        let state = etat();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+
+        patch(&state, serde_json::json!({"replaygain_mode": "album"})).unwrap();
+        assert_eq!(
+            settings.get("replaygain_analysis_enabled").unwrap(),
+            None,
+            "écrire la granularité seule ne doit pas poser la coche d'analyse"
+        );
+        let c = config_de(&state).await;
+        assert_eq!(c["replaygain_mode"], "album");
+
+        patch(
+            &state,
+            serde_json::json!({"replaygain_analysis_enabled": "false"}),
+        )
+        .unwrap();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_mode"], "album",
+            "écrire la coche seule ne doit pas toucher la granularité"
+        );
+        assert_eq!(c["replaygain_analysis_enabled"], false);
+
+        // Le niveau lui-même : préampli et anti-écrêtage voyagent intacts.
+        patch(
+            &state,
+            serde_json::json!({"replaygain_preamp_db": "-3.5", "replaygain_prevent_clipping": "false"}),
+        )
+        .unwrap();
+        let applique = tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend);
+        assert_eq!(
+            applique.mode,
+            tune_core::audio::replaygain::ReplayGainMode::Album
+        );
+        assert!((applique.preamp_db - (-3.5)).abs() < 1e-9);
+        assert!(!applique.prevent_clipping);
     }
 }
