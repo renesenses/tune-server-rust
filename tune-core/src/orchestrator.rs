@@ -1220,6 +1220,82 @@ fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'static str {
     }
 }
 
+/// Les types de sortie qui poussent l'audio vers un appareil PAR LE RÉSEAU.
+///
+/// **L'unique exemplaire de cette liste.** Elle était recopiée à l'identique en
+/// trois endroits — `is_push_uri_output_type`, `resolve_local_track` et
+/// [`PlaybackOrchestrator::seek`] — et #2893 en réclamait une quatrième. Toutes
+/// y passent désormais : un renderer ajouté ici l'est partout, alors qu'une
+/// copie oubliée serait restée MUETTE (un morceau qui repart du début).
+fn is_network_output_type(output_type: Option<&str>) -> bool {
+    matches!(
+        output_type,
+        Some("dlna")
+            | Some("openhome")
+            | Some("chromecast")
+            | Some("bluos")
+            | Some("squeezebox")
+            | Some("slimproto")
+    )
+}
+
+/// Après une recréation de flux à une position donnée, faut-il ENCORE envoyer
+/// un `Seek` à la sortie ?
+///
+/// # Le défaut #2893
+///
+/// [`PlaybackOrchestrator::replay_zone_at_position`] recrée le flux avec
+/// `PlayRequest { seek_ms: Some(position_ms), .. }` et s'arrête là. Or
+/// `seek_ms` n'est honoré que par les deux bras qui **décodent** —
+/// `decode_to_pcm_streaming_seeked` reçoit l'offset et démarre le PCM à la
+/// bonne seconde. Tous les autres bras posent le flux dans une **session
+/// fichier** (transcodage vers un temporaire, cache, passthrough natif) ou une
+/// **session proxy** (CDN) : ces sessions servent depuis l'**octet 0** et ne
+/// regardent jamais `seek_ms`.
+///
+/// Et ces deux familles sont exactement les deux moitiés de
+/// `is_seekable_session` :
+///
+/// | session | `seek_ms` honoré | « range-seekable » |
+/// |---|---|---|
+/// | décodée (canal mpsc) | **oui**, par le producteur | non |
+/// | fichier / proxy | **non**, servie depuis 0 | **oui** |
+///
+/// D'où la règle : une session seekable sur une sortie réseau a été recréée au
+/// début du morceau, et il ne manque plus QUE le `Seek` SOAP pour amener le
+/// renderer à la position. Une session non seekable, elle, part déjà de
+/// l'offset — lui envoyer un `Seek` **doublerait** le saut, la panne de la
+/// famille #1518 (« un seek à 4:30 jetait tout le PCM restant → silence
+/// total »).
+///
+/// C'est le miroir de la condition de [`PlaybackOrchestrator::seek`], et non sa
+/// copie : là-bas une session seekable se contente d'un `Seek` **sans**
+/// recréation ; ici la recréation a déjà eu lieu et impose le `Seek`.
+///
+/// Symptôme corrigé : sur un Marantz ND8006 en DLNA, basculer le mode Pure
+/// faisait repartir le morceau du début — dans les deux sens, puisque les deux
+/// sens changent de bras de streaming sans jamais quitter la session fichier
+/// (Jean Valjean, 0.9.126, fil 1618).
+///
+/// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
+/// [`use_file_transcode_for`] et [`streaming_needs_pretranscode`].
+fn replay_needs_output_seek(
+    is_network_output: bool,
+    session_is_range_seekable: bool,
+    position_ms: u64,
+) -> bool {
+    is_network_output && session_is_range_seekable && position_ms > 0
+}
+
+/// Temporisation avant le `Seek` qui suit une recréation de flux réseau.
+///
+/// Même valeur, et même raison, que la branche réseau de
+/// [`PlaybackOrchestrator::seek`] : le renderer vient de recevoir une URL
+/// neuve, il faut lui laisser commencer à bufferiser avant de lui demander de
+/// sauter. Le ND8006 fait déjà des `soap_retry` sur `GetTransportInfo` dans ces
+/// instants-là.
+const REPLAY_OUTPUT_SEEK_SETTLE_MS: u64 = 500;
+
 /// Insère la chaîne DSP entre le décodeur progressif et la session HTTP.
 ///
 /// Le bras AAC→WAV (Tidal AAC, YouTube Opus vers un renderer DLNA) pousse le
@@ -1300,16 +1376,15 @@ fn pull_output_needs_dsp_transcode(
         && source_format != Some(AudioFormat::Dsd)
 }
 
+/// Les sorties qui reçoivent une URI et peuvent repartir de l'octet 0 sur un
+/// envoi redondant (Revox S100) — la porte de coalescence de #1129.
+///
+/// Même ensemble que [`is_network_output_type`], et ce n'est pas un hasard :
+/// « pousser une URI » est précisément ce que fait une sortie réseau ici. La
+/// liste ne vit donc qu'à UN endroit ; ce nom-ci reste pour que la porte #1129
+/// se lise pour ce qu'elle est.
 fn is_push_uri_output_type(output_type: Option<&str>) -> bool {
-    matches!(
-        output_type,
-        Some("dlna")
-            | Some("openhome")
-            | Some("chromecast")
-            | Some("bluos")
-            | Some("squeezebox")
-            | Some("slimproto")
-    )
+    is_network_output_type(output_type)
 }
 
 /// Profondeur de bits admissible par un appareil de lecture, en sortie.
@@ -3844,15 +3919,7 @@ impl PlaybackOrchestrator {
         // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
         // pour servir du DoP à un renderer réseau (#1772). Ne dépend que de
         // `zone_output_type`, connu bien plus haut.
-        let is_network_output = matches!(
-            zone_output_type.as_deref(),
-            Some("dlna")
-                | Some("openhome")
-                | Some("chromecast")
-                | Some("bluos")
-                | Some("squeezebox")
-                | Some("slimproto")
-        );
+        let is_network_output = is_network_output_type(zone_output_type.as_deref());
 
         // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
         // trames PCM 24 bits au seizième du débit.
@@ -7818,11 +7885,12 @@ impl PlaybackOrchestrator {
         };
         self.playback.seek(zone_id, position_ms as i64).await;
 
-        let output_device_id = ZoneRepo::with_backend(self.db.clone())
+        let zone_row = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()
-            .flatten()
-            .and_then(|z| z.output_device_id);
+            .flatten();
+        let output_type = zone_row.as_ref().and_then(|z| z.output_type.clone());
+        let output_device_id = zone_row.and_then(|z| z.output_device_id);
 
         // Arrêter la sortie AVANT que play() n'en crée une autre : sans ça,
         // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
@@ -7840,7 +7908,7 @@ impl PlaybackOrchestrator {
 
         let req = PlayRequest {
             zone_id,
-            output_device_id,
+            output_device_id: output_device_id.clone(),
             track_id: np.track_id,
             source: Some(np.source.clone()),
             source_id: np.source_id.clone(),
@@ -7865,11 +7933,82 @@ impl PlaybackOrchestrator {
         self.playback.seek(zone_id, position_ms as i64).await;
         match resultat {
             Ok(_) => {
+                // Le flux est neuf. Sur une sortie réseau servie par une
+                // session fichier/proxy, il repart de l'OCTET 0 : sans ce
+                // Seek, le renderer joue le morceau depuis le début (#2893).
+                self.seek_output_after_replay(
+                    zone_id,
+                    output_device_id.as_deref(),
+                    output_type.as_deref(),
+                    position_ms,
+                )
+                .await;
                 info!(zone_id, position_ms, raison, "zone_replayed_at_position");
                 Ok(())
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Envoyer à la sortie le `Seek` qui manque après une recréation de flux
+    /// (#2893). Voir [`replay_needs_output_seek`] pour la règle de décision et
+    /// la raison pour laquelle elle n'est ni « toujours », ni « jamais ».
+    ///
+    /// **Au mieux, jamais fatal** : la relecture, elle, a réussi — le
+    /// changement de traitement est bien passé dans le signal. Un renderer qui
+    /// refuse le `Seek` laisse un morceau qui repart du début, ce qui est
+    /// exactement l'ancien comportement ; le faire remonter en `Err`
+    /// transformerait cette dégradation en `eq_replay_failed`, et empêcherait
+    /// au passage d'armer le plancher anti-rafale.
+    async fn seek_output_after_replay(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        output_type: Option<&str>,
+        position_ms: u64,
+    ) {
+        let Some(did) = device_id else {
+            return;
+        };
+        // La session est celle que `play_without_history` vient d'installer :
+        // `now_playing.stream_id` porte le NOUVEAU flux, pas l'ancien.
+        let stream_id = self
+            .playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id);
+        let session_is_range_seekable = match stream_id {
+            Some(ref sid) => self.streamer.is_seekable_session(sid).await,
+            None => false,
+        };
+        if !replay_needs_output_seek(
+            is_network_output_type(output_type),
+            session_is_range_seekable,
+            position_ms,
+        ) {
+            return;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            REPLAY_OUTPUT_SEEK_SETTLE_MS,
+        ))
+        .await;
+        let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+            warn!(
+                zone_id,
+                device_id = did,
+                "replay_output_seek_output_disparue"
+            );
+            return;
+        };
+        match output.lock().await.checked_seek(position_ms).await {
+            Ok(()) => info!(zone_id, position_ms, "replay_output_seek_sent"),
+            Err(e) => warn!(zone_id, position_ms, error = %e, "replay_output_seek_failed"),
+        }
+        // Repositionner APRÈS le Seek : la grâce du poller doit partir de la
+        // commande, pas de la recréation qui la précède de 500 ms.
+        self.playback.seek(zone_id, position_ms as i64).await;
     }
 
     /// Faire prendre effet un changement d'égaliseur, PAR TOUS LES CHEMINS.
@@ -9227,15 +9366,7 @@ impl PlaybackOrchestrator {
                 .ok()
                 .flatten()
                 .and_then(|z| z.output_type);
-            let is_network = matches!(
-                zone_output_type.as_deref(),
-                Some("dlna")
-                    | Some("openhome")
-                    | Some("chromecast")
-                    | Some("bluos")
-                    | Some("squeezebox")
-                    | Some("slimproto")
-            );
+            let is_network = is_network_output_type(zone_output_type.as_deref());
 
             if is_streaming_source && is_network {
                 // Check if the current stream session supports Range seeking
@@ -11739,9 +11870,10 @@ mod tests {
     use crate::streaming::registry::ServiceRegistry;
 
     use super::{
-        PlayRequest, PlaybackOrchestrator, StreamingDsp, is_push_uri_output_type,
-        passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, spawn_streaming_dsp_relay,
-        streaming_needs_pretranscode, streaming_pretranscode_format, use_file_transcode_for,
+        PlayRequest, PlaybackOrchestrator, StreamingDsp, is_network_output_type,
+        is_push_uri_output_type, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
+        replay_needs_output_seek, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
+        streaming_pretranscode_format, use_file_transcode_for,
     };
 
     #[test]
@@ -11900,6 +12032,69 @@ mod tests {
     fn le_pretranscodage_dsp_garde_la_pleine_profondeur() {
         assert_eq!(streaming_pretranscode_format(true), "flac");
         assert_eq!(streaming_pretranscode_format(false), "wav");
+    }
+
+    /// #2893 — la matrice de décision du `Seek` qui suit une recréation de flux.
+    ///
+    /// La ligne qui MORD est la première : sortie réseau + session
+    /// fichier/proxy + position non nulle. C'est le cas de Jean Valjean, une
+    /// bascule Pure sur un Marantz ND8006 avec `position_ms=94000` juste au
+    /// serveur — et le morceau qui repart du début faute de `Seek`.
+    ///
+    /// Les autres lignes sont le TÉMOIN anti-régression, et la deuxième est la
+    /// plus chère : une session décodée est déjà pré-seekée par
+    /// `decode_to_pcm_streaming_seeked`, lui envoyer un `Seek` doublerait
+    /// l'offset — la panne #1518 (silence total, puis boucle de redémarrage).
+    /// Cas réel de cette ligne : DSD servi en LPCM progressif sur DLNA
+    /// (`dsd_lpcm_stream=true`), le seul bras réseau qui reste en canal mpsc.
+    #[test]
+    fn une_relecture_reseau_sur_session_seekable_reclame_le_seek() {
+        // LE défaut : le flux a été recréé depuis l'octet 0, il manque le Seek.
+        assert!(replay_needs_output_seek(true, true, 94_000));
+
+        // Témoin 1 — session décodée : le producteur part DÉJÀ de l'offset.
+        // Un Seek ici sauterait deux fois (#1518).
+        assert!(!replay_needs_output_seek(true, false, 94_000));
+
+        // Témoin 2 — sortie locale / OAAT : elles consomment un transcodage
+        // séquentiel qui honore `seek_ms`. Chemin inchangé, aucun Seek ajouté.
+        assert!(!replay_needs_output_seek(false, true, 94_000));
+        assert!(!replay_needs_output_seek(false, false, 94_000));
+
+        // Témoin 3 — position nulle : rien à rattraper, le début EST la cible.
+        // C'est le cas de figure de #2595 (zone sans périphérique, position
+        // restée à 0) : il ne doit pas produire un Seek inutile de plus.
+        assert!(!replay_needs_output_seek(true, true, 0));
+    }
+
+    /// La liste des sorties « réseau » ne vit plus qu'à un endroit.
+    ///
+    /// Elle était inline dans `seek()` ; `replay_zone_at_position` en a besoin
+    /// pour la même décision. Ce test existe pour qu'un renderer ajouté à l'une
+    /// n'oublie pas l'autre — c'est le mode de panne que la duplication aurait
+    /// produit, et il serait resté MUET (un morceau qui repart du début).
+    #[test]
+    fn la_liste_des_sorties_reseau_couvre_les_six_renderers() {
+        for t in [
+            "dlna",
+            "openhome",
+            "chromecast",
+            "bluos",
+            "squeezebox",
+            "slimproto",
+        ] {
+            assert!(is_network_output_type(Some(t)), "{t} doit être réseau");
+        }
+        for t in ["local", "oaat", "browser"] {
+            assert!(!is_network_output_type(Some(t)), "{t} n'est PAS réseau");
+        }
+        // `airplay` est ABSENT de la liste historique de `seek()`. Ce test le
+        // constate, il ne l'approuve pas : l'y ajouter changerait aussi le
+        // chemin de `seek()`, ce qui est une décision à part entière et n'a
+        // rien à faire dans un correctif #2893.
+        assert!(!is_network_output_type(Some("airplay")));
+        // Une zone sans type déclaré est traitée comme locale partout ailleurs.
+        assert!(!is_network_output_type(None));
     }
 
     /// Un PCM de test : sinusoïde 80 Hz, stéréo 16 bits.
@@ -13465,6 +13660,137 @@ mod tests {
         assert_eq!(persisted.last_position_ms, 0);
         assert_eq!(persisted.volume, 50.0);
         assert!(!persisted.muted);
+    }
+
+    /// Zone qui joue un FLAC de la bibliothèque, prête pour une relecture.
+    ///
+    /// Rend `(orchestrateur, zone_id, répertoire)` — le répertoire doit rester
+    /// vivant tant que le test tourne, sinon le fichier disparaît sous la zone
+    /// et `resolve_local_track` échoue en `file_not_found`.
+    async fn zone_qui_joue_un_flac(
+        output_type: &str,
+        device_id: &str,
+    ) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
+        let orch = test_orchestrator();
+
+        // Un VRAI FLAC : le passthrough réseau lit sa taille sur le disque, et
+        // le bras local le décode pour de bon.
+        let dir = tempfile::tempdir().unwrap();
+        let piste = dir.path().join("morceau.flac");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            &piste,
+        )
+        .unwrap();
+        let chemin = piste.to_string_lossy().into_owned();
+
+        orch.db
+            .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+                &[],
+            )
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                 duration_ms, sample_rate, bit_depth, channels) \
+                 VALUES (1, 'Morceau', 1, 1, ?, 'flac', 300000, 44100, 16, 2)",
+                &[&chemin as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Marantz ND8006", Some(output_type), Some(device_id))
+            .unwrap();
+        // FLAC natif imposé : la sortie factice n'est pas un `DlnaOutput`, la
+        // négociation `GetProtocolInfo` serait donc non concluante et
+        // basculerait en WAV. On veut le passthrough du testeur.
+        zone_repo.update_dlna_native_flac(zone_id, true).unwrap();
+
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new(device_id, "Marantz ND8006").with_type(output_type),
+        ));
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(1),
+                    title: "Morceau".into(),
+                    source: "local".into(),
+                    duration_ms: 300_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        (orch, zone_id, dir)
+    }
+
+    /// Position rapportée par la sortie factice après la relecture.
+    ///
+    /// `play_media` la remet à 0 ; seul un `Seek` peut l'en faire bouger. Une
+    /// valeur de 0 signifie donc « aucun Seek n'a été envoyé », sans compteur
+    /// supplémentaire à ajouter au mock partagé.
+    async fn position_vue_par_la_sortie(orch: &PlaybackOrchestrator, device_id: &str) -> u64 {
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get(device_id).unwrap();
+        let guard = out.lock().await;
+        guard.get_status().await.unwrap().position_ms
+    }
+
+    /// #2893 — LE défaut, de bout en bout : bascule Pure sur une sortie DLNA.
+    ///
+    /// Jean Valjean (0.9.126, Marantz ND8006, fil 1618) : le serveur relance à
+    /// la bonne position — ses journaux portent `position_ms=94000`, `48000`,
+    /// `259000`, `23000` — et le morceau repart quand même du début. La cause
+    /// n'est pas la position serveur (c'est #2595) : c'est que
+    /// `replay_zone_at_position` recrée le flux et s'arrête là. Le renderer
+    /// reçoit `Stop` → `SetAVTransportURI` → `Play` sur une session FICHIER
+    /// servie depuis l'octet 0, **sans aucun `Seek`**.
+    ///
+    /// Ce test échoue sur le code d'avant le correctif : la sortie reste à 0.
+    #[tokio::test]
+    async fn bascule_pure_sur_dlna_le_renderer_recoit_le_seek_vers_la_position() {
+        let device_id = "dlna:uuid-56fcb4ae-2893";
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("dlna", device_id).await;
+
+        orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
+            .await
+            .expect("la relecture doit réussir");
+
+        assert_eq!(
+            position_vue_par_la_sortie(&orch, device_id).await,
+            94_000,
+            "le renderer doit recevoir un Seek vers la position : sans lui il rejoue le morceau depuis le début (#2893)"
+        );
+    }
+
+    /// Témoin anti-régression de #2893 : la sortie LOCALE ne reçoit rien.
+    ///
+    /// Elle consomme un transcodage séquentiel que
+    /// `decode_to_pcm_streaming_seeked` démarre DÉJÀ à l'offset. Lui envoyer un
+    /// `Seek` par-dessus sauterait deux fois — la panne #1518 (silence total,
+    /// puis boucle de redémarrage). Le chemin local doit rester exactement ce
+    /// qu'il était.
+    #[tokio::test]
+    async fn une_relecture_sur_sortie_locale_n_envoie_aucun_seek() {
+        let device_id = "local:Sortie 2893";
+        let (orch, zone_id, _dir) = zone_qui_joue_un_flac("local", device_id).await;
+
+        orch.replay_zone_at_position(zone_id, 94_000, "eq_change")
+            .await
+            .expect("la relecture doit réussir");
+
+        assert_eq!(
+            position_vue_par_la_sortie(&orch, device_id).await,
+            0,
+            "sortie locale : le flux est pré-seeké à la source, un Seek de plus doublerait l'offset (#1518)"
+        );
     }
 
     /// Un timeout de transport ne doit PAS détruire la session de flux : la
