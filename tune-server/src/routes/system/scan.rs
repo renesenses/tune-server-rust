@@ -786,6 +786,13 @@ pub(crate) struct ChiffresDeFinDeScan<'a> {
     pub(crate) skipped_unsupported_paths: &'a [String],
     pub(crate) skipped_no_metadata_paths: &'a [String],
     pub(crate) skipped_duplicate_paths: &'a [String],
+    /// Ce que les feuilles CUE de la bibliothèque décrivent réellement (#1763).
+    ///
+    /// Sans cela le rapport dit « 2 600 fichiers `.cue` ignorés » et s'arrête
+    /// là — un chiffre qui ne distingue pas la feuille prête à être découpée
+    /// de celle qui a perdu son FLAC, alors que c'est toute la différence
+    /// entre un album récupérable et un album fantôme.
+    pub(crate) cue: &'a tune_core::scanner::cue_album::InventaireCue,
 }
 
 impl ChiffresDeFinDeScan<'_> {
@@ -826,6 +833,30 @@ impl ChiffresDeFinDeScan<'_> {
             "artwork_extracted": self.artwork_extracted,
             "auto_enrichment": self.auto_enrichment,
             "failed_paths": self.scan_stats.failed_paths,
+            // Des COMPTEURS, donc ils partent chez les trois consommateurs —
+            // comme tous les autres. Seule la liste nominative des feuilles
+            // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
+            // même raison que les autres chemins : le bus d'événements est
+            // diffusé à tous les clients connectés.
+            "cue_sheets": self.cue_sheets(),
+        })
+    }
+
+    /// Les compteurs des feuilles CUE, sous une clé unique (#1763).
+    ///
+    /// Un objet plutôt que huit clés à plat : ces chiffres ne se lisent que
+    /// les uns par rapport aux autres — « 14 écartées » ne veut rien dire sans
+    /// « sur 132 vues ».
+    fn cue_sheets(&self) -> Value {
+        json!({
+            "folders": self.cue.dossiers,
+            "folders_not_inventoried": self.cue.dossiers_non_inventories,
+            "albums": self.cue.albums,
+            "albums_multi_sheet": self.cue.albums_multi_feuilles,
+            "sheets_used": self.cue.feuilles_retenues,
+            "tracks": self.cue.pistes,
+            "sheets_skipped": self.cue.feuilles_ecartees,
+            "sheets_skipped_by_reason": self.cue.ecarts_par_cle,
         })
     }
 
@@ -850,6 +881,9 @@ impl ChiffresDeFinDeScan<'_> {
         rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
         rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
         rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // LESQUELLES, pas seulement combien (#1763). Même règle que ci-dessus :
+        // ce sont des chemins de l'utilisateur, ils sortent par le fichier.
+        rapport["cue_sheets_skipped_paths"] = json!(self.cue.chemins_ecartes);
         // Dire que la liste est un échantillon, plutôt que de laisser croire
         // qu'elle est complète : une liste muette de 500 entrées face à
         // 40 000 fichiers écartés se lit comme un rapport faux.
@@ -869,6 +903,10 @@ impl ChiffresDeFinDeScan<'_> {
         self.skipped_unsupported_paths.len() >= PLAFOND
             || self.skipped_no_metadata_paths.len() >= PLAFOND
             || self.skipped_duplicate_paths.len() >= PLAFOND
+            // La quatrième liste (#1763) obéit au même plafond et se serait
+            // tronquée en silence : c'est exactement le défaut « un chemin
+            // corrigé, les autres nus » que cette clé existe pour éviter.
+            || self.cue.chemins_ecartes.len() >= PLAFOND
     }
 }
 
@@ -1070,6 +1108,25 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
         let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les feuilles CUE, relues APRÈS le parcours (#1763). Le parcours les
+        // a comptées comme des fichiers non lus et n'en a retenu que les
+        // dossiers — les ouvrir pendant le parcours ajouterait une lecture
+        // bloquante par fichier sur un NAS, ce que le parcours s'interdit.
+        // Aucune écriture en base : c'est le rapport qui gagne la vérité, pas
+        // la bibliothèque. Presque toujours instantané, parce que la liste est
+        // vide dans l'immense majorité des bibliothèques.
+        let inventaire_cue =
+            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        if inventaire_cue.dossiers > 0 {
+            tracing::info!(
+                dossiers = inventaire_cue.dossiers,
+                albums = inventaire_cue.albums,
+                albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
+                pistes = inventaire_cue.pistes,
+                feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
+            );
+        }
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -2115,6 +2172,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unsupported_paths: &skipped_unsupported_paths,
             skipped_no_metadata_paths: &skipped_no_metadata_paths,
             skipped_duplicate_paths: &skipped_duplicate_paths,
+            cue: &inventaire_cue,
         };
         let rapport_scan = chiffres.rapport();
 
@@ -3438,6 +3496,22 @@ mod rapport_de_fin_de_scan {
         let doublons: &[String] = Box::leak(Box::new([
             "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)".to_string(),
         ]));
+        let cue: &tune_core::scanner::cue_album::InventaireCue =
+            Box::leak(Box::new(tune_core::scanner::cue_album::InventaireCue {
+                dossiers: 120,
+                dossiers_non_inventories: 121,
+                albums: 122,
+                albums_multi_feuilles: 123,
+                feuilles_retenues: 124,
+                pistes: 125,
+                feuilles_ecartees: 126,
+                ecarts_par_cle: std::collections::BTreeMap::from([("cue-image-introuvable", 126)]),
+                chemins_ecartes: vec![
+                    "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                     rien à découper)"
+                        .to_string(),
+                ],
+            }));
         ChiffresDeFinDeScan {
             total_discovered: 1_651,
             missing_dirs: missing,
@@ -3466,6 +3540,7 @@ mod rapport_de_fin_de_scan {
             skipped_unsupported_paths: non_lus,
             skipped_no_metadata_paths: sans_metadonnees,
             skipped_duplicate_paths: doublons,
+            cue,
         }
     }
 
@@ -3524,6 +3599,7 @@ mod rapport_de_fin_de_scan {
             // Ordre alphabétique : c'est celui des clés d'un objet
             // `serde_json`, pas celui où on les a écrites.
             vec![
+                "cue_sheets_skipped_paths",
                 "skipped_duplicate_paths",
                 "skipped_no_metadata_paths",
                 "skipped_paths_truncated",
@@ -3590,6 +3666,29 @@ mod rapport_de_fin_de_scan {
         assert_eq!(
             r["skipped_unsupported_reasons"],
             serde_json::json!({"mpc": "format non pris en charge"})
+        );
+        // Ce que les feuilles CUE décrivent (#1763). Huit chiffres tous
+        // distincts : un rapport qui rangerait « albums » sous « pistes »
+        // passerait inaperçu s'ils se ressemblaient.
+        assert_eq!(
+            r["cue_sheets"],
+            serde_json::json!({
+                "folders": 120,
+                "folders_not_inventoried": 121,
+                "albums": 122,
+                "albums_multi_sheet": 123,
+                "sheets_used": 124,
+                "tracks": 125,
+                "sheets_skipped": 126,
+                "sheets_skipped_by_reason": {"cue-image-introuvable": 126},
+            })
+        );
+        assert_eq!(
+            r["cue_sheets_skipped_paths"],
+            serde_json::json!([
+                "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                 rien à découper)"
+            ])
         );
         // La liste demandée (#2050) : LESQUELS, pas seulement COMBIEN. Trois
         // listes distinctes — un rapport qui rangerait les doublons sous les
@@ -3665,11 +3764,16 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 4] = [
+        const CLES: [&str; 6] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
             "\"skipped_paths_truncated\"",
+            // Les feuilles CUE (#1763) : mêmes deux clés des deux côtés, pour
+            // la même raison. Le compteur part chez les trois consommateurs,
+            // la liste nominative par le seul fichier.
+            "\"cue_sheets\"",
+            "\"cue_sheets_skipped_paths\"",
         ];
 
         for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
