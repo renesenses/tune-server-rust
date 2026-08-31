@@ -17,6 +17,8 @@ mod bios_langue_album;
 mod bios_langue_entete;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "cles_developpeur_persistance.rs"]
+mod cles_developpeur_persistance;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
 #[path = "contexte_de_session.rs"]
