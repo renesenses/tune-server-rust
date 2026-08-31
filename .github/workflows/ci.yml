@@ -369,7 +369,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -394,11 +394,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -420,7 +420,7 @@ jobs:
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -457,7 +457,7 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
