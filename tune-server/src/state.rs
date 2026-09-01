@@ -148,6 +148,12 @@ impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpStat
     }
 }
 
+impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
+    fn from_ref(state: &AppState) -> Self {
+        Self::new(state.backend.clone())
+    }
+}
+
 impl AppState {
     /// L'horodatage absolu du démarrage du processus, en RFC 3339 (UTC).
     ///

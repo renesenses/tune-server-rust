@@ -22,20 +22,24 @@
 //! cinq écrans sans rien gagner : aucun utilisateur ne lit une URL d'API. On
 //! garde la valeur, on change le libellé.
 
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
-use crate::error::AppError;
-use crate::state::AppState;
+use crate::SmartHttpState;
+use tune_http_types::AppError;
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SmartHttpState: axum::extract::FromRef<S>,
+{
     Router::new()
         .route("/generate", post(generate_smart_playlist))
         .route("/mood", post(mood_playlist))
@@ -85,7 +89,7 @@ struct GenerateRequest {
 }
 
 async fn generate_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<GenerateRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);
@@ -276,7 +280,7 @@ struct MoodRequest {
 }
 
 async fn mood_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<MoodRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(20);
@@ -437,7 +441,7 @@ struct SimilarToRequest {
 }
 
 async fn similar_to_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<SimilarToRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(20);
@@ -602,7 +606,7 @@ struct HistoryBasedRequest {
 }
 
 async fn history_based_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<HistoryBasedRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);
@@ -792,7 +796,7 @@ struct TempoMatchRequest {
 }
 
 async fn tempo_match_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<TempoMatchRequest>,
 ) -> Result<Json<Value>, AppError> {
     let tolerance = body.tolerance.unwrap_or(10.0);
@@ -871,7 +875,7 @@ struct DiscoveryRequest {
 }
 
 async fn discovery_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<DiscoveryRequest>,
 ) -> Result<Json<Value>, AppError> {
     let limit = body.limit.unwrap_or(30);
@@ -1039,5 +1043,52 @@ mod tests {
     fn ignores_names_under_three_chars() {
         // "U2" (2 chars) must not match on an incidental "u2" substring.
         assert_eq!(pick_artist_from_prompt("music from u2 era", &names()), None);
+    }
+
+    /// Le helper `ou_defaut_journalise` (#2861) est visible depuis CETTE
+    /// caisse, et rend le même contrat que côté `tune-server`.
+    ///
+    /// ## Ce que ce test empêche de reperdre
+    ///
+    /// `panne_sql` est né dans `tune-server/src/routes/`. Une fusion de
+    /// `rc/v0.9.130` dans le lot d'extraction a rejoué, par détection de
+    /// renommage et **sans conflit**, les modifications écrites pour l'ANCIEN
+    /// emplacement : les vingt appels ci-dessus sont arrivés ici avec un
+    /// `use crate::routes::panne_sql::…` qui n'a de sens que dans
+    /// `tune-server`. Trente erreurs de compilation, aucune ligne signalée par
+    /// git.
+    ///
+    /// Le helper vit désormais dans `tune-http-types`, la caisse que les DEUX
+    /// caisses de routes voient déjà. Ce test nomme cette dépendance : si
+    /// quelqu'un le remonte dans `tune-server` — ou en pose une seconde copie
+    /// ici — il rougit avant la fusion, pas après.
+    #[test]
+    fn les_deux_caisses_de_routes_voient_le_meme_helper() {
+        use tune_http_types::panne_sql::OuDefautJournalise;
+
+        // Le `Ok` passe tel quel : le helper n'est pas un `unwrap_or_default`
+        // déguisé qui écraserait aussi les succès.
+        let ok: Result<Vec<i64>, String> = Ok(vec![7]);
+        assert_eq!(ok.ou_defaut_journalise(), vec![7]);
+
+        // L'`Err` rend le défaut — même réponse HTTP qu'avant la #2861, seule
+        // la trace s'ajoute.
+        let echec: Result<Vec<i64>, String> = Err("no such table: tracks".into());
+        assert!(echec.ou_defaut_journalise().is_empty());
+    }
+
+    /// Même verrou pour le canon d'instrument (#2799 §4), descendu dans
+    /// `tune-core` par la même fusion.
+    ///
+    /// `regle_credit_instrument_canonisee_comme_a_l_ecriture`
+    /// (`smart_collections.rs`) prouve que la RÈGLE l'applique ; celui-ci
+    /// prouve que la table elle-même est bien la table partagée, et non une
+    /// copie locale qui divergerait au premier instrument ajouté.
+    #[test]
+    fn le_canon_d_instrument_est_celui_de_tune_core() {
+        use tune_core::metadata::instruments::canoniser_instrument;
+
+        assert_eq!(canoniser_instrument("Grand Piano"), "piano");
+        assert_eq!(canoniser_instrument("bass drum"), "drums");
     }
 }

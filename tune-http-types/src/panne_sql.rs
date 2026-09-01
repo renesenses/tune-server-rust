@@ -40,6 +40,20 @@
 //! l'**appelant**, pas ceux de ce module. Aucune étiquette n'est à saisir sur
 //! les dizaines de sites concernés, donc aucune ne peut être fausse ni
 //! diverger du code après un déplacement.
+//!
+//! ## Pourquoi ce module vit ICI et non dans `tune-server::routes`
+//!
+//! Il y est né, mais les gestionnaires de routes ne vivent plus tous dans la
+//! même caisse : `tune-smart-http` en emprunte autant que `tune-server`. Une
+//! caisse extraite ne peut pas dépendre de `tune-server` — ce serait un cycle
+//! — donc l'helper descend au point que **les deux** voient déjà,
+//! `tune-http-types`, la caisse des contrats HTTP partagés.
+//!
+//! Le déplacement plutôt que la copie : deux implémentations divergeraient, et
+//! une seule des deux porterait la trace. Le test
+//! `les_deux_caisses_de_routes_voient_le_meme_helper` de `tune-smart-http`
+//! verrouille l'accès depuis la seconde caisse, que la compilation de
+//! `tune-server` seule ne prouve pas.
 
 /// Rend le défaut comme `unwrap_or_default()`, mais laisse une trace.
 ///

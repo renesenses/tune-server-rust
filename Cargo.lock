@@ -5383,6 +5383,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-http-types"
+version = "0.9.129"
+dependencies = [
+ "axum",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "tune-karaoke"
 version = "0.9.129"
 dependencies = [
@@ -5454,14 +5465,28 @@ dependencies = [
  "tune-concerts",
  "tune-core",
  "tune-dj",
+ "tune-http-types",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
+ "tune-smart-http",
  "tune-stream-http",
  "tune-streaming-http",
  "unicode-normalization",
  "urlencoding",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "tune-smart-http"
+version = "0.9.129"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tune-core",
+ "tune-http-types",
 ]
 
 [[package]]

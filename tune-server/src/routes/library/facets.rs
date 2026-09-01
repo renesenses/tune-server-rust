@@ -1,8 +1,8 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
@@ -1029,7 +1029,7 @@ fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(St
         // Résolveur branché sur la base + profil par défaut (1), cohérent avec
         // la convention « profil 1 » du reste des facettes ; laisse les
         // nouveaux critères référence/favori compter correctement.
-        let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+        let resolver = crate::routes::smart_refs::DbRefResolver::new(&state.backend);
         let ctx = crate::routes::smart_refs::RefCtx::root(
             &resolver,
             Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
@@ -1106,7 +1106,7 @@ pub(super) fn smart_collection_track_ids(state: &AppState, name: &str) -> Option
         .get(2)
         .and_then(|v| v.as_string())
         .unwrap_or_else(|| "all".into());
-    let resolver = crate::routes::smart_refs::DbRefResolver::new(state);
+    let resolver = crate::routes::smart_refs::DbRefResolver::new(&state.backend);
     let ctx = crate::routes::smart_refs::RefCtx::root(
         &resolver,
         Some(crate::routes::active_profile::DEFAULT_PROFILE_ID),
