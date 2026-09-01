@@ -143,14 +143,77 @@ async fn wasm_dispatch(
     (status, Json(out_body)).into_response()
 }
 
-async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
+/// Les fiches héritées de la clef de réglages `plugins`, débarrassées de
+/// celles que ce serveur ne peut pas honorer.
+///
+/// Cette clef est le **second** catalogue, et le seul que le tri de
+/// `MarketplacePlugin::is_installable` n'atteint pas : elle n'est écrite nulle
+/// part dans ce dépôt (`git grep 'set("plugins"' → 0 écriture, 3 lectures) et
+/// n'est rendue que par ici et par `/system/plugins`. Ce qu'elle contient vient
+/// donc de la table `settings` d'AVANT — celle du Tune écrit en Python, que la
+/// migration conserve —, et ces lignes ressortent **telles quelles** : ni
+/// `type`, ni `platforms`, aucun signal qui distingue une fiche vivante d'une
+/// fiche morte. C'est ce que décrit #2132 : « rien ne les filtre ».
+///
+/// Le signal retenu n'est pas un champ de la fiche — il n'y en a aucun de
+/// fiable dans un objet JSON libre — mais **le nom, confronté à ce que ce
+/// binaire peut réellement charger** ([`noms_chargeables`]) : exactement
+/// l'autorité que `install`/`update` interrogent déjà. Proposer et installer
+/// répondent ainsi de la même vérité ; sans quoi le gestionnaire offrirait une
+/// fiche que le bouton refuse ensuite par un 404.
+///
+/// Une fiche gardée est rendue **inchangée**, identifiant compris : un
+/// identifiant qui bouge casse les installations existantes.
+pub(crate) async fn fiches_locales_honorables(state: &AppState) -> Vec<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut plugins: Vec<Value> = settings
+    let heritees: Vec<Value> = settings
         .get("plugins")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    if heritees.is_empty() {
+        return heritees;
+    }
+
+    let chargeables = noms_chargeables(state).await;
+    let mut ecartees: Vec<String> = Vec::new();
+    let gardees: Vec<Value> = heritees
+        .into_iter()
+        .filter(|fiche| {
+            // Une fiche sans nom exploitable ne désigne rien : toutes les
+            // routes d'action (`/{name}/install`, `/enable`, `/{name}`) sont
+            // clavetées sur `name`.
+            let nom = fiche.get("name").and_then(Value::as_str).unwrap_or("");
+            if !nom.is_empty() && chargeables.contains(nom) {
+                return true;
+            }
+            ecartees.push(if nom.is_empty() {
+                "<sans nom>".to_string()
+            } else {
+                nom.to_string()
+            });
+            false
+        })
+        .collect();
+
+    if !ecartees.is_empty() {
+        // Même journal que le tri du catalogue distant
+        // (`marketplace_catalog_uninstallable_rows_dropped`) : les deux
+        // sources se lisent de la même façon dans un export.
+        tracing::info!(
+            kept = gardees.len(),
+            dropped = ecartees.len(),
+            noms = ?ecartees,
+            "plugins_local_catalog_unloadable_rows_dropped"
+        );
+    }
+    gardees
+}
+
+async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
 
     // Built-in plugins
     let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
@@ -313,6 +376,30 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // Le sort d'une fiche que l'utilisateur croit avoir installée.
+    //
+    // Avant le garde-fou d'`install_plugin`, un clic sur « Synchronized
+    // Lyrics » posait `plugin_lyrics_installed=true` et `_enabled=true` et
+    // répondait « installé, redémarrage requis ». Ces deux réglages sont
+    // toujours dans la base des serveurs ≤ v0.9.124, et cette route les
+    // relisait telle quelle : elle répondait encore « installed » pour un
+    // greffon qui n'a jamais existé ici, et le répéterait à vie.
+    //
+    // On ne détruit rien — `DELETE /plugins/{name}` reste la sortie, et si le
+    // greffon arrive un jour le réglage reprend son sens tout seul. On cesse
+    // seulement de confirmer une installation qui n'a rien chargé, et on le
+    // DIT : `unavailable`, avec la raison (#2132).
+    if (installed || enabled) && !peut_etre_installe(&state, &name).await {
+        tracing::info!(plugin_name = %name, "plugin_installed_flag_names_nothing");
+        return Json(json!({
+            "name": name,
+            "installed": false,
+            "enabled": false,
+            "status": "unavailable",
+            "detail": "no plugin by that name is compiled into this server or installed on disk — nothing was ever loaded",
+        }));
+    }
+
     Json(json!({
         "name": name,
         "installed": installed,
@@ -357,24 +444,39 @@ struct InstallRequest {
 /// encore ici par la ligne locale du gestionnaire, et repartait avec
 /// « installé » et « redémarrage requis » (#2132).
 async fn peut_etre_installe(state: &AppState, name: &str) -> bool {
-    if state
+    noms_chargeables(state).await.contains(name)
+}
+
+/// L'ensemble des identifiants que ce serveur peut réellement charger.
+///
+/// Une seule autorité, interrogée par tout ce qui promet quelque chose :
+/// `install`, `update`, le détail d'une fiche, et le tri des fiches héritées
+/// ([`fiches_locales_honorables`]). Deux sources, et seulement deux :
+///
+/// * le jeu **registré** ([`AppState::plugin_names`]) — dormant et hors
+///   catalogue compris (#2090) ;
+/// * les greffons **wasm déjà posés sur le disque**, que `load_wasm_plugins`
+///   ramasse au démarrage suivant.
+///
+/// Le balayage du disque a lieu à chaque appel : c'est un `readdir` sur un
+/// dossier de quelques entrées, et la seule alternative — mémoriser le jeu au
+/// démarrage — rendrait invisible un greffon installé depuis le dernier boot,
+/// que la liste des greffons wasm plus bas montre pourtant déjà.
+async fn noms_chargeables(state: &AppState) -> std::collections::HashSet<String> {
+    let mut noms: std::collections::HashSet<String> = state
         .plugin_names
         .get()
-        .is_some_and(|noms| noms.iter().any(|n| n == name))
-    {
-        return true;
-    }
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_default();
 
-    // Un greffon wasm déjà posé sur le disque : ses réglages le gouvernent
-    // vraiment, donc (ré)installer par son identifiant a un sens.
     let Some(dir) = crate::plugins::wasm_plugins_dir() else {
-        return false;
+        return noms;
     };
     let manager = tune_core::plugins::PluginManager::new(dir);
-    match manager.scan().await {
-        Ok(infos) => infos.iter().any(|i| i.manifest.id == name),
-        Err(_) => false,
+    if let Ok(infos) = manager.scan().await {
+        noms.extend(infos.into_iter().map(|i| i.manifest.id));
     }
+    noms
 }
 
 /// 404 pour un nom que ce serveur ne porte pas — corps identique pour
