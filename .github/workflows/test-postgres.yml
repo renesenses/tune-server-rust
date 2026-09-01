@@ -134,6 +134,19 @@ jobs:
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
       # migration n'ajoute. Sans lui, la prochaine colonne oubliee se
       # decouvrirait comme les colonnes CUE : par hasard, des mois plus tard.
+      # Restauration de sauvegarde : le volume fixe ne se rearme jamais et le
+      # volume d'une zone armee ne se propage pas (#2395, #2477). La requete
+      # `UPDATE` de `import_zones` est desormais BATIE -- elle porte ou non la
+      # colonne `volume` -- et une requete batie doit rendre le meme resultat
+      # sur les deux moteurs. Les memes scenarios tournent sur SQLite dans le
+      # job `test` de ci.yml ; sans cette etape, PostgreSQL ne les verrait pas :
+      # l'etape « Tests tune-core avec PostgreSQL » ci-dessus ne pose pas
+      # TUNE_TEST_PG_URL, donc `pg_or_skip!` y saute.
+      - name: Volume fixe et restauration de sauvegarde (#2395)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_config_backup -- --nocapture
+
       - name: Parité du schéma PG (#2111)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

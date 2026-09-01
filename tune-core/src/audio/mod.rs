@@ -21,6 +21,8 @@ pub mod encoder;
 pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
+/// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
+pub mod fixed_volume;
 pub mod formats;
 pub mod http_range;
 pub mod iso_sacd;
