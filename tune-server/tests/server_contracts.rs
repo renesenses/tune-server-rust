@@ -19,6 +19,8 @@ mod bios_langue_entete;
 mod bump_natifs_android;
 #[path = "cles_developpeur_persistance.rs"]
 mod cles_developpeur_persistance;
+#[path = "collections_couleur_persistee.rs"]
+mod collections_couleur_persistee;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
 #[path = "contexte_de_session.rs"]
