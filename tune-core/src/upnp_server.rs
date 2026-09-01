@@ -530,7 +530,7 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
 ///
 /// Portee volontairement etroite, et annoncee comme telle : on sait rendre
 /// **ce que `browse_*` publie deja** — pistes, radios, artistes, albums,
-/// genres. C'est ce que demandent les clients d'indexation et les menus des
+/// genres, listes de lecture. C'est ce que demandent les clients d'indexation et les menus des
 /// lecteurs reseau, et c'est tout ce qu'on puisse servir sans inventer un
 /// moteur de criteres complet : un `SearchCriteria` peut porter des
 /// expressions booleennes arbitraires que personne ici ne sait evaluer.
@@ -610,6 +610,7 @@ pub(crate) enum CibleRecherche {
     Artistes,
     Albums,
     Genres,
+    Listes,
 }
 
 impl CibleRecherche {
@@ -623,6 +624,7 @@ impl CibleRecherche {
             CibleRecherche::Artistes => "artists",
             CibleRecherche::Albums => "albums",
             CibleRecherche::Genres => "genres",
+            CibleRecherche::Listes => "playlists",
         }
     }
 }
@@ -632,15 +634,21 @@ impl CibleRecherche {
 ///
 /// `Search` ne peut rendre que ce qui existe : cette table est la liste
 /// exhaustive, et c'est elle qui dit quelle rubrique une expression vise.
-/// Les cinq entrées correspondent une à une aux `browse_*` : `browse_all_tracks`,
-/// `browse_radios`, `browse_artists`, `browse_albums`, `browse_genres`.
+/// Les six entrées correspondent une à une aux `browse_*` : `browse_all_tracks`,
+/// `browse_radios`, `browse_artists`, `browse_albums`, `browse_genres`,
+/// `browse_playlists`.
+///
+/// Le rayon « Years » n'y figure pas, et c'est un manque ASSUMÉ : ses
+/// conteneurs portent `object.container`, la classe générique, qu'aucun
+/// `SearchCriteria` ne peut viser sans ramener aussi les quatre autres
+/// rubriques de conteneurs. Il se parcourt par `Browse`, pas par `Search`.
 ///
 /// Les ancêtres sont volontairement PROCHES. `object.item`, `object.container`
 /// ou `object` balaieraient tout, et c'est exactement le garde que tient le
 /// test `une_recherche_d_images_ou_de_videos_ne_rend_rien` : sans lui,
 /// « object.item.imageItem » passerait par la clause `object.item` et rendrait
 /// toute la discothèque à un client qui cherche des photos.
-const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 5] = [
+const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 6] = [
     (
         CibleRecherche::Pistes,
         "object.item.audioitem.musictrack",
@@ -665,6 +673,16 @@ const CLASSES_PUBLIEES: [(CibleRecherche, &str, &[&str]); 5] = [
         CibleRecherche::Genres,
         "object.container.genre.musicgenre",
         &["object.container.genre"],
+    ),
+    (
+        CibleRecherche::Listes,
+        "object.container.playlistcontainer",
+        // Aucun ancêtre : le seul que DIDL-Lite lui donne est
+        // `object.container`, et la table le refuse délibérément — le nommer
+        // ferait de « tous les conteneurs » une recherche de listes de
+        // lecture. Un point de contrôle nomme la classe exacte, c'est ce
+        // qu'envoie l'entrée « Playlists » du menu d'un lecteur réseau.
+        &[],
     ),
 ];
 
@@ -1050,7 +1068,8 @@ fn search_tracks_in_container(
 /// ordre de grandeur que `candidats_par_titre` pour les pistes.
 const MAX_CANDIDATS_CONTENEURS: i64 = 10_000;
 
-/// Les rubriques NON-pistes d'un `Search` : artistes, albums, genres, radios.
+/// Les rubriques NON-pistes d'un `Search` : artistes, albums, genres, radios,
+/// listes de lecture.
 ///
 /// C'est le trou que decrit le fil forum #1439 (#1777, Jean Valjean, Marantz
 /// ND8006, releve du 30/08/2026) : le meme serveur montre ses conteneurs
@@ -1112,6 +1131,17 @@ fn search_containers_in_container(
             let retenus = retenir_par_titre(genres, titres, |g| g.0.as_str());
             let (page, total) = paginer(retenus, start, count);
             let mut didl = didl_genres(&page);
+            didl.total = total;
+            Some(didl)
+        }
+        // #2971 : `browse_playlists` publie déjà ces conteneurs, et
+        // `Search` ne les trouvait pas — le dossier « Playlists » plein par
+        // un verbe, vide par l'autre. Même source, même émetteur DIDL.
+        CibleRecherche::Listes => {
+            let listes = lire_listes_publiables(state);
+            let retenues = retenir_par_titre(listes, titres, |l| l.name.as_str());
+            let (page, total) = paginer(retenues, start, count);
+            let mut didl = didl_listes(&page);
             didl.total = total;
             Some(didl)
         }
@@ -1672,8 +1702,8 @@ fn browse_direct_children(
         "0" => browse_root(state),
         "artists" => browse_artists(state, start, count),
         "albums" => browse_albums(state, start, count),
-        "genres" => browse_genres(state),
-        "years" => browse_years(state),
+        "genres" => browse_genres(state, start, count),
+        "years" => browse_years(state, start, count),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
@@ -1828,10 +1858,18 @@ fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
     let demande = usize::try_from(count).unwrap_or(usize::MAX);
     let fin = debut.saturating_add(demande).min(total);
-    let page = &listes[debut..fin];
+    let mut didl = didl_listes(&listes[debut..fin]);
+    didl.total = total as u64;
+    didl
+}
 
+/// Le DIDL d'une liste de listes de lecture. `Browse` et `Search` passent par
+/// ici, comme `didl_genres` pour les genres : deux emetteurs pour la meme
+/// rubrique finiraient par diverger, et c'est exactement ce que #1777 avait
+/// laisse arriver — le meme dossier plein par un verbe, vide par l'autre.
+fn didl_listes(listes: &[crate::db::playlist_repo::Playlist]) -> DidlResult {
     let mut inner = String::new();
-    for liste in page {
+    for liste in listes {
         inner.push_str(&didl_container(
             &format!("playlist/{}", liste.id.unwrap_or(0)),
             "playlists",
@@ -1840,11 +1878,11 @@ fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
             Some(liste.track_count as u64),
         ));
     }
-
+    let total = listes.len() as u64;
     DidlResult {
         xml: didl_wrap(&inner),
-        total: total as u64,
-        returned: page.len() as u64,
+        total,
+        returned: total,
     }
 }
 
@@ -2112,8 +2150,19 @@ fn browse_all_tracks(state: &UpnpState, start: u64, count: u64, base_url: &str) 
     }
 }
 
-fn browse_genres(state: &UpnpState) -> DidlResult {
-    didl_genres(&lire_genres(state))
+/// Le rayon « Genres », page par page.
+///
+/// `start` et `count` viennent de `StartingIndex` / `RequestedCount`, comme
+/// pour `browse_radios` (#3115) : ils etaient purement ignores ici, et un
+/// point de controle qui pagine strictement lisait une reponse hors contrat.
+/// `TotalMatches` reste le nombre REEL de genres — c'est lui qui dit qu'il
+/// reste des pages. Meme decoupage que la branche `Genres` de `Search`, par
+/// le meme `paginer` : les deux verbes doivent rendre la meme page.
+fn browse_genres(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let (page, total) = paginer(lire_genres(state), start, count);
+    let mut didl = didl_genres(&page);
+    didl.total = total;
+    didl
 }
 
 /// Le DIDL d'une liste de genres. `Browse` et `Search` passent par ici.
@@ -2187,11 +2236,25 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
 /// `ROOT_CONTAINERS` (aucun conteneur annoncé qui s'ouvre vide) descend d'un
 /// niveau. Les albums sans année (`NULL` ou 0) restent visibles par les
 /// autres conteneurs, mais aucun dossier « année inconnue » n'est inventé.
-fn browse_years(state: &UpnpState) -> DidlResult {
-    let years = lire_annees(state);
+/// Le rayon « Years », page par page — meme regle que `browse_genres`.
+fn browse_years(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let (page, total) = paginer(lire_annees(state), start, count);
+    let mut didl = didl_annees(&page);
+    didl.total = total;
+    didl
+}
 
+/// Le DIDL d'une liste d'annees.
+///
+/// La classe reste `object.container`, la plus generique : DIDL-Lite n'en
+/// definit aucune pour une annee. C'est aussi pourquoi `Search` ne sait pas
+/// viser ce rayon — aucun `SearchCriteria` ne peut nommer une classe que
+/// quatre autres rubriques portent aussi. Constate, pas corrige ici :
+/// changer cette classe changerait ce que les points de controle deja
+/// installes lisent de ce dossier.
+fn didl_annees(annees: &[i64]) -> DidlResult {
     let mut inner = String::new();
-    for annee in &years {
+    for annee in annees {
         inner.push_str(&didl_container(
             &format!("year/{annee}"),
             "years",
@@ -2200,8 +2263,7 @@ fn browse_years(state: &UpnpState) -> DidlResult {
             None,
         ));
     }
-
-    let total = years.len() as u64;
+    let total = annees.len() as u64;
     DidlResult {
         xml: didl_wrap(&inner),
         total,
@@ -2925,7 +2987,7 @@ mod tests {
             !publies.is_empty(),
             "une bibliothèque étiquetée doit publier des genres"
         );
-        let liste = browse_genres(&state);
+        let liste = browse_genres(&state, 0, UNLIMITED_BROWSE_COUNT);
         for (genre, annonce) in &publies {
             let id = format!("genre/{}", urlencoding::encode(genre));
             let ouvert = browse_direct_children(&state, &id, 0, 0).total;
@@ -4763,6 +4825,311 @@ mod ssdp_msearch_tests {
             + marque.len();
         let fin = debut + reponse[debut..].find("&quot;").expect("id non ferme");
         reponse[debut..fin].to_string()
+    }
+
+    /// Tous les identifiants transportes par un DIDL echappe, dans l'ordre.
+    ///
+    /// `premier_objet` ne distingue que deux pages ; ici on verrouille la
+    /// LISTE — un identifiant de conteneur qui bouge casse les favoris des
+    /// points de controle DLNA, qui les memorisent tels quels.
+    fn ids_transportes(reponse: &str) -> Vec<String> {
+        const MARQUE: &str = "id=&quot;";
+        let mut ids = Vec::new();
+        let mut reste = reponse;
+        while let Some(p) = reste.find(MARQUE) {
+            let debut = p + MARQUE.len();
+            let fin = debut
+                + reste[debut..]
+                    .find("&quot;")
+                    .expect("un id ouvert doit se fermer");
+            ids.push(reste[debut..fin].to_string());
+            reste = &reste[fin..];
+        }
+        ids
+    }
+
+    /// #2971 — une base ou CHACUN des sept rayons racine porte de quoi
+    /// paginer : trois annees, trois genres, trois listes de lecture peuplees.
+    ///
+    /// `state_du_releve_nd8006` ne suffit pas : sans annee ni liste de
+    /// lecture, deux des sept rayons y sont vides, et un rayon vide ne
+    /// mesure aucune pagination.
+    fn state_aux_sept_rayons() -> UpnpState {
+        use crate::db::models::{Album, Artist};
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let artiste = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let pistes = TrackRepo::with_backend(backend.clone());
+        let listes = PlaylistRepo::with_backend(backend.clone());
+        for (titre, genre, annee) in [
+            ("Kind of Blue", "Jazz", 1959),
+            ("Bitches Brew", "Fusion", 1970),
+            ("The Wall", "Rock", 1979),
+        ] {
+            let mut album = Album::new(titre.into());
+            album.genre = Some(genre.into());
+            album.year = Some(annee);
+            album.artist_id = Some(artiste);
+            album.artist_name = Some("Miles Davis".into());
+            let album_id = albums.create(&album).unwrap();
+
+            let mut piste = Track::new(format!("{titre} — ouverture"));
+            piste.album_id = Some(album_id);
+            piste.album_title = Some(titre.into());
+            piste.artist_id = Some(artiste);
+            piste.artist_name = Some("Miles Davis".into());
+            piste.file_path = Some(format!("/music/{annee}.flac"));
+            let piste_id = pistes.create(&piste).unwrap();
+
+            let liste = listes
+                .create(&format!("Liste {annee}"), None, UPNP_PROFILE_ID)
+                .unwrap();
+            listes.set_tracks(liste, &[piste_id]).unwrap();
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    /// #2971 — le VERBE BROWSE des rayons « Years » et « Genres ».
+    ///
+    /// FAIT DE BASE, sur la reponse SOAP : un rayon ne transporte jamais plus
+    /// que le `RequestedCount` demande, il annonce exactement ce qu'il
+    /// transporte, son `TotalMatches` dit la taille du dossier et non celle de
+    /// la page, et deux pages successives ne commencent pas sur le meme objet.
+    ///
+    /// MESURE AVANT — trois annees, trois genres, `RequestedCount=2` :
+    /// `years` et `genres` rendaient `NumberReturned=3` et transportaient les
+    /// trois, et `StartingIndex=2` rendait la MEME premiere page.
+    /// `browse_direct_children` laissait tomber `start` et `count` sur ces
+    /// deux branches — les deux SEULES du dispatcher a le faire, une fois
+    /// `browse_radios` corrige par #3115. Un point de controle qui pagine
+    /// strictement lit une reponse hors contrat ContentDirectory:1.
+    ///
+    /// TEMOINS, verts des DEUX cotes et sur la meme base : la racine annonce
+    /// ses SEPT rayons, dans le meme ordre et avec les memes identifiants —
+    /// un identifiant qui bouge casse les favoris DLNA —, et les cinq autres
+    /// rayons respectaient deja leur `RequestedCount`.
+    #[test]
+    fn les_rayons_annees_et_genres_paginent_leur_reponse_browse() {
+        let state = state_aux_sept_rayons();
+
+        // --- TEMOIN 1 : la racine, ses sept rayons, leur ordre.
+        let racine = browse_action_response(&state, &soap_browse("0", 0, 0));
+        assert!(
+            !is_soap_fault(&racine),
+            "la racine rend un fault : {racine}"
+        );
+        assert_eq!(
+            ids_transportes(&racine),
+            vec![
+                "artists",
+                "albums",
+                "genres",
+                "years",
+                "tracks",
+                "radios",
+                "playlists"
+            ],
+            "les rayons de la racine ont change d'ordre ou d'identifiant : {racine}"
+        );
+        assert_eq!(
+            compteur(&racine, "NumberReturned"),
+            7,
+            "la racine n'annonce plus sept rayons : {racine}"
+        );
+
+        // --- TEMOIN 2 : les cinq rayons qui paginaient deja.
+        for rayon in ["artists", "albums", "tracks", "radios", "playlists"] {
+            let page = browse_action_response(&state, &soap_browse(rayon, 0, 2));
+            assert_eq!(
+                compteur(&page, "NumberReturned"),
+                objets_transportes(&page),
+                "temoin {rayon} : {page}"
+            );
+            assert!(
+                compteur(&page, "NumberReturned") <= 2,
+                "temoin {rayon} : RequestedCount=2 depasse — {page}"
+            );
+        }
+
+        // --- LE FAIT DE BASE : les deux rayons de ce ticket.
+        for rayon in ["years", "genres"] {
+            let page1 = browse_action_response(&state, &soap_browse(rayon, 0, 2));
+            let annonce1 = compteur(&page1, "NumberReturned");
+            assert_eq!(
+                annonce1,
+                objets_transportes(&page1),
+                "le rayon {rayon} annonce {annonce1} elements et en transporte {} : {page1}",
+                objets_transportes(&page1)
+            );
+            assert_ne!(annonce1, 0, "le rayon {rayon} est vide : {page1}");
+            assert!(
+                annonce1 <= 2,
+                "NumberReturned={annonce1} pour un RequestedCount=2 — le rayon \
+                 {rayon} sort du contrat ContentDirectory:1 : {page1}"
+            );
+            assert_eq!(
+                compteur(&page1, "TotalMatches"),
+                3,
+                "TotalMatches doit dire la taille du dossier {rayon}, pas celle \
+                 de la page : {page1}"
+            );
+
+            let page2 = browse_action_response(&state, &soap_browse(rayon, 2, 2));
+            assert_eq!(
+                compteur(&page2, "NumberReturned"),
+                objets_transportes(&page2),
+                "page 2 de {rayon} : {page2}"
+            );
+            assert_ne!(
+                premier_objet(&page1),
+                premier_objet(&page2),
+                "StartingIndex est ignore sur {rayon} : les deux pages \
+                 commencent sur le meme objet.\npage 1 : {page1}\npage 2 : {page2}"
+            );
+        }
+    }
+
+    /// #2971 — le VERBE SEARCH du rayon « Playlists ».
+    ///
+    /// Le menu d'un lecteur reseau passe par `Search`, le parcours de dossiers
+    /// par `Browse` : c'est la lecon de #1777, et elle n'avait ete tiree que
+    /// pour quatre rubriques sur six. `CLASSES_PUBLIEES` ne nommait pas
+    /// `object.container.playlistContainer` — la classe que `browse_playlists`
+    /// publie pourtant sur CHAQUE liste. Une recherche de listes de lecture
+    /// retombait donc sur `cible = None`, donc sur un DIDL vide, sans faute ni
+    /// trace : le dossier « Playlists » plein par un verbe, vide par l'autre.
+    ///
+    /// MESURE AVANT, trois listes peuplees en base :
+    /// `Browse(playlists)` rendait `NumberReturned=3` et
+    /// `Search(upnp:class derivedfrom "object.container.playlistContainer")`
+    /// rendait `NumberReturned=0`.
+    ///
+    /// TEMOINS verts des DEUX cotes : les quatre rubriques que `Search`
+    /// servait deja, sur la meme base et dans le meme test.
+    #[test]
+    fn le_menu_du_lecteur_trouve_aussi_les_listes_de_lecture() {
+        const CLASSE_LISTE: &str = "object.container.playlistContainer";
+        let state = state_aux_sept_rayons();
+
+        // --- TEMOINS : ce que Search sert deja.
+        for (classe, attendu) in [
+            ("object.container.person.musicArtist", "Miles Davis"),
+            ("object.container.album.musicAlbum", "Kind of Blue"),
+            ("object.container.genre.musicGenre", "Jazz"),
+            ("object.item.audioItem.musicTrack", "ouverture"),
+        ] {
+            let reponse = search_action_response(
+                &state,
+                &soap_search(
+                    "0",
+                    &format!("upnp:class derivedfrom &quot;{classe}&quot;"),
+                    0,
+                    100,
+                ),
+            );
+            assert!(!is_soap_fault(&reponse), "temoin {classe} : {reponse}");
+            assert_ne!(
+                compteur(&reponse, "NumberReturned"),
+                0,
+                "temoin {classe} : la rubrique est vide — {reponse}"
+            );
+            assert!(
+                reponse.contains(attendu),
+                "temoin {classe} : {attendu} absent — {reponse}"
+            );
+        }
+
+        // --- LE FAIT DE BASE : la meme rubrique par les DEUX verbes.
+        let parcours = browse_action_response(&state, &soap_browse("playlists", 0, 100));
+        assert_eq!(
+            compteur(&parcours, "NumberReturned"),
+            3,
+            "le parcours de dossiers ne montre deja pas les trois listes : {parcours}"
+        );
+
+        let recherche = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                0,
+                100,
+            ),
+        );
+        assert!(
+            !is_soap_fault(&recherche),
+            "chercher des listes de lecture rend un fault : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            compteur(&parcours, "NumberReturned"),
+            "le menu du lecteur lit « liste vide » la ou le parcours de \
+             dossiers montre trois listes.\nBrowse : {parcours}\nSearch : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "TotalMatches"),
+            3,
+            "TotalMatches : {recherche}"
+        );
+        assert_eq!(
+            ids_transportes(&recherche),
+            ids_transportes(&parcours),
+            "les deux verbes ne publient pas les memes listes.\nBrowse : \
+             {parcours}\nSearch : {recherche}"
+        );
+
+        // --- Et ce verbe-la pagine, comme les autres rubriques.
+        let page2 = search_action_response(
+            &state,
+            &soap_search(
+                "playlists",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                2,
+                1,
+            ),
+        );
+        assert_eq!(
+            compteur(&page2, "NumberReturned"),
+            1,
+            "la deuxieme page ne rend pas la piece demandee : {page2}"
+        );
+        assert_eq!(
+            compteur(&page2, "TotalMatches"),
+            3,
+            "TotalMatches doit rester celui du dossier : {page2}"
+        );
+        assert_ne!(
+            premier_objet(&page2),
+            premier_objet(&recherche),
+            "StartingIndex est ignore par la recherche de listes.\npage 1 : \
+             {recherche}\npage 2 : {page2}"
+        );
+
+        // --- Chercher des listes DANS un album n'a pas de sens : vide, pas
+        // en faute. C'est la regle deja tenue par les autres rubriques.
+        let hors_portee = search_action_response(
+            &state,
+            &soap_search(
+                "albums",
+                &format!("upnp:class derivedfrom &quot;{CLASSE_LISTE}&quot;"),
+                0,
+                100,
+            ),
+        );
+        assert!(!is_soap_fault(&hors_portee), "hors portee : {hors_portee}");
+        assert_eq!(
+            compteur(&hors_portee, "NumberReturned"),
+            0,
+            "hors portee : {hors_portee}"
+        );
     }
 
     /// #2103 et #1800 — le dossier Radio vu VIDE sur le Marantz ND8006, huit
