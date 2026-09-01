@@ -198,6 +198,84 @@ async fn pg_tracks_round_trip() {
     assert!(paths.contains("/music/time.flac"));
 }
 
+/// #2168 — **la même facette profonde doit rendre le même ensemble sur les
+/// DEUX moteurs.**
+///
+/// Une facette « contient » (genre, label, compositeur) assemble un `OU` de
+/// `LIKE`. En chaîne plate, sa profondeur d'arbre vaut son nombre de termes :
+/// SQLite refuse au-delà de 1 000 (`Expression tree is too large`) tandis que
+/// PostgreSQL accepte la même chaîne. Le filtre rendait donc la bonne liste ici
+/// et une liste VIDE là-bas — la divergence entre moteurs que
+/// `facet_filter::ou_equilibre` supprime.
+///
+/// Le jumeau SQLite de cette épreuve est
+/// `facettes_multivaleurs::une_facette_a_mille_valeurs_rend_encore_lunion`
+/// (crate `tune-server`). Les deux mesurent le MÊME fait — l'ensemble rendu —
+/// pour qu'une correction d'un seul côté se voie.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2168_facette_profonde_rend_le_meme_ensemble_que_sqlite() {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::track_repo::TrackRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db);
+
+    // 3 Jazz, 2 Rock, 2 Blues.
+    for (titre, genre) in [
+        ("J1", "Jazz"),
+        ("J2", "Jazz"),
+        ("J3", "Jazz"),
+        ("R1", "Rock"),
+        ("R2", "Rock"),
+        ("B1", "Blues"),
+        ("B2", "Blues"),
+    ] {
+        let mut t = Track::new(titre.into());
+        t.file_path = Some(format!("/music/{titre}.flac"));
+        t.duration_ms = 1000;
+        t.format = Some("flac".into());
+        t.genre = Some(genre.into());
+        repo.create(&t).unwrap();
+    }
+
+    let titres = |f: &TrackFilter| -> Vec<String> {
+        let (items, total) = repo.list_filtered(f, 100, 0).unwrap();
+        assert_eq!(items.len() as i64, total, "la liste doit tenir son total");
+        let mut v: Vec<String> = items.into_iter().map(|t| t.title).collect();
+        v.sort();
+        v
+    };
+
+    // Le témoin : deux valeurs, l'union, sans doublon.
+    let deux = TrackFilter {
+        genres: vec!["Jazz".into(), "Rock".into()],
+        ..Default::default()
+    };
+    assert_eq!(titres(&deux), vec!["J1", "J2", "J3", "R1", "R2"]);
+
+    // La même sélection noyée dans 1 500 valeurs qui ne désignent rien : sur
+    // SQLite, la chaîne plate échouait ici et rendait zéro piste.
+    let mut profond = deux.clone();
+    profond.genres.extend((0..1500).map(|i| format!("z{i}")));
+    assert_eq!(
+        titres(&profond),
+        titres(&deux),
+        "PostgreSQL doit rendre exactement le même ensemble que la sélection à deux valeurs"
+    );
+
+    // Témoin ET : (Jazz OU Rock) ET un format absent ne rend rien — le OU de la
+    // facette ne doit pas déborder sur le ET.
+    let mut croise = profond.clone();
+    croise.formats = vec!["aiff".into()];
+    assert!(titres(&croise).is_empty());
+
+    // Témoin ZÉRO : une facette vide ne filtre rien.
+    let rien = TrackFilter::default();
+    assert!(!rien.is_active());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_zones_round_trip() {
     use crate::db::zone_repo::ZoneRepo;
