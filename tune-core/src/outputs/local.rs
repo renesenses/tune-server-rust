@@ -1082,12 +1082,14 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     };
 
                 let is_default = raw_name == default_name;
-                // caps_reliable was only read by the removed (name, caps) collapse
-                // (Linux collapses by name; Windows/macOS now keep every device).
-                let _ = caps_reliable;
                 // Ce que vaut la liste qu'on s'apprête à publier. Sur WASAPI
-                // elle n'a jamais été confrontée au matériel (#2862).
-                let rates_evidence = sample_rate_evidence(&host_name);
+                // elle n'a jamais été confrontée au matériel (#2862) ; sur ALSA
+                // elle ne vaut que si le PCM interrogé EST le matériel, et pas
+                // un `dmix:`/`plughw:` qui accepte tout (#1655). Et une liste
+                // SUPPOSÉE (`caps_reliable = false`) n'a jamais rien mesuré —
+                // ce drapeau était calculé puis jeté.
+                let rates_evidence =
+                    sample_rate_evidence_for_device(&host_name, &endpoint_id, caps_reliable);
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
                 // output repeatedly with varying caps, so collapse by NAME and
@@ -5729,11 +5731,20 @@ impl OutputTarget for LocalOutput {
                     // (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Sur ALSA / ASIO /
                     // CoreAudio la plage vient d'une interrogation du pilote et
                     // la branche dit bien ce qu'elle prétend.
-                    let rate_evidence = sample_rate_evidence(host_id_name);
+                    // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
+                    // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
+                    // pilote ou d'un rééchantillonneur (#1655). Le journaliser
+                    // ici est la ligne qui manquait pour trancher un relevé de
+                    // terrain sans y retourner.
+                    let opened_endpoint_id =
+                        device.id().map(|id| id.to_string()).unwrap_or_default();
+                    let rate_evidence =
+                        sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
                     info!(
                         source_sr = sample_rate,
                         device_default_sr = ?default_sr,
                         backend = %host_id_name,
+                        endpoint_id = %opened_endpoint_id,
                         rate_support_measured = rate_evidence.is_measured(),
                         "local_audio_open_at_source_rate_reported_supported"
                     );
@@ -7876,6 +7887,76 @@ pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
     }
 }
 
+/// Le nom de PCM ALSA porté par un `endpoint_id`, sans le préfixe d'hôte.
+///
+/// cpal rend `DeviceId` sous la forme `«hôte»:«pcm»` (`Display`, `cpal-0.17.3`
+/// `src/lib.rs:255`), et le `pcm` d'ALSA est lui-même préfixé par son greffon
+/// (`hw:CARD=…`, `dmix:CARD=…`). On ne retire donc QUE le préfixe d'hôte, et
+/// seulement s'il est présent : certains enregistrements ne portent que le PCM.
+fn alsa_pcm_name(endpoint_id: &str) -> &str {
+    let Some((tete, reste)) = endpoint_id.split_once(':') else {
+        return endpoint_id;
+    };
+    if tete.eq_ignore_ascii_case("alsa") {
+        reste
+    } else {
+        endpoint_id
+    }
+}
+
+/// Ce PCM ALSA parle-t-il au MATÉRIEL, ou à un convertisseur logiciel ?
+///
+/// `snd_device_name_hint` expose la même carte sous une dizaine de noms qui
+/// partagent tous la même première ligne de description — c'est pourquoi le
+/// dédoublonnage Linux les regroupe. Un seul de ces noms atteint le pilote sans
+/// conversion : `hw:`. Tous les autres (`default`, `sysdefault:`, `plughw:`,
+/// `dmix:`, `plug:`, `front:`, `iec958:`, `pipewire`, `pulse`, `jack`) passent
+/// par un greffon qui ACCEPTE tout et rééchantillonne.
+///
+/// La distinction n'est pas cosmétique : `dmix` fixe la cadence de son esclave
+/// (`defaults.pcm.dmix.rate 48000` dans `alsa.conf`). Interroger un tel PCM
+/// cadence par cadence rend « oui » pour 44,1 → 384 kHz, mais c'est le
+/// convertisseur qui répond, pas le DAC.
+pub fn alsa_pcm_is_direct_hardware(endpoint_id: &str) -> bool {
+    alsa_pcm_name(endpoint_id)
+        .split(':')
+        .next()
+        .is_some_and(|greffon| greffon.eq_ignore_ascii_case("hw"))
+}
+
+/// Ce que vaut la liste de cadences d'UN périphérique — pas seulement de son hôte.
+///
+/// [`sample_rate_evidence`] répond pour l'hôte ; elle ne peut pas voir deux
+/// faits qui, eux, sont propres au périphérique :
+///
+/// 1. **Le PCM interrogé n'est pas forcément le matériel.** Sur ALSA, cpal
+///    interroge bien le pilote (`hw_params.test_rate`) — mais le « pilote »
+///    d'un `dmix:` ou d'un `plughw:` est un rééchantillonneur logiciel. GgB
+///    (#1655, Eversolo DAC-Z8) : l'écran annonce 44,1 → 384 kHz « mesurées »,
+///    `local_audio_stream_config` note `output_sr=192000`, et
+///    `/proc/asound/card0/stream0` montre l'endpoint USB à 48 kHz nominal.
+///    C'est le greffon qui a dit oui.
+/// 2. **La liste peut être une SUPPOSITION.** Quand l'énumération échoue,
+///    [`probe_device_fallback_caps`] invente `(2, [44100, 48000])` et le
+///    signale par `caps_reliable = false` — un drapeau que l'énumération
+///    calculait puis jetait (`let _ = caps_reliable`).
+///
+/// Aucune de ces deux réserves ne change ce qui est JOUÉ : elles changent ce
+/// que l'écran a le droit d'affirmer.
+pub fn sample_rate_evidence_for_device(
+    backend: &str,
+    endpoint_id: &str,
+    enumeration_answered: bool,
+) -> SampleRateEvidence {
+    if !enumeration_answered {
+        return SampleRateEvidence::Unverified;
+    }
+    if backend.eq_ignore_ascii_case("alsa") && !alsa_pcm_is_direct_hardware(endpoint_id) {
+        return SampleRateEvidence::Unverified;
+    }
+    sample_rate_evidence(backend)
+}
+
 /// Quels chemins de sortie **exclusive** sont réellement COMPILÉS pour une
 /// cible donnée.
 ///
@@ -9046,6 +9127,94 @@ mod tests {
         assert!(sample_rate_evidence("alsa").is_measured());
     }
 
+    // -----------------------------------------------------------------------
+    // #1655 — sur ALSA, « le pilote a répondu » ne veut pas dire « le DAC a
+    // répondu ».
+    //
+    // Relevé de GgB du 30/08/2026, sur 0.9.127, pendant la lecture d'un
+    // fichier 192 kHz / 24 bits (`/proc/asound/card0/stream0`) :
+    //
+    //     Momentary freq = 48001 Hz (0x6.0008)
+    //     Packet Size = 72
+    //     Rates: 44100, 48000, …, 705600, 768000
+    //
+    // `Momentary freq` n'est pas une cadence nominale : c'est `freqm`, le
+    // compteur de rétroaction de l'endpoint USB, en 16.16 échantillon par
+    // micro-trame (noyau Linux, `sound/usb/proc.c`, `proc_dump_ep_status` →
+    // `get_high_speed_hz(x) = (x * 125 + (1 << 9)) >> 10`). 0x6.0008 vaut
+    // 6,000122 échantillon par micro-trame de 125 µs, soit 48 000 Hz nominal
+    // dérivant de +0,002 % — la dérive NORMALE d'un endpoint asynchrone
+    // (`ASYNC`, `Feedback Format = 16.16`) asservi à l'horloge du DAC. Le
+    // 48001 n'est donc pas le défaut. Le défaut est le 48 000 nominal qu'il
+    // révèle : un flux 192 kHz demanderait ≈24 échantillons par micro-trame
+    // (0x18.xxxx), et ne tiendrait pas dans un paquet de 72 octets
+    // (24 × 2 canaux × 4 octets = 192 octets minimum).
+    //
+    // Côté Tune, le journal du même appareil dit `output_sr=192000` et
+    // `max_channels=32` — or ce DAC est stéréo. 32 est le PLAFOND que cpal
+    // impose (`cpal-0.17.3` `src/host/alsa/mod.rs:556`) : seul un greffon
+    // logiciel annonce autant de canaux. Et le journal porte
+    // `ALSA lib pcm_direct.c … snd1_pcm_direct_slave_recover`, c'est-à-dire
+    // `dmix` — dont `alsa.conf` fixe l'esclave à `defaults.pcm.dmix.rate
+    // 48000`. L'écran affiche donc, comme MESURÉES, les cadences qu'un
+    // rééchantillonneur a bien voulu accepter.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn un_pcm_alsa_convertisseur_ne_peut_pas_annoncer_une_cadence_mesuree() {
+        for pcm in [
+            "ALSA:default",
+            "ALSA:sysdefault:CARD=DACZ8",
+            "ALSA:plughw:CARD=DACZ8,DEV=0",
+            "ALSA:dmix:CARD=DACZ8,DEV=0",
+            "ALSA:front:CARD=DACZ8,DEV=0",
+            "ALSA:iec958:CARD=DACZ8,DEV=0",
+            "ALSA:pipewire",
+            "ALSA:pulse",
+        ] {
+            assert!(
+                !sample_rate_evidence_for_device("Alsa", pcm, true).is_measured(),
+                "« {pcm} » n'est pas le DAC : c'est un greffon qui accepte tout \
+                 et rééchantillonne. Présenter ses cadences comme mesurées, \
+                 c'est faire dire au matériel ce que le convertisseur a \
+                 répondu — l'écran de GgB annonce 44,1 → 384 kHz pendant que \
+                 l'endpoint USB tourne à 48 kHz (#1655)"
+            );
+        }
+    }
+
+    #[test]
+    fn le_pcm_materiel_direct_reste_une_mesure_et_la_supposition_jamais() {
+        // Témoin : `hw:` atteint le pilote sans conversion. Le rétrograder
+        // ferait perdre à Linux une information qu'il avait bel et bien.
+        assert!(
+            sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", true).is_measured()
+        );
+        // Le préfixe d'hôte est facultatif : le PCM reste lisible sans lui.
+        assert!(sample_rate_evidence_for_device("Alsa", "hw:CARD=DACZ8,DEV=0", true).is_measured());
+        assert!(alsa_pcm_is_direct_hardware("hw:CARD=DACZ8,DEV=0"));
+        assert!(!alsa_pcm_is_direct_hardware("dmix:CARD=DACZ8,DEV=0"));
+
+        // Une liste SUPPOSÉE n'a mesuré personne — quel que soit l'hôte ou le
+        // PCM. C'est le drapeau que `probe_device_fallback_caps` calculait et
+        // que l'énumération jetait (`let _ = caps_reliable`) : les 40
+        // `local_audio_device_fallback_to_assumed_stereo_44100_48000` du
+        // journal de GgB étaient publiés comme des mesures.
+        assert!(
+            !sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", false)
+                .is_measured()
+        );
+        assert!(
+            !sample_rate_evidence_for_device("CoreAudio", "CoreAudio:Engine", false).is_measured()
+        );
+
+        // Les hôtes non-ALSA ne dépendent pas d'un nom de PCM : leur verdict
+        // reste celui de `sample_rate_evidence`, inchangé.
+        assert!(sample_rate_evidence_for_device("CoreAudio", "", true).is_measured());
+        assert!(sample_rate_evidence_for_device("Asio", "", true).is_measured());
+        assert!(!sample_rate_evidence_for_device("Wasapi", "", true).is_measured());
+    }
+
     /// La table est indexée sur `cpal::HostId::name()`, qui rend le nom de la
     /// VARIANTE (`stringify!`) et non un libellé d'affichage. Si cpal renomme
     /// une variante, la table devient muette et l'hôte retombe silencieusement
@@ -9152,7 +9321,7 @@ mod tests {
         // Decoupe en CARACTERES : ce fichier est accentue, une coupe a
         // l octet pres tomberait au milieu d un caractere et paniquerait.
         let branche: String = apres.chars().take(4_000).collect();
-        let appel_indice = ["sample_rate_evidence(", "host_id_name)"].concat();
+        let appel_indice = ["sample_rate_evidence_for_device(", "host_id_name,"].concat();
         assert!(
             branche.contains(&appel_indice),
             "cette branche ouvre à la cadence source parce que le périphérique \
@@ -9160,7 +9329,15 @@ mod tests {
              find_matching_config recopie la cadence demandée — donc la branche \
              est toujours prise, needs_resample reste faux et rubato ne tourne \
              jamais. Elle doit au moins journaliser d'où vient cette \
-             supposition (#2862)"
+             supposition (#2862), et sur ALSA QUEL PCM a dit oui : le « oui » \
+             d'un `dmix:` n'est pas celui du DAC (#1655)"
+        );
+        let pcm_journalise = ["endpoint_id = %", "opened_endpoint_id,"].concat();
+        assert!(
+            branche.contains(&pcm_journalise),
+            "sans le nom du PCM ALSA dans le journal, un relevé de terrain ne \
+             peut pas dire si Tune a ouvert le matériel ou un \
+             rééchantillonneur — c'est la ligne qui manquait à #1655"
         );
     }
 
