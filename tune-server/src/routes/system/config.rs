@@ -559,18 +559,18 @@ pub(super) async fn get_config(
     );
     config.insert("zone_limit".to_string(), zone_limit);
     config.insert("license_key_masked".to_string(), json!(license_key_masked));
-    // Redact secrets before returning. The verbatim settings dump above includes
-    // raw credentials that the web client never reads (it uses discogs_token_set,
-    // license_key_masked and the streaming status store). Never expose them.
-    config.remove("license_key");
-    config.remove("discogs_token");
-    if let Some(Value::Object(qobuz)) = config.get_mut("auth_tokens_qobuz") {
-        for k in ["stored_password", "user_auth_token", "app_secret"] {
-            if qobuz.contains_key(k) {
-                qobuz.insert(k.to_string(), json!("********"));
-            }
-        }
-    }
+    // Caviardage des secrets, EN DERNIER — après `discogs_token_set` et
+    // `license_key_masked`, qui se calculent sur les valeurs en clair.
+    //
+    // Cette route recopie la table `settings` telle quelle : tout ce qu'une
+    // fonctionnalité y écrit sort par ici. Il y avait à la place une liste de
+    // deux retraits et trois sous-champs Qobuz nommés à la main, et elle avait
+    // pris du retard sur ce que la table contient (#2793) — la graine Ed25519
+    // d'un appairage AirPlay (`airplay2_pairing:<id>`) et les clés `tunedev_`
+    // de l'API développeur (`developer_api_keys`) sortaient en clair. La règle
+    // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
+    // donc aussi le réglage ajouté demain.
+    tune_core::secrets::caviarder_carte(&mut config);
     Json(Value::Object(config))
 }
 
@@ -911,7 +911,17 @@ pub(super) struct ExportConfigQuery {
     include_secrets: bool,
 }
 
+/// `GET /system/config/export` — sauvegarde de la table `settings`.
+///
+/// **Réservée à l'administrateur** (#2793). Sans `RequireAdmin`, le
+/// middleware d'authentification se contentait de vérifier qu'un jeton était
+/// valide : n'importe quel compte, même sans rôle, obtenait le dump complet —
+/// et `?include_secrets=true` le lui rendait en clair, secret de signature JWT
+/// compris. `RequireAdmin` laisse passer sans condition quand l'authentification
+/// est désactivée (`auth.rs:502`), donc l'installation mono-utilisateur, qui est
+/// le cas courant, ne voit aucun changement.
 pub(super) async fn export_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
 ) -> Json<Value> {
@@ -930,32 +940,63 @@ pub(super) async fn export_config(
     // payload), so restoring a redacted backup to the SAME server leaves the
     // existing secrets untouched. Pass ?include_secrets=true for a full backup
     // when migrating to a fresh server.
+    //
+    // La liste de trois retraits nommés à la main a été remplacée par la même
+    // règle que `get_config` : c'était la seconde des « listes partielles » de
+    // #2793, et elle ne connaissait ni la graine AirPlay ni les clés
+    // développeur.
+    //
+    // On RETIRE, on ne masque pas — c'est la différence avec `get_config`, et
+    // elle est délibérée : une sauvegarde se ré-importe. Poser `********` à la
+    // place de `jwt_secret` écraserait le vrai secret de signature à la
+    // restauration ; l'absence de la clé, elle, est ce que `import_config` sait
+    // déjà ignorer.
     if !q.include_secrets {
-        config.remove("license_key");
-        config.remove("discogs_token");
-        config.remove("auth_tokens_qobuz");
+        tune_core::secrets::retirer_les_secrets(&mut config);
     }
     Json(Value::Object(config))
 }
 
+/// `POST /system/config/import` — restauration de réglages.
+///
+/// **Réservée à l'administrateur** (#2793) : la route appelait `settings.set`
+/// sur chaque clé reçue, donc un utilisateur standard pouvait poster
+/// `{"auth_enabled": "false"}` et éteindre l'authentification du serveur.
+///
+/// L'application est en DEUX TEMPS : tout le corps est validé et converti
+/// d'abord, et rien n'est écrit tant qu'une entrée est refusée. Avant, la
+/// validation vivait dans la boucle d'écriture, donc un corps dont la dixième
+/// entrée était invalide laissait les neuf premières appliquées.
+///
+/// Une écriture qui échoue en cours de route est désormais DITE (`500`) avec
+/// le nombre de clés déjà appliquées, au lieu d'être avalée par un
+/// `if ….is_ok()` qui rendait `200` et un compte silencieusement trop bas :
+/// l'appelant croyait sa restauration complète.
 pub(super) async fn import_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let mut a_ecrire: Vec<(String, String)> = Vec::with_capacity(body.len());
+    for (key, value) in body {
+        if key.trim().is_empty() {
+            return Err(AppError::bad_request("empty setting key"));
+        }
+        let str_val = match value {
+            Value::String(s) => s,
+            other => other.to_string(),
+        };
+        a_ecrire.push((key, str_val));
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut imported = 0;
-    for (key, value) in body {
-        let str_val = if value.is_string() {
-            value
-                .as_str()
-                .ok_or_else(|| AppError::bad_request("expected string"))?
-                .to_string()
-        } else {
-            value.to_string()
-        };
-        if settings.set(&key, &str_val).is_ok() {
-            imported += 1;
-        }
+    for (key, str_val) in a_ecrire {
+        settings.set(&key, &str_val).map_err(|e| {
+            AppError::internal(format!(
+                "import stopped after {imported} settings: writing '{key}' failed: {e}"
+            ))
+        })?;
+        imported += 1;
     }
     Ok(Json(json!({ "imported": imported })))
 }

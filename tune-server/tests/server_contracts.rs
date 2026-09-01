@@ -21,6 +21,8 @@ mod bump_natifs_android;
 mod cles_developpeur_persistance;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "config_secrets_et_roles.rs"]
+mod config_secrets_et_roles;
 #[path = "contexte_de_session.rs"]
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
