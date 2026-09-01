@@ -9,6 +9,9 @@ pub mod convolver;
 pub mod crossfeed;
 pub mod dash_growth;
 pub mod decode;
+/// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
+/// sur le décodage en cours, sans le coûter.
+pub mod decode_progress;
 pub mod dff;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
