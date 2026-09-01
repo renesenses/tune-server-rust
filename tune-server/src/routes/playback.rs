@@ -1972,6 +1972,23 @@ async fn set_volume(
                     .into_response();
             }
         };
+    // #1274 — voir `zones::refus_de_resolution_volume`. Le refus vient AVANT
+    // le verrou audiophile et avant l'orchestrateur : rien n'est envoyé au
+    // périphérique, et rien n'est persisté, pour une consigne qui n'a nulle
+    // part où atterrir.
+    if let Some(db) = body.volume_db {
+        let device_id = get_zone_device_id(&state, zone_id);
+        if let Some(motif) =
+            crate::routes::zones::refus_de_resolution_volume(&state, device_id.as_deref(), db).await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "volume_db_hors_resolution", "message": motif })),
+            )
+                .into_response();
+        }
+    }
+
     let volume = tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, demande);
     if (volume - demande).abs() > f64::EPSILON {
         tracing::debug!(
