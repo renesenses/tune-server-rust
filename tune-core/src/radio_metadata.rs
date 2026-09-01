@@ -23,8 +23,9 @@ pub struct IcyMetadata {
 /// Fetch metadata for the given radio station.
 ///
 /// The function first checks whether the station URL matches a known metadata
-/// API (Radio France / FIP, Radio Paradise) and uses those richer endpoints.
-/// As a fallback it attempts to read raw ICY metadata from the audio stream.
+/// API (Radio France / FIP, Radio Paradise, BBC) and uses those richer
+/// endpoints. As a fallback it attempts to read raw ICY metadata from the audio
+/// stream.
 pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Option<IcyMetadata> {
     // Radio France family (FIP, France Inter, France Musique, ...)
     if stream_url.contains("fipradio")
@@ -48,6 +49,15 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
     {
         let chan = radioparadise_channel(stream_url);
         return fetch_radio_paradise_metadata(station_name, chan).await;
+    }
+
+    // BBC — troisième famille (#2486). Mesuré le 01/09/2026 :
+    // `http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three` répond 200 SANS
+    // en-tête `icy-metaint`, même en réclamant `Icy-MetaData: 1`. Le repli ICY
+    // s'arrête donc sur son `?` et l'écran ne montre RIEN. Le service RMS de la
+    // BBC, lui, publie le morceau en cours.
+    if let Some(service_id) = bbc_service_id(station_name, stream_url) {
+        return fetch_bbc_metadata(BBC_RMS_BASE, station_name, &service_id).await;
     }
 
     // Fallback: raw ICY metadata
@@ -288,6 +298,184 @@ async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<
         station: Some(station_name.to_string()),
         cover_url,
     })
+}
+
+// ---------------------------------------------------------------------------
+// BBC (#2486)
+// ---------------------------------------------------------------------------
+
+/// Racine du service *RMS* de la BBC — public, sans clef ni compte.
+const BBC_RMS_BASE: &str = "https://rms.api.bbc.co.uk";
+
+/// L'adresse d'illustration rendue par la BBC porte un gabarit `{recipe}` :
+/// `https://ichef.bbci.co.uk/images/ic/{recipe}/p03mpgxn.jpg`. Servie telle
+/// quelle elle répond **403** (mesuré le 01/09/2026) — une image cassée là où
+/// le logo de la station faisait l'affaire. Substituée, elle répond 200
+/// `image/jpeg`. C'est un gabarit à remplir, pas une URL à recopier.
+const BBC_RECETTE_POCHETTE: &str = "320x320";
+
+/// Longueur au-delà de laquelle un jeton `bbc_…` n'est plus un identifiant de
+/// service plausible : on ne l'envoie pas au distant.
+const BBC_SERVICE_ID_MAX: usize = 48;
+
+/// L'identifiant de service BBC porté par l'URL de flux, ou déduit du nom.
+///
+/// **L'URL décide d'abord**, parce qu'elle dit ce qui est réellement diffusé :
+/// les deux formes livrées par la BBC portent l'identifiant en clair —
+/// `…bbcmedia.co.uk/bbc_radio_three` et le HLS
+/// `…/live/ww/bbc_radio_three/bbc_radio_three.isml/bbc_radio_three-audio%3d320000…`.
+/// On retient le premier jeton qui commence par `bbc_` et l'on s'arrête au
+/// premier caractère qui n'est ni lettre, ni chiffre, ni `_` : le `-audio…` et
+/// le `.isml` tombent d'eux-mêmes.
+///
+/// **Le nom ne sert qu'en second**, pour les stations ajoutées à la main qui ne
+/// portent pas d'URL reconnaissable. La table est courte **et mesurée** : les
+/// six identifiants ci-dessous ont été interrogés le 01/09/2026 et répondent
+/// tous 200 (un identifiant inconnu, lui, rend 400 — vérifié). On n'en devine
+/// aucun autre : rendre `None` renvoie au repli ICY, ce qui est exactement ce
+/// qui se passait avant ce correctif.
+fn bbc_service_id(station_name: &str, stream_url: &str) -> Option<String> {
+    if let Some(depuis_url) = bbc_id_dans_url(&stream_url.to_lowercase()) {
+        return Some(depuis_url);
+    }
+
+    let nom: String = station_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if !nom.split(' ').any(|mot| mot == "bbc") {
+        return None;
+    }
+
+    let id = if nom.contains("6 music") || nom.contains("6music") {
+        "bbc_6music"
+    } else if nom.contains("world service") {
+        "bbc_world_service"
+    } else if nom.contains("radio 1") || nom.contains("radio one") {
+        "bbc_radio_one"
+    } else if nom.contains("radio 2") || nom.contains("radio two") {
+        "bbc_radio_two"
+    } else if nom.contains("radio 3") || nom.contains("radio three") {
+        "bbc_radio_three"
+    } else if nom.contains("radio 4") || nom.contains("radio four") {
+        // L'identifiant du 4 est `…fourfm` : c'est le flux FM que diffuse la BBC.
+        "bbc_radio_fourfm"
+    } else {
+        return None;
+    };
+
+    Some(id.to_string())
+}
+
+/// Le jeton `bbc_…` d'une URL déjà passée en minuscules.
+fn bbc_id_dans_url(url: &str) -> Option<String> {
+    let debut = url.find("bbc_")?;
+    let jeton: String = url[debut..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+
+    // « bbc_ » tout seul, ou un jeton à rallonge, ne sont pas des identifiants.
+    if jeton.len() <= "bbc_".len() || jeton.len() > BBC_SERVICE_ID_MAX {
+        return None;
+    }
+    Some(jeton)
+}
+
+/// L'illustration du morceau, gabarit rempli.
+///
+/// Si un autre gabarit que `{recipe}` apparaissait un jour, l'accolade
+/// survivrait à la substitution : on rend alors `None` plutôt qu'une adresse
+/// qui répondrait 403.
+///
+/// Le reste des règles est celui de [`pochette_de_stream_url`], le plus strict
+/// des deux filtres du fichier : il exige que le **chemin** se termine par une
+/// extension d'image. `url_de_pochette` seul laisserait passer une page — et
+/// une image cassée est pire que l'absence, parce qu'elle remplace un repli
+/// qui, lui, fonctionnait.
+fn pochette_bbc(image_url: Option<&str>) -> Option<String> {
+    let brut = image_url?.trim();
+    let rempli = brut.replace("{recipe}", BBC_RECETTE_POCHETTE);
+    if rempli.contains('{') || rempli.contains('}') {
+        return None;
+    }
+    pochette_de_stream_url(Some(&rempli))
+}
+
+/// Lire le morceau **en cours** dans la réponse RMS.
+///
+/// Le piège que la lecture d'un seul champ ne montre pas : `data` porte les
+/// quatre derniers segments, et la BBC en diffuse toujours quatre — même
+/// quand plus rien ne joue. Le morceau en cours est celui, et seulement celui,
+/// que l'API marque `offset.now_playing = true`. Mesuré le 01/09/2026 :
+/// `bbc_radio_one`, `bbc_radio_fourfm`, `bbc_world_service` et
+/// `bbc_radio_scotland_fm` rendaient quatre segments et **aucun** marqué en
+/// cours. Prendre `data[0]` y aurait affiché un morceau terminé depuis vingt
+/// minutes — une réponse assurée et fausse, ce que ce fichier refuse déjà pour
+/// FIP Pop.
+///
+/// Le titre est `titles.secondary` (l'œuvre) et l'artiste `titles.primary`.
+/// Sans `secondary`, on rend `None` : promouvoir l'artiste — ou le nom de la
+/// station — dans la case du titre fabriquerait un morceau qui n'existe pas.
+fn lire_now_playing_bbc(body: &serde_json::Value, station_name: &str) -> Option<IcyMetadata> {
+    let segments = body.get("data")?.as_array()?;
+
+    let en_cours = segments.iter().find(|segment| {
+        segment
+            .get("offset")
+            .and_then(|o| o.get("now_playing"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && segment.get("segment_type").and_then(|v| v.as_str()) == Some("music")
+    })?;
+
+    let titres = en_cours.get("titles")?;
+    let title = titres.get("secondary").and_then(|v| v.as_str())?.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    let artist = titres
+        .get("primary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Some(IcyMetadata {
+        title: title.to_string(),
+        artist,
+        station: Some(station_name.to_string()),
+        cover_url: pochette_bbc(en_cours.get("image_url").and_then(|v| v.as_str())),
+    })
+}
+
+/// `base` est un paramètre pour que la contre-épreuve puisse dresser un faux
+/// service : aucun test de ce dépôt n'appelle une vraie radio.
+async fn fetch_bbc_metadata(
+    base: &str,
+    station_name: &str,
+    service_id: &str,
+) -> Option<IcyMetadata> {
+    let url = format!("{base}/v2/services/{service_id}/segments/latest?experience=domestic");
+    let client = crate::http::client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        debug!(station = %station_name, status = %resp.status(), "bbc_rms_api_error");
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    lire_now_playing_bbc(&body, station_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -736,5 +924,328 @@ mod tests {
         let m = parse_icy_string("StreamTitle='Kings Of Leon - Pistol of fire';", None)
             .expect("l'ICY se lit");
         assert_eq!(m.cover_url, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // La troisième famille : BBC (#2486)
+    // -----------------------------------------------------------------------
+    //
+    // ## Le fait de base, mesuré le 01/09/2026
+    //
+    // `http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three` (BBC Radio 3, du
+    // catalogue livré) répond 200 **sans** en-tête `icy-metaint`, même en
+    // réclamant `Icy-MetaData: 1`. `fetch_icy_metadata` s'arrête donc sur son
+    // `?` et l'écran ne montre **rien** : ni titre, ni artiste, ni pochette.
+    //
+    // Le service RMS de la BBC — public, sans clef — rendait au même instant
+    // `titles.primary = "Lennox Berkeley"`,
+    // `titles.secondary = "Divertimento, Op.18: I. Prelude. Moderato"`.
+    //
+    // Aucun test ci-dessous n'appelle une vraie radio : les distants sont des
+    // serveurs montés dans le test, qui répondent puis se ferment proprement.
+
+    use serde_json::{Value, json};
+
+    /// Monte un distant local et rend sa racine.
+    async fn faux_distant(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port local");
+        let port = listener.local_addr().expect("adresse locale").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Faux service RMS qui rend `corps` sur la route des segments.
+    async fn faux_rms(service_id: &str, corps: serde_json::Value) -> String {
+        let chemin = format!("/v2/services/{service_id}/segments/latest");
+        let app = axum::Router::new().route(
+            &chemin,
+            axum::routing::get(move || {
+                let c = corps.clone();
+                async move { axum::Json(c) }
+            }),
+        );
+        faux_distant(app).await
+    }
+
+    /// Un segment RMS, à la forme mesurée.
+    fn segment(kind: &str, primary: Option<&str>, secondary: Option<&str>, now: bool) -> Value {
+        json!({
+            "type": "segment_item",
+            "segment_type": kind,
+            "titles": { "primary": primary, "secondary": secondary, "tertiary": null },
+            "image_url": "https://ichef.bbci.co.uk/images/ic/{recipe}/p03mpgxn.jpg",
+            "offset": { "start": 5830, "end": 6053, "now_playing": now },
+        })
+    }
+
+    /// La charge utile mesurée sur `bbc_radio_three` le 01/09/2026 : quatre
+    /// segments, le premier marqué en cours.
+    fn charge_radio_three() -> Value {
+        json!({ "total": 4, "data": [
+            segment("music", Some("Lennox Berkeley"), Some("Divertimento, Op.18: I. Prelude. Moderato"), true),
+            segment("music", Some("Cécile Chaminade"), Some("Concertino, Op.107"), false),
+            segment("music", Some("Robert Kahn"), Some("Es war der Tag der weißen Chrysanthemen, Op. 61 No. 10"), false),
+            segment("music", Some("Antonín Dvořák"), Some("Slavonic Dance No 9 in B major, Op 72"), false),
+        ]})
+    }
+
+    /// **Le vert.** Une station de la nouvelle famille rend le titre et
+    /// l'artiste en cours — et ils sont justes, au caractère près.
+    #[tokio::test]
+    async fn une_station_bbc_rend_le_titre_et_l_artiste_en_cours() {
+        let base = faux_rms("bbc_radio_three", charge_radio_three()).await;
+        let meta = fetch_bbc_metadata(&base, "BBC Radio 3", "bbc_radio_three")
+            .await
+            .expect("le morceau en cours doit sortir du service");
+
+        assert_eq!(meta.title, "Divertimento, Op.18: I. Prelude. Moderato");
+        assert_eq!(meta.artist.as_deref(), Some("Lennox Berkeley"));
+        assert_eq!(meta.station.as_deref(), Some("BBC Radio 3"));
+        assert_eq!(
+            meta.cover_url.as_deref(),
+            Some("https://ichef.bbci.co.uk/images/ic/320x320/p03mpgxn.jpg"),
+            "le gabarit {{recipe}} doit être rempli : servi nu, il répond 403"
+        );
+    }
+
+    /// **L'absence propre.** Mesuré le 01/09/2026 : `bbc_radio_one`,
+    /// `bbc_radio_fourfm`, `bbc_world_service` et `bbc_radio_scotland_fm`
+    /// rendaient quatre segments et **aucun** marqué en cours. Rien ne doit
+    /// sortir — ni chaîne vide, ni morceau terminé, ni nom de station.
+    #[tokio::test]
+    async fn une_station_bbc_qui_ne_joue_rien_rend_une_absence_propre() {
+        let corps = json!({ "total": 2, "data": [
+            segment("music", Some("Billy Ocean"), Some("Caribbean Queen"), false),
+            segment("music", Some("DIIV"), Some("The Fountain"), false),
+        ]});
+        let base = faux_rms("bbc_radio_fourfm", corps).await;
+        assert!(
+            fetch_bbc_metadata(&base, "BBC Radio 4", "bbc_radio_fourfm")
+                .await
+                .is_none(),
+            "aucun segment n'est en cours : l'écran doit rester au logo"
+        );
+    }
+
+    /// Un identifiant inconnu rend **400** chez la BBC (mesuré). Un refus ne
+    /// doit pas devenir un titre.
+    #[tokio::test]
+    async fn un_refus_du_service_bbc_ne_fabrique_aucun_titre() {
+        let base = faux_distant(axum::Router::new()).await; // tout est 404
+        assert!(
+            fetch_bbc_metadata(&base, "BBC Machin", "bbc_machin")
+                .await
+                .is_none()
+        );
+    }
+
+    /// Le piège que `data[0]` ne montre pas : le morceau en cours n'est pas
+    /// toujours le premier de la liste. C'est le drapeau qui décide.
+    #[test]
+    fn seul_le_segment_marque_en_cours_est_retenu() {
+        let corps = json!({ "data": [
+            segment("music", Some("Terminé"), Some("Il y a vingt minutes"), false),
+            segment("music", Some("DIIV"), Some("The Fountain"), true),
+        ]});
+        let meta = lire_now_playing_bbc(&corps, "BBC 6 Music").expect("un segment est en cours");
+        assert_eq!(meta.title, "The Fountain");
+        assert_eq!(meta.artist.as_deref(), Some("DIIV"));
+    }
+
+    /// Un segment de parole marqué en cours n'est pas un morceau. Le rendre
+    /// mettrait le nom d'une émission dans la case du titre.
+    #[test]
+    fn un_segment_de_parole_nest_pas_un_morceau() {
+        let corps = json!({ "data": [
+            segment("speech", Some("Petroc Trelawny"), Some("Breakfast"), true),
+        ]});
+        assert!(lire_now_playing_bbc(&corps, "BBC Radio 3").is_none());
+    }
+
+    /// Sans titre d'œuvre, aucune métadonnée : promouvoir l'artiste — ou le
+    /// nom de la station — dans la case du titre inventerait un morceau.
+    #[test]
+    fn sans_titre_d_oeuvre_rien_ne_prend_sa_place() {
+        for corps in [
+            json!({ "data": [segment("music", Some("Lennox Berkeley"), None, true)] }),
+            json!({ "data": [segment("music", Some("Lennox Berkeley"), Some(""), true)] }),
+            json!({ "data": [segment("music", Some("Lennox Berkeley"), Some("   "), true)] }),
+            json!({ "data": [] }),
+            json!({ "total": 0 }),
+        ] {
+            assert_eq!(
+                lire_now_playing_bbc(&corps, "BBC Radio 3").map(|m| m.title),
+                None,
+                "aucun titre ne doit être fabriqué à partir de {corps}"
+            );
+        }
+    }
+
+    /// L'identifiant vient de l'URL en priorité — elle dit ce qui est
+    /// réellement diffusé. Les deux formes livrées par la BBC le portent en
+    /// clair, l'une nue, l'autre noyée dans un HLS.
+    #[test]
+    fn l_identifiant_bbc_se_lit_dans_l_url() {
+        assert_eq!(
+            bbc_service_id(
+                "BBC Radio 3",
+                "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three"
+            )
+            .as_deref(),
+            Some("bbc_radio_three")
+        );
+        assert_eq!(
+            bbc_service_id(
+                "",
+                "https://as-hls-ww.live.cf.md.bbci.co.uk/pool/x/live/ww/bbc_6music/bbc_6music.isml/bbc_6music-audio%3d320000.norewind.m3u8"
+            )
+            .as_deref(),
+            Some("bbc_6music"),
+            "le .isml et le -audio doivent tomber"
+        );
+        // L'URL prime sur le nom : c'est elle qui dit ce qui joue.
+        assert_eq!(
+            bbc_service_id("BBC Radio 3", "http://x/bbc_radio_two").as_deref(),
+            Some("bbc_radio_two")
+        );
+    }
+
+    /// Le nom ne sert qu'en second, et seulement pour les six identifiants
+    /// interrogés le 01/09/2026 (tous 200). Rien d'autre n'est deviné.
+    #[test]
+    fn le_nom_ne_sert_que_pour_les_services_mesures() {
+        for (nom, attendu) in [
+            ("BBC Radio 3", "bbc_radio_three"),
+            ("BBC Radio 1", "bbc_radio_one"),
+            ("BBC Radio 2", "bbc_radio_two"),
+            ("BBC Radio 4", "bbc_radio_fourfm"),
+            ("BBC Radio 6 Music", "bbc_6music"),
+            ("BBC World Service", "bbc_world_service"),
+        ] {
+            assert_eq!(
+                bbc_service_id(nom, "http://exemple.invalid/flux.mp3").as_deref(),
+                Some(attendu),
+                "« {nom} »"
+            );
+        }
+    }
+
+    /// **Témoin.** Aucune station des deux familles déjà couvertes, ni aucune
+    /// station quelconque, ne doit être détournée vers la BBC : elles doivent
+    /// continuer d'emprunter exactement le chemin qu'elles empruntaient.
+    #[test]
+    fn aucune_autre_station_n_est_detournee_vers_la_bbc() {
+        for (nom, url) in [
+            ("FIP", "https://icecast.radiofrance.fr/fip-hifi.aac"),
+            ("Radio Paradise", "http://stream.radioparadise.com/aac-320"),
+            (
+                "TSF Jazz",
+                "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3",
+            ),
+            ("KEXP", "https://kexp-mp3-128.streamguys1.com/kexp128.mp3"),
+            // « bbcmedia » sans souligné n'est pas un identifiant de service,
+            // et un nom sans « bbc » isolé non plus.
+            (
+                "Radio 3",
+                "http://stream.live.vc.bbcmedia.co.uk/some_stream",
+            ),
+            ("Abbey Road Radio", "http://exemple.invalid/flux.mp3"),
+            // Un « bbc_ » nu ne doit pas partir chez le distant.
+            ("", "http://exemple.invalid/bbc_"),
+        ] {
+            assert_eq!(
+                bbc_service_id(nom, url),
+                None,
+                "« {nom} » / « {url} » ne doit pas être routé vers la BBC"
+            );
+        }
+    }
+
+    /// Le gabarit `{recipe}` doit être rempli, et rien d'autre ne doit passer :
+    /// une accolade survivante répondrait 403, c'est-à-dire une image cassée là
+    /// où le logo de la station faisait l'affaire.
+    #[test]
+    fn la_pochette_bbc_remplit_le_gabarit_et_refuse_le_reste() {
+        assert_eq!(
+            pochette_bbc(Some(
+                "https://ichef.bbci.co.uk/images/ic/{recipe}/p026ktjp.jpg"
+            )),
+            Some("https://ichef.bbci.co.uk/images/ic/320x320/p026ktjp.jpg".to_string())
+        );
+        // Déjà remplie, elle passe telle quelle.
+        assert_eq!(
+            pochette_bbc(Some(
+                "https://ichef.bbci.co.uk/images/ic/480x480/p026ktjp.jpg"
+            )),
+            Some("https://ichef.bbci.co.uk/images/ic/480x480/p026ktjp.jpg".to_string())
+        );
+        // Un gabarit inconnu, une page, un chemin relatif : rien.
+        assert_eq!(
+            pochette_bbc(Some("https://ichef.bbci.co.uk/images/ic/{size}/p0.jpg")),
+            None
+        );
+        assert_eq!(
+            pochette_bbc(Some("https://www.bbc.co.uk/programmes/b006tp52")),
+            None
+        );
+        assert_eq!(pochette_bbc(Some("/images/ic/{recipe}/p0.jpg")), None);
+        assert_eq!(pochette_bbc(Some("   ")), None);
+        assert_eq!(pochette_bbc(None), None);
+    }
+
+    // --- Témoins sur le repli ICY, des deux côtés du correctif --------------
+
+    /// Un faux flux : `avec_metaint` décide s'il annonce ses métadonnées.
+    /// Sans l'en-tête, c'est ce que sert BBC Radio 3 (mesuré).
+    async fn faux_flux(avec_metaint: bool) -> String {
+        let app = axum::Router::new().fallback(move || async move {
+            let mut corps: Vec<u8> = vec![0xAA; 16];
+            corps.push(2); // 2 × 16 = 32 octets de bloc
+            let mut bloc = b"StreamTitle='A - B';".to_vec();
+            bloc.resize(32, 0);
+            corps.extend_from_slice(&bloc);
+
+            let mut reponse = axum::response::Response::new(axum::body::Body::from(corps));
+            reponse.headers_mut().insert(
+                "icy-name",
+                axum::http::HeaderValue::from_static("Faux Flux"),
+            );
+            if avec_metaint {
+                reponse
+                    .headers_mut()
+                    .insert("icy-metaint", axum::http::HeaderValue::from_static("16"));
+            }
+            reponse
+        });
+        faux_distant(app).await
+    }
+
+    /// **Le rouge, tel qu'il se mesure aujourd'hui.** Un flux qui n'annonce
+    /// pas `icy-metaint` — ce que sert BBC Radio 3 — ne rend rien du tout.
+    /// C'est l'état d'où part ce correctif, et il ne change pas : la BBC est
+    /// désormais servie AVANT ce repli, pas à travers lui.
+    #[tokio::test]
+    async fn temoin_un_flux_sans_icy_metaint_ne_rend_rien() {
+        let url = faux_flux(false).await;
+        assert!(
+            fetch_icy_metadata(&url).await.is_none(),
+            "sans icy-metaint le repli n'a rien à lire"
+        );
+    }
+
+    /// **Témoin.** Le repli ICY — celui qui sert toutes les stations non
+    /// câblées — lit exactement ce qu'il lisait avant.
+    #[tokio::test]
+    async fn temoin_un_flux_icy_complet_se_lit_comme_avant() {
+        let url = faux_flux(true).await;
+        let meta = fetch_icy_metadata(&url).await.expect("le bloc ICY se lit");
+        assert_eq!(meta.title, "B");
+        assert_eq!(meta.artist.as_deref(), Some("A"));
+        assert_eq!(meta.station.as_deref(), Some("Faux Flux"));
+        assert_eq!(meta.cover_url, None);
     }
 }
