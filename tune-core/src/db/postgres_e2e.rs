@@ -276,6 +276,160 @@ async fn pg_2168_facette_profonde_rend_le_meme_ensemble_que_sqlite() {
     assert!(!rien.is_active());
 }
 
+/// #3101 — la portée de répertoire sur le SECOND moteur : sélectionner un
+/// dossier rend ce dossier et rien d'autre, jokers compris.
+///
+/// Le jumeau SQLite est `portee_repertoire_jokers` (crate `tune-server`), qui
+/// mesure la même chose à travers la route `GET /library/tracks?folder=`. Cette
+/// route-là vit dans `tune-server`, que la matrice `Test (PostgreSQL)` ne
+/// compile pas : la mesure sur PostgreSQL porte donc sur la fonction que la
+/// route appelle, `TrackRepo::list_filtered`, et sur le même fait de base —
+/// **l'ensemble des fichiers rendus**.
+///
+/// Sans échappement, `%` et `_` restaient les jokers de `LIKE` : `100% Live`
+/// ramenait `1000/Best Of Live` (un autre sous-arbre, le `%` traversant les
+/// séparateurs) et `Disc_1` ramenait `DiscX1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3101_les_jokers_du_nom_de_dossier_ne_filtrent_pas_plus_large() {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::track_repo::TrackRepo;
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db);
+
+    // Mêmes effectifs que l'épreuve SQLite : 2 + 1 + 3 + 4 + 5 = 15, toutes
+    // sommes deux à deux distinctes pour qu'aucun compte juste ne le soit par
+    // accident.
+    let mut n = 0;
+    for (dossier, combien) in [
+        ("/musique/100% Live", 2),
+        ("/musique/100% Live/Bonus", 1),
+        ("/musique/1000/Best Of Live", 3),
+        ("/musique/Disc_1", 4),
+        ("/musique/DiscX1", 5),
+    ] {
+        for _ in 0..combien {
+            n += 1;
+            let mut t = Track::new(format!("P{n}"));
+            t.file_path = Some(format!("{dossier}/p{n}.flac"));
+            t.duration_ms = 1000;
+            t.format = Some("flac".into());
+            repo.create(&t).unwrap();
+        }
+    }
+    assert_eq!(n, 15);
+
+    let sous = |dossier: &str| -> Vec<String> {
+        let f = TrackFilter {
+            folder: Some(dossier.to_string()),
+            ..Default::default()
+        };
+        assert!(f.is_active(), "un dossier doit activer le chemin filtré");
+        let (items, total) = repo.list_filtered(&f, 500, 0).unwrap();
+        assert_eq!(
+            items.len() as i64,
+            total,
+            "le compteur partage le prédicat de la liste"
+        );
+        let mut v: Vec<String> = items.into_iter().filter_map(|t| t.file_path).collect();
+        v.sort();
+        v
+    };
+
+    // LE FAIT : `%` dans le nom ne fait pas déborder la portée sur un voisin.
+    let cent_pour_cent = sous("/musique/100% Live");
+    assert!(
+        cent_pour_cent
+            .iter()
+            .all(|f| f.starts_with("/musique/100% Live/")),
+        "des fichiers hors du répertoire sélectionné : {cent_pour_cent:?}"
+    );
+    assert_eq!(cent_pour_cent.len(), 3, "{cent_pour_cent:?}");
+
+    // Et `_`, qui ne vaut qu'un caractère : `Disc_1` n'est pas `DiscX1`.
+    let disc = sous("/musique/Disc_1");
+    assert!(
+        disc.iter().all(|f| f.starts_with("/musique/Disc_1/")),
+        "des fichiers hors du répertoire sélectionné : {disc:?}"
+    );
+    assert_eq!(disc.len(), 4, "{disc:?}");
+
+    // Témoin imbriqué : le sous-dossier rend son contenu, pas celui du parent.
+    let bonus = sous("/musique/100% Live/Bonus");
+    assert_eq!(bonus, vec!["/musique/100% Live/Bonus/p3.flac".to_string()]);
+
+    // Témoin vide : zéro proprement, pas une erreur.
+    assert!(sous("/musique/Vide").is_empty());
+
+    // Témoin sans portée : toute la bibliothèque, toujours.
+    let rien = TrackFilter::default();
+    assert!(!rien.is_active());
+    let (tout, total) = repo.list_filtered(&rien, 500, 0).unwrap();
+    assert_eq!(tout.len(), 15);
+    assert_eq!(total, 15);
+}
+
+/// #1752 — l'antislash de Windows reste LITTÉRAL sur PostgreSQL, maintenant que
+/// la clause n'est plus `ESCAPE ''` mais `ESCAPE '\'`.
+///
+/// C'était le défaut d'origine : Postgres traite l'antislash comme son
+/// caractère d'échappement par défaut, donc un motif brut `G:\Blues 2\%` se
+/// dégradait en la chaîne littérale `G:Blues 2%` et tous les répertoires
+/// annonçaient « 0 piste » (JF, Windows + Postgres). L'ancienne réponse coupait
+/// l'échappement ; la nouvelle DOUBLE l'antislash dans la valeur.
+///
+/// L'épreuve construit le motif à la main parce que `folder_like_pattern` pose
+/// le séparateur de l'HÔTE : sur le Linux qui fait tourner cette suite, elle ne
+/// produirait jamais d'antislash. Ce qui est écrit ici est, caractère pour
+/// caractère, ce qu'elle produit sur un hôte Windows.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1752_l_antislash_de_windows_reste_litteral() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::models::Track;
+    use crate::db::track_repo::{TrackRepo, echapper_jokers_like, like_escape_clause};
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = TrackRepo::with_backend(db.clone());
+
+    for (n, chemin) in [
+        r"G:\Blues 2\aa.flac",
+        r"G:\Blues 2\Sous\bb.flac",
+        r"G:\Jazz\cc.flac",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut t = Track::new(format!("W{n}"));
+        t.file_path = Some((*chemin).to_string());
+        t.duration_ms = 1000;
+        repo.create(&t).unwrap();
+    }
+
+    // Ce que `folder_like_pattern` produit sur un hôte Windows pour `G:\Blues 2`.
+    let motif = format!(
+        "{}{}%",
+        echapper_jokers_like(r"G:\Blues 2"),
+        echapper_jokers_like("\\")
+    );
+    assert_eq!(motif, r"G:\\Blues 2\\%", "antislashs doublés, `%` final nu");
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1{}",
+        like_escape_clause()
+    );
+    let compte = db
+        .query_one(&sql, &[&motif as &dyn ToSqlValue])
+        .unwrap()
+        .and_then(|c| c.first().and_then(|v| v.as_i64()))
+        .unwrap_or(-1);
+    assert_eq!(
+        compte, 2,
+        "le sous-arbre `G:\\Blues 2` porte deux pistes ; 0 = l'antislash a été \
+         consommé comme échappement (#1752), 3 = le motif ne filtre plus rien"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_zones_round_trip() {
     use crate::db::zone_repo::ZoneRepo;

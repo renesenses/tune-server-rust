@@ -75,6 +75,8 @@ mod playlists_cloisonnement_par_profil;
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
+#[path = "portee_repertoire_jokers.rs"]
+mod portee_repertoire_jokers;
 #[path = "radios_recherche_distinction.rs"]
 mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]
