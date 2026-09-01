@@ -1675,7 +1675,7 @@ fn browse_direct_children(
         "genres" => browse_genres(state),
         "years" => browse_years(state),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
-        "radios" => browse_radios(state),
+        "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
@@ -2276,34 +2276,72 @@ fn didl_albums_under(
     }
 }
 
-fn browse_radios(state: &UpnpState) -> DidlResult {
+/// Le dossier Radio, PAGINÉ comme tous les autres conteneurs peuplés.
+///
+/// `StartingIndex` et `RequestedCount` étaient purement ignorés : mesuré sur un
+/// Tune local portant 49 stations, un `Browse` demandant dix éléments recevait
+/// les quarante-neuf, avec `NumberReturned = 49` — et `StartingIndex = 10`
+/// rendait exactement la même première page. La spécification
+/// ContentDirectory:1 borne `NumberReturned` par `RequestedCount` et fait
+/// commencer la réponse au `StartingIndex` demandé ; un point de contrôle qui
+/// pagine reçoit donc une réponse hors contrat, et le dossier se lit vide
+/// (#2103, #1800, Jean Valjean, Marantz ND8006, fil forum #1439).
+///
+/// Le correctif de la v0.9.118 (`5d123568`) n'avait touché QUE le `<res>` :
+/// URL Tune stable et `audio/wav` à la place de l'URL du diffuseur. L'enveloppe
+/// de la réponse, elle, n'a jamais été paginée — ni avant, ni après. C'est la
+/// moitié restée dehors, et elle explique que le symptôme n'ait pas bougé huit
+/// versions plus tard.
+///
+/// `Search` sur les mêmes lignes paginait déjà correctement
+/// (`search_containers_in_container`) : c'est le témoin qui isole le verbe.
+fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
-    didl_radios(&stations, &state.base_url())
+    let (page, total) = paginer(stations, start, count);
+    let mut didl = didl_radios(&page, &state.base_url());
+    // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
+    // c'est de là que le point de contrôle sait qu'il reste des pages.
+    didl.total = total;
+    didl
 }
 
 /// Le DIDL d'une liste de stations. `Browse` et `Search` passent par ici.
+///
+/// L'item est bâti sur le même patron que celui d'une piste
+/// ([`crate::outputs::didl::DidlBuilder::build_item`], qui sert « All Tracks »
+/// — la rubrique que le ND8006 affiche correctement) :
+///
+/// * `restricted="1"` : attribut OBLIGATOIRE d'un objet DIDL-Lite. Les items de
+///   « All Tracks » le portent depuis toujours ; ceux du dossier Radio, jamais.
+/// * la pochette AVANT le `<res>` : la séquence DIDL-Lite ferme l'objet par ses
+///   `<res>`, après les propriétés. `didl_radios` était le seul émetteur du
+///   fichier à publier `<upnp:albumArtURI>` APRÈS — et depuis la
+///   synchronisation de l'annuaire de logos, 45 des 49 stations d'une base
+///   fraîche en portent une, donc 45 items sur 49 hors séquence.
 fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
     let mut inner = String::new();
     for station in stations {
         let id = format!("radio/{}", station.id.unwrap_or(0));
-        let mut res = String::new();
-        let url = radio_audio_url(base, station.id.unwrap_or(0));
-        res.push_str(&format!(
-            "<res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>",
-            url = quick_xml::escape::escape(&url),
-        ));
+        let mut props = String::new();
         if let Some(ref logo) = station.logo_url {
-            res.push_str(&format!(
+            props.push_str(&format!(
                 "<upnp:albumArtURI>{}</upnp:albumArtURI>",
                 quick_xml::escape::escape(logo)
             ));
         }
+        let url = radio_audio_url(base, station.id.unwrap_or(0));
         inner.push_str(&format!(
-            "<item id=\"{id}\" parentID=\"radios\"><dc:title>{title}</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class>{res}</item>",
+            "<item id=\"{id}\" parentID=\"radios\" restricted=\"1\">\
+             <dc:title>{title}</dc:title>\
+             <upnp:class>object.item.audioItem.audioBroadcast</upnp:class>\
+             {props}\
+             <res protocolInfo=\"http-get:*:audio/wav:*\">{url}</res>\
+             </item>",
             id = quick_xml::escape::escape(&id),
             title = quick_xml::escape::escape(&station.name),
-            res = res,
+            props = props,
+            url = quick_xml::escape::escape(&url),
         ));
     }
 
@@ -3790,7 +3828,7 @@ mod tests {
         let mut state = UpnpState::new(backend, 8888, None);
         state.advertised_ip = Some("192.168.1.18".into());
 
-        let didl = browse_radios(&state);
+        let didl = browse_radios(&state, 0, 100);
         let url = radio_audio_url(&state.base_url(), station_id);
 
         assert!(didl.total >= 1);
@@ -4675,6 +4713,222 @@ mod ssdp_msearch_tests {
                 "{classe} : {reponse}"
             );
         }
+    }
+
+    fn soap_browse(object_id: &str, start: u64, count: u64) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope><s:Body>
+<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ObjectID>{object_id}</ObjectID>
+<BrowseFlag>BrowseDirectChildren</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>{start}</StartingIndex>
+<RequestedCount>{count}</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// Un compteur de l'enveloppe SOAP — `NumberReturned` ou `TotalMatches`.
+    fn compteur(reponse: &str, balise: &str) -> u64 {
+        let ouvrant = format!("<{balise}>");
+        let fermant = format!("</{balise}>");
+        let debut = reponse
+            .find(&ouvrant)
+            .unwrap_or_else(|| panic!("{balise} absent de : {reponse}"))
+            + ouvrant.len();
+        let fin = debut
+            + reponse[debut..]
+                .find(&fermant)
+                .unwrap_or_else(|| panic!("{balise} non ferme dans : {reponse}"));
+        reponse[debut..fin]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{balise} n'est pas un entier dans : {reponse}"))
+    }
+
+    /// Le nombre d'objets que le DIDL TRANSPORTE réellement. Le corps est
+    /// échappé dans `<Result>` : un objet s'y lit `&lt;item ` ou
+    /// `&lt;container `.
+    fn objets_transportes(reponse: &str) -> u64 {
+        (reponse.matches("&lt;item ").count() + reponse.matches("&lt;container ").count()) as u64
+    }
+
+    /// L'identifiant du premier objet transporté, pour distinguer deux pages.
+    fn premier_objet(reponse: &str) -> String {
+        let marque = "id=&quot;";
+        let debut = reponse
+            .find(marque)
+            .unwrap_or_else(|| panic!("aucun objet dans : {reponse}"))
+            + marque.len();
+        let fin = debut + reponse[debut..].find("&quot;").expect("id non ferme");
+        reponse[debut..fin].to_string()
+    }
+
+    /// #2103 et #1800 — le dossier Radio vu VIDE sur le Marantz ND8006, huit
+    /// versions apres le correctif livre en v0.9.118.
+    ///
+    /// FAIT DE BASE, sur la reponse `Browse` du conteneur Radio : elle annonce
+    /// autant d'elements qu'elle en transporte, ce nombre n'est pas zero, il
+    /// ne depasse jamais le `RequestedCount` demande, et deux pages
+    /// successives ne commencent pas sur le meme objet.
+    ///
+    /// MESURE REELLE AVANT — Tune local, 49 stations, capture SOAP dans la PR :
+    /// `RequestedCount=10` rendait `NumberReturned=49` et transportait 49
+    /// items ; `StartingIndex=10` rendait la MEME premiere page.
+    /// `browse_radios` ignorait purement ses deux arguments de pagination, et
+    /// c'est la moitie que le correctif `5d123568` (v0.9.118) n'avait pas
+    /// touchee : il n'avait refait que le `<res>`.
+    ///
+    /// TEMOINS, verts des DEUX cotes, sur la meme base et dans le meme test :
+    /// `Search` vise les memes stations par l'autre verbe, deja pagine ; et le
+    /// conteneur `albums` est le chemin que le testeur voit PLEIN. S'ils
+    /// passaient au rouge, le defaut ne serait pas la pagination du dossier
+    /// Radio mais la base elle-meme.
+    #[test]
+    fn le_dossier_radio_annonce_exactement_ce_qu_il_transporte() {
+        let state = state_du_releve_nd8006();
+        let total_stations = RadioRepo::with_backend(state.backend.clone())
+            .list()
+            .unwrap()
+            .len() as u64;
+        assert!(
+            total_stations > 10,
+            "le jeu d'essai doit porter assez de stations pour qu'une page en \
+             laisse dehors — {total_stations} seulement"
+        );
+
+        // --- TEMOIN 1 : l'autre verbe, sur les memes stations.
+        let recherche = search_action_response(
+            &state,
+            &soap_search(
+                "0",
+                "upnp:class derivedfrom &quot;object.item.audioItem.audioBroadcast&quot;",
+                0,
+                5,
+            ),
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            objets_transportes(&recherche),
+            "temoin Search : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "NumberReturned"),
+            5,
+            "temoin Search : {recherche}"
+        );
+        assert_eq!(
+            compteur(&recherche, "TotalMatches"),
+            total_stations,
+            "temoin Search : {recherche}"
+        );
+
+        // --- TEMOIN 2 : l'autre chemin, celui que le testeur voit plein.
+        let albums = browse_action_response(&state, &soap_browse("albums", 0, 1));
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            objets_transportes(&albums),
+            "temoin albums : {albums}"
+        );
+        assert_eq!(
+            compteur(&albums, "NumberReturned"),
+            1,
+            "temoin albums : {albums}"
+        );
+        assert_eq!(
+            compteur(&albums, "TotalMatches"),
+            2,
+            "temoin albums : {albums}"
+        );
+
+        // --- LE FAIT DE BASE : premiere page du dossier Radio.
+        let page1 = browse_action_response(&state, &soap_browse("radios", 0, 5));
+        let annonce1 = compteur(&page1, "NumberReturned");
+        assert_eq!(
+            annonce1,
+            objets_transportes(&page1),
+            "le dossier Radio annonce {annonce1} elements et en transporte {} : {page1}",
+            objets_transportes(&page1)
+        );
+        assert_ne!(annonce1, 0, "le dossier Radio est vide : {page1}");
+        assert!(
+            annonce1 <= 5,
+            "NumberReturned={annonce1} pour un RequestedCount=5 — la reponse \
+             sort du contrat ContentDirectory:1 : {page1}"
+        );
+        assert_eq!(
+            compteur(&page1, "TotalMatches"),
+            total_stations,
+            "TotalMatches doit dire la taille du dossier, pas celle de la page : {page1}"
+        );
+
+        // --- Et la page suivante en est bien une.
+        let page2 = browse_action_response(&state, &soap_browse("radios", 5, 5));
+        let annonce2 = compteur(&page2, "NumberReturned");
+        assert_eq!(annonce2, objets_transportes(&page2), "page 2 : {page2}");
+        assert!(annonce2 <= 5, "page 2 : {page2}");
+        assert_ne!(
+            premier_objet(&page1),
+            premier_objet(&page2),
+            "StartingIndex est ignore : les deux pages commencent sur le meme \
+             objet.\npage 1 : {page1}\npage 2 : {page2}"
+        );
+    }
+
+    /// L'item d'une station doit etre bati comme celui d'une piste — la
+    /// rubrique « All Tracks » que le ND8006 affiche correctement.
+    ///
+    /// `restricted` est un attribut OBLIGATOIRE d'un objet DIDL-Lite, et la
+    /// sequence DIDL-Lite ferme l'objet par ses `<res>`, apres les proprietes.
+    /// `didl_radios` etait le seul emetteur du fichier a publier la pochette
+    /// APRES le `<res>` ; sur une base fraiche, 45 des 49 stations en portent
+    /// une depuis la synchronisation de l'annuaire de logos.
+    #[test]
+    fn un_item_de_station_est_bati_comme_un_item_de_piste() {
+        use crate::db::radio_repo::RadioStation;
+
+        let state = state_du_releve_nd8006();
+        RadioRepo::with_backend(state.backend.clone())
+            .create(&RadioStation {
+                id: None,
+                name: "Station a logo".into(),
+                url: "https://icecast.example/logo.aac".into(),
+                homepage: None,
+                logo_url: Some("https://exemple.test/logo.png".into()),
+                country: None,
+                language: None,
+                genre: None,
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
+
+        let didl = browse_radios(&state, 0, 1000).xml;
+        assert!(
+            didl.contains("parentID=\"radios\" restricted=\"1\""),
+            "l'item d'une station ne porte pas l'attribut obligatoire \
+             restricted, la ou celui d'une piste le porte : {didl}"
+        );
+
+        let item = didl
+            .split("<item ")
+            .find(|bloc| bloc.contains("Station a logo"))
+            .unwrap_or_else(|| panic!("station absente du DIDL : {didl}"));
+        let art = item
+            .find("<upnp:albumArtURI>")
+            .unwrap_or_else(|| panic!("pochette absente : {item}"));
+        let res = item
+            .find("<res ")
+            .unwrap_or_else(|| panic!("res absent : {item}"));
+        assert!(
+            art < res,
+            "la pochette est publiee APRES le <res> : la sequence DIDL-Lite \
+             ferme l'objet par ses <res> — {item}"
+        );
     }
 
     /// Le garde de non-regression du parcours d'indexation (#1516).
