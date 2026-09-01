@@ -348,6 +348,44 @@ fn offsets_recherche(
         .collect()
 }
 
+/// Ce que `map_track` et `map_artist` ecrivent quand Qobuz omet l'`id`.
+///
+/// `map_album` et `map_featured_playlist` ecrivent la chaine vide dans le meme
+/// cas. Les deux valeurs designent la meme chose : un element qu'on ne sait pas
+/// nommer.
+const ID_ABSENT: &str = "0";
+
+/// Retire les doublons d'identifiant d'une categorie fusionnee, en gardant la
+/// PREMIERE occurrence — donc l'ordre rendu par Qobuz.
+///
+/// Une pagination par `offset` suppose un ordre TOTAL et stable.
+/// `/catalog/search` classe par pertinence, n'expose aucune cle de tri, et les
+/// pages suivantes sont demandees CONCURREMMENT ([`pages_de_recherche`]) : il
+/// suffit qu'un element entre ou sorte du classement entre deux requetes pour
+/// que le rang 50 de la deuxieme page porte l'element deja rendu au rang 49 de
+/// la premiere. La liste fusionnee affichait alors deux fois le meme titre, et
+/// un ecran qui compte ses lignes croyait tenir 200 resultats distincts quand
+/// il en tenait 199. C'est le defaut mesure sur `OFFSET` en #3074, transpose a
+/// la recherche.
+///
+/// On ne dedoublonne QUE ce qu'on sait nommer. Un identifiant absent ne
+/// distingue rien : deux elements anonymes ne sont pas le meme element, et les
+/// fusionner effacerait des resultats reels.
+///
+/// Rend le nombre d'elements retires.
+fn dedoublonner_par_id<T>(items: &mut Vec<T>, identifiant: impl Fn(&T) -> &str) -> usize {
+    let avant = items.len();
+    let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    items.retain(|element| {
+        let cle = identifiant(element);
+        if cle.is_empty() || cle == ID_ABSENT {
+            return true;
+        }
+        vus.insert(cle.to_string())
+    });
+    avant - items.len()
+}
+
 /// Trace le résultat d'une écriture de favori chez Qobuz.
 ///
 /// Sans cette trace, un favori qui n'arrive jamais dans l'app Qobuz ne laisse
@@ -1191,8 +1229,8 @@ impl QobuzService {
         )
     }
 
-    /// Concatène les pages d'une recherche, dans l'ordre des décalages, et
-    /// borne CHAQUE catégorie au plafond demandé.
+    /// Concatène les pages d'une recherche, dans l'ordre des décalages,
+    /// dédoublonne, et borne CHAQUE catégorie au plafond demandé.
     ///
     /// Le plafond s'applique catégorie par catégorie, comme le demande #2160 :
     /// « 200 » veut dire deux cents albums ET deux cents artistes ET deux
@@ -1217,6 +1255,20 @@ impl QobuzService {
                 .artists
                 .extend(Self::elements(page, "artists").iter().map(Self::map_artist));
             resultats.playlists.extend(Self::search_playlists(page));
+        }
+        // Dedoublonner APRES la fusion et AVANT la coupe : le plafond compte
+        // des elements DISTINCTS, sinon un doublon consommerait une place que
+        // l'ecran attendait.
+        let doublons = dedoublonner_par_id(&mut resultats.tracks, |t| t.id.as_str())
+            + dedoublonner_par_id(&mut resultats.albums, |a| a.id.as_str())
+            + dedoublonner_par_id(&mut resultats.artists, |a| a.id.as_str())
+            + dedoublonner_par_id(&mut resultats.playlists, |p| p.id.as_str());
+        if doublons > 0 {
+            warn!(
+                doublons,
+                pages = pages.len(),
+                "qobuz_search_doublons_entre_pages"
+            );
         }
         resultats.tracks.truncate(plafond);
         resultats.albums.truncate(plafond);
@@ -4358,6 +4410,36 @@ mod tests_recherche_paginee {
     }
 
     #[test]
+    fn fusionner_recherche_ne_garde_qu_une_occurrence_par_identifiant() {
+        // Deux pages qui se chevauchent d'un rang — ce que produit un
+        // classement de pertinence qui glisse entre deux requetes.
+        let pages = [page(0, 50, 200), page(49, 50, 200)];
+        let r = QobuzService::fusionner_recherche(&pages, 200);
+        assert_eq!(r.tracks.len(), 99, "50 + 50 moins un chevauchement");
+        let ids: Vec<&str> = r.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids[48], "48");
+        assert_eq!(ids[49], "49", "l'occurrence gardee est la PREMIERE");
+        assert_eq!(ids[50], "50", "et la suite reste dans l'ordre de Qobuz");
+        assert_eq!(r.albums.len(), 99);
+        assert_eq!(r.artists.len(), 99);
+        assert_eq!(r.playlists.len(), 99);
+    }
+
+    #[test]
+    fn deux_elements_sans_identifiant_ne_sont_pas_le_meme_element() {
+        // Qobuz omet parfois l'`id` : `map_track` ecrit alors « 0 » et
+        // `map_album` la chaine vide. Les fusionner effacerait des resultats
+        // reels — c'est le temoin vert du dedoublonnage.
+        let anonymes = json!({
+            "tracks": {"items": [{"title": "a"}, {"title": "b"}, {"title": "c"}], "total": 3},
+            "albums": {"items": [{"title": "x"}, {"title": "y"}], "total": 2},
+        });
+        let r = QobuzService::fusionner_recherche(&[anonymes], 200);
+        assert_eq!(r.tracks.len(), 3, "trois titres anonymes restent trois");
+        assert_eq!(r.albums.len(), 2, "deux albums anonymes restent deux");
+    }
+
+    #[test]
     fn fusionner_recherche_ne_complete_pas_une_categorie_courte() {
         // Le plafond est un maximum PAR catégorie, pas un quota : une
         // catégorie épuisée reste courte, les autres ne sont pas tronquées.
@@ -4700,6 +4782,216 @@ mod tests_recherche_paginee {
         assert_eq!(decalages(&vus), vec![0], "une seule requête");
         assert_eq!(p.results.tracks.len(), 50);
         assert_eq!(p.offset, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Les quatre mesures de pagination (#2160)
+    //
+    // 1. la route recoit-elle une taille de page et un decalage ? — mesure
+    //    portee par `tune-streaming-http` (`tests_route_recherche`) ;
+    // 2. ce qui est annonce correspond-il a ce qui est transporte ?
+    // 3. deux pages consecutives commencent-elles sur des objets differents ?
+    // 4. l'ordre est-il total ?
+
+    /// Mesure 2 : la page transporte ce qu'elle annonce, jamais plus que la
+    /// taille demandee, et jamais zero sur une recherche fournie.
+    #[tokio::test]
+    async fn une_page_transporte_ce_qu_elle_annonce_et_jamais_plus_que_demande() {
+        let (base, _vus) =
+            qobuz_simule(Carte::from([("tracks", 5000usize), ("albums", 300)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let p = svc
+            .search_page("jazz", 100, 0)
+            .await
+            .expect("serveur simule");
+
+        assert_ne!(
+            p.results.tracks.len(),
+            0,
+            "une recherche fournie ne rend pas zero"
+        );
+        assert!(
+            p.results.tracks.len() <= 100,
+            "jamais plus que la taille demandee, rendu : {}",
+            p.results.tracks.len()
+        );
+        assert_eq!(p.results.tracks.len(), 100);
+        assert_eq!(p.results.albums.len(), 100);
+        assert_eq!(
+            p.totals.tracks, 5000,
+            "le total annonce est celui de Qobuz, pas la taille du tableau"
+        );
+        assert!(p.has_more, "100 rendus sur 5000 annonces : il en reste");
+    }
+
+    /// Mesure 3 : deux pages consecutives ne commencent pas sur le meme objet
+    /// et ne se recouvrent pas — le defaut exact releve sur `browse_radios`
+    /// (#3115), ou `StartingIndex` etait purement ignore.
+    #[tokio::test]
+    async fn deux_pages_consecutives_ne_commencent_pas_sur_le_meme_objet() {
+        let (base, _vus) = qobuz_simule(Carte::from([("tracks", 5000usize)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let p1 = svc
+            .search_page("jazz", 50, 0)
+            .await
+            .expect("serveur simule");
+        let p2 = svc
+            .search_page("jazz", 50, 50)
+            .await
+            .expect("serveur simule");
+
+        assert_eq!(p1.results.tracks.len(), 50);
+        assert_eq!(p2.results.tracks.len(), 50);
+        assert_ne!(
+            p1.results.tracks[0].id, p2.results.tracks[0].id,
+            "la seconde page rejouerait la premiere"
+        );
+        let un: std::collections::HashSet<&str> =
+            p1.results.tracks.iter().map(|t| t.id.as_str()).collect();
+        let deux: std::collections::HashSet<&str> =
+            p2.results.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            un.is_disjoint(&deux),
+            "deux pages consecutives ne doivent partager aucun titre"
+        );
+    }
+
+    /// Serveur qui imite un classement de PERTINENCE qui glisse (mesure 4).
+    ///
+    /// La toute premiere requete — celle qui apprend les `total` — est servie
+    /// sur le classement d'origine ; toutes les suivantes le sont sur un
+    /// classement decale de `decalage` rangs, comme si `decalage` elements
+    /// etaient entres en tete entre-temps. C'est ce que produit une recherche
+    /// par pertinence sans cle de tri dont les pages suivantes sont demandees
+    /// concurremment.
+    async fn qobuz_simule_classement_glissant(
+        total: usize,
+        decalage: usize,
+    ) -> (String, Arc<Mutex<Vec<usize>>>) {
+        use axum::extract::Query as ExtraitQuery;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let vus: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let vus_srv = vus.clone();
+        let servies = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/catalog/search",
+            get(
+                move |ExtraitQuery(p): ExtraitQuery<Carte<String, String>>| {
+                    let vus = vus_srv.clone();
+                    let servies = servies.clone();
+                    async move {
+                        let offset: usize =
+                            p.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let limit: usize = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        vus.lock().expect("verrou d'essai").push(offset);
+                        let glisse = if servies.fetch_add(1, Ordering::SeqCst) == 0 {
+                            0
+                        } else {
+                            decalage
+                        };
+                        let fin = (offset + limit).min(total);
+                        let items: Vec<serde_json::Value> = (offset..fin)
+                            .map(|rang| {
+                                let id = rang.saturating_sub(glisse);
+                                json!({
+                                    "id": id as u64,
+                                    "title": format!("piste-{id}"),
+                                    "name": format!("piste-{id}"),
+                                })
+                            })
+                            .collect();
+                        Json(json!({"tracks": {"items": items, "total": total}}))
+                    }
+                },
+            ),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), vus)
+    }
+
+    /// Mesure 4 : l'ordre de `/catalog/search` n'est pas total, et sans garde
+    /// la pagination par `offset` affiche deux fois le meme titre (#3074).
+    #[tokio::test]
+    async fn un_classement_qui_glisse_ne_fait_pas_afficher_deux_fois_le_meme_titre() {
+        // 200 demandes = quatre pages. Un seul element entre en tete apres la
+        // premiere : le rang 50 porte alors le titre deja rendu au rang 49.
+        let (base, vus) = qobuz_simule_classement_glissant(200, 1).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let p = svc
+            .search_page("miles davis", 200, 0)
+            .await
+            .expect("serveur simule");
+
+        assert_eq!(
+            decalages(&vus),
+            vec![0, 50, 100, 150],
+            "quatre pages demandees"
+        );
+        let ids: Vec<&str> = p.results.tracks.iter().map(|t| t.id.as_str()).collect();
+        let distincts: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            distincts.len(),
+            "un titre rendu deux fois : rendus {}, distincts {}",
+            ids.len(),
+            distincts.len()
+        );
+        assert_eq!(
+            p.results.tracks.len(),
+            199,
+            "199 titres distincts sur les 200 rangs balayes — la page dit ce \
+             qu'elle transporte, elle ne complete pas le compte avec un doublon"
+        );
+        assert!(p.has_more, "199 rendus sur 200 annonces : il en reste");
+    }
+
+    /// Temoin vert : une recherche qui tient sur une page reste entiere — le
+    /// dedoublonnage ne mange rien.
+    #[tokio::test]
+    async fn une_recherche_qui_tient_sur_une_page_reste_entiere() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 30usize), ("albums", 7)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let p = svc
+            .search_page("obscur", 50, 0)
+            .await
+            .expect("serveur simule");
+        assert_eq!(decalages(&vus), vec![0], "une seule requete");
+        assert_eq!(p.results.tracks.len(), 30);
+        assert_eq!(p.results.albums.len(), 7);
+        assert!(!p.has_more);
+        assert!(!p.truncated);
+    }
+
+    /// Temoin vert : une recherche sans resultat rend zero proprement, pas une
+    /// erreur — et n'invite pas a un « Charger plus » qui tournerait a vide.
+    #[tokio::test]
+    async fn une_recherche_sans_resultat_rend_zero_proprement() {
+        let (base, vus) = qobuz_simule(Carte::from([("tracks", 0usize), ("albums", 0)])).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let p = svc
+            .search_page("zzzzzzzzz", 200, 0)
+            .await
+            .expect("zero resultat n'est pas une erreur");
+        assert_eq!(
+            decalages(&vus),
+            vec![0],
+            "rien a paginer : une seule requete"
+        );
+        assert!(p.results.tracks.is_empty());
+        assert!(p.results.albums.is_empty());
+        assert_eq!(p.totals, SearchTotals::default());
+        assert_eq!(p.offset, 0);
+        assert!(!p.has_more);
+        assert!(!p.truncated);
     }
 
     /// `search()` et `search_page(.., 0)` doivent rendre les MÊMES éléments :
