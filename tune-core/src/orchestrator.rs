@@ -504,7 +504,9 @@ fn spawn_paced_levels_forwarder(
 
 /// Décode un fichier local EN FLUX, uniquement pour alimenter un forwarder de
 /// niveaux neuf : c'est ce qui rend les aiguilles à la piste devenue courante
-/// après une avance gapless.
+/// après une avance gapless, et ce qui les rend aussi à une piste servie depuis
+/// le cache de transcodage (`transcode_cache_hit`, #3104) — là le « fichier
+/// local » est la RENDITION en cache, celle qui part au renderer.
 ///
 /// Le PCM produit part dans un puits — seules comptent les fenêtres de niveaux
 /// et le fait de borner la mémoire. `decode_to_pcm` matérialisait ici la piste
@@ -526,6 +528,15 @@ fn spawn_paced_levels_forwarder(
 /// puits ne consomme donc pas plus vite que
 /// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur, bloqué sur un canal
 /// borné, s'aligne dessus.
+///
+/// Ce frein n'est PAS un détail d'implémentation qu'on peut recopier de
+/// mémoire : #3104 a reproduit la forme de cette fonction en ligne dans la
+/// branche du cache hit, puits compris, mais avec un drain inconditionnel.
+/// Mesuré sur un WAV 44,1/16 stéréo
+/// (`la_rendition_en_cache_ne_retient_plus_toute_la_piste`) : sans frein la
+/// file retient 10 551 296 octets pour 60 s de piste et 21 102 592 pour 120 s —
+/// elle SUIT la durée ; avec frein elle plafonne à 5 636 096 octets (31,9 s
+/// d'audio) dans les deux cas. Tout nouvel appelant passe par ici.
 fn spawn_local_file_levels_decode(
     bus: Arc<EventBus>,
     playback: Arc<PlaybackManager>,
@@ -4749,51 +4760,46 @@ impl PlaybackOrchestrator {
                     // un ReplayGain est en jeu, donc une rendition en cache est
                     // toujours du signal non traité.
                     //
-                    // Même forme que les niveaux du passthrough : décodage EN
-                    // FLUX, le PCM part dans un puits, seules les fenêtres
-                    // ressortent. Matérialiser la piste coûterait ~1,9 Go sur un
-                    // 24/192 de dix minutes, uniquement pour animer des aiguilles.
+                    // Décodage EN FLUX, le PCM part dans un puits, seules les
+                    // fenêtres ressortent : matérialiser la piste coûterait
+                    // ~1,9 Go sur un 24/192 de dix minutes, uniquement pour
+                    // animer des aiguilles.
+                    //
+                    // Par `spawn_local_file_levels_decode`, et pas en recopiant
+                    // la forme à la main. La première version de ce bloc s'était
+                    // modelée sur le décodage-pour-niveaux du PASSTHROUGH, qui
+                    // n'a jamais eu de frein (#1423) : elle en a hérité la forme
+                    // (flux, PCM au puits) mais pas le bridage que porte la
+                    // fonction ci-dessus — son puits drainait sans condition. Le
+                    // décodage courait alors à la vitesse du DISQUE pendant que
+                    // le forwarder ne publie qu'au temps réel, et la file du
+                    // forwarder — non bornée, chaque fenêtre portant son PCM —
+                    // retenait la piste ENTIÈRE. Le comble : le commentaire
+                    // ci-dessus invoquait les ~1,9 Go qu'il laissait revenir par
+                    // la file. Et le cache hit est le cas COURANT, pas le rare.
+                    //
+                    // On décode la rendition à son débit NATIF : la clef du
+                    // cache (`transcode_cache::cache_path`) couvre `out_sr`,
+                    // `out_bd` et `channels`, donc le fichier en cache est déjà
+                    // dans ce format — rééchantillonner vers lui ne changeait
+                    // rien.
                     if let Some(bus) = ev_bus
                         .clone()
                         .filter(|_| self.levels_attach_allowed(zone_id))
                     {
-                        let playback = playback.clone();
-                        let sr = out_sr;
-                        let ch = channels as u32;
-                        let rendition = cp.clone();
                         // Génération épinglée au moment de la décision (#1110) :
                         // ce décodage dure toute la piste, il ne doit pas pouvoir
                         // se raccrocher à la suivante.
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        tokio::spawn(async move {
-                            // Cache hit : la rendition est servie depuis son
-                            // début (un seek passe par Range HTTP).
-                            let levels_tx =
-                                spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
-                            let ready = std::sync::Arc::new(tokio::sync::Notify::new());
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::audio::decode::decode_to_pcm_streaming_with_levels(
-                                    &rendition,
-                                    Some(sr),
-                                    Some(ch),
-                                    None,
-                                    sink_tx,
-                                    LEVELS_DECODE_CHUNK,
-                                    ready,
-                                    levels_tx,
-                                )
-                            })
-                            .await;
-                            match result {
-                                Err(e) => debug!(error = %e, "cache_hit_levels_task_panic"),
-                                Ok(Err(e)) => {
-                                    debug!(error = %e, "cache_hit_levels_decode_failed")
-                                }
-                                Ok(Ok(_)) => {}
-                            }
-                        });
+                        // Cache hit : la rendition est servie depuis son début
+                        // (un seek passe par Range HTTP).
+                        spawn_local_file_levels_decode(
+                            bus,
+                            playback.clone(),
+                            zone_id,
+                            play_seq,
+                            cp.clone(),
+                        );
                     }
                     (
                         session_id,
@@ -12942,6 +12948,288 @@ mod tests {
         assert!(super::levels_decode_doit_freiner(90_001, 60_000));
     }
 
+    // ------------------------------------------------------------------
+    // #3104 — les niveaux d'un CACHE HIT : mesurés, pas seulement écrits.
+    // ------------------------------------------------------------------
+
+    /// Écrit un WAV PCM 44,1 kHz / 16 bits / stéréo de `duree_ms`, rempli d'un
+    /// carré à ~43 Hz et -2,7 dBFS. C'est la forme exacte d'une rendition mise
+    /// en cache pour un renderer DLNA en LPCM. Le signal est FRANC : un test
+    /// peut exiger des niveaux au-dessus du silence, et pas seulement
+    /// l'existence d'événements.
+    fn ecrire_wav_carre(path: &std::path::Path, duree_ms: u64) {
+        const SR: u32 = 44_100;
+        const CANAUX: u16 = 2;
+        const BITS: u16 = 16;
+        let trames = (SR as u64 * duree_ms / 1000) as usize;
+        let mut buf = Vec::with_capacity(44 + trames * 4);
+        buf.extend_from_slice(&crate::audio::wav::build_wav_header_with_duration(
+            CANAUX,
+            SR,
+            BITS,
+            Some(duree_ms),
+        ));
+        let demi_periode = (SR / 86).max(1) as usize;
+        for t in 0..trames {
+            let v: i16 = if (t / demi_periode) % 2 == 0 {
+                24_000
+            } else {
+                -24_000
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// Ce que la file du forwarder RETIENT quand la zone n'a pas encore avancé
+    /// (position rapportée à 0, l'état d'un début de lecture) : fenêtres en
+    /// attente, octets de PCM, et millisecondes d'audio.
+    ///
+    /// La file est reproduite à l'identique du forwarder — `unbounded_channel`
+    /// de [`crate::audio::tap::RawWindow`], chaque fenêtre portant son
+    /// `pcm: Vec<u8>` — et personne ne la draine : c'est exactement un
+    /// forwarder qui n'a encore rien publié. Le SEUL écart entre les deux
+    /// appels est le puits : `freine = false` reproduit verbatim le drain
+    /// inconditionnel du bloc en ligne livré par #3104
+    /// (`while sink_rx.recv().await.is_some() {}`), `freine = true` celui de
+    /// `spawn_local_file_levels_decode`.
+    ///
+    /// Aucun délai dans la mesure : on compte des tours jusqu'à ce que le
+    /// décodage rende la main (cas sans frein) ou que l'avance décodée cesse de
+    /// croître (cas freiné — le décodeur reste bloqué sur son canal borné tant
+    /// que la zone est à 0). Le cas freiné atteint un PLATEAU : attendre plus
+    /// longtemps ne change pas le chiffre, donc la mesure n'est pas une course.
+    async fn pcm_retenu(chemin: &str, freine: bool) -> (usize, usize, i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let relache = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Relais compteur d'avance, identique à celui de la fonction bridée.
+        let (relais_tx, mut relais_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let relais = {
+            let avance_ms = avance_ms.clone();
+            tokio::spawn(async move {
+                while let Some(raw) = relais_rx.recv().await {
+                    avance_ms.fetch_add(raw.window.as_millis() as i64, Relaxed);
+                    if levels_tx.send(raw).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        {
+            let avance_ms = avance_ms.clone();
+            let relache = relache.clone();
+            tokio::spawn(async move {
+                while sink_rx.recv().await.is_some() {
+                    while freine
+                        && !relache.load(Relaxed)
+                        && super::levels_decode_doit_freiner(avance_ms.load(Relaxed), 0)
+                    {
+                        tokio::time::sleep(super::LEVELS_HOLD).await;
+                    }
+                }
+            });
+        }
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let mut decodage = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                None,
+                None,
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+            )
+        });
+
+        let mut fini = false;
+        let mut precedent = -1i64;
+        let mut plateau = 0u32;
+        for _ in 0..2_000 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), &mut decodage)
+                .await
+                .is_ok()
+            {
+                fini = true;
+                break;
+            }
+            let a = avance_ms.load(Relaxed);
+            if a == precedent {
+                plateau += 1;
+                if plateau >= 25 {
+                    break;
+                }
+            } else {
+                plateau = 0;
+                precedent = a;
+            }
+        }
+        // Décodage terminé : le relais se ferme de lui-même (son émetteur est
+        // tombé avec la tâche de décodage). On l'attend pour que la file soit
+        // complète au moment du comptage. En plateau, l'avance stable prouve
+        // déjà que le relais est au repos.
+        if fini {
+            let _ = relais.await;
+        }
+
+        let mut fenetres = 0usize;
+        let mut octets = 0usize;
+        let mut audio_ms = 0i64;
+        while let Ok(raw) = levels_rx.try_recv() {
+            fenetres += 1;
+            octets += raw.pcm.len();
+            audio_ms += raw.window.as_millis() as i64;
+        }
+
+        // Libérer le décodeur : sans cela il resterait bloqué sur son canal
+        // borné pour toute la vie du binaire de test.
+        relache.store(true, Relaxed);
+        if !fini {
+            let _ = decodage.await;
+        }
+        (fenetres, octets, audio_ms)
+    }
+
+    /// Contre-épreuve CHIFFRÉE du frein sur le chemin du cache hit.
+    ///
+    /// #3104 a recopié la forme du décodage-pour-niveaux — flux, PCM au puits —
+    /// mais pas son frein : son puits drainait sans condition. Le décodage
+    /// courait alors à la vitesse du DISQUE pendant que le forwarder ne publie
+    /// qu'au temps réel, et la file du forwarder — non bornée, chaque fenêtre
+    /// portant son PCM — retenait la piste ENTIÈRE. Le cache hit étant le cas
+    /// courant, la fuite l'était aussi.
+    ///
+    /// Le test mesure les deux formes sur deux durées : sans frein la rétention
+    /// SUIT la durée de la piste (elle double quand la piste double) ; avec
+    /// frein elle plafonne à ~30 s d'audio, quelle que soit la piste.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn la_rendition_en_cache_ne_retient_plus_toute_la_piste() {
+        let court = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let long = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(court.path(), 60_000);
+        ecrire_wav_carre(long.path(), 120_000);
+        let court = court.path().to_str().unwrap().to_string();
+        let long = long.path().to_str().unwrap().to_string();
+
+        // Forme livrée par #3104 : puits sans frein.
+        let (f60, o60, ms60) = pcm_retenu(&court, false).await;
+        let (f120, o120, ms120) = pcm_retenu(&long, false).await;
+        // Forme bridée : celle de `spawn_local_file_levels_decode`.
+        let (g60, p60, gms60) = pcm_retenu(&court, true).await;
+        let (g120, p120, gms120) = pcm_retenu(&long, true).await;
+
+        println!(
+            "sans frein — 60 s : {f60} fenêtres / {o60} octets / {ms60} ms ; \
+             120 s : {f120} fenêtres / {o120} octets / {ms120} ms"
+        );
+        println!(
+            "avec frein — 60 s : {g60} fenêtres / {p60} octets / {gms60} ms ; \
+             120 s : {g120} fenêtres / {p120} octets / {gms120} ms"
+        );
+
+        assert!(
+            ms60 >= 59_000 && ms120 >= 119_000,
+            "sans frein, la file doit retenir la piste entière — c'est le défaut \
+             qu'on mesure : {ms60} ms sur 60 s, {ms120} ms sur 120 s"
+        );
+        assert!(
+            o120 as f64 > o60 as f64 * 1.9,
+            "sans frein, la rétention doit SUIVRE la durée : {o60} octets sur \
+             60 s contre {o120} sur 120 s — si ce rapport n'est pas ~2, la \
+             mesure ne décrit pas ce qu'elle prétend"
+        );
+
+        assert!(
+            gms60 <= 35_000 && gms120 <= 35_000,
+            "le frein doit plafonner la file à ~30 s d'audio (PROXY_LEVELS_MAX_AHEAD_MS \
+             plus le canal borné du puits) : {gms60} ms sur 60 s, {gms120} ms sur 120 s"
+        );
+        assert!(
+            gms60 >= 25_000,
+            "le frein ne doit pas ÉTEINDRE les niveaux : il en garde ~30 s \
+             d'avance ; reçu {gms60} ms"
+        );
+        assert!(
+            (gms120 - gms60).abs() <= 4_000,
+            "le plafond ne doit pas dépendre de la durée de la piste : {gms60} ms \
+             sur 60 s contre {gms120} ms sur 120 s"
+        );
+        assert!(
+            (p120 as f64) < o120 as f64 / 2.0,
+            "sur 120 s, le frein doit diviser la rétention : {p120} octets contre \
+             {o120} sans frein"
+        );
+    }
+
+    /// #3104 a livré son correctif avec un garde sur le TEXTE source : il
+    /// vérifiait qu'un forwarder était bien câblé dans la tranche du cache hit,
+    /// sans jamais faire passer UNE SEULE fenêtre. Voici la mesure qui manquait.
+    ///
+    /// On appelle ce que la branche « cache hit » appelle, avec la même
+    /// génération épinglée, sur une RENDITION (pas sur la source) : les
+    /// `playback.audio_levels` doivent monter sur le bus, et décrire du SIGNAL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_cache_hit_fait_bien_monter_des_niveaux_sur_le_bus() {
+        let rendition = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(rendition.path(), 5_000);
+        let chemin = rendition.path().to_str().unwrap().to_string();
+        let (orch, bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        let play_seq = orch.playback.current_play_seq(zone_id).await;
+        super::spawn_local_file_levels_decode(
+            bus,
+            orch.playback.clone(),
+            zone_id,
+            play_seq,
+            chemin,
+        );
+
+        let (n, crete) =
+            compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(20), 25).await;
+        assert!(
+            n >= 25,
+            "une piste servie depuis le cache de transcodage doit animer les VU : \
+             reçu {n} événements"
+        );
+        assert!(
+            crete > -20.0,
+            "les niveaux doivent décrire le SIGNAL de la rendition, pas du \
+             silence : crête {crete:.1} dBFS"
+        );
+    }
+
+    /// Contre-épreuve PERMANENTE du test ci-dessus : la décision d'AVANT #3104
+    /// — un cache hit sert le fichier et n'attache rien — sur le même harnais.
+    /// Si des `audio_levels` arrivaient ici par un autre chemin, le test
+    /// principal deviendrait insensible au défaut ; celui-ci tomberait d'abord.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contre_epreuve_un_cache_hit_sans_niveaux_laisse_les_vu_morts() {
+        let rendition = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(rendition.path(), 5_000);
+        let chemin = rendition.path().to_str().unwrap().to_string();
+        let (_orch, _bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        // Comportement historique : la branche de cache créait la session de
+        // streaming et s'arrêtait là. Rien n'est attaché, volontairement.
+        let (n, _) = compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(3), 0).await;
+        assert_eq!(
+            n, 0,
+            "sous le défaut, ce harnais doit voir ZÉRO niveau — sinon le test \
+             principal ne prouve rien"
+        );
+    }
+
     /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend
     /// `applied_live=false`, mais ce n'est pas une raison pour laisser le
     /// client afficher l'ancien chemin du signal. `zone.updated` lui ordonne
@@ -15866,8 +16154,15 @@ mod annonce_apres_sortie_guard {
     ///
     /// Le garde tient sur la TRANCHE de la branche de cache — de son propre
     /// journal jusqu'à celui du transcodage frais. Chercher
-    /// `spawn_paced_levels_forwarder` dans tout le fichier serait satisfait par
-    /// la douzaine d'autres chemins qui l'appellent déjà.
+    /// `spawn_local_file_levels_decode` dans tout le fichier serait satisfait
+    /// par les autres chemins qui l'appellent déjà.
+    ///
+    /// Ce garde-fou exige la fonction BRIDÉE, pas un forwarder nu. Sa première
+    /// version demandait `spawn_paced_levels_forwarder` : elle était satisfaite
+    /// par le bloc en ligne qui recopiait la forme du décodage sans son frein,
+    /// et laissait donc passer la régression que ce garde prétendait couvrir.
+    /// La mesure qui va avec est
+    /// `la_rendition_en_cache_ne_retient_plus_toute_la_piste`.
     #[test]
     fn un_cache_hit_attache_aussi_les_niveaux() {
         let debut = position("\"transcode_cache_hit\"");
@@ -15877,12 +16172,19 @@ mod annonce_apres_sortie_guard {
             "les deux branches ont été réordonnées : la découpe ne délimite \
              plus la branche de cache, ce garde-fou ne garde plus rien."
         );
+        let tranche = &code_de_production()[debut..fin];
         assert!(
-            code_de_production()[debut..fin].contains("spawn_paced_levels_forwarder"),
-            "la branche « cache hit » n'attache plus de forwarder de niveaux : \
-             toute piste servie depuis le cache de transcodage joue avec des \
-             VU-mètres morts et un spectrogramme plat, alors que sa toute \
-             première écoute — la seule à transcoder — les animait."
+            tranche.contains("spawn_local_file_levels_decode("),
+            "la branche « cache hit » n'attache plus de niveaux par la fonction \
+             bridée : soit les VU-mètres retombent morts dès la deuxième écoute, \
+             soit — si le décodage a été réécrit en ligne — il repart sans frein \
+             et la file du forwarder retient tout le PCM de la piste."
+        );
+        assert!(
+            !tranche.contains("spawn_paced_levels_forwarder"),
+            "la branche « cache hit » rebranche un forwarder à la main : c'est \
+             la forme qui avait perdu le frein en route. Elle doit passer par \
+             `spawn_local_file_levels_decode`, qui porte le bridage."
         );
     }
 
