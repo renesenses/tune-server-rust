@@ -2571,6 +2571,12 @@ fn decode_symphonia(
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
         all_samples.extend_from_slice(&packet_samples);
+        // Débit de décodage observable sans coût (#3140) : un paquet FLAC vaut
+        // quelques dizaines de millisecondes d'audio. Inerte sans balise.
+        super::decode_progress::publier(
+            all_samples.len() as u64 / source_channels.max(1) as u64 * 1000
+                / source_rate.max(1) as u64,
+        );
     }
 
     if all_samples.len() > max_samples {
@@ -3015,6 +3021,13 @@ fn decode_dsd_to_pcm(
         let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            // Débit de décodage observable sans coût (#3140) : un super-bloc
+            // DSF vaut ~3 ms d'audio en DSD256, ~12 ms en DSD64, et le budget
+            // du transcodage a besoin de savoir à quelle vitesse CET hôte
+            // avance sur CE fichier. Inerte quand personne n'a posé de balise.
+            super::decode_progress::publier(
+                all_samples.len() as u64 / channels as u64 * 1000 / output_rate as u64,
+            );
             if all_samples.len() >= needed {
                 break;
             }
@@ -3040,6 +3053,10 @@ fn decode_dsd_to_pcm(
         let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            // Même balise que la branche DSF (#3140).
+            super::decode_progress::publier(
+                all_samples.len() as u64 / channels as u64 * 1000 / output_rate as u64,
+            );
             if all_samples.len() >= needed {
                 break;
             }

@@ -114,6 +114,13 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Test-only : `#[tokio::test(start_paused = true)]`. Le chien de garde du budget
+# de transcodage (#3140) compte en MINUTES — un DSD256 de 20 min à × 2,2 met
+# 545 s à se décoder. Sans horloge virtuelle, l'éprouver coûterait ce temps-là
+# pour de vrai, et un test de budget qui dort est un test intermittent.
+# `test-util` n'entre que dans les cibles de test : le binaire publié ne le
+# compile pas. Même déclaration que `tune-server` (#2073).
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "integration_contracts"
