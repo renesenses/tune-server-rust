@@ -900,12 +900,28 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
 /// trois surfaces qui portent `current_track` restaient muettes ; ce
 /// fabricant les aligne, à l'identique de `inject_metadata_anchor`, et aux
 /// mêmes trois points d'appel, pour qu'elles ne puissent plus diverger.
+///
+/// `session_context_source` complète la paire, et sans lui elle ne suffisait
+/// pas à ROUVRIR ce qui joue. L'identifiant est une chaîne nue tirée de deux
+/// espaces de noms : un `i64` de la table `albums`, ou l'identifiant
+/// d'édition d'un service. Le chemin LOCAL s'en tirait tout seul — la
+/// bibliothèque est l'espace de noms implicite, `"42"` s'ouvre par
+/// `GET /albums/42`. Le chemin QOBUZ, celui du ticket, restait nu :
+/// `("album", "0060254735822")` ne dit pas chez qui l'ouvrir, quand
+/// `GET /streaming/{service}/albums/{id}` réclame ce `{service}`. Le client
+/// n'avait plus qu'à supposer que le service affiché à l'écran est celui qui
+/// joue — faux dès qu'on regarde Tidal en écoutant Qobuz, et la devinette
+/// même que #1284 a condamnée.
 pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
     obj.insert(
         "session_context_type".into(),
         json!(ps.session_context_type),
     );
     obj.insert("session_context_id".into(), json!(ps.session_context_id));
+    obj.insert(
+        "session_context_source".into(),
+        json!(ps.session_context_source),
+    );
 }
 
 /// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
