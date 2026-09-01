@@ -91,6 +91,12 @@ mod rustsec_allowlists;
 mod serveur_media_criteres_canoniques;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "sso_modules_du_compte.rs"]
+mod sso_modules_du_compte;
+#[path = "support_journaux_joints.rs"]
+mod support_journaux_joints;
+#[path = "support_relais_diagnostic_sortant.rs"]
+mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
 mod support_relais_marquer_lu;
 #[path = "tests_orphelins.rs"]
