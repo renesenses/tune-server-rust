@@ -39,6 +39,8 @@ mod etiquettes_types_et_playlists;
 mod explorateur_dossiers;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "favoris_cloisonnement_par_profil.rs"]
+mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
 #[path = "generateur_playlists_sans_ia.rs"]
