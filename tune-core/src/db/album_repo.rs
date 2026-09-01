@@ -1513,8 +1513,104 @@ impl AlbumRepo {
             .collect())
     }
 
+    /// Module de l'arithmetique du tri aleatoire : 2^31 - 1, premier de
+    /// Mersenne.
+    ///
+    /// Il est choisi pour que TOUT produit intermediaire tienne dans un entier
+    /// 64 bits signe (`u < 2^31` donc `u * u < 2^62`), et ce n'est pas de la
+    /// prudence gratuite : un depassement ne se signale pas de la meme facon
+    /// des deux cotes. PostgreSQL leve « bigint out of range » et coupe la
+    /// requete ; SQLite, lui, bascule en silence vers un flottant et rend un
+    /// ordre FAUX, sans le dire. Voir
+    /// `melange_aleatoire_ne_deborde_jamais_3074`.
+    pub const GRAINE_MODULE: i64 = 2_147_483_647;
+
+    /// Premier tour : etaler les identifiants sur tout le module. Sans lui, une
+    /// bibliotheque de 3 357 albums ne couvrirait qu'un millieme de l'intervalle
+    /// et le carre du second tour n'aurait rien a replier.
+    const GRAINE_MULT_A: i64 = 1_103_515_245;
+
+    /// Second tour : le terme lineaire du carre. Il brise la symetrie
+    /// `u <-> -u`, qui apparierait les albums deux a deux.
+    const GRAINE_MULT_B: i64 = 48_271;
+
+    /// Une graine tiree au sort, dans `[0, GRAINE_MODULE)`.
+    ///
+    /// C'est tout le « bouton de re-tirage » demande au fil 1635 (#3074) :
+    /// re-tirer, c'est changer de graine, rien d'autre.
+    pub fn graine_aleatoire() -> i64 {
+        use rand_core::RngCore;
+        (rand_core::OsRng.next_u64() % (Self::GRAINE_MODULE as u64)) as i64
+    }
+
+    /// L'expression SQL qui range les albums « au hasard, mais toujours de la
+    /// meme facon pour une graine donnee ».
+    ///
+    /// Ni `RANDOM()` (SQLite : aucune graine par requete) ni `setseed()`
+    /// (PostgreSQL : reglage de SESSION, hors de portee d'ici) ne conviennent,
+    /// et le precedent de `smart_collections.rs` / `smart_playlists.rs` n'est
+    /// pas transposable : ces deux chemins ne posent qu'un `LIMIT`, JAMAIS
+    /// d'`OFFSET`, donc un seul tirage. La vue Bibliotheque, elle, est paginee
+    /// par offset et charge 3 357 albums en quatre requetes. Un tirage par
+    /// requete afficherait des albums en double et en cacherait d'autres, sans
+    /// rien dire (#3074).
+    ///
+    /// D'ou une fonction de melange ecrite a la main, en `+`, `*` et `%`
+    /// seulement : les trois seuls operateurs arithmetiques dont SQLite et
+    /// PostgreSQL donnent exactement le meme resultat sur des entiers positifs.
+    /// Aucune branche par moteur — c'est la meme chaine des deux cotes, et
+    /// `melange_aleatoire_est_portable_sqlite_postgres_3074` l'epingle.
+    ///
+    /// Le terme CARRE n'est pas decoratif. Une expression affine
+    /// (`(a.id * k + graine) % p`) est aussi une permutation, mais l'ordre
+    /// qu'elle produit est une progression arithmetique d'identifiants — un
+    /// album sur trente-sept — et comme les identifiants suivent l'ordre de
+    /// parcours du scan, cette regularite SE VOIT sur la grille. Le carre la
+    /// supprime.
+    pub fn melange_aleatoire_sql(colonne_id: &str, graine: i64) -> String {
+        let m = Self::GRAINE_MODULE;
+        let g = graine.rem_euclid(m);
+        let a = Self::GRAINE_MULT_A;
+        let b = Self::GRAINE_MULT_B;
+        let u = format!("((({colonne_id} % {m}) * {a} + {g}) % {m})");
+        format!("(({u} * ({u} + {b})) % {m})")
+    }
+
+    /// Listage sans graine : `sort=random` y vaut graine 0.
+    ///
+    /// Conserve pour les dizaines d'appelants qui ne trient jamais au hasard
+    /// (Browse UPnP, maintenance, `list_paginated`). La ROUTE, elle, passe
+    /// toujours par [`Self::list_filtered_seeded`] — voir
+    /// `tune-server/src/routes/library/albums.rs`.
     #[allow(clippy::too_many_arguments)]
     pub fn list_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+    ) -> Result<Vec<Album>, TuneError> {
+        self.list_filtered_seeded(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_filtered_seeded(
         &self,
         limit: i64,
         offset: i64,
@@ -1533,6 +1629,11 @@ impl AlbumRepo {
         // AUCUNE jointure supplémentaire n'est ajoutée : le SQL du cas courant
         // est exactement celui d'avant.
         dr: Option<DrRange>,
+        // Graine du tri aleatoire (#3074), n'a de sens qu'avec `sort=random`.
+        // `None` = graine 0 : reproductible quand meme, donc jamais de
+        // doublons en pagination. C'est la route HTTP qui en tire une quand le
+        // client n'en donne pas, et qui la lui renvoie.
+        seed: Option<i64>,
     ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
@@ -1585,6 +1686,12 @@ impl AlbumRepo {
             "dynamic_range" | "dr" => {
                 format!("dr.dr {dir} NULLS LAST, LOWER(a.title) ASC, a.id ASC")
             }
+            // Tri aleatoire (#3074). L'ordre vient de la colonne calculee
+            // `rnd`, posee dans le SELECT plus bas ; ici on ne fait que la
+            // nommer. `a.id` departage comme partout ailleurs : deux albums
+            // tombes sur la meme valeur doivent quand meme sortir toujours
+            // dans le meme ordre, sinon la pagination les remelange.
+            "random" => format!("rnd {dir}, a.id ASC"),
             _ => format!("a.id {dir}"),
         };
 
@@ -1670,6 +1777,11 @@ impl AlbumRepo {
         // 1er temps : trier des lignes ÉTROITES — a.id et la clé de tri
         // seulement — et borner en SQL (LIMIT/OFFSET).
         let added_at_sort = matches!(sort, "added_at" | "added_date");
+        // #3074 — la colonne de melange n'est calculee QUE pour
+        // `sort=random` : le SQL de tous les autres tris ne bouge pas d'un
+        // caractere, et le plan de #1269 est preserve tel quel.
+        let rnd_expr =
+            (sort == "random").then(|| Self::melange_aleatoire_sql("a.id", seed.unwrap_or(0)));
         let mut joins = "LEFT JOIN artists ar ON a.artist_id = ar.id".to_string();
         if added_at_sort {
             // `aa.added_at` vient de la jointure groupée `ADDED_AT_JOIN` —
@@ -1687,6 +1799,11 @@ impl AlbumRepo {
         }
         let id_select = if added_at_sort {
             format!("SELECT a.id, aa.added_at FROM albums a {joins}")
+        } else if let Some(rnd) = rnd_expr.as_deref() {
+            // La colonne calculee reste dans le 1er temps de #1269 : on trie
+            // des lignes ETROITES (id + valeur de melange), jamais les vingt-
+            // cinq colonnes de l'album.
+            format!("SELECT a.id, {rnd} AS rnd FROM albums a {joins}")
         } else {
             format!("SELECT a.id FROM albums a {joins}")
         };
@@ -3209,6 +3326,162 @@ mod tests {
         assert!(repo.get(id).unwrap().unwrap().is_compilation);
     }
 
+    /// #3074 — deux graines, deux ordres ; la meme graine, le meme ordre.
+    ///
+    /// Le fait de base du tri aleatoire, et il etait FAUX : `sort=random`
+    /// n'etait reconnu nulle part et tombait dans le bras fourre-tout
+    /// `_ => format!("a.id {dir}")`, si bien que toutes les graines rendaient
+    /// la meme liste — l'ordre des identifiants.
+    #[test]
+    fn deux_graines_donnent_deux_ordres_3074() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        for n in 0..60 {
+            repo.create(&Album::new(format!("album {n:02}"))).unwrap();
+        }
+        let ordre = |graine: i64| -> Vec<i64> {
+            repo.list_filtered_seeded(
+                60,
+                0,
+                "random",
+                "asc",
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some(graine),
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| a.id)
+            .collect()
+        };
+        let un = ordre(1);
+        let deux = ordre(2);
+        assert_eq!(un.len(), 60, "la page doit rendre les soixante albums");
+        assert_ne!(un, deux, "deux graines rendent le meme ordre (#3074)");
+        assert_eq!(ordre(1), un, "la meme graine doit redonner le meme ordre");
+
+        let mut trie = un.clone();
+        trie.sort_unstable();
+        assert_ne!(
+            un, trie,
+            "l'ordre rendu est celui des identifiants : rien n'a ete melange"
+        );
+        let mut contenu = deux.clone();
+        contenu.sort_unstable();
+        assert_eq!(trie, contenu, "melanger ne doit rien ajouter ni retirer");
+    }
+
+    /// #3074 — la pagination par offset ne double ni ne perd rien.
+    #[test]
+    fn le_tri_aleatoire_pagine_sans_doublon_ni_absent_3074() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        for n in 0..60 {
+            repo.create(&Album::new(format!("album {n:02}"))).unwrap();
+        }
+        let page = |limit: i64, offset: i64| -> Vec<i64> {
+            repo.list_filtered_seeded(
+                limit,
+                offset,
+                "random",
+                "asc",
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some(1234),
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|a| a.id)
+            .collect()
+        };
+        let mut recolle = Vec::new();
+        for offset in (0..60).step_by(13) {
+            recolle.extend(page(13, offset));
+        }
+        assert_eq!(
+            recolle,
+            page(60, 0),
+            "les pages recollees doivent redonner la page unique"
+        );
+        let mut distincts = recolle.clone();
+        distincts.sort_unstable();
+        distincts.dedup();
+        assert_eq!(
+            distincts.len(),
+            60,
+            "doublons ou absents dans la pagination (#3074)"
+        );
+    }
+
+    /// #3074 — l'arithmetique doit tenir dans un entier 64 bits SIGNE, pour
+    /// tout identifiant et toute graine.
+    ///
+    /// Ce n'est pas une precaution theorique : PostgreSQL leve « bigint out of
+    /// range » et coupe la requete, SQLite bascule en silence vers un flottant
+    /// et rend un ordre faux. L'essai rejoue l'expression en Rust avec des
+    /// operations VERIFIEES — un depassement y devient un panic, ici, plutot
+    /// qu'une grille de travers chez un testeur.
+    #[test]
+    fn melange_aleatoire_ne_deborde_jamais_3074() {
+        let m = AlbumRepo::GRAINE_MODULE;
+        for id in [0i64, 1, 3_357, 45_000, i64::MAX / 2, i64::MAX] {
+            for graine in [0i64, 1, m / 2, m - 1] {
+                let u = (id % m)
+                    .checked_mul(AlbumRepo::GRAINE_MULT_A)
+                    .and_then(|v| v.checked_add(graine))
+                    .unwrap_or_else(|| {
+                        panic!("debordement du 1er tour (id={id}, graine={graine})")
+                    })
+                    % m;
+                assert!((0..m).contains(&u));
+                u.checked_add(AlbumRepo::GRAINE_MULT_B)
+                    .and_then(|v| u.checked_mul(v))
+                    .unwrap_or_else(|| panic!("debordement du 2e tour (id={id}, graine={graine})"));
+            }
+        }
+    }
+
+    /// #3074 — portabilite : l'expression n'emploie que `+`, `*`, `%` et des
+    /// entiers, donc AUCUNE branche par moteur.
+    ///
+    /// Le schema SQLite derive de PostgreSQL et les deux dorsales partagent ce
+    /// `list_filtered` ; toute fonction propre a l'un (`RANDOM`, `setseed`,
+    /// `md5`, `hashtext`) rendrait le tri aleatoire indisponible sur l'autre —
+    /// en silence pour SQLite, qui ignore aussi les indices de marqueurs.
+    #[test]
+    fn melange_aleatoire_est_portable_sqlite_postgres_3074() {
+        let sql = AlbumRepo::melange_aleatoire_sql("a.id", 7);
+        for interdit in [
+            "RANDOM", "random", "setseed", "md5", "MD5", "hashtext", "ABS", "ORDER",
+        ] {
+            assert!(!sql.contains(interdit), "expression non portable : {sql}");
+        }
+        assert!(
+            sql.chars()
+                .all(|c| c.is_ascii_digit() || "ai.d ()+*%_".contains(c)),
+            "caractere inattendu dans l'expression : {sql}"
+        );
+        // La graine est normalisee dans `[0, GRAINE_MODULE)` AVANT d'entrer
+        // dans le SQL : une graine negative envoyee par un client ne doit pas
+        // produire un `% -1` ni un ordre different d'un moteur a l'autre.
+        let negative = AlbumRepo::melange_aleatoire_sql("a.id", -7);
+        assert!(
+            !negative.contains('-'),
+            "graine negative recopiee telle quelle : {negative}"
+        );
+        assert_eq!(
+            negative,
+            AlbumRepo::melange_aleatoire_sql("a.id", -7 + AlbumRepo::GRAINE_MODULE),
+            "la normalisation de la graine doit etre modulaire"
+        );
+    }
+
     /// Filtrer la bibliothèque sur les compilations — un des trois usages que
     /// l'absence de colonne interdisait (#1957).
     #[test]
@@ -4371,6 +4644,47 @@ mod tests {
         }
         sql.push_str("COMMIT;\n");
         db.execute_batch(&sql).unwrap();
+    }
+
+    /// #3074 — contre-épreuve de coût : le tri aléatoire doit coûter du même
+    /// ordre qu'une page du tri trivial, PAS un multiple.
+    ///
+    /// L'expression de mélange est évaluée POUR CHAQUE LIGNE de la table, sur
+    /// la passe étroite de #1269 (id + valeur de mélange, jamais les
+    /// vingt-cinq colonnes de l'album). Elle ne fait que trois
+    /// multiplications, deux additions et deux modulos d'entiers — mais cela
+    /// se MESURE, cela ne se suppose pas : la bibliothèque de Megalo compte
+    /// 45 000 albums et les clients iOS/macOS coupent à 15 s par requête.
+    #[test]
+    fn le_tri_aleatoire_coute_comme_le_tri_trivial_3074() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        seed_grosse_bibliotheque(&db, 10_000, 2);
+        let chrono = |sort: &str, graine: Option<i64>| -> std::time::Duration {
+            (0..3)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    let page = repo
+                        .list_filtered_seeded(
+                            2000, 0, sort, "asc", None, None, None, true, None, graine,
+                        )
+                        .unwrap();
+                    assert_eq!(page.len(), 2000);
+                    t0.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let t_id = chrono("id", None);
+        let t_rnd = chrono("random", Some(1234));
+        eprintln!("contre-épreuve #3074 : id={t_id:?} random={t_rnd:?}");
+        let plafond = t_id.max(std::time::Duration::from_millis(5)) * 8;
+        assert!(
+            t_rnd < plafond,
+            "le tri aléatoire coûte {t_rnd:?} pour une page de 2000 contre \
+             {t_id:?} en tri id : l'expression de mélange n'est plus évaluée \
+             sur la passe étroite de #1269 (#3074)"
+        );
     }
 
     /// #2144 — contre-épreuve de coût : trier ou filtrer par DR doit coûter du

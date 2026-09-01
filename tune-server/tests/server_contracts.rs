@@ -95,6 +95,8 @@ mod support_relais_marquer_lu;
 mod tests_orphelins;
 #[path = "tranches_dynamic_range.rs"]
 mod tranches_dynamic_range;
+#[path = "tri_aleatoire_albums.rs"]
+mod tri_aleatoire_albums;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]
