@@ -595,6 +595,7 @@ impl OutputTarget for OaatOutput {
             true,
             self.supports_internal_gapless(),
         )
+        .with_percent_volume()
     }
 
     /// OAAT genuinely chains tracks internally in BOTH modes, so it always

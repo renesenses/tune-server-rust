@@ -872,7 +872,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true)
+        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

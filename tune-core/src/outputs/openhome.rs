@@ -343,6 +343,7 @@ impl OutputTarget for OpenHomeOutput {
             volume,
             self.svc_url("playlist").is_some(),
         )
+        .with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {

@@ -97,6 +97,8 @@ mod tranches_dynamic_range;
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]
 mod volume_db_contrat;
+#[path = "volume_db_resolution.rs"]
+mod volume_db_resolution;
 #[path = "web_response_contracts.rs"]
 mod web_response_contracts;
 #[path = "workflows_bornes.rs"]
