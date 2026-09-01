@@ -17,7 +17,7 @@
 //!   traité comme `classic:<id>`.
 //! - `favorite` s'évalue sur le profil actif de la requête (header
 //!   `X-Profile-Id`, sinon le profil actif global, sinon le profil 1 — voir
-//!   [`crate::routes::active_profile::ActiveProfile`]). Sans profil résolu
+//!   [`tune_http_types::ActiveProfile`]). Sans profil résolu
 //!   (`profile_id = None`, jamais le cas via l'extracteur), le critère ne
 //!   matche RIEN — y compris `is_not` : sans profil le statut favori est
 //!   inconnu, on échoue fermé.
@@ -29,11 +29,10 @@
 //!   compteur de la liste des smart collections.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::Value;
-use tune_core::db::backend::ToSqlValue;
-
-use crate::state::AppState;
+use tune_core::db::backend::{DbBackend, ToSqlValue};
 
 /// Profondeur maximale de références smart imbriquées à l'évaluation.
 pub const MAX_REF_DEPTH: u32 = 10;
@@ -79,12 +78,12 @@ impl RefResolver for EmptyResolver {
 /// Résolveur branché sur la base (SQLite comme Postgres : `$1` est compris
 /// par les deux backends).
 pub struct DbRefResolver<'a> {
-    state: &'a AppState,
+    backend: &'a Arc<dyn DbBackend>,
 }
 
 impl<'a> DbRefResolver<'a> {
-    pub fn new(state: &'a AppState) -> Self {
-        Self { state }
+    pub fn new(backend: &'a Arc<dyn DbBackend>) -> Self {
+        Self { backend }
     }
 }
 
@@ -99,7 +98,6 @@ impl RefResolver for DbRefResolver<'_> {
             }
         };
         let row = self
-            .state
             .backend
             .query_one(sql, &[&id as &dyn ToSqlValue])
             .ok()
@@ -124,11 +122,10 @@ impl RefResolver for DbRefResolver<'_> {
     }
 
     fn collection_album_ids(&self, id: i64) -> Option<Vec<i64>> {
-        let raw =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(self.state.backend.clone())
-                .get("collections")
-                .ok()
-                .flatten()?;
+        let raw = tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+            .get("collections")
+            .ok()
+            .flatten()?;
         let collections: Vec<Value> = serde_json::from_str(&raw).ok()?;
         let found = collections
             .iter()
@@ -220,15 +217,14 @@ fn nested_smart_ids_sql(kind: RefKind, id: i64, ctx: &RefCtx) -> Result<Option<S
     let child = ctx.child();
     let sql = match kind {
         RefKind::SmartCollection => {
-            let (where_clause, _order, _limit) =
-                crate::routes::smart_collections::build_album_query(
-                    &entity.rules_json,
-                    &entity.match_mode,
-                    "title",
-                    "asc",
-                    None,
-                    &child,
-                );
+            let (where_clause, _order, _limit) = crate::smart_collections::build_album_query(
+                &entity.rules_json,
+                &entity.match_mode,
+                "title",
+                "asc",
+                None,
+                &child,
+            );
             format!(
                 "SELECT DISTINCT al.id FROM albums al \
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -236,7 +232,7 @@ fn nested_smart_ids_sql(kind: RefKind, id: i64, ctx: &RefCtx) -> Result<Option<S
             )
         }
         RefKind::SmartPlaylist => {
-            let (where_clause, _order, _limit) = crate::routes::smart_playlists::build_smart_query(
+            let (where_clause, _order, _limit) = crate::smart_playlists::build_smart_query(
                 &entity.rules_json,
                 &entity.match_mode,
                 "title",

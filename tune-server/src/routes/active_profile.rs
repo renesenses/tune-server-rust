@@ -5,12 +5,10 @@ use axum::http::request::Parts;
 
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
+pub use tune_http_types::DEFAULT_PROFILE_ID;
 
 use crate::auth::AuthUser;
 use crate::state::AppState;
-
-/// The built-in default profile id (seeded by migration 6).
-pub const DEFAULT_PROFILE_ID: i64 = 1;
 
 /// The user profile a request acts on.
 ///
@@ -47,14 +45,7 @@ pub const DEFAULT_PROFILE_ID: i64 = 1;
 /// first run) and profiles are a convenience, not a security boundary: the
 /// header is honoured exactly as before, so per-device profile selection keeps
 /// working unchanged.
-#[derive(Debug, Clone, Copy)]
-pub struct ActiveProfile(pub i64);
-
-impl ActiveProfile {
-    pub fn id(&self) -> i64 {
-        self.0
-    }
-}
+pub use tune_http_types::ActiveProfile;
 
 /// Whether a caller may act as the profile named in `X-Profile-Id`.
 ///

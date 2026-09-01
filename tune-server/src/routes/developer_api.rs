@@ -11,6 +11,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 
 use crate::state::AppState;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -81,32 +82,59 @@ pub fn router() -> Router<AppState> {
 // Helpers — settings persistence
 // ---------------------------------------------------------------------------
 
-fn load_api_keys(settings: &SettingsRepo) -> Vec<DevApiKey> {
-    settings
-        .get(SETTINGS_KEY_API_KEYS)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
+fn load_api_keys(settings: &SettingsRepo) -> Result<Vec<DevApiKey>, String> {
+    settings.get_json_list(SETTINGS_KEY_API_KEYS)
+}
+
+pub fn load_webhooks(settings: &SettingsRepo) -> Result<Vec<Webhook>, String> {
+    settings.get_json_list(SETTINGS_KEY_WEBHOOKS)
+}
+
+/// Une panne de stockage se dit, elle ne se déguise pas en liste vide (#2795).
+///
+/// Le corps ne porte jamais la valeur stockée : `detail` vient des messages de
+/// `SettingsRepo`, de `serde_json` (position seule) et du pilote SQL (jamais
+/// les paramètres liés). Aucune clef d'API n'y transite — le test
+/// `cles_developpeur_persistance.rs` le vérifie sur une base volontairement
+/// corrompue avec une clef à l'intérieur.
+fn panne_de_stockage(quoi: &str, erreur: String) -> axum::response::Response {
+    // La valeur n'est PAS journalisée, seulement la cause.
+    warn!(quoi, erreur = %erreur, "developer_api_stockage_en_echec");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "storage_failure",
+            "detail": erreur,
+        })),
+    )
+        .into_response()
+}
+
+/// L'origine d'une URL de webhook — schéma et hôte, rien de plus.
+///
+/// Une adresse de webhook est un secret en soi : chez Slack ou Discord, le
+/// chemin (`/services/T…/B…/…`) EST le jeton, et quiconque l'a peut publier.
+/// Le journal doit donc pouvoir nommer la destination sans la livrer. C'est la
+/// même règle que pour les clefs d'API : jamais de secret dans une trace, même
+/// tronqué.
+pub fn origine_seule(url: &str) -> String {
+    let (schema, reste) = match url.split_once("://") {
+        Some((s, r)) => (s, r),
+        // Pas de schéma reconnaissable : on ne devine pas, on ne cite rien.
+        None => return "(adresse illisible)".to_string(),
+    };
+    let hote = reste
+        .split(['/', '?', '#'])
+        .next()
         .unwrap_or_default()
-}
-
-fn save_api_keys(settings: &SettingsRepo, keys: &[DevApiKey]) {
-    let json = serde_json::to_string(keys).unwrap_or_else(|_| "[]".into());
-    settings.set(SETTINGS_KEY_API_KEYS, &json).ok();
-}
-
-pub fn load_webhooks(settings: &SettingsRepo) -> Vec<Webhook> {
-    settings
-        .get(SETTINGS_KEY_WEBHOOKS)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_webhooks(settings: &SettingsRepo, hooks: &[Webhook]) {
-    let json = serde_json::to_string(hooks).unwrap_or_else(|_| "[]".into());
-    settings.set(SETTINGS_KEY_WEBHOOKS, &json).ok();
+        // Un éventuel `user:motdepasse@` est lui aussi un secret.
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if hote.is_empty() {
+        return "(adresse illisible)".to_string();
+    }
+    format!("{schema}://{hote}")
 }
 
 /// Generate a `tunedev_` prefixed key with 32 random hex chars.
@@ -138,7 +166,10 @@ async fn list_api_keys(
     crate::premium_guard::require_premium(&state.license, Feature::DeveloperApi).await?;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let keys = load_api_keys(&settings);
+    let keys = match load_api_keys(&settings) {
+        Ok(k) => k,
+        Err(e) => return Ok(panne_de_stockage("lecture_cles", e)),
+    };
 
     // Redact full keys in listing — show prefix only
     let redacted: Vec<Value> = keys
@@ -162,7 +193,8 @@ async fn list_api_keys(
     Ok(Json(json!({
         "api_keys": redacted,
         "count": redacted.len(),
-    })))
+    }))
+    .into_response())
 }
 
 /// `POST /developer/api-keys` — create a new developer API key.
@@ -203,7 +235,6 @@ async fn create_api_key(
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut keys = load_api_keys(&settings);
 
     let new_key = DevApiKey {
         id: uuid::Uuid::new_v4().to_string(),
@@ -213,6 +244,21 @@ async fn create_api_key(
         created_at: now_iso(),
     };
 
+    // La lecture, l'ajout et l'écriture dans UNE transaction, un écrivain à la
+    // fois : deux créations simultanées se retrouvent toutes les deux dans la
+    // liste. Avant la #2795, la seconde réécrivait la liste lue avant que la
+    // première ne s'y ajoute — et le client repartait avec une clef affichée
+    // une fois, jamais persistée.
+    let ajoutee = new_key.clone();
+    if let Err(e) = settings.update_json_list::<DevApiKey, _, _>(SETTINGS_KEY_API_KEYS, move |k| {
+        k.push(ajoutee);
+        Ok(())
+    }) {
+        return Ok(panne_de_stockage("creation_cle", e));
+    }
+
+    // Journalisée APRÈS la persistance, et sans la clef : une trace ne doit
+    // annoncer que ce qui est vrai, et jamais porter un secret.
     info!(name = %new_key.name, id = %new_key.id, "developer_api_key_created");
 
     let response = json!({
@@ -222,9 +268,6 @@ async fn create_api_key(
         "scopes": new_key.scopes,
         "created_at": new_key.created_at,
     });
-
-    keys.push(new_key);
-    save_api_keys(&settings, &keys);
 
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -237,12 +280,21 @@ async fn revoke_api_key(
     crate::premium_guard::require_premium(&state.license, Feature::DeveloperApi).await?;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut keys = load_api_keys(&settings);
 
-    let before = keys.len();
-    keys.retain(|k| k.id != key_id);
+    let cible = key_id.clone();
+    let trouvee =
+        match settings.update_json_list::<DevApiKey, _, _>(SETTINGS_KEY_API_KEYS, move |keys| {
+            let avant = keys.len();
+            keys.retain(|k| k.id != cible);
+            Ok(keys.len() != avant)
+        }) {
+            Ok(t) => t,
+            // Une révocation annoncée sans effet est pire que le refus : la
+            // clef reste valable et son propriétaire la croit morte.
+            Err(e) => return Ok(panne_de_stockage("revocation_cle", e)),
+        };
 
-    if keys.len() == before {
+    if !trouvee {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "api key not found"})),
@@ -250,7 +302,6 @@ async fn revoke_api_key(
             .into_response());
     }
 
-    save_api_keys(&settings, &keys);
     info!(key_id = %key_id, "developer_api_key_revoked");
 
     Ok(Json(json!({"ok": true, "revoked": key_id})).into_response())
@@ -267,12 +318,16 @@ async fn list_webhooks(
     crate::premium_guard::require_premium(&state.license, Feature::DeveloperApi).await?;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let hooks = load_webhooks(&settings);
+    let hooks = match load_webhooks(&settings) {
+        Ok(h) => h,
+        Err(e) => return Ok(panne_de_stockage("lecture_webhooks", e)),
+    };
 
     Ok(Json(json!({
         "webhooks": hooks,
         "count": hooks.len(),
-    })))
+    }))
+    .into_response())
 }
 
 /// `POST /developer/webhooks` — register a webhook.
@@ -315,7 +370,6 @@ async fn create_webhook(
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut hooks = load_webhooks(&settings);
 
     let webhook = Webhook {
         id: uuid::Uuid::new_v4().to_string(),
@@ -324,7 +378,19 @@ async fn create_webhook(
         created_at: now_iso(),
     };
 
-    info!(id = %webhook.id, url = %webhook.url, "developer_webhook_registered");
+    let ajoute = webhook.clone();
+    if let Err(e) = settings.update_json_list::<Webhook, _, _>(SETTINGS_KEY_WEBHOOKS, move |h| {
+        h.push(ajoute);
+        Ok(())
+    }) {
+        return Ok(panne_de_stockage("creation_webhook", e));
+    }
+
+    info!(
+        id = %webhook.id,
+        origine = %origine_seule(&webhook.url),
+        "developer_webhook_registered"
+    );
 
     let response = json!({
         "id": webhook.id,
@@ -332,9 +398,6 @@ async fn create_webhook(
         "events": webhook.events,
         "created_at": webhook.created_at,
     });
-
-    hooks.push(webhook);
-    save_webhooks(&settings, &hooks);
 
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -347,12 +410,19 @@ async fn delete_webhook(
     crate::premium_guard::require_premium(&state.license, Feature::DeveloperApi).await?;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut hooks = load_webhooks(&settings);
 
-    let before = hooks.len();
-    hooks.retain(|h| h.id != id);
+    let cible = id.clone();
+    let trouve =
+        match settings.update_json_list::<Webhook, _, _>(SETTINGS_KEY_WEBHOOKS, move |hooks| {
+            let avant = hooks.len();
+            hooks.retain(|h| h.id != cible);
+            Ok(hooks.len() != avant)
+        }) {
+            Ok(t) => t,
+            Err(e) => return Ok(panne_de_stockage("suppression_webhook", e)),
+        };
 
-    if hooks.len() == before {
+    if !trouve {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "webhook not found"})),
@@ -360,7 +430,6 @@ async fn delete_webhook(
             .into_response());
     }
 
-    save_webhooks(&settings, &hooks);
     info!(webhook_id = %id, "developer_webhook_removed");
 
     Ok(Json(json!({"ok": true, "removed": id})).into_response())
@@ -373,7 +442,12 @@ async fn test_webhooks(
     crate::premium_guard::require_premium(&state.license, Feature::DeveloperApi).await?;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let hooks = load_webhooks(&settings);
+    let hooks = match load_webhooks(&settings) {
+        Ok(h) => h,
+        // « 0 envoyé, aucun webhook enregistré » sur une base en panne
+        // enverrait l'utilisateur reconfigurer ce qui existe déjà.
+        Err(e) => return Ok(panne_de_stockage("lecture_webhooks", e)),
+    };
 
     if hooks.is_empty() {
         return Ok(Json(json!({
@@ -470,7 +544,12 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                     };
 
                     let settings = SettingsRepo::with_backend(backend.clone());
-                    let hooks = load_webhooks(&settings);
+                    // Ici, et ici seulement, la liste vide reste acceptable :
+                    // le distributeur est « au mieux » et ne doit pas mourir
+                    // sur une panne passagère. Mais elle ne sera plus
+                    // silencieuse — et surtout, ce chemin n'ÉCRIT rien, donc
+                    // il ne peut pas remplacer les webhooks par `[]`.
+                    let hooks = load_webhooks(&settings).ou_defaut_journalise();
 
                     if hooks.is_empty() {
                         continue;
@@ -508,7 +587,11 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                                 .await;
 
                             if let Err(e) = result {
-                                warn!(url = %url, error = %e, "webhook_delivery_failed");
+                                warn!(
+                                    origine = %origine_seule(&url),
+                                    error = %e,
+                                    "webhook_delivery_failed"
+                                );
                             }
                         });
                     }
@@ -537,7 +620,7 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                     };
 
                     let settings = SettingsRepo::with_backend(backend2.clone());
-                    let hooks = load_webhooks(&settings);
+                    let hooks = load_webhooks(&settings).ou_defaut_journalise();
 
                     let matching: Vec<&Webhook> = hooks
                         .iter()
@@ -569,7 +652,11 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                                 .await;
 
                             if let Err(e) = result {
-                                warn!(url = %url, error = %e, "webhook_delivery_failed");
+                                warn!(
+                                    origine = %origine_seule(&url),
+                                    error = %e,
+                                    "webhook_delivery_failed"
+                                );
                             }
                         });
                     }

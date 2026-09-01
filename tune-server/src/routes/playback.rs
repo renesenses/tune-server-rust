@@ -1,4 +1,3 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -229,6 +229,27 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
         "can_skip_next": can_skip_next(&zone_state),
+        // #2092 / #2055 — TROISIÈME construction de la charge utile d'une zone,
+        // et la dernière qui ne portait pas le transport.
+        //
+        // Le correctif #2153 avait rendu `shuffle` et `repeat` aux DEUX charges
+        // utiles de `zones.rs` (liste et fiche) ; le WebSocket les envoyait déjà
+        // (`ws.rs`), et la zone tout juste créée les pose aussi
+        // (`zone_repo::…`, « même divergence que #2092, en plus discret »).
+        // Celle-ci, rendue par une vingtaine de retours — `play` et ses neuf
+        // sorties anticipées, `pause`, `resume`, `stop`, `queue/jump`,
+        // `pins/{i}/invoke` —, portait `queue_length`, `queue_position` et
+        // `can_skip_next` mais pas les deux réglages dont `can_skip_next`
+        // DÉPEND : sous aléatoire, la fin de file suit la permutation (#2337).
+        //
+        // Le garde-fou écrit pour #2092 ne pouvait pas le voir : son
+        // `code_de_production()` ne lisait que `zones.rs`. La divergence qu'il
+        // devait empêcher s'était produite un fichier plus loin. Il lit
+        // désormais ce corps-ci aussi.
+        "shuffle": zone_state.shuffle,
+        // Le TYPE et non la chaîne « off » : un renommage de variante suit ici
+        // tout seul.
+        "repeat": zone_state.repeat,
         "muted": zone_state.muted,
     });
     // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
@@ -807,6 +828,84 @@ mod sqlite_scan_queue_arbitration_tests {
     }
 }
 
+/// La position rendue par la base au démarrage, à demander pour CETTE piste.
+///
+/// Ce que le serveur écrit : le poller persiste `zones.last_position_ms` tout
+/// au long de la lecture, et `restore_playback_positions` la réinjecte dans
+/// l'état de zone au démarrage. C'est cette valeur que `/zones` sert sous le
+/// nom `position_ms` et que le curseur affiche à l'ouverture de l'interface.
+///
+/// Ce que le serveur en faisait : rien. Les chemins « Lecture après arrêt »
+/// construisaient tous leur `PlayRequest` avec `seek_ms: None`, si bien que le
+/// morceau repartait de 0:00 pendant que l'écran annonçait 2:31 — Sandro,
+/// fil 1610, sortie Diretta UPnP (#2876).
+///
+/// Rend la position à passer dans le `PlayRequest`. Ne vaut QUE pour la piste
+/// restaurée, et une seule fois : le `play()` qui suit efface le marqueur (voir
+/// `ZoneState::pending_resume_ms`).
+async fn position_de_reprise(
+    state: &AppState,
+    zone_id: i64,
+    piste: Option<i64>,
+    source_id: Option<&str>,
+) -> Option<u64> {
+    let zone = state.playback.get_state(zone_id).await;
+    reprise_applicable(&zone, piste, source_id).map(|ms| ms as u64)
+}
+
+/// Ancre dans l'état de zone la position que la requête demande VRAIMENT.
+///
+/// `PlaybackManager::play` remet `position_ms` à zéro sauf juste après un seek,
+/// et le poller lit la même estampille pour ouvrir sa fenêtre de grâce. Sans cet
+/// ancrage, le son repartirait au bon endroit et le curseur retomberait à
+/// 0:00 — on aurait déplacé le mensonge de Sandro au lieu de le lever.
+///
+/// ⚠️ Lit `demandee`, c'est-à-dire le `seek_ms` **tel qu'il part dans le
+/// `PlayRequest`**, et jamais la variable qui l'a produit. C'est ce qui fait que
+/// débrancher le champ éteint aussi l'ancrage : un ancrage qui survivrait au
+/// débranchement rendrait la contre-épreuve verte alors que le morceau
+/// repartirait toujours de zéro (mesuré : cette première rédaction du correctif
+/// ne prouvait rien).
+///
+/// N'agit que pour une reprise : un `seek_ms` venu du corps de la requête garde
+/// le comportement d'avant.
+async fn ancrer_position_demandee(
+    state: &AppState,
+    zone_id: i64,
+    demandee: Option<u64>,
+    reprise: Option<u64>,
+) {
+    let (Some(position), Some(_)) = (demandee, reprise) else {
+        return;
+    };
+    state.playback.seek(zone_id, position as i64).await;
+    info!(
+        zone_id,
+        position_ms = position,
+        "reprise_a_la_position_restauree"
+    );
+}
+
+/// La décision seule, sans effet de bord : cette demande de lecture porte-t-elle
+/// sur la piste dont le démarrage a restauré la position ?
+///
+/// Une piste locale s'identifie par son `track_id`, un flux distant par son
+/// `source_id` — comparer l'un à l'autre ferait reprendre au mauvais endroit
+/// une piste qui n'a rien à voir.
+fn reprise_applicable(
+    zone: &tune_core::playback::ZoneState,
+    piste: Option<i64>,
+    source_id: Option<&str>,
+) -> Option<i64> {
+    let position = zone.pending_resume_ms.filter(|ms| *ms > 0)?;
+    let np = zone.now_playing.as_ref()?;
+    let meme_piste = match (piste, np.track_id) {
+        (Some(demandee), Some(restauree)) => demandee == restauree,
+        _ => source_id.is_some() && source_id == np.source_id.as_deref(),
+    };
+    meme_piste.then_some(position)
+}
+
 async fn play(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -830,6 +929,9 @@ async fn play(
             let current = state.playback.get_state(zone_id).await;
             if let Some(ref np) = current.now_playing {
                 let output_device_id = get_zone_device_id(&state, zone_id);
+                let reprise =
+                    position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref())
+                        .await;
                 let orch_req = tune_core::orchestrator::PlayRequest {
                     zone_id,
                     output_device_id,
@@ -845,7 +947,7 @@ async fn play(
                     album_title: np.album_title.clone(),
                     cover_url: np.cover_path.clone(),
                     duration_ms: Some(np.duration_ms),
-                    seek_ms: None,
+                    seek_ms: reprise,
                     temp_file_path: None,
                     sample_rate: None,
                     bit_depth: None,
@@ -853,6 +955,7 @@ async fn play(
                     track_number: None,
                     disc_number: None,
                 };
+                ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
                         // Restore queue_length from DB so the poller can
@@ -1281,14 +1384,34 @@ async fn play(
         };
     }
 
+    // #2876 — une demande NUE, c'est-à-dire une seule piste et aucun contenant.
+    // C'est la forme qu'envoie la barre de transport quand la zone est à
+    // l'arrêt : `{ "track_id": N }` et rien d'autre. Un album, une liste de
+    // lecture ou un `start_index` désignent un nouveau geste d'écoute, qui
+    // commence à son début même si sa première piste se trouve être celle que
+    // le démarrage a restaurée. Relevé AVANT la résolution : la chaîne
+    // ci-dessous consomme `body`.
+    let demande_nue = body.album_id.is_none()
+        && body.playlist_id.is_none()
+        && body.track_ids.is_none()
+        && body.start_index.is_none();
+
     // Resolve track list: containers (album/playlist) take priority so the full
     // collection is always queued, even when a track_id is also provided.
     let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
         resoudre_pistes_d_album(&state, &track_repo, album_id, zone_id)
     } else if let Some(playlist_id) = body.playlist_id {
-        tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
-            .get_track_ids(playlist_id)
-            .unwrap_or_default()
+        // Un `playlist_id` dans le corps versait les pistes de N'IMPORTE
+        // QUELLE playlist du foyer dans la file de la zone, puis les jouait :
+        // la lecture par énumération d'ids, sans jamais passer par
+        // `/playlists` (#2794, #3073). Même refus qu'ailleurs — 404, jamais
+        // 403 : distinguer « existe mais pas à vous » rendrait l'énumération
+        // utile.
+        let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
+        match crate::routes::playlists::owned_or_404_response(&repo, playlist_id, profile.id()) {
+            Ok(_) => repo.get_track_ids(playlist_id).unwrap_or_default(),
+            Err(r) => return r,
+        }
     } else if let Some(ids) = body.track_ids {
         ids
     } else if let Some(id) = body.track_id {
@@ -1302,6 +1425,8 @@ async fn play(
             let output_device_id = body
                 .output_device_id
                 .or_else(|| get_zone_device_id(&state, zone_id));
+            let reprise =
+                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
             let orch_req = tune_core::orchestrator::PlayRequest {
                 zone_id,
                 output_device_id,
@@ -1317,7 +1442,7 @@ async fn play(
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
-                seek_ms: None,
+                seek_ms: reprise,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -1325,6 +1450,7 @@ async fn play(
                 track_number: None,
                 disc_number: None,
             };
+            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
                     persist_queue_async(&state, zone_id);
@@ -1401,6 +1527,17 @@ async fn play(
             .and_then(|z| z.output_device_id)
     });
 
+    // Le chemin réellement emprunté par le bouton Lecture des clients web et
+    // Flutter quand la zone est à l'arrêt : ils envoient `{ "track_id": N }`,
+    // pas un corps vide. Un `seek_ms` explicite reste prioritaire — il vient
+    // d'un geste, la reprise n'est qu'un souvenir (#2876).
+    let reprise = if body.seek_ms.is_none() && demande_nue {
+        position_de_reprise(&state, zone_id, Some(target_id), None).await
+    } else {
+        None
+    };
+    let seek_ms = body.seek_ms.or(reprise);
+
     let orch_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id,
@@ -1422,7 +1559,7 @@ async fn play(
         duration_ms: body
             .duration_ms
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
-        seek_ms: body.seek_ms,
+        seek_ms,
         temp_file_path: body.temp_file_path,
         sample_rate: body.sample_rate,
         bit_depth: body.bit_depth,
@@ -1430,6 +1567,8 @@ async fn play(
         track_number: None,
         disc_number: None,
     };
+
+    ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
 
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -1466,10 +1605,17 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
 async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let current = state.playback.get_state(zone_id).await;
 
-    // When stopped with a valid NowPlaying, re-play the current track from the start
+    // Zone à l'arrêt avec une piste en mémoire : on la rejoue — à la position
+    // que le démarrage a restaurée si elle vaut encore, depuis le début sinon.
+    // Le commentaire d'avant disait « from the start », en contradiction avec
+    // celui de `PlaybackManager::stop` : « keep position_ms […] can resume from
+    // the same position ». L'intention était écrite, l'instruction manquait
+    // (#2876).
     if current.state == tune_core::playback::PlayState::Stopped {
         if let Some(ref np) = current.now_playing {
             let output_device_id = get_zone_device_id(&state, zone_id);
+            let reprise =
+                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
             let orch_req = tune_core::orchestrator::PlayRequest {
                 zone_id,
                 output_device_id,
@@ -1485,7 +1631,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
-                seek_ms: None,
+                seek_ms: reprise,
                 temp_file_path: None,
                 sample_rate: None,
                 bit_depth: None,
@@ -1493,6 +1639,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 track_number: None,
                 disc_number: None,
             };
+            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
                     // Restore queue_length from DB so the poller can
@@ -1825,6 +1972,23 @@ async fn set_volume(
                     .into_response();
             }
         };
+    // #1274 — voir `zones::refus_de_resolution_volume`. Le refus vient AVANT
+    // le verrou audiophile et avant l'orchestrateur : rien n'est envoyé au
+    // périphérique, et rien n'est persisté, pour une consigne qui n'a nulle
+    // part où atterrir.
+    if let Some(db) = body.volume_db {
+        let device_id = get_zone_device_id(&state, zone_id);
+        if let Some(motif) =
+            crate::routes::zones::refus_de_resolution_volume(&state, device_id.as_deref(), db).await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "volume_db_hors_resolution", "message": motif })),
+            )
+                .into_response();
+        }
+    }
+
     let volume = tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, demande);
     if (volume - demande).abs() > f64::EPSILON {
         tracing::debug!(
@@ -3462,6 +3626,15 @@ async fn set_audio_profile(
 // Shuffle All (global playback)
 // ---------------------------------------------------------------------------
 
+/// Le contexte de filtrage que l'écran transmet à la lecture aléatoire.
+///
+/// `folder` est la portée de RÉPERTOIRE — le même `folder=<chemin absolu>` que
+/// `/library/tracks` et que les facettes Oxygen, appliqué au sous-arbre entier.
+/// Il manquait ici : la pastille de répertoire de la Bibliothèque n'avait
+/// aucun champ où se transmettre, et la lecture aléatoire retombait sur sa
+/// dernière branche — un tirage dans TOUTE la table `tracks` (#2801, Marco
+/// Polo : « il semble s'alimenter de toute la bibliothèque, pas seulement de la
+/// sélection à l'écran »).
 #[derive(serde::Deserialize)]
 pub struct ShuffleAllQuery {
     zone_id: Option<i64>,
@@ -3469,6 +3642,9 @@ pub struct ShuffleAllQuery {
     genre: Option<String>,
     album_id: Option<i64>,
     artist_id: Option<i64>,
+    /// Répertoire (chemin absolu) : la lecture aléatoire se limite à son
+    /// sous-arbre, récursivement.
+    folder: Option<String>,
 }
 
 // Combien de pistes une lecture aléatoire enfile au maximum.
@@ -3585,6 +3761,34 @@ pub async fn shuffle_all(
             .unwrap_or_default();
         let n = ids.len() as i64;
         (ids, Some(n))
+    } else if let Some(fld) = q.folder.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // La portée de répertoire passe AVANT la recherche et le genre parce
+        // que c'est ce que fait l'écran : pastille active, la Bibliothèque ne
+        // charge plus que le sous-arbre (`loadScopedAlbums/Artists/Tracks` →
+        // `/library/tracks?folder=`), et la zone de recherche ne fait que le
+        // RESTREINDRE, côté client. `random_ids_in_folder` reprend les deux
+        // mêmes prédicats, dans le même ordre.
+        //
+        // Le genre n'entre pas ici : sur cet écran il vit dans l'onglet
+        // Genres, qui n'a pas de pastille de répertoire — les deux portées ne
+        // coexistent pas. Un client qui enverrait les deux verra le
+        // répertoire l'emporter, ce que ce commentaire et le champ `folder`
+        // disent explicitement plutôt que de le laisser deviner.
+        let terme = q
+            .search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match track_repo.random_ids_in_folder(fld, terme, plafond) {
+            Ok((ids, total)) => (ids, Some(total)),
+            Err(e) => {
+                // Ne PAS retomber sur la bibliothèque entière : c'est
+                // exactement le défaut que ce ticket ferme. Une sélection vide
+                // se conclut plus bas par un 400 explicite.
+                tracing::error!(error = %e, folder = fld, "shuffle_all_folder_query_failed");
+                (Vec::new(), None)
+            }
+        }
     } else if let Some(sq) = q
         .search_query
         .as_deref()
@@ -3827,6 +4031,67 @@ mod contrat_suivant_tests {
         };
 
         assert!(can_skip_next(&state));
+    }
+}
+
+/// #2801 — la portée de répertoire doit TRAVERSER la barrière HTTP.
+///
+/// Le défaut n'était pas dans la lecture : il était dans le contrat. Le client
+/// n'avait aucun champ où mettre `scopedFolder`, et `ShuffleAllQuery` n'en
+/// avait aucun pour le recevoir — un `?folder=…` était accepté, silencieusement
+/// jeté par serde, et la lecture aléatoire retombait sur la bibliothèque
+/// entière. Un « 200 pour rien » : la route répondait, la portée disparaissait.
+///
+/// Ce test garde l'ARRIVÉE du champ, sur une vraie chaîne de requête, avec
+/// l'extracteur réellement employé par la route.
+#[cfg(test)]
+mod portee_repertoire_tests {
+    use super::ShuffleAllQuery;
+    use axum::extract::Query;
+
+    fn depuis(query: &str) -> ShuffleAllQuery {
+        let uri: axum::http::Uri = format!("/playback/shuffle-all?{query}").parse().unwrap();
+        Query::<ShuffleAllQuery>::try_from_uri(&uri)
+            .expect("la chaîne de requête doit se désérialiser")
+            .0
+    }
+
+    /// Le chemin est absolu, contient des espaces et des chiffres — c'est le
+    /// répertoire de Marco Polo, tel que la pastille le porte.
+    #[test]
+    fn le_repertoire_arrive_jusqua_la_route() {
+        let q = depuis("zone_id=3&folder=%2Fmnt%2Fmusic%2F80s%2012%20INCH%20COLLECTION");
+        assert_eq!(q.zone_id, Some(3));
+        assert_eq!(
+            q.folder.as_deref(),
+            Some("/mnt/music/80s 12 INCH COLLECTION"),
+            "sans ce champ, serde jetait `folder` en silence et la lecture \
+             aléatoire puisait dans toute la bibliothèque (#2801)"
+        );
+    }
+
+    /// Témoin anti-régression : les cinq champs qui traversaient déjà doivent
+    /// continuer de traverser. Ajouter `folder` ne doit rien déplacer.
+    #[test]
+    fn les_champs_deja_transmis_traversent_toujours() {
+        let q = depuis("zone_id=1&search_query=miles&genre=Jazz&album_id=7&artist_id=9");
+        assert_eq!(q.zone_id, Some(1));
+        assert_eq!(q.search_query.as_deref(), Some("miles"));
+        assert_eq!(q.genre.as_deref(), Some("Jazz"));
+        assert_eq!(q.album_id, Some(7));
+        assert_eq!(q.artist_id, Some(9));
+        assert_eq!(q.folder, None, "aucun répertoire demandé, aucun inventé");
+    }
+
+    /// La pastille de répertoire et la zone de recherche cohabitent à l'écran :
+    /// la seconde ne fait que restreindre la première. Les deux doivent donc
+    /// arriver ensemble — c'est ce qui permet à la branche `folder` de passer
+    /// le terme à `random_ids_in_folder` au lieu de l'ignorer.
+    #[test]
+    fn le_repertoire_et_la_recherche_arrivent_ensemble() {
+        let q = depuis("zone_id=2&folder=%2Fmnt%2Fmusic%2FDisco%20Pack&search_query=funky");
+        assert_eq!(q.folder.as_deref(), Some("/mnt/music/Disco Pack"));
+        assert_eq!(q.search_query.as_deref(), Some("funky"));
     }
 }
 
@@ -4441,5 +4706,95 @@ mod tests_crossfade_indisponible {
 
         assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
         assert_eq!(validate_crossfade_update(&default), Ok(3.0));
+    }
+}
+
+/// #2876 — la position restaurée au démarrage doit atteindre le son.
+///
+/// Sandro (fil 1610, sortie DirettaRenderer UPnP) : « le curseur de temps
+/// affiche exactement la position où je m'étais arrêté […] lorsque j'appuie sur
+/// Play, le morceau reprend depuis le début (0:00) ». Les deux moitiés sont
+/// vraies et elles se contredisent : `restore_playback_positions` réinjecte
+/// bien `zones.last_position_ms` dans l'état de zone — c'est ce que `/zones`
+/// sert et que le curseur affiche — mais les chemins de lecture posaient tous
+/// `seek_ms: None`.
+#[cfg(test)]
+mod tests_reprise_position_2876 {
+    use super::reprise_applicable;
+    use tune_core::playback::{NowPlaying, ZoneState};
+
+    fn zone_restauree(position: Option<i64>, track_id: Option<i64>) -> ZoneState {
+        ZoneState {
+            zone_id: 1,
+            pending_resume_ms: position,
+            now_playing: Some(NowPlaying {
+                track_id,
+                title: "Piste".into(),
+                duration_ms: 300_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Le cas signalé : même piste, position restaurée, Play doit la demander.
+    #[test]
+    fn la_piste_restauree_repart_a_sa_position() {
+        let zone = zone_restauree(Some(151_000), Some(42));
+        assert_eq!(
+            reprise_applicable(&zone, Some(42), None),
+            Some(151_000),
+            "la position affichée par le curseur n'a pas atteint le PlayRequest (#2876)"
+        );
+    }
+
+    /// Témoin anti-régression : une AUTRE piste ne récupère pas la position de
+    /// celle qui a été interrompue. C'est le risque propre à ce correctif —
+    /// démarrer un morceau à 2:31 parce qu'un autre s'y était arrêté.
+    #[test]
+    fn une_autre_piste_repart_de_zero() {
+        let zone = zone_restauree(Some(151_000), Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(43), None), None);
+    }
+
+    /// Sans marqueur, rien ne change : c'est tout le comportement en session
+    /// (Stop puis Play, file arrivée à son terme) qui reste intact. `stop()`
+    /// conserve `position_ms` sans armer `pending_resume_ms`.
+    #[test]
+    fn sans_marqueur_la_lecture_repart_de_zero() {
+        let zone = zone_restauree(None, Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+
+    /// Une position nulle n'est pas une reprise.
+    #[test]
+    fn une_position_nulle_n_arme_rien() {
+        let zone = zone_restauree(Some(0), Some(42));
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
+    }
+
+    /// Un flux distant n'a pas de `track_id` : il s'identifie par son
+    /// `source_id`. Les comparer de travers ferait reprendre au mauvais endroit.
+    #[test]
+    fn un_flux_distant_s_identifie_par_son_source_id() {
+        let mut zone = zone_restauree(Some(88_000), None);
+        if let Some(np) = zone.now_playing.as_mut() {
+            np.source = "qobuz".into();
+            np.source_id = Some("12345".into());
+        }
+        assert_eq!(reprise_applicable(&zone, None, Some("12345")), Some(88_000));
+        assert_eq!(reprise_applicable(&zone, None, Some("99999")), None);
+        assert_eq!(reprise_applicable(&zone, None, None), None);
+    }
+
+    /// Rien en lecture : il n'y a pas de piste à laquelle rattacher la position.
+    #[test]
+    fn sans_piste_restauree_aucune_reprise() {
+        let zone = ZoneState {
+            zone_id: 1,
+            pending_resume_ms: Some(151_000),
+            ..Default::default()
+        };
+        assert_eq!(reprise_applicable(&zone, Some(42), None), None);
     }
 }

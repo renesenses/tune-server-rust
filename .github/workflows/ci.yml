@@ -129,7 +129,16 @@ jobs:
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
+          python3 scripts/verser-message-forum.py --self-test
           python3 scripts/synchroniser-release-main.py --self-test
+
+      # Contre-epreuve du critere de selection des rondes de tri (#2910),
+      # rejouee hors ligne sur la fenetre reelle du 28 au 30/08/2026 : le
+      # critere retire rate les reponses 5922, 5949 et 5958, le critere par
+      # message les selectionne, et le fil temoin 1588 reste hors lot des
+      # deux cotes. Aucun reseau, aucune ecriture sur le forum.
+      - name: Contre-épreuve de la ronde de tri
+        run: python3 scripts/nouveautes-forum.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
         run: |
@@ -183,7 +192,12 @@ jobs:
       # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
       # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
       # ne rougisse : une requete de flux distante finissait en 504, muette.
-      - run: cargo test -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
+      #
+      # `-p tune-http-types` et `-p tune-smart-http` : deux caisses extraites
+      # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
+      # porte au lieu de l'y garder — la liste est un inventaire, pas un
+      # echantillon (cf #2865).
+      - run: cargo test -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -220,7 +234,7 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -377,7 +391,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -402,11 +416,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -428,7 +442,7 @@ jobs:
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -498,7 +512,16 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      # UNION des deux cotes, jamais un camp. La liste des paquets et celle des
+      # features sont deux inventaires, pas des echantillons (#2865) :
+      #  - `-p tune-http-types` et `-p tune-smart-http` viennent de ce lot,
+      #    deux caisses extraites ; les en sortir retirerait ce code de la
+      #    porte en le decoupant — c'est precisement ce que cette porte a
+      #    attrape apres la fusion precedente ;
+      #  - `concerts` vient de `rc` (#2768, 12987dbd) ; l'en sortir rouvrirait
+      #    l'angle mort que ce commit-la venait de fermer, et
+      #    `toute_feature_declaree_est_activee_par_une_porte_clippy` rougirait.
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit

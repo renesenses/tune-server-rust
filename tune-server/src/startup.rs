@@ -875,7 +875,7 @@ async fn restore_oaat_groups(state: &AppState) {
         .ok()
         .flatten()
         .unwrap_or_else(|| "[]".into());
-    let mut groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
+    let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
     let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();

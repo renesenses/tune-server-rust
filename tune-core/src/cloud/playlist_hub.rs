@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 
+use crate::cloud::refusal::CloudError;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::playlist_repo::PlaylistRepo;
 
@@ -19,7 +20,7 @@ pub async fn backup_playlist(
     http_client: &reqwest::Client,
     instance_id: &str,
     playlist_id: i64,
-) -> Result<String, String> {
+) -> Result<String, CloudError> {
     let repo = PlaylistRepo::with_backend(backend.clone());
 
     // Load playlist metadata
@@ -162,8 +163,14 @@ pub async fn backup_playlist(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let entetes = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("playlist hub upload: HTTP {status} — {text}"));
+        return Err(CloudError::from_parts(
+            format!("playlist hub upload: HTTP {status} — {text}"),
+            status.as_u16(),
+            &entetes,
+            &text,
+        ));
     }
 
     let result: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
@@ -184,7 +191,7 @@ pub async fn backup_playlist(
 pub async fn list_cloud_playlists(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, CloudError> {
     let resp = http_client
         .get(HUB_API)
         .query(&[("instance_id", instance_id)])
@@ -194,7 +201,10 @@ pub async fn list_cloud_playlists(
         .map_err(|e| format!("playlist hub list: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("playlist hub list: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(
+            CloudError::from_response(format!("playlist hub list: HTTP {status}"), resp).await,
+        );
     }
 
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
@@ -207,7 +217,7 @@ pub async fn list_cloud_playlists(
 pub async fn get_cloud_playlist(
     http_client: &reqwest::Client,
     hub_id: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, CloudError> {
     let url = format!("{HUB_API}/{hub_id}");
     let resp = http_client
         .get(&url)
@@ -217,7 +227,10 @@ pub async fn get_cloud_playlist(
         .map_err(|e| format!("playlist hub get: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("playlist hub get: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(
+            CloudError::from_response(format!("playlist hub get: HTTP {status}"), resp).await,
+        );
     }
 
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
@@ -228,7 +241,7 @@ pub async fn get_cloud_playlist(
 pub async fn delete_cloud_playlist(
     http_client: &reqwest::Client,
     hub_id: &str,
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let url = format!("{HUB_API}/{hub_id}");
     let resp = http_client
         .delete(&url)
@@ -238,7 +251,10 @@ pub async fn delete_cloud_playlist(
         .map_err(|e| format!("playlist hub delete: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("playlist hub delete: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(
+            CloudError::from_response(format!("playlist hub delete: HTTP {status}"), resp).await,
+        );
     }
 
     info!(hub_id, "playlist_hub_deleted");
@@ -254,7 +270,7 @@ pub async fn request_transfer(
     instance_id: &str,
     hub_id: &str,
     target_service: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, CloudError> {
     let url = format!("{HUB_API}/{hub_id}/transfer");
     let body = serde_json::json!({
         "instance_id": instance_id,
@@ -271,8 +287,14 @@ pub async fn request_transfer(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        let entetes = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("playlist hub transfer: HTTP {status} — {text}"));
+        return Err(CloudError::from_parts(
+            format!("playlist hub transfer: HTTP {status} — {text}"),
+            status.as_u16(),
+            &entetes,
+            &text,
+        ));
     }
 
     let result: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;

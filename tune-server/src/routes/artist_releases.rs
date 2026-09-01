@@ -25,11 +25,11 @@
 //! l'artiste qu'on écoute, et une section qui se trompe est pire qu'une section
 //! vide.
 
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;

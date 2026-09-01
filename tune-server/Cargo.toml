@@ -46,16 +46,22 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
+# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
+# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+concerts = ["dep:tune-concerts"]
 
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-http-types = { path = "../tune-http-types" }
+tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }
 tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -136,3 +142,11 @@ required-features = ["plugins-wasm"]
 [[test]]
 name = "panne_sql_journalisee"
 path = "tests/panne_sql_journalisee.rs"
+
+# Même raison, mot pour mot : abonné `tracing` GLOBAL, donc un binaire à lui
+# seul et un seul essai dedans. Celui-ci lit le journal au niveau TRACE pour
+# prouver qu'aucune clef d'API développeur ni chemin d'adresse de webhook n'y
+# apparaît (#2795).
+[[test]]
+name = "cles_developpeur_hors_journal"
+path = "tests/cles_developpeur_hors_journal.rs"

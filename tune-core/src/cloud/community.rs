@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use tracing::{debug, info};
 
+use crate::cloud::refusal::CloudError;
+
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
 /// A community-approved album cover returned by mozaiklabs.fr.
@@ -19,7 +21,7 @@ pub async fn report_artist_image(
     mbid: &str,
     image_url: &str,
     base_url: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let base = base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/');
     let url = format!("{base}/api/v1/artists/{mbid}/image/report");
     let client = crate::http::client::shared();
@@ -34,7 +36,11 @@ pub async fn report_artist_image(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(mbid, status = %status, "artist_image_report_rejected");
-        return Err(format!("artist image report failed: {status}"));
+        return Err(CloudError::from_response(
+            format!("artist image report failed: {status}"),
+            resp,
+        )
+        .await);
     }
 
     info!(mbid, "artist_image_reported");
@@ -58,7 +64,7 @@ pub async fn submit_report(
     base_url: &str,
     instance_id: &str,
     report: &ReportSubmission<'_>,
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/community/reports");
     let client = crate::http::client::shared();
@@ -90,7 +96,9 @@ pub async fn submit_report(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(entity = report.entity, status = %status, "metadata_report_rejected");
-        return Err(format!("metadata report failed: {status}"));
+        return Err(
+            CloudError::from_response(format!("metadata report failed: {status}"), resp).await,
+        );
     }
 
     info!(
@@ -109,7 +117,7 @@ pub async fn submit_cover(
     artist_name: Option<&str>,
     instance_id: &str,
     image_data: &[u8],
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/community/covers");
     let client = crate::http::client::shared();
@@ -140,7 +148,9 @@ pub async fn submit_cover(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(mbid_release, status = %status, "cover_submit_rejected");
-        return Err(format!("cover submit failed: {status}"));
+        return Err(
+            CloudError::from_response(format!("cover submit failed: {status}"), resp).await,
+        );
     }
 
     info!(mbid_release, "community_cover_submitted");
@@ -152,7 +162,7 @@ pub async fn submit_cover(
 pub async fn fetch_approved_covers(
     base_url: &str,
     since: Option<&str>,
-) -> Result<Vec<CommunityCover>, String> {
+) -> Result<Vec<CommunityCover>, CloudError> {
     let base = base_url.trim_end_matches('/');
     let mut url = format!("{base}/api/v1/community/covers/approved");
     if let Some(s) = since {
@@ -170,7 +180,11 @@ pub async fn fetch_approved_covers(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(status = %status, "fetch_approved_covers_failed");
-        return Err(format!("fetch approved covers failed: {status}"));
+        return Err(CloudError::from_response(
+            format!("fetch approved covers failed: {status}"),
+            resp,
+        )
+        .await);
     }
 
     #[derive(Deserialize)]
@@ -203,7 +217,7 @@ pub async fn submit_artist_image(
     artist_name: &str,
     instance_id: &str,
     image_data: &[u8],
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/community/artist-images");
     let client = crate::http::client::shared();
@@ -230,7 +244,11 @@ pub async fn submit_artist_image(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(mbid, status = %status, "artist_image_submit_rejected");
-        return Err(format!("artist image submit failed: {status}"));
+        return Err(CloudError::from_response(
+            format!("artist image submit failed: {status}"),
+            resp,
+        )
+        .await);
     }
 
     info!(mbid, artist_name, "community_artist_image_submitted");
@@ -241,7 +259,7 @@ pub async fn submit_artist_image(
 pub async fn fetch_approved_artist_images(
     base_url: &str,
     since: Option<&str>,
-) -> Result<Vec<CommunityArtistImage>, String> {
+) -> Result<Vec<CommunityArtistImage>, CloudError> {
     let base = base_url.trim_end_matches('/');
     let mut url = format!("{base}/api/v1/community/artist-images/approved");
     if let Some(s) = since {
@@ -259,7 +277,11 @@ pub async fn fetch_approved_artist_images(
     if !resp.status().is_success() {
         let status = resp.status();
         debug!(status = %status, "fetch_approved_artist_images_failed");
-        return Err(format!("fetch approved artist images failed: {status}"));
+        return Err(CloudError::from_response(
+            format!("fetch approved artist images failed: {status}"),
+            resp,
+        )
+        .await);
     }
 
     #[derive(Deserialize)]

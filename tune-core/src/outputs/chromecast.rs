@@ -1096,7 +1096,12 @@ mod deadline_tests {
                     // client échoue à l'écriture et non à la lecture.
                     let mut bytes = [0u8; 1024];
                     let _ = socket.read(&mut bytes).await;
-                    let _ = socket.set_linger(Some(Duration::ZERO));
+                    // `TcpStream::set_linger` est déprécié depuis tokio 1.53 :
+                    // SO_LINGER fait BLOQUER le fil à la fermeture. Ici c'est
+                    // le pair de test qui veut ce RST, pas Tune — on passe donc
+                    // par `socket2`, la voie que tokio désigne, plutôt que de
+                    // renoncer au seul moyen d'obtenir un vrai `ECONNRESET`.
+                    let _ = socket2::SockRef::from(&socket).set_linger(Some(Duration::ZERO));
                     drop(socket);
                 });
             }

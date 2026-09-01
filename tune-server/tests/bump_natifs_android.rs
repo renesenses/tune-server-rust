@@ -47,14 +47,15 @@ fn rendre_executable(chemin: &Path) {
 ///
 /// `version_pubspec` et `version_manifeste` sont dissociables a dessein : c'est
 /// exactement la derive que le pre-vol doit refuser.
+/// `racine` est le GARDE, pas un simple chemin : il supprime l'arborescence a
+/// la destruction de `FauxDev`, panique comprise (#3030).
 struct FauxDev {
-    racine: PathBuf,
+    racine: tune_core::test_scratch::ScratchDir,
 }
 
 impl FauxDev {
     fn nouveau(nom: &str, version_pubspec: &str, version_manifeste: &str) -> Self {
         let racine = tune_core::test_scratch::scratch_dir(&format!("tune-bump-natifs-{nom}"));
-        let _ = fs::remove_dir_all(&racine);
 
         let rust = racine.join("tune-server-rust");
         ecrire(
@@ -163,12 +164,6 @@ exit {code_sortie}
 
     fn trace_build(&self) -> Option<String> {
         fs::read_to_string(self.racine.join("leurre-build-android.trace")).ok()
-    }
-}
-
-impl Drop for FauxDev {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.racine);
     }
 }
 

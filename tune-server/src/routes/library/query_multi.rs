@@ -96,6 +96,11 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         source_medias: texts("source_media"),
         ratings: ints(raw, "rating")?,
         original_years: ints(raw, "original_year")?,
+        // `?dr=14&dr=13&dr=12` — la TRANCHE du ticket #2144, dite dans la
+        // convention des cases à cocher : plusieurs valeurs d'une même facette
+        // se combinent en OU. Clé courte `dr`, comme l'affichent les taggeurs
+        // (DR14) et comme la nomme le testeur.
+        dynamic_ranges: ints(raw, "dr")?,
         favorites: texts("favorite"),
         playlists: texts("playlist"),
         untagged: texts("untagged"),
@@ -277,6 +282,31 @@ mod tests {
         assert!(!lu("untagged=mbid").is_active());
         assert!(lu("favorite=album").is_active());
         assert!(lu("untagged=cover").is_active());
+    }
+
+    /// La tranche de Dynamic Range se dit en clés répétées (#2144).
+    ///
+    /// Trois pastilles cochées = trois occurrences de `dr` = la tranche
+    /// « DR12 à DR14 », en OU comme toute facette. Une seule occurrence reste
+    /// un filtre exact, et l'ordre de la requête est conservé.
+    #[test]
+    fn la_tranche_de_dr_se_lit_en_cles_repetees() {
+        assert_eq!(lu("dr=14").dynamic_ranges, vec![14]);
+        assert_eq!(lu("dr=14&dr=13&dr=12").dynamic_ranges, vec![14, 13, 12]);
+        // DR0 est une MESURE (un master entièrement écrasé), pas une absence :
+        // il doit rester cochable.
+        assert_eq!(lu("dr=0").dynamic_ranges, vec![0]);
+        assert!(lu("dr=14").is_active());
+        // Décochée, la facette ne filtre rien — et surtout n'active pas le
+        // chemin filtré, qui rendrait la bibliothèque entière.
+        assert!(lu("dr=").dynamic_ranges.is_empty());
+        assert!(!lu("dr=").is_active());
+        // Non numérique : 400, jamais « aucun filtre ».
+        assert!(track_filter_from_raw(Some("dr=DR14")).is_err());
+        // `dr` est comparée ENTIÈRE : `dr_min` appartient à la grille
+        // d'albums, pas au rail, et ne doit pas être avalée ici.
+        assert!(lu("dr_min=14").dynamic_ranges.is_empty());
+        assert!(lu("dr_max=7").dynamic_ranges.is_empty());
     }
 
     /// Doublons écartés, ordre conservé : deux clics sur la même valeur ne

@@ -132,7 +132,7 @@ impl OutputTarget for SlimProtoOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, false, true, true, false)
+        OutputCapabilities::v1(true, true, false, true, true, false).with_linear_volume(65536)
     }
 
     /// Native SlimProto has no internal next-track staging yet (phase 3 wires

@@ -71,6 +71,41 @@ async fn body_of(app: &axum::Router, path: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+async fn post_json(app: &axum::Router, path: &str, body: &str) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// The two settings keys `install`/`update` write, read straight back from the
+/// database — the only place that decides what the next boot does.
+fn reglages_d_installation(state: &AppState, name: &str) -> (Option<String>, Option<String>) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    (
+        settings
+            .get(&format!("plugin_{name}_installed"))
+            .ok()
+            .flatten(),
+        settings
+            .get(&format!("plugin_{name}_enabled"))
+            .ok()
+            .flatten(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Mounting
 // ---------------------------------------------------------------------------
@@ -576,4 +611,151 @@ async fn uncatalogued_dj_still_loads_when_installed_by_hand() {
         .find(|p| p["name"] == "dj")
         .expect("un greffon qui tourne reste listé, hors catalogue ou non");
     assert_eq!(entry["enabled"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Installation — un nom qui ne désigne rien ne doit rien écrire (#2132)
+// ---------------------------------------------------------------------------
+
+/// Un greffon hors catalogue, comme DJ et Karaoké : compilé, dormant, et que
+/// le gestionnaire ne propose PAS. Il ne figure ni dans `plugin_info` ni dans
+/// `plugin_available` — c'est précisément ce qui le rend utile ici.
+struct Uncatalogued;
+
+#[async_trait]
+impl TunePlugin for Uncatalogued {
+    fn name(&self) -> &str {
+        "horscatalogue"
+    }
+    fn version(&self) -> &str {
+        "3.0.0"
+    }
+    fn description(&self) -> &str {
+        "Compilé, dormant, jamais proposé"
+    }
+    fn default_enabled(&self) -> bool {
+        false
+    }
+    fn catalogued(&self) -> bool {
+        false
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Le défaut du ticket : `POST /plugins/{nom}/install` répondait
+/// « installed » + « restart_required » pour N'IMPORTE quel nom, en posant
+/// deux réglages que le démarrage ne peut satisfaire — le catalogue distant
+/// sert encore « Synchronized Lyrics » (`platforms: "python"`), et un testeur
+/// a « bien mis le plugin » sans aucun résultat.
+///
+/// La preuve est prise **dans la base**, pas sur le code de retour : ce sont
+/// `plugin_{nom}_installed` / `_enabled` qui décidaient de la promesse.
+#[tokio::test]
+async fn un_nom_de_greffon_inconnu_n_ecrit_rien_et_le_dit() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/lyrics/install", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "un nom que ce binaire ne porte pas doit être refusé (corps : {body})"
+    );
+    assert_eq!(body["error"], "plugin_inconnu");
+    assert_eq!(body["name"], "lyrics");
+
+    assert_eq!(
+        reglages_d_installation(&state, "lyrics"),
+        (None, None),
+        "aucun réglage ne doit être posé pour un greffon qui ne peut pas charger"
+    );
+}
+
+/// La mise à jour écrit le MÊME réglage que l'installation : laisser ce
+/// chemin ouvert rouvrait le trou par le bouton « Mettre à jour ».
+#[tokio::test]
+async fn la_mise_a_jour_refuse_aussi_un_nom_inconnu() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/karaoke-python/update", "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "corps : {body}");
+    assert_eq!(body["error"], "plugin_inconnu");
+    assert_eq!(
+        reglages_d_installation(&state, "karaoke-python"),
+        (None, None)
+    );
+}
+
+/// Témoin : le garde-fou n'a pas fermé la porte à ce qui s'installe vraiment.
+/// Un opt-in catalogué passe, et les deux réglages sont bien posés.
+#[tokio::test]
+async fn un_greffon_compile_s_installe_toujours() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
+    let app = tune_server::routes::router(state.clone());
+
+    let (status, body) = post_json(&app, "/api/v1/plugins/optin/install", "{}").await;
+    assert_eq!(status, StatusCode::OK, "corps : {body}");
+    assert_eq!(body["status"], "installed");
+    assert_eq!(body["restart_required"], true);
+
+    assert_eq!(
+        reglages_d_installation(&state, "optin"),
+        (Some("true".into()), Some("true".into())),
+        "l'installation d'un greffon réel doit toujours poser ses deux réglages"
+    );
+}
+
+/// Témoin anti-régression de #2090 : « retiré du catalogue » n'est pas
+/// « condamné ». Un greffon hors catalogue n'apparaît dans AUCUNE des deux
+/// listes publiées par `init` — un garde-fou bâti sur elles l'aurait refusé —
+/// et il doit pourtant rester installable par qui le nomme.
+#[tokio::test]
+async fn un_greffon_hors_catalogue_reste_installable_par_son_nom() {
+    use_scratch_plugin_data_dir();
+
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
+
+    let charges: Vec<&str> = state
+        .plugin_info
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    let proposes: Vec<&str> = state
+        .plugin_available
+        .get()
+        .map(|v| v.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !charges.contains(&"horscatalogue") && !proposes.contains(&"horscatalogue"),
+        "le témoin ne prouve rien s'il figure dans l'une des deux listes \
+         (chargés : {charges:?}, proposés : {proposes:?})"
+    );
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = post_json(&app, "/api/v1/plugins/horscatalogue/install", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un greffon compilé mais hors catalogue reste installable nommément (corps : {body})"
+    );
+    assert_eq!(
+        reglages_d_installation(&state, "horscatalogue"),
+        (Some("true".into()), Some("true".into()))
+    );
 }

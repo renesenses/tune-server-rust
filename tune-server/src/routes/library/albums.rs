@@ -1,10 +1,10 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
@@ -47,6 +47,17 @@ pub(super) struct AlbumFilters {
     /// réellement présentes, à charge du client de dessiner ses pastilles.
     dr_min: Option<i64>,
     dr_max: Option<i64>,
+    /// Graine du tri aleatoire (#3074). N'a de sens qu'avec `sort=random`.
+    ///
+    /// Absente, le serveur en tire une et la RENVOIE dans la reponse
+    /// (`"seed"`) : le client doit la repasser sur les pages suivantes, sinon
+    /// chaque `offset` re-tire et la grille montre des albums en double tout
+    /// en en cachant d'autres — la vue Bibliotheque charge ses albums en
+    /// quatre requetes (offset 0/100, puis 0, 2000, 4000).
+    ///
+    /// Le « bouton de re-tirage » demande au fil 1635 n'est donc rien d'autre
+    /// que « redemander la page 0 sans graine », ou avec une autre.
+    seed: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -92,7 +103,13 @@ pub(super) async fn list_albums(
         None if include_hidden => repo.count().unwrap_or(0),
         None => repo.count_visible().unwrap_or(0),
     };
-    let items = match repo.list_filtered(
+    // #3074 — `sort=random` : la graine EST le contrat. Le serveur en tire une
+    // quand le client n'en donne pas, et la lui rend toujours, pour que les
+    // pages suivantes retombent sur le meme tirage. Hors tri aleatoire elle
+    // reste `None` et la reponse ne bouge pas d'un octet pour les clients deja
+    // livres (iOS, macOS, Android, client web, UPnP).
+    let seed = (sort == "random").then(|| p.seed.unwrap_or_else(AlbumRepo::graine_aleatoire));
+    let items = match repo.list_filtered_seeded(
         limit,
         offset,
         sort,
@@ -102,6 +119,7 @@ pub(super) async fn list_albums(
         p.compilation,
         include_hidden,
         dr,
+        seed,
     ) {
         Ok(albums) => albums,
         Err(e) => {
@@ -127,7 +145,13 @@ pub(super) async fn list_albums(
             j
         })
         .collect();
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    let mut corps = json!({"items": items, "total": total, "limit": limit, "offset": offset});
+    if let Some(graine) = seed {
+        // Ajoutee SEULEMENT en tri aleatoire : un client qui ignore #3074 lit
+        // exactement la reponse d'avant.
+        corps["seed"] = json!(graine);
+    }
+    Json(corps)
 }
 
 pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {

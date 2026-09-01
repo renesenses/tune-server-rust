@@ -186,7 +186,7 @@ impl OutputTarget for SqueezeboxOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, false)
+        OutputCapabilities::v1(true, true, true, true, true, false).with_percent_volume()
     }
 
     /// Opt out of the poller's position-polling (DLNA-style) gapless. On this

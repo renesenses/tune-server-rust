@@ -91,6 +91,92 @@ impl std::error::Error for OutputCommandError {}
 
 pub type OutputCommandResult<T> = Result<T, OutputCommandError>;
 
+/// Résolution de volume que la sortie tient RÉELLEMENT (#1274).
+///
+/// `can_set_volume` répond « cette sortie sait régler le volume » ; il ne dit
+/// pas *avec quelle finesse*. La question n'existait pas tant que l'API ne
+/// parlait qu'en pour-cent : le pas de l'interface et le pas du protocole
+/// étaient le même nombre. Elle apparaît avec `volume_db`, qui permet enfin de
+/// viser −18 dB — une consigne que sept des treize sorties intégrées ne
+/// peuvent pas recevoir telle quelle.
+///
+/// Ce que chaque sortie envoie réellement, relevé dans son `set_volume` :
+///
+/// | sortie | ce qui part sur le fil | grille |
+/// |---|---|---|
+/// | locale | facteur × 1000, entier | `Linear { steps: 1000 }` |
+/// | SlimProto | gain 16.16, 65536 = unité | `Linear { steps: 65536 }` |
+/// | DLNA/UPnP, OpenHome, BluOS, Squeezebox, HQPlayer, OAAT | entier 0..100 | `Linear { steps: 100 }` |
+/// | AirPlay (RTSP) | des dB, un chiffre après la virgule | `Decibels { step_mdb: 100 }` |
+/// | Chromecast, AirPlay 2, bridge, mock | un flottant | `Continuous` |
+///
+/// Sur une grille de 100 pas, un pas ne vaut pas partout la même chose en dB :
+/// 0,09 dB sous la pleine échelle, mais **6,02 dB** entre 1 % et 2 %, et
+/// au-dessous de 1 % il n'y a plus rien du tout. C'est la raison d'être de
+/// [`VolumeResolution::holds`] : une consigne en dB plus basse que le plus
+/// petit pas ne *manque* pas sa cible, elle **éteint** la zone — et le serveur
+/// répondait 200 sur ce silence.
+///
+/// La valeur par défaut est `Continuous`, y compris pour un plugin ancien
+/// (`version == 0`) : aucune consigne ne lui est refusée, exactement comme
+/// avant l'existence de ce champ. Ce champ ne ferme donc jamais une porte
+/// qui était ouverte ; il n'en ouvre une que là où une sortie a déclaré sa
+/// grille.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VolumeResolution {
+    /// Le niveau voyage en flottant : la sortie n'impose aucune grille.
+    #[default]
+    Continuous,
+    /// Grille linéaire de `steps` intervalles égaux sur `0..=1`.
+    ///
+    /// `steps: 100` est le pour-cent entier de UPnP RenderingControl et de la
+    /// plupart des protocoles réseau.
+    Linear { steps: u32 },
+    /// Grille en décibels, exprimée en millièmes de dB pour rester comparable
+    /// sans flottant (`100` = 0,1 dB, le pas d'AirPlay).
+    Decibels { step_mdb: u32 },
+}
+
+impl VolumeResolution {
+    /// Le plus petit niveau **non nul** que la grille sache représenter.
+    ///
+    /// `None` pour `Continuous` et pour `Decibels` : ni l'un ni l'autre ne
+    /// transforme un niveau audible en silence. Une grille en dB n'a pas de
+    /// plancher de représentation — c'est le mute, pas l'arrondi, qui coupe.
+    #[must_use]
+    pub fn smallest_audible(&self) -> Option<f64> {
+        match self {
+            Self::Linear { steps } if *steps > 0 => Some(1.0 / f64::from(*steps)),
+            _ => None,
+        }
+    }
+
+    /// Le même seuil, en dB — le chiffre à montrer à qui règle sa chaîne.
+    #[must_use]
+    pub fn floor_db(&self) -> Option<f64> {
+        self.smallest_audible().map(|l| 20.0 * l.log10())
+    }
+
+    /// Cette sortie sait-elle tenir ce niveau linéaire ?
+    ///
+    /// Le silence (`0.0`) est toujours tenable : c'est le mute, et toute
+    /// grille sait envoyer zéro. Au-dessus, un niveau est tenable dès qu'il
+    /// atteint le premier pas ; la tolérance couvre le fait que `10^(-40/20)`
+    /// ne rend pas `0.01` au bit près, et qu'un plancher annoncé doit être
+    /// accepté par le contrôle qui l'annonce.
+    #[must_use]
+    pub fn holds(&self, linear: f64) -> bool {
+        if linear.is_nan() {
+            return false;
+        }
+        match self.smallest_audible() {
+            None => true,
+            Some(pas) => linear <= 0.0 || linear >= pas * (1.0 - 1e-9),
+        }
+    }
+}
+
 /// Capacités déclarées par une sortie.
 ///
 /// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
@@ -111,6 +197,12 @@ pub struct OutputCapabilities {
     pub formats: Vec<String>,
     #[serde(default)]
     pub channel_layouts: Vec<String>,
+    /// La finesse que cette sortie tient réellement (#1274).
+    ///
+    /// Additif : absent d'une charge utile ancienne, il vaut `Continuous`,
+    /// et rien ne change pour la sortie qui ne le déclare pas.
+    #[serde(default)]
+    pub volume_resolution: VolumeResolution,
 }
 
 impl OutputCapabilities {
@@ -132,7 +224,29 @@ impl OutputCapabilities {
             can_gapless,
             formats: Vec::new(),
             channel_layouts: Vec::new(),
+            volume_resolution: VolumeResolution::Continuous,
         }
+    }
+
+    /// Déclare une grille linéaire de `steps` pas (voir [`VolumeResolution`]).
+    #[must_use]
+    pub fn with_linear_volume(mut self, steps: u32) -> Self {
+        self.volume_resolution = VolumeResolution::Linear { steps };
+        self
+    }
+
+    /// Déclare le pour-cent entier — la grille de la majorité des protocoles
+    /// réseau, et la seule sur laquelle une consigne en dB peut se perdre.
+    #[must_use]
+    pub fn with_percent_volume(self) -> Self {
+        self.with_linear_volume(100)
+    }
+
+    /// Déclare une grille en décibels, en millièmes de dB (`100` = 0,1 dB).
+    #[must_use]
+    pub fn with_decibel_volume(mut self, step_mdb: u32) -> Self {
+        self.volume_resolution = VolumeResolution::Decibels { step_mdb };
+        self
     }
 
     pub fn supports(&self, command: OutputCommand) -> bool {
@@ -669,5 +783,102 @@ mod tests {
                 command: OutputCommand::Seek,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod resolution_de_volume {
+    use super::*;
+
+    /// Le chiffre qui a motivé tout ce module : sur une grille de 100 pas, le
+    /// plus petit niveau audible vaut −40 dB. Une consigne au-dessous ne
+    /// baisse pas le son, elle le coupe.
+    #[test]
+    fn le_pour_cent_plafonne_la_finesse_a_moins_quarante_db() {
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        assert_eq!(pour_cent.smallest_audible(), Some(0.01));
+        let plancher = pour_cent.floor_db().expect("une grille a un plancher");
+        assert!((plancher - (-40.0)).abs() < 1e-12, "{plancher}");
+    }
+
+    /// La frontière, des deux côtés, sur les valeurs que produit vraiment
+    /// `db_to_linear` — pas sur des littéraux choisis pour tomber juste.
+    #[test]
+    fn la_frontiere_du_pour_cent_tient_des_deux_cotes() {
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        let lineaire = |db: f64| 10f64.powf(db / 20.0);
+        // −40 dB EST le plancher : il doit être accepté par le contrôle qui
+        // l'annonce, malgré l'inexactitude de 10^(-2) en binaire.
+        assert!(pour_cent.holds(lineaire(-40.0)), "le plancher annoncé");
+        assert!(
+            pour_cent.holds(lineaire(-18.0)),
+            "−18 dB, la cible de l'issue"
+        );
+        assert!(pour_cent.holds(lineaire(0.0)));
+        // Au-dessous, la valeur envoyée s'arrondirait à zéro.
+        assert!(!pour_cent.holds(lineaire(-40.1)));
+        assert!(!pour_cent.holds(lineaire(-46.1)));
+        assert!(!pour_cent.holds(lineaire(-50.0)));
+        // Le silence reste tenable : c'est le mute, pas un arrondi raté.
+        assert!(pour_cent.holds(0.0));
+    }
+
+    /// Une grille fine ou continue ne refuse rien : le garde-fou ne doit pas
+    /// mordre là où le matériel suit.
+    #[test]
+    fn les_grilles_fines_ne_refusent_rien_d_audible() {
+        for resolution in [
+            VolumeResolution::Continuous,
+            VolumeResolution::Decibels { step_mdb: 100 },
+            VolumeResolution::Linear { steps: 65536 },
+            VolumeResolution::Linear { steps: 1000 },
+        ] {
+            assert!(resolution.holds(10f64.powf(-50.0 / 20.0)), "{resolution:?}");
+        }
+        // Le millième de la sortie locale s'arrête tout de même à −60 dB.
+        let locale = VolumeResolution::Linear { steps: 1000 };
+        let plancher = locale.floor_db().expect("grille");
+        assert!((plancher - (-60.0)).abs() < 1e-12, "{plancher}");
+        assert!(!locale.holds(10f64.powf(-61.0 / 20.0)));
+        // Ni le continu ni les dB n'ont de plancher de représentation.
+        assert_eq!(VolumeResolution::Continuous.floor_db(), None);
+        assert_eq!(
+            VolumeResolution::Decibels { step_mdb: 100 }.floor_db(),
+            None
+        );
+    }
+
+    /// Le champ est ADDITIF : une charge utile écrite avant son existence se
+    /// relit sans erreur, et vaut « continu », donc ne refuse rien.
+    #[test]
+    fn une_charge_utile_sans_le_champ_reste_lisible_et_permissive() {
+        let ancien = serde_json::json!({
+            "version": 1,
+            "can_pause": true,
+            "can_resume": true,
+            "can_seek": true,
+            "can_set_volume": true,
+            "can_mute": true,
+            "can_gapless": false,
+        });
+        let capabilities: OutputCapabilities = serde_json::from_value(ancien).unwrap();
+        assert_eq!(capabilities.volume_resolution, VolumeResolution::Continuous);
+        assert!(capabilities.volume_resolution.holds(0.0001));
+    }
+
+    /// Et il est lisible par un client : la grille sort nommée, avec son
+    /// nombre de pas, pas sous forme d'un entier opaque.
+    #[test]
+    fn la_grille_est_publiee_sous_un_nom_lisible() {
+        let capabilities =
+            OutputCapabilities::v1(true, true, true, true, true, false).with_percent_volume();
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(json["volume_resolution"]["kind"], "linear");
+        assert_eq!(json["volume_resolution"]["steps"], 100);
+        let airplay =
+            OutputCapabilities::v1(true, true, false, true, true, false).with_decibel_volume(100);
+        let json = serde_json::to_value(&airplay).unwrap();
+        assert_eq!(json["volume_resolution"]["kind"], "decibels");
+        assert_eq!(json["volume_resolution"]["step_mdb"], 100);
     }
 }

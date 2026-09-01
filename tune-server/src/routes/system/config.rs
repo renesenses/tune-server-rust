@@ -1,10 +1,10 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -26,41 +26,102 @@ pub(super) async fn version() -> Json<Value> {
     }))
 }
 
-pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
+/// Sonde de santé publique (#2796).
+///
+/// ## Ce que la route prétendait, et ce qu'elle vérifiait
+///
+/// Elle annonçait `status: "ok"` en dur, dans un `Json` donc toujours en
+/// **HTTP 200**, quel que soit l'état de la base. Le seul reflet du réel était
+/// le champ `db`, calculé sur la seule sonde `tracks` : une panne sur
+/// `albums`, ou sur la lecture du réglage `server_name`, était convertie en
+/// zéro ou en nom par défaut sans dégrader quoi que ce soit. Les trois
+/// affirmations de la réponse — code HTTP, champ `status`, détail par
+/// composant — pouvaient donc se contredire, et deux d'entre elles mentaient.
+///
+/// ## Qui lit cette route, et pourquoi le code HTTP se dose
+///
+/// Elle n'est pas seulement une sonde de supervision : c'est le **test
+/// d'existence d'un serveur Tune**. La découverte réseau du client Flutter
+/// (`server_discovery.dart`) n'enregistre un hôte que si elle obtient
+/// exactement `200`; la télécommande macOS conditionne toute sa connexion à
+/// cet appel; les clients iOS/iPadOS lèvent sur non-2xx; la barre latérale web
+/// y prend le numéro de version; `SettingsView` s'en sert pour savoir quand le
+/// serveur est revenu après un redémarrage. Un 503 rend donc le serveur
+/// **invisible**, il ne le signale pas « en peine ».
+///
+/// D'où la gradation, qui reste dans le contrat demandé sans transformer une
+/// requête malchanceuse en disparition :
+///
+/// - toutes les sondes passent → `ok`, HTTP 200 ;
+/// - une partie échoue (la base répond encore, une requête a échoué : verrou
+///   SQLite pris pendant un balayage, par exemple) → `degraded`, HTTP **200** ;
+/// - **toutes** échouent, c'est-à-dire base indisponible → `error`, HTTP 503.
+///
+/// Les conteneurs ne rebouclent pas là-dessus : les `HEALTHCHECK` des deux
+/// `Dockerfile` visent `/system/stats`, pas cette route.
+///
+/// ## Pourquoi `components` et pas un nouveau vocabulaire
+///
+/// Le détail par composant existe déjà **côté clients** et n'a jamais été
+/// servi : `SystemHealth.components: Record<string, boolean>` est déclaré dans
+/// le client web (`types.ts`), rendu en grille par `DiagnosticsView` et
+/// `SettingsView`, et déclaré dans les modèles iOS et macOS. La bannière web
+/// distingue déjà `ok` de `degraded`. On remplit ce contrat-là ; on n'en
+/// invente pas un second. La santé « avancée » (mémoire, disque, blocage de
+/// lecture) reste où elle est, sur `/system/health/monitor`, et n'entre pas
+/// ici : ses sondes lancent un sous-processus `df`, ce qu'une route sollicitée
+/// par la découverte réseau et par une boucle de 700 ms ne peut pas payer.
+pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
     let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
     let uptime_secs = state.started_at.elapsed().as_secs();
-
-    let db_status = if tracks_result.is_ok() {
-        "connected"
-    } else {
-        "error"
-    };
-    let tracks = tracks_result.unwrap_or(0);
-    let albums = albums_result.unwrap_or(0);
 
     // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
     // latérale fait déjà pour afficher « v0.9.117 » : la plainte d'origine est
     // qu'elle annonce une version sans dire de quelle machine elle parle. Les
     // séparer imposerait un second appel — et laisserait l'étiquette absente
-    // tant qu'il n'a pas répondu.
-    let server_name = resolve_server_name(
-        SettingsRepo::with_backend(state.backend.clone())
-            .get("server_name")
-            .ok()
-            .flatten()
-            .as_deref(),
-    );
+    // tant qu'il n'a pas répondu. C'est aussi la troisième sonde de la base :
+    // elle touche `settings`, une table que les deux comptages ne lisent pas.
+    let name_result = SettingsRepo::with_backend(state.backend.clone()).get("server_name");
+    let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
-    Json(json!({
-        "status": "ok",
-        "version": tune_core::version(),
-        "server_name": server_name,
-        "uptime_seconds": uptime_secs,
-        "db": db_status,
-        "tracks": tracks,
-        "albums": albums,
-    }))
+    let sondes = [
+        ("db_tracks", tracks_result.is_ok()),
+        ("db_albums", albums_result.is_ok()),
+        ("db_settings", name_result.is_ok()),
+    ];
+    let echecs = sondes.iter().filter(|(_, ok)| !*ok).count();
+
+    // Une panne SQL ne doit pas rester muette dans le journal (#2861) : les
+    // valeurs de repli partent quand même dans la réponse, mais accompagnées
+    // du `components` qui les contredit, et d'une trace côté serveur.
+    let tracks = tracks_result.ou_defaut_journalise();
+    let albums = albums_result.ou_defaut_journalise();
+
+    let (code, status, db_status) = match echecs {
+        0 => (StatusCode::OK, "ok", "connected"),
+        n if n == sondes.len() => (StatusCode::SERVICE_UNAVAILABLE, "error", "error"),
+        _ => (StatusCode::OK, "degraded", "degraded"),
+    };
+
+    let components: serde_json::Map<String, Value> = sondes
+        .iter()
+        .map(|(nom, ok)| ((*nom).to_string(), Value::Bool(*ok)))
+        .collect();
+
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "version": tune_core::version(),
+            "server_name": server_name,
+            "uptime_seconds": uptime_secs,
+            "db": db_status,
+            "tracks": tracks,
+            "albums": albums,
+            "components": components,
+        })),
+    )
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
@@ -498,18 +559,18 @@ pub(super) async fn get_config(
     );
     config.insert("zone_limit".to_string(), zone_limit);
     config.insert("license_key_masked".to_string(), json!(license_key_masked));
-    // Redact secrets before returning. The verbatim settings dump above includes
-    // raw credentials that the web client never reads (it uses discogs_token_set,
-    // license_key_masked and the streaming status store). Never expose them.
-    config.remove("license_key");
-    config.remove("discogs_token");
-    if let Some(Value::Object(qobuz)) = config.get_mut("auth_tokens_qobuz") {
-        for k in ["stored_password", "user_auth_token", "app_secret"] {
-            if qobuz.contains_key(k) {
-                qobuz.insert(k.to_string(), json!("********"));
-            }
-        }
-    }
+    // Caviardage des secrets, EN DERNIER — après `discogs_token_set` et
+    // `license_key_masked`, qui se calculent sur les valeurs en clair.
+    //
+    // Cette route recopie la table `settings` telle quelle : tout ce qu'une
+    // fonctionnalité y écrit sort par ici. Il y avait à la place une liste de
+    // deux retraits et trois sous-champs Qobuz nommés à la main, et elle avait
+    // pris du retard sur ce que la table contient (#2793) — la graine Ed25519
+    // d'un appairage AirPlay (`airplay2_pairing:<id>`) et les clés `tunedev_`
+    // de l'API développeur (`developer_api_keys`) sortaient en clair. La règle
+    // vit désormais dans `tune_core::secrets`, qui classe sur le NOM et couvre
+    // donc aussi le réglage ajouté demain.
+    tune_core::secrets::caviarder_carte(&mut config);
     Json(Value::Object(config))
 }
 
@@ -850,7 +911,17 @@ pub(super) struct ExportConfigQuery {
     include_secrets: bool,
 }
 
+/// `GET /system/config/export` — sauvegarde de la table `settings`.
+///
+/// **Réservée à l'administrateur** (#2793). Sans `RequireAdmin`, le
+/// middleware d'authentification se contentait de vérifier qu'un jeton était
+/// valide : n'importe quel compte, même sans rôle, obtenait le dump complet —
+/// et `?include_secrets=true` le lui rendait en clair, secret de signature JWT
+/// compris. `RequireAdmin` laisse passer sans condition quand l'authentification
+/// est désactivée (`auth.rs:502`), donc l'installation mono-utilisateur, qui est
+/// le cas courant, ne voit aucun changement.
 pub(super) async fn export_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
 ) -> Json<Value> {
@@ -869,32 +940,63 @@ pub(super) async fn export_config(
     // payload), so restoring a redacted backup to the SAME server leaves the
     // existing secrets untouched. Pass ?include_secrets=true for a full backup
     // when migrating to a fresh server.
+    //
+    // La liste de trois retraits nommés à la main a été remplacée par la même
+    // règle que `get_config` : c'était la seconde des « listes partielles » de
+    // #2793, et elle ne connaissait ni la graine AirPlay ni les clés
+    // développeur.
+    //
+    // On RETIRE, on ne masque pas — c'est la différence avec `get_config`, et
+    // elle est délibérée : une sauvegarde se ré-importe. Poser `********` à la
+    // place de `jwt_secret` écraserait le vrai secret de signature à la
+    // restauration ; l'absence de la clé, elle, est ce que `import_config` sait
+    // déjà ignorer.
     if !q.include_secrets {
-        config.remove("license_key");
-        config.remove("discogs_token");
-        config.remove("auth_tokens_qobuz");
+        tune_core::secrets::retirer_les_secrets(&mut config);
     }
     Json(Value::Object(config))
 }
 
+/// `POST /system/config/import` — restauration de réglages.
+///
+/// **Réservée à l'administrateur** (#2793) : la route appelait `settings.set`
+/// sur chaque clé reçue, donc un utilisateur standard pouvait poster
+/// `{"auth_enabled": "false"}` et éteindre l'authentification du serveur.
+///
+/// L'application est en DEUX TEMPS : tout le corps est validé et converti
+/// d'abord, et rien n'est écrit tant qu'une entrée est refusée. Avant, la
+/// validation vivait dans la boucle d'écriture, donc un corps dont la dixième
+/// entrée était invalide laissait les neuf premières appliquées.
+///
+/// Une écriture qui échoue en cours de route est désormais DITE (`500`) avec
+/// le nombre de clés déjà appliquées, au lieu d'être avalée par un
+/// `if ….is_ok()` qui rendait `200` et un compte silencieusement trop bas :
+/// l'appelant croyait sa restauration complète.
 pub(super) async fn import_config(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let mut a_ecrire: Vec<(String, String)> = Vec::with_capacity(body.len());
+    for (key, value) in body {
+        if key.trim().is_empty() {
+            return Err(AppError::bad_request("empty setting key"));
+        }
+        let str_val = match value {
+            Value::String(s) => s,
+            other => other.to_string(),
+        };
+        a_ecrire.push((key, str_val));
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut imported = 0;
-    for (key, value) in body {
-        let str_val = if value.is_string() {
-            value
-                .as_str()
-                .ok_or_else(|| AppError::bad_request("expected string"))?
-                .to_string()
-        } else {
-            value.to_string()
-        };
-        if settings.set(&key, &str_val).is_ok() {
-            imported += 1;
-        }
+    for (key, str_val) in a_ecrire {
+        settings.set(&key, &str_val).map_err(|e| {
+            AppError::internal(format!(
+                "import stopped after {imported} settings: writing '{key}' failed: {e}"
+            ))
+        })?;
+        imported += 1;
     }
     Ok(Json(json!({ "imported": imported })))
 }

@@ -8,6 +8,7 @@ pub mod artist_releases;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
+pub mod cloud_error;
 pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
@@ -42,7 +43,9 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
-pub mod panne_sql;
+// `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
+// extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
+// peut pas dependre de `tune-server` sans fabriquer un cycle.
 pub mod party;
 pub mod peers;
 pub mod playback;
@@ -64,10 +67,7 @@ pub mod setlistfm;
 pub mod shazam;
 pub mod siri;
 pub mod skins;
-pub mod smart_ai;
-pub mod smart_collections;
-pub mod smart_playlists;
-pub mod smart_refs;
+pub use tune_smart_http::{smart_ai, smart_collections, smart_playlists, smart_refs};
 pub mod snapcast;
 pub mod social;
 pub mod sonos;

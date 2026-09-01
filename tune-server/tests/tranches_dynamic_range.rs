@@ -219,3 +219,137 @@ async fn la_route_des_filtres_annonce_les_valeurs_de_dr_presentes_2144() {
     assert!(body.get("formats").is_some());
     assert!(body.get("sample_rates").is_some());
 }
+
+/// Le DR est une FACETTE du rail d'Oxygen, avec ses effectifs (#2144).
+///
+/// C'est la forme que le ticket réclame — « classer par tranches, façon
+/// pastilles de genres » — et la seule qui réponde à la question que
+/// `/library/albums/filters` laissait ouverte : *combien* de disques dans
+/// chaque tranche. Sans effectif, une pastille peut ne rien rendre.
+#[tokio::test]
+async fn le_dynamic_range_est_une_facette_avec_ses_effectifs_2144() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/facets?fields=dr").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["dr"],
+        serde_json::json!([
+            { "value": "14", "count": 1 },
+            { "value": "9",  "count": 1 },
+            { "value": "6",  "count": 1 },
+            { "value": "0",  "count": 1 },
+        ]),
+        "du plus dynamique au plus compressé ; « DR12.5 » écarté, DR0 gardé, \
+         et l'album SANS tag ne fabrique pas de pastille"
+    );
+}
+
+/// Plusieurs valeurs cochées = **une tranche**, en OU (#2168 appliqué au DR).
+///
+/// C'est ici que « filtrer par tranches » se joue : le serveur ne grave aucune
+/// borne, l'utilisateur coche DR14, DR9 — et obtient la réunion. Une seule
+/// valeur cochée reste un filtre exact.
+#[tokio::test]
+async fn plusieurs_dr_coches_forment_la_tranche_en_ou_2144() {
+    let app = bibliotheque();
+
+    for (requete, attendu) in [
+        ("dr=14", vec!["Bravo"]),
+        ("dr=14&dr=9", vec!["Bravo", "Charlie"]),
+        ("dr=0", vec!["Foxtrot"]),
+        // Une valeur qu'aucun album ne porte ne rend RIEN — surtout pas tout.
+        ("dr=13", vec![]),
+        // La tranche est toujours RESTRICTIVE : « DR12.5 » et l'album non
+        // tagué n'y entrent par aucune valeur.
+        ("dr=12", vec![]),
+    ] {
+        let (status, body) = get(
+            &app,
+            &format!("/api/v1/library/albums-detailed?limit=50&{requete}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{requete}");
+        let mut vus = titres(&body);
+        vus.sort();
+        let mut veut: Vec<String> = attendu.iter().map(|s| s.to_string()).collect();
+        veut.sort();
+        assert_eq!(vus, veut, "cartes album pour {requete}");
+        assert_eq!(
+            total(&body),
+            veut.len() as i64,
+            "le total compte la sélection, pas la bibliothèque ({requete})"
+        );
+    }
+
+    // La liste de PISTES filtre à l'identique — c'est le jumeau du rail, et
+    // deux prédicats recopiés auraient fini par diverger.
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50&dr=14&dr=6").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&body), 2, "Bravo et Alpha, une piste chacun");
+}
+
+/// Le TÉMOIN d'anti-régression : sans valeur de DR, rien ne change.
+///
+/// `?dr=` (case décochée, ce que le client envoie parfois) ne doit ni filtrer,
+/// ni activer le chemin filtré — le piège n°1 de `facet_filter`, qui rendrait
+/// la bibliothèque entière avec un total qui la confirme. Et une valeur non
+/// numérique REFUSE la requête plutôt que de laisser tout passer.
+#[tokio::test]
+async fn une_facette_dr_vide_ou_invalide_ne_filtre_pas_a_moitie_2144() {
+    let app = bibliotheque();
+
+    let (_, plein) = get(&app, "/api/v1/library/albums-detailed?limit=50").await;
+    let (status, vide) = get(&app, "/api/v1/library/albums-detailed?limit=50&dr=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&vide), 6, "les six albums, comme sans le paramètre");
+    assert_eq!(total(&plein), total(&vide));
+
+    let (status, _) = get(&app, "/api/v1/library/albums-detailed?limit=50&dr=abc").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "une valeur non numérique refuse la requête : ignorée, elle rendrait \
+         un filtre annoncé qui laisse tout passer"
+    );
+
+    // Et les facettes SŒURS ne bougent pas d'un cheveu quand `dr` s'ajoute au
+    // jeu demandé : la clé s'ajoute, aucune ne se remplace.
+    let (_, avant) = get(&app, "/api/v1/library/facets?fields=format,year").await;
+    let (_, apres) = get(&app, "/api/v1/library/facets?fields=format,year,dr").await;
+    assert_eq!(avant["format"], apres["format"]);
+    assert_eq!(avant["year"], apres["year"]);
+    assert!(avant.get("dr").is_none(), "non demandée, non rendue");
+}
+
+/// Les effectifs des AUTRES facettes suivent la sélection de DR — c'est ce que
+/// « cumulatif » veut dire, et ce qu'un rail qui ment sur ses effectifs ferait
+/// perdre : une pastille annonçant 6 pour une liste de 1.
+#[tokio::test]
+async fn la_selection_de_dr_retrecit_les_effectifs_des_autres_facettes_2144() {
+    let app = bibliotheque();
+
+    let (_, large) = get(&app, "/api/v1/library/facets?fields=format").await;
+    assert_eq!(
+        large["format"],
+        serde_json::json!([{ "value": "flac", "count": 6 }]),
+        "sans sélection, les six pistes"
+    );
+
+    let (status, etroit) = get(&app, "/api/v1/library/facets?fields=format&dr=14&dr=9").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        etroit["format"],
+        serde_json::json!([{ "value": "flac", "count": 2 }]),
+        "Bravo et Charlie seulement"
+    );
+
+    // ⚠️ La facette DR, elle, ne se filtre PAS elle-même : ses alternatives
+    // doivent rester visibles, sinon cocher DR14 effacerait DR9 de l'écran et
+    // l'utilisateur ne pourrait plus élargir sa tranche.
+    let (_, soi) = get(&app, "/api/v1/library/facets?fields=dr&dr=14").await;
+    assert_eq!(
+        soi["dr"].as_array().map(Vec::len),
+        Some(4),
+        "les quatre valeurs restent proposées malgré DR14 coché"
+    );
+}

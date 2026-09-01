@@ -186,13 +186,8 @@ async fn un_lien_vers_un_arbre_systeme_est_refuse_par_la_route() {
     // `/tmp` et non `std::env::temp_dir()` : sous macOS ce dernier vit sous
     // `/private/var`, donc déjà hors périmètre — le refus attendu tomberait
     // pour la mauvaise raison et ne prouverait plus rien du lien.
-    let base = std::path::PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
-        "tune-explorateur-route-i1275",
-    ));
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::create_dir_all(&base).expect("dossier de test");
+    let base = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-explorateur-route-i1275");
     let lien = base.join("raccourci");
-    std::fs::remove_file(&lien).ok();
     std::os::unix::fs::symlink("/etc", &lien).expect("lien de test");
 
     // Sur macOS le dossier temporaire vit sous `/private/var`, donc DÉJÀ hors
@@ -206,7 +201,6 @@ async fn un_lien_vers_un_arbre_systeme_est_refuse_par_la_route() {
     )
     .await;
     if statut_base != StatusCode::OK {
-        std::fs::remove_dir_all(&base).ok();
         return;
     }
 
@@ -221,6 +215,4 @@ async fn un_lien_vers_un_arbre_systeme_est_refuse_par_la_route() {
         StatusCode::FORBIDDEN,
         "le lien a ouvert /etc : {corps}"
     );
-
-    std::fs::remove_dir_all(&base).ok();
 }

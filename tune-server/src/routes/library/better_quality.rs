@@ -4,10 +4,10 @@
 //! entrées séparées : ces routes les rapprochent par titre+artiste, comme
 //! les Doublons, mais dans le sens du service — trouver MIEUX, pas pareil.
 
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, State};
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;

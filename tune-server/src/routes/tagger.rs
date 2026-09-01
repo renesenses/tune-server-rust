@@ -1,4 +1,3 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;

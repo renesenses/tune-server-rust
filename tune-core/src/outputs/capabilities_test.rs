@@ -186,6 +186,28 @@ async fn toutes_les_sorties_integrees_declarent_le_contrat_v1() {
             "{} doit déclarer explicitement le contrat courant",
             output.output_type()
         );
+        // #1274 — la finesse REELLE, celle que set_volume envoie sur le
+        // fil. Un type de sortie inconnu fait echouer ce test : c'est
+        // volontaire. Une sortie neuve doit declarer sa grille, faute de quoi
+        // une consigne en dB s'y arrondirait en silence sans que rien ne le
+        // dise.
+        let grille_attendue = match output.output_type() {
+            "dlna" | "bluos" | "openhome" | "squeezebox" | "hqplayer" | "oaat"
+            | "oaat-multiroom" => crate::outputs::VolumeResolution::Linear { steps: 100 },
+            "slimproto" => crate::outputs::VolumeResolution::Linear { steps: 65536 },
+            "local" => crate::outputs::VolumeResolution::Linear { steps: 1000 },
+            "airplay" => crate::outputs::VolumeResolution::Decibels { step_mdb: 100 },
+            "chromecast" | "airplay2" | "bridge" | "mock" => {
+                crate::outputs::VolumeResolution::Continuous
+            }
+            autre => panic!("sortie « {autre} » : declarez sa grille de volume (#1274)"),
+        };
+        assert_eq!(
+            capabilities.volume_resolution,
+            grille_attendue,
+            "{} ne declare pas la grille que son set_volume envoie",
+            output.output_type()
+        );
         assert_eq!(
             capabilities.can_gapless,
             output.supports_internal_gapless(),

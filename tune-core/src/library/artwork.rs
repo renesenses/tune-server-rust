@@ -14,6 +14,27 @@ use tracing::{debug, info, warn};
 /// `FetchOutcome` propagated up the source cascade).
 static ARTWORK_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
+/// Nombre d'images ramenées **puis refusées par le disque**, incrémenté dans
+/// [`save_to_cache`] — le seul point de passage des deux échecs possibles
+/// (création du répertoire, écriture du fichier).
+///
+/// Sans lui, une passe d'enrichissement compte dans le même `failed` deux
+/// causes opposées : « aucune source n'a d'image pour cet artiste » et
+/// « l'image est en main, le répertoire de cache la refuse ». Les deux
+/// affichent alors le même écran — « terminé, 0 enrichi » — et #2507 s'est
+/// arrêté exactement là : « Le repertoire de cache d artwork n a pas ete
+/// regarde […] Je n ai aucun element pour l affirmer ni pour l ecarter ».
+/// C'est le cas d'une image système dont le répertoire de travail n'est pas
+/// inscriptible : le chemin Linux de `artwork_cache_dir()` est **relatif**
+/// (`artwork_cache`), là où Windows et macOS résolvent un chemin absolu.
+///
+/// Même forme que `ARTWORK_RATE_LIMIT_HITS` juste au-dessus, et pour la même
+/// raison (#1096) : une passe qui « n'a rien trouvé » n'est pas une
+/// bibliothèque vide quand ce compteur est haut — c'est un disque à corriger.
+/// Global au processus (les passes sont sérialisées) ; `Relaxed` suffit à un
+/// compteur de diagnostic.
+static ARTWORK_CACHE_WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
+
 /// Candidate filenames for folder-level cover art.
 ///
 /// On case-insensitive filesystems (NTFS, APFS) duplicates are harmless.
@@ -312,6 +333,7 @@ pub fn store_thumbnail(cache_dir: &Path, bucket: u32, hash: &str, bytes: &[u8]) 
 
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             dir = %cache_dir.display(),
             error = %e,
@@ -327,6 +349,7 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
     if let Err(e) = std::fs::write(&path, data) {
+        ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             path = %path.display(),
             error = %e,
@@ -1341,6 +1364,10 @@ async fn batch_enrich_artist_artwork_inner(
     // downloads THIS run had throttled (429/503) — a "found nothing" run with a
     // high count is retryable, not genuinely empty (#1096).
     let rl_start = ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed);
+    // Même instantané pour les refus du disque : c'est la seule façon de
+    // distinguer « aucune source n'a d'image » de « le cache n'est pas
+    // inscriptible », les deux se présentant sinon comme « 0 enrichi » (#2507).
+    let cw_start = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
@@ -1516,6 +1543,10 @@ async fn batch_enrich_artist_artwork_inner(
                     "enriched": 0,
                     "failed": 0,
                     "community_applied": community_applied,
+                    // La passe communautaire vient de tourner : elle a pu
+                    // ramener des images et se les faire refuser par le disque.
+                    "cache_write_failed":
+                        ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
                 })
                 .to_string(),
             )
@@ -1659,6 +1690,8 @@ async fn batch_enrich_artist_artwork_inner(
                         "community_applied": community_applied,
                         "rate_limit_hits":
                             ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
+                        "cache_write_failed":
+                            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
                     })
                     .to_string(),
                 )
@@ -1787,6 +1820,13 @@ async fn batch_enrich_artist_artwork_inner(
                 // artists are simply absent (#1096).
                 "rate_limit_hits":
                     ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
+                // Combien d'images ont été ramenées puis REFUSÉES par le
+                // disque. `failed` les mélange avec les artistes qu'aucune
+                // source ne connaît ; ce compteur-là est le seul qui nomme un
+                // cache non inscriptible, la cause qu'on ne savait ni affirmer
+                // ni écarter sur une image système (#2507).
+                "cache_write_failed":
+                    ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
             })
             .to_string(),
         )
@@ -1818,7 +1858,24 @@ pub fn save_embedded_cover(
     if find_cached(cache_dir, &legacy).is_some() {
         return Some(legacy);
     }
+    cache_embedded_cover(audio_path, cache_dir, cover)
+}
 
+/// [`save_embedded_cover`] **sans la sonde héritée** : met en cache les octets
+/// reçus et rend leur condensat de CONTENU, quoi que porte déjà le cache sous
+/// l'adresse dérivée du chemin.
+///
+/// Réservé aux gestes où l'utilisateur demande explicitement de relire ses
+/// fichiers — « Scan complet » et les deux routes `/artwork/rescan`. Sur ces
+/// chemins-là, la sonde héritée est précisément ce qui rendait l'ancienne
+/// image : elle est adressée par le CHEMIN, donc remplacer la pochette ne la
+/// déplace pas (#3028). Les passes automatiques (scan incrémental, surveillant
+/// de fichiers) gardent [`save_embedded_cover`] et ses URL stables (#1444).
+pub fn cache_embedded_cover(
+    audio_path: &Path,
+    cache_dir: &Path,
+    cover: &(Vec<u8>, String),
+) -> Option<String> {
     let (data, mime) = cover;
     // Nouvelle écriture : adressée par le CONTENU (#1444). Mêmes octets dans
     // N fichiers = une seule entrée, et un rescan retombe sur elle sans rien
@@ -1937,7 +1994,30 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     if find_cached(cache_dir, &legacy).is_some() {
         return Some(legacy);
     }
+    refresh_cover_hash(audio_path, cache_dir)
+}
 
+/// [`get_or_extract`] **sans la sonde héritée** : relit toujours la source
+/// (jaquette intégrée, puis pochette du dossier) et rend le condensat de son
+/// CONTENU.
+///
+/// C'est le seul chemin capable de rafraîchir la pochette d'un album qui en a
+/// déjà une (#3028). `get_or_extract` commence par sonder l'entrée héritée,
+/// adressée par le CHEMIN de la piste (`artwork_hash`) : remplacer `cover.jpg`
+/// dans le dossier ne change pas ce chemin, donc la sonde trouvait l'ancienne
+/// entrée et rendait l'ancienne image sans jamais rouvrir le fichier — y
+/// compris depuis les deux routes `/artwork/rescan`, écrites pour ce
+/// rattrapage et neutralisées par cette même sonde.
+///
+/// Le condensat rendu changeant avec les octets, l'URL servie change aussi :
+/// le `Cache-Control: immutable` de la route ne retient plus l'ancienne image
+/// côté navigateur. Aucune entrée existante n'est supprimée — les URL déjà
+/// distribuées restent servies.
+///
+/// À n'appeler que sur un geste explicite de l'utilisateur. Les passes
+/// automatiques gardent [`get_or_extract`], dont la sonde héritée épargne la
+/// relecture du fichier et fige les URL (#1444).
+pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     // Try embedded cover art from the audio file tags.
     // Nouvelle écriture : adressée par le CONTENU (#1444) — la même jaquette
     // intégrée à N pistes ne peuple le cache que d'UNE entrée.
@@ -2075,6 +2155,116 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         std::sync::Arc::new(db)
+    }
+
+    // ---------------------------------------------------------------------
+    // #2507 — un cache non inscriptible doit se NOMMER.
+    //
+    // Le fait de base : après le passage, le fichier d'image existe et n'est
+    // pas vide. Quand il n'existe pas, l'enrichissement comptait la fiche dans
+    // le même `failed` qu'un artiste qu'aucune source ne connaît. Les deux
+    // rendaient « terminé, 0 enrichi », et le ticket s'est arrêté là faute de
+    // pouvoir départager (« aucun element pour l affirmer ni pour l ecarter »).
+    // ---------------------------------------------------------------------
+
+    /// Le témoin, sur le fait de base : répertoire inscriptible, le fichier
+    /// d'image existe après le passage et il n'est pas vide. Vert des deux
+    /// côtés du correctif — c'est ce qui prouve que le test rouge ci-dessous
+    /// mesure le refus du disque et non la mécanique d'écriture elle-même.
+    ///
+    /// Il n'affirme rien sur le compteur : celui-ci est global au processus et
+    /// les tests de ce module tournent en parallèle, donc seule une variation
+    /// mesurée autour d'un échec CERTAIN a un sens — c'est ce que fait le test
+    /// suivant, avec des comparaisons qu'une écriture concurrente ne peut que
+    /// renforcer.
+    #[test]
+    fn temoin_cache_inscriptible_le_fichier_existe_et_n_est_pas_vide() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("artwork_cache");
+
+        let hash = cache_fetched_image(b"OCTETS-D-IMAGE", &cache, "jpg")
+            .expect("un répertoire inscriptible doit rendre un condensat");
+
+        let fichier = cache.join(format!("{hash}.jpg"));
+        assert!(fichier.exists(), "le fichier d'image doit exister");
+        assert_eq!(
+            std::fs::read(&fichier).unwrap(),
+            b"OCTETS-D-IMAGE",
+            "le fichier d'image ne doit pas être vide"
+        );
+    }
+
+    /// Le cas signalé : le disque refuse. Rien n'est écrit — et le refus est
+    /// COMPTÉ, donc nommable. Les deux échecs possibles de `save_to_cache`
+    /// sont couverts : la création du répertoire, puis l'écriture du fichier.
+    #[cfg(unix)]
+    #[test]
+    fn un_cache_non_inscriptible_est_compte_et_non_confondu_avec_une_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ferme = dir.path().join("ferme");
+        std::fs::create_dir_all(&ferme).unwrap();
+        std::fs::set_permissions(&ferme, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Sous root, un répertoire en lecture seule n'arrête rien : la mesure
+        // n'aurait aucun sens, on ne la fait pas. On le PROUVE au lieu de le
+        // supposer, sans dépendre de `libc`.
+        if std::fs::write(ferme.join(".sonde"), b"x").is_ok() {
+            std::fs::remove_file(ferme.join(".sonde")).ok();
+            return;
+        }
+
+        // 1) La création du répertoire de cache échoue.
+        let avant = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
+        let sous_dossier = ferme.join("artwork_cache");
+        assert!(
+            cache_fetched_image(b"OCTETS-D-IMAGE", &sous_dossier, "jpg").is_none(),
+            "un répertoire impossible à créer ne peut pas rendre un condensat"
+        );
+        assert!(
+            !sous_dossier.exists(),
+            "aucun fichier d'image ne doit avoir été posé"
+        );
+        assert!(
+            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed) > avant,
+            "le refus du disque doit être compté, sinon il reste indiscernable \
+             d'un artiste dont aucune source n'a d'image (#2507)"
+        );
+
+        // 2) Le répertoire existe déjà, c'est l'écriture qui échoue.
+        let avant = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
+        assert!(
+            cache_fetched_image(b"OCTETS-D-IMAGE", &ferme, "jpg").is_none(),
+            "un répertoire non inscriptible ne peut pas rendre un condensat"
+        );
+        assert!(
+            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed) > avant,
+            "l'échec d'écriture doit être compté au même titre que l'échec de \
+             création du répertoire"
+        );
+
+        // Remis inscriptible : sinon `TempDir` ne peut pas se nettoyer.
+        std::fs::set_permissions(&ferme, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// Tout rapport qui sait dire « on a été bridé » doit aussi savoir dire
+    /// « le disque a refusé » : ce sont les deux raisons pour lesquelles un
+    /// « 0 enrichi » n'est PAS une bibliothèque sans images, et elles se
+    /// lisent au même endroit. Ces `json!` sont des copies manuelles — la même
+    /// configuration a déjà divergé deux fois côté scan (#2012, #2146), et une
+    /// clé posée dans un rapport sur deux ne casse aucune compilation.
+    #[test]
+    fn tout_rapport_qui_dit_le_bridage_dit_aussi_le_refus_du_disque() {
+        let source = include_str!("artwork.rs");
+        let bridage = source.matches("\"rate_limit_hits\":").count();
+        let refus = source.matches("\"cache_write_failed\":").count();
+        assert!(
+            bridage > 0 && refus >= bridage,
+            "{bridage} rapports portent `rate_limit_hits`, seulement {refus} \
+             portent `cache_write_failed` : un « 0 enrichi » y redevient \
+             indiscernable d'un cache non inscriptible (#2507)"
+        );
     }
 
     /// Toutes les cinq fiches, et toujours la dernière.
@@ -2491,6 +2681,128 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // #3028 — remplacer sa pochette dans la bibliothèque.
+    // ------------------------------------------------------------------
+
+    /// Le défaut, nu. L'utilisateur remplace `cover.jpg` par une autre image :
+    /// la sonde héritée est adressée par le CHEMIN, qui n'a pas bougé, donc
+    /// `get_or_extract` rend l'ANCIENNE entrée sans jamais rouvrir le fichier.
+    ///
+    /// Ce test est le TÉMOIN : il fige le comportement des passes automatiques
+    /// (URL stables, #1444), qui ne doit pas changer.
+    #[test]
+    fn temoin_get_or_extract_garde_l_ancienne_pochette_apres_remplacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let pochette = dossier.join("cover.jpg");
+        std::fs::write(&pochette, b"ANCIENNE-POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        // Cache tel que le laisse une bibliothèque antérieure à la v0.9.127 :
+        // l'entrée est adressée par le chemin de la PISTE.
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-POCHETTE").unwrap();
+
+        // L'utilisateur remplace l'image sur son disque.
+        std::fs::write(&pochette, b"NOUVELLE-POCHETTE").unwrap();
+
+        let h = get_or_extract(&piste, &cache).unwrap();
+        assert_eq!(h, legacy, "la sonde héritée court-circuite la relecture");
+        assert_eq!(
+            std::fs::read(cache.join(format!("{legacy}.jpg"))).unwrap(),
+            b"ANCIENNE-POCHETTE",
+            "les octets servis sont ceux de l'ancienne image"
+        );
+    }
+
+    /// La correction : sur un geste explicite (« Scan complet », les deux
+    /// routes `/artwork/rescan`), la relecture saute la sonde héritée, rend le
+    /// condensat du CONTENU de la nouvelle image — donc une autre URL — et
+    /// écrit les nouveaux octets dans le cache.
+    #[test]
+    fn refresh_cover_hash_rend_la_nouvelle_pochette_et_une_autre_adresse() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let pochette = dossier.join("cover.jpg");
+        std::fs::write(&pochette, b"ANCIENNE-POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-POCHETTE").unwrap();
+
+        std::fs::write(&pochette, b"NOUVELLE-POCHETTE").unwrap();
+
+        let h = refresh_cover_hash(&piste, &cache).unwrap();
+        assert_ne!(h, legacy, "l'adresse change avec le contenu");
+        assert_eq!(h, content_hash(b"NOUVELLE-POCHETTE"));
+        let (chemin, _) = find_cached(&cache, &h).expect("la nouvelle entrée est écrite");
+        assert_eq!(
+            std::fs::read(chemin).unwrap(),
+            b"NOUVELLE-POCHETTE",
+            "ce sont bien les octets neufs qui seront servis"
+        );
+        // L'entrée héritée n'est pas supprimée : les URL déjà distribuées
+        // restent servies, elles ne partent pas en 404 (#1444).
+        assert!(
+            find_cached(&cache, &legacy).is_some(),
+            "l'entrée héritée survit"
+        );
+    }
+
+    /// Contre-épreuve : à fichier INCHANGÉ, la relecture forcée ne fabrique
+    /// aucune entrée de plus à chaque passe. Deux « Scan complet » de suite ne
+    /// doivent pas gonfler le cache.
+    #[test]
+    fn refresh_cover_hash_est_idempotent_a_fichier_inchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let dossier = dir.path().join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        std::fs::write(dossier.join("cover.jpg"), b"POCHETTE").unwrap();
+        let piste = dossier.join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+
+        let h1 = refresh_cover_hash(&piste, &cache).unwrap();
+        let h2 = refresh_cover_hash(&piste, &cache).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(nb_fichiers(&cache), 1, "aucune entrée en doublon");
+    }
+
+    /// Même contrat pour la jaquette INTÉGRÉE, dont les octets sont déjà lus :
+    /// `save_embedded_cover` garde l'entrée héritée, `cache_embedded_cover`
+    /// adresse par le contenu.
+    #[test]
+    fn cache_embedded_cover_ignore_l_entree_heritee() {
+        let dir = tempfile::tempdir().unwrap();
+        let piste = dir.path().join("01.flac");
+        std::fs::write(&piste, b"").unwrap();
+        let cache = dir.path().join("cache");
+        let legacy = artwork_hash(&piste.to_string_lossy());
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{legacy}.jpg")), b"ANCIENNE-JAQUETTE").unwrap();
+
+        let neuve = (b"NOUVELLE-JAQUETTE".to_vec(), "image/jpeg".to_string());
+
+        // Témoin : la passe automatique ne bouge pas.
+        assert_eq!(
+            save_embedded_cover(&piste, &cache, &neuve).unwrap(),
+            legacy,
+            "sans geste explicite, l'URL distribuée est conservée"
+        );
+
+        let h = cache_embedded_cover(&piste, &cache, &neuve).unwrap();
+        assert_eq!(h, content_hash(b"NOUVELLE-JAQUETTE"));
+        let (chemin, _) = find_cached(&cache, &h).expect("la nouvelle entrée est écrite");
+        assert_eq!(std::fs::read(chemin).unwrap(), b"NOUVELLE-JAQUETTE");
+    }
+
+    // ------------------------------------------------------------------
     // #1444 — les producteurs restés adressés par l'IDENTITÉ.
     // ------------------------------------------------------------------
 
@@ -2845,8 +3157,6 @@ mod tests {
             filled_again, 0,
             "backfill must not re-process covered albums"
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

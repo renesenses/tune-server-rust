@@ -33,7 +33,6 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
-    spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
@@ -1614,15 +1613,6 @@ fn spawn_audio_embedding(state: &AppState) {
     tune_core::audio::embedding::spawn(state.backend.clone(), state.license.clone());
 }
 
-fn spawn_concert_alerts(state: &AppState) {
-    tune_core::cloud::concert_alerts::spawn(state.backend.clone());
-
-    // Veille Bandcamp : un appel reseau par artiste, donc en arriere-plan et
-    // sur les seuls favoris. Sans le plugin, la fonction n'existe pas.
-    #[cfg(feature = "bandcamp")]
-    crate::bandcamp_sweep::spawn(state.backend.clone());
-}
-
 fn spawn_cloud_library_sync(state: &AppState) {
     tune_core::cloud::library_sync::spawn(state.backend.clone(), state.license.clone());
     // L'arbitrage part apres la synchronisation : demander des propositions
@@ -1664,6 +1654,11 @@ fn spawn_memory_diagnostics(
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
 ) {
     tokio::spawn(async move {
+        // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
+        // base de comparaison suit la même portée, sinon elle est déclarée et
+        // jamais lue ailleurs. `rss_delta_mb` reste donc mesuré partout où la
+        // trace tourne — c'est-à-dire sur Linux, et nulle part ailleurs.
+        #[cfg(target_os = "linux")]
         let mut rss_initial_mb: Option<u64> = None;
         loop {
             #[cfg(target_os = "linux")]

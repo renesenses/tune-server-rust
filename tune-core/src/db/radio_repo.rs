@@ -497,7 +497,6 @@ mod tests {
         assert!(repo.update(&station).is_err());
     }
 
-    #[test]
     /// La FORME de l'horodatage est ce qui compte : sans le `Z`, un client
     /// JavaScript lit la chaine comme une heure locale et n'applique aucune
     /// conversion — l'ecran affichait deux heures d'avance l'ete (#1515).
@@ -514,6 +513,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn radio_favorites_empty() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();

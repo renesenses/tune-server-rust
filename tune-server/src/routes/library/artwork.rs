@@ -1,10 +1,10 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
@@ -1408,7 +1408,14 @@ pub(super) async fn rescan_album_artwork(
     let mut found_hash: Option<String> = None;
     for track in &tracks {
         if let Some(ref file_path) = track.file_path {
-            if let Some(hash) = tune_core::library::artwork::get_or_extract(
+            // `refresh_cover_hash` et non `get_or_extract` : cette route EST le
+            // rattrapage manuel. `get_or_extract` sonde d'abord l'entrée
+            // héritée, adressée par le CHEMIN de la piste — remplacer
+            // `cover.jpg` ne déplace pas ce chemin, donc la sonde rendait
+            // l'ancienne image et le `force_update_cover_path` ci-dessous
+            // réécrivait la base avec le condensat qu'elle portait déjà. Le
+            // bouton ne pouvait rien changer (#3028).
+            if let Some(hash) = tune_core::library::artwork::refresh_cover_hash(
                 std::path::Path::new(file_path),
                 &cache_dir,
             ) {
@@ -1518,7 +1525,10 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
             for track in &tracks {
                 if let Some(ref file_path) = track.file_path {
-                    if let Some(hash) = tune_core::library::artwork::get_or_extract(
+                    // Même raison qu'au rattrapage par album : sans sauter la
+                    // sonde héritée, cette passe réécrit la base avec le
+                    // condensat qu'elle portait déjà (#3028).
+                    if let Some(hash) = tune_core::library::artwork::refresh_cover_hash(
                         std::path::Path::new(file_path),
                         &cache_dir,
                     ) {
