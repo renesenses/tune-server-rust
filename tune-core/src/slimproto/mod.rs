@@ -20,7 +20,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::outputs::TransportState;
 
@@ -624,6 +624,139 @@ pub fn new_player_registry() -> PlayerRegistry {
 // SlimProto TCP server
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Ce que devient le port 3483 quand on n'arrive pas a le prendre (#2938)
+// ---------------------------------------------------------------------------
+
+/// Delai laisse a la sonde pour joindre celui qui tient le port.
+///
+/// Une seconde suffit largement en boucle locale ; au-dela, on prefere rendre
+/// « indeterminee » plutot que de retarder le demarrage du serveur.
+const DELAI_SONDE_PORT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ce que la sonde a pu ETABLIR sur un port que le noyau nous a refuse.
+///
+/// Le ticket #2938 releve cinq journaux de testeurs, sur deux systemes, ou le
+/// bind de 3483 echoue — et rien dans ces journaux ne permet de departager les
+/// causes. Cette enumeration est ce qu'une seule mesure, faite au moment de
+/// l'echec, permet de trancher : on essaie de se CONNECTER au port. Le
+/// resultat separe un conflit franc (quelqu'un ecoute) d'un refus du systeme
+/// (personne n'ecoute, et pourtant le bind est refuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CausePortIndisponible {
+    /// Quelqu'un accepte des connexions sur ce port : conflit franc avec un
+    /// autre serveur (Lyrion/LMS, ou une instance precedente de Tune).
+    UnAutreServeurEcoute,
+    /// Personne n'accepte de connexion, et pourtant le bind est refuse. Sous
+    /// Windows c'est la signature d'une plage de ports exclue par le systeme
+    /// (Hyper-V / WinNAT reservent des blocs entiers) ; ailleurs, d'un socket
+    /// lie a une adresse precise que la boucle locale ne voit pas.
+    PersonneNEcoute,
+    /// La sonde n'a pas pu conclure (delai depasse, pare-feu qui absorbe).
+    Indeterminee,
+}
+
+impl CausePortIndisponible {
+    /// Le code machine, pour la route de diagnostic et l'evenement.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::UnAutreServeurEcoute => "port_tenu_par_un_autre_serveur",
+            Self::PersonneNEcoute => "port_refuse_par_le_systeme",
+            Self::Indeterminee => "cause_indeterminee",
+        }
+    }
+
+    /// La phrase que lira un testeur : la cause, la consequence, le
+    /// contournement. Meme forme que le message du repondeur UDP voisin.
+    pub fn phrase(self, port: u16) -> String {
+        match self {
+            Self::UnAutreServeurEcoute => format!(
+                "un autre serveur ecoute deja sur le port TCP {port} (un Lyrion/LMS \
+                 installe sur cette machine, ou une instance precedente de Tune non \
+                 terminee) : les platines Squeezebox ne pourront pas se connecter a \
+                 Tune. Arretez l'autre serveur, ou donnez un autre port a Tune avec \
+                 la variable TUNE_SLIMPROTO_PORT."
+            ),
+            Self::PersonneNEcoute => format!(
+                "le port TCP {port} est refuse par le systeme alors que PERSONNE n'y \
+                 ecoute (sous Windows : plage de ports exclue par Hyper-V/WinNAT — \
+                 « netsh int ipv4 show excludedportrange tcp ») : les platines \
+                 Squeezebox ne pourront pas se connecter a Tune. Donnez un autre port \
+                 a Tune avec la variable TUNE_SLIMPROTO_PORT."
+            ),
+            Self::Indeterminee => format!(
+                "le port TCP {port} est refuse et la sonde n'a pas pu joindre celui \
+                 qui le tient : les platines Squeezebox ne pourront pas se connecter a \
+                 Tune. Verifiez qui tient le port (« ss -lptn 'sport = :{port}' » sous \
+                 Linux, « netstat -ano | findstr :{port} » sous Windows), ou donnez un \
+                 autre port a Tune avec la variable TUNE_SLIMPROTO_PORT."
+            ),
+        }
+    }
+}
+
+/// L'etat du canal TCP de SlimProto, retenu pour toute la session.
+///
+/// C'est la moitie du ticket qui coute le plus cher au testeur : sans cet
+/// etat, l'echec du bind ne vivait que dans UNE ligne de journal, dans une
+/// tache detachee, sans route ni ecran pour la relire. Un `bus.emit` seul n'y
+/// suffit pas : le bus est un `broadcast` sans rejeu, et le bind a lieu au
+/// DEMARRAGE — aucun client WebSocket n'est encore connecte, l'evenement ne
+/// serait recu par personne. L'evenement part quand meme (il sert a une
+/// tentative faite en cours de session), mais c'est cet etat-ci qui survit et
+/// que `/system/diagnostics/network` sert.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EtatEcouteSlimProto {
+    /// Le port sur lequel l'ecoute a ete tentee.
+    pub port: u16,
+    /// `true` si le bind a reussi et que le serveur accepte des connexions.
+    pub ecoute: bool,
+    /// Code machine de la cause, `None` quand l'ecoute est en service.
+    pub cause: Option<&'static str>,
+    /// Phrase lisible, `None` quand l'ecoute est en service.
+    pub message: Option<String>,
+    /// L'erreur du systeme, telle quelle (`os error 98`, `os error 10048`…).
+    pub erreur_systeme: Option<String>,
+}
+
+static ETAT_ECOUTE: std::sync::RwLock<Option<EtatEcouteSlimProto>> = std::sync::RwLock::new(None);
+
+/// L'etat du canal TCP SlimProto, ou `None` tant qu'aucune tentative d'ecoute
+/// n'a eu lieu. Lu par `/system/diagnostics/network` et par le rapport de bogue.
+pub fn etat_ecoute() -> Option<EtatEcouteSlimProto> {
+    ETAT_ECOUTE.read().ok().and_then(|g| g.clone())
+}
+
+fn retenir_etat_ecoute(etat: EtatEcouteSlimProto) {
+    if let Ok(mut g) = ETAT_ECOUTE.write() {
+        *g = Some(etat);
+    }
+}
+
+/// Essaie de se connecter au port pour savoir QUI le tient.
+///
+/// On sonde la boucle locale d'abord ; puis, si on la connait, l'adresse LAN du
+/// serveur — un socket lie a `192.168.x.y:3483` seul refuse notre bind sur
+/// `0.0.0.0` sans jamais repondre sur `127.0.0.1`.
+async fn sonder_qui_tient_le_port(port: u16, adresses: &[String]) -> CausePortIndisponible {
+    let mut indeterminee = false;
+    for hote in adresses {
+        let Ok(addr) = format!("{hote}:{port}").parse::<SocketAddr>() else {
+            continue;
+        };
+        match tokio::time::timeout(DELAI_SONDE_PORT, TcpStream::connect(addr)).await {
+            Ok(Ok(_)) => return CausePortIndisponible::UnAutreServeurEcoute,
+            Ok(Err(_)) => {}
+            Err(_) => indeterminee = true,
+        }
+    }
+    if indeterminee {
+        CausePortIndisponible::Indeterminee
+    } else {
+        CausePortIndisponible::PersonneNEcoute
+    }
+}
+
 /// Server state needed to bridge a connected player into a Tune zone + playback.
 /// Optional so the server can still be constructed bare in unit tests.
 pub struct SlimProtoState {
@@ -647,6 +780,9 @@ pub struct SlimProtoServer {
     /// Zone/playback bridge state. `None` in unit tests (server accepts
     /// connections but does not register zones).
     state: Option<Arc<SlimProtoState>>,
+    /// Le bus, tenu a part de [`SlimProtoState`] : l'annonce d'un echec de bind
+    /// doit pouvoir partir d'un serveur qui n'a AUCUN pont de zone (#2938).
+    event_bus: Option<Arc<crate::event_bus::EventBus>>,
 }
 
 impl SlimProtoServer {
@@ -658,7 +794,28 @@ impl SlimProtoServer {
             port: Self::resolve_port(),
             players: new_player_registry(),
             state: None,
+            event_bus: None,
         }
+    }
+
+    /// Meme chose, mais sur un port impose plutot que resolu depuis
+    /// l'environnement. Sert a une mesure qui doit choisir son port (le port 0
+    /// laisse le systeme en attribuer un libre) sans toucher a
+    /// `TUNE_SLIMPROTO_PORT` : une variable d'environnement posee dans un test
+    /// contamine toute la suite.
+    pub fn new_sur_port(port: u16) -> Self {
+        Self {
+            port,
+            players: new_player_registry(),
+            state: None,
+            event_bus: None,
+        }
+    }
+
+    /// Branche le bus d'evenements sur un serveur construit sans pont de zone.
+    pub fn avec_bus(mut self, bus: Arc<crate::event_bus::EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     /// Create a server wired to the app state so connected players are
@@ -674,11 +831,12 @@ impl SlimProtoServer {
             players: new_player_registry(),
             state: Some(Arc::new(SlimProtoState {
                 db,
-                event_bus,
+                event_bus: event_bus.clone(),
                 outputs,
                 server_ip,
                 command_channels: Arc::new(Mutex::new(HashMap::new())),
             })),
+            event_bus: Some(event_bus),
         }
     }
 
@@ -695,13 +853,31 @@ impl SlimProtoServer {
     }
 
     /// Start listening and spawn per-client handlers. This runs forever.
+    ///
+    /// Un bind refuse ne fait plus qu'une ligne de journal noyee (#2938) : la
+    /// cause est SONDEE, nommee, retenue dans [`etat_ecoute`] pour toute la
+    /// session, et annoncee sur le bus. L'appelant garde une `Err` — le serveur
+    /// HTTP, lui, demarre quand meme : `tune-server/src/background.rs` detache
+    /// cette tache, un SlimProto mort reste un service degrade, jamais un
+    /// serveur mort.
     pub async fn spawn(self: Arc<Self>) -> Result<(), String> {
         let addr = format!("0.0.0.0:{}", self.port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("slimproto bind {addr}: {e}"))?;
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => return Err(self.annoncer_bind_impossible(&addr, &e).await),
+        };
 
-        info!(port = self.port, "slimproto_server_started");
+        // Le port reellement obtenu : avec `port = 0` le systeme en attribue un,
+        // et l'etat doit dire celui-la, pas le zero demande.
+        let port_obtenu = listener.local_addr().map(|a| a.port()).unwrap_or(self.port);
+        retenir_etat_ecoute(EtatEcouteSlimProto {
+            port: port_obtenu,
+            ecoute: true,
+            cause: None,
+            message: None,
+            erreur_systeme: None,
+        });
+        info!(port = port_obtenu, "slimproto_server_started");
 
         loop {
             match listener.accept().await {
@@ -720,6 +896,53 @@ impl SlimProtoServer {
                 }
             }
         }
+    }
+
+    /// Sonde, nomme, retient et annonce un bind refuse. Rend le texte d'erreur
+    /// que l'appelant propage.
+    ///
+    /// Les trois sorties ne font qu'une seule mesure : la sonde de port. Elles
+    /// disent la meme chose a trois lecteurs differents — le journal pour qui
+    /// l'exporte, [`etat_ecoute`] pour la route de diagnostic et le rapport de
+    /// bogue, le bus pour un client deja connecte.
+    async fn annoncer_bind_impossible(&self, addr: &str, e: &std::io::Error) -> String {
+        let mut adresses = vec!["127.0.0.1".to_string()];
+        if let Some(ip) = self.state.as_ref().map(|s| s.server_ip.clone())
+            && ip != "127.0.0.1"
+        {
+            adresses.push(ip);
+        }
+        let cause = sonder_qui_tient_le_port(self.port, &adresses).await;
+        let phrase = cause.phrase(self.port);
+
+        error!(
+            port = self.port,
+            cause = cause.code(),
+            error = %e,
+            "slimproto_bind_impossible — {phrase}"
+        );
+
+        retenir_etat_ecoute(EtatEcouteSlimProto {
+            port: self.port,
+            ecoute: false,
+            cause: Some(cause.code()),
+            message: Some(phrase.clone()),
+            erreur_systeme: Some(e.to_string()),
+        });
+
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_typed(
+                crate::event_types::EventType::SlimprotoListenFailed,
+                serde_json::json!({
+                    "port": self.port,
+                    "cause": cause.code(),
+                    "message": phrase,
+                    "erreur_systeme": e.to_string(),
+                }),
+            );
+        }
+
+        format!("slimproto bind {addr}: {e} — {phrase}")
     }
 
     /// Handle a single client connection.
@@ -1519,5 +1742,237 @@ mod tests {
             assert!(removed.is_some());
             assert!(reg.is_empty());
         }
+    }
+
+    // ── #2938 : un bind refuse doit NOMMER sa cause et la RETENIR ──────────
+    //
+    // Cinq testeurs, deux systemes, une seule ligne de journal en anglais dans
+    // une tache detachee. Les mesures qui suivent portent sur le VRAI
+    // `SlimProtoServer::spawn()` — pas sur une reecriture du mecanisme : c'est
+    // la fonction que `tune-server/src/background.rs` appelle en production.
+
+    /// L'etat d'ecoute est un global de processus. Deux mesures qui l'ecrivent
+    /// en meme temps se marcheraient dessus : ce verrou les met a la file.
+    fn verrou_etat() -> &'static tokio::sync::Mutex<()> {
+        static V: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        V.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Attend que l'etat retenu satisfasse `predicat`, ou rend `None`.
+    ///
+    /// `spawn()` ne rend jamais la main quand l'ecoute reussit (c'est une
+    /// boucle d'acceptation) : le succes se lit donc dans l'etat, pas dans une
+    /// valeur de retour.
+    async fn attendre_etat(
+        predicat: impl Fn(&EtatEcouteSlimProto) -> bool,
+    ) -> Option<EtatEcouteSlimProto> {
+        for _ in 0..200 {
+            if let Some(e) = etat_ecoute()
+                && predicat(&e)
+            {
+                return Some(e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// LA contre-epreuve. Sur un fait de base — un port reellement tenu par un
+    /// autre socket — et jamais sur un code HTTP.
+    ///
+    /// Rouge avant le correctif : `spawn()` rendait « slimproto bind
+    /// 0.0.0.0:P: Address already in use (os error 98) », rien d'autre
+    /// n'existait, et `etat_ecoute()` n'existait pas du tout.
+    #[tokio::test]
+    async fn un_port_deja_pris_nomme_la_cause_la_retient_et_l_annonce() {
+        let _verrou = verrou_etat().lock().await;
+
+        // Le squatteur prend `0.0.0.0` : sous Linux, SO_REUSEADDR — que std
+        // pose deja — laisse cohabiter `127.0.0.1:P` et `0.0.0.0:P`, mais
+        // jamais deux fois la MEME adresse exacte. Port 0 : c'est le systeme
+        // qui attribue, deux mesures concurrentes ne peuvent pas se disputer
+        // le meme numero.
+        let squatteur = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = squatteur.local_addr().unwrap().port();
+
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+        let serveur = Arc::new(SlimProtoServer::new_sur_port(port).avec_bus(Arc::clone(&bus)));
+
+        let err = serveur
+            .spawn()
+            .await
+            .expect_err("le bind devait echouer : le port est tenu");
+
+        // 1. Une trace LISIBLE : l'erreur propagee (celle que journalise
+        //    `background.rs`) nomme la cause ET le contournement.
+        assert!(
+            err.contains("un autre serveur ecoute deja"),
+            "l'erreur doit NOMMER ce qui tient le port, pas seulement « address \
+             already in use » — obtenu : {err}"
+        );
+        assert!(
+            err.contains("TUNE_SLIMPROTO_PORT"),
+            "l'erreur doit donner le contournement — obtenu : {err}"
+        );
+
+        // 2. Un ETAT que quelque chose peut lire APRES coup : c'est lui que
+        //    sert `/system/diagnostics/network` et le rapport de bogue. La
+        //    ligne de journal, elle, est deja passee.
+        let etat = etat_ecoute().expect("aucun etat retenu apres un bind refuse");
+        assert_eq!(etat.port, port);
+        assert!(!etat.ecoute, "l'etat doit dire que SlimProto n'ecoute pas");
+        assert_eq!(
+            etat.cause,
+            Some("port_tenu_par_un_autre_serveur"),
+            "la sonde a joint quelqu'un sur ce port : la cause doit le dire"
+        );
+        let message = etat.message.expect("l'etat doit porter une phrase lisible");
+        assert!(
+            message.contains("Squeezebox"),
+            "la phrase doit dire la CONSEQUENCE pour l'utilisateur — obtenu : {message}"
+        );
+        assert!(
+            message.contains("TUNE_SLIMPROTO_PORT"),
+            "la phrase doit donner le contournement — obtenu : {message}"
+        );
+        assert!(
+            etat.erreur_systeme.is_some(),
+            "l'erreur brute du systeme (os error 98 / 10048) doit rester lisible"
+        );
+
+        // 3. Et l'annonce part sur le bus, pour un client deja connecte.
+        let ev = rx
+            .try_recv()
+            .expect("aucun evenement annonce sur le bus apres un bind refuse");
+        assert_eq!(ev.event_type, "slimproto.listen_failed");
+        assert_eq!(ev.data["cause"], "port_tenu_par_un_autre_serveur");
+        assert_eq!(ev.data["port"], port);
+
+        drop(squatteur);
+    }
+
+    /// Temoin vert : un bind qui REUSSIT ne change rien. Aucune cause, aucun
+    /// message, aucun evenement — et le port accepte vraiment une connexion.
+    #[tokio::test]
+    async fn un_bind_qui_reussit_n_annonce_aucun_echec() {
+        let _verrou = verrou_etat().lock().await;
+
+        let sonde = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = sonde.local_addr().unwrap().port();
+        drop(sonde);
+
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let mut rx = bus.subscribe();
+        let serveur = Arc::new(SlimProtoServer::new_sur_port(port).avec_bus(Arc::clone(&bus)));
+        let tache = tokio::spawn(Arc::clone(&serveur).spawn());
+
+        let etat = attendre_etat(|e| e.port == port && e.ecoute)
+            .await
+            .expect("le bind devait reussir sur un port libre");
+        assert!(etat.cause.is_none(), "aucune cause sur un bind qui reussit");
+        assert!(
+            etat.message.is_none(),
+            "aucun message sur un bind qui reussit"
+        );
+        assert!(etat.erreur_systeme.is_none());
+
+        // Le port accepte reellement : l'etat ne ment pas.
+        TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("le serveur annonce ecouter mais refuse la connexion");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "un bind qui reussit ne doit annoncer AUCUNE erreur"
+        );
+
+        tache.abort();
+    }
+
+    /// Temoin vert : le sous-systeme n'est pas empoisonne par un premier echec.
+    /// Une seconde tentative, le port une fois libere, ecoute — et l'etat
+    /// retenu repasse au vert.
+    #[tokio::test]
+    async fn une_seconde_tentative_apres_liberation_du_port_reussit() {
+        let _verrou = verrou_etat().lock().await;
+
+        let squatteur = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = squatteur.local_addr().unwrap().port();
+
+        let serveur = Arc::new(SlimProtoServer::new_sur_port(port));
+        // Premiere tentative : refusee, et `spawn()` REND une erreur — il ne
+        // panique pas et n'arrete pas le processus. C'est ce qui garde le
+        // serveur HTTP debout quand SlimProto tombe (`background.rs` detache
+        // cette tache et se contente de journaliser).
+        assert!(Arc::clone(&serveur).spawn().await.is_err());
+        assert!(!etat_ecoute().unwrap().ecoute);
+
+        drop(squatteur);
+
+        let tache = tokio::spawn(Arc::clone(&serveur).spawn());
+        let etat = attendre_etat(|e| e.port == port && e.ecoute)
+            .await
+            .expect("la seconde tentative devait reussir une fois le port libere");
+        assert!(
+            etat.cause.is_none(),
+            "l'etat doit oublier la cause du premier echec quand l'ecoute reprend"
+        );
+        tache.abort();
+    }
+
+    /// La sonde, seule, sur les deux faits qu'elle doit separer : un port tenu
+    /// par un socket bien reel, et un port que personne ne tient.
+    #[tokio::test]
+    async fn la_sonde_separe_un_port_tenu_d_un_port_libre() {
+        let boucle = vec!["127.0.0.1".to_string()];
+
+        let occupe = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port_occupe = occupe.local_addr().unwrap().port();
+        assert_eq!(
+            sonder_qui_tient_le_port(port_occupe, &boucle).await,
+            CausePortIndisponible::UnAutreServeurEcoute
+        );
+        drop(occupe);
+
+        let libre = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port_libre = libre.local_addr().unwrap().port();
+        drop(libre);
+        assert_eq!(
+            sonder_qui_tient_le_port(port_libre, &boucle).await,
+            CausePortIndisponible::PersonneNEcoute
+        );
+    }
+
+    /// Le suspect « SO_REUSEADDR manquant » du ticket, tranche par la mesure et
+    /// non par elimination.
+    ///
+    /// Ce n'est PAS une garde du correctif : c'est la caracterisation de la
+    /// plateforme. `std`/`tokio` posent deja SO_REUSEADDR sur un listener sous
+    /// Unix — un TIME_WAIT ne peut donc pas expliquer les `os error 98` des
+    /// journaux Linux. (Sous Windows, `std` ne le pose deliberement PAS : l'y
+    /// poser laisserait un tiers detourner une ecoute vivante.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn le_bind_pose_deja_so_reuseaddr_sous_unix() {
+        use std::os::fd::AsRawFd;
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut valeur: libc::c_int = 0;
+        let mut taille = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let code = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &raw mut valeur as *mut libc::c_void,
+                &mut taille,
+            )
+        };
+        assert_eq!(code, 0, "getsockopt a echoue");
+        assert_ne!(
+            valeur, 0,
+            "SO_REUSEADDR n'est PAS pose : le suspect « TIME_WAIT apres un \
+             redemarrage rapide » redeviendrait plausible sous Linux"
+        );
     }
 }
