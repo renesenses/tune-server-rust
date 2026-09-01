@@ -467,7 +467,7 @@ pub fn build_album_query(
                         // l'utilisateur, une collection `instrument: Grand
                         // Piano` ne trouverait plus rien alors que les lignes
                         // existent. Deux normalisations, deux résultats.
-                        let canon = crate::routes::library::credits_mb::canoniser_instrument(instr);
+                        let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
                         let motif = if canon.is_empty() { instr } else { &canon };
                         sub_conds.push(format!(
                             "LOWER(tc.instrument) LIKE LOWER('%{}%')",

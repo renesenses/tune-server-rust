@@ -1,6 +1,7 @@
 //! Shared HTTP contracts used by the server and its route crates.
 
 pub mod error;
+pub mod panne_sql;
 
 pub use error::AppError;
 

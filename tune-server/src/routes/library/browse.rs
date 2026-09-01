@@ -1,10 +1,10 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
+use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;

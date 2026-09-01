@@ -7,6 +7,7 @@ pub mod credit_enricher;
 pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
+pub mod instruments;
 pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;

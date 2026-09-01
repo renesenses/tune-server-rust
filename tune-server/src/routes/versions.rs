@@ -13,8 +13,8 @@
 //! (`predicat_rapprochement`), et la recherche streaming avec son cache
 //! (`versions_streaming`). Les deux routes ne gardent que leur vivier.
 
-use crate::routes::panne_sql::OuDefautJournalise;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};

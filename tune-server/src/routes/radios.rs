@@ -1,5 +1,5 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use std::sync::Arc;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
