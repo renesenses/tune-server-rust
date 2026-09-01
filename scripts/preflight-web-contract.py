@@ -54,8 +54,29 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Répertoires de sources serveur où une route peut être déclarée : le serveur
-# lui-même, le cœur, et les greffons in-tree (bandcamp, dj, karaoke…).
-SOURCES_SERVEUR = ["tune-server/src", "tune-core/src", "plugins"]
+# lui-même, le cœur, les greffons in-tree (bandcamp, dj, karaoke…), et les
+# caisses HTTP extraites de `tune-server`.
+#
+# ⚠️ Cette liste a DÉJÀ été prise en défaut. Le 01/09/2026, la v0.9.130 a été
+# refusée sur deux routes `/smart-ai/*` parfaitement servies : #2541 venait de
+# sortir `smart_ai.rs` de `tune-server/src/routes/` vers `tune-smart-http`, et
+# le scanner cherchait encore à l'ancien endroit. Soixante-dix déclarations de
+# route lui étaient devenues invisibles, réparties sur quatre caisses.
+#
+# Un contrôle qui crie au loup sur du code juste est pire qu'absent : il
+# apprend à passer outre. D'où la garde `caisses_a_routes_non_scannees()`
+# ci-dessous, qui refuse de tourner si une caisse déclare des routes sans
+# figurer ici. Le prochain déplacement de module sera signalé PAR le script,
+# nommément, au lieu d'être découvert un jour de release.
+SOURCES_SERVEUR = [
+    "tune-server/src",
+    "tune-core/src",
+    "tune-smart-http/src",
+    "tune-stream-http/src",
+    "tune-streaming-http/src",
+    "tune-bridge/src",
+    "plugins",
+]
 
 # Routes déjà cassées AVANT ce contrôle, documentées dans #1893.
 #
@@ -340,6 +361,40 @@ def lire_sources_serveur() -> str:
     return "\n".join(morceaux)
 
 
+def caisses_a_routes_non_scannees() -> list[tuple[str, int]]:
+    """Les caisses de l'espace de travail qui déclarent des routes SANS être scannées.
+
+    La garde qui manquait le 01/09/2026. `SOURCES_SERVEUR` est une liste tenue
+    à la main : le jour où un module déménage vers une caisse qui n'y figure
+    pas, ses routes deviennent invisibles et le préflight refuse une release
+    parfaitement saine — en accusant le client web, qui n'y est pour rien.
+
+    Plutôt que de faire confiance à la liste, on la CONFRONTE à l'arbre : toute
+    caisse `tune-*/src` qui contient `.route(` doit être scannée. Le contrôle
+    ne coûte qu'une lecture des sources déjà sur disque.
+
+    Rend la liste des caisses fautives avec leur nombre de déclarations, vide
+    si tout est couvert.
+    """
+    couvertes = {r.split("/", 1)[0] for r in SOURCES_SERVEUR}
+    fautives: list[tuple[str, int]] = []
+    for caisse in sorted(REPO_ROOT.glob("tune-*")):
+        if not caisse.is_dir() or caisse.name in couvertes:
+            continue
+        src = caisse / "src"
+        if not src.is_dir():
+            continue
+        compte = 0
+        for f in src.rglob("*.rs"):
+            try:
+                compte += f.read_text(encoding="utf-8", errors="ignore").count(".route(")
+            except OSError:
+                pass
+        if compte:
+            fautives.append((caisse.name, compte))
+    return fautives
+
+
 def self_test() -> int:
     """Vérifie que le contrôle attrape ce qu'il doit, et se tait sinon."""
     echecs = []
@@ -512,6 +567,19 @@ def main() -> int:
     racine_web = Path(args.web).resolve()
     if not (racine_web / "src").is_dir():
         print(f"pas de src/ dans {racine_web} — chemin du client web incorrect", file=sys.stderr)
+        return 2
+
+    # AVANT de juger le client web, vérifier qu'on sait lire le serveur. Un
+    # scanner aveugle à une caisse accuse l'écran d'appeler une route absente
+    # alors qu'elle est servie — c'est ce qui a refusé la v0.9.130 (#2541 avait
+    # déplacé `smart_ai.rs` vers `tune-smart-http`).
+    if fautives := caisses_a_routes_non_scannees():
+        print("le scanner est aveugle à des routes RÉELLEMENT servies :", file=sys.stderr)
+        for caisse, compte in fautives:
+            print(f"    {caisse} déclare {compte} route(s), absente de SOURCES_SERVEUR",
+                  file=sys.stderr)
+        print("Ajouter ces caisses à SOURCES_SERVEUR avant de conclure quoi que ce "
+              "soit sur le client web.", file=sys.stderr)
         return 2
 
     routes = routes_appelees_par_le_web(lire_sources_web(racine_web))
