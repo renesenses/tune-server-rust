@@ -1855,6 +1855,30 @@
     "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
     "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
   },
+  "cloud.tropDeRequetes": {
+    "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
+    "en": "The Tune online service has received too many requests from this server and is refusing further ones for now. Try again a little later.",
+    "de": "Der Tune-Onlinedienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuche es etwas später erneut.",
+    "es": "El servicio en línea de Tune ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Inténtalo un poco más tarde.",
+    "it": "Il servizio online di Tune ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova un po' più tardi.",
+    "zh": "Tune 在线服务收到本服务器发来的请求过多，暂时拒绝后续请求。请稍后再试。",
+    "ja": "Tune のオンラインサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。少し時間をおいて再試行してください。",
+    "ko": "Tune 온라인 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. 잠시 후 다시 시도하세요.",
+    "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou puțin mai târziu.",
+    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare."
+  },
+  "cloud.tropDeRequetesDelai": {
+    "fr": "Le service en ligne Tune a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
+    "en": "The Tune online service has received too many requests from this server and is refusing further ones for now. Try again in {minutes} min.",
+    "de": "Der Tune-Onlinedienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuche es in {minutes} Min. erneut.",
+    "es": "El servicio en línea de Tune ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Inténtalo de nuevo en {minutes} min.",
+    "it": "Il servizio online di Tune ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova tra {minutes} min.",
+    "zh": "Tune 在线服务收到本服务器发来的请求过多，暂时拒绝后续请求。请在 {minutes} 分钟后重试。",
+    "ja": "Tune のオンラインサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。{minutes} 分後に再試行してください。",
+    "ko": "Tune 온라인 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
+    "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou peste {minutes} min.",
+    "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+  },
   "metadata.enrich.cleLastfmAbsente": {
     "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
     "en": "Biography enrichment requires a Last.fm API key. Set the “lastfm_api_key” setting to enable it.",

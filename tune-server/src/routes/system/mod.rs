@@ -265,9 +265,15 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /system/concerts — upcoming concerts for artists in the local library.
+///
+/// Sur un refus du nuage, le statut d'amont n'est plus écrasé par un 200 :
+/// une limite atteinte repart en 429 avec son motif et son délai
+/// (`routes::cloud_error`, #2178). L'enveloppe `concerts: []` est conservée,
+/// pour l'écran qui rend la liste avant de regarder l'erreur.
 async fn concerts_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -277,15 +283,25 @@ async fn concerts_handler(
     match tune_core::cloud::concert_alerts::get_upcoming_concerts(&state.http_client, &instance_id)
         .await
     {
-        Ok(concerts) => axum::Json(serde_json::json!({"concerts": concerts})),
-        Err(e) => axum::Json(serde_json::json!({"concerts": [], "error": e})),
+        Ok(concerts) => {
+            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                "concerts": concerts
+            })))
+        }
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "concerts": [] }),
+        ),
     }
 }
 
 /// GET /system/new-releases — new album releases from library artists (digest).
 async fn new_releases_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -293,15 +309,25 @@ async fn new_releases_handler(
         .unwrap_or_default();
 
     match tune_core::cloud::digest::get_new_releases(&state.http_client, &instance_id).await {
-        Ok(releases) => axum::Json(serde_json::json!({"releases": releases})),
-        Err(e) => axum::Json(serde_json::json!({"releases": [], "error": e})),
+        Ok(releases) => {
+            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                "releases": releases
+            })))
+        }
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "releases": [] }),
+        ),
     }
 }
 
 /// GET /system/recommendations — get cached recommendations from cloud.
 async fn recommendations_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -311,8 +337,15 @@ async fn recommendations_handler(
     match tune_core::cloud::recommendations::get_recommendations(&state.http_client, &instance_id)
         .await
     {
-        Ok(recs) => axum::Json(serde_json::json!({"recommendations": recs})),
-        Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+        Ok(recs) => axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+            "recommendations": recs
+        }))),
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "recommendations": [] }),
+        ),
     }
 }
 

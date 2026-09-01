@@ -8,6 +8,7 @@ pub mod artist_releases;
 pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
+pub mod cloud_error;
 pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
