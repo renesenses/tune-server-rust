@@ -3051,6 +3051,44 @@ fn record_exclusive_open_failure(
     }
 }
 
+/// Le périphérique s'est OUVERT puis a cessé de tirer l'audio : dire lequel,
+/// et où la lecture s'est arrêtée.
+///
+/// Distinct de [`record_exclusive_open_failure`] parce que la cause l'est :
+/// là-bas rien n'a jamais été envoyé, ici le rappel de rendu a accepté
+/// l'ouverture puis s'est tu. Vu de l'utilisateur les deux se ressemblent —
+/// « ça ne joue pas » — mais le geste diffère (rebrancher/rallumer contre
+/// choisir une autre sortie), et c'est ce que dit le message.
+///
+/// `frozen_position_ms` n'est pas décoratif : c'est la position à laquelle
+/// l'écran est resté figé, donc le seul chiffre qui relie ce que le testeur
+/// voit à ce que le journal dit. Sur un anneau exclusif dimensionné à deux
+/// secondes d'audio, il vaut 2000 — le « figée à 2 s » du constat.
+///
+/// Passe par `failure_slot`, c'est-à-dire par `take_output_failure()` : le
+/// canal que le poller draine déjà à chaque tick pour émettre
+/// `zone.playback_error` avec `fatal: true`. Aucun second canal n'est ouvert.
+fn record_feed_stall_failure(
+    backend: &str,
+    device: &str,
+    frozen_position_ms: u64,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        frozen_position_ms,
+        stall_timeout_secs = FEED_STALL_TIMEOUT.as_secs(),
+        "output_feed_stall_consumer_dead"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "Sortie « {device} » : le périphérique a accepté l'ouverture {backend} puis a cessé de recevoir l'audio ; la lecture est restée figée à {frozen_position_ms} ms. {}",
+            OpenFailure::DeviceGone.user_message()
+        ));
+    }
+}
+
 /// Last preparation step before the f32 ring used by Windows exclusive
 /// backends.
 ///
@@ -4461,11 +4499,8 @@ impl OutputTarget for LocalOutput {
                 // ring stays full and this loop used to spin until restart.
                 // Deadline = queued audio duration + 5s margin, mirroring the
                 // asio_drain_timeout guard of the exclusive path.
-                let drain_deadline = std::time::Duration::from_millis(
-                    (ring.available() as u64 * 1000)
-                        / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                        + 5000,
-                );
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
                 let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -4607,6 +4642,13 @@ impl OutputTarget for LocalOutput {
                 };
 
                 // Process leftover from header read
+                // #3108 — le verdict de blocage était JETÉ aux trois sites de
+                // ce chemin, seul de tous les chemins de lecture. Conséquence
+                // exacte du constat : l'anneau exclusif tient deux secondes
+                // d'audio (`ring_cap` ci-dessus), il se remplit une fois, le
+                // rappel de rendu ne tire rien, et la position reste sur 2 000
+                // ms pour toujours — sans un mot.
+                let mut feed_stalled = false;
                 if let Some(processed) = pcm_processor.process_pcm_chunk(
                     &mut leftover,
                     frame_bytes,
@@ -4614,18 +4656,20 @@ impl OutputTarget for LocalOutput {
                     channels,
                     &mut pcm_kind,
                 ) {
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                    }
                     total_frames_fed += processed.source_frames;
                 }
 
                 let mut http_eof_excl = false;
-                loop {
+                while !feed_stalled {
                     if stop_rx.try_recv().is_ok() {
                         break;
                     }
@@ -4671,19 +4715,35 @@ impl OutputTarget for LocalOutput {
                         continue;
                     };
 
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                        break;
+                    }
 
                     total_frames_fed += processed.source_frames;
 
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                if feed_stalled {
+                    // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
+                    // aucune fin naturelle n'est signalée et la file n'avance
+                    // pas vers un morceau qui heurterait le même périphérique
+                    // mort. Le seul mot dit à l'utilisateur part d'ici.
+                    record_feed_stall_failure(
+                        "CoreAudio",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
+                    );
                 }
 
                 if http_eof_excl {
@@ -4702,7 +4762,7 @@ impl OutputTarget for LocalOutput {
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
-                if !queue.is_empty() {
+                if !queue.is_empty() && !feed_stalled {
                     feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
                 }
@@ -4716,7 +4776,15 @@ impl OutputTarget for LocalOutput {
                     TRACK_END_NOTIFY.notify_one();
                 }
 
-                // Wait for ring buffer to drain
+                // Wait for ring buffer to drain — JAMAIS sans fin (#3108).
+                // Les chemins ASIO, WASAPI et partagé bornaient déjà leur
+                // vidage ; celui-ci, seul, tournait tant que l'anneau n'était
+                // pas vide. Face à un rappel de rendu mort il ne se vide
+                // jamais : le fil restait vivant, la zone « en lecture », et le
+                // réexamen des branchements gelé avec elle.
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), sample_rate as u64, channels as u64);
+                let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -4725,6 +4793,14 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        break;
+                    }
+                    if drain_started.elapsed() >= drain_deadline {
+                        warn!(
+                            device = %device_name,
+                            remaining_samples = ring.available(),
+                            "local_audio_exclusive_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -6435,6 +6511,16 @@ impl OutputTarget for LocalOutput {
                         total_bytes_read,
                         "local_audio_stopped_feed_stall"
                     );
+                    // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
+                    // `device_gone` ne comble pas le trou : sur macOS le rappel
+                    // d'erreur cpal ne se déclenche jamais à l'arrachage, donc
+                    // le seul témoin est le blocage qu'on vient de constater.
+                    record_feed_stall_failure(
+                        "CPAL",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
+                    );
                     break;
                 }
 
@@ -6892,6 +6978,15 @@ impl OutputTarget for LocalOutput {
                                     total_bytes_read,
                                     "local_audio_gapless_stopped_feed_stall"
                                 );
+                                // Même canal que la boucle principale (#3108) :
+                                // une piste enchaînée qui meurt en silence est
+                                // aussi muette qu'une première piste.
+                                record_feed_stall_failure(
+                                    "CPAL",
+                                    &device_name,
+                                    position_ms.load(Ordering::Relaxed),
+                                    &open_failure,
+                                );
                                 http_eof = false;
                                 break;
                             }
@@ -7038,11 +7133,8 @@ impl OutputTarget for LocalOutput {
             // the zone "Playing" and freezing the hotplug rescan. Deadline =
             // queued audio duration + 5s margin (same guard as the ASIO
             // exclusive path's asio_drain_timeout).
-            let drain_deadline = std::time::Duration::from_millis(
-                (ring.available() as u64 * 1000)
-                    / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                    + 5000,
-            );
+            let drain_deadline =
+                drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
             let drain_started = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -7095,10 +7187,15 @@ impl OutputTarget for LocalOutput {
             // the zone shows a clear message instead of silently stopping.
             if device_gone.load(Ordering::Relaxed) {
                 if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "Sortie « {device_name} » : {}.",
-                        OpenFailure::DeviceGone.user_message()
-                    ));
+                    // Ne pas écraser un constat déjà posé : le blocage de
+                    // l'anneau (#3108) dit la même panne AVEC la position où
+                    // l'écran s'est figé, et il est arrivé le premier.
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "Sortie « {device_name} » : {}.",
+                            OpenFailure::DeviceGone.user_message()
+                        ));
+                    }
                 }
             }
 
@@ -7416,6 +7513,12 @@ fn make_stream_error_cb(
     }
 }
 
+/// Seuil du détecteur de blocage : au-delà, le consommateur de l'anneau est
+/// tenu pour mort. Très au-dessus de toute contre-pression normale (le rappel
+/// de rendu vide un anneau plein en quelques périodes de tampon), donc jamais
+/// atteint par une lecture saine.
+const FEED_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
 /// Checks the stop signal, abort flag, and pause state periodically.
 /// Returns immediately when abort is signaled or stop is received.
@@ -7430,6 +7533,30 @@ fn feed_ring_abortable(
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
     abort: Option<&AtomicBool>,
+) -> bool {
+    feed_ring_abortable_with_stall_timeout(
+        ring,
+        samples,
+        stop_rx,
+        paused,
+        abort,
+        FEED_STALL_TIMEOUT,
+    )
+}
+
+/// Le corps réel de [`feed_ring_abortable`], avec son seuil de blocage en
+/// paramètre.
+///
+/// Le seuil est injecté pour UNE raison : le vérifier sans dormir cinq
+/// secondes. Un test qui passe `Duration::ZERO` traverse exactement le même
+/// code que la production — c'est la boucle de production, pas une réplique.
+fn feed_ring_abortable_with_stall_timeout(
+    ring: &RingBuf,
+    samples: &[f32],
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    abort: Option<&AtomicBool>,
+    stall_timeout: std::time::Duration,
 ) -> bool {
     let mut offset = 0;
     // Wedge detector: if the render callback stops consuming, the ring stays
@@ -7462,7 +7589,7 @@ fn feed_ring_abortable(
         let written = ring.push(&samples[offset..]);
         offset += written;
         if written == 0 {
-            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+            if last_progress_at.elapsed() >= stall_timeout {
                 warn!(
                     remaining_samples = samples.len() - offset,
                     "asio_feed_ring_stall_timeout"
@@ -7476,6 +7603,23 @@ fn feed_ring_abortable(
         }
     }
     true
+}
+
+/// Combien de temps accorder au vidage d'un anneau qui contient encore
+/// `queued_samples` échantillons entrelacés.
+///
+/// Durée de l'audio en attente + 5 s de marge. Extrait des deux chemins
+/// partagés qui la calculaient déjà en ligne (#1626) pour que le chemin
+/// CoreAudio exclusif — le seul qui n'en avait AUCUNE — s'y raccroche sans
+/// recopier l'arithmétique.
+fn drain_deadline_for(
+    queued_samples: usize,
+    sample_rate: u64,
+    channels: u64,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        (queued_samples as u64 * 1000) / (sample_rate.max(1) * channels.max(1)) + 5000,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -10916,6 +11060,145 @@ mod open_failure_tests {
         assert!(h.contains("audio"), "got: {h}");
         let m = OpenFailure::ServerUnreachable.user_message();
         assert!(m.contains("audio"), "got: {m}");
+    }
+}
+
+/// #3108 — « la zone reste figée à 2 s, sans message ».
+///
+/// Le refus d'OUVERTURE avait déjà son canal (`record_exclusive_open_failure`).
+/// Ce qui n'en avait aucun, c'est la panne d'APRÈS l'ouverture : le
+/// périphérique accepte, puis son rappel de rendu se tait. L'anneau se remplit
+/// une fois — deux secondes d'audio, par construction — et plus rien ne bouge.
+///
+/// Les trois fonctions éprouvées ici sont celles de la production, compilées
+/// sur toutes les cibles. Aucune ne dort : le seuil de blocage est injecté.
+#[cfg(test)]
+mod feed_stall_tests {
+    use super::{
+        FEED_STALL_TIMEOUT, OpenFailure, RingBuf, drain_deadline_for,
+        feed_ring_abortable_with_stall_timeout, record_feed_stall_failure,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// La boucle de production, avec son seuil ramené à zéro : un anneau plein
+    /// que personne ne vide rend le verdict « consommateur mort » — tout de
+    /// suite, sans dormir cinq secondes.
+    #[test]
+    fn un_anneau_que_personne_ne_vide_rend_le_verdict_de_blocage() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // plein, et personne ne tirera jamais
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let debut = std::time::Instant::now();
+        assert!(
+            !feed_ring_abortable_with_stall_timeout(
+                &ring,
+                &[0.5f32; 8],
+                &rx,
+                &paused,
+                None,
+                std::time::Duration::ZERO,
+            ),
+            "un anneau plein et jamais vidé doit être déclaré bloqué"
+        );
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(1),
+            "le seuil injecté doit rendre le verdict sans attendre"
+        );
+    }
+
+    /// TÉMOIN VERT : le même appel, sur un anneau qui a de la place, ne
+    /// déclare rien. Le détecteur ne doit pas devenir un couperet.
+    #[test]
+    fn un_anneau_qui_accepte_tout_ne_declare_aucun_blocage() {
+        let ring = RingBuf::new(16);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        assert!(feed_ring_abortable_with_stall_timeout(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            None,
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(ring.available(), 8);
+    }
+
+    /// Le seuil réel n'est pas nul : un test qui l'injecterait à zéro partout
+    /// masquerait une production devenue instantanément couperet.
+    #[test]
+    fn le_seuil_de_production_laisse_le_temps_a_la_contre_pression() {
+        assert_eq!(FEED_STALL_TIMEOUT, std::time::Duration::from_secs(5));
+    }
+
+    /// Le message doit nommer la sortie, la position où l'écran s'est figé, et
+    /// le geste à faire. « Une erreur est survenue » ne répare rien.
+    #[test]
+    fn le_blocage_dit_la_sortie_la_position_et_le_geste() {
+        let slot = std::sync::Mutex::new(None);
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &slot);
+        let message = slot.lock().unwrap().clone().expect("le canal doit porter");
+        assert!(message.contains("DAC USB"), "sortie absente : {message}");
+        assert!(
+            message.contains("CoreAudio"),
+            "transport absent : {message}"
+        );
+        assert!(
+            message.contains("2000 ms"),
+            "la position figée est le chiffre qui relie l'écran au journal : {message}"
+        );
+        assert!(
+            message.contains(OpenFailure::DeviceGone.user_message()),
+            "le geste à faire est absent : {message}"
+        );
+    }
+
+    /// Le canal est celui du poller : `take_output_failure()` le draine, une
+    /// fois, et le tick suivant ne re-stoppe pas la zone.
+    #[test]
+    fn le_blocage_passe_par_le_canal_que_le_poller_draine() {
+        use super::super::traits::OutputTarget;
+        let sortie = super::LocalOutput::new("DAC USB".into());
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "TÉMOIN VERT : une sortie saine ne remonte rien"
+        );
+
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &sortie.open_failure);
+        let remonte = sortie
+            .take_output_failure()
+            .expect("le blocage doit remonter par le canal du poller");
+        assert!(remonte.contains("2000 ms"), "got: {remonte}");
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+    }
+
+    /// Le vidage borné : durée de l'audio en attente + 5 s de marge.
+    #[test]
+    fn le_delai_de_vidage_couvre_l_audio_en_attente_plus_la_marge() {
+        // Deux secondes de stéréo à 44,1 kHz = 176 400 échantillons entrelacés.
+        assert_eq!(
+            drain_deadline_for(44_100 * 2 * 2, 44_100, 2),
+            std::time::Duration::from_millis(7000)
+        );
+        // Anneau vide : la marge seule.
+        assert_eq!(
+            drain_deadline_for(0, 44_100, 2),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    /// Une cadence ou un nombre de canaux nuls ne doivent pas diviser par zéro
+    /// — ce serait tuer le fil de lecture au lieu de borner son vidage.
+    #[test]
+    fn une_cadence_nulle_ne_divise_pas_par_zero() {
+        assert_eq!(
+            drain_deadline_for(0, 0, 0),
+            std::time::Duration::from_millis(5000)
+        );
     }
 }
 
