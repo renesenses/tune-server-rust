@@ -46,6 +46,9 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
+# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
+# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+concerts = ["dep:tune-concerts"]
 
 [dependencies]
 libc = "0.2"
@@ -58,6 +61,7 @@ tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = tr
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
