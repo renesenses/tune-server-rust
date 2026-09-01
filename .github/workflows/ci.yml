@@ -130,6 +130,14 @@ jobs:
           python3 scripts/measure-compile.py --self-test
           python3 scripts/verser-message-forum.py --self-test
 
+      # Contre-epreuve du critere de selection des rondes de tri (#2910),
+      # rejouee hors ligne sur la fenetre reelle du 28 au 30/08/2026 : le
+      # critere retire rate les reponses 5922, 5949 et 5958, le critere par
+      # message les selectionne, et le fil temoin 1588 reste hors lot des
+      # deux cotes. Aucun reseau, aucune ecriture sur le forum.
+      - name: Contre-épreuve de la ronde de tri
+        run: python3 scripts/nouveautes-forum.py --self-test
+
       - name: Syntaxe des scripts de garde-fou
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
