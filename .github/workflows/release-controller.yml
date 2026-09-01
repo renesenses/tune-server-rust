@@ -173,6 +173,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # `relire_tag_avec_reprise` : la relecture d'apres-creation, avec
+          # quelques tentatives. Le fichier porte le detail de la panne et ses
+          # contre-epreuves (`--autotest`).
+          source scripts/relire-tag-avec-reprise.sh
+
           # Trois issues distinctes, jamais confondues :
           #   0  le tag existe, son SHA est ecrit sur la sortie standard
           #   1  le tag n'existe pas, et on a la preuve que le depot est lisible
@@ -224,9 +229,21 @@ jobs:
             gh api --method POST "repos/$repo/git/refs" \
               -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
             # La relecture doit rendre 0 : apres un POST reussi, « absent »
-            # (1) comme « illisible » (2) sont tous deux des echecs.
-            relu="$(cible_tag "$repo" "$tag")" && etat=0 || etat=$?
-            if [ "$etat" -ne 0 ] || [ "$relu" != "$sha" ]; then
+            # (1) comme « illisible » (2) restent des ECHECS DURS.
+            #
+            # Mais elle ne les constate plus du PREMIER coup. Run 33522674458,
+            # v0.9.130 : le tag venait d'etre cree sur `tune-web-client`, la
+            # relecture immediate a rendu « neant », et le controleur s'est
+            # arrete avant `universal`, `os` et `server`. Le tag existait — relu
+            # trente secondes plus tard, sur le bon SHA. L'API GitHub n'est pas
+            # coherente en lecture-apres-ecriture a cette echelle de temps.
+            #
+            # `relire_tag_avec_reprise` distingue donc « absent » de « pas
+            # encore visible » : cinq lectures espacees d'une seconde, quatre
+            # secondes d'attente au pire. Elle N'AFFAIBLIT PAS la garde — un
+            # tag DIVERGENT rend 3 des la premiere lecture, sans reprise.
+            relu="$(relire_tag_avec_reprise "$sha" cible_tag "$repo" "$tag")" && etat=0 || etat=$?
+            if [ "$etat" -ne 0 ]; then
               echo "::error::$repo:$tag n'est pas verifiable apres creation (etat=$etat, relu=${relu:-neant})"
               exit 1
             fi
