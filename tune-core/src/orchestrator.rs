@@ -2575,43 +2575,36 @@ impl PlaybackOrchestrator {
                 "playback_timing"
             );
 
-            // After play_media succeeds, send the zone's stored volume to the
-            // renderer — but ONLY if the user has explicitly set a volume
-            // (not the default 50). This prevents blasting speakers at an
-            // unexpected level after a server restart.
-            if result.0 {
-                let zone_db = ZoneRepo::with_backend(self.db.clone())
-                    .get(req.zone_id)
-                    .ok()
-                    .flatten();
-                let is_fixed = zone_db.as_ref().is_some_and(|z| z.fixed_volume);
-                // Only (re)assert the volume on play for fixed-volume (bit-perfect)
-                // zones, which must sit at 100%. For a normal zone, leave the
-                // device's current volume untouched: Tune previously pushed the
-                // stored zone volume on EVERY play, overriding a level the user
-                // had set directly on the device — the stored value drifts from
-                // the device (no external-change sync) so a low device jumped to
-                // the stored 50% on play (Fabien, "Salon"). Trade-off: this drops
-                // the old "re-apply saved volume after a restart to avoid a blast"
-                // behaviour for normal zones; the device keeps whatever level it
-                // is physically at.
-                if is_fixed {
-                    let did = device_id.clone();
-                    let outputs = self.outputs.clone();
-                    let zone_id = req.zone_id;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let arc = { outputs.lock().await.get(&did) };
-                        if let Some(output) = arc {
-                            if let Err(e) = output.lock().await.checked_set_volume(1.0).await {
-                                warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
-                            } else {
-                                info!(zone_id, volume = 1.0, "play_initial_volume_sent");
-                            }
-                        }
-                    });
-                }
-            }
+            // #2395 — AUCUNE commande de volume n'est envoyée ici, pour aucune
+            // zone.
+            //
+            // Deux comportements sont morts à cet endroit, et pour deux
+            // raisons distinctes :
+            //
+            // 1. Zone ordinaire : Tune poussait le volume stocké à CHAQUE
+            //    lecture, écrasant le niveau réglé directement sur l'appareil
+            //    — la valeur stockée dérive (rien ne resynchronise depuis le
+            //    device), et un appareil laissé bas remontait aux 50 % stockés
+            //    (Fabien, « Salon »). Retiré avant #2395 ; la zone garde le
+            //    niveau où elle est physiquement.
+            //
+            // 2. Zone `fixed_volume` : le plein volume était RÉASSERTÉ 500 ms
+            //    après chaque piste (`play_initial_volume_sent`). C'est la
+            //    part du mode que l'utilisateur n'a jamais consentie : il a
+            //    accepté UN saut à l'armement, pas une commande à 100 %
+            //    renvoyée à chaque morceau. Sur un renderer qui porte son
+            //    propre ampli — Denon RC12, Marco Polo, fil 1546 — chacune de
+            //    ces commandes est une puissance acoustique réelle.
+            //
+            // Le mode bit-perfect reste entier : le 100 % est commandé UNE
+            // fois, à l'armement, derrière la confirmation explicite
+            // (`fixed_volume_confirmation_required`, routes/zones.rs), et il
+            // est rendu au désarmement (`audio::fixed_volume`).
+            //
+            // Contrepartie assumée : une commande extérieure qui rebaisse le
+            // renderer EN COURS de session casse le bit-perfect sans que rien
+            // ne le dise. C'est le prix du choix — un saut annoncé et
+            // réversible — et non un défaut à rattraper par une réassertion.
 
             result
         } else {
@@ -9722,6 +9715,53 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Arme le volume fixe : commande le plein volume au périphérique, **une
+    /// seule fois** (#2395).
+    ///
+    /// C'est le seul chemin autorisé à commander une zone `fixed_volume` :
+    /// [`Self::set_volume`] sort au plus tôt pour ces zones et ne parle jamais
+    /// au device. L'appelant est la route qui écrit `fixed_volume` (PATCH
+    /// `/zones/{id}`), APRÈS que la confirmation explicite a été obtenue —
+    /// jamais la lecture, qui ne commande plus rien.
+    ///
+    /// Le trim de gain par renderer n'est délibérément pas composé ici : le
+    /// mode promet du bit-perfect, et `1.0` doit rester `1.0`.
+    ///
+    /// L'ordre suit celui de `set_volume` : le device d'abord, la base et
+    /// l'état interne seulement s'il a accepté. Une zone sans sortie
+    /// enregistrée n'est pas une erreur — le 100 % est alors seulement
+    /// persisté, et la sortie le recevra à son enregistrement.
+    pub async fn arm_fixed_volume(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
+        if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) };
+            match output {
+                Some(output) => {
+                    info!(zone_id, device_id = did, "fixed_volume_arm_sending");
+                    if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
+                        warn!(zone_id, error = %error, "fixed_volume_arm_failed");
+                        return Err(error);
+                    }
+                }
+                // Sortie déclarée mais pas encore enregistrée : rien à
+                // commander, et surtout rien à refuser — la zone reste armée.
+                None => info!(zone_id, device_id = did, "fixed_volume_arm_no_output"),
+            }
+        } else {
+            info!(zone_id, "fixed_volume_arm_no_device_id");
+        }
+
+        self.playback.set_volume(zone_id, 1.0).await;
+        self.playback.mark_volume_changed(zone_id).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(zone_id, 100.0)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        Ok(())
+    }
+
     pub async fn set_mute(
         &self,
         zone_id: i64,
@@ -13804,6 +13844,230 @@ mod tests {
             .await;
 
         (orch, zone_id, dir)
+    }
+
+    // ------------------------------------------------------------------
+    // #2395 — le volume que l'APPAREIL reçoit pendant la lecture.
+    // ------------------------------------------------------------------
+
+    /// Zone réseau garnie de trois pistes, prête à enchaîner (#2395).
+    ///
+    /// Trois pistes DISTINCTES, et non trois fois la même : les deux gardes
+    /// anti-doublon de `play` (retap dans `RETAP_DEDUP_WINDOW`, puis
+    /// `last_net_play` dans `DUPLICATE_NET_PLAY_WINDOW`) coalescent une
+    /// relecture du même `track_id`. Trois lectures du même morceau ne
+    /// mesureraient donc qu'un seul passage par `send_to_output` : le test
+    /// serait vert sans rien prouver.
+    ///
+    /// Trois FICHIERS distincts, et pas trois lignes vers le même : la colonne
+    /// `tracks.file_path` porte une contrainte d'unicité. Ce sont de vraies
+    /// copies du FLAC du dépôt — le chemin réseau lit leur taille sur le
+    /// disque, un chemin fantôme échouerait en `file_not_found`.
+    ///
+    /// Le répertoire est rendu à l'appelant et doit vivre aussi longtemps que
+    /// le test : il se nettoie tout seul, par `Drop`.
+    async fn zone_reseau_trois_pistes(
+        device_id: &str,
+        fixed_volume: bool,
+    ) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
+        let orch = test_orchestrator();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pistes = Vec::new();
+        for id in 1..=3i64 {
+            let chemin = dir.path().join(format!("piste-{id}.flac"));
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+                &chemin,
+            )
+            .unwrap();
+            pistes.push(chemin.to_string_lossy().into_owned());
+        }
+
+        orch.db
+            .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+                &[],
+            )
+            .unwrap();
+        for id in 1..=3i64 {
+            orch.db
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                     duration_ms, sample_rate, bit_depth, channels) \
+                     VALUES (?, ?, 1, 1, ?, 'flac', 300000, 44100, 16, 2)",
+                    &[
+                        &id as &dyn crate::db::backend::ToSqlValue,
+                        &format!("Piste {id}") as &dyn crate::db::backend::ToSqlValue,
+                        &pistes[(id - 1) as usize] as &dyn crate::db::backend::ToSqlValue,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Denon RC12", Some("dlna"), Some(device_id))
+            .unwrap();
+        zone_repo.update_dlna_native_flac(zone_id, true).unwrap();
+        // 30 % : un niveau d'écoute ordinaire, franchement distinct du plein
+        // volume. Une commande à 1.0 se verrait donc, si elle partait.
+        zone_repo.update_volume(zone_id, 30.0).unwrap();
+        if fixed_volume {
+            zone_repo.update_fixed_volume(zone_id, true).unwrap();
+        }
+
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new(device_id, "Denon RC12").with_type("dlna"),
+        ));
+
+        (orch, zone_id, dir)
+    }
+
+    /// Les commandes de volume que l'APPAREIL a reçues, dans l'ordre (#2395).
+    ///
+    /// On interroge la sortie, pas l'état du serveur : la question est « qu'a
+    /// reçu le Denon ? », et seul le mock peut y répondre.
+    async fn volumes_recus_par_l_appareil(
+        orch: &PlaybackOrchestrator,
+        device_id: &str,
+    ) -> Vec<f64> {
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get(device_id).expect("sortie enregistree");
+        let guard = out.lock().await;
+        guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("la sortie factice")
+            .volume_calls()
+            .await
+    }
+
+    /// Enchaîne les trois pistes, en laissant à une éventuelle réassertion
+    /// différée tout le temps de partir.
+    ///
+    /// L'ancien code postait la commande dans un `tokio::spawn` qui dormait
+    /// 500 ms. Mesurer juste après le `play` ne prouverait donc rien : on
+    /// attend franchement plus que ce délai après chaque piste, sinon le test
+    /// serait vert même avec le défaut en place.
+    async fn enchainer_trois_pistes(orch: &PlaybackOrchestrator, zone_id: i64) {
+        for track_id in 1..=3i64 {
+            orch.play(PlayRequest {
+                zone_id,
+                track_id: Some(track_id),
+                source: Some("local".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("la lecture doit aboutir");
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        }
+    }
+
+    /// #2395 — LE défaut, mesuré sur l'appareil : en mode bit-perfect, le plein
+    /// volume repartait vers le renderer 500 ms après CHAQUE piste.
+    ///
+    /// Marco Polo (fil 1546) écoute sur un Denon RC12, à la fois renderer DLNA
+    /// et amplificateur : chacune de ces commandes est une puissance
+    /// acoustique réelle, et il n'en a jamais consenti qu'une — celle de
+    /// l'armement.
+    ///
+    /// Le compte est fait sur des COMMANDES REÇUES, pas sur un code HTTP ni
+    /// sur le volume courant : trois consignes à 100 % sur un appareil déjà à
+    /// 100 % ne changent aucun état lisible, et se liraient comme une seule.
+    ///
+    /// Avant le correctif : trois commandes (une par piste). Après : zéro.
+    #[tokio::test]
+    async fn en_bit_perfect_trois_lectures_ne_commandent_plus_le_volume() {
+        let device_id = "dlna-denon-rc12";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, true).await;
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            Vec::<f64>::new(),
+            "la lecture ne doit commander AUCUN volume : le 100 % du mode \
+             bit-perfect s'obtient a l'armement, une fois, et pas a chaque piste"
+        );
+    }
+
+    /// #2395 — le mode entier, vu de l'appareil : UNE seule commande.
+    ///
+    /// C'est la promesse tenue à l'utilisateur — un saut, annoncé — vérifiée
+    /// bout à bout : l'armement commande le plein volume, les trois lectures
+    /// qui suivent ne commandent rien.
+    #[tokio::test]
+    async fn armement_puis_trois_lectures_ne_font_qu_une_commande() {
+        let device_id = "dlna-denon-rc12";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        // L'armement, seul chemin autorisé à monter la zone à 100 %.
+        orch.arm_fixed_volume(zone_id, Some(device_id))
+            .await
+            .expect("l'armement doit aboutir");
+        ZoneRepo::with_backend(orch.db.clone())
+            .update_fixed_volume(zone_id, true)
+            .unwrap();
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            vec![1.0],
+            "apres trois lectures successives, l'appareil ne doit avoir recu \
+             qu'UNE seule commande de volume : celle de l'armement"
+        );
+    }
+
+    /// #2395 — TÉMOIN : hors du mode, ce chemin ne commande jamais le volume.
+    ///
+    /// Vert avant comme après le correctif. Il tient la mesure honnête : sans
+    /// lui, un test qui compte zéro commande pourrait se contenter d'une
+    /// lecture qui n'a rien joué du tout. Ici la même zone, les mêmes trois
+    /// pistes et le même compteur donnent déjà zéro sans le mode — la
+    /// différence mesurée plus haut vient donc bien de `fixed_volume`, et pas
+    /// d'un banc qui ne mesure rien.
+    #[tokio::test]
+    async fn temoin_hors_bit_perfect_la_lecture_ne_commande_aucun_volume() {
+        let device_id = "dlna-zone-ordinaire";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            Vec::<f64>::new(),
+            "une zone ordinaire garde le niveau ou l'appareil est \
+             physiquement : la lecture ne lui commande rien"
+        );
+    }
+
+    /// #2395 — le banc mesure vraiment quelque chose.
+    ///
+    /// Contre-épreuve du compteur lui-même : si `volume_calls` restait vide
+    /// quoi qu'il arrive, les trois tests ci-dessus seraient verts pour rien.
+    /// Une commande envoyée à la main doit s'y voir, et le compteur doit
+    /// distinguer deux consignes identiques d'une seule.
+    #[tokio::test]
+    async fn le_compteur_de_commandes_voit_ce_qui_part() {
+        let device_id = "dlna-temoin-compteur";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        orch.set_volume(zone_id, 0.3, Some(device_id))
+            .await
+            .unwrap();
+        orch.set_volume(zone_id, 0.3, Some(device_id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            vec![0.3, 0.3],
+            "deux consignes identiques restent DEUX commandes recues"
+        );
     }
 
     /// Position rapportée par la sortie factice après la relecture.

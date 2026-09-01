@@ -2842,11 +2842,57 @@ async fn patch_zone(
         );
     }
     if let Some(fixed) = body.fixed_volume {
+        // #2395 — le mode bit-perfect fait UN saut, annoncé et réversible.
+        //
+        // Seules les TRANSITIONS agissent : un PATCH qui réaffirme l'état
+        // courant ne commande rien. C'est ce qui rend le saut unique — sans
+        // cette garde, chaque `{"fixed_volume": true}` d'un client bavard
+        // renverrait 100 % à l'appareil, et on aurait remplacé la réassertion
+        // à la lecture par une réassertion au PATCH.
+        let etait_fixe = zone_before.fixed_volume;
         ecrire!("fixed_volume", fixed, repo.update_fixed_volume(id, fixed));
-        // When enabling fixed_volume, pin volume to 100% in DB and in-memory
-        if fixed {
-            repo.update_volume(id, 100.0).ok();
-            state.playback.set_volume(id, 1.0).await;
+        if fixed && !etait_fixe {
+            // Mémoriser AVANT de commander : une fois le 100 % appliqué, la
+            // valeur d'origine n'est plus lisible nulle part. L'échec de la
+            // mémorisation coûte la restauration, pas le mode — il est dit au
+            // journal, il n'interrompt pas l'armement.
+            if let Err(error) =
+                tune_core::audio::fixed_volume::remember(&state.backend, id, zone_before.volume)
+            {
+                warn!(zone_id = id, %error, "fixed_volume_memoire_non_ecrite");
+            }
+            // `arm_fixed_volume` et non `set_volume` : ce dernier sort au plus
+            // tôt sur une zone désormais `fixed_volume` et ne parlerait pas au
+            // device. C'est ici, et nulle part ailleurs, que le 100 % part.
+            if let Err(error) = state
+                .orchestrator
+                .arm_fixed_volume(id, command_device_id)
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
+        } else if !fixed && etait_fixe {
+            // Sortie du mode : rendre le volume d'avant. `update_fixed_volume`
+            // est déjà écrit ci-dessus, donc `set_volume` ne sort plus au plus
+            // tôt et commande réellement l'appareil.
+            //
+            // Sans mémoire (zone armée par une version antérieure à ce
+            // correctif, ou écriture perdue), on ne devine pas : la zone reste
+            // à 100 % et l'utilisateur garde la main. Commander une valeur
+            // inventée serait le défaut qu'on corrige, à l'envers.
+            match tune_core::audio::fixed_volume::take(&state.backend, id) {
+                Some(pourcent) => {
+                    if let Err(error) = state
+                        .orchestrator
+                        .set_volume(id, pourcent / 100.0, command_device_id)
+                        .await
+                    {
+                        return crate::routes::playback::output_command_error_response(error);
+                    }
+                    info!(zone_id = id, volume = pourcent, "fixed_volume_restaure");
+                }
+                None => info!(zone_id = id, "fixed_volume_sans_memoire_rien_a_restaurer"),
+            }
         }
     }
     // #2271 — les deux champs visent la MEME colonne. `autoplay_mode` est le
