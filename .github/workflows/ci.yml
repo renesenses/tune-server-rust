@@ -281,13 +281,34 @@ jobs:
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test --no-fail-fast -p tune-core --features audio-embedding
 
-  # Signal Windows sur une PR complete : les deux configurations qui ont deja
-  # casse uniquement sur cet OS sont compilees sur l'integration du lot, ou
-  # immediatement avec `ci:full`. La matrice de livraison les rejoue au push.
+  # Signal Windows sur TOUTE PR qui touche du Rust — plus seulement sur une PR
+  # « complete » (#3123).
+  #
+  # Ce que la condition `full` a coute, mesure : le commit 93186f81 (#3074)
+  # appelait `rand_core::OsRng` depuis `tune-core/src/db/album_repo.rs`, du code
+  # sans garde de plateforme, alors que `rand_core` n'est declare que sous
+  # `[target.'cfg(unix)'.dependencies]`. Une PR vers `batch/*` ne porte pas
+  # `full` : le defaut a traverse SA PROPRE PR, puis le lot, puis la RC sans
+  # qu'aucune compilation Windows ne l'ait vu. La promotion `rc/v0.9.130 -> main`
+  # (#3112) est la premiere a porter `full` : elle est partie rouge, et le train
+  # de la 0.9.130 s'est arrete.
+  #
+  # Le cout est un `cargo check`, pas une matrice de livraison. Mesure sur les
+  # executions du 01/09/2026 qui ont reellement lance ces deux jobs (#3112 et
+  # les trois promotions rc/v0.9.130) : `windows-pr` 7 min 55 / 9 min 45 /
+  # 10 min 20 / 10 min 34, `macos-pr` 3 min 19 / 5 min 19 / 5 min 22 / 6 min 08.
+  # Les jobs sont paralleles : sur une PR de lot, le mur passe de ~5 min 40 (le
+  # job `test`, le plus long aujourd'hui) a ~10 min 40, et `macos-pr` reste sous
+  # le mur existant. Le depot est PUBLIC : ces minutes de runner ne sont pas
+  # facturees.
+  #
+  # Deliberement PAS la piste « poser `ci:full` quand un Cargo.toml change » :
+  # #3074 ne touchait aucun manifeste — la caisse etait deja declaree sous son
+  # `cfg(unix)`, seul l'APPEL etait neuf. Ce garde-la n'aurait rien vu.
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -316,13 +337,19 @@ jobs:
       - name: ASIO
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
 
-  # Un seul ABI/configuration macOS suffit sur une PR complete : les deux
-  # architectures partagent le meme cfg Rust. Les deux vrais binaires restent
-  # construits au push, puis par le workflow qui fabrique la release taguee.
+  # Un seul ABI/configuration macOS suffit : les deux architectures partagent le
+  # meme cfg Rust. Les deux vrais binaires restent construits au push, puis par
+  # le workflow qui fabrique la release taguee.
+  #
+  # Arme sur toute PR qui touche du Rust, comme `windows-pr` ci-dessus (#3123).
+  # `cfg(target_os = "macos")` est l'autre famille de code que Linux ne compile
+  # jamais ; la laisser derriere `full` reproduirait exactement le trou de
+  # #3074, une plateforme plus loin. Mesure : 3 min 19 a 6 min 08, donc sous le
+  # mur deja pose par le job `test` — ce job n'allonge pas la PR.
   macos-pr:
     name: macOS (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
