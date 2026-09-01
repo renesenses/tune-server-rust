@@ -48,6 +48,39 @@ pub mod sql {
         )
     }
 
+    /// Pochettes des playlists d'UNE PAGE, en une seule requête.
+    ///
+    /// Le client construisait la mosaïque en interrogeant les pistes de chaque
+    /// playlist : une requête HTTP par playlist. Invisible sur treize en réseau
+    /// local, intenable sur cent depuis l'extérieur.
+    ///
+    /// La sous-requête `IN` reprend EXACTEMENT la pagination de [`list`] —
+    /// mêmes trois paramètres, même tri. Elle rend donc les pochettes des
+    /// playlists de cette page, et d'aucune autre : pas de second passage sur
+    /// toute la table.
+    ///
+    /// `MIN(pt.position)` fixe l'ordre : une pochette apparaît à la place de sa
+    /// PREMIÈRE piste dans la playlist. Sans lui, deux pochettes à égalité
+    /// sortiraient dans un ordre laissé au moteur, et la mosaïque changerait
+    /// d'un rafraîchissement à l'autre.
+    ///
+    /// Le `GROUP BY` dédoublonne côté base : un album de douze titres ne fait
+    /// pas douze lignes. Le découpage à quatre reste à l'appelant — la base
+    /// n'a pas à connaître la forme de la vignette.
+    pub fn covers_for_page<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT pt.playlist_id, t.cover_path, MIN(pt.position) AS pos \
+             FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id \
+             WHERE t.cover_path IS NOT NULL AND t.cover_path <> '' \
+             AND pt.playlist_id IN (SELECT p.id FROM playlists p WHERE p.profile_id = {} \
+             ORDER BY LOWER(p.name) LIMIT {} OFFSET {}) \
+             GROUP BY pt.playlist_id, t.cover_path ORDER BY pt.playlist_id, pos",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     pub fn delete<D: SqlDialect>(d: &D) -> String {
         format!("DELETE FROM playlists WHERE id = {}", d.placeholder(1))
     }
@@ -198,6 +231,38 @@ impl PlaylistRepo {
         let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_playlist).collect())
+    }
+
+    /// Pochettes par playlist, pour la même page que [`list`].
+    ///
+    /// Rend au plus `max` pochettes par playlist, dans l'ordre d'apparition.
+    /// Une playlist sans aucune pochette est simplement absente de la carte :
+    /// l'appelant retombe alors sur son affichage par défaut.
+    pub fn covers_for_page(
+        &self,
+        profile_id: i64,
+        limit: i64,
+        offset: i64,
+        max: usize,
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>, String> {
+        let sql = self.dialect_sql(sql::covers_for_page, sql::covers_for_page);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        let mut out: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        for cols in &rows {
+            let Some(pid) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(cover) = cols.get(1).and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let e = out.entry(pid).or_default();
+            // Le tri de la requête garantit l'ordre ; on coupe simplement.
+            if e.len() < max {
+                e.push(cover);
+            }
+        }
+        Ok(out)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -480,6 +545,119 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Une piste avec la pochette voulue.
+    fn piste(
+        track_repo: &crate::db::track_repo::TrackRepo,
+        titre: &str,
+        cover: Option<&str>,
+    ) -> i64 {
+        let mut t = TrackModel::new(titre.into());
+        t.file_path = Some(format!("/{titre}.flac"));
+        t.cover_path = cover.map(|c| c.to_string());
+        track_repo.create(&t).unwrap()
+    }
+
+    /// Les pochettes de la mosaïque : DISTINCTES, dans l'ordre, plafonnées.
+    ///
+    /// Le client construisait cette liste en interrogeant les pistes de CHAQUE
+    /// playlist — une requête HTTP par playlist. Elle vient désormais avec la
+    /// liste, en une seule requête.
+    #[test]
+    fn pochettes_distinctes_dans_l_ordre_et_plafonnees() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        // A, A, B, C, D, E : six pistes, cinq pochettes distinctes.
+        // On attend A B C D — la première occurrence fixe le rang, et le
+        // doublon de A ne consomme pas une seconde case.
+        let ids: Vec<i64> = [
+            ("t1", Some("A")),
+            ("t2", Some("A")),
+            ("t3", Some("B")),
+            ("t4", Some("C")),
+            ("t5", Some("D")),
+            ("t6", Some("E")),
+        ]
+        .iter()
+        .map(|(n, c)| piste(&track_repo, n, *c))
+        .collect();
+
+        let pl = repo.create("Melange", None, 1).unwrap();
+        repo.add_tracks(pl, &ids, None).unwrap();
+
+        let map = repo.covers_for_page(1, 50, 0, 4).unwrap();
+        assert_eq!(
+            map.get(&pl).cloned().unwrap_or_default(),
+            vec!["A", "B", "C", "D"],
+            "ordre d'apparition, doublons ecartes, plafond a quatre"
+        );
+    }
+
+    /// Une playlist sans aucune pochette est ABSENTE de la carte.
+    ///
+    /// Elle n'y figure pas avec une liste vide : l'appelant distingue ainsi
+    /// « rien a montrer » de « pas encore charge », et retombe sur son
+    /// affichage par defaut sans dessiner un carre vide.
+    #[test]
+    fn une_playlist_sans_pochette_est_absente() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let sans = piste(&track_repo, "muette", None);
+        let pl = repo.create("Sans pochette", None, 1).unwrap();
+        repo.add_tracks(pl, &[sans], None).unwrap();
+
+        assert!(
+            !repo.covers_for_page(1, 50, 0, 4).unwrap().contains_key(&pl),
+            "une playlist sans pochette ne doit pas apparaitre du tout"
+        );
+    }
+
+    /// La requete ne rend QUE les playlists de la page demandee.
+    ///
+    /// C'est tout l'interet : sans le `IN` cale sur la pagination, chaque page
+    /// balaierait la table entiere des `playlist_tracks`.
+    #[test]
+    fn seules_les_playlists_de_la_page_sont_lues() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let t = piste(&track_repo, "commune", Some("Z"));
+
+        // Triees par nom : « Alpha » puis « Beta ».
+        let a = repo.create("Alpha", None, 1).unwrap();
+        let b = repo.create("Beta", None, 1).unwrap();
+        repo.add_tracks(a, &[t], None).unwrap();
+        repo.add_tracks(b, &[t], None).unwrap();
+
+        let page1 = repo.covers_for_page(1, 1, 0, 4).unwrap();
+        assert!(page1.contains_key(&a), "la premiere page doit porter Alpha");
+        assert!(!page1.contains_key(&b), "elle ne doit PAS porter Beta");
+
+        let page2 = repo.covers_for_page(1, 1, 1, 4).unwrap();
+        assert!(page2.contains_key(&b), "la seconde page doit porter Beta");
+        assert!(!page2.contains_key(&a), "elle ne doit PAS porter Alpha");
+    }
+
+    /// Le cloisonnement par profil vaut ici comme ailleurs (#2794).
+    #[test]
+    fn les_pochettes_ne_traversent_pas_les_profils() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let t = piste(&track_repo, "x", Some("A"));
+
+        let autre = repo.create("Chez l autre", None, 2).unwrap();
+        repo.add_tracks(autre, &[t], None).unwrap();
+
+        assert!(
+            repo.covers_for_page(1, 50, 0, 4).unwrap().is_empty(),
+            "le profil 1 ne doit rien voir des playlists du profil 2"
+        );
     }
 
     #[test]

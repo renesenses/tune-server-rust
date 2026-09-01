@@ -142,7 +142,41 @@ async fn list_playlists(
     let offset = p.offset.unwrap_or(0);
     let items = repo.list(profile.id(), limit, offset).unwrap_or_default();
     let _total = repo.count(profile.id()).unwrap_or(0);
-    Json(json!(items))
+    // Pochettes de la mosaïque, jointes ICI plutôt que réclamées piste par
+    // piste par le client.
+    //
+    // Le nouveau client dessine la pochette d'une playlist locale comme une
+    // mosaïque des pochettes qu'elle contient — la table `playlists` n'en porte
+    // aucune. Il interrogeait donc `/playlists/{id}/tracks` POUR CHAQUE
+    // playlist : treize requêtes sur un serveur de test en réseau local,
+    // invisible ; cent chez un utilisateur avec cent playlists et un serveur
+    // distant, intenable.
+    //
+    // Une seule requête suffit pour toute la page, et elle ne remonte que ce
+    // qui sert : au plus quatre pochettes DISTINCTES par playlist, dans l'ordre
+    // d'apparition.
+    //
+    // Champ ADDITIF : `covers` s'ajoute, rien n'est retiré ni renommé. Un
+    // client qui l'ignore ne voit aucune différence, et un client neuf face à
+    // un vieux serveur reçoit simplement l'absence du champ — qu'il traite déjà
+    // comme « pas de mosaïque ».
+    let covers = repo
+        .covers_for_page(profile.id(), limit, offset, 4)
+        .unwrap_or_default();
+    let enrichis: Vec<Value> = items
+        .iter()
+        .map(|p| {
+            let mut v = json!(p);
+            if let (Some(id), Some(obj)) = (p.id, v.as_object_mut()) {
+                obj.insert(
+                    "covers".to_string(),
+                    json!(covers.get(&id).cloned().unwrap_or_default()),
+                );
+            }
+            v
+        })
+        .collect();
+    Json(json!(enrichis))
 }
 
 /// #2794 — le cloisonnement par profil ne tenait qu'au listing. Toute route
