@@ -4727,6 +4727,81 @@ impl PlaybackOrchestrator {
                         out_bd,
                         target_format_str.clone(),
                     );
+
+                    // …et les VU-mètres avec, sinon ils s'éteignent DÈS la
+                    // deuxième écoute.
+                    //
+                    // Le chemin du transcodage frais, juste en dessous, émet ses
+                    // niveaux depuis le `pcm_bytes` que lui rend
+                    // `transcode_source_to_file`. Un cache hit saute tout le
+                    // décodage — c'est son intérêt — donc plus une seule fenêtre
+                    // de PCM ne passe par ici, et rien n'attachait de forwarder :
+                    // aiguilles à zéro, spectrogramme plat, pour une lecture
+                    // pourtant parfaitement normale.
+                    //
+                    // Le symptôme suit exactement la mise en cache, ce qui le
+                    // rendait incompréhensible côté testeur : la PREMIÈRE écoute
+                    // d'une piste anime tout, chaque REPRISE est morte. Et il
+                    // frappe l'ALAC en premier parce que l'ALAC transcode
+                    // toujours pour un renderer réseau — il peuple donc ce cache
+                    // à chaque album, là où un FLAC part souvent en natif sans
+                    // jamais traverser ce bloc. Journaux d'Yves Corbat du
+                    // 01/09/2026 : 7 des 8 lectures de « Topography of Mind »
+                    // sont des cache hits, toutes sans niveaux.
+                    //
+                    // On décode la RENDITION mise en cache, pas la source : c'est
+                    // elle qui part au renderer, donc c'est elle que les aiguilles
+                    // doivent décrire. Aucune divergence à craindre au passage —
+                    // `cache_path_opt` est `None` dès qu'un EQ, une convolution ou
+                    // un ReplayGain est en jeu, donc une rendition en cache est
+                    // toujours du signal non traité.
+                    //
+                    // Même forme que les niveaux du passthrough : décodage EN
+                    // FLUX, le PCM part dans un puits, seules les fenêtres
+                    // ressortent. Matérialiser la piste coûterait ~1,9 Go sur un
+                    // 24/192 de dix minutes, uniquement pour animer des aiguilles.
+                    if let Some(bus) = ev_bus
+                        .clone()
+                        .filter(|_| self.levels_attach_allowed(zone_id))
+                    {
+                        let playback = playback.clone();
+                        let sr = out_sr;
+                        let ch = channels as u32;
+                        let rendition = cp.clone();
+                        // Génération épinglée au moment de la décision (#1110) :
+                        // ce décodage dure toute la piste, il ne doit pas pouvoir
+                        // se raccrocher à la suivante.
+                        let play_seq = playback.current_play_seq(zone_id).await;
+                        tokio::spawn(async move {
+                            // Cache hit : la rendition est servie depuis son
+                            // début (un seek passe par Range HTTP).
+                            let levels_tx =
+                                spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+                            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                            let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+                            let result = tokio::task::spawn_blocking(move || {
+                                crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                                    &rendition,
+                                    Some(sr),
+                                    Some(ch),
+                                    None,
+                                    sink_tx,
+                                    LEVELS_DECODE_CHUNK,
+                                    ready,
+                                    levels_tx,
+                                )
+                            })
+                            .await;
+                            match result {
+                                Err(e) => debug!(error = %e, "cache_hit_levels_task_panic"),
+                                Ok(Err(e)) => {
+                                    debug!(error = %e, "cache_hit_levels_decode_failed")
+                                }
+                                Ok(Ok(_)) => {}
+                            }
+                        });
+                    }
                     (
                         session_id,
                         out_mime,
@@ -15507,6 +15582,43 @@ mod annonce_apres_sortie_guard {
                 .contains("if output_sent {\n            self.dispatch_now_playing("),
             "`dispatch_now_playing` n'est plus gardé par `if output_sent` — \
              l'annonce « en écoute » repartirait sur un envoi refusé (#1998)."
+        );
+    }
+
+    /// Un cache hit doit attacher des niveaux, comme le transcodage frais.
+    ///
+    /// Le chemin du transcodage frais émet ses fenêtres depuis le `pcm_bytes`
+    /// que lui rend `transcode_source_to_file`. Un cache hit saute tout le
+    /// décodage : plus une seule fenêtre ne passe par là. Tant que sa branche
+    /// n'attachait pas son propre forwarder, les aiguilles tombaient à zéro et
+    /// le spectrogramme restait plat — dès la DEUXIÈME écoute d'une piste, la
+    /// première ayant rempli le cache.
+    ///
+    /// Invisible à la lecture comme à la compilation : deux branches correctes
+    /// dont une seule alimente les niveaux, séparées par cent lignes. Et
+    /// invisible au testeur aussi, puisque la panne suit la mise en cache et
+    /// non le fichier. Journaux d'Yves Corbat du 01/09/2026 : 7 des 8 lectures
+    /// de « Topography of Mind » sont des cache hits, toutes sans niveaux.
+    ///
+    /// Le garde tient sur la TRANCHE de la branche de cache — de son propre
+    /// journal jusqu'à celui du transcodage frais. Chercher
+    /// `spawn_paced_levels_forwarder` dans tout le fichier serait satisfait par
+    /// la douzaine d'autres chemins qui l'appellent déjà.
+    #[test]
+    fn un_cache_hit_attache_aussi_les_niveaux() {
+        let debut = position("\"transcode_cache_hit\"");
+        let fin = position("\"transcode_to_temp_file_start\"");
+        assert!(
+            debut < fin,
+            "les deux branches ont été réordonnées : la découpe ne délimite \
+             plus la branche de cache, ce garde-fou ne garde plus rien."
+        );
+        assert!(
+            code_de_production()[debut..fin].contains("spawn_paced_levels_forwarder"),
+            "la branche « cache hit » n'attache plus de forwarder de niveaux : \
+             toute piste servie depuis le cache de transcodage joue avec des \
+             VU-mètres morts et un spectrogramme plat, alors que sa toute \
+             première écoute — la seule à transcoder — les animait."
         );
     }
 
