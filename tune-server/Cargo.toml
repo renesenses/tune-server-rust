@@ -148,3 +148,11 @@ path = "tests/panne_sql_journalisee.rs"
 [[test]]
 name = "cles_developpeur_hors_journal"
 path = "tests/cles_developpeur_hors_journal.rs"
+
+# Meme raison, mot pour mot : abonne `tracing` GLOBAL, donc un binaire a lui
+# seul et un seul essai dedans. Celui-ci compte les lignes qu'un sondeur
+# HQPlayer en panne coute au journal, et les tours de boucle qu'il fait sur
+# vingt-quatre heures (#2566).
+[[test]]
+name = "journal_sondage_hqplayer"
+path = "tests/journal_sondage_hqplayer.rs"

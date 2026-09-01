@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use tune_core::outputs::OutputRegistry;
+use tune_core::poller::{JournalSondage, TraceEchecSondage};
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -567,6 +568,104 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
     });
 }
 
+/// Plein rythme d'un sondeur d'intégration : l'hôte répond, on le rappelle
+/// chaque minute.
+pub const SONDAGE_INTERVALLE_BASE_SECS: u64 = 60;
+/// Plancher de fréquence quand il ne répond plus. Dix minutes : un hôte éteint
+/// ne coûte plus que six connexions perdues par heure.
+pub const SONDAGE_INTERVALLE_MAX_SECS: u64 = 600;
+
+/// Cadence du prochain tour d'un sondeur d'intégration.
+///
+/// Écrite en clair dans `spawn_squeezebox_poller`, elle en est extraite parce
+/// qu'il fallait la donner **aussi** à `spawn_hqplayer_poller` (#2566) : ce
+/// dernier était le seul sondeur sans aucun recul. Un hôte HQPlayer saisi puis
+/// débranché était rappelé toutes les soixante secondes, sans fin — **1 440
+/// connexions perdues et 1 440 lignes de journal par jour**, pour un appareil
+/// dont on savait depuis la première seconde qu'il ne répondait pas.
+///
+/// Le retour au plein rythme est immédiat, et il ne dépend pas d'un succès :
+/// une intégration coupée ou un hôte vidé y ramènent aussi, pour qu'un hôte
+/// fraîchement saisi soit pris tout de suite.
+///
+/// Fonction pure, et testée comme telle (`journal_sondage_hqplayer.rs`) : une
+/// cadence éprouvée par de vraies attentes est un test qui dure dix minutes et
+/// qui clignote.
+pub fn prochain_intervalle_sondage(actuel_secs: u64, echec: bool) -> u64 {
+    if echec {
+        actuel_secs
+            .saturating_mul(2)
+            .min(SONDAGE_INTERVALLE_MAX_SECS)
+    } else {
+        SONDAGE_INTERVALLE_BASE_SECS
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer en échec (#2566).
+///
+/// Fonction à part, et publique, pour une seule raison : le garde
+/// `tests/journal_sondage_hqplayer.rs` compte les lignes que `tracing` reçoit
+/// de **ce point-ci**, pas d'une copie. Elle reste dans `tune_server::background`
+/// pour que la cible du module — celle que l'export de diagnostic comptabilise
+/// (`QUOTA_PAR_MODULE`, #1974) — désigne bien le sondeur d'intégration et non
+/// le poller.
+///
+/// Ce que le journal dit désormais, pour un HQPlayer débranché :
+/// les **cinq premiers** échecs en entier, avec l'erreur, l'hôte et la cadence
+/// suivante — de quoi établir la cause et vérifier que le recul monte —, puis
+/// un récapitulatif portant le TOTAL aux paliers 8, 16, 32… Un échec isolé
+/// reste dit en entier : c'est le n° 1.
+pub fn journaliser_echec_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    error: &dyn std::fmt::Display,
+    next_retry_secs: u64,
+) {
+    match journal.compter_echec() {
+        TraceEchecSondage::Detaille => tracing::debug!(
+            error = %error,
+            host = %host,
+            next_retry_secs,
+            "hqplayer_poll_failed"
+        ),
+        TraceEchecSondage::Recapitulatif => tracing::debug!(
+            error = %error,
+            host = %host,
+            echecs = journal.echecs(),
+            detaillees = tune_core::poller::ECHECS_SONDAGE_DETAILLES,
+            next_retry_secs,
+            "hqplayer_poll_still_failing"
+        ),
+        TraceEchecSondage::Muet => {}
+    }
+}
+
+/// Point d'émission du journal d'un sondage HQPlayer qui répond (#2566).
+///
+/// `hqplayer_poll_registered` partait à **chaque tour**, au niveau `INFO` : un
+/// HQPlayer qui marche écrivait 1 440 lignes par jour pour dire qu'il marchait
+/// toujours. C'est le même défaut que les 79 lignes du ticket, à l'envers — un
+/// journal qui crie pour rien noie celui qui dirait quelque chose — et il est
+/// ici plus grave, parce qu'`INFO` traverse les filtres par défaut.
+///
+/// Reste dit : la **première** découverte, et chaque **retour** après une panne
+/// qu'on avait cessé de détailler, avec le total d'échecs.
+pub fn journaliser_succes_hqplayer(
+    journal: &mut JournalSondage,
+    host: &str,
+    deja_annonce: &mut bool,
+) {
+    let retour = journal.cloturer();
+    if retour.is_some() || !*deja_annonce {
+        info!(
+            host = %host,
+            echecs = retour.unwrap_or(0),
+            "hqplayer_poll_registered"
+        );
+        *deja_annonce = true;
+    }
+}
+
 fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -578,9 +677,9 @@ fn spawn_squeezebox_poller(state: &AppState) {
         // with `lms_cli_command: TCP connect failed` every minute. Backing off
         // stops the spam and the wasted connects; a reachable LMS is polled
         // normally and recovery resets the interval immediately.
-        const BASE_INTERVAL_SECS: u64 = 60;
-        const MAX_INTERVAL_SECS: u64 = 600; // 10 min ceiling for a dead LMS
-        let mut interval_secs = BASE_INTERVAL_SECS;
+        // Cadence partagée avec le sondeur HQPlayer : voir
+        // `prochain_intervalle_sondage` (60 s de base, 600 s de plancher).
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -604,10 +703,10 @@ fn spawn_squeezebox_poller(state: &AppState) {
                             info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
                         }
                         // Reachable → back to normal cadence.
-                        interval_secs = BASE_INTERVAL_SECS;
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        interval_secs = (interval_secs * 2).min(MAX_INTERVAL_SECS);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
                         tracing::debug!(
                             error = %e,
                             lms = %host,
@@ -619,7 +718,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
             } else {
                 // Integration off / no host configured — idle at base cadence so
                 // a freshly configured host is picked up promptly.
-                interval_secs = BASE_INTERVAL_SECS;
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -631,6 +730,13 @@ fn spawn_hqplayer_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        // Même cadence et même comptabilité de journal que le sondeur
+        // Squeezebox ci-dessus (#2566). Ce sondeur-ci était le seul à n'avoir
+        // ni l'une ni l'autre : 1 440 tours et 1 440 lignes par jour, que
+        // l'hôte réponde ou non.
+        let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+        let mut journal = JournalSondage::default();
+        let mut deja_annonce = false;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -649,15 +755,21 @@ fn spawn_hqplayer_poller(state: &AppState) {
             if enabled && !host.is_empty() {
                 match crate::routes::hqplayer::discover_and_register(&state).await {
                     Ok(_) => {
-                        info!(host = %host, "hqplayer_poll_registered");
+                        journaliser_succes_hqplayer(&mut journal, &host, &mut deja_annonce);
+                        interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, host = %host, "hqplayer_poll_failed");
+                        interval_secs = prochain_intervalle_sondage(interval_secs, true);
+                        journaliser_echec_hqplayer(&mut journal, &host, &e, interval_secs);
                     }
                 }
+            } else {
+                // Intégration coupée ou hôte non saisi : plein rythme, pour
+                // qu'un hôte fraîchement configuré soit pris tout de suite.
+                interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     });
 }
