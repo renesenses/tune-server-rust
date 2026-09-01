@@ -152,6 +152,151 @@ pub fn continue_listening_albums_deduits(engine: Engine, zone_filter: &str) -> S
     )
 }
 
+/// Les cinq natures que `contexte_de_lecture` (tune-server/src/routes/
+/// playback.rs) sait ecrire, telles que FabienM les a enumerees (#2441).
+pub const CONTEXTES_AFFICHES: [&str; 5] = ["album", "playlist", "artist", "label", "track"];
+
+/// Premier rang de « Continuer l'ecoute » : la derniere ecoute de CHAQUE
+/// contexte distinct — l'objet que l'auditeur a demande, et ou il en etait.
+///
+/// # Pourquoi cette requete est descendue ici (#2441)
+///
+/// Elle etait redigee dans `tune-server/src/routes/home.rs`. C'est le crate
+/// que le job « Test (PostgreSQL) » ne compile PAS : il lance
+/// `cargo test -p tune-core`. La requete qui EST le correctif de #2441
+/// n'etait donc jouee que sur SQLite — exactement la situation qui avait
+/// laisse « Continuer l'ecoute » vide sur tout serveur PostgreSQL pendant des
+/// mois (#2860), sans qu'aucun test ne rougisse, l'erreur etant avalee par le
+/// `unwrap_or_default()` de l'appelant.
+///
+/// Mesure du 01/09/2026 sur PostgreSQL 15, schema monte des scripts numerotes
+/// plus `ENSURE_COLUMNS` : la requete s'execute et rend ses colonnes. Le
+/// defaut de #2860 ne se rejouait pas ici — mais rien ne le prouvait, et
+/// `pg_2441_*` le prouve desormais a chaque promotion.
+///
+/// # L'ordre est TOTAL, a dessein
+///
+/// `ORDER BY lh.listened_at DESC` seul ne departage pas deux contextes ecoutes
+/// dans la MEME seconde — or `listened_at` est au format seconde, et deux
+/// gestes rapproches y tombent. Avec un `LIMIT`, un ordre partiel laisse le
+/// moteur choisir QUI entre dans la section et qui disparait, sans rien dire.
+///
+/// RESERVE — sur le jeu mesure (trois contextes a la meme seconde, `LIMIT 2`)
+/// les deux moteurs rendaient DEJA le meme couple : la divergence est latente,
+/// pas observee. Le departage est donc une GARDE, pas la reparation d'un
+/// defaut constate. Il est gratuit : `EXPLAIN QUERY PLAN` sur SQLite montre le
+/// meme `USE TEMP B-TREE FOR ORDER BY` avant et apres, la jointure continuant
+/// de passer par `idx_listen_history_listened_at`.
+///
+/// `zone_filter` est injecte tel quel par l'appelant (`AND lh.zone_id = N `,
+/// ou vide) : c'est un entier formate, pas une saisie.
+///
+/// Colonnes rendues, dans l'ordre : `context_type, context_id, listened_at,
+/// context_position, title, artist_name, album_title, cover_url, album_id,
+/// source`.
+pub fn continue_listening_contextes(engine: Engine, zone_filter: &str) -> String {
+    let p1 = ph(engine, 1);
+    let natures = CONTEXTES_AFFICHES
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // La ligne la PLUS RECENTE de chaque contexte : c'est elle qui porte le
+    // rang atteint, et les champs d'affichage de repli. La jointure sur le
+    // MAX plutot qu'une fonction de fenetrage — les deux moteurs la
+    // comprennent, `ROW_NUMBER() OVER` n'existe pas sur toutes les versions de
+    // SQLite embarquees.
+    format!(
+        "SELECT lh.context_type, lh.context_id, lh.listened_at, \
+                lh.context_position, lh.title, lh.artist_name, lh.album_title, \
+                lh.cover_url, lh.album_id, lh.source \
+         FROM listen_history lh \
+         JOIN (SELECT context_type, context_id, MAX(listened_at) as dernier \
+               FROM listen_history lh \
+               WHERE lh.context_type IN ({natures}) \
+                 AND lh.context_id IS NOT NULL \
+                 {zone_filter}\
+               GROUP BY context_type, context_id) d \
+           ON d.context_type = lh.context_type \
+          AND d.context_id = lh.context_id \
+          AND d.dernier = lh.listened_at \
+         WHERE lh.context_type IN ({natures}) \
+         {zone_filter}\
+         ORDER BY lh.listened_at DESC, lh.context_type ASC, lh.context_id ASC \
+         LIMIT {p1}"
+    )
+}
+
+/// Les albums LOCAUX designes par des contextes `album`, avec leur avancement.
+///
+/// C'est CETTE requete qui produit les deux nombres dont sort la barre de
+/// progression (`listened_tracks` et `track_count`). Descendue ici avec sa
+/// jumelle ci-dessus, et pour la meme raison : redigee dans `tune-server`,
+/// elle n'etait jamais executee sur PostgreSQL, alors qu'elle porte
+/// exactement les deux pieges qui avaient vide la section (#2860) — `ar.name`
+/// selectionnee depuis une AUTRE table, et un `GROUP BY` qui doit donc etre
+/// exhaustif.
+///
+/// `ids` est interpole tel quel : ce sont des `i64` reformates par l'appelant,
+/// pas une saisie.
+///
+/// Colonnes rendues, dans l'ordre : `id, title, artist_name, year, cover_path,
+/// genre, listened_tracks, track_count`.
+pub fn continue_listening_albums_du_contexte(ids: &[i64]) -> String {
+    let liste = ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {COLONNES_ALBUM}, \
+                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
+         FROM albums a \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         LEFT JOIN listen_history lh ON {HISTORIQUE_VERS_ALBUM} \
+         WHERE a.id IN ({liste}) \
+         GROUP BY {COLONNES_ALBUM}, a.track_count"
+    )
+}
+
+/// L'avancement d'une entree de « Continuer l'ecoute », en pourcentage entier.
+///
+/// # Le defaut repare (#2441, arbitrage de Bertrand du 01/09/2026)
+///
+/// « Corriger au passage le champ de progression que le client lit et que le
+/// serveur n'emet nulle part. » `HomeView.svelte` dessine la barre sous la
+/// vignette derriere `{#if item.progress_percent != null}` — et
+/// `progress_percent` n'apparaissait NULLE PART dans ce depot (compte : zero
+/// occurrence). La barre etait donc morte sur toute installation, quel que
+/// soit le moteur : la condition n'a jamais pu etre vraie.
+///
+/// # Pourquoi le calcul est en Rust et NON en SQL
+///
+/// `100 * ecoutees / total` en SQL diverge entre les deux moteurs des que
+/// `total` vaut 0 : SQLite rend NULL, PostgreSQL LEVE `division by zero` — et
+/// l'erreur, avalee par le `unwrap_or_default()` de l'appelant, ferait
+/// disparaitre la section entiere au lieu d'une barre. C'est la forme exacte
+/// du defaut #2860. Le garde-fou `total > 0` ci-dessous est donc la raison
+/// d'etre de cette fonction, pas un detail.
+///
+/// Renvoie `None` — donc `null`, donc pas de barre — quand l'avancement n'a
+/// pas de sens : nature sans notion de completude (playlist, artiste, label,
+/// titre isole), album de streaming dont on ignore le nombre de pistes, ou
+/// `track_count` a zero. Mieux vaut aucune barre qu'une barre a 0 % qui
+/// ferait croire a une ecoute jamais commencee.
+///
+/// Borne a 100 : `listened_tracks` compte les titres DISTINCTS de l'historique
+/// rattaches a l'album, et un disque dont une piste a ete renommee depuis le
+/// scan peut en compter plus que `track_count`. Une barre a 130 % deborderait
+/// sa gouttiere.
+pub fn progression_pourcent(ecoutees: Option<i64>, total: Option<i64>) -> Option<i64> {
+    let (ecoutees, total) = (ecoutees?, total?);
+    if total <= 0 || ecoutees < 0 {
+        return None;
+    }
+    Some((ecoutees.saturating_mul(100) / total).min(100))
+}
+
 /// « Ajoutes recemment » : les albums dont une piste a ete ecrite sur le disque
 /// depuis `$1`.
 ///
@@ -187,12 +332,59 @@ mod tests {
     /// ECHOUE sur PostgreSQL. Le test PG `pg_2860_*` le prouve en base ; ici on
     /// interdit la reecriture du motif, y compris pour le moteur SQLite ou il
     /// passerait sans bruit.
+    /// L'avancement est calcule en Rust, JAMAIS en SQL — et ce test dit
+    /// pourquoi. `100 * ecoutees / total` avec `total` a zero rend NULL sur
+    /// SQLite et LEVE `division by zero` sur PostgreSQL ; l'erreur, avalee par
+    /// le `unwrap_or_default()` de l'appelant, emporterait la section entiere
+    /// au lieu d'une seule barre. C'est la forme exacte du defaut #2860.
+    #[test]
+    fn un_album_sans_piste_ne_divise_pas_par_zero() {
+        assert_eq!(progression_pourcent(Some(3), Some(0)), None);
+        assert_eq!(progression_pourcent(Some(0), Some(0)), None);
+        assert_eq!(progression_pourcent(Some(3), None), None);
+        assert_eq!(progression_pourcent(None, Some(5)), None);
+    }
+
+    /// Les nombres que les deux tests de moteur exigent, et les deux bornes.
+    #[test]
+    fn l_avancement_est_borne_et_entier() {
+        assert_eq!(progression_pourcent(Some(1), Some(5)), Some(20));
+        assert_eq!(progression_pourcent(Some(2), Some(5)), Some(40));
+        assert_eq!(progression_pourcent(Some(3), Some(5)), Some(60));
+        assert_eq!(progression_pourcent(Some(0), Some(5)), Some(0));
+        // Un titre renomme depuis le scan peut faire compter plus de pistes
+        // ecoutees que l'album n'en porte : la barre ne doit pas deborder.
+        assert_eq!(progression_pourcent(Some(9), Some(5)), Some(100));
+        assert_eq!(progression_pourcent(Some(5), Some(5)), Some(100));
+    }
+
+    /// L'ordre de la section doit etre TOTAL : `listened_at` seul ne departage
+    /// pas deux gestes de la meme seconde, et le `LIMIT` laisse alors le
+    /// moteur choisir qui disparait.
+    #[test]
+    fn l_ordre_des_contextes_est_total() {
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            let sql = continue_listening_contextes(engine, "");
+            let order_by = sql
+                .split("ORDER BY ")
+                .nth(1)
+                .expect("la requete porte un ORDER BY");
+            assert!(
+                order_by.contains("lh.context_type") && order_by.contains("lh.context_id"),
+                "`ORDER BY lh.listened_at DESC` seul n'est pas un ordre total : \
+                 deux contextes de la meme seconde se classent au hasard et le \
+                 LIMIT en supprime un en silence. SQL :\n{sql}"
+            );
+        }
+    }
+
     #[test]
     fn le_group_by_nomme_toutes_les_colonnes_non_agregees() {
         for engine in [Engine::Sqlite, Engine::Postgres] {
             for sql in [
                 continue_listening_albums_deduits(engine, ""),
                 recently_added(engine),
+                continue_listening_albums_du_contexte(&[1, 2]),
             ] {
                 let group_by = sql
                     .split("GROUP BY ")
