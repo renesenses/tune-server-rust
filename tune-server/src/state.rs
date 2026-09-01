@@ -209,7 +209,19 @@ impl AppState {
         let exclusive = stored.unwrap_or(self.config.local_exclusive_mode);
         // ASIO is exclusive by nature — the shared path can't drive it.
         // Mirrors the same rule applied to the config file at load time.
-        exclusive || self.effective_audio_backend().eq_ignore_ascii_case("asio")
+        //
+        // #1268 — mais c'est une notion WINDOWS, et cette règle ne le disait
+        // pas. `local_audio_backend = "asio"` se trouve en base sur des
+        // serveurs macOS et Linux : une bibliothèque migrée depuis une machine
+        // Windows l'y apporte telle quelle, et le sélecteur du client web
+        // propose encore ASIO partout (c'est le symptôme du ticket). Aucun de
+        // ces serveurs ne peut ouvrir un host ASIO — `select_host` sort par le
+        // host par défaut — mais cette ligne armait quand même le mode
+        // exclusif, c'est-à-dire, sur macOS, le hog mode CoreAudio que
+        // personne n'avait demandé. Sous Windows, rien ne change.
+        exclusive
+            || (cfg!(target_os = "windows")
+                && self.effective_audio_backend().eq_ignore_ascii_case("asio"))
     }
 
     /// The audio backend local outputs *should* be built with: the stored
