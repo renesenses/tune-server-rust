@@ -169,6 +169,15 @@ pub struct StreamSession {
     /// calls `claim_channel_consumer()` to bump this and supersede the older
     /// connection, which then hands off the channel and ends. `0` = no consumer.
     pub consumer_epoch: std::sync::atomic::AtomicU64,
+    /// Vrai dès que le canal PCM de cette session a été observé PLEIN, donc
+    /// dès que le producteur a pris de l'avance sur le lecteur au moins une
+    /// fois. Sans ce témoin, « canal vide » ne veut rien dire : au démarrage
+    /// il l'est toujours, le temps que le décodeur prenne son avance.
+    pub channel_was_full: std::sync::atomic::AtomicBool,
+    /// Vrai une fois l'alerte `stream_producer_ran_dry` émise. Une seule
+    /// ligne par session : elle dit un FAIT ponctuel — le producteur a cessé
+    /// d'être en avance — et le répéter à chaque morceau noierait le journal.
+    pub dry_alert_emitted: std::sync::atomic::AtomicBool,
     /// Wakes an older radio consumer the instant a newer one claims the channel
     /// so it releases the `rx` lock promptly instead of staying parked in
     /// `recv_chunk()`. Paired with `consumer_epoch`; see `claim_channel_consumer`.
@@ -267,6 +276,8 @@ impl StreamSession {
             active_consumers: std::sync::atomic::AtomicU32::new(0),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
+            channel_was_full: std::sync::atomic::AtomicBool::new(false),
+            dry_alert_emitted: std::sync::atomic::AtomicBool::new(false),
             consumer_supersede: std::sync::Arc::new(tokio::sync::Notify::new()),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -332,6 +343,31 @@ impl StreamSession {
             let max = tx.max_capacity();
             (max.saturating_sub(tx.capacity()), max)
         })
+    }
+
+    /// Enregistre un remplissage observé du canal et dit s'il faut ALERTER.
+    ///
+    /// Rend `true` la PREMIÈRE fois que le canal, après avoir été observé
+    /// PLEIN, est trouvé VIDE — et jamais ensuite. C'est le seul instant qui
+    /// se lit sans ambiguïté : le producteur avait pris de l'avance, il ne
+    /// l'a plus. Un canal vide au DÉMARRAGE ne dit rien (il l'est toujours,
+    /// le temps que le décodeur démarre), et c'est pourquoi la condition
+    /// n'est pas « vide » mais « vide après avoir été plein ».
+    ///
+    /// C'est la trace symétrique de `local_audio_slow_read` (outputs/local.rs)
+    /// : celle-ci dit qu'on a attendu, celle-là dit QUI faisait attendre. Une
+    /// attente de la sortie locale SANS cette ligne dans la même fenêtre
+    /// disculpe le producteur — le canal était plein, les octets étaient là.
+    pub fn note_channel_fill(&self, buffered: usize, max: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if max > 0 && buffered >= max {
+            self.channel_was_full.store(true, Relaxed);
+            return false;
+        }
+        if buffered > 0 || !self.channel_was_full.load(Relaxed) {
+            return false;
+        }
+        !self.dry_alert_emitted.swap(true, Relaxed)
     }
 }
 
@@ -985,6 +1021,51 @@ pub fn build_icy_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un canal VIDE ne prouve rien tant que le producteur n'a jamais été en
+    /// avance : au démarrage il l'est toujours, le temps que le décodeur
+    /// prenne son élan. `note_channel_fill` doit rester muet.
+    #[test]
+    fn un_canal_vide_qui_n_a_jamais_ete_plein_n_alerte_pas() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 4), "vide au démarrage");
+        assert!(!session.note_channel_fill(1, 4), "un morceau en attente");
+        assert!(
+            !session.note_channel_fill(0, 4),
+            "de nouveau vide, jamais plein"
+        );
+        assert!(!session.note_channel_fill(3, 4), "presque plein, pas plein");
+        assert!(!session.note_channel_fill(0, 4), "toujours jamais plein");
+    }
+
+    /// Le seul instant qui se lit sans ambiguïté : le canal a été PLEIN, il
+    /// est maintenant VIDE. Le producteur avait de l'avance, il ne l'a plus.
+    /// Une seule ligne par session — le fait est ponctuel.
+    #[test]
+    fn un_canal_plein_puis_vide_alerte_une_seule_fois() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 4), "démarrage");
+        assert!(!session.note_channel_fill(4, 4), "plein : rien à dire");
+        assert!(
+            session.note_channel_fill(0, 4),
+            "plein puis vide : c'est LÀ que le producteur a lâché"
+        );
+        assert!(!session.note_channel_fill(0, 4), "une seule fois");
+        assert!(!session.note_channel_fill(4, 4), "de nouveau plein");
+        assert!(
+            !session.note_channel_fill(0, 4),
+            "et toujours une seule fois"
+        );
+    }
+
+    /// Un canal de capacité nulle n'existe pas dans le dépôt, mais le verdict
+    /// ne doit pas s'inventer un « plein » à partir d'un maximum de 0.
+    #[test]
+    fn une_capacite_nulle_ne_vaut_pas_plein() {
+        let session = StreamSession::new("s".into(), StreamInfo::default(), false, 4);
+        assert!(!session.note_channel_fill(0, 0));
+        assert!(!session.note_channel_fill(0, 4));
+    }
 
     #[tokio::test]
     async fn create_and_remove_session() {
