@@ -112,7 +112,7 @@ fn where_with_prefix(
     let mut parts: Vec<String> = conds.to_vec();
     parts.push(format!(
         "t.file_path LIKE {like_ph}{}",
-        tune_core::db::track_repo::like_escape_clause(engine)
+        tune_core::db::track_repo::like_escape_clause()
     ));
     (parts.join(" AND "), all)
 }

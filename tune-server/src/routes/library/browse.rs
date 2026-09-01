@@ -48,7 +48,7 @@ pub(super) async fn browse_roots(
             } else {
                 "?1"
             };
-            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
+            let esc = tune_core::db::track_repo::like_escape_clause();
             let count: i64 = match state.backend.query_one(
                 &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
@@ -120,7 +120,7 @@ pub(super) async fn browse_roots(
             } else {
                 "?1"
             };
-            let esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine());
+            let esc = tune_core::db::track_repo::like_escape_clause();
             let count: i64 = state
                 .backend
                 .query_one(
@@ -274,7 +274,7 @@ pub(super) async fn browse_directory(
                             } else {
                                 "?1"
                             },
-                            tune_core::db::track_repo::like_escape_clause(state.backend.engine())
+                            tune_core::db::track_repo::like_escape_clause()
                         ),
                         &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
                     ) {
@@ -338,7 +338,7 @@ pub(super) async fn browse_directory(
                LEFT JOIN artists ar ON t.artist_id = ar.id \
                WHERE t.file_path LIKE {ph}{esc} \
                ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
-        esc = tune_core::db::track_repo::like_escape_clause(state.backend.engine())
+        esc = tune_core::db::track_repo::like_escape_clause()
     );
     let rows = state
         .backend
