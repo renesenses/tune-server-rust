@@ -1578,7 +1578,17 @@ impl OutputTarget for OaatOutput {
                         }
                     };
                     match adaptateur.finish() {
-                        Ok(fin) => pcm_data.extend(fin),
+                        Ok((fin, residu)) => {
+                            if residu > 0 {
+                                warn!(
+                                    device = %device_name,
+                                    residu_octets = residu,
+                                    trame_octets = adaptateur.source_frame_bytes(),
+                                    "oaat: fin de PCM direct sur une trame incomplète, reliquat abandonné"
+                                );
+                            }
+                            pcm_data.extend(fin);
+                        }
                         Err(raison) => {
                             error!(device = %device_name, %raison, "oaat: fin adaptation PCM directe invalide");
                             playing.store(false, Ordering::SeqCst);
@@ -2578,8 +2588,32 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
                             None => {
+                                // Un reliquat de 1 à 3 octets à l'EOF n'est PAS
+                                // un échec de piste : c'est une fraction de
+                                // trame, moins d'un échantillon, sur une piste
+                                // qui vient d'être délivrée en entier. On la
+                                // jette et on le dit — la seule issue possible
+                                // en fin de flux, où le report n'a plus de bloc
+                                // suivant et où compléter par des zéros
+                                // fabriquerait un micro-clic. Elle était traitée
+                                // en `RefusNegociation { reconnectable: false }`,
+                                // ce qui faisait couper la zone au poller et
+                                // sautait, avec le `break`, le rattrapage du
+                                // préchargement, `extraire_payloads_fin_flux`
+                                // (donc LAST_PACKET) et la transition gapless
+                                // déjà armée (#3163, fil 1641).
                                 match adaptateur_pcm.finish() {
-                                    Ok(fin) => buf.extend(fin),
+                                    Ok((fin, residu)) => {
+                                        if residu > 0 {
+                                            warn!(
+                                                device = %device_name,
+                                                residu_octets = residu,
+                                                trame_octets = adaptateur_pcm.source_frame_bytes(),
+                                                "oaat: fin de flux PCM sur une trame incomplète, reliquat abandonné"
+                                            );
+                                        }
+                                        buf.extend(fin);
+                                    }
                                     Err(raison) => {
                                         let refus = RefusNegociation {
                                             stream_id: stream_id.clone(),
@@ -3369,7 +3403,16 @@ pub(crate) fn adapter_piste_directe_gapless(
     };
     let mut adaptateur = construire_adaptateur_pcm(&source, cible)?;
     let mut pcm = adaptateur.push(&piste.pcm)?;
-    pcm.extend(adaptateur.finish()?);
+    let (fin, residu) = adaptateur.finish()?;
+    if residu > 0 {
+        warn!(
+            residu_octets = residu,
+            trame_octets = adaptateur.source_frame_bytes(),
+            title = %piste.title,
+            "oaat: piste directe gapless finissant sur une trame incomplète, reliquat abandonné"
+        );
+    }
+    pcm.extend(fin);
     piste.pcm = pcm;
     piste.format = cible.format;
     piste.sample_rate = cible.sample_rate;

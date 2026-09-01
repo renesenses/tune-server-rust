@@ -75,15 +75,35 @@ pub struct StreamInfo {
 impl StreamInfo {
     /// Calculate the expected WAV file size from audio parameters and duration.
     /// Returns `44 + data_bytes` (WAV header + raw PCM data).
+    ///
+    /// `data_bytes` est **arrondi vers le bas sur une trame entière**. Une
+    /// durée en millisecondes ne tombe presque jamais sur un nombre entier de
+    /// trames : 192 705 ms en 44,1 kHz / 16 bits / stéréo donnent
+    /// 192 705 × 176 400 / 1 000 = 33 993 162 octets, soit 8 498 290 trames
+    /// **plus 2 octets**. Cette longueur est annoncée en `Content-Length` ; le
+    /// client HTTP livre exactement ce nombre d'octets puis signale une fin de
+    /// corps propre, et les 1 à 3 derniers octets ne sont pas de l'audio — ils
+    /// sont une fraction de trame. Côté OAAT, `StreamingPcmByteAdapter::finish()`
+    /// les retrouvait dans son reliquat et faisait échouer la piste APRÈS
+    /// qu'elle a été jouée en entier, ce qui coupait la zone et annulait une
+    /// transition gapless déjà prête (#3163, Steve Taylor, fil 1641 : reliquat
+    /// de 2 octets à 21:57:32, puis de 1 octet à 22:09:29).
+    ///
+    /// Un octet de moins annoncé ne retire aucun audio : ces octets n'existent
+    /// pas dans le flux décodé, la durée réelle diffère de toute façon de la
+    /// durée en bibliothèque.
     pub fn wav_content_length(&self) -> Option<u64> {
         let dur = self.duration_ms?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
         let bytes_per_sample = self.bit_depth as u64 / 8;
-        let data_bytes =
-            dur * self.sample_rate as u64 * self.channels as u64 * bytes_per_sample / 1000;
-        Some(44 + data_bytes)
+        let frame_bytes = self.channels as u64 * bytes_per_sample;
+        if frame_bytes == 0 {
+            return None;
+        }
+        let data_bytes = dur * self.sample_rate as u64 * frame_bytes / 1000;
+        Some(44 + data_bytes - data_bytes % frame_bytes)
     }
 }
 
@@ -1579,6 +1599,66 @@ mod tests {
         };
         let expected = 256_487u64 * 96000 * 2 * 3 / 1000 + 44;
         assert_eq!(info.wav_content_length(), Some(expected));
+    }
+
+    /// La longueur annoncée doit tomber sur une TRAME entière (#3163).
+    ///
+    /// 192 705 ms est la durée en bibliothèque de « Culture Of Fear »
+    /// (Thievery Corporation), la piste du fil 1641. En 44,1 kHz / 16 bits /
+    /// stéréo la formule brute rend 33 993 162 octets, soit 8 498 290 trames
+    /// **plus 2 octets** — exactement le reliquat de 2 octets du journal de
+    /// Steve Taylor. Le client HTTP lit précisément ce `Content-Length`, donc
+    /// ces 2 octets entrent dans l'adaptateur PCM et s'y retrouvent coincés :
+    /// une fraction de trame n'est pas de l'audio.
+    #[test]
+    fn wav_content_length_tombe_sur_une_trame_entiere() {
+        for (duration_ms, sample_rate, bit_depth, channels) in [
+            (192_705u64, 44_100u32, 16u16, 2u16), // reliquat brut de 2 octets
+            (224_774, 44_100, 16, 2),             // reliquat brut de 1 octet
+            (192_705, 96_000, 24, 2),             // trame de 6 octets
+            (1_001, 44_100, 32, 6),               // trame de 24 octets
+        ] {
+            let info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate,
+                bit_depth,
+                channels,
+                file_size: None,
+                duration_ms: Some(duration_ms),
+                ..Default::default()
+            };
+            let frame_bytes = channels as u64 * (bit_depth as u64 / 8);
+            let annoncee = info.wav_content_length().expect("longueur connue");
+            assert_eq!(
+                (annoncee - 44) % frame_bytes,
+                0,
+                "{duration_ms} ms en {sample_rate}/{bit_depth}/{channels} : \
+                 la longueur annoncée coupe au milieu d'une trame de {frame_bytes} octets"
+            );
+            let brute = duration_ms * sample_rate as u64 * frame_bytes / 1000;
+            assert_eq!(
+                annoncee,
+                44 + brute - brute % frame_bytes,
+                "seul le reliquat sous-trame doit disparaître, pas une trame entière"
+            );
+        }
+    }
+
+    /// Le témoin vert : une durée qui tombe déjà juste ne perd pas un octet.
+    #[test]
+    fn wav_content_length_ne_change_rien_quand_la_duree_tombe_juste() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(180_000),
+            ..Default::default()
+        };
+        assert_eq!(info.wav_content_length(), Some(180 * 44100 * 2 * 2 + 44));
     }
 
     // ─── Péremption des sessions : activité, pas âge (#2536) ────────

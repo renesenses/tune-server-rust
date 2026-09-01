@@ -302,9 +302,21 @@ struct StreamingPcmAdapter {
 ///
 /// Network chunks are not required to end on a sample or frame boundary.  The
 /// incomplete tail is therefore retained until the next call, while complete
-/// frames go through the same channel/rate adapter as file decoding.  A final
-/// partial frame is an invalid payload and is reported instead of silently
-/// truncating it.
+/// frames go through the same channel/rate adapter as file decoding.
+///
+/// **En fin de flux, le report n'est plus possible** : il n'y a pas de bloc
+/// suivant auquel préfixer le reliquat. Des trois issues — jeter, compléter par
+/// des zéros, reporter — seule la première tient ici. Un reliquat de 1 à 3
+/// octets est une FRACTION d'échantillon : il ne porte aucune valeur PCM
+/// décodable, le compléter par des zéros fabriquerait un échantillon qui
+/// n'existe pas (donc un micro-clic), et le reporter n'a plus de destinataire.
+/// `finish()` le jette donc et en rend le compte, à charge pour l'appelant de
+/// le journaliser.
+///
+/// Cette fonction rendait une `Err` : une piste jouée INTÉGRALEMENT échouait sur
+/// ses 1 à 2 derniers octets, la sortie OAAT remontait un refus non rejouable,
+/// le poller coupait la zone et la transition gapless déjà armée était annulée
+/// (#3163, Steve Taylor, fil 1641).
 pub(crate) struct StreamingPcmByteAdapter {
     pcm: StreamingPcmAdapter,
     source_bit_depth: u16,
@@ -488,19 +500,23 @@ impl StreamingPcmByteAdapter {
         ))
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, String> {
-        if !self.source_leftover.is_empty() {
-            return Err(format!(
-                "PCM stream ended with {} byte(s) outside a complete {}-byte source frame",
-                self.source_leftover.len(),
-                self.source_frame_bytes
-            ));
-        }
+    /// Taille d'une trame source, en octets — ce qu'un reliquat n'a pas atteint.
+    pub(crate) fn source_frame_bytes(&self) -> usize {
+        self.source_frame_bytes
+    }
+
+    /// Termine le flux.
+    ///
+    /// Rend les octets adaptés restants **et le nombre d'octets source jetés**
+    /// parce qu'ils ne complétaient pas une trame. Ce compte vaut 0 sur un flux
+    /// dont la longueur tombe juste ; l'appelant journalise le cas contraire.
+    pub(crate) fn finish(&mut self) -> Result<(Vec<u8>, usize), String> {
+        // Jeté, pas complété ni reporté : voir la note de type.
+        let residu_abandonne = std::mem::take(&mut self.source_leftover).len();
         let adapted = self.pcm.finish()?;
-        Ok(convert_pcm_bit_depth(
-            &adapted,
-            self.source_bit_depth,
-            self.target_bit_depth,
+        Ok((
+            convert_pcm_bit_depth(&adapted, self.source_bit_depth, self.target_bit_depth),
+            residu_abandonne,
         ))
     }
 }
@@ -4140,7 +4156,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         for byte in &source {
             output.extend(adapter.push(std::slice::from_ref(byte)).unwrap());
         }
-        output.extend(adapter.finish().unwrap());
+        let (fin, residu) = adapter.finish().unwrap();
+        output.extend(fin);
+        assert_eq!(residu, 0, "an aligned stream drops nothing");
         assert_eq!(output, source, "identity adaptation must be byte-for-byte");
     }
 
@@ -4163,7 +4181,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         for chunk in source.chunks(137) {
             output.extend(adapter.push(chunk).unwrap());
         }
-        output.extend(adapter.finish().unwrap());
+        let (fin, residu) = adapter.finish().unwrap();
+        output.extend(fin);
+        assert_eq!(residu, 0, "an aligned stream drops nothing");
 
         assert_eq!(output.len() % 2, 0, "16-bit mono frames must stay aligned");
         assert_eq!(
@@ -4173,15 +4193,85 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         );
     }
 
+    /// Une trame finale incomplète est JETÉE, et comptée (#3163).
+    ///
+    /// Cinq octets ne font pas une trame stéréo 24 bits. Ils ne portent pas non
+    /// plus d'audio : les compléter par des zéros fabriquerait un échantillon
+    /// inventé. `finish()` les abandonne et rend leur nombre, au lieu de faire
+    /// échouer un flux qui a par ailleurs été livré en entier.
     #[test]
-    fn streaming_pcm_bytes_refuse_a_partial_final_frame() {
+    fn streaming_pcm_bytes_abandonne_une_trame_finale_incomplete() {
         let mut adapter = StreamingPcmByteAdapter::new(24, 2, 96_000, 16, 1, 48_000)
             .expect("valid conversion adapter");
+        assert_eq!(adapter.source_frame_bytes(), 6);
         assert!(adapter.push(&[0; 5]).unwrap().is_empty());
-        let error = adapter
+        let (fin, residu) = adapter
             .finish()
-            .expect_err("five bytes are not a stereo 24-bit frame");
-        assert!(error.contains("outside a complete 6-byte source frame"));
+            .expect("cinq octets orphelins ne doivent plus faire échouer le flux");
+        assert_eq!(residu, 5, "le nombre d'octets jetés doit être rendu");
+        assert!(
+            fin.is_empty(),
+            "rien n'a été complété : aucun échantillon inventé, donc aucun clic"
+        );
+    }
+
+    /// La contre-épreuve, sur un fait de base : **un flux dont la longueur
+    /// n'est pas un multiple de la taille d'échantillon aboutit, et le nombre
+    /// d'octets délivrés est celui attendu** (#3163).
+    ///
+    /// L'adaptateur est ici une identité 44,1 kHz / 16 bits / stéréo — le
+    /// format exact du fil 1641, où `Content-Length` livrait 1 à 2 octets
+    /// au-delà de la dernière trame complète.
+    #[test]
+    fn un_residu_de_fin_de_flux_aboutit_et_delivre_les_octets_attendus() {
+        const TRAMES: usize = 1_000;
+        let audio: Vec<u8> = (0..TRAMES * 4).map(|i| (i % 251) as u8).collect();
+
+        // Le témoin : longueur multiple de la trame, rien ne bouge d'un octet.
+        let mut temoin = StreamingPcmByteAdapter::new(16, 2, 44_100, 16, 2, 44_100)
+            .expect("adaptateur identité valide");
+        let mut sortie_temoin = Vec::new();
+        for morceau in audio.chunks(137) {
+            sortie_temoin.extend(temoin.push(morceau).unwrap());
+        }
+        let (fin_temoin, residu_temoin) = temoin.finish().unwrap();
+        sortie_temoin.extend(fin_temoin);
+        assert_eq!(residu_temoin, 0);
+        assert_eq!(sortie_temoin, audio, "un flux aligné est rendu tel quel");
+
+        // 1 puis 2 octets orphelins : les deux reliquats observés en production.
+        for orphelins in [1usize, 2, 3] {
+            let mut flux = audio.clone();
+            flux.extend(std::iter::repeat_n(0xAB, orphelins));
+            assert_ne!(
+                flux.len() % 4,
+                0,
+                "le flux doit justement NE PAS être un multiple de la trame"
+            );
+
+            let mut adapter = StreamingPcmByteAdapter::new(16, 2, 44_100, 16, 2, 44_100)
+                .expect("adaptateur identité valide");
+            let mut sortie = Vec::new();
+            for morceau in flux.chunks(137) {
+                sortie.extend(adapter.push(morceau).unwrap());
+            }
+            let (fin, residu) = adapter
+                .finish()
+                .expect("un reliquat sous-trame ne doit pas faire échouer le flux");
+            sortie.extend(fin);
+
+            assert_eq!(residu, orphelins, "le compte de ce qui est jeté");
+            assert_eq!(
+                sortie.len(),
+                TRAMES * 4,
+                "le nombre d'octets délivrés est celui des trames complètes"
+            );
+            assert_eq!(
+                sortie, sortie_temoin,
+                "le contenu audio délivré est identique au témoin, au reliquat près : \
+                 rien n'est décalé, rien n'est complété, donc aucun clic"
+            );
+        }
     }
 
     #[test]
