@@ -46,6 +46,29 @@ fn systemctl_bin() -> String {
     std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into())
 }
 
+/// L'unique argument passé au binaire d'extinction.
+///
+/// `systemctl poweroff` plutôt que `shutdown -h now` : c'est l'ordre que
+/// systemd comprend sans passer par un shell, et il rend la main tout de
+/// suite.
+const POWEROFF_ARG: &str = "poweroff";
+
+/// Envoyer l'ordre d'extinction — **le binaire est un paramètre**.
+///
+/// Isolé du handler exprès : c'est la seule façon d'éprouver « la route
+/// appelle bien la commande d'extinction, avec cet argument » sans éteindre
+/// la machine de test. Le chemin est passé en argument et **non lu de
+/// l'environnement ici** : `TUNE_SYSTEMCTL_BIN` est une variable de
+/// PROCESSUS, un test qui la poserait ferait dérailler les essais voisins du
+/// même binaire.
+async fn issue_poweroff(bin: &str) -> Result<(), String> {
+    match Command::new(bin).arg(POWEROFF_ARG).output().await {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Éteindre la machine — **uniquement sur l'appliance**.
 ///
 /// Demandé par GgB (fil forum #1511), appuyé par Benjithom : « dans le cas de
@@ -69,17 +92,13 @@ async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppE
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(500)).await;
         tracing::info!("appliance_shutdown_requested");
-        // `systemctl poweroff` plutôt que `shutdown -h now` : c'est l'ordre que
-        // systemd comprend sans passer par un shell, et il rend la main tout de
-        // suite. L'image Tune OS tourne son service en root — ailleurs, la
-        // route n'est de toute façon pas montée.
-        match Command::new(systemctl_bin()).arg("poweroff").output().await {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                tracing::warn!(error = %err, "appliance_shutdown_failed");
-            }
-            Err(e) => tracing::warn!(error = %e, "appliance_shutdown_command_failed"),
+        // L'image Tune OS tourne son service en root — ailleurs, la route
+        // n'est de toute façon pas montée. Si l'ordre échoue quand même
+        // (droits, polkit), la réponse HTTP est déjà partie : le journal est
+        // le SEUL endroit où l'échec apparaît. C'est pourquoi les trois
+        // images appliance doivent lancer le service en root, garde ci-dessous.
+        if let Err(err) = issue_poweroff(&systemctl_bin()).await {
+            tracing::warn!(error = %err, "appliance_shutdown_failed");
         }
     });
 
@@ -501,11 +520,134 @@ mod tests {
         assert_eq!(systemctl_bin(), "systemctl");
     }
 
+    // `la_route_d_extinction_est_montee` a ete RETIRE : il affirmait
+    // `format!("{:?}", router()).contains("Router")`, ce qui est vrai d'un
+    // `Router::new()` VIDE. Il serait reste vert apres suppression de la
+    // route. Le montage reel est desormais eprouve par la requete elle-meme,
+    // dans tests/appliance.rs (`extinction_montee_et_gardee_par_l_auth`).
+
+    /// Un bouchon qui NOTE ses arguments au lieu d'eteindre quoi que ce soit.
+    /// Rend le dossier avec le chemin : sans lui, le repertoire disparait a la
+    /// sortie de la fonction et le bouchon avec (lecon de #3030).
+    #[cfg(unix)]
+    fn bouchon_systemctl(
+        code_sortie: i32,
+    ) -> (
+        tune_core::test_scratch::ScratchDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tune_core::test_scratch::scratch_dir("tune-poweroff-test");
+        let bin = dir.join("systemctl-bouchon.sh");
+        let trace = dir.join("argv.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$*\" > {}\necho 'refuse' 1>&2\nexit {}\n",
+            trace.display(),
+            code_sortie
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin, trace)
+    }
+
+    /// LE fait de base : l'ordre envoye est `poweroff`, et rien d'autre.
+    ///
+    /// On n'appelle jamais le vrai `systemctl` — le bouchon ecrit sa ligne de
+    /// commande dans un fichier, et c'est ce fichier qu'on relit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l_extinction_envoie_exactement_poweroff() {
+        let (_garde, bin, trace) = bouchon_systemctl(0);
+        let issue = issue_poweroff(bin.to_str().unwrap()).await;
+        assert!(
+            issue.is_ok(),
+            "un bouchon qui rend 0 est un succes : {issue:?}"
+        );
+        let argv =
+            std::fs::read_to_string(&trace).expect("le binaire d'extinction n'a JAMAIS ete lance");
+        assert_eq!(
+            argv, "poweroff",
+            "l'unique argument doit etre `poweroff` — ni `-h`, ni `now`"
+        );
+        assert_eq!(POWEROFF_ARG, "poweroff");
+    }
+
+    /// Le motif « 200 pour rien » : sur une image dont le service ne tourne pas
+    /// en root, `systemctl poweroff` est refuse et la reponse HTTP est deja
+    /// partie. On ne peut plus la rattraper, mais l'echec doit au moins
+    /// REMONTER de la couche commande, pour finir dans le journal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn une_extinction_refusee_ne_passe_pas_pour_un_succes() {
+        let (_garde, bin, _trace) = bouchon_systemctl(1);
+        let issue = issue_poweroff(bin.to_str().unwrap()).await;
+        assert_eq!(
+            issue,
+            Err("refuse".to_string()),
+            "un code de sortie non nul doit remonter le stderr, pas Ok(())"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn un_binaire_d_extinction_absent_remonte_l_erreur() {
+        let issue = issue_poweroff("/n/existe/pas/systemctl").await;
+        assert!(issue.is_err(), "un binaire absent n'eteint rien");
+    }
+
+    // --- Les images appliance : marqueur ET privileges (#2135) ---
+    //
+    // GgB demandait un bouton d'extinction « dans le cas de Tune OS sur un PC
+    // dedie ». La route existe, l'ecran aussi ; sur l'image Raspberry Pi 4
+    // rien ne s'affichait, parce que le constructeur d'image ne posait pas
+    // /etc/tune-appliance — `is_appliance()` faux, /api/v1/appliance/* en 404.
+    // Et l'y poser seul aurait fabrique un « 200 pour rien » : son service
+    // tournait sous `User=tune`, incapable d'appeler `systemctl poweroff`.
+    //
+    // Les deux faits sont lus dans les scripts eux-memes : une image qui
+    // oublie l'un des deux ne se voit qu'a la mise en service, sur une machine
+    // sans clavier ni ecran.
+    const CONSTRUCTEURS_D_IMAGE: [(&str, &str); 3] = [
+        (
+            "build-nuc-image.sh",
+            include_str!("../../../image/build-nuc-image.sh"),
+        ),
+        (
+            "build-rpi4-image.sh",
+            include_str!("../../../image/build-rpi4-image.sh"),
+        ),
+        (
+            "build-sunxi-image.sh",
+            include_str!("../../../image/build-sunxi-image.sh"),
+        ),
+    ];
+
     #[test]
-    fn la_route_d_extinction_est_montee() {
-        // Un bouton qui appelle une route absente est pire que pas de bouton :
-        // l'ecran promet, le serveur rend 404.
-        let rendu = format!("{:?}", router());
-        assert!(rendu.contains("Router"), "le routeur se construit");
+    fn chaque_image_appliance_pose_le_marqueur() {
+        for (nom, source) in CONSTRUCTEURS_D_IMAGE {
+            assert!(
+                source.contains("/etc/tune-appliance\""),
+                "{nom} ne pose pas {APPLIANCE_MARKER} : sur cette image, tout \
+                 /api/v1/appliance/* rend 404 — ni bouton « Eteindre », ni \
+                 configuration WiFi depuis l'interface web"
+            );
+        }
+    }
+
+    #[test]
+    fn chaque_image_appliance_lance_le_service_en_root() {
+        for (nom, source) in CONSTRUCTEURS_D_IMAGE {
+            assert!(
+                source.contains("\nUser=root\n"),
+                "{nom} lance tune.service sous un compte non privilegie : le \
+                 marqueur ferait apparaitre le bouton, `systemctl poweroff` \
+                 serait refuse, et la route aurait deja repondu 200"
+            );
+            assert!(
+                !source.contains("\nUser=tune\n"),
+                "{nom} garde un `User=tune` pour tune.service"
+            );
+        }
     }
 }
