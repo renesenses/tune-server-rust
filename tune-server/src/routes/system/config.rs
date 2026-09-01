@@ -205,6 +205,28 @@ pub(super) fn refus_backend_actif() -> String {
     )
 }
 
+/// Le message rendu à qui règle un backend que CETTE machine ne sait pas
+/// ouvrir : ce qui aurait eu lieu, et la liste des valeurs acceptées ici.
+///
+/// #1268 — le serveur publie la liste vraie depuis #2806, mais le sélecteur du
+/// client web écrit toujours ses trois choix en dur (Auto/WASAPI/ASIO). Un
+/// testeur sous Debian ou Fedora peut donc encore demander WASAPI, et le
+/// serveur ne peut pas l'en empêcher depuis ici. Il peut en revanche refuser de
+/// RETENIR un réglage qu'il n'honorera jamais, et dire lesquels il honore.
+#[cfg(feature = "local-audio")]
+pub(super) fn refus_backend_non_supporte(demande: &str) -> String {
+    let acceptes: Vec<&str> = tune_core::outputs::local::supported_backends()
+        .iter()
+        .map(|b| b.value)
+        .collect();
+    let acceptes = acceptes.join(", ");
+    format!(
+        "'local_audio_backend' value '{demande}' is not available on this server's platform: the \
+         local output would silently fall back to the default host and the setting would be shown \
+         back as 'auto'. Accepted here: {acceptes} — the same list published as \
+         'supported_audio_backends' in GET /system/config."
+    )
+}
 pub(super) async fn get_config(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
@@ -708,6 +730,28 @@ pub(super) async fn update_config(
     // quoi envoyer.
     if values.contains_key(BACKEND_ACTIF_PAS_UN_REGLAGE) {
         return Err(AppError::bad_request(refus_backend_actif()));
+    }
+    // #1268 — et la même discipline pour le RÉGLAGE lui-même : une valeur que
+    // la plateforme du serveur ne peut pas ouvrir n'est plus retenue.
+    //
+    // Elle l'était : la ligne s'installait en base, `select_host` ouvrait le
+    // host par défaut, et `GET /system/config` la ramenait à `auto` dans sa
+    // réponse — sans un mot. Le choix du testeur disparaissait donc en
+    // silence, ce qui est exactement ce que le ticket demandait de trancher
+    // (« refusé, ignoré, ou plus de son ? »). Il est désormais refusé, et le
+    // refus nomme les valeurs acceptables ICI.
+    //
+    // Rien n'est réécrit en base : une ligne héritée d'une machine Windows
+    // reste, et le diagnostic continue de la rapporter telle quelle (#1395).
+    #[cfg(feature = "local-audio")]
+    if let Some(demande) = values.get("local_audio_backend").and_then(|v| v.as_str())
+        && !demande.trim().is_empty()
+        && !tune_core::outputs::local::backend_value_is_supported(demande.trim())
+    {
+        tracing::warn!(demande = %demande, "reglage_backend_non_supporte_refuse");
+        return Err(AppError::bad_request(refus_backend_non_supporte(
+            demande.trim(),
+        )));
     }
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
