@@ -247,6 +247,14 @@ async fn sso_callback(
         .set_account_premium(user.premium, user.license_expires_at.clone())
         .await;
 
+    // Droits de MODULE payants (SKU distincts du palier, ex. la sortie
+    // Diretta). Ils voyagent avec le compte, jamais avec la clé : sans cet
+    // appel, `set_modules` n'avait qu'un seul appelant — le battement de fond
+    // (`background.rs`, HEARTBEAT_INTERVAL = 1 h). Un compte qui vient d'être
+    // lié s'entendait donc répondre « module_not_owned / purchase_module »
+    // pendant une heure pour un module qu'il possède (#2138).
+    state.license.set_modules(user.modules.clone()).await;
+
     // Qobuz endpoint order (founder flag): persist and push into the live
     // QobuzService so the order applies without a restart.
     state
