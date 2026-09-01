@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -17,8 +17,29 @@ pub fn is_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Le cache d'icônes de notification, sous `temp_dir()`.
+///
+/// En exploitation, le dossier doit survivre au processus : c'est un cache,
+/// et le vider à chaque démarrage retélécharge chaque pochette. Le geste est
+/// donc légitime ICI.
 fn icon_cache_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("tune-notify-icons");
+    icon_cache_dir_in(std::env::temp_dir())
+}
+
+/// Le même, sous une racine imposée.
+///
+/// La racine est un paramètre **pour le test** : `icon_cache_dir_exists`
+/// appelait l'autre, donc créait pour de bon `/tmp/tune-notify-icons` et le
+/// laissait derrière lui. C'était le dernier résidu d'une passe complète de
+/// la suite au 01/09/2026, et le seul que le garde de #3030 ne pouvait pas
+/// nommer : le `temp_dir()` fautif n'est pas dans du code de test, il est
+/// ici, dans du code de production que le test appelle. Un garde de source
+/// lit les tests ; il ne suit pas les appels.
+///
+/// Le test passe désormais un `ScratchDir`, qui emporte le dossier en
+/// sortant de portée.
+fn icon_cache_dir_in(racine: impl AsRef<Path>) -> PathBuf {
+    let dir = racine.as_ref().join("tune-notify-icons");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -188,10 +209,20 @@ pub fn spawn_notification_listener(
 mod tests {
     use super::*;
 
+    /// Le cache est bien CRÉÉ, et sous la racine qu'on lui donne.
+    ///
+    /// La racine est un `ScratchDir` : ce test appelait `icon_cache_dir()`,
+    /// donc créait `/tmp/tune-notify-icons` pour de vrai et l'y laissait
+    /// (#3030). Vérifier `starts_with` n'est pas décoratif — c'est ce qui
+    /// interdit qu'on « répare » la fuite en rendant un chemin que la
+    /// fonction ne crée plus.
     #[test]
     fn icon_cache_dir_exists() {
-        let dir = icon_cache_dir();
-        assert!(dir.exists());
+        let racine = crate::test_scratch::scratch_dir("tune-notify-cache");
+        let dir = icon_cache_dir_in(&racine);
+        assert!(dir.is_dir(), "cache d'icônes non créé : {dir:?}");
+        assert!(dir.starts_with(racine.path()), "cache hors de sa racine");
+        assert_eq!(dir.file_name().unwrap(), "tune-notify-icons");
     }
 
     #[cfg(target_os = "macos")]
