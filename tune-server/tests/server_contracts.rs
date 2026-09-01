@@ -61,6 +61,8 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
+#[path = "playlist_manager_cloisonnement_par_profil.rs"]
+mod playlist_manager_cloisonnement_par_profil;
 #[path = "playlists_cloisonnement_par_profil.rs"]
 mod playlists_cloisonnement_par_profil;
 #[path = "playlists_ecritures_partielles.rs"]

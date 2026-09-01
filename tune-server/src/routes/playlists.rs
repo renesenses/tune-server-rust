@@ -104,7 +104,13 @@ pub fn router() -> Router<AppState> {
 /// donc sur cette lecture cloisonnée. Le propriétaire d'une playlist ne change
 /// jamais — aucune route ne transfère `profile_id` —, la fenêtre entre la
 /// vérification et l'écriture n'ouvre donc sur rien.
-fn owned_or_404(
+///
+/// `pub(crate)` : les mêmes accès par id existent hors de ce module —
+/// `playlist_manager` (transfert, fusion, export, synchronisation d'un lien) et
+/// `playback` (`playlist_id` dans le corps de `POST /zones/{id}/play`). Un
+/// second point de refus serait un second endroit où se tromper de code de
+/// statut ; ils passent tous par celui-ci.
+pub(crate) fn owned_or_404(
     repo: &PlaylistRepo,
     id: i64,
     profile_id: i64,
@@ -118,7 +124,7 @@ fn owned_or_404(
 
 /// Variante pour les handlers qui rendent `impl IntoResponse` plutôt qu'un
 /// `Result<_, AppError>`.
-fn owned_or_404_response(
+pub(crate) fn owned_or_404_response(
     repo: &PlaylistRepo,
     id: i64,
     profile_id: i64,
