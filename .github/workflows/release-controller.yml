@@ -35,19 +35,37 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run }}
       CONTROLLER_ENABLED: ${{ vars.RELEASE_CONTROLLER_ENABLED }}
     steps:
+      # Premiere etape, avant meme le checkout : sans ce secret, aucune suite
+      # n'a de sens. `github.token` est limite au depot courant et rend 404
+      # sur `tune-os` et `tune-server-universal`, qui sont prives — un repli
+      # sur lui ne verifierait que la moitie du train tout en se declarant
+      # vert. On refuse ici plutot que de deviner plus loin.
+      - name: Exiger le jeton du controleur
+        env:
+          CONTROLLER_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$CONTROLLER_TOKEN" ]; then
+            echo "::error::secret RELEASE_CONTROLLER_TOKEN absent."
+            echo "::error::Le controleur lit les quatre depots, dont deux prives"
+            echo "::error::(tune-os, tune-server-universal). Le jeton d'action ne"
+            echo "::error::les voit pas : sans ce secret, le train ne peut etre"
+            echo "::error::ni verifie ni tague. Poser un jeton portant 'repo' sur"
+            echo "::error::les quatre depots, puis relancer."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Valider et resoudre le manifeste
         env:
-          # `github.token` est limite au depot courant : il rend 404 sur
-          # `tune-os` et `tune-server-universal`, qui sont prives. La
-          # validation lit les quatre `main` — elle ne peut donc PAS se
-          # contenter du jeton d'action, y compris en dry-run. Sans cela le
-          # controleur s'arrete sur le troisieme composant, et un dry-run qui
-          # ne verifie que la moitie du train ne verifie rien.
-          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN || github.token }}
+          # Pas de repli sur `github.token` : il rend 404 sur les deux depots
+          # prives, et la garde « Exiger le jeton du controleur » a deja
+          # refuse le cas ou le secret manque.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -144,34 +162,54 @@ jobs:
 
       - name: Creer les quatre tags
         env:
-          # Meme jeton en dry-run et en tir reel. Avec `github.token`, la
-          # lecture d'un tag existant sur `tune-os` ou
-          # `tune-server-universal` rend 404 faute de droits — et
-          # `cible_tag()` traite un echec comme « aucun tag n'existe ».
-          # Un tag DIVERGENT sur un depot prive serait donc invisible, en
-          # silence, exactement dans l'etape censee le detecter.
-          # C'est l'environnement qui separe les pouvoirs, pas le workflow :
-          # `release-dry-run` porte un jeton en lecture seule,
-          # `release` un jeton en ecriture, sous approbation.
-          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN || github.token }}
+          # Meme jeton en dry-run et en tir reel. Pas de repli sur
+          # `github.token` : il rend 404 sur les deux depots prives, et un
+          # 404 est indiscernable de « le tag n'existe pas ». Un tag
+          # DIVERGENT y serait alors invisible, en silence, dans l'etape
+          # meme censee le detecter. La garde en tete de job refuse deja le
+          # cas ou le secret manque.
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
+          # Trois issues distinctes, jamais confondues :
+          #   0  le tag existe, son SHA est ecrit sur la sortie standard
+          #   1  le tag n'existe pas, et on a la preuve que le depot est lisible
+          #   2  l'API a refuse — on ne sait RIEN, il faut s'arreter
+          #
+          # Sur un depot prive, GitHub rend 404 aussi bien pour « ce tag
+          # n'existe pas » que pour « ce jeton n'a pas acces ». Le seul appel
+          # sur la ref ne permet donc pas de conclure : on verifie que le
+          # depot lui-meme est lisible avant d'oser dire « aucun tag ».
           cible_tag() {
             local repo="$1" tag="$2" objet type
-            objet="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)" || return 1
-            type="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.type)"
-            if [ "$type" = tag ]; then
-              gh api "repos/$repo/git/tags/$objet" --jq .object.sha
-            else
-              printf '%s\n' "$objet"
+            if objet="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha 2>/dev/null)"; then
+              type="$(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.type)"
+              if [ "$type" = tag ]; then
+                gh api "repos/$repo/git/tags/$objet" --jq .object.sha
+              else
+                printf '%s\n' "$objet"
+              fi
+              return 0
             fi
+            if ! gh api "repos/$repo" --jq .full_name >/dev/null 2>&1; then
+              echo "::error::$repo: depot illisible par RELEASE_CONTROLLER_TOKEN." >&2
+              echo "::error::Impossible de dire si $tag existe deja : un tag divergent" >&2
+              echo "::error::passerait inapercu. Le jeton doit porter 'repo' sur les" >&2
+              echo "::error::quatre depots du train." >&2
+              return 2
+            fi
+            return 1
           }
 
           assurer_tag() {
-            local name="$1" repo="$2" sha="$3" tag="$4" existant
-            if existant="$(cible_tag "$repo" "$tag")"; then
+            local name="$1" repo="$2" sha="$3" tag="$4" existant relu etat
+            existant="$(cible_tag "$repo" "$tag")" && etat=0 || etat=$?
+            if [ "$etat" -ge 2 ]; then
+              exit 1
+            fi
+            if [ "$etat" -eq 0 ]; then
               if [ "$existant" != "$sha" ]; then
                 echo "::error::$repo:$tag pointe sur $existant au lieu de $sha"
                 exit 1
@@ -185,10 +223,13 @@ jobs:
             fi
             gh api --method POST "repos/$repo/git/refs" \
               -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
-            [ "$(cible_tag "$repo" "$tag")" = "$sha" ] || {
-              echo "::error::$repo:$tag n'est pas verifiable apres creation"
+            # La relecture doit rendre 0 : apres un POST reussi, « absent »
+            # (1) comme « illisible » (2) sont tous deux des echecs.
+            relu="$(cible_tag "$repo" "$tag")" && etat=0 || etat=$?
+            if [ "$etat" -ne 0 ] || [ "$relu" != "$sha" ]; then
+              echo "::error::$repo:$tag n'est pas verifiable apres creation (etat=$etat, relu=${relu:-neant})"
               exit 1
-            }
+            fi
             echo "$name: $tag cree sur $sha"
           }
 
