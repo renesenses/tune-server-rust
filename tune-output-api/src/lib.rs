@@ -624,11 +624,18 @@ pub trait OutputTarget: Send + Sync {
     ///
     /// Push-based outputs do their work on a background thread: by the time
     /// the device refuses to open, `play_url()` has long since returned `Ok`.
-    /// Without a channel like this one the failure stays invisible until the
-    /// poller's stall heuristics give up — roughly 73 seconds later — and
-    /// meanwhile the UI shows a track advancing in total silence (Yacine,
-    /// 8 Aug 2026: a DAC his account had no permission to open, and an hour
-    /// spent looking for the cause because nothing said so).
+    /// Without a channel like this one the failure stays invisible while the
+    /// UI shows a track advancing in total silence (Yacine, 8 Aug 2026: a DAC
+    /// his account had no permission to open, and an hour spent looking for
+    /// the cause because nothing said so).
+    ///
+    /// This doc used to promise a safety net that does not exist for a local
+    /// output: "the poller's stall heuristics give up — roughly 73 seconds
+    /// later". Measured on #3108: the frozen-position watchdog
+    /// (`dlna_playing_stall_eligible`) is gated on `output_type == "dlna"`, so
+    /// a local zone whose position stops advancing is caught by NOTHING and
+    /// stays "playing" forever. This channel is not a shortcut to a slower
+    /// path — for a local output it is the ONLY path.
     ///
     /// The message is user-facing and returned **once**: the implementation
     /// clears it, so the caller owns it and no stale error can kill the next
