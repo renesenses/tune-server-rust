@@ -375,17 +375,14 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
             "job {nom} : les crates HTTP extraites ne sont plus testees explicitement"
         );
     }
-    for nom in [
-        "test-shipped-features",
-        "audio-embedding",
-        "windows-pr",
-        "macos-pr",
-    ] {
+    for nom in ["test-shipped-features", "audio-embedding"] {
         assert!(
             corps(nom).contains("needs.impact.outputs.full == 'true'"),
             "suite complete {nom} encore lancee sur chaque correctif du lot"
         );
     }
+    // `windows-pr` et `macos-pr` ont QUITTE cette liste (#3123) : voir
+    // `les_deux_plateformes_compilent_sur_toute_pr_rust`, qui exige l'inverse.
 
     let livraison = corps("build");
     assert!(livraison.contains("if: github.event_name != 'pull_request'"));
@@ -622,7 +619,7 @@ fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
             .lines()
             .filter(|ligne| {
                 ligne.trim()
-                    == "run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres,oaat"
+                    == "run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat"
             })
             .count(),
         1,
@@ -690,6 +687,175 @@ fn toute_porte_cargo_test_va_jusqu_au_bout() {
         vues >= 10,
         "seulement {vues} portes `cargo test` reperees : le detecteur ne voit \
          plus les lignes qu'il doit garder"
+    );
+}
+
+/// Contre-epreuve de #3123, porte 1 : Windows et macOS compilent sur TOUTE PR
+/// qui touche du Rust.
+///
+/// Ce que la condition `full` a coute, mesure : `rand_core::OsRng` appele depuis
+/// `tune-core/src/db/album_repo.rs` (93186f81, #3074) alors que la caisse n'est
+/// declaree que sous `[target.'cfg(unix)'.dependencies]`. Une PR vers `batch/*`
+/// ne porte pas `full` : le defaut a traverse sa propre PR, le lot ET la RC sans
+/// une seule compilation Windows, et n'a rougi qu'a la promotion vers main, ou
+/// il a arrete le train de la 0.9.130.
+///
+/// Le compte minimal est delibere, comme dans le garde de #3098 : un detecteur
+/// qui ne repere plus aucun job passerait a vide.
+#[test]
+fn les_deux_plateformes_compilent_sur_toute_pr_rust() {
+    let source = workflow("ci.yml");
+    let jobs = jobs(&source);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+
+    let mut vus = 0usize;
+    for nom in ["windows-pr", "macos-pr"] {
+        let job = corps(nom);
+        vus += 1;
+        assert!(
+            job.contains("needs.impact.outputs.rust == 'true'"),
+            "{nom} ne suit plus le verdict d impact"
+        );
+        assert!(
+            !job.contains("needs.impact.outputs.full"),
+            "{nom} est de nouveau reserve aux PR `full` : une PR de lot ne \
+             serait plus compilee sur cette plateforme, et c'est exactement \
+             comment #3074 a traverse le lot et la RC"
+        );
+    }
+    assert_eq!(
+        vus, 2,
+        "le detecteur ne voit plus les deux jobs de plateforme qu'il garde"
+    );
+
+    // Rien n'est RETIRE : les deux jobs gardent leurs configurations, et
+    // `release-gate` continue de les exiger verts pour promouvoir vers main.
+    let windows = corps("windows-pr");
+    assert!(windows.contains("--features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm"));
+    assert!(
+        windows
+            .contains("--features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
+    );
+    assert!(corps("macos-pr").contains("cargo check --package tune-server"));
+    let porte = corps("release-gate");
+    for nom in ["windows-pr", "macos-pr"] {
+        assert!(
+            porte.contains(&format!("- {nom}")),
+            "release-gate n'exige plus {nom}"
+        );
+    }
+}
+
+/// Contre-epreuve de #3123, porte 2 : PostgreSQL execute aussi `tune-server`,
+/// et ne saute plus les PR de lot qui touchent du Rust.
+///
+/// Ce que le trou a coute, mesure : les deux requetes de « Continuer l'ecoute »
+/// (#2441) vivaient dans `tune-server`, que ce workflow ne compilait pas. Elles
+/// n'avaient donc jamais tourne sur PostgreSQL. L'une calculait un pourcentage
+/// en SQL : `total = 0` rend `NULL` sur SQLite et leve `division by zero` sur
+/// PostgreSQL. C'est l'angle mort de #2860, rejoue une release plus tard.
+///
+/// Compte du 01/09/2026 sur les 100 dernieres executions du workflow : sur 98
+/// declenchements de PR, **73 sautes**, 23 reussis, 2 annules.
+#[test]
+fn postgresql_execute_les_requetes_de_tune_server() {
+    let postgres = workflow("test-postgres.yml");
+
+    // a) Les trois clauses de #2808 sont INTACTES — la promotion `rc/* -> main`
+    //    sans une ligne de Rust reste couverte — et une quatrieme s'y ajoute.
+    assert!(postgres.contains("github.event_name != 'pull_request'"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'batch/')"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'rc/')"));
+    assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
+    assert!(
+        postgres.contains("|| needs.impact.outputs.rust == 'true'"),
+        "une PR de correctif vers batch/* ou rc/* saute encore PostgreSQL en \
+         entier, alors que c'est la que le SQL des P2 s'ecrit"
+    );
+    // Le temoin vert de l'autre cote : la PR qui ne touche aucun Rust ne doit
+    // rien declencher de lourd, donc le classifieur reste en place et garde sa
+    // propre contre-epreuve.
+    assert!(postgres.contains("bash scripts/detecter-impact-ci.sh --autotest"));
+
+    // b) Les paquets reellement exerces sur PostgreSQL, comptes dans le
+    //    fichier. Avant #3123 : `tune-core` seul, sur les six etapes.
+    let mut lignes = 0usize;
+    let mut paquets: Vec<&str> = Vec::new();
+    for ligne in postgres.lines() {
+        let nue = ligne.trim();
+        let Some(commande) = nue.strip_prefix("run: ") else {
+            continue;
+        };
+        if !commande.starts_with("cargo test ") {
+            continue;
+        }
+        lignes += 1;
+        let mots: Vec<&str> = commande.split_whitespace().collect();
+        for (index, mot) in mots.iter().enumerate() {
+            if *mot == "-p" {
+                if let Some(paquet) = mots.get(index + 1) {
+                    if !paquets.contains(paquet) {
+                        paquets.push(paquet);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        lignes >= 7,
+        "seulement {lignes} etapes `cargo test` reperees dans test-postgres.yml : \
+         le detecteur ne voit plus ce qu'il doit compter"
+    );
+    paquets.sort_unstable();
+    assert_eq!(
+        paquets,
+        ["tune-core", "tune-server"],
+        "l'inventaire des paquets joues sur PostgreSQL a change : on n'en retire \
+         jamais, et `tune-server` doit y rester — c'est la que vivent les \
+         requetes des routes"
+    );
+
+    // c) L'etape qui EXECUTE ces requetes, avec une base vivante.
+    assert!(
+        postgres.contains("--test pg_routes_serveur"),
+        "l'epreuve des routes de tune-server sur PostgreSQL a disparu"
+    );
+    let etape = postgres
+        .split("--test pg_routes_serveur")
+        .nth(1)
+        .expect("etape pg_routes_serveur");
+    assert!(
+        etape.contains("--test-threads=1"),
+        "les TRUNCATE CASCADE de l'epreuve s'interbloquent en parallele"
+    );
+    assert!(
+        postgres.matches("TUNE_TEST_PG_URL: postgresql://").count() >= 6,
+        "une etape PostgreSQL a perdu sa base vivante : `pg_or_skip!` la sauterait \
+         en silence"
+    );
+
+    // Le test lui-meme doit exister et etre DECLARE : `tune-server` porte
+    // `autotests = false`, donc un fichier non inscrit ne se compile jamais.
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        racine.join("tests/pg_routes_serveur.rs").is_file(),
+        "tune-server/tests/pg_routes_serveur.rs absent"
+    );
+    let manifeste =
+        fs::read_to_string(racine.join("Cargo.toml")).expect("tune-server/Cargo.toml lisible");
+    assert!(
+        manifeste.contains("name = \"pg_routes_serveur\""),
+        "cible de test pg_routes_serveur non declaree : avec autotests = false, \
+         le fichier ne serait JAMAIS compile"
+    );
+    assert!(
+        manifeste.contains("required-features = [\"postgres\"]"),
+        "pg_routes_serveur doit exiger la feature postgres"
     );
 }
 

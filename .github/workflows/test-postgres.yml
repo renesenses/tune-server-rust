@@ -3,16 +3,20 @@ name: Tests (PostgreSQL)
 # Dual-engine test workflow.
 #
 # The default `cargo test` covers SQLite. This workflow boots a real
-# PostgreSQL 16 server and runs the `tune-core` tests with the
-# `postgres` feature enabled. It currently only exercises the
-# PostgresDb smoke tests (ping + version); per-repo PG tests will be
-# added as repos are migrated in subsequent phases.
+# PostgreSQL 16 server and runs the `tune-core` AND `tune-server` tests with the
+# `postgres` feature enabled.
+#
+# `tune-server` depuis #3123 : c'est la que vivent les requetes des ROUTES, et
+# elles n'avaient jamais ete jouees sur PostgreSQL.
 
 on:
   push:
     branches: [main, release/v0.9, "feature/postgres-support"]
     paths:
       - "tune-core/**"
+      # #3123 : sans cette ligne, un push qui ne touche que `tune-server` ne
+      # declenchait pas ce workflow — alors qu'il porte desormais les routes.
+      - "tune-server/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/test-postgres.yml"
@@ -33,21 +37,79 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Meme classifieur que ci.yml, meme script, meme contre-epreuve. Il n'existe
+  # ici que pour armer PostgreSQL sur les PR de lot QUI TOUCHENT DU RUST, sans
+  # le rearmer sur une PR de documentation vers `batch/*`.
+  #
+  # Il ne calcule PAS `full` : ce job ne se decide plus sur le profil.
+  impact:
+    name: Impact (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.classer.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classer le diff
+        id: classer
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Fail-closed comme ci.yml : hors PR, base introuvable ou diff
+          # impossible, on declare l'impact Rust et le job PostgreSQL tourne.
+          if [ "$EVENEMENT" != pull_request ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "base du diff introuvable : impact Rust par securite"
+            exit 0
+          fi
+          if ! git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" > /tmp/chemins-pg; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "diff impossible : impact Rust par securite"
+            exit 0
+          fi
+          if bash scripts/detecter-impact-ci.sh < /tmp/chemins-pg; then
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Contre-épreuve du classifieur
+        run: bash scripts/detecter-impact-ci.sh --autotest
+
   test-postgres:
     name: Test (PostgreSQL)
-    # Une PR de correctif vers batch/* ou rc/* garde le noyau Rust de ci.yml.
-    # Cette suite revient sur la promotion vers main ou des que ci:full
-    # l'exige.
-    #
+    needs: impact
     # Consequence de la levee du filtre `paths` : toute PR vers `main` passe
     # ici, y compris une promotion `rc/* -> main` qui ne touche aucun fichier
-    # Rust. C'est exactement le trou que #2808 demandait de fermer.
+    # Rust. C'est exactement le trou que #2808 demandait de fermer, et les trois
+    # premieres clauses ci-dessous sont celles de #2808, INTACTES.
+    #
+    # La quatrieme est neuve (#3123). Une PR de correctif vers `batch/*` ou
+    # `rc/*` sautait PostgreSQL en entier : c'est la que vivent les P2, donc la
+    # que le SQL s'ecrit, et il n'etait jamais joue sur PG avant la promotion.
+    # Elle s'ajoute en UNION : rien de ce qui tournait avant ne cesse de tourner
+    # — une promotion `rc/* -> main` sans une ligne de Rust reste couverte par
+    # la deuxieme clause, comme #2808 l'exige. Ce qui s'ajoute, c'est la PR de
+    # lot qui touche du Rust. Une PR de lot qui ne touche QUE de la
+    # documentation reste hors de ce job : les quatre clauses sont fausses.
     if: >-
       github.event_name != 'pull_request'
       || (!startsWith(github.base_ref, 'batch/') && !startsWith(github.base_ref, 'rc/'))
       || contains(github.event.pull_request.labels.*.name, 'ci:full')
+      || needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 et non 30 : le job compile et execute un paquet de plus (#3123). Mesure
+    # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
+    # dernieres executions reelles, et `tune-server` ajoute une compilation
+    # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -80,8 +142,17 @@ jobs:
       # PostgresDb et tout tune-core avec le meme jeu postgres+oaat que le job
       # retire de ci.yml. On ne compile donc plus deux fois le crate pour deux
       # filtres qui etaient deja inclus dans cette execution.
-      - name: Tests tune-core avec PostgreSQL
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres,oaat
+      #
+      # `-p tune-server` depuis #3123. Sur une PR de lot, ce paquet n'etait
+      # compile avec la feature `postgres` par AUCUNE porte : `test` de ci.yml
+      # ne l'active pas, et `test-shipped-features`, qui l'active, est derriere
+      # `full`. Un bloc `#[cfg(feature = "postgres")]` de `tune-server` pouvait
+      # donc casser sans que rien ne rougisse avant la promotion vers main.
+      # Cout mesure sur Shrek (arbre chaud) : 4 min 47 pour tune-core seul,
+      # 5 min 36 pour les deux, soit +49 s. La compilation de `tune-server` est
+      # ensuite REUTILISEE par l'etape « Routes de tune-server » plus bas.
+      - name: Tests tune-core et tune-server avec PostgreSQL
+        run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat
 
       # Real-schema regression for #1706: the self-healing DDL in
       # `ensure_schema` and migration 026 can only be proven against an actual
@@ -151,3 +222,22 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
+
+      # #3123 — les requetes de tune-server, ENFIN executees sur PostgreSQL.
+      #
+      # Toutes les etapes ci-dessus visent `tune-core`. Les 419 litteraux SQL
+      # ecrits dans `tune-server/src` (54 fichiers, comptes le 01/09/2026)
+      # n'avaient jamais tourne sur PostgreSQL, sur aucune branche, avec aucune
+      # etiquette. #2860 puis #2441 ont chacun ete refermes en DESCENDANT la
+      # requete fautive dans `tune-core` pour qu'une porte l'execute ; cette
+      # etape retire cette obligation.
+      #
+      # Le test monte un `AppState` sur le moteur PostgreSQL — le chemin exact
+      # de la production — et fait passer douze requetes HTTP par le vrai
+      # routeur, bibliotheque VIDE : l'etat ou un agregat divise par zero.
+      # `--test-threads=1` : le test vide ses tables, et les `TRUNCATE CASCADE`
+      # s'interbloquent en parallele.
+      - name: Routes de tune-server sur PostgreSQL (#3123)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_routes_serveur -- --nocapture --test-threads=1
