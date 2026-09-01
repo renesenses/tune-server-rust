@@ -148,4 +148,11 @@ TUNE_LOG_LEVEL=debug cargo run --package tune-server
 
 ## License
 
-MIT
+Business Source License 1.1 — see [LICENSE](LICENSE). This is a
+source-available licence, not an OSI-approved open-source licence.
+
+Personal and non-commercial use is free: home listening, evaluation and testing,
+academic and educational use, contributing patches or documentation, and writing
+about the project. Any commercial use requires a licence from MozAIk Labs —
+contact@mozaiklabs.fr. Each release converts to the Apache License 2.0 four years
+after its publication.
