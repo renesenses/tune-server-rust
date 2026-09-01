@@ -798,6 +798,32 @@ pub(crate) mod decisions {
         gapless_sent && age_secs.is_some_and(|a| a > GAPLESS_STAGE_MAX_AGE_SECS)
     }
 
+    /// La preparation gapless deja acceptee par le renderer vise-t-elle encore
+    /// la piste que la file designe MAINTENANT comme suivante ? (#3026)
+    ///
+    /// `armed_row_id` est l'identifiant de LIGNE de file (`queue_items.id`)
+    /// realement passe a `SetNextAVTransportURI` ; `row_id_at_next` celui que
+    /// `next_position` designe a cet instant. Une ligne, et non une position :
+    /// « Lire ensuite » DECALE les positions — `insert_at` ouvre un trou par un
+    /// `UPDATE position = position + 1`, il ne reecrit pas les lignes — donc la
+    /// piste armee change de position sans changer de piste, et l'index+1
+    /// designe alors quelqu'un d'autre.
+    ///
+    /// Ni l'identifiant de piste ni le titre ne feraient l'affaire : la meme
+    /// piste peut occuper deux lignes de la file (journal Sandro du 01/09 :
+    /// `Hold Me` ajoute deux fois, positions 4 puis 5), et ces deux lignes-la
+    /// doivent rester distinctes.
+    ///
+    /// Sens de defaut : sans les DEUX identifiants on ne conclut rien. Un
+    /// « perime » de trop desarmerait un enchainement valide, c'est-a-dire
+    /// ferait payer un blanc a qui n'a rien demande.
+    pub fn gapless_arm_outdated(armed_row_id: Option<i64>, row_id_at_next: Option<i64>) -> bool {
+        match (armed_row_id, row_id_at_next) {
+            (Some(arme), Some(suivant)) => arme != suivant,
+            _ => false,
+        }
+    }
+
     /// The renderer-reported duration for the CURRENT track, sanitised against
     /// the queue-known (DB) duration.
     ///
@@ -2603,6 +2629,18 @@ struct ZonePollState {
     /// inexactes — fausse transition garantie. Cleared au changement de
     /// génération et à chaque transition, comme `gapless_arm_logged`.
     gapless_dsd_skip_pos: Option<i64>,
+    /// La LIGNE de file (`queue_items.id`) que le renderer a ACCEPTEE comme
+    /// piste suivante, et la position qu'elle occupait alors (#3026).
+    ///
+    /// L'armement ne laissait aucune trace de ce qu'il avait arme. A la
+    /// transition, le poller avancait donc sur `next_position()` — l'index+1
+    /// COURANT — qui n'est plus la piste armee des que la file a bouge entre
+    /// les deux. Un « Lire ensuite » dans les 30 dernieres secondes suffit : le
+    /// renderer joue ce qu'on lui a envoye, l'ecran nomme l'inseree, et le
+    /// compteur de fin de piste adopte la duree de l'INSEREE — d'ou la coupure
+    /// de l'audio reellement en cours (`dlna_frozen_end=true`, journal Sandro
+    /// du 01/09 a 14:23:10).
+    gapless_armed: Option<ArmedNext>,
 }
 
 impl ZonePollState {
@@ -2650,6 +2688,7 @@ impl ZonePollState {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         }
     }
 }
@@ -2659,9 +2698,23 @@ impl ZonePollState {
 /// cette position — verrou `gapless_dsd_skip_pos`, #2394) ».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GaplessPrep {
-    Armed,
+    /// Le renderer a accepte la piste suivante. Porte la LIGNE de file
+    /// reellement envoyee (`None` si la file n'a pas su la rendre) : c'est
+    /// elle, et non l'index, qui decide ou avancer a la transition (#3026).
+    Armed(Option<ArmedNext>),
     DsdNextSkipped,
     NotArmed,
+}
+
+/// Ce que le renderer a ACCEPTE comme piste suivante — a distinguer de ce que
+/// la file designe comme suivante : les deux divergent des qu'on insere (#3026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArmedNext {
+    /// `queue_items.id`. Stable quand `insert_at` decale les positions.
+    row_id: i64,
+    /// La position occupee AU MOMENT de l'armement. Journalisee seule : elle
+    /// dit de combien la file a glisse sous l'armement.
+    position: i64,
 }
 
 /// Retrouver en base la station qui joue, a partir du `source_id` du
@@ -3443,6 +3496,7 @@ impl PositionPoller {
                 // Force one gapless_arm_trace line at the start of the new track.
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
+                ps.gapless_armed = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -4093,6 +4147,9 @@ impl PositionPoller {
                     );
                     ps.gapless_sent = false;
                     ps.gapless_sent_at = None;
+                    // Retire de l'etat, gardee sous la main : c'est elle qui
+                    // dit ou avancer (#3026).
+                    let arme_avant = ps.gapless_armed.take();
                     ps.stopped_ticks = 0;
                     ps.past_end_ticks = 0;
                     ps.peak_position_ms = 0;
@@ -4122,7 +4179,10 @@ impl PositionPoller {
                         .unwrap_or(false);
                     if recently_restarted {
                         info!(zone_id, "gapless_advance_suppressed_after_restart");
-                    } else if let Some(next_pos) = Self::next_position(zone_state) {
+                    } else if let Some(next_pos) = self
+                        .position_a_avancer(zone_id, zone_state, arme_avant)
+                        .await
+                    {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
                             .orchestrator
@@ -4289,6 +4349,7 @@ impl PositionPoller {
                             // play_from_queue which handles metadata correctly.
                             info!(zone_id, "gapless_guard_stopped_pending_confirmation");
                             ps.gapless_sent = false;
+                            ps.gapless_armed = None;
                             ps.gapless_sent_at = None;
                             ps.stopped_ticks = 0;
                             ps.peak_position_ms = 0;
@@ -4436,6 +4497,7 @@ impl PositionPoller {
                                     // play_from_queue which handles metadata itself.
                                     info!(zone_id, "gapless_natural_end_waiting_for_transition");
                                     ps.gapless_sent = false;
+                                    ps.gapless_armed = None;
                                     ps.gapless_sent_at = None;
                                     ps.stopped_ticks = 0;
                                     ps.peak_position_ms = 0;
@@ -4469,6 +4531,7 @@ impl PositionPoller {
                                     {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
+                                        ps.gapless_armed = None;
                                         track_ended = true;
                                         motif_fin_de_piste =
                                             decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
@@ -4739,6 +4802,8 @@ impl PositionPoller {
                         );
                         ps.gapless_sent = false;
                         ps.gapless_sent_at = None;
+                        // Voir `position_a_avancer` (#3026).
+                        let arme_avant = ps.gapless_armed.take();
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.last_bytes_sent = 0;
@@ -4753,7 +4818,10 @@ impl PositionPoller {
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
                         ps.gapless_dsd_skip_pos = None;
-                        if let Some(next_pos) = Self::next_position(zone_state) {
+                        if let Some(next_pos) = self
+                            .position_a_avancer(zone_id, zone_state, arme_avant)
+                            .await
+                        {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
                                 .orchestrator
@@ -4789,6 +4857,56 @@ impl PositionPoller {
                             );
                             ps.gapless_sent = false;
                             ps.gapless_sent_at = None;
+                            ps.gapless_armed = None;
+                        }
+                        // « Lire ensuite » PENDANT la fenetre d'armement : la
+                        // piste que le renderer a acceptee n'est plus celle que
+                        // la file annonce comme suivante (#3026).
+                        //
+                        // Le geste explicite de l'utilisateur gagne. On desarme,
+                        // et la condition ci-dessous re-arme DANS LE MEME TICK
+                        // avec la piste inseree : un nouveau
+                        // `SetNextAVTransportURI` part vers le renderer.
+                        //
+                        // Le blanc eventuel est celui que l'utilisateur a
+                        // lui-meme provoque, et lui seul : tant que personne ne
+                        // touche a la file, les deux identifiants sont egaux,
+                        // rien n'est desarme, et l'enchainement sans blanc est
+                        // intact. C'est tout l'ecart avec le faux correctif —
+                        // desarmer des qu'on touche a la file — qui supprimerait
+                        // le defaut en supprimant la fonctionnalite.
+                        if ps.gapless_sent {
+                            let suivant = Self::next_position(zone_state);
+                            let ligne_au_suivant = suivant.and_then(|p| {
+                                crate::db::play_queue_repo::PlayQueueRepo::with_backend(
+                                    self.db.clone(),
+                                )
+                                .get_at(zone_id, p)
+                                .ok()
+                                .flatten()
+                                .map(|e| e.id)
+                            });
+                            if decisions::gapless_arm_outdated(
+                                ps.gapless_armed.map(|a| a.row_id),
+                                ligne_au_suivant,
+                            ) {
+                                info!(
+                                    zone_id,
+                                    armed_row = ?ps.gapless_armed.map(|a| a.row_id),
+                                    armed_pos = ?ps.gapless_armed.map(|a| a.position),
+                                    next_pos = ?suivant,
+                                    row_at_next = ?ligne_au_suivant,
+                                    "gapless_rearm_queue_changed"
+                                );
+                                ps.gapless_sent = false;
+                                ps.gapless_sent_at = None;
+                                ps.gapless_armed = None;
+                                // Une ligne de trace neuve pour le nouvel
+                                // armement : sans cela le journal garderait
+                                // « already_armed » et ne dirait pas ce qui
+                                // vient d'etre renvoye.
+                                ps.gapless_arm_logged = None;
+                            }
                         }
                         decisions::should_arm_gapless(
                             ps.gapless_sent,
@@ -4828,6 +4946,10 @@ impl PositionPoller {
                             if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                                // Le drapeau est pose pour cesser de re-tenter,
+                                // pas parce qu'une piste est partie : ne rien
+                                // laisser croire le contraire (#3026).
+                                ps.gapless_armed = None;
                             } else if decisions::dsd_skip_latched(
                                 ps.gapless_dsd_skip_pos,
                                 Self::next_position(zone_state),
@@ -4839,9 +4961,13 @@ impl PositionPoller {
                                 // piste explicitement en fin de morceau.
                             } else {
                                 match self.prepare_gapless(zone_id, zone_state, &device_id).await {
-                                    GaplessPrep::Armed => {
+                                    GaplessPrep::Armed(arme) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
+                                        // Ce que le renderer a ACCEPTE. Pose
+                                        // apres `set_next_media` seulement :
+                                        // un envoi refuse n'arme rien (#3026).
+                                        ps.gapless_armed = arme;
                                     }
                                     GaplessPrep::DsdNextSkipped => {
                                         ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
@@ -5641,6 +5767,61 @@ impl PositionPoller {
     /// fail transiently (network blip, DASH parse, token refreshed mid-flight);
     /// previously a single failure silently abandoned gapless, producing an
     /// audible Stop+Play gap. The happy path is unchanged (first-try success).
+    /// Ou avancer les metadonnees a la transition : la ou est passee la piste
+    /// que le renderer a REELLEMENT acceptee (#3026).
+    ///
+    /// Cas courant — personne n'a touche a la file : la ligne armee EST celle
+    /// que l'index designe, et cette fonction rend exactement `next_position`.
+    /// Rien ne change, pour aucune sortie.
+    ///
+    /// Cas de la course : l'insertion tombe ENTRE deux sondages. Aucun tick n'a
+    /// pu re-armer, le renderer joue donc toujours la piste armee — et c'est
+    /// ELLE que l'ecran doit nommer. Avancer sur l'index+1 courant nommerait
+    /// l'inseree : l'ecran ment, puis le compteur de fin de piste adopte la
+    /// duree de l'inseree et coupe l'audio reel avant sa fin.
+    ///
+    /// L'insertion n'est pas perdue, elle garde sa ligne dans la file ; elle
+    /// perd son tour. C'est le prix de la course, et il se paie une fois : des
+    /// qu'un tick separe le geste de la transition — 15 s et 18 s dans les deux
+    /// occurrences du journal — le re-armement rend son tour a l'inseree.
+    async fn position_a_avancer(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        arme: Option<ArmedNext>,
+    ) -> Option<i64> {
+        let par_index = Self::next_position(zone_state);
+        let arme = arme?;
+        let repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        let ligne_au_suivant = par_index
+            .and_then(|p| repo.get_at(zone_id, p).ok().flatten())
+            .map(|e| e.id);
+        if !decisions::gapless_arm_outdated(Some(arme.row_id), ligne_au_suivant) {
+            return par_index;
+        }
+        // La ligne armee a glisse : la retrouver PAR SON IDENTITE.
+        match repo
+            .get_ordered(zone_id)
+            .ok()
+            .and_then(|file| file.into_iter().find(|e| e.id == arme.row_id))
+        {
+            Some(e) => {
+                info!(
+                    zone_id,
+                    armed_row = arme.row_id,
+                    armed_pos = arme.position,
+                    now_pos = e.position,
+                    by_index = ?par_index,
+                    "gapless_advance_follows_armed_track"
+                );
+                Some(e.position)
+            }
+            // La piste armee a quitte la file : plus rien a suivre. On retombe
+            // sur l'index, c'est-a-dire sur le comportement d'avant.
+            None => par_index,
+        }
+    }
+
     async fn resolve_gapless_next(
         &self,
         zone_id: i64,
@@ -5670,6 +5851,18 @@ impl PositionPoller {
         let Some(next_pos) = Self::next_position(zone_state) else {
             return GaplessPrep::NotArmed;
         };
+
+        // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
+        // une ligne de file, pas une position (#3026). C'est la seule trace de
+        // ce que le renderer aura reellement accepte.
+        let arme = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+            .get_at(zone_id, next_pos)
+            .ok()
+            .flatten()
+            .map(|e| ArmedNext {
+                row_id: e.id,
+                position: next_pos,
+            });
 
         // Local-file gapless (OAAT native DSD): the output reads the next
         // track's `.dsf` directly, so resolve it as a local file WITHOUT a
@@ -5729,7 +5922,7 @@ impl PositionPoller {
                                 resolve_ms = t0.elapsed().as_millis() as u64,
                                 "gapless_next_set_local_file"
                             );
-                            GaplessPrep::Armed
+                            GaplessPrep::Armed(arme)
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
@@ -5847,7 +6040,7 @@ impl PositionPoller {
                             streaming = is_streaming,
                             "gapless_next_set"
                         );
-                        GaplessPrep::Armed
+                        GaplessPrep::Armed(arme)
                     }
                 } else {
                     GaplessPrep::NotArmed
@@ -6404,6 +6597,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -6464,6 +6658,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulates entering Playing state
@@ -6769,6 +6964,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -7569,6 +7765,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -7896,6 +8093,7 @@ mod tests {
             wall_clock_end_fired: false,
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
+            gapless_armed: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
@@ -9444,5 +9642,569 @@ mod depassement_duree_nagit_pas_guard {
              detecteurs de fin de piste, sinon il double-signale une fin de \
              piste parfaitement normale."
         );
+    }
+}
+
+/// #3026 — « Lire ensuite » pendant la fenêtre gapless de 30 s.
+///
+/// Sandro, 0.9.127 Linux, Diretta Renderer, fil forum 1622. Deux occurrences à
+/// 24 h d'intervalle, même forme exacte : `dlna_set_next` part, l'utilisateur
+/// insère une piste 15 s (puis 18 s) plus tard, et **rien ne repart vers le
+/// renderer** — le journal ne porte aucun `dlna_set_next`, `dlna_set_uri_ok` ni
+/// `dlna_play` entre l'insertion et la transition. L'écran avance alors sur
+/// l'index+1 courant — l'insérée — pendant que le renderer joue ce qu'on lui
+/// avait envoyé. Le 01/09 la conséquence devient audible : le compteur de fin
+/// de piste adopte la durée de l'INSÉRÉE et coupe le flux réellement en cours
+/// (`position_past_end_advancing … dlna_frozen_end=true` à 14:23:10).
+///
+/// Ces tests mesurent LE FAIT DE BASE : **quelle piste part réellement au
+/// renderer après le geste, et dans quel ordre**, sur un renderer factice qui
+/// note ce qu'il reçoit. Aucun code HTTP n'y sert de preuve.
+///
+/// **Aucun `sleep`.** La fenêtre des trente secondes est atteinte en écrivant
+/// la position du renderer et l'horloge de piste du poller — deux champs
+/// d'état. Un test qui attendrait trente secondes est un test qu'on finirait
+/// par désarmer.
+#[cfg(test)]
+mod lire_ensuite_dans_la_fenetre_gapless {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::event_bus::EventBus;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::PlaybackOrchestrator;
+    use crate::outputs::OutputRegistry;
+    use crate::outputs::mock::MockOutput;
+    use crate::playback::{NowPlaying, PlaybackManager};
+    use crate::streaming::ServiceRegistry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    const APPAREIL: &str = "dlna:diretta-renderer-88782b77cab17717";
+    /// La piste en cours. Longue, pour que la fenêtre des 30 s soit un vrai
+    /// intervalle et non toute la piste.
+    const DUREE_COURANTE_MS: i64 = 300_000;
+    /// Toutes les SUIVANTES ont la même durée, exprès : après la transition le
+    /// renderer annonce cette durée quelle que soit celle des trois qu'il joue,
+    /// donc la durée rapportée ne peut pas trahir la réponse qu'on cherche.
+    const DUREE_SUIVANTE_MS: i64 = 200_000;
+
+    /// Les quatre titres du banc, tous DISTINCTS et sur quatre pistes
+    /// distinctes : les gardes anti-doublon de la lecture coalescent une
+    /// relecture du même identifiant de piste, et un test qui rejouerait deux
+    /// fois la même piste serait vert sans rien prouver.
+    const COURANTE: &str = "Voir un ami pleurer";
+    const ARMEE: &str = "Script Switch Trigger";
+    const SUITE: &str = "Hold Me";
+    const INSEREE: &str = "Freddie Freeloader";
+
+    /// Un WAV minuscule mais réel : `resolve_stream` ouvre le fichier, un
+    /// chemin qui ne mène à rien ne s'armerait pas.
+    fn ecrire_wav(chemin: &std::path::Path) {
+        use std::io::Write;
+        let octets_data: u32 = 44_100 * 4 / 5; // 200 ms, 16 bits stéréo
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + octets_data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&44_100u32.to_le_bytes());
+        v.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+        v.extend_from_slice(&4u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&octets_data.to_le_bytes());
+        v.extend(std::iter::repeat_n(0u8, octets_data as usize));
+        let mut f = std::fs::File::create(chemin).unwrap();
+        f.write_all(&v).unwrap();
+        f.flush().unwrap();
+    }
+
+    struct Banc {
+        poller: PositionPoller,
+        playback: Arc<PlaybackManager>,
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        outputs: Arc<Mutex<OutputRegistry>>,
+        zone_id: i64,
+        pistes: Vec<i64>,
+        _fichiers: Vec<tempfile::NamedTempFile>,
+        poll_states: HashMap<i64, ZonePollState>,
+        idle: HashMap<i64, IdlePollBackoff>,
+    }
+
+    impl Banc {
+        /// Une zone DLNA en lecture de `COURANTE`, file `[COURANTE, ARMEE,
+        /// SUITE]`. `INSEREE` existe en bibliothèque mais pas encore en file :
+        /// c'est elle que le geste ajoutera.
+        async fn monter() -> Self {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+
+            let zone_id = ZoneRepo::with_backend(db.clone())
+                .create("Salon", Some("dlna"), Some(APPAREIL))
+                .unwrap();
+
+            let depot = TrackRepo::with_backend(db.clone());
+            let mut fichiers = Vec::new();
+            let mut pistes = Vec::new();
+            for (n, titre) in [COURANTE, ARMEE, SUITE, INSEREE].iter().enumerate() {
+                let f = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+                ecrire_wav(f.path());
+                let mut piste = crate::db::models::Track::new((*titre).to_string());
+                piste.file_path = Some(f.path().to_str().unwrap().to_string());
+                piste.format = Some("wav".into());
+                piste.sample_rate = Some(44_100);
+                piste.bit_depth = Some(16);
+                piste.channels = 2;
+                piste.track_number = n as i32 + 1;
+                piste.duration_ms = if n == 0 {
+                    DUREE_COURANTE_MS
+                } else {
+                    DUREE_SUIVANTE_MS
+                };
+                pistes.push(depot.create(&piste).unwrap());
+                fichiers.push(f);
+            }
+            PlayQueueRepo::with_backend(db.clone())
+                .set_queue(zone_id, &pistes[..3])
+                .unwrap();
+
+            let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+            outputs.lock().await.register(Box::new(
+                MockOutput::new(APPAREIL, "Diretta Renderer").with_type("dlna"),
+            ));
+            let playback = Arc::new(PlaybackManager::new());
+            let orchestrator = Arc::new(PlaybackOrchestrator::new(
+                db.clone(),
+                playback.clone(),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                outputs.clone(),
+                None,
+            ));
+            let poller = PositionPoller::new(
+                orchestrator,
+                playback.clone(),
+                outputs.clone(),
+                db.clone(),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
+            .with_event_bus(Arc::new(EventBus::new()));
+
+            playback
+                .play(
+                    zone_id,
+                    NowPlaying {
+                        track_id: Some(pistes[0]),
+                        title: COURANTE.into(),
+                        source: "local".into(),
+                        duration_ms: DUREE_COURANTE_MS,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            playback.update_queue_info(zone_id, 0, 3).await;
+
+            let generation = playback.get_state(zone_id).await.track_generation;
+            let mut poll_states = HashMap::new();
+            poll_states.insert(zone_id, ZonePollState::new(generation));
+
+            Self {
+                poller,
+                playback,
+                db,
+                outputs,
+                zone_id,
+                pistes,
+                _fichiers: fichiers,
+                poll_states,
+                idle: HashMap::new(),
+            }
+        }
+
+        /// Porter la lecture à `position_ms` SANS attendre : la position du
+        /// renderer et l'horloge de fin de piste du poller sont deux champs, on
+        /// les écrit. C'est l'injection réclamée — pas un `sleep` déguisé.
+        async fn a(&mut self, position_ms: u64) {
+            {
+                let reg = self.outputs.lock().await;
+                let arc = reg.get(APPAREIL).unwrap();
+                let sortie = arc.lock().await;
+                let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+                mock.set_state(crate::outputs::traits::TransportState::Playing)
+                    .await;
+                mock.set_duration(DUREE_COURANTE_MS as u64);
+                mock.set_position(position_ms);
+            }
+            let ps = self.poll_states.get_mut(&self.zone_id).unwrap();
+            // Le mur d'horloge de `played_enough` (30 s) et celui de
+            // `stale_start_position` : on les franchit en datant le début de la
+            // piste, pas en dormant.
+            ps.track_started_at = Some(Instant::now() - Duration::from_secs(320));
+            ps.peak_position_ms = position_ms;
+            ps.last_position_ms = position_ms;
+        }
+
+        async fn tic(&mut self) {
+            self.poller
+                .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
+                .await;
+        }
+
+        /// Le renderer enchaîne : il passe sur l'URI qu'on lui a armée et
+        /// repart de zéro. C'est la chute de position du journal
+        /// (`gapless_position_reset_detected prev_pos=… new_pos=0`).
+        async fn le_renderer_enchaine(&mut self) {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .simulate_gapless_transition(DUREE_SUIVANTE_MS as u64)
+                .await;
+        }
+
+        /// « Lire ensuite » : exactement ce que fait la route — `insert_at` à la
+        /// position demandée, puis `update_queue_info` avec le nouveau total.
+        async fn lire_ensuite(&self, indice_piste: usize, position: i64) {
+            let depot = PlayQueueRepo::with_backend(self.db.clone());
+            depot
+                .insert_at(
+                    self.zone_id,
+                    &[QueueInput::Local {
+                        track_id: self.pistes[indice_piste],
+                    }],
+                    Some(position),
+                )
+                .unwrap();
+            let total = depot.count_all(self.zone_id).unwrap();
+            let courante = self.playback.get_state(self.zone_id).await.queue_position;
+            self.playback
+                .update_queue_info(self.zone_id, courante, total)
+                .await;
+        }
+
+        /// « + File » : le même ajout, mais en FIN de file. Rien ne bouge avant
+        /// la piste armée.
+        async fn ajouter_en_fin(&self, indice_piste: usize) {
+            let depot = PlayQueueRepo::with_backend(self.db.clone());
+            depot
+                .append(
+                    self.zone_id,
+                    &[QueueInput::Local {
+                        track_id: self.pistes[indice_piste],
+                    }],
+                )
+                .unwrap();
+            let total = depot.count_all(self.zone_id).unwrap();
+            let courante = self.playback.get_state(self.zone_id).await.queue_position;
+            self.playback
+                .update_queue_info(self.zone_id, courante, total)
+                .await;
+        }
+
+        /// Ce qui est PARTI au renderer par `SetNextAVTransportURI`, dans
+        /// l'ordre. La mesure du ticket.
+        async fn armees(&self) -> Vec<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .set_next_titles()
+                .await
+        }
+
+        /// Ce que le renderer JOUE réellement, nommé par le titre qu'on lui a
+        /// donné avec l'URI.
+        async fn joue_par_le_renderer(&self) -> Option<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .current_title()
+                .await
+        }
+
+        /// Les `Play` complets envoyés au renderer. Un enchaînement sans blanc
+        /// n'en produit AUCUN : dès qu'il y en a un, il y a eu un arrêt et une
+        /// relance, c'est-à-dire un blanc.
+        async fn play_complets(&self) -> Vec<String> {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(APPAREIL).unwrap();
+            let sortie = arc.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<MockOutput>()
+                .unwrap()
+                .play_titles()
+                .await
+        }
+
+        /// Ce que l'écran affiche : la position dans la file, et le titre.
+        async fn ecran(&self) -> (i64, String) {
+            let etat = self.playback.get_state(self.zone_id).await;
+            (
+                etat.queue_position,
+                etat.now_playing.map(|np| np.title).unwrap_or_default(),
+            )
+        }
+
+        /// La file telle qu'elle est rendue à l'écran, dans l'ordre.
+        async fn file_affichee(&self) -> Vec<String> {
+            PlayQueueRepo::with_backend(self.db.clone())
+                .get_ordered(self.zone_id)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.title.unwrap_or_default())
+                .collect()
+        }
+    }
+
+    /// **LE FAIT DE BASE.** « Lire ensuite » à quinze secondes de la fin — la
+    /// chronologie exacte du journal du 31/08.
+    ///
+    /// Ce qui doit partir au renderer, dans l'ordre : la piste armée d'abord
+    /// (personne n'avait rien demandé), puis **l'insérée**, parce que le geste
+    /// de l'utilisateur est explicite et postérieur. Et à la transition, la
+    /// piste que le renderer joue doit être celle que l'écran nomme.
+    ///
+    /// Sans le correctif, la seconde ligne n'existe pas : le renderer garde la
+    /// piste armée, l'écran part sur l'insérée, et les deux se contredisent.
+    #[tokio::test]
+    async fn le_geste_de_l_utilisateur_atteint_le_renderer_et_l_ecran_dit_vrai() {
+        let mut banc = Banc::monter().await;
+
+        // 14:10:46 — l'armement, quinze secondes avant l'insertion.
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "la fenêtre d'armement doit avoir envoyé la piste suivante au renderer"
+        );
+
+        // 14:11:01 — « Lire ensuite ». L'insérée prend la position 1, la piste
+        // armée glisse en 2 : même ligne, autre position.
+        banc.lire_ensuite(3, 1).await;
+        assert_eq!(
+            banc.file_affichee().await,
+            vec![
+                COURANTE.to_string(),
+                INSEREE.to_string(),
+                ARMEE.to_string(),
+                SUITE.to_string()
+            ],
+            "la file doit porter l'insérée juste après la piste en cours"
+        );
+
+        // Le tick suivant, toujours dans la fenêtre.
+        banc.a(276_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string(), INSEREE.to_string()],
+            "LE FAIT DE BASE : après le geste, c'est l'INSÉRÉE qui doit partir              au renderer, et après la piste déjà armée — pas à sa place, pas              jamais"
+        );
+
+        // 14:11:16 — le renderer enchaîne.
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(INSEREE),
+            "le renderer doit jouer l'insérée : c'est la dernière URI qu'on lui              a donnée"
+        );
+        assert_eq!(
+            titre, INSEREE,
+            "l'écran doit nommer ce qui joue, pas un index de file"
+        );
+        assert_eq!(position, 1, "et pointer la ligne de file correspondante");
+    }
+
+    /// **LA COURSE, dans sa forme la plus serrée** : l'insertion tombe ENTRE
+    /// deux sondages. Aucun tick n'a pu ré-armer, le renderer joue donc encore
+    /// la piste armée — et c'est ELLE que l'écran doit nommer.
+    ///
+    /// C'est le cas qui produisait la coupure du 01/09 : avancer sur l'index+1
+    /// nommait l'insérée, dont la durée devenait la limite du compteur de fin
+    /// de piste ; à 346 s d'un flux qu'on croyait long de 340 s, Tune coupait
+    /// l'audio réel (`dlna_frozen_end=true`). L'insertion garde sa ligne dans
+    /// la file ; elle perd son tour. C'est le seul prix de la course.
+    #[tokio::test]
+    async fn insertion_entre_deux_sondages_l_ecran_suit_ce_qui_joue() {
+        let mut banc = Banc::monter().await;
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+
+        // Le geste, puis la transition, sans un seul tick entre les deux.
+        banc.lire_ensuite(3, 1).await;
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(ARMEE),
+            "aucun tick n'a pu ré-armer : le renderer joue toujours la piste armée"
+        );
+        assert_eq!(
+            titre, ARMEE,
+            "l'écran doit dire la piste ARMÉE — la nommer autrement, c'est ce              qui faisait adopter la durée de l'insérée et couper l'audio réel"
+        );
+        assert_eq!(
+            position, 2,
+            "la piste armée a glissé en position 2 ; c'est là que l'écran doit              pointer, pas sur l'index+1 courant"
+        );
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "rien de neuf n'est parti au renderer : il n'y avait pas de tick pour              le faire"
+        );
+    }
+
+    /// **TÉMOIN VERT — l'enchaînement sans blanc reste intact.** Personne ne
+    /// touche à la file : dix sondages dans la fenêtre ne doivent produire
+    /// qu'UN seul `SetNextAVTransportURI`, et la transition ne doit produire
+    /// AUCUN `Play` complet.
+    ///
+    /// C'est la garde contre le faux correctif : désarmer le gapless dès qu'on
+    /// touche à la file supprimerait le défaut en supprimant la fonctionnalité.
+    #[tokio::test]
+    async fn sans_geste_l_enchainement_sans_blanc_est_intact() {
+        let mut banc = Banc::monter().await;
+        for ms in 0..10u64 {
+            banc.a(275_000 + ms * 1_000).await;
+            banc.tic().await;
+        }
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "un seul armement par piste : re-préparer à chaque tick, c'est              re-résoudre et re-télécharger la suivante une fois par seconde"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+
+        let (position, titre) = banc.ecran().await;
+        assert_eq!(
+            titre, ARMEE,
+            "l'enchaînement normal doit avancer d'une piste"
+        );
+        assert_eq!(position, 1);
+        assert_eq!(
+            banc.joue_par_le_renderer().await.as_deref(),
+            Some(ARMEE),
+            "et le renderer joue bien cette piste-là"
+        );
+        assert!(
+            banc.play_complets().await.is_empty(),
+            "aucun `Play` complet : un enchaînement qui repasse par un arrêt et              une relance, c'est précisément le blanc qu'on ne veut pas payer"
+        );
+    }
+
+    /// **TÉMOIN VERT — un ajout en FIN de file ne coûte rien.** La question 2
+    /// posée au testeur, tranchée par la mesure : « + File » pendant la fenêtre
+    /// ne déplace rien avant la piste armée, donc ne doit RIEN désarmer.
+    #[tokio::test]
+    async fn un_ajout_en_fin_de_file_ne_desarme_rien() {
+        let mut banc = Banc::monter().await;
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+
+        banc.ajouter_en_fin(3).await;
+        banc.a(276_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![ARMEE.to_string()],
+            "la file a changé mais la piste armée est toujours la suivante :              rien ne doit repartir au renderer"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+        assert_eq!(banc.ecran().await, (1, ARMEE.to_string()));
+        assert!(
+            banc.play_complets().await.is_empty(),
+            "l'enchaînement sans blanc doit survivre à un ajout en fin de file"
+        );
+    }
+
+    /// **TÉMOIN VERT — hors de la fenêtre, rien ne change.** À mi-morceau, rien
+    /// n'est armé : « Lire ensuite » se comporte exactement comme avant, et
+    /// c'est l'insérée qui sera armée le moment venu.
+    ///
+    /// C'est la question 1 posée au testeur, celle qui tranche : le défaut est
+    /// bien circonscrit aux trente dernières secondes.
+    #[tokio::test]
+    async fn hors_de_la_fenetre_lire_ensuite_se_comporte_comme_avant() {
+        let mut banc = Banc::monter().await;
+
+        // Mi-morceau : la fenêtre s'ouvre à 270 s, on est loin.
+        banc.a(150_000).await;
+        banc.tic().await;
+        assert!(
+            banc.armees().await.is_empty(),
+            "hors fenêtre, rien ne doit être armé"
+        );
+
+        banc.lire_ensuite(3, 1).await;
+        banc.a(151_000).await;
+        banc.tic().await;
+        assert!(
+            banc.armees().await.is_empty(),
+            "un geste hors fenêtre ne doit rien envoyer au renderer : il n'y a              rien à corriger"
+        );
+
+        // La fenêtre s'ouvre enfin.
+        banc.a(275_000).await;
+        banc.tic().await;
+        assert_eq!(
+            banc.armees().await,
+            vec![INSEREE.to_string()],
+            "et c'est l'insérée qui est armée, une seule fois, au moment normal"
+        );
+
+        banc.le_renderer_enchaine().await;
+        banc.tic().await;
+        assert_eq!(banc.ecran().await, (1, INSEREE.to_string()));
+        assert_eq!(banc.joue_par_le_renderer().await.as_deref(), Some(INSEREE));
+    }
+
+    /// Le prédicat seul, sur ses quatre cas. Il décide de désarmer un
+    /// enchaînement déjà accepté par le renderer : son sens de défaut doit être
+    /// écrit noir sur blanc.
+    #[test]
+    fn le_predicat_ne_conclut_rien_sans_les_deux_identifiants() {
+        // La ligne armée est toujours la suivante : on ne touche à rien.
+        assert!(!decisions::gapless_arm_outdated(Some(7), Some(7)));
+        // Une AUTRE ligne occupe la place : le geste a bougé la file.
+        assert!(decisions::gapless_arm_outdated(Some(7), Some(9)));
+        // Rien n'a été armé : il n'y a rien à désarmer.
+        assert!(!decisions::gapless_arm_outdated(None, Some(9)));
+        // La file ne rend plus rien à cette position : on ne désarme pas sur une
+        // absence — un « périmé » de trop fait payer un blanc à qui n'a rien
+        // demandé.
+        assert!(!decisions::gapless_arm_outdated(Some(7), None));
     }
 }
