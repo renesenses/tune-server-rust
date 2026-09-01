@@ -395,6 +395,12 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     Json(json!({
         "discovered_devices": devices.len(),
         "registered_outputs": output_count,
+        // L'etat du canal TCP de SlimProto (port 3483). Sans ce champ, un bind
+        // refuse ne vivait que dans une ligne de journal, dans une tache
+        // detachee : le testeur n'avait AUCUN moyen de savoir que ses platines
+        // Squeezebox ne pourraient jamais se connecter (#2938). `null` tant
+        // qu'aucune tentative d'ecoute n'a eu lieu.
+        "slimproto": tune_core::slimproto::etat_ecoute(),
         "devices": devices.iter().map(|d| json!({
             "id": d.id,
             "name": d.name,
@@ -1191,6 +1197,31 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
+    // #2938 : cinq testeurs ont joint un journal ou le bind TCP 3483 echoue.
+    // La ligne existait, noyee dans le journal et en anglais ; personne ne l'a
+    // reliee a « ma platine n'apparait pas ». Ici elle est en haut du rapport,
+    // avec sa cause sondee.
+    match tune_core::slimproto::etat_ecoute() {
+        Some(etat) if !etat.ecoute => {
+            md.push_str(&format!(
+                "- **⚠ SlimProto (Squeezebox) HORS SERVICE** — port {} : {}\n",
+                etat.port,
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+            ));
+            if let Some(err) = etat.erreur_systeme.as_deref() {
+                md.push_str(&format!("  - erreur systeme : {err}\n"));
+            }
+        }
+        Some(etat) => {
+            md.push_str(&format!(
+                "- SlimProto (Squeezebox): en ecoute sur {}\n",
+                etat.port
+            ));
+        }
+        None => {
+            md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");
+        }
+    }
     md.push('\n');
 
     // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
@@ -1274,6 +1305,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "network": {
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
+            "slimproto": tune_core::slimproto::etat_ecoute(),
         },
         "oaat_endpoints": oaat_endpoints,
         "database": {
