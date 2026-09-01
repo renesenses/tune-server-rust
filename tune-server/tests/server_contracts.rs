@@ -57,6 +57,8 @@ mod licence_activation_immediate;
 mod licence_grace_visible;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
+#[path = "nuage_limite_dit_la_limite.rs"]
+mod nuage_limite_dit_la_limite;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_ecriture_fichiers.rs"]

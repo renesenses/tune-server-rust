@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::cloud::refusal::CloudError;
 use crate::db::backend::DbBackend;
 
 const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
@@ -13,7 +14,7 @@ pub async fn sync_artist_subscriptions(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<usize, String> {
+) -> Result<usize, CloudError> {
     // Get all artists with MusicBrainz IDs from local library
     let rows = backend
         .query_many(
@@ -53,7 +54,10 @@ pub async fn sync_artist_subscriptions(
         .map_err(|e| format!("concert subscribe: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("concert subscribe: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(
+            CloudError::from_response(format!("concert subscribe: HTTP {status}"), resp).await,
+        );
     }
 
     let result: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
@@ -66,7 +70,7 @@ pub async fn sync_artist_subscriptions(
 pub async fn get_upcoming_concerts(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, CloudError> {
     let resp = http_client
         .get(format!("{CONCERTS_API}/upcoming"))
         .query(&[("instance_id", instance_id)])
@@ -76,7 +80,8 @@ pub async fn get_upcoming_concerts(
         .map_err(|e| format!("concerts: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("concerts: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(CloudError::from_response(format!("concerts: HTTP {status}"), resp).await);
     }
 
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
