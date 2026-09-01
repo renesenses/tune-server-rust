@@ -89,13 +89,25 @@ jobs:
       # Le web et le serveur sortent dans la MÊME version, mais rien ne
       # vérifiait leur contrat : deux fois en trois jours, un écran web
       # fusionné a failli partir en appelant une route serveur encore en PR
-      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). On lit main, la
-      # branche depuis laquelle la release construit son bundle.
+      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). Le manifeste
+      # identifie désormais le commit web exact construit par la release.
+      - name: Lire le SHA web du manifeste
+        id: web
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        shell: bash
+        run: |
+          PLAN=".release/$RELEASE_VERSION.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Checkout web client
         uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          ref: main
+          ref: ${{ steps.web.outputs.sha }}
           path: .web-client
 
       - name: Contrat d'API web ↔ serveur

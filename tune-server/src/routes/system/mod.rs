@@ -252,8 +252,6 @@ pub fn router() -> Router<AppState> {
             "/config-backup/cloud-status",
             get(config_backup::cloud_status),
         )
-        // Concert alerts — upcoming concerts for library artists
-        .route("/concerts", get(concerts_handler))
         // Weekly digest — new releases from library artists
         .route("/new-releases", get(new_releases_handler))
         // AI Recommendations — discover new music based on library
@@ -262,39 +260,6 @@ pub fn router() -> Router<AppState> {
             "/recommendations/generate",
             post(recommendations_generate_handler),
         )
-}
-
-/// GET /system/concerts — upcoming concerts for artists in the local library.
-///
-/// Sur un refus du nuage, le statut d'amont n'est plus écrasé par un 200 :
-/// une limite atteinte repart en 429 avec son motif et son délai
-/// (`routes::cloud_error`, #2178). L'enveloppe `concerts: []` est conservée,
-/// pour l'écran qui rend la liste avant de regarder l'erreur.
-async fn concerts_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> axum::response::Response {
-    let instance_id = SettingsRepo::with_backend(state.backend.clone())
-        .get("instance_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    match tune_core::cloud::concert_alerts::get_upcoming_concerts(&state.http_client, &instance_id)
-        .await
-    {
-        Ok(concerts) => {
-            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
-                "concerts": concerts
-            })))
-        }
-        Err(e) => crate::routes::cloud_error::reponse(
-            &e,
-            &headers,
-            axum::http::StatusCode::OK,
-            serde_json::json!({ "concerts": [] }),
-        ),
-    }
 }
 
 /// GET /system/new-releases — new album releases from library artists (digest).

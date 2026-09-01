@@ -2,15 +2,7 @@ name: CI
 
 on:
   push:
-    # La ligne de release doit etre couverte comme main : c'est d'elle que
-    # sortent les tags v0.9.x. Sans cela, une PR vers release/v0.9 n'etait
-    # verifiee que par test-postgres.yml (seul workflow dont le trigger
-    # pull_request n'a pas de filtre de branche) — donc ni fmt, ni clippy, ni
-    # cargo test, ni compilation. Trois defauts sont passes ainsi le 8 aout
-    # 2026 et n'ont ete revels qu'en construisant la branche elle-meme : un
-    # test OAAT instable (#1358), une migration PG non declaree (#1364), et
-    # l'incident #875 en juillet avait deja le meme mecanisme.
-    branches: [main, release/v0.9]
+    branches: [main]
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
@@ -54,6 +46,7 @@ jobs:
         env:
           EVENEMENT: ${{ github.event_name }}
           BASE_REF_CI: ${{ github.base_ref }}
+          HEAD_REF_CI: ${{ github.head_ref }}
           FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -74,6 +67,14 @@ jobs:
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
+          # Une promotion RC -> main valide toujours le serveur entier, meme
+          # si le dernier diff ne touche que la CI ou les versions.
+          if [ "$EVENEMENT" = pull_request ] && [ "$BASE_REF_CI" = main ] && [[ "$HEAD_REF_CI" = rc/* ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "promotion $HEAD_REF_CI -> main : batterie complete"
+            exit 0
           fi
 
           case "$EVENEMENT" in
@@ -129,6 +130,7 @@ jobs:
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
           python3 scripts/verser-message-forum.py --self-test
+          python3 scripts/synchroniser-release-main.py --self-test
 
       # Contre-epreuve du critere de selection des rondes de tri (#2910),
       # rejouee hors ligne sur la fenetre reelle du 28 au 30/08/2026 : le
@@ -227,7 +229,7 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+      - run: cargo test -p tune-server --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
   # The acoustic Smart Radio pulls `ort` (onnxruntime) behind the opt-in
   # `audio-embedding` feature, now shipped in the release + docker builds. This
@@ -384,7 +386,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Install ALSA dev (Linux)
         if: runner.os == 'Linux' && !matrix.cross
@@ -409,11 +411,11 @@ jobs:
 
       - name: Build (native, Linux with local-audio)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
       # NOT covered by the build above, so ASIO code compiled only at release
@@ -435,7 +437,7 @@ jobs:
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -505,7 +507,7 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -630,3 +632,49 @@ jobs:
           cargo check -p tune-ffi --target aarch64-linux-android
         env:
           RUSTFLAGS: ""
+
+  # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
+  # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
+  # batterie complete ci-dessus en succes. PostgreSQL reste un required check
+  # separe, porte par test-postgres.yml.
+  release-gate:
+    name: release-gate
+    if: always() && github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs:
+      - impact
+      - fmt
+      - test
+      - test-shipped-features
+      - audio-embedding
+      - windows-pr
+      - macos-pr
+      - clippy
+      - audit
+      - ffi
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuser une branche autre qu'une RC
+        if: startsWith(github.head_ref, 'rc/') == false
+        run: |
+          echo "::error::main n'accepte que les promotions rc/*"
+          exit 1
+
+      - name: Refuser un job absent, ignore ou rouge
+        if: >-
+          needs.impact.result != 'success' ||
+          needs.fmt.result != 'success' ||
+          needs.test.result != 'success' ||
+          needs.test-shipped-features.result != 'success' ||
+          needs.audio-embedding.result != 'success' ||
+          needs.windows-pr.result != 'success' ||
+          needs.macos-pr.result != 'success' ||
+          needs.clippy.result != 'success' ||
+          needs.audit.result != 'success' ||
+          needs.ffi.result != 'success'
+        run: |
+          echo "::error::la batterie complete n'est pas entierement verte"
+          exit 1
+
+      - name: Confirmer la promotion
+        run: echo "RC verte, eligible a la promotion vers main"
