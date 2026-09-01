@@ -452,11 +452,24 @@ const CONTEXTES_CONNUS: [&str; 5] = ["track", "album", "playlist", "artist", "la
 /// la piste : un `POST` qui porte a la fois `album_id` et `track_id` met tout
 /// l'album en file, donc c'est bien l'album qui a ete demande.
 ///
-/// `(None, None)` quand rien ne permet de trancher — notamment une liste de
-/// `track_ids` nue, qui peut aussi bien venir d'une page artiste que d'une
-/// selection manuelle. On ecrit alors NULL : une intention devinee est pire
-/// qu'une intention absente.
-fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
+/// `(None, None, None)` quand rien ne permet de trancher — notamment une
+/// liste de `track_ids` nue, qui peut aussi bien venir d'une page artiste que
+/// d'une selection manuelle. On ecrit alors NULL : une intention devinee est
+/// pire qu'une intention absente.
+///
+/// Le TROISIEME membre est le service auquel l'identifiant appartient, sans
+/// lequel il ne s'ouvre pas (#1361). Il ne se lit pas dans le corps entier
+/// mais dans la BRANCHE prise : `album_id`, `playlist_id` et `track_id` sont
+/// des `i64` de bibliotheque, donc `"local"` quel que soit le `source`
+/// annonce — c'est bien la bibliotheque que le gestionnaire interroge sous ces
+/// champs, et `"7"` n'aurait aucun sens chez Qobuz. Les branches de streaming,
+/// elles, portent le service nomme par l'appelant.
+fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, Option<String>) {
+    /// L'espace de noms d'un identifiant de BIBLIOTHEQUE. Le mot est celui que
+    /// `NowPlaying.source` emploie deja pour une piste locale : le client lit
+    /// le meme vocabulaire des deux cotes.
+    const LOCAL: &str = "local";
+
     // 1. L'appelant l'a dit explicitement : sa parole prime sur toute
     //    deduction. C'est la seule voie pour `artist` et `label`.
     if let Some(t) = body
@@ -465,33 +478,61 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
         .map(str::trim)
         .filter(|t| CONTEXTES_CONNUS.contains(t))
     {
-        return (Some(t.to_string()), body.context_id.clone());
+        // L'appelant qui ENONCE son contexte enonce aussi le service dans
+        // `source`, comme pour toute lecture de service. Son absence dit la
+        // bibliotheque : c'est la seule autre provenance possible.
+        let service = body.source.clone().unwrap_or_else(|| LOCAL.to_string());
+        return (Some(t.to_string()), body.context_id.clone(), Some(service));
     }
 
     // 2. Sinon, ce que le corps trahit deja de lui-meme. Les deux premiers cas
     //    exigent `source` comme le gestionnaire lui-meme : sans service
     //    nomme, il ne prend pas la branche streaming, et le contexte doit
     //    decrire ce qui joue vraiment.
-    if let (Some(_), Some(id)) = (&body.source, &body.streaming_album_id) {
-        return ("album".to_string().into(), Some(id.clone()));
+    if let (Some(service), Some(id)) = (&body.source, &body.streaming_album_id) {
+        return (
+            "album".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
-    if let (Some(_), Some(id)) = (&body.source, &body.streaming_playlist_id) {
-        return ("playlist".to_string().into(), Some(id.clone()));
+    if let (Some(service), Some(id)) = (&body.source, &body.streaming_playlist_id) {
+        return (
+            "playlist".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
     if let Some(id) = body.album_id {
-        return ("album".to_string().into(), Some(id.to_string()));
+        return (
+            "album".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     if let Some(id) = body.playlist_id {
-        return ("playlist".to_string().into(), Some(id.to_string()));
+        return (
+            "playlist".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     if let Some(id) = body.track_id {
-        return ("track".to_string().into(), Some(id.to_string()));
+        return (
+            "track".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     // Piste unique en streaming : `source` + `source_id`, sans track_id.
-    if body.source.is_some() && body.source_id.is_some() && body.track_ids.is_none() {
-        return ("track".to_string().into(), body.source_id.clone());
+    if let (Some(service), Some(id), None) = (&body.source, &body.source_id, &body.track_ids) {
+        return (
+            "track".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
-    (None, None)
+    (None, None, None)
 }
 
 #[derive(Deserialize)]
@@ -1063,10 +1104,10 @@ async fn play(
     //
     // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
     // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
-    let (contexte_type, contexte_id) = contexte_de_lecture(&body);
+    let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
     state
         .playback
-        .set_session_context(zone_id, contexte_type, contexte_id)
+        .set_session_context(zone_id, contexte_type, contexte_id, contexte_service)
         .await;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
@@ -4572,7 +4613,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("playlist".into()), Some("12".into())),
+            (
+                Some("playlist".into()),
+                Some("12".into()),
+                Some("local".into())
+            ),
             "le corps portait `playlist_id` et l'intention s'est perdue (#2441)"
         );
     }
@@ -4590,7 +4635,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("7".into()))
+            (Some("album".into()), Some("7".into()), Some("local".into()))
         );
     }
 
@@ -4603,7 +4648,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("track".into()), Some("99".into()))
+            (
+                Some("track".into()),
+                Some("99".into()),
+                Some("local".into())
+            )
         );
     }
 
@@ -4618,7 +4667,52 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("0060254735822".into()))
+            (
+                Some("album".into()),
+                Some("0060254735822".into()),
+                // #1361 — sans ce troisieme membre, l'identifiant nomme
+                // l'album sans dire par quelle route le rouvrir.
+                Some("qobuz".into())
+            )
+        );
+    }
+
+    /// L'identifiant d'un album de BIBLIOTHEQUE reste local meme si le corps
+    /// annonce un service : c'est bien la table `albums` que le gestionnaire
+    /// interroge sous `album_id`, et `"7"` n'a aucun sens chez Qobuz.
+    ///
+    /// Lire `body.source` sans regarder la branche aurait envoye le raccourci
+    /// sur `GET /streaming/qobuz/albums/7` — un 404, ou pire, un album
+    /// etranger.
+    #[test]
+    fn un_album_de_bibliotheque_reste_local_sous_un_service_annonce() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()), Some("local".into()))
+        );
+    }
+
+    /// Une piste unique de streaming garde son service, comme l'album : c'est
+    /// le meme geste vu de plus pres.
+    #[test]
+    fn une_piste_de_streaming_garde_son_service() {
+        let body = PlayRequest {
+            source: Some("tidal".into()),
+            source_id: Some("77390017".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (
+                Some("track".into()),
+                Some("77390017".into()),
+                Some("tidal".into())
+            )
         );
     }
 
@@ -4634,7 +4728,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (None, None),
+            (None, None, None),
             "une intention devinee est pire qu'une intention absente"
         );
     }
@@ -4652,7 +4746,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("artist".into()), Some("451".into()))
+            (
+                Some("artist".into()),
+                Some("451".into()),
+                Some("local".into())
+            )
         );
     }
 
@@ -4668,7 +4766,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("7".into()))
+            (Some("album".into()), Some("7".into()), Some("local".into()))
         );
     }
 }
