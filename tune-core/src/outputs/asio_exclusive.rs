@@ -453,6 +453,18 @@ impl AsioExclusiveOutput {
         self.transport.is_native()
     }
 
+    /// Le nom du périphérique RÉELLEMENT ouvert, tel que le pilote ASIO le
+    /// rend — pas celui que la zone demandait.
+    ///
+    /// `AsioExclusiveOutput::new` résout par sous-chaîne insensible à la casse
+    /// et accepte `"default"` (premier pilote listé) : le nom ouvert peut donc
+    /// légitimement différer du nom demandé. Jumeau de
+    /// `WasapiExclusiveOutput::opened_device_name`. Pas d'`opened_device_id`
+    /// ici : ASIO n'expose aucun identifiant d'endpoint stable.
+    pub fn opened_device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn underrun_count(&self) -> u64 {
         self.counters.underruns.load(Ordering::Relaxed)
     }
