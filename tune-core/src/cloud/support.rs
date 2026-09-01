@@ -12,7 +12,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-const SUPPORT_API: &str = "https://mozaiklabs.fr/api/v1/support/tickets";
+/// Adresse du nuage par défaut, écrite comme dans `cloud::community`,
+/// `cloud::plugins` et `cloud::sso` : le réglage `mozaik_base_url` la remplace
+/// quand il est posé. C'est la couture qui manquait au support — voir
+/// [`SupportRelay`].
+const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `Ok(body)` sur 2xx ; `Err((status, body))` sinon — le status HTTP de
@@ -42,6 +46,74 @@ impl SupportAuth {
                 .header("X-License-Key", key)
                 .header("X-Hardware-Fingerprint", fingerprint),
         }
+    }
+}
+
+/// Où le relais support écrit, et avec quelle identité.
+///
+/// L'adresse était une **constante en dur**. Toutes les autres portes du nuage
+/// — `cloud::community` (pochettes, signalements, images d'artistes),
+/// `cloud::plugins`, `cloud::sso` — lisent déjà le réglage `mozaik_base_url` et
+/// acceptent donc d'être dirigées ailleurs. Le support, non : c'était la seule
+/// qui partait toujours vers `https://mozaiklabs.fr`.
+///
+/// Ce n'est pas un détail de confort. Le ticket support est le SEUL chemin qui
+/// transporte le diagnostic du testeur et ses pièces jointes, et c'est ce
+/// chargement que le miroir forum de mozaiklabs annonce ensuite au fil public
+/// (#2856). Tant que l'adresse était figée, **aucun test de ce dépôt ne pouvait
+/// observer la requête sortante** : on ne pouvait vérifier ni que `logs` partait,
+/// ni que `attachments[]` partait. C'est exactement ainsi que le diagnostic a
+/// disparu de 39 tickets sur 62 pendant vingt-trois jours (#2916) sans qu'une
+/// seule ligne rouge apparaisse — le client affichait « envoyé », mozaiklabs
+/// répondait 201, et le fil forum restait muet.
+pub struct SupportRelay {
+    base_url: String,
+    auth: SupportAuth,
+}
+
+impl SupportRelay {
+    /// `base_url` vaut le réglage `mozaik_base_url` quand il est posé, sinon
+    /// [`DEFAULT_BASE_URL`]. Une valeur vide retombe sur le défaut plutôt que de
+    /// fabriquer une URL relative injoignable.
+    pub fn new(base_url: Option<&str>, auth: SupportAuth) -> Self {
+        let base = base_url
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .unwrap_or(DEFAULT_BASE_URL)
+            .trim_end_matches('/')
+            .to_string();
+        Self {
+            base_url: base,
+            auth,
+        }
+    }
+
+    /// Collection des tickets : `GET` (liste) et `POST` (ouverture).
+    fn tickets_url(&self) -> String {
+        format!("{}/api/v1/support/tickets", self.base_url)
+    }
+
+    /// Détail d'un ticket.
+    fn ticket_url(&self, id: i64) -> String {
+        format!("{}/{id}", self.tickets_url())
+    }
+
+    /// URL de réponse à un ticket.
+    ///
+    /// Le singulier n'est pas un détail : mozaiklabs expose `…/reply` ET son
+    /// alias `…/replies`, et se tromper de forme rendrait un 404 que le relais
+    /// propagerait tel quel.
+    fn reply_url(&self, id: i64) -> String {
+        format!("{}/reply", self.ticket_url(id))
+    }
+
+    /// URL de marquage « lu » d'un ticket.
+    fn read_url(&self, id: i64) -> String {
+        format!("{}/read", self.ticket_url(id))
+    }
+
+    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.auth.apply(req)
     }
 }
 
@@ -83,13 +155,13 @@ fn ticket_payload(ticket: &NewTicket) -> Value {
 /// le SAV voit la config sans la demander.
 pub async fn create_ticket(
     http_client: &reqwest::Client,
-    auth: &SupportAuth,
+    relay: &SupportRelay,
     ticket: &NewTicket,
 ) -> SupportResult {
     let payload = ticket_payload(ticket);
 
-    let resp = auth
-        .apply(http_client.post(SUPPORT_API))
+    let resp = relay
+        .apply(http_client.post(relay.tickets_url()))
         .json(&payload)
         .timeout(TIMEOUT)
         .send()
@@ -118,7 +190,7 @@ pub struct AttachmentUpload {
 /// (route serveur) a déjà validé nombre, taille et type des fichiers.
 pub async fn create_ticket_multipart(
     http_client: &reqwest::Client,
-    auth: &SupportAuth,
+    relay: &SupportRelay,
     fields: Vec<(String, String)>,
     files: Vec<AttachmentUpload>,
 ) -> SupportResult {
@@ -144,8 +216,8 @@ pub async fn create_ticket_multipart(
         form = form.part("attachments[]", part);
     }
 
-    let resp = auth
-        .apply(http_client.post(SUPPORT_API))
+    let resp = relay
+        .apply(http_client.post(relay.tickets_url()))
         .multipart(form)
         .timeout(TIMEOUT)
         .send()
@@ -156,9 +228,9 @@ pub async fn create_ticket_multipart(
 }
 
 /// Liste les tickets du compte premium.
-pub async fn list_tickets(http_client: &reqwest::Client, auth: &SupportAuth) -> SupportResult {
-    let resp = auth
-        .apply(http_client.get(SUPPORT_API))
+pub async fn list_tickets(http_client: &reqwest::Client, relay: &SupportRelay) -> SupportResult {
+    let resp = relay
+        .apply(http_client.get(relay.tickets_url()))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -170,11 +242,11 @@ pub async fn list_tickets(http_client: &reqwest::Client, auth: &SupportAuth) -> 
 /// Détail d'un ticket (fil de messages inclus).
 pub async fn get_ticket(
     http_client: &reqwest::Client,
-    auth: &SupportAuth,
+    relay: &SupportRelay,
     id: i64,
 ) -> SupportResult {
-    let resp = auth
-        .apply(http_client.get(format!("{SUPPORT_API}/{id}")))
+    let resp = relay
+        .apply(http_client.get(relay.ticket_url(id)))
         .timeout(TIMEOUT)
         .send()
         .await
@@ -186,12 +258,12 @@ pub async fn get_ticket(
 /// Ajoute une réponse client à un ticket (le rouvre côté SAV).
 pub async fn reply(
     http_client: &reqwest::Client,
-    auth: &SupportAuth,
+    relay: &SupportRelay,
     id: i64,
     body: &str,
 ) -> SupportResult {
-    let resp = auth
-        .apply(http_client.post(reply_url(id)))
+    let resp = relay
+        .apply(http_client.post(relay.reply_url(id)))
         .json(&json!({ "body": body }))
         .timeout(TIMEOUT)
         .send()
@@ -212,31 +284,17 @@ pub async fn reply(
 /// ne quitte plus le serveur et l'appel est de même origine pour la page.
 pub async fn mark_read(
     http_client: &reqwest::Client,
-    auth: &SupportAuth,
+    relay: &SupportRelay,
     id: i64,
 ) -> SupportResult {
-    let resp = auth
-        .apply(http_client.post(read_url(id)))
+    let resp = relay
+        .apply(http_client.post(relay.read_url(id)))
         .timeout(TIMEOUT)
         .send()
         .await
         .map_err(request_error)?;
 
     parse(resp).await
-}
-
-/// URL de réponse à un ticket.
-///
-/// Le singulier n'est pas un détail : mozaiklabs expose `…/reply` ET son alias
-/// `…/replies`, et se tromper de forme rendrait un 404 que le relais
-/// propagerait tel quel. Isolé pour être vérifié par un test.
-fn reply_url(id: i64) -> String {
-    format!("{SUPPORT_API}/{id}/reply")
-}
-
-/// URL de marquage « lu » d'un ticket.
-fn read_url(id: i64) -> String {
-    format!("{SUPPORT_API}/{id}/read")
 }
 
 /// 502 Bad Gateway quand mozaiklabs est injoignable (réseau, timeout).
@@ -447,6 +505,10 @@ mod tests {
         assert!(body.get("retry_after").is_none(), "corps modifié : {body}");
     }
 
+    fn relais(base: Option<&str>) -> SupportRelay {
+        SupportRelay::new(base, SupportAuth::Bearer("jeton".into()))
+    }
+
     /// Les chemins amont sont recopiés de `routes/api.php` de site-mozaiklabs :
     /// `POST /v1/support/tickets/{ticket}/reply` et
     /// `POST /v1/support/tickets/{ticket}/read`. Une faute de forme rendrait un
@@ -454,13 +516,57 @@ mod tests {
     /// silencieusement mort, exactement le défaut qu'on corrige.
     #[test]
     fn les_urls_amont_suivent_le_contrat_laravel() {
+        let r = relais(None);
         assert_eq!(
-            reply_url(42),
+            r.tickets_url(),
+            "https://mozaiklabs.fr/api/v1/support/tickets"
+        );
+        assert_eq!(
+            r.ticket_url(42),
+            "https://mozaiklabs.fr/api/v1/support/tickets/42"
+        );
+        assert_eq!(
+            r.reply_url(42),
             "https://mozaiklabs.fr/api/v1/support/tickets/42/reply"
         );
         assert_eq!(
-            read_url(42),
+            r.read_url(42),
             "https://mozaiklabs.fr/api/v1/support/tickets/42/read"
+        );
+    }
+
+    /// La couture : posé, `mozaik_base_url` détourne le relais — c'est ce qui
+    /// rend la requête sortante observable par un test, et donc le transport du
+    /// diagnostic et des pièces jointes vérifiable (#2856).
+    #[test]
+    fn le_reglage_mozaik_base_url_detourne_le_relais() {
+        let r = relais(Some("http://127.0.0.1:9099"));
+        assert_eq!(
+            r.tickets_url(),
+            "http://127.0.0.1:9099/api/v1/support/tickets"
+        );
+        assert_eq!(
+            r.read_url(7),
+            "http://127.0.0.1:9099/api/v1/support/tickets/7/read"
+        );
+    }
+
+    /// Une barre finale ne doit pas fabriquer un double slash, et un réglage
+    /// vide (colonne présente mais jamais renseignée) ne doit pas produire une
+    /// URL relative injoignable : on retombe sur le nuage réel.
+    #[test]
+    fn une_base_mal_formee_ne_casse_pas_l_url() {
+        assert_eq!(
+            relais(Some("http://192.168.1.18:8000/")).tickets_url(),
+            "http://192.168.1.18:8000/api/v1/support/tickets"
+        );
+        assert_eq!(
+            relais(Some("   ")).tickets_url(),
+            "https://mozaiklabs.fr/api/v1/support/tickets"
+        );
+        assert_eq!(
+            relais(Some("")).tickets_url(),
+            "https://mozaiklabs.fr/api/v1/support/tickets"
         );
     }
 

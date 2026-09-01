@@ -75,12 +75,12 @@ struct ReplyBody {
 }
 
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
+    let relay = match relay(&state) {
+        Ok(r) => r,
         Err(resp) => return resp,
     };
     finish(
-        support::list_tickets(&state.http_client, &auth).await,
+        support::list_tickets(&state.http_client, &relay).await,
         &headers,
     )
 }
@@ -89,8 +89,8 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
 async fn create(State(state): State<AppState>, req: Request) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
+    let relay = match relay(&state) {
+        Ok(r) => r,
         Err(resp) => return resp,
     };
 
@@ -107,16 +107,16 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     let headers = req.headers().clone();
 
     if is_multipart {
-        create_multipart(state, auth, req, headers).await
+        create_multipart(state, relay, req, headers).await
     } else {
-        create_json(state, auth, req, headers).await
+        create_json(state, relay, req, headers).await
     }
 }
 
 /// Chemin JSON historique — ticket sans pièce jointe.
 async fn create_json(
     state: AppState,
-    auth: support::SupportAuth,
+    relay: support::SupportRelay,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -127,7 +127,7 @@ async fn create_json(
     finish(
         support::create_ticket(
             &state.http_client,
-            &auth,
+            &relay,
             &support::NewTicket {
                 subject: payload.subject,
                 body: payload.body,
@@ -147,7 +147,7 @@ async fn create_json(
 /// le multipart tel quel avec la clé de licence / le token premium.
 async fn create_multipart(
     state: AppState,
-    auth: support::SupportAuth,
+    relay: support::SupportRelay,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -234,7 +234,7 @@ async fn create_multipart(
     }
 
     finish(
-        support::create_ticket_multipart(&state.http_client, &auth, fields, files).await,
+        support::create_ticket_multipart(&state.http_client, &relay, fields, files).await,
         &headers,
     )
 }
@@ -526,12 +526,12 @@ async fn detail(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
+    let relay = match relay(&state) {
+        Ok(r) => r,
         Err(resp) => return resp,
     };
     finish(
-        support::get_ticket(&state.http_client, &auth, id).await,
+        support::get_ticket(&state.http_client, &relay, id).await,
         &headers,
     )
 }
@@ -542,12 +542,12 @@ async fn reply(
     Path(id): Path<i64>,
     Json(payload): Json<ReplyBody>,
 ) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
+    let relay = match relay(&state) {
+        Ok(r) => r,
         Err(resp) => return resp,
     };
     finish(
-        support::reply(&state.http_client, &auth, id, &payload.body).await,
+        support::reply(&state.http_client, &relay, id, &payload.body).await,
         &headers,
     )
 }
@@ -559,26 +559,39 @@ async fn mark_read(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
+    let relay = match relay(&state) {
+        Ok(r) => r,
         Err(resp) => return resp,
     };
     finish(
-        support::mark_read(&state.http_client, &auth, id).await,
+        support::mark_read(&state.http_client, &relay, id).await,
         &headers,
     )
 }
 
-/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
-/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
-/// 412 seulement si NI l'un NI l'autre n'est disponible.
-fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+/// Résout la cible du relais : l'adresse du nuage ET l'auth vers mozaiklabs —
+/// token OAuth premium (SSO) en priorité, sinon la clé de licence (premium par
+/// clé, sans SSO — la majorité des testeurs). 412 seulement si NI l'un NI
+/// l'autre n'est disponible.
+///
+/// L'adresse vient du réglage `mozaik_base_url`, comme pour les pochettes
+/// communautaires (`routes/cloud.rs`), les signalements de métadonnées
+/// (`routes/library/reports.rs`) et le magasin de greffons. Le support était la
+/// seule porte du nuage à l'ignorer : il partait toujours vers
+/// `https://mozaiklabs.fr`, et c'est pour cela que le transport du diagnostic et
+/// des pièces jointes — ce que le miroir forum annonce ensuite (#2856) — n'était
+/// vérifié par aucun test.
+fn relay(state: &AppState) -> Result<support::SupportRelay, Response> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    let base_url = settings.get("mozaik_base_url").ok().flatten();
 
     // Chemin 1 : token OAuth premium (login SSO dans Tune).
     if let Some(token) = settings.get("mozaik_access_token").ok().flatten() {
         if !token.is_empty() {
-            return Ok(support::SupportAuth::Bearer(token));
+            return Ok(support::SupportRelay::new(
+                base_url.as_deref(),
+                support::SupportAuth::Bearer(token),
+            ));
         }
     }
 
@@ -592,7 +605,10 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
                 .flatten()
                 .filter(|f| !f.is_empty())
                 .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
-            return Ok(support::SupportAuth::License { key, fingerprint });
+            return Ok(support::SupportRelay::new(
+                base_url.as_deref(),
+                support::SupportAuth::License { key, fingerprint },
+            ));
         }
     }
 

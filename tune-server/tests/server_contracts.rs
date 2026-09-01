@@ -89,6 +89,8 @@ mod rustsec_allowlists;
 mod serveur_media_criteres_canoniques;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "support_relais_diagnostic_sortant.rs"]
+mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
 mod support_relais_marquer_lu;
 #[path = "tests_orphelins.rs"]
