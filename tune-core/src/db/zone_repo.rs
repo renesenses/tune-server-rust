@@ -368,7 +368,17 @@ pub struct Zone {
     pub name: String,
     pub output_type: Option<String>,
     pub output_device_id: Option<String>,
-    pub volume: i32,
+    /// Volume persiste, en POUR-CENT (0..100), a virgule.
+    ///
+    /// #2886 — c'etait un `i32`, et la colonne un `INTEGER`. L'ecriture
+    /// arrondissait `(v * 100).round()`, ce qui coute jusqu'a 3 dB vers
+    /// -37 dB et, **sous 0,005 lineaire (= -46,0205999133 dB exactement)**,
+    /// tombait a 0 : la zone se rallumait MUETTE au redemarrage. La valeur
+    /// commandee est desormais persistee telle quelle.
+    ///
+    /// L'echelle reste 0..100 et non 0..1 : ainsi aucune ligne existante n'a
+    /// besoin d'etre convertie, seul le TYPE de la colonne s'elargit.
+    pub volume: f64,
     pub muted: bool,
     pub online: bool,
     pub gapless_enabled: bool,
@@ -491,8 +501,8 @@ pub fn zone_creee_contrat_client(
         // Le TYPE et non la chaine « off » : un renommage de variante suit ici
         // tout seul.
         obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
-        let vol = zone.map(|z| z.volume).unwrap_or(50);
-        let lineaire = vol as f64 / 100.0;
+        let vol = zone.map(|z| z.volume).unwrap_or(50.0);
+        let lineaire = vol / 100.0;
         obj.insert("volume".into(), json!(lineaire));
         // #1274 — la lecture en dB accompagne le volume PARTOUT où il sort,
         // ici comprise : ce contrat-ci est celui d'une zone qui vient de
@@ -866,7 +876,8 @@ impl ZoneRepo {
         Ok(())
     }
 
-    pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
+    /// Ecrit le volume en pour-cent (0..100), **sans arrondi** (#2886).
+    pub fn update_volume(&self, id: i64, volume: f64) -> Result<(), String> {
         let sql = self.update_field_sql("volume");
         let params: [&dyn ToSqlValue; 2] = [&volume, &id];
         self.db.execute(&sql, &params)?;
@@ -1670,7 +1681,9 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         output_type: cols.get(2).and_then(|v| v.as_string()),
         output_device_id: cols.get(3).and_then(|v| v.as_string()),
-        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(20) as i32,
+        // `as_f64` accepte Int, Real ET Text : les trois formes que les deux
+        // moteurs peuvent rendre pour cette colonne (#2886).
+        volume: cols.get(4).and_then(|v| v.as_f64()).unwrap_or(20.0),
         muted: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
         online: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
         gapless_enabled: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
@@ -1716,13 +1729,13 @@ mod tests {
             .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
 
-        repo.update_volume(id, 75).unwrap();
+        repo.update_volume(id, 75.0).unwrap();
         repo.update_muted(id, true).unwrap();
         let updated = repo.get(id).unwrap().unwrap();
-        assert_eq!(updated.volume, 75);
+        assert_eq!(updated.volume, 75.0);
         assert!(updated.muted);
 
         // delete is a soft-delete (is_hidden=1): the row is kept for later
@@ -2142,7 +2155,7 @@ mod tests {
 
         let id = repo.create("Default Zone", None, None).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
         assert!(zone.online);
         assert!(zone.output_type.is_none());
@@ -2171,11 +2184,154 @@ mod tests {
 
         let id = repo.create("Zone", None, None).unwrap();
 
-        repo.update_volume(id, 0).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0);
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
 
-        repo.update_volume(id, 100).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100);
+        repo.update_volume(id, 100.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100.0);
+    }
+
+    /// #2886 — le SEUIL, mesure et non estime.
+    ///
+    /// L'ecriture d'avant etait `update_volume(id, (v * 100.0).round() as i32)`.
+    /// `f64::round` arrondit a l'oppose de zero, donc l'entier vaut 0 pour tout
+    /// `v` **strictement inferieur a 0,005** — et 0,005 lineaire, c'est
+    /// `20*log10(0,005) = -46,0205999133 dB` **exactement**. « Environ -46 dB »
+    /// de l'enonce n'est pas une approximation de mesure : c'est ce nombre-la.
+    ///
+    /// Ce test ne touche pas la base : il cloue l'arithmetique qui a servi a
+    /// identifier la conversion fautive, pour que le chiffre ne se perde pas.
+    #[test]
+    fn le_seuil_du_silence_vaut_moins_quarante_six_virgule_zero_deux_db() {
+        const SEUIL_LINEAIRE: f64 = 0.005;
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * SEUIL_LINEAIRE.log10() - SEUIL_DB).abs() < 1e-12,
+            "0,005 lineaire vaut {} dB",
+            20.0 * SEUIL_LINEAIRE.log10()
+        );
+
+        // L'ecriture d'AVANT, reproduite ici pour montrer ou elle bascule.
+        let ecriture_d_avant = |v: f64| (v.clamp(0.0, 1.0) * 100.0).round() as i32;
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE),
+            1,
+            "au seuil : encore audible"
+        );
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE - f64::EPSILON),
+            0,
+            "un ulp sous le seuil : MUET"
+        );
+        // -48 dB, le reglage plausible cite par l'issue.
+        assert_eq!(ecriture_d_avant(10f64.powf(-48.0 / 20.0)), 0);
+    }
+
+    /// #2886 — le couple ECRITURE / RELECTURE, sur toute la plage utile.
+    ///
+    /// C'est le test qui rougit contre le code d'avant : `update_volume`
+    /// arrondissait au pour-cent entier, donc tout reglage qui n'etait pas un
+    /// multiple exact de 1 % revenait ailleurs apres redemarrage. Il rougit
+    /// des -0,25 dB, et il rougit en SILENCE (0) sous -46,0205999133 dB.
+    #[test]
+    fn le_volume_persiste_se_relit_a_l_identique_de_zero_a_moins_quatre_vingts_db() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for n in 0..=320 {
+            let cible_db = -f64::from(n) / 4.0; // 0 → -80 dB par pas de 0,25
+            let lineaire = 10f64.powf(cible_db / 20.0);
+
+            repo.update_volume(id, lineaire * 100.0).unwrap();
+            let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+
+            assert!(
+                (relu - lineaire).abs() <= 1e-12 * lineaire.max(1e-9),
+                "{cible_db} dB : ecrit {lineaire}, relu {relu} — la persistance a bouge le niveau"
+            );
+            // Et surtout : ce qui etait audible le reste.
+            assert!(
+                relu > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (relu {relu})"
+            );
+        }
+
+        // Le zero commande reste du zero : on ne rallume personne.
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
+    }
+
+    /// #2886 — les volumes USUELS ne bougent pas d'un iota.
+    ///
+    /// Temoin anti-regression : un correctif sur le volume touche le niveau
+    /// sonore reel. Chacun de ces reglages est un multiple exact de 1 %, donc
+    /// l'ancien code les rendait deja parfaitement — ils doivent sortir
+    /// EXACTEMENT pareil apres le passage a la virgule.
+    #[test]
+    fn les_volumes_usuels_ne_bougent_pas_d_un_iota() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for pour_cent in [
+            0, 1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 99, 100,
+        ] {
+            let pour_cent = f64::from(pour_cent);
+            repo.update_volume(id, pour_cent).unwrap();
+            let relu = repo.get(id).unwrap().unwrap();
+            assert_eq!(
+                relu.volume, pour_cent,
+                "{pour_cent} % : la colonne doit rendre le meme nombre qu'avant"
+            );
+            // Et le lineaire que la lecture en tire est celui d'avant, au bit pres.
+            assert_eq!(relu.volume / 100.0, pour_cent / 100.0);
+        }
+    }
+
+    /// #2886 — pourquoi il n'y a PAS de migration SQLite.
+    ///
+    /// SQLite est a typage dynamique : l'affinite INTEGER ne convertit une
+    /// decimale en entier que si la conversion est SANS PERTE. Une base creee
+    /// avant ce correctif, dont la colonne est encore declaree `INTEGER`,
+    /// stocke donc 0,4 tel quel. Seul PostgreSQL, qui type reellement ses
+    /// colonnes, exige la migration 048.
+    ///
+    /// Ce test le PROUVE sur une table declaree a l'ancienne au lieu de le
+    /// supposer : si un jour SQLite changeait d'avis, il rougirait ici plutot
+    /// que chez un utilisateur.
+    #[test]
+    fn un_volume_fractionnaire_survit_a_une_colonne_declaree_integer() {
+        let backend: Arc<dyn DbBackend> = Arc::new(SqliteDb::open_in_memory().unwrap());
+        backend
+            .execute(
+                "CREATE TABLE zones_ancienne (id INTEGER PRIMARY KEY, volume INTEGER DEFAULT 50)",
+                &[],
+            )
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO zones_ancienne (id, volume) VALUES (1, 50)",
+                &[],
+            )
+            .unwrap();
+
+        let vol: f64 = 0.398_107_170_553_497_2 * 100.0; // -8 dB
+        backend
+            .execute(
+                "UPDATE zones_ancienne SET volume = ? WHERE id = 1",
+                &[&vol as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        let relu = backend
+            .query_one("SELECT volume FROM zones_ancienne WHERE id = 1", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (relu - vol).abs() < 1e-12,
+            "SQLite a rabote {vol} en {relu} — il FAUDRAIT alors une migration SQLite"
+        );
     }
 
     #[test]
@@ -2379,7 +2535,7 @@ mod tests {
             .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
             .unwrap();
         assert!(created);
-        repo.update_volume(id1, 75).unwrap();
+        repo.update_volume(id1, 75.0).unwrap();
 
         // Soft-delete the zone
         repo.delete(id1).unwrap();

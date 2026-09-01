@@ -475,6 +475,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 format!("{base}{av}"),
                                 format!("{base}{rc}"),
                                 cm_url,
+                            )
+                            .with_upnp_events(
+                                crate::startup::create_oh_listener().await,
+                                crate::discovery_setup::urls_evenements_dlna(
+                                    &d.host,
+                                    d.port,
+                                    &desc.event_sub_urls(),
+                                ),
+                            )
+                            .with_upnp_silence(
+                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;

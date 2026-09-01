@@ -459,7 +459,19 @@ pub async fn register_manual_device(
                 format!("{base}{rc}"),
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                crate::startup::create_oh_listener().await,
+                crate::discovery_setup::urls_evenements_dlna(
+                    &dev.host,
+                    dev.port,
+                    &desc.event_sub_urls(),
+                ),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(
+                &state.backend,
+                &device_id,
+            ));
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -1015,7 +1027,15 @@ async fn register_discovered_dlna(
         format!("{base}{rc}"),
         cm_url,
     )
-    .with_play_delay(delay);
+    .with_play_delay(delay)
+    .with_upnp_events(
+        crate::startup::create_oh_listener().await,
+        crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &desc.event_sub_urls()),
+    )
+    .with_upnp_silence(crate::config::resolve_upnp_silence(
+        &state.backend,
+        &dev.uuid,
+    ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
     state.outputs.lock().await.register(Box::new(dlna));
@@ -1159,7 +1179,16 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                         format!("{base}{rc}"),
                         cm_url,
                     )
-                    .with_play_delay(delay);
+                    .with_play_delay(delay)
+                    .with_upnp_events(
+                        crate::startup::create_oh_listener().await,
+                        crate::discovery_setup::urls_evenements_dlna(
+                            &d.host,
+                            d.port,
+                            &desc.event_sub_urls(),
+                        ),
+                    )
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
@@ -1335,7 +1364,20 @@ async fn device_status(
     };
     let output = output.lock().await;
     match output.get_status().await {
-        Ok(status) => Json(json!(status)).into_response(),
+        Ok(status) => {
+            let mut corps = json!(status);
+            // #2263 — d'où vient ce qu'on vient de rendre. Une position
+            // extrapolée a exactement la même forme qu'une position mesurée :
+            // sans ce champ, rien ne distingue les deux, et le mode « silence
+            // UPnP » deviendrait précisément l'interrupteur muet qu'il ne doit
+            // pas être. Absent pour toute sortie qui n'est pas DLNA — additif.
+            if let Some(dlna) = output.as_any().downcast_ref::<DlnaOutput>()
+                && let Some(obj) = corps.as_object_mut()
+            {
+                obj.insert("upnp_events".into(), json!(dlna.etat_evenements().await));
+            }
+            Json(corps).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }

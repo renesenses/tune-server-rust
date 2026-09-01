@@ -210,8 +210,10 @@ mod tests {
 
     fn tmp_source(bytes: usize) -> String {
         // A unique real file so metadata() succeeds; content size varies the key.
-        let p =
-            std::env::temp_dir().join(format!("tcache-src-{}-{}.flac", std::process::id(), bytes));
+        let p = std::env::temp_dir().join(format!(
+            "{}-{bytes}.flac",
+            crate::test_scratch::scratch_name("tcache-src")
+        ));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(&vec![0u8; bytes]).unwrap();
         p.to_string_lossy().to_string()
@@ -287,7 +289,10 @@ mod tests {
 
     #[test]
     fn is_hit_requires_completed_file() {
-        let p = std::env::temp_dir().join(format!("tune-tcache-hit-{}.flac", std::process::id()));
+        let p = std::env::temp_dir().join(format!(
+            "{}.flac",
+            crate::test_scratch::scratch_name("tune-tcache-hit")
+        ));
         let ps = p.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
         assert!(!is_hit(&ps), "missing → miss");
@@ -302,8 +307,10 @@ mod tests {
     fn evict_never_removes_recent_files() {
         // A freshly written cache file is younger than EVICT_MIN_AGE_SECS, so
         // even with a 0-byte cap it must survive (it may be streaming).
-        let p =
-            std::env::temp_dir().join(format!("tune-tcache-recent-{}.flac", std::process::id()));
+        let p = std::env::temp_dir().join(format!(
+            "{}.flac",
+            crate::test_scratch::scratch_name("tune-tcache-recent")
+        ));
         std::fs::write(&p, vec![0u8; 4096]).unwrap();
         // Cap of 0 forces eviction pressure; the file is younger than
         // EVICT_MIN_AGE_SECS so it must still survive.

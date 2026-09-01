@@ -2,15 +2,7 @@ name: CI
 
 on:
   push:
-    # La ligne de release doit etre couverte comme main : c'est d'elle que
-    # sortent les tags v0.9.x. Sans cela, une PR vers release/v0.9 n'etait
-    # verifiee que par test-postgres.yml (seul workflow dont le trigger
-    # pull_request n'a pas de filtre de branche) — donc ni fmt, ni clippy, ni
-    # cargo test, ni compilation. Trois defauts sont passes ainsi le 8 aout
-    # 2026 et n'ont ete revels qu'en construisant la branche elle-meme : un
-    # test OAAT instable (#1358), une migration PG non declaree (#1364), et
-    # l'incident #875 en juillet avait deja le meme mecanisme.
-    branches: [main, release/v0.9]
+    branches: [main]
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
@@ -54,6 +46,7 @@ jobs:
         env:
           EVENEMENT: ${{ github.event_name }}
           BASE_REF_CI: ${{ github.base_ref }}
+          HEAD_REF_CI: ${{ github.head_ref }}
           FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -74,6 +67,14 @@ jobs:
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
+          # Une promotion RC -> main valide toujours le serveur entier, meme
+          # si le dernier diff ne touche que la CI ou les versions.
+          if [ "$EVENEMENT" = pull_request ] && [ "$BASE_REF_CI" = main ] && [[ "$HEAD_REF_CI" = rc/* ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "promotion $HEAD_REF_CI -> main : batterie complete"
+            exit 0
           fi
 
           case "$EVENEMENT" in
@@ -128,6 +129,7 @@ jobs:
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
+          python3 scripts/synchroniser-release-main.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
         run: |
@@ -450,12 +452,29 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  # La liste `--features` de cette porte est un INVENTAIRE, pas un echantillon :
+  # avec `--no-default-features`, une feature absente d'ici n'est lue par AUCUN
+  # lint. Le test `toute_feature_declaree_est_activee_par_une_porte_clippy`
+  # (tune-server/tests/workflows_bornes.rs) refuse desormais toute feature
+  # declaree qui n'y figure pas — ou qui n'est pas inscrite avec sa raison.
+  #
+  # Mesure du 31/08/2026 (#2865), avant cet elargissement — quatre features
+  # nues : `local-audio` (16 fichiers, dont `outputs/local.rs` et ses 10 826
+  # lignes), `postgres` (11), `audio-embedding` (3), `asio` (3).
+  #
+  # L'issue ne citait que `audio-embedding`. Le plus gros trou etait ailleurs :
+  # `local-audio` est dans le `default` des deux crates, et c'est precisement
+  # `--no-default-features` qui la retirait. Deux agents ont du relancer clippy
+  # a la main sur `local.rs` dans la nuit du 30 au 31/08.
+  #
+  # `asio` reste dehors — `cpal/asio` ne se compile que sous Windows ; le job
+  # `windows-pr` la couvre en `cargo check`.
   clippy:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # clippy — 2 min observe
+    timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -463,7 +482,23 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
+      # `local-audio` tire cpal, qui lie ALSA : sans ce paquet la porte s'arrete
+      # sur « Package alsa was not found in the pkg-config search path ».
+      # Meme boucle de reprises que les autres jobs — cf release.yml.
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
+      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -588,3 +623,49 @@ jobs:
           cargo check -p tune-ffi --target aarch64-linux-android
         env:
           RUSTFLAGS: ""
+
+  # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
+  # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
+  # batterie complete ci-dessus en succes. PostgreSQL reste un required check
+  # separe, porte par test-postgres.yml.
+  release-gate:
+    name: release-gate
+    if: always() && github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs:
+      - impact
+      - fmt
+      - test
+      - test-shipped-features
+      - audio-embedding
+      - windows-pr
+      - macos-pr
+      - clippy
+      - audit
+      - ffi
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuser une branche autre qu'une RC
+        if: startsWith(github.head_ref, 'rc/') == false
+        run: |
+          echo "::error::main n'accepte que les promotions rc/*"
+          exit 1
+
+      - name: Refuser un job absent, ignore ou rouge
+        if: >-
+          needs.impact.result != 'success' ||
+          needs.fmt.result != 'success' ||
+          needs.test.result != 'success' ||
+          needs.test-shipped-features.result != 'success' ||
+          needs.audio-embedding.result != 'success' ||
+          needs.windows-pr.result != 'success' ||
+          needs.macos-pr.result != 'success' ||
+          needs.clippy.result != 'success' ||
+          needs.audit.result != 'success' ||
+          needs.ffi.result != 'success'
+        run: |
+          echo "::error::la batterie complete n'est pas entierement verte"
+          exit 1
+
+      - name: Confirmer la promotion
+        run: echo "RC verte, eligible a la promotion vers main"

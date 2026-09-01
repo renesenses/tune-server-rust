@@ -999,7 +999,12 @@ fn write_one_tag(cand: &ExportCandidate) -> WriteOutcome {
     if crate::metadata::tag_writer::is_unsupported_format(&cand.file_path) {
         return WriteOutcome::Nothing;
     }
-    if !std::path::Path::new(&cand.file_path).is_file() {
+    // Le chemin vient de `tracks.file_path`, donc en NFC ; le disque peut le
+    // porter en NFD. Un `is_file()` sur la graphie stockée refusait ici 147
+    // pistes de `.18` qui existent bel et bien, et la passe les comptait en
+    // « rien à écrire » — le corps était pourtant là (#1865). La garde reste :
+    // un fichier qu'AUCUNE graphie ne trouve est toujours écarté.
+    if crate::library::local_path::resolve_local_path(&cand.file_path).is_missing() {
         return WriteOutcome::Nothing;
     }
     // Dernière vérification avant d'ouvrir : la base peut ignorer une

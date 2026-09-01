@@ -927,6 +927,68 @@ async fn les_backends_audio_proposes_suivent_la_plateforme_du_serveur() {
     }
 }
 
+// #2868 — la capacité « mode exclusif » doit être LISIBLE, et dire vrai.
+//
+// `/system/config` publiait le réglage `local_exclusive_mode` mais pas la
+// capacité correspondante : le client ne pouvait que la deviner d'un nom de
+// plateforme. Et le prédicat qui l'établissait était faux — il exigeait la
+// feature `asio`, alors que la branche WASAPI exclusive est compilée sur TOUT
+// Windows.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_capacite_de_mode_exclusif_est_publiee_et_suit_la_plateforme() {
+    let app = make_app();
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+
+    let supporte = config
+        .get("local_exclusive_mode_supported")
+        .and_then(|v| v.as_bool())
+        .expect(
+            "/system/config doit publier `local_exclusive_mode_supported` : le \
+             réglage `local_exclusive_mode` est déjà là, la capacité qui dit \
+             s'il a un sens ne l'était pas (#2868)",
+        );
+
+    // Le réglage, lui, reste écrit et écrivable — on ajoute une lecture, on ne
+    // déplace rien.
+    assert!(
+        config.get("local_exclusive_mode").is_some(),
+        "le RÉGLAGE reste publié à côté de la CAPACITÉ"
+    );
+
+    // Le champ doit être BRANCHÉ sur le prédicat, pas recopié à côté : une
+    // constante posée là redirait « supporté » partout sans que rien ne rougisse.
+    assert_eq!(
+        supporte,
+        tune_core::outputs::local::LocalOutput::supports_exclusive_mode(),
+        "la charge utile doit dire ce que dit le prédicat, sur la MÊME cible et \
+         avec les MÊMES features"
+    );
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        !supporte,
+        "aucune branche exclusive n'est compilée pour Linux : l'annoncer \
+         serait une promesse fantôme"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        supporte,
+        "macOS ouvre le hog mode CoreAudio : la capacité existait avant #2868 \
+         et ne doit pas avoir bougé"
+    );
+    // Windows : la branche WASAPI exclusive est là même sans la feature `asio`
+    // — c'est précisément ce que #2868 corrige.
+    #[cfg(target_os = "windows")]
+    assert!(
+        supporte,
+        "sur Windows, `WasapiExclusiveOutput` est compilé sans condition de \
+         feature : répondre « non supporté » prive l'utilisateur d'une \
+         capacité qu'il a (#2868)"
+    );
+}
+
 // #1268, volet compatibilité : une bibliothèque migrée d'une machine Windows
 // peut arriver avec `local_audio_backend = "wasapi"` en base. Sur un serveur
 // non-Windows, la lecture joue déjà via le host par défaut (repli de
@@ -949,6 +1011,141 @@ async fn une_valeur_windows_persistee_retombe_sur_auto_hors_windows() {
         config.get("local_audio_backend").and_then(|v| v.as_str()),
         Some("auto"),
         "une valeur Windows persistée doit retomber sur `auto` hors Windows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2265 — « le client doit préférer local_audio_backend ».
+//
+// `audio_backend` n'est pas un réglage : dans cette API il nomme le backend
+// RÉELLEMENT ouvert, après un éventuel repli ASIO → WASAPI. Le réglage
+// s'appelle `local_audio_backend`, et c'est le seul nom que la lecture
+// consulte (`AppState::effective_audio_backend`).
+//
+// Mais `PATCH /system/config` persistait n'importe quelle clé et
+// `GET /system/config` renvoyait la table `settings` telle quelle : une ligne
+// `audio_backend` s'y installait donc et repartait dans la réponse comme si
+// elle était le réglage. Le client web livré lit
+// `data.audio_backend ?? data.local_audio_backend` — l'ANCIEN nom d'abord —,
+// et affichait donc un backend que le serveur n'ouvre jamais.
+
+/// L'écriture est refusée, et le refus DIT quoi envoyer à la place.
+#[tokio::test]
+async fn le_nom_du_backend_actif_est_refuse_comme_reglage() {
+    let app = make_app();
+    let (status, corps) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "audio_backend": "asio" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "`audio_backend` est le backend ACTIF, pas un réglage : l'accepter \
+         inscrit une ligne que la lecture ne lit jamais"
+    );
+    let message = corps.to_string();
+    assert!(
+        message.contains("local_audio_backend"),
+        "le refus doit nommer le réglage à employer, sinon il renvoie le \
+         client à la devinette : {message}"
+    );
+    assert!(
+        message.contains("supported_audio_backends"),
+        "le refus doit dire où lire les valeurs acceptées par CETTE \
+         plateforme : {message}"
+    );
+
+    // Rien n'a été écrit : le refus est total, pas partiel.
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert!(
+        config.get("audio_backend").is_none(),
+        "une clé refusée ne doit pas apparaître dans la config"
+    );
+}
+
+/// Un refus ne doit pas emporter le reste du lot : le témoin anti-régression.
+#[tokio::test]
+async fn le_refus_ne_bloque_pas_l_ecriture_du_vrai_reglage() {
+    let app = make_app();
+    let (status, _) = patch_json(
+        &app,
+        "/api/v1/system/config",
+        json!({ "local_audio_backend": "auto", "local_exclusive_mode": true }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "le vrai réglage doit rester écrivable : {status}"
+    );
+    let (_, config) = get(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        config.get("local_audio_backend").and_then(|v| v.as_str()),
+        Some("auto")
+    );
+    assert_eq!(
+        config.get("local_exclusive_mode").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// Une ligne déjà en base — écrite avant cette garde, ou à la main — ne doit
+/// plus masquer le réglage dans la réponse.
+///
+/// L'assertion est écrite avec l'expression EXACTE du client livré
+/// (`audio_backend ?? local_audio_backend`) : c'est elle qui doit atterrir
+/// sur le nom canonique, sans rien changer côté client.
+#[tokio::test]
+async fn une_ligne_heritee_ne_masque_plus_le_reglage_canonique() {
+    let (app, state) = make_app_with_state();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    // Écriture directe : la route la refuse désormais, mais une base existante
+    // peut parfaitement la contenir.
+    settings.set("audio_backend", "asio").unwrap();
+    settings.set("local_audio_backend", "auto").unwrap();
+
+    let (status, config) = get(&app, "/api/v1/system/config").await;
+    assert!(status.is_success(), "statut {status}");
+    assert!(
+        config.get("audio_backend").is_none(),
+        "la ligne héritée ne doit pas être publiée : le client livré la lit \
+         AVANT `local_audio_backend` et afficherait un backend que le serveur \
+         n'ouvre jamais"
+    );
+
+    // `data.audio_backend ?? data.local_audio_backend`, à la lettre.
+    let lu_par_le_client = config
+        .get("audio_backend")
+        .or_else(|| config.get("local_audio_backend"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        lu_par_le_client,
+        Some("auto"),
+        "le client livré doit atterrir sur le réglage canonique"
+    );
+
+    // Le contenu de la table n'est pas réécrit : on corrige la RÉPONSE.
+    assert_eq!(
+        settings.get("audio_backend").unwrap().as_deref(),
+        Some("asio"),
+        "on ne réécrit pas la base derrière l'utilisateur"
+    );
+}
+
+/// Témoin de vocabulaire : `audio_backend` garde son sens — le backend ACTIF —
+/// là où il le porte. Le retirer de `/system/config` ne doit pas le retirer du
+/// diagnostic, sinon le correctif aurait effacé l'information au lieu de la
+/// ranger.
+#[tokio::test]
+async fn le_backend_actif_reste_publie_la_ou_il_a_un_sens() {
+    let app = make_app();
+    let (status, diag) = get(&app, "/api/v1/system/diagnostics").await;
+    assert!(status.is_success(), "statut {status}");
+    assert!(
+        diag.get("audio_backend").is_some(),
+        "`/system/diagnostics` publie le backend ACTIF sous ce nom : #2265 \
+         sépare les deux informations, il n'en supprime aucune"
     );
 }
 
@@ -1574,7 +1771,7 @@ async fn lyrics_track_without_any_source_is_404_no_lyrics() {
 
 #[tokio::test]
 async fn lyrics_sidecar_lrc_is_synced() {
-    let dir = std::env::temp_dir().join(format!("tune_lyrics_it_{}", std::process::id()));
+    let dir = tune_core::test_scratch::scratch_dir("tune_lyrics_it");
     std::fs::create_dir_all(&dir).unwrap();
     let audio = dir.join("Ma Chanson.flac");
     // Multi-timestamps on one line + metadata tags to ignore.
@@ -1787,6 +1984,360 @@ async fn playlist_depuis_favoris_radio_rend_compte_de_chaque_favori() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #3022 — les trois compteurs de l'écran « Favoris radio → Créer une playlist »
+// ---------------------------------------------------------------------------
+
+/// Service de streaming factice : il rend EXACTEMENT les candidats qu'on lui
+/// dicte, et accepte l'écriture de playlist.
+///
+/// Indispensable pour éprouver la cible que le testeur a réellement utilisée
+/// (`service: "qobuz"`) : sans lui, seule la cible locale est atteignable
+/// depuis un test, et c'est précisément la branche qui N'EST PAS celle du
+/// défaut — l'écran ne propose que TIDAL, Qobuz et Spotify
+/// (`RadioFavoritesView.svelte:134-136`).
+struct ServiceFactice {
+    nom: String,
+    /// title normalisé du favori → candidats rendus par la recherche.
+    catalogue: Vec<tune_core::streaming::traits::StreamTrack>,
+    ajouts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn piste_factice(
+    id: &str,
+    titre: &str,
+    artiste: &str,
+) -> tune_core::streaming::traits::StreamTrack {
+    tune_core::streaming::traits::StreamTrack {
+        id: id.into(),
+        title: titre.into(),
+        artist: artiste.into(),
+        album: None,
+        album_id: None,
+        duration_ms: 0,
+        cover_path: None,
+        track_number: None,
+        disc_number: None,
+        explicit: false,
+        quality: None,
+        isrc: None,
+        composer: None,
+        artist_id: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl tune_core::streaming::traits::StreamingService for ServiceFactice {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.nom
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+
+    async fn authenticate(
+        &mut self,
+        _credentials: &Value,
+    ) -> Result<tune_core::streaming::traits::AuthStatus, tune_core::TuneError> {
+        Ok(tune_core::streaming::traits::AuthStatus {
+            authenticated: true,
+            ..Default::default()
+        })
+    }
+    async fn auth_status(&self) -> tune_core::streaming::traits::AuthStatus {
+        tune_core::streaming::traits::AuthStatus {
+            authenticated: true,
+            ..Default::default()
+        }
+    }
+    async fn logout(&mut self) -> Result<(), tune_core::TuneError> {
+        Ok(())
+    }
+
+    /// La recherche rend tout le catalogue : c'est le MATCHER qui tranche, et
+    /// c'est lui qu'on veut éprouver, pas une pertinence simulée.
+    async fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<tune_core::streaming::traits::SearchResults, tune_core::TuneError> {
+        Ok(tune_core::streaming::traits::SearchResults {
+            tracks: self.catalogue.clone(),
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        })
+    }
+
+    async fn get_track(
+        &self,
+        _id: &str,
+    ) -> Result<tune_core::streaming::traits::StreamTrack, tune_core::TuneError> {
+        Err("non".into())
+    }
+    async fn get_track_url(
+        &self,
+        _id: &str,
+        _q: Option<&str>,
+    ) -> Result<tune_core::streaming::traits::StreamUrl, tune_core::TuneError> {
+        Err("non".into())
+    }
+    async fn get_album(
+        &self,
+        _id: &str,
+    ) -> Result<tune_core::streaming::traits::StreamAlbum, tune_core::TuneError> {
+        Err("non".into())
+    }
+    async fn get_album_tracks(
+        &self,
+        _id: &str,
+    ) -> Result<Vec<tune_core::streaming::traits::StreamTrack>, tune_core::TuneError> {
+        Ok(vec![])
+    }
+    async fn get_artist(
+        &self,
+        _id: &str,
+    ) -> Result<tune_core::streaming::traits::StreamArtist, tune_core::TuneError> {
+        Err("non".into())
+    }
+    async fn get_playlist(
+        &self,
+        _id: &str,
+    ) -> Result<tune_core::streaming::traits::StreamPlaylist, tune_core::TuneError> {
+        Err("non".into())
+    }
+    async fn get_playlist_tracks(
+        &self,
+        _id: &str,
+    ) -> Result<Vec<tune_core::streaming::traits::StreamTrack>, tune_core::TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_playlists(
+        &self,
+    ) -> Result<Vec<tune_core::streaming::traits::StreamPlaylist>, tune_core::TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_albums(
+        &self,
+    ) -> Result<Vec<tune_core::streaming::traits::StreamAlbum>, tune_core::TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_artists(
+        &self,
+    ) -> Result<Vec<tune_core::streaming::traits::StreamArtist>, tune_core::TuneError> {
+        Ok(vec![])
+    }
+
+    fn supports_write(&self) -> bool {
+        true
+    }
+    async fn create_playlist(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<String, tune_core::TuneError> {
+        Ok("pl-factice-1".into())
+    }
+    async fn add_tracks_to_playlist(
+        &self,
+        _playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, tune_core::TuneError> {
+        self.ajouts.lock().unwrap().extend_from_slice(track_ids);
+        Ok(track_ids.len())
+    }
+}
+
+/// #3022 — la playlist part bien sur le service, et l'écran affiche « 0 ».
+///
+/// Reivax66 (forum 1628) : « la playlist est créée sur Qobuz avec les titres
+/// mais l'UI affiche toujours 0 trouvés / 0 approximatifs / 0 non trouvés ».
+/// Le panneau lit `createResult.matched || 0`, `.approximate || 0`,
+/// `.not_found || 0` et `createResult.playlist_id`
+/// (`RadioFavoritesView.svelte:145-148`) ; la route rendait `matched_tracks`,
+/// `remote_playlist_id` et `details[]`. **Aucun des quatre noms lus n'était
+/// rendu** : quatre `|| 0` silencieux, zéro erreur, un écran qui ment.
+///
+/// Ce test envoie le corps que le client envoie RÉELLEMENT
+/// (`{service, playlist_name, limit}`, `api.ts:3248-3253`) et exige que la
+/// réponse porte les quatre noms, avec les bonnes valeurs :
+/// - un favori qui matche sûrement  → `matched = 1`
+/// - un favori dans la bande 0,6–0,7 → `approximate = 1`
+/// - un favori introuvable            → `not_found = 1`
+///
+/// Témoin anti-régression : `matched_tracks`, `remote_playlist_id` et
+/// `details[]` restent rendus — un client déjà écrit dessus ne casse pas.
+#[tokio::test]
+async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
+    let (app, state) = make_app_with_state();
+
+    let ajouts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let mut reg = state.services.lock().await;
+        reg.register(Box::new(ServiceFactice {
+            nom: "factice".into(),
+            catalogue: vec![
+                // Titre ET artiste identiques après normalisation → match_exact
+                // (0.95) ≥ MATCH_ACCEPT_SCORE (0.7) ⇒ « matched ».
+                piste_factice("t-sure", "Under The Strikes", "Yannis & The Yaw"),
+                // « nightswimming » vs « nights » : similarity = 6/13 = 0.4615.
+                // 0.4615 × 0.5 + 1.0 × 0.4 = 0.6308 — au-dessus de
+                // MATCH_APPROX_SCORE (0.6), sous MATCH_ACCEPT_SCORE (0.7)
+                // ⇒ « approximate ». C'est exactement la bande que #1235 avait
+                // cessé de jeter, et que l'écran n'a jamais su afficher.
+                piste_factice("t-approx", "Nights", "R.E.M."),
+            ],
+            ajouts: ajouts.clone(),
+        }));
+    }
+
+    for (title, artist) in [
+        ("Under the Strikes", "Yannis & The Yaw"),
+        ("Nightswimming", "R.E.M."),
+        ("Un titre que ce service n a jamais eu", "Personne du tout"),
+    ] {
+        let (st, _) = post_json(
+            &app,
+            "/api/v1/radio-favorites",
+            json!({ "title": title, "artist": artist, "station_name": "FIP" }),
+        )
+        .await;
+        assert!(st.is_success(), "favori « {title} » refusé (statut {st})");
+    }
+
+    // Le corps EXACT du client : api.ts:3248-3253.
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "factice", "playlist_name": "Mes favoris radio", "limit": 3 }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "réponse : {body}");
+    assert_eq!(body["favorites_count"], 3, "réponse : {body}");
+
+    // Le serveur a bien fait le travail — c'est ce que Reivax66 constatait sur
+    // Qobuz pendant que l'écran affichait 0.
+    assert_eq!(
+        *ajouts.lock().unwrap(),
+        vec!["t-sure".to_string(), "t-approx".to_string()],
+        "les deux pistes rapprochées doivent être poussées sur le service"
+    );
+
+    // ── LE DÉFAUT #3022 : les quatre noms que l'écran lit ──
+    assert_eq!(
+        body["matched"], 1,
+        "l'écran lit `matched` (RadioFavoritesView.svelte:145) — sans cette clé \
+         il affiche « 0 trouvés » alors qu'une piste est dans la playlist : {body}"
+    );
+    assert_eq!(
+        body["approximate"], 1,
+        "l'écran lit `approximate` (ligne 146) : {body}"
+    );
+    assert_eq!(
+        body["not_found"], 1,
+        "l'écran lit `not_found` (ligne 147) : {body}"
+    );
+    assert_eq!(
+        body["playlist_id"], "pl-factice-1",
+        "l'écran conditionne son bandeau « Playlist créée avec succès ! » à \
+         `createResult.playlist_id` (ligne 148) : {body}"
+    );
+
+    // Les trois cases du panneau couvrent tous les favoris.
+    let somme = body["matched"].as_u64().unwrap_or(0)
+        + body["approximate"].as_u64().unwrap_or(0)
+        + body["not_found"].as_u64().unwrap_or(0);
+    assert_eq!(
+        somme, 3,
+        "la répartition doit couvrir tous les favoris : {body}"
+    );
+
+    // ── Témoin anti-régression : l'ancien contrat tient toujours ──
+    assert_eq!(body["matched_tracks"], 2, "témoin : {body}");
+    assert_eq!(
+        body["remote_playlist_id"], "pl-factice-1",
+        "témoin : {body}"
+    );
+    let details = body["details"]
+        .as_array()
+        .unwrap_or_else(|| panic!("témoin : `details[]` doit rester rendu : {body}"));
+    assert_eq!(details.len(), 3, "témoin : {body}");
+    let statuts: Vec<&str> = details
+        .iter()
+        .map(|d| d["status"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        statuts,
+        vec!["matched", "approximate", "not_found"],
+        "{body}"
+    );
+}
+
+/// La cible LOCALE rendait un troisième dialecte : `id` + `results[]` là où la
+/// cible streaming rend `remote_playlist_id` + `details[]` — même route, même
+/// contenu, deux jeux de noms selon `service`. Un client ne pouvait pas écrire
+/// une seule lecture.
+///
+/// La bibliothèque du test est vide : aucun favori ne peut correspondre. Ce qui
+/// est éprouvé, c'est le CONTRAT — les trois compteurs et `playlist_id` sont là,
+/// et `not_found` vaut le nombre de favoris au lieu de disparaître.
+#[tokio::test]
+async fn favoris_radio_vers_playlist_locale_rend_le_meme_contrat() {
+    let app = make_app();
+
+    for (title, artist) in [("Nightswimming", "R.E.M."), ("So What", "Miles Davis")] {
+        let (st, _) = post_json(
+            &app,
+            "/api/v1/radio-favorites",
+            json!({ "title": title, "artist": artist, "station_name": "FIP" }),
+        )
+        .await;
+        assert!(st.is_success(), "favori « {title} » refusé (statut {st})");
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "playlist_name": "Depuis FIP", "limit": 2 }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "réponse : {body}");
+    assert_eq!(body["matched"], 0, "réponse : {body}");
+    assert_eq!(body["approximate"], 0, "réponse : {body}");
+    assert_eq!(
+        body["not_found"], 2,
+        "bibliothèque vide : les deux favoris sont introuvables, et l'écran doit \
+         le DIRE au lieu d'afficher trois zéros : {body}"
+    );
+    assert!(
+        body["playlist_id"].is_i64(),
+        "l'écran lit `playlist_id`, pas `id` : {body}"
+    );
+    assert_eq!(
+        body["playlist_id"], body["id"],
+        "`playlist_id` et `id` désignent la même playlist : {body}"
+    );
+    // Le rapport par favori sous LES DEUX noms : plus de dialecte par cible.
+    assert_eq!(body["details"], body["results"], "réponse : {body}");
+    assert_eq!(
+        body["details"].as_array().map(|a| a.len()),
+        Some(2),
+        "réponse : {body}"
+    );
+    // Témoin anti-régression : l'ancien contrat local tient.
+    assert_eq!(body["matched_tracks"], 0, "témoin : {body}");
+    assert_eq!(body["favorites_count"], 2, "témoin : {body}");
+}
+
 /// Le scan de doublons : la porte manquante d'un moteur qui existait.
 ///
 /// `duplicate_detector::scan_duplicates` était complet dans `tune-core` et
@@ -1855,6 +2406,57 @@ async fn sonos_speakers_rend_un_tableau() {
     assert!(
         body.is_array(),
         "la barre latérale fait `for sp of speakers` : un objet la casserait, reçu {body}"
+    );
+}
+
+/// `POST /sonos/rooms/{id}/group` : ne pas décrire un groupe qu'on n'a pas formé.
+///
+/// La route répondait **200 OK** avec `{coordinator, members, status}`, le
+/// champ `status` valant « grouping not yet implemented ». Aucune enceinte
+/// n'était contactée : les `members` renvoyés étaient une simple copie du
+/// corps de la requête.
+///
+/// Le piège est propre à ce dossier : un 200 dont un champ dit « pas
+/// implémenté » **passe tous les tests de forme**. On ne teste donc pas ici le
+/// code HTTP pour lui-même, mais le COMPORTEMENT observable : la réponse ne
+/// doit pas ressembler à un groupe formé. Un appelant écrit contre le code
+/// HTTP — c'est ce que fait `fetchJSON` côté client — lisait un succès et un
+/// coordinateur avec ses membres.
+///
+/// Ce qui manque réellement : le serveur ne sait pas qui est coordinateur
+/// (service UPnP `ZoneGroupTopology`, que rien n'interroge) et n'envoie aucun
+/// `SetAVTransportURI` / `x-rincon:` aux enceintes.
+#[tokio::test]
+async fn sonos_group_ne_decrit_pas_un_groupe_non_forme() {
+    let app = make_app();
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/sonos/rooms/RINCON_salon/group",
+        json!({ "room_ids": ["RINCON_cuisine", "RINCON_chambre"] }),
+    )
+    .await;
+
+    assert!(
+        !status.is_success(),
+        "aucune enceinte n'a été contactée : un 2xx annonce un groupe formé, \
+         reçu {status} avec {body}"
+    );
+
+    assert!(
+        body.get("coordinator").is_none(),
+        "désigner un coordinateur, c'est affirmer qu'un groupe existe : {body}"
+    );
+    assert!(
+        body.get("members").is_none(),
+        "les « membres » n'étaient qu'une copie de la requête, jamais un état \
+         d'enceinte : {body}"
+    );
+
+    // Et l'échec doit se nommer, sinon l'appelant ne peut rien en dire à
+    // l'utilisateur.
+    assert_eq!(
+        body["error"], "sonos_grouping_not_implemented",
+        "le refus doit porter une cause lisible : {body}"
     );
 }
 

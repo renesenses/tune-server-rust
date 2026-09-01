@@ -6,9 +6,18 @@ mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
+/// Périmètre de l'explorateur de dossiers (#1275).
+pub(crate) mod explorateur;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 pub(crate) use enrich::gate_enrichment;
+// Même partage, même raison, pour la PORTÉE par répertoire (#1660) : les deux
+// routes d'enrichissement doivent valider un `path` à l'identique — refus des
+// composantes `..`, appartenance à une racine musicale, refus franc plutôt que
+// repli sur la bibliothèque entière. Une seconde validation écrite à côté
+// finirait par diverger, et un repli silencieux enrichirait justement ce que
+// l'utilisateur voulait épargner.
+pub(crate) use enrich::resoudre_portee;
 mod import;
 mod playlist_hub;
 mod plugins;
@@ -24,6 +33,12 @@ mod youtube;
 /// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
 /// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
 pub(crate) use config::resolve_server_name;
+
+/// Adresses complètes — schéma ET port — auxquelles ce serveur répond depuis
+/// un autre appareil. Réexporté parce que le démarrage les imprime aussi
+/// (#1272) : elles ne doivent exister qu'en UN endroit, sans quoi la console
+/// et l'interface finiraient par annoncer deux adresses différentes.
+pub(crate) use config::server_urls;
 
 use axum::Router;
 use axum::routing::{get, post};

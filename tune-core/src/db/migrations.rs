@@ -1588,6 +1588,71 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
 CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 ",
     },
+    // « Dans la Smart Collection "World Music" [il] n'a pas les bons albums,
+    // c'est un peu mélangé (Folk, Folk Métal, Folk Rock) » (#1426, Jean
+    // Valjean, forum « F5 obligatoire »).
+    //
+    // Le moteur de règles fait exactement ce qu'on lui demande : le préréglage
+    // livré (migrations 41 puis 47) porte `genre CONTIENT folk`, qui compile en
+    // `t.genre LIKE '%folk%' COLLATE NOCASE`. « Folk Metal » et « Folk Rock »
+    // entrent donc dans la collection PAR CONSTRUCTION. C'est le préréglage qui
+    // promet, par son nom, plus étroit que sa règle — pas
+    // `smart_collections::compile_rule`.
+    //
+    // Seul `folk` passe en égalité stricte. `world` et `ethnic` gardent
+    // « contient », où la sous-chaîne est utile et non trompeuse (« World
+    // Fusion », « Ethnic Jazz ») ; `folk` est le seul des trois dont les dérivés
+    // forment des genres franchement différents. Les tags composés du type
+    // « Folk, World, & Country » restent pris — par la règle `world`, le
+    // `match_mode` étant `any`.
+    //
+    // Patron de la migration 67 (`fix_sans_pochette_rule`, jumelle PG 018) :
+    // UPDATE gardé sur la chaîne de règles EXACTE du semis, donc
+    //   - une collection personnalisée par l'utilisateur n'est jamais touchée,
+    //   - la migration est idempotente par le même garde,
+    //   - et les bibliothèques DÉJÀ installées sont réparées, ce qu'un simple
+    //     changement du semis (`INSERT OR IGNORE`, création seulement) ne fait
+    //     pas.
+    // Sur une installation neuve, 41/47 sèment l'ancienne règle et celle-ci la
+    // corrige dans la même passe.
+    Migration {
+        version: 93,
+        name: "resserrer_folk_dans_world_music",
+        up: "
+UPDATE smart_collections
+SET rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"equals\",\"value\":\"folk\"}]'
+WHERE name LIKE '%World%'
+  AND rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"folk\"}]';
+",
+    },
+    Migration {
+        version: 94,
+        name: "listen_history_rang_dans_le_contexte",
+        // OU l'auditeur en etait dans l'objet qu'il avait demande.
+        //
+        // La migration 84 a pose CE QU'il avait demande (`context_type` /
+        // `context_id`). Il manquait le RANG : sans lui, « Continuer l'ecoute »
+        // peut rouvrir la bonne playlist, mais toujours a son debut. L'arbitrage
+        // rendu sur #2441 est « objet courant + position », pas l'instantane de
+        // la file entiere — pour un artiste ou un label, la file est batie par
+        // une requete qui change d'un jour a l'autre, « conserver l'ordre » n'y
+        // a aucun sens, et ecrire la file a chaque ecoute couterait un facteur
+        // dix sur le volume, pour une section d'accueil.
+        //
+        // NULL a deux sens, et un seul est « on ne sait pas » :
+        // * ligne anterieure a cette migration — inconnu, on rouvre au debut ;
+        // * ecoute en lecture ALEATOIRE — le rang est deliberement laisse vide.
+        //   Rejouer le meme tirage n'aurait pas de sens : on RE-TIRE. C'est la
+        //   seconde moitie de l'arbitrage, ecrite ici plutot que devinee a la
+        //   lecture, parce que l'etat « aleatoire » de la zone n'existe plus au
+        //   moment ou l'accueil s'affiche.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79 et 84, et
+        // l'ALTER planterait le runner en « duplicate column name » sur une
+        // base qui l'a deja.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2675,6 +2740,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // local ou une chaine de service de streaming.
     add_column_if_missing(db, "listen_history", "context_type", "TEXT");
     add_column_if_missing(db, "listen_history", "context_id", "TEXT");
+    // Rang de la piste dans cet objet (migration 94, #2441). NULL = inconnu
+    // (ligne d'avant la migration) OU tirage aleatoire, cas ou l'on RE-TIRE
+    // au lieu de rejouer le meme ordre.
+    add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -3108,6 +3177,55 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "ignored_devices",
         include_str!("../../migrations/postgres/044_ignored_devices.sql"),
     ),
+    // Jumelle de la SQLite 93 (#1426). C'est une migration de DONNÉES, pas de
+    // schéma : sans elle, le parc PostgreSQL garderait « genre contient folk »
+    // dans le préréglage « World Music » — et donc Folk Metal et Folk Rock —
+    // pour toujours. PostgreSQL ne sème pas les collections intelligentes
+    // lui-même : elles y sont arrivées par la bascule SQLite → PostgreSQL.
+    (
+        45,
+        "resserrer_folk_dans_world_music",
+        include_str!("../../migrations/postgres/045_resserrer_folk_dans_world_music.sql"),
+    ),
+    // #2441 — le RANG dans l'objet demandé. La 037 avait posé CE QUE
+    // l'auditeur avait demandé ; sans le rang, « Continuer l'écoute » rouvre
+    // la bonne playlist mais toujours à sa première piste. NULL vaut aussi
+    // « on re-tire » : en lecture aléatoire, le rang n'est délibérément pas
+    // écrit.
+    (
+        46,
+        "listen_history_rang_dans_le_contexte",
+        include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
+    ),
+    // #2860 — `listen_history.album_id` est TEXT et `albums.id` BIGINT : la
+    // jointure de « Continuer l'ecoute » rend `operator does not exist:
+    // text = bigint`, avalee par `unwrap_or_default()`, donc section vide sur
+    // TOUTE installation PostgreSQL. La 012 convertit deja cette colonne, mais
+    // elle ne l'a jamais vue : `album_id` n'arrive par aucun script numerote,
+    // seulement par ENSURE_COLUMNS, joue APRES. Cette migration rejoue la
+    // conversion maintenant que la colonne existe.
+    (
+        47,
+        "listen_history_album_id_bigint",
+        include_str!("../../migrations/postgres/047_listen_history_album_id_bigint.sql"),
+    ),
+    // #2886 — `zones.volume` passe d'INTEGER a DOUBLE PRECISION. Pas de
+    // jumelle SQLite : SQLite est a typage dynamique et l'affinite INTEGER ne
+    // convertit une decimale que si c'est SANS PERTE, donc une base deja
+    // creee stocke deja 0,4 tel quel. PostgreSQL, lui, REFUSE un f64 dans une
+    // colonne integer — sans cette migration, tout reglage de volume echouerait
+    // sur PG. Le test `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer`
+    // tient l'autre moitie de la preuve.
+    (
+        48,
+        "zones_volume_a_virgule",
+        include_str!("../../migrations/postgres/048_zones_volume_a_virgule.sql"),
+    ),
+    (
+        49,
+        "profile_id_bigint",
+        include_str!("../../migrations/postgres/049_profile_id_bigint.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3331,6 +3449,130 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// #1426 — le préréglage « World Music » livré ne doit plus porter
+    /// « genre CONTIENT folk », qui ramasse « Folk Metal » et « Folk Rock ».
+    /// `world` et `ethnic` gardent « contient », où la sous-chaîne est utile.
+    #[test]
+    fn world_music_livre_avec_folk_en_egalite_stricte() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("le préréglage « World Music » doit être semé");
+
+        assert!(
+            regles.contains(r#"{"field":"genre","operator":"equals","value":"folk"}"#),
+            "folk doit être en égalité stricte : {regles}"
+        );
+        assert!(
+            !regles.contains(r#"{"field":"genre","operator":"contains","value":"folk"}"#),
+            "« contient folk » ramasse Folk Metal et Folk Rock (#1426) : {regles}"
+        );
+        for garde in [
+            "\"contains\",\"value\":\"world\"",
+            "\"contains\",\"value\":\"ethnic\"",
+        ] {
+            assert!(
+                regles.contains(garde),
+                "seul `folk` change ; `world` et `ethnic` restent en « contient » : {regles}"
+            );
+        }
+    }
+
+    /// La correction #1426 est gardée sur la chaîne de règles EXACTE du semis :
+    /// une collection que l'utilisateur a retouchée ne doit JAMAIS être
+    /// réécrite sous ses pieds — c'est la contrepartie de réparer les
+    /// bibliothèques déjà installées.
+    #[test]
+    fn world_music_personnalisee_nest_pas_reecrite() {
+        const SUR_MESURE: &str = r#"[{"field":"genre","operator":"contains","value":"gnawa"}]"#;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        {
+            // On remet la base dans l'état d'un utilisateur qui avait déjà
+            // retouché sa collection AVANT que la 93 n'arrive : règles sur
+            // mesure, et la 93 retirée du registre pour qu'elle rejoue.
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![SUR_MESURE],
+            )
+            .unwrap();
+            // `>= 93` et non `= 93` : le runner repart de MAX(version), donc
+            // effacer la seule 93 ne la ferait PAS rejouer dès qu'une
+            // migration ultérieure existe — le test se serait tu en croyant
+            // prouver quelque chose. Il ne dépend plus de sa place dans la
+            // liste (#2441, migration 94).
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            current_version(&db).unwrap(),
+            latest_version(),
+            "la 93 doit bien avoir rejoué"
+        );
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            regles, SUR_MESURE,
+            "une collection personnalisée doit rester intacte (#1426)"
+        );
+        drop(conn);
+
+        // Contre-épreuve DANS le test : sans elle, « rien n'a bougé » serait
+        // aussi vrai d'une migration vide. On repose la chaîne LIVRÉE, on fait
+        // rejouer la 93, et cette fois elle DOIT mordre.
+        const LIVREE: &str = concat!(
+            r#"[{"field":"genre","operator":"contains","value":"world"},"#,
+            r#"{"field":"genre","operator":"contains","value":"ethnic"},"#,
+            r#"{"field":"genre","operator":"contains","value":"folk"}]"#
+        );
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![LIVREE],
+            )
+            .unwrap();
+            // Même raison qu'au-dessus : c'est le plancher MAX(version) qui
+            // décide de ce qui rejoue.
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            regles, LIVREE,
+            "sur la chaîne livrée, la 93 doit mordre — sinon le garde ci-dessus \
+             ne prouve rien"
+        );
+        assert!(regles.contains(r#""operator":"equals","value":"folk""#));
     }
 
     /// Forum #1328 : décalage des paroles par zone. Vérifie la colonne ET son
@@ -4565,7 +4807,35 @@ mod tests {
         // et par `album_distinct_pairs` (#1276), tous deux fusionnés pendant
         // que cette branche passait ses portes — d'où le renumérotage, fait
         // AVANT qu'aucune base ne voie l'ancien numéro.
-        assert_eq!(pg_latest_version(), 44, "latest PG migration must be 44");
+        // 45 : `resserrer_folk_dans_world_music` (#1426), jumelle de la
+        // SQLite 93. Migration de DONNÉES : sans jumelle PG, le préréglage
+        // « World Music » garderait « contient folk » sur tout le parc
+        // PostgreSQL.
+        // 46 : `listen_history_rang_dans_le_contexte` (#2441). ⚠️ Cette
+        // migration a été ajoutée SANS remonter la borne ci-dessous : la
+        // branche était donc déjà ROUGE sur ce test avant #2860. Personne ne
+        // l'a vu parce que « Test (PostgreSQL) » est SAUTÉ sur une PR vers
+        // `batch/*` ou `rc/*` sans l'étiquette `ci:full` — c'est cette
+        // PR-ci, qui la porte, qui a réveillé le test.
+        // 47 : `listen_history_album_id_bigint` (#2860). `album_id` était
+        // TEXT contre `albums.id` BIGINT : la jointure de « Continuer
+        // l'écoute » rendait `operator does not exist: text = bigint`, avalé
+        // par `unwrap_or_default()`, donc section vide sur tout le parc
+        // PostgreSQL.
+        // 48 : `zones_volume_a_virgule` (#2886). `zones.volume` était un
+        // INTEGER : sous 0,005 linéaire (−46,0205999133 dB) la valeur
+        // persistée tombait à 0 et la zone se rallumait MUETTE. PAS de jumelle
+        // SQLite — voir le commentaire de l'entrée 48 dans PG_MIGRATIONS.
+        // 49 : `profile_id_bigint` (#2995). `listen_history.profile_id` et
+        // `playlists.profile_id` étaient TEXT sur toute installation
+        // PostgreSQL NATIVE, contre `profiles.id` BIGINT et un `i64` lié :
+        // `PlaylistRepo::list()` rendait `operator does not exist: text =
+        // bigint`, donc liste de playlists vide. Même cause que la 47 —
+        // les colonnes n'arrivent par aucun script numéroté, seulement par
+        // `ENSURE_COLUMNS`, et la 012 qui les vise ne les a jamais vues.
+        // Ce sont les DEUX dernières colonnes dans ce cas : la mesure de
+        // #2995 en compte cinq, dont trois déjà réparées.
+        assert_eq!(pg_latest_version(), 49, "latest PG migration must be 49");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -4994,6 +5264,13 @@ mod tests {
         for (fichier, nom) in [
             ("029_format_lowercase.sql", "format_lowercase"),
             ("030_format_conteneur_dsd.sql", "format_conteneur_dsd"),
+            // #1426 — le préréglage « World Music » est arrivé sur PostgreSQL
+            // par la bascule, jamais par un semis PG : sans jumelle, « contient
+            // folk » y resterait pour toujours.
+            (
+                "045_resserrer_folk_dans_world_music.sql",
+                "resserrer_folk_dans_world_music",
+            ),
         ] {
             assert!(
                 MIGRATIONS.iter().any(|m| m.name == nom),

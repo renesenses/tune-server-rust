@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -310,9 +310,14 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 3] = [
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
     "enrich_all_status",
     "artist_artwork_enrich_result",
+    // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une
+    // grosse bibliothèque à 1 req/s : un arrêt en cours de route est le cas
+    // NORMAL, pas l'exception. Sans cette ligne, `running` resterait en base
+    // pour toujours — le défaut #2002, à l'identique.
+    crate::routes::library::credits_mb::REGLAGE_AVANCEMENT_CREDITS,
     // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
     // de passe laisserait `status: "running"` en base pour toujours et le
     // bouton de relance grisé — exactement le défaut #2002. La constante
@@ -341,7 +346,12 @@ const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
 /// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
 /// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
 /// ne saurait pas où sa passe s'est arrêtée.
-fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+/// `pub(crate)` parce que le démarrage n'est plus le seul déclencheur : la fin
+/// d'une passe d'images d'artistes qui s'est arrêtée sans écrire son `done`
+/// applique la MÊME réécriture, tout de suite, sans attendre un redémarrage
+/// (`routes::library::artwork::FinDePasseArtistes`, #2073). Deux règles
+/// séparées auraient divergé au premier champ neutralisé.
+pub(crate) fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
     let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
         Ok(v) => v,
         Err(_) => {
@@ -776,7 +786,7 @@ async fn restore_zone_volumes(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
-                let vol = (zone.volume as f64) / 100.0;
+                let vol = zone.volume / 100.0;
                 if zone.fixed_volume {
                     // Contrat « Volume fixe (bit-perfect) » : 100 % est un
                     // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
@@ -984,18 +994,36 @@ async fn restore_oaat_groups(state: &AppState) {
 #[cfg(not(feature = "oaat"))]
 async fn restore_oaat_groups(_state: &AppState) {}
 
-/// Create the OpenHome event listener (shared between SSDP handler and outputs).
-pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
-    let server_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into());
-    match OpenHomeEventListener::new(server_ip).await {
-        Ok(l) => Some(Arc::new(l)),
-        Err(e) => {
-            tracing::warn!(error = %e, "oh_event_listener_init_failed");
-            None
-        }
-    }
+/// LE récepteur GENA du processus. Créé une seule fois, quel que soit l'appelant.
+///
+/// La mémoïsation n'est pas un raffinement : elle lève l'obstacle qui privait
+/// d'évènements tout renderer récupéré au redémarrage (#1126). Ce chemin-là
+/// n'atteignait pas le récepteur du gestionnaire SSDP depuis `AppState`, et en
+/// créer un second aurait couru contre lui pour le port fixe 8890 —
+/// [`UpnpEventListener::new`] retombant alors sur un port éphémère, au
+/// détriment du premier. Une cellule unique rend le même récepteur aux deux, et
+/// la course disparaît au lieu d'être contournée (#2263).
+static RECEPTEUR_EVENEMENTS: tokio::sync::OnceCell<Option<Arc<UpnpEventListener>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Create the UPnP (GENA) event listener, shared between the SSDP handler,
+/// the restart-recovery path and the outputs. Idempotent.
+pub async fn create_oh_listener() -> Option<Arc<UpnpEventListener>> {
+    RECEPTEUR_EVENEMENTS
+        .get_or_init(|| async {
+            let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            match UpnpEventListener::new(server_ip).await {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }
 
 /// Persist music_dirs and discogs_token from config/env into the settings DB.
@@ -1115,11 +1143,11 @@ async fn resolve_ytdlp(state: &AppState) {
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+        (zone_volume / 100.0).clamp(0.0, 1.0)
     }
 }
 
@@ -1385,10 +1413,13 @@ pub async fn register_local_outputs(state: &AppState) {
 /// musique.
 ///
 /// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
-/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
-/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
-/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
-/// que le serveur ne remplit jamais.
+/// active`). Une SECONDE definition de `network_mounts` a longtemps coexiste,
+/// dans `tune-core/src/mount_manager.rs` (`host/share_name/…/auto_mount`) :
+/// meme nom, colonnes differentes, jamais construite hors tests. Elle a ete
+/// supprimee par #1914 ; le test `network_mounts_n_a_qu_une_definition_par_moteur`
+/// (tune-core, `db/migrations.rs`) empeche desormais qu'une concurrente
+/// reapparaisse. Batir le remontage sur `auto_mount` interrogerait donc une
+/// colonne qui n'existe plus.
 ///
 /// Chaque montage est independant : un partage injoignable est journalise et
 /// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
@@ -1596,7 +1627,7 @@ mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
 
-    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+    fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let repo = ZoneRepo::with_backend(state.backend.clone());
         let id = repo
@@ -1615,7 +1646,7 @@ mod restore_zone_volumes_tests {
     /// d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn fixed_volume_zone_restarts_at_full_scale() {
-        let (state, id) = state_with_zone(100, true);
+        let (state, id) = state_with_zone(100.0, true);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1633,7 +1664,7 @@ mod restore_zone_volumes_tests {
     /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
-        let (state, id) = state_with_zone(100, false);
+        let (state, id) = state_with_zone(100.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1646,11 +1677,11 @@ mod restore_zone_volumes_tests {
     /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
     #[tokio::test]
     async fn memory_agrees_with_db_for_every_stored_level() {
-        for stocke in [0, 20, 55, 99, 100] {
+        for stocke in [0.0, 20.0, 55.0, 99.0, 100.0] {
             let (state, id) = state_with_zone(stocke, false);
             restore_zone_volumes(&state).await;
             let vol = state.playback.get_state(id).await.volume;
-            let attendu = stocke as f64 / 100.0;
+            let attendu = stocke / 100.0;
             assert!(
                 (vol - attendu).abs() < 1e-9,
                 "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
@@ -1665,31 +1696,84 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+    }
+
+    /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
+    ///
+    /// `restore_zone_volumes` est le pont entre la colonne et le son après un
+    /// redémarrage. Avec `zones.volume` en `INTEGER`, tout réglage sous
+    /// **0,005 linéaire — soit −46,0205999133 dB exactement** — était persisté
+    /// à 0 : la zone revenait à zéro, indiscernable d'un mute volontaire.
+    ///
+    /// Ce test balaie les deux côtés du seuil mesuré et exige que le niveau
+    /// restauré soit celui qui a été stocké, à l'ulp près.
+    #[tokio::test]
+    async fn un_volume_sous_le_seuil_mesure_ne_revient_pas_muet() {
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12,
+            "le seuil est 20·log10(0,005)"
+        );
+
+        for cible_db in [-40.0, -46.0, SEUIL_DB, SEUIL_DB - 0.001, -48.0, -60.0] {
+            let lineaire: f64 = 10f64.powf(cible_db / 20.0);
+            let (state, id) = state_with_zone(lineaire * 100.0, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            assert!(
+                vol > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (volume restauré {vol})"
+            );
+            assert!(
+                (vol - lineaire).abs() < 1e-12,
+                "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
+            );
+            // Et le chemin qui atteint vraiment le son dit la même chose.
+            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+        }
+    }
+
+    /// Témoin anti-régression #2886 : les volumes USUELS ne bougent pas d'un
+    /// iota. Multiples exacts de 1 %, donc déjà parfaits avant le correctif.
+    #[tokio::test]
+    async fn les_volumes_usuels_reviennent_identiques() {
+        for pour_cent in [
+            0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 90.0, 99.0, 100.0,
+        ] {
+            let (state, id) = state_with_zone(pour_cent, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = pour_cent / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-12,
+                "{pour_cent} % restauré à {vol} au lieu de {attendu}"
+            );
+        }
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
     #[tokio::test]
     async fn ordinary_volume_is_restored_verbatim() {
-        let (state, id) = state_with_zone(55, false);
+        let (state, id) = state_with_zone(55.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");

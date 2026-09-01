@@ -17,9 +17,24 @@ use crate::TuneError;
 /// nothing (same trap handled in `browse.rs`). The server's `MAIN_SEPARATOR` is
 /// the separator stored in `tracks.file_path` (paths are absolute local paths on
 /// the scanning host), so both the flat filter and the folder facet agree.
+///
+/// Le préfixe est replié en **NFC**, parce que c'est la forme sous laquelle le
+/// scanner écrit `tracks.file_path` (`scanner::walker` et `routes/system/scan`
+/// appellent tous deux `.nfc()` avant d'insérer). Un préfixe qui vient du
+/// *disque* — et non de la base — peut arriver en **NFD** : un dossier accentué
+/// créé côté NAS, ou copié depuis macOS, n'existe qu'en forme décomposée, et
+/// c'est cette forme-là que `resolve_browse_path` rend puisque c'est la seule
+/// que le système de fichiers accepte d'ouvrir. Les deux chaînes s'affichent à
+/// l'identique et ne partagent pas un octet : sans ce repli, le `LIKE` ne
+/// ramène **aucune** ligne pour un dossier pourtant scanné, et l'écran annonce
+/// un répertoire vide.
+///
+/// Sur un préfixe déjà NFC — tout ce qui sort de la base — le repli est un
+/// no-op par construction.
 pub fn folder_like_pattern(prefix: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
     let sep = std::path::MAIN_SEPARATOR;
-    let base = prefix.trim_end_matches(['/', '\\']);
+    let base: String = prefix.trim_end_matches(['/', '\\']).nfc().collect();
     format!("{base}{sep}%")
 }
 
@@ -461,6 +476,23 @@ pub fn dedup_display_tracks(tracks: Vec<Track>) -> Vec<Track> {
 /// constantes de découpage dans le dépôt.
 pub(crate) const ID_INLINE_BATCH: usize = 5_000;
 
+/// Combien d'échecs d'insertion/mise à jour un lot détaille avant de basculer
+/// sur un récapitulatif (#2890).
+///
+/// Un lot de scan fait `SCAN_BATCH_SIZE` = 500 pistes, et quand il échoue, il
+/// échoue pour UNE cause — une FK périmée, une base verrouillée, un disque
+/// plein — répétée 500 fois à l'identique. Or l'export de diagnostic borne
+/// chaque module à un quart de la fenêtre (`QUOTA_PAR_MODULE`, #1974) : ces
+/// 500 lignes prennent 250 lignes sur 1000, arrachées aux modules qu'on
+/// cherchait justement à lire.
+///
+/// Dix suffisent à établir la cause et à donner des chemins de fichiers à
+/// rejouer ; le récapitulatif qui suit donne le TOTAL, si bien qu'aucune perte
+/// de piste n'est masquée — c'était tout l'intérêt de ces avertissements
+/// (~205 pistes en base pour ~779 sur le disque, JP Borderies). Même patron
+/// que `scan_walk_errors_truncated` dans `scanner::walker`.
+const ECHECS_DETAILLES: usize = 10;
+
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -760,10 +792,13 @@ impl TrackRepo {
             let in_part = ph
                 .in_list_ci("t.genre", n)
                 .expect("liste non vide déjà vérifiée");
-            let like_part = (0..n)
-                .map(|_| format!("t.genres LIKE {}", ph.take()))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            // ⚠️ Insensible à la casse des DEUX côtés, comme le `in_list_ci`
+            // ci-dessus : un `LIKE` nu l'est en SQLite, mais PAS en
+            // PostgreSQL. Jumeau strict du rail (`facets::build_conditions`),
+            // qui a reçu la même correction (#1821).
+            let like_part = ph
+                .or_like_ci("t.genres", n)
+                .expect("liste non vide déjà vérifiée");
             conditions.push(format!("({in_part} OR {like_part})"));
             for g in &f.genres {
                 owned_params.push(SqlValue::Text(g.clone()));
@@ -1335,18 +1370,9 @@ impl TrackRepo {
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
+        let mut echecs = 0usize;
         let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
-            if track.title.to_lowercase().contains("personal jesus") {
-                tracing::warn!(
-                    title = %track.title,
-                    album_id = ?track.album_id,
-                    artist_id = ?track.artist_id,
-                    album_artist = ?track.album_artist,
-                    file = ?track.file_path,
-                    "BUG_TRACE_insert_personal_jesus"
-                );
-            }
             let params: [&dyn ToSqlValue; 28] = [
                 &track.title,
                 &track.album_id,
@@ -1394,14 +1420,76 @@ impl TrackRepo {
                 // after a delete + full rescan). Log it so the drop is visible
                 // and the root cause (stale album_id/artist_id FK from an
                 // importer cache surviving a batch rollback) is diagnosable.
-                Err(e) => tracing::warn!(
-                    file = ?track.file_path,
-                    album_id = ?track.album_id,
-                    artist_id = ?track.artist_id,
-                    error = %e,
-                    "track_insert_failed_in_batch"
-                ),
+                // Plafonné, sur le modèle de `scan_walk_errors_truncated`
+                // (#2890) : la cause d'un lot qui échoue est la MÊME pour les
+                // 500 lignes (FK périmée, base verrouillée, disque plein).
+                // Les premières la disent ; les 490 suivantes ne font que
+                // manger le quart de fenêtre alloué à ce module. Le total est
+                // récapitulé juste après — aucune perte n'est masquée.
+                Err(e) => {
+                    echecs += 1;
+                    if echecs <= ECHECS_DETAILLES {
+                        tracing::warn!(
+                            file = ?track.file_path,
+                            album_id = ?track.album_id,
+                            artist_id = ?track.artist_id,
+                            error = %e,
+                            "track_insert_failed_in_batch"
+                        );
+                    }
+                }
             }
+        }
+        if echecs > ECHECS_DETAILLES {
+            tracing::warn!(
+                echecs,
+                detaillees = ECHECS_DETAILLES,
+                pistes = tracks.len(),
+                "track_insert_failures_truncated"
+            );
+        }
+        // ── Ce que la sonde retirée voulait voir (#2890) ──────────────────
+        //
+        // Un `warn!` par piste vivait en tête de la boucle ci-dessus depuis le
+        // 01/07/2026 (commit e57c9acc, message `diag:`) : il testait le TITRE
+        // de chaque piste contre « personal jesus » en dur et sortait
+        // `album_id`/`artist_id` quand ça mordait. Le doute d'origine — un
+        // album éclaté entre deux `album_id` à l'insertion — reste ouvert ; la
+        // sonde, non, pour trois raisons :
+        //
+        // 1. `warn!` est un niveau LIVRÉ. L'export de diagnostic borne chaque
+        //    module à un quart de la fenêtre (`QUOTA_PAR_MODULE`, #1974) : une
+        //    ligne par piste peut prendre 250 lignes sur 1000, arrachées à
+        //    tous les autres modules — et `db::track_repo` est justement celui
+        //    qu'on lit quand un scan perd des pistes (#2939).
+        // 2. Le prédicat était un titre en dur, l'un des plus repris du
+        //    répertoire : original, remixes, compilations et reprises mordent
+        //    tous, et `to_lowercase()` allouait une `String` par piste insérée
+        //    pour un test faux dans la quasi-totalité des cas.
+        // 3. La même question se répond PAR LOT. Un dossier scanné qui rend
+        //    plus d'un `album_id` EST la signature de l'album éclaté ; c'est
+        //    ce compte qui instruit, pas la répétition piste à piste.
+        //
+        // D'où ce récapitulatif : une ligne par appel (500 fichiers,
+        // `SCAN_BATCH_SIZE`) au lieu d'une par piste, et en `debug!` — sous le
+        // niveau livré, donc à activer quand on enquête, comme toute sonde.
+        // Les échecs d'insertion réels, eux, restent en `warn!` juste au-dessus.
+        if !tracks.is_empty() {
+            tracing::debug!(
+                pistes = tracks.len(),
+                inserees = count,
+                albums_distincts = tracks
+                    .iter()
+                    .map(|t| t.album_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                artistes_distincts = tracks
+                    .iter()
+                    .map(|t| t.artist_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                "track_batch_inserted"
+            );
         }
         Ok(count)
     }
@@ -1449,11 +1537,28 @@ impl TrackRepo {
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
+        let mut echecs = 0usize;
         for res in self.db.execute_many(&update_sql, &row_params) {
             match res {
                 Ok(_) => count += 1,
-                Err(e) => tracing::warn!(error = %e, "track_update_failed_in_batch"),
+                // Même plafond que `create_batch` ci-dessus (#2890), et pour
+                // la même raison : un lot qui échoue échoue pour une seule
+                // cause, répétée à l'identique.
+                Err(e) => {
+                    echecs += 1;
+                    if echecs <= ECHECS_DETAILLES {
+                        tracing::warn!(error = %e, "track_update_failed_in_batch");
+                    }
+                }
             }
+        }
+        if echecs > ECHECS_DETAILLES {
+            tracing::warn!(
+                echecs,
+                detaillees = ECHECS_DETAILLES,
+                pistes = tracks.len(),
+                "track_update_failures_truncated"
+            );
         }
         Ok(count)
     }

@@ -1,0 +1,6 @@
+{
+  "identifier": "full-window",
+  "description": "Fenetre « pleine » (#1598) : elle charge l'interface web du serveur, pas un contenu embarque. On ne lui ouvre donc QUE la commande dont le raccourci de zoom de Tauri a besoin sur macOS et Linux — pas core:default, qui exposerait les API natives a une page distante.",
+  "windows": ["full"],
+  "permissions": ["core:webview:allow-set-webview-zoom"]
+}

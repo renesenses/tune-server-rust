@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -234,6 +235,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // champs que GET /zones et GET /zones/{id}.
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+        crate::routes::zones::inject_session_context(obj, &zone_state);
     }
     // Include stream_url ONLY for browser playback zones, so the web client can
     // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
@@ -2915,7 +2917,7 @@ async fn do_transfer(
     // symptôme que le trim par renderer corrige, autant ne plus l'aggraver).
     let target_volume = target_db_zone
         .as_ref()
-        .map(|z| f64::from(z.volume) / 100.0)
+        .map(|z| z.volume / 100.0)
         .unwrap_or(current.volume);
     state.playback.set_volume(target_zone, target_volume).await;
     state
@@ -3012,7 +3014,7 @@ async fn get_alarms(
     let rows = state
         .backend
         .query_many(&sql, &[&zone_id as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -3469,22 +3471,36 @@ pub struct ShuffleAllQuery {
     artist_id: Option<i64>,
 }
 
-/// Maximum number of tracks a single "shuffle all" enqueues. Enqueuing an entire
-/// large library (Yves, 50k) froze the web UI and gains nothing musically — a few
-/// hundred randomly-shuffled tracks is a "shuffle all" for all practical use.
-const SHUFFLE_MAX_TRACKS: i64 = 500;
+// Combien de pistes une lecture aléatoire enfile au maximum.
+//
+// C'était une constante à 500, posée pour fermer le gel d'interface de Jean
+// Valjean (30 000 pistes, #2228). C'est désormais un RÉGLAGE, parce que le
+// besoin INVERSE existe aussi : william veut lire plus de 2 400 pistes et se
+// fait tronquer à 500 sans que rien ne le lui dise (fil 1620, #2901).
+//
+// Le défaut ne bouge pas : qui n'y touche pas garde exactement le
+// comportement de #2228. Bornes, mesures et justification du maximum sont
+// dans `tune_core::playback::queue`.
+use tune_core::playback::queue::shuffle_max_tracks;
 
-/// Une sélection que la base a déjà bornée à `SHUFFLE_MAX_TRACKS`.
+/// Une sélection que la base a déjà bornée à `plafond`.
 ///
 /// `search()` s'arrête à la limite qu'on lui donne : une liste PLEINE veut
 /// dire « il y en avait peut-être davantage », et on ne sait pas combien. On
 /// rend donc `None` plutôt qu'un total qui serait faux — la même règle que
 /// #2250 : la valeur mesurée, ou rien.
-fn selection_bornee(pistes: Option<Vec<tune_core::db::models::Track>>) -> (Vec<i64>, Option<i64>) {
+///
+/// Le plafond est un PARAMÈTRE et non plus une constante : le comparer à une
+/// constante pendant qu'un autre chemin tronque à la valeur configurée
+/// rendrait `capped` faux dès que l'utilisateur relève le réglage.
+fn selection_bornee(
+    pistes: Option<Vec<tune_core::db::models::Track>>,
+    plafond: i64,
+) -> (Vec<i64>, Option<i64>) {
     let ids: Vec<i64> = pistes
         .map(|v| v.into_iter().filter_map(|t| t.id).collect())
         .unwrap_or_default();
-    let total = ((ids.len() as i64) < SHUFFLE_MAX_TRACKS).then_some(ids.len() as i64);
+    let total = ((ids.len() as i64) < plafond).then_some(ids.len() as i64);
     (ids, total)
 }
 
@@ -3541,6 +3557,11 @@ pub async fn shuffle_all(
 ) -> impl IntoResponse {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    // Lu UNE fois par requête, puis passé à toutes les branches. Les cinq
+    // chemins (album, artiste, recherche, genre, bibliothèque entière) et la
+    // troncature finale doivent voir le MÊME plafond : c'est aussi la valeur
+    // sur laquelle la réponse fonde son `capped`.
+    let plafond = shuffle_max_tracks(&state.backend);
 
     // Honor the current library filter context so the shuffle applies to the
     // visible results, not the whole library, and target the caller's zone
@@ -3570,11 +3591,11 @@ pub async fn shuffle_all(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        selection_bornee(track_repo.search(sq, SHUFFLE_MAX_TRACKS).ok())
+        selection_bornee(track_repo.search(sq, plafond).ok(), plafond)
     } else if let Some(g) = q.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        selection_bornee(track_repo.search(g, SHUFFLE_MAX_TRACKS).ok())
+        selection_bornee(track_repo.search(g, plafond).ok(), plafond)
     } else {
-        // Whole-library shuffle: take a random SHUFFLE_MAX_TRACKS sample straight
+        // Whole-library shuffle: take a random `plafond`-sized sample straight
         // from the DB rather than every row. Enqueuing an entire 50k-track library
         // froze the web UI (rendering the queue) and served no purpose — a random
         // few-hundred is a "shuffle all" in every practical sense (Yves, 50k
@@ -3584,9 +3605,7 @@ pub async fn shuffle_all(
         // C'est la seule branche où le total est connu sans coût : la
         // bibliothèque entière se compte.
         (
-            track_repo
-                .random_ids(SHUFFLE_MAX_TRACKS)
-                .unwrap_or_default(),
+            track_repo.random_ids(plafond).unwrap_or_default(),
             track_repo.count().ok(),
         )
     };
@@ -3610,7 +3629,7 @@ pub async fn shuffle_all(
 
     // Cap the enqueued set uniformly (a filtered path — album/artist — could also
     // be large). A queue of a few hundred shuffled tracks never freezes the UI.
-    all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
+    all_ids.truncate(plafond as usize);
 
     let zone_id = q.zone_id.unwrap_or(1);
     // Was `.ok()` — the only call site that swallowed a set_queue failure
@@ -3814,12 +3833,14 @@ mod contrat_suivant_tests {
 /// Le plafond de la lecture aléatoire doit être DIT, pas seulement appliqué.
 ///
 /// Rappel du fil 1096 (Jean Valjean, #2228) : une file de 30 000 pistes gelait
-/// l'interface, d'où `SHUFFLE_MAX_TRACKS`. Le plafond reste — le retirer
-/// rouvrirait ce gel. Mais la réponse n'en disait rien, et le bouton, lui,
-/// promet « tout ».
+/// l'interface, d'où le plafond. Il RESTE, et son défaut reste 500 — le
+/// retirer rouvrirait ce gel. Depuis #2901 il est réglable jusqu'à 5 000
+/// (borne mesurée) pour ceux qui veulent une file plus longue, mais la
+/// réponse doit dire quand elle a tronqué, quelle que soit la valeur.
 #[cfg(test)]
 mod plafond_aleatoire_tests {
-    use super::{SHUFFLE_MAX_TRACKS, compte_rendu_selection, reponse_shuffle, selection_bornee};
+    use super::{compte_rendu_selection, reponse_shuffle, selection_bornee};
+    use tune_core::playback::queue::SHUFFLE_MAX_TRACKS_DEFAULT;
 
     /// Le cas de Jean Valjean : 30 412 pistes en bibliothèque, 500 enfilées.
     /// La réponse doit porter les deux nombres, pas seulement le second.
@@ -3882,22 +3903,38 @@ mod plafond_aleatoire_tests {
     /// prouve pas que la sélection faisait exactement cette taille.
     #[test]
     fn une_recherche_revenue_pleine_ne_connait_pas_sa_taille() {
-        let pleine: Vec<tune_core::db::models::Track> = (0..SHUFFLE_MAX_TRACKS)
-            .map(|i| {
-                let mut t = tune_core::db::models::Track::new(format!("piste {i}"));
-                t.id = Some(i + 1);
-                t
-            })
-            .collect();
-        let (ids, total) = selection_bornee(Some(pleine));
-        assert_eq!(ids.len(), SHUFFLE_MAX_TRACKS as usize);
+        let pistes = |n: i64| -> Vec<tune_core::db::models::Track> {
+            (0..n)
+                .map(|i| {
+                    let mut t = tune_core::db::models::Track::new(format!("piste {i}"));
+                    t.id = Some(i + 1);
+                    t
+                })
+                .collect()
+        };
+        let (ids, total) = selection_bornee(
+            Some(pistes(SHUFFLE_MAX_TRACKS_DEFAULT)),
+            SHUFFLE_MAX_TRACKS_DEFAULT,
+        );
+        assert_eq!(ids.len(), SHUFFLE_MAX_TRACKS_DEFAULT as usize);
         assert_eq!(total, None, "liste pleine ⇒ taille réelle inconnue");
-
         let mut courte = tune_core::db::models::Track::new("unique".into());
         courte.id = Some(7);
-        let (ids, total) = selection_bornee(Some(vec![courte]));
+        let (ids, total) = selection_bornee(Some(vec![courte]), SHUFFLE_MAX_TRACKS_DEFAULT);
         assert_eq!(ids, vec![7]);
         assert_eq!(total, Some(1), "liste incomplète ⇒ taille réelle connue");
+        // Le plafond RELEVÉ : la même liste de 500, sous un plafond de 2 000,
+        // n'est plus pleine — elle connaît donc sa taille, et `capped` sera
+        // faux. Une comparaison restée sur la constante 500 dirait l'inverse,
+        // et la lecture aléatoire annoncerait un plafond qu'elle n'a pas posé.
+        let (ids, total) = selection_bornee(Some(pistes(SHUFFLE_MAX_TRACKS_DEFAULT)), 2_000);
+        assert_eq!(ids.len(), 500);
+        assert_eq!(
+            total,
+            Some(500),
+            "sous un plafond relevé, une liste de 500 n'est plus bornée : \
+             l'annoncer « plafonnée » serait un mensonge de plus"
+        );
     }
 
     /// Garde-fou de non-régression : le client lit `track_count` pour son

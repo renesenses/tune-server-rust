@@ -14,11 +14,11 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id";
+    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id, context_type, context_id, context_position";
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -31,7 +31,8 @@ pub mod sql {
             d.placeholder(10),
             d.placeholder(11),
             d.placeholder(12),
-            d.placeholder(13)
+            d.placeholder(13),
+            d.placeholder(14)
         )
     }
 
@@ -172,6 +173,15 @@ pub struct ListenRecord {
     /// non INTEGER : une playlist locale a un id numerique, un album Qobuz
     /// une chaine. La colonne doit accueillir les deux.
     pub context_id: Option<String>,
+    /// Rang de la piste DANS cet objet, au moment ou elle a ete jouee : la
+    /// position dans la file de la zone. C'est ce qui permet de rouvrir la
+    /// playlist a la piste 7 plutot qu'a son debut (#2441, migration 94).
+    ///
+    /// `None` a deux causes, et l'une n'est pas une ignorance : une ligne
+    /// anterieure a la migration 94 (rang inconnu), OU une ecoute en lecture
+    /// ALEATOIRE. Dans ce second cas le rang est laisse vide a dessein — on
+    /// RE-TIRE au lieu de rejouer le meme tirage.
+    pub context_position: Option<i64>,
 }
 
 pub struct HistoryRepo {
@@ -200,7 +210,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 13] = [
+        let params: [&dyn ToSqlValue; 14] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -214,6 +224,7 @@ impl HistoryRepo {
             &rec.profile_id,
             &rec.context_type,
             &rec.context_id,
+            &rec.context_position,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -1214,6 +1225,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         profile_id: None,
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
+        context_position: cols.get(13).and_then(|v| v.as_i64()),
     }
 }
 
@@ -1261,6 +1273,7 @@ mod tests {
             profile_id: None,
             context_type: Some("playlist".into()),
             context_id: Some("42".into()),
+            context_position: Some(6),
         };
         repo.record(&depuis_une_playlist).unwrap();
 
@@ -1278,6 +1291,12 @@ mod tests {
             Some("42"),
             "le type est la mais pas l'identifiant : on saurait que c'etait \
              une playlist sans jamais savoir LAQUELLE"
+        );
+        assert_eq!(
+            relu[0].context_position,
+            Some(6),
+            "le rang n'a pas survecu : on rouvrirait la bonne playlist, mais \
+             toujours a sa premiere piste (#2441, migration 94)"
         );
 
         // Une piste jouee seule dit « track », pas « playlist » : les deux
@@ -1302,6 +1321,7 @@ mod tests {
             title: "All Blues".into(),
             context_type: None,
             context_id: None,
+            context_position: None,
             ..depuis_une_playlist.clone()
         };
         repo.record(&sans_contexte).unwrap();
@@ -1332,6 +1352,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         };
 
         repo.record(&rec).unwrap();
@@ -1369,6 +1390,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1389,6 +1411,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1421,6 +1444,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1452,6 +1476,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -1476,6 +1501,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -1494,6 +1520,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
 
@@ -1523,6 +1550,7 @@ mod tests {
                 profile_id: None,
                 context_type: None,
                 context_id: None,
+                context_position: None,
             })
             .unwrap();
         }
@@ -1536,12 +1564,13 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        // 13 colonnes depuis #2441 : `context_type` et `context_id` se sont
+        // 14 colonnes depuis #2441 : `context_type` et `context_id`
+        // (migration 84) puis `context_position` (migration 94) se sont
         // ajoutees aux onze precedentes.
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
         assert!(
             sql::record(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)")
         );
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
@@ -1573,6 +1602,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
 
@@ -1606,6 +1636,7 @@ mod tests {
             profile_id: None,
             context_type: None,
             context_id: None,
+            context_position: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);

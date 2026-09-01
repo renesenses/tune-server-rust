@@ -1759,6 +1759,50 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// Le nombre d'albums de CHACUN des artistes demandés, en UNE requête.
+    ///
+    /// C'est le `childCount` du conteneur `artist/<id>` du serveur média. Il
+    /// doit valoir exactement ce que [`Self::list_by_artist`] ouvrira —
+    /// donc le même prédicat, exclusion des albums masqués comprise : un
+    /// conteneur qui annonce 12 et en montre 9 se lit comme une bibliothèque
+    /// abîmée, alors qu'il ne manque qu'un filtre.
+    ///
+    /// Une requête par artiste ferait 500 allers-retours sur une seule page
+    /// de `Browse`. Les identifiants viennent de la base et sont des entiers :
+    /// ils s'inlinent sans risque d'injection, comme le fait déjà
+    /// `TrackRepo::list_by_ids`.
+    ///
+    /// Un artiste sans album ne figure pas dans la réponse — l'appelant lit
+    /// une absence comme un zéro.
+    pub fn count_by_artists(
+        &self,
+        artist_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+        if artist_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let id_list = artist_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT a.artist_id, COUNT(*) FROM albums a \
+             WHERE a.artist_id IN ({id_list}) AND {} \
+             GROUP BY a.artist_id",
+            crate::db::facet_filter::hidden_albums_excluded()
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|cols| {
+                let id = cols.first().and_then(|v| v.as_i64())?;
+                let n = cols.get(1).and_then(|v| v.as_i64())?;
+                Some((id, n))
+            })
+            .collect())
+    }
+
     /// Les albums d'une année (colonne `year`), triés par titre.
     ///
     /// C'est la requête du conteneur UPnP « Years », comme `list_by_genre`

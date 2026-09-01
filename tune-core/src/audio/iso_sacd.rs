@@ -1,7 +1,26 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tracing::info;
+
+/// Motif rendu à l'utilisateur pour un ISO SACD que Tune n'a pas su extraire.
+///
+/// Il quitte volontairement le vocabulaire du journal : `sacd_extract` ne dit
+/// rien à qui n'a jamais entendu parler de cet outil, et c'est justement à
+/// cette personne que le rapport de scan s'adresse (#2992).
+pub const MOTIF_ISO_SACD_NON_EXTRAIT: &str =
+    "ISO SACD : extraction impossible (sacd_extract, outil externe non fourni avec Tune)";
+
+/// Motif rendu à l'utilisateur pour un `.iso` qui n'est pas un SACD du tout.
+pub const MOTIF_ISO_SANS_ZONE_SACD: &str =
+    "image ISO sans zone SACD : ce fichier n'est pas de l'audio";
+
+/// Clé de rapport des ISO SACD dont l'extraction a échoué.
+pub const CLE_RAPPORT_ISO_SACD: &str = "iso-sacd";
+
+/// Clé de rapport des `.iso` qui ne portent pas de zone SACD.
+pub const CLE_RAPPORT_ISO_DONNEES: &str = "iso";
 
 /// Extract DSF tracks from a SACD ISO file using sacd_extract.
 /// Returns the paths of the extracted DSF files in a temp directory.
@@ -50,17 +69,48 @@ pub fn extract_iso_to_dsf(iso_path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(dsf_files)
 }
 
-/// Check if a file is a SACD ISO by reading the first bytes.
+/// Secteur logique du Master TOC d'un disque SACD, en octets.
+///
+/// Le Master TOC occupe le LSN 510 d'une image SACD ; un secteur fait 0x800
+/// octets. La signature `SACDMTOC` s'y trouve à l'octet zéro.
+const DECALAGE_MASTER_TOC_SACD: u64 = 0x800 * 510;
+
+/// Signature du Master TOC d'un disque SACD.
+const SIGNATURE_MASTER_TOC_SACD: &[u8; 8] = b"SACDMTOC";
+
+/// Dit si ce chemin est réellement une image SACD, signature à l'appui.
+///
+/// Le commentaire de cette fonction annonçait le contrôle de `SACDMTOC` depuis
+/// l'origine — et la fonction ne le faisait pas : elle se contentait de
+/// « extension `.iso` **et** taille > 4 Mo ». Toute image de données y passait,
+/// jusqu'à `ubuntu-26.04-desktop-amd64.iso` soumis à l'extraction SACD dans le
+/// journal de JeromeQ (#2992).
+///
+/// Le coût reste celui d'une énumération : un `open` + un `seek` + huit octets
+/// lus, et **seulement sur les `.iso`**, là où le code précédent payait déjà un
+/// `stat` puis jusqu'à quatre créations de processus par fichier. Sur une
+/// bibliothèque sans ISO, rien ne change.
 pub fn is_sacd_iso(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if ext != "iso" {
+    let est_iso = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"));
+    if !est_iso {
         return false;
     }
-    // SACD ISOs have "SACDMTOC" at offset 0x800 * 510
-    // For a quick check, just verify file size > 4MB and extension
-    std::fs::metadata(path)
-        .map(|m| m.len() > 4_000_000)
-        .unwrap_or(false)
+    let Ok(mut fichier) = std::fs::File::open(path) else {
+        return false;
+    };
+    if fichier
+        .seek(SeekFrom::Start(DECALAGE_MASTER_TOC_SACD))
+        .is_err()
+    {
+        return false;
+    }
+    let mut signature = [0u8; SIGNATURE_MASTER_TOC_SACD.len()];
+    // `read_exact` échoue proprement sur une image trop courte pour porter un
+    // Master TOC : pas besoin de tester la taille séparément.
+    fichier.read_exact(&mut signature).is_ok() && &signature == SIGNATURE_MASTER_TOC_SACD
 }
 
 fn find_sacd_extract() -> Option<PathBuf> {
@@ -99,6 +149,60 @@ mod tests {
     fn is_sacd_iso_checks_extension() {
         assert!(!is_sacd_iso(Path::new("/tmp/test.flac")));
         assert!(!is_sacd_iso(Path::new("/tmp/test.dsf")));
-        // Can't test positive case without a real ISO file
+    }
+
+    /// Écrit une image creuse dont le Master TOC porte `signature`.
+    ///
+    /// Taille portée au-delà de 4 Mo à dessein : c'est le seuil du contrôle
+    /// d'origine. Une fixture plus petite ferait échouer la contre-épreuve pour
+    /// une autre raison que le défaut visé.
+    fn image_iso(dossier: &Path, nom: &str, signature: Option<&[u8; 8]>) -> PathBuf {
+        use std::io::Write;
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        // Fichier creux : aucun octet réel n'est écrit avant le décalage, le
+        // test ne consomme donc pas 4 Mo sur disque.
+        fichier
+            .seek(SeekFrom::Start(DECALAGE_MASTER_TOC_SACD))
+            .unwrap();
+        fichier
+            .write_all(signature.map(|s| &s[..]).unwrap_or(b"........"))
+            .unwrap();
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin
+    }
+
+    /// Le contrôle annoncé par le commentaire est enfin celui qui est fait
+    /// (#2992) : une image de données de plus de 4 Mo n'est pas un SACD.
+    #[test]
+    fn seule_la_signature_sacdmtoc_designe_un_sacd() {
+        let dossier = tempfile::tempdir().unwrap();
+
+        let sacd = image_iso(dossier.path(), "album.iso", Some(SIGNATURE_MASTER_TOC_SACD));
+        assert!(
+            is_sacd_iso(&sacd),
+            "une image portant SACDMTOC au LSN 510 est un SACD"
+        );
+
+        // Le cas exact du journal de JeromeQ : une image d'installation Ubuntu,
+        // grosse et parfaitement innocente, soumise à l'extraction SACD.
+        let ubuntu = image_iso(dossier.path(), "ubuntu-26.04-desktop-amd64.iso", None);
+        assert!(
+            !is_sacd_iso(&ubuntu),
+            "l'ancien contrôle (extension + taille > 4 Mo) prenait cette image \
+             de données pour un disque SACD"
+        );
+
+        // Une image trop courte pour porter un Master TOC ne fait pas paniquer
+        // la lecture : elle est simplement refusée.
+        let tronquee = dossier.path().join("tronquee.iso");
+        std::fs::write(&tronquee, b"pas assez long").unwrap();
+        assert!(!is_sacd_iso(&tronquee));
+
+        // L'extension reste testée sans tenir compte de la casse, comme le
+        // fait le parcours de bibliothèque qui appelle cette fonction.
+        let majuscules = image_iso(dossier.path(), "ALBUM.ISO", Some(SIGNATURE_MASTER_TOC_SACD));
+        assert!(is_sacd_iso(&majuscules));
     }
 }

@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
@@ -48,7 +49,7 @@ pub(super) async fn export_ratings(
     let rows = state
         .backend
         .query_many(&sql, &[&profile_id as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {

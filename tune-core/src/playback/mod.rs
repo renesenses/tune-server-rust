@@ -3,7 +3,22 @@ pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
-pub mod radio_handler;
+// `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
+// métadonnées radio, sans aucun appelant depuis sa création : un
+// `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`
+// homonyme de la vraie, dont `fetch_icy_metadata` rendait `cover_url: None`
+// sans condition. La lecture vivante est `crate::radio_metadata` — elle relit
+// `visual` (Radio France), `cover` (Radio Paradise) et `StreamUrl` (ICY), et
+// c'est `crate::poller::vignette_du_pas_radio` qui arbitre pochette du titre
+// contre logo de la station.
+//
+// Pourquoi la suppression compte : le 30/08/2026, une réponse au fil forum 104
+// se réclamant explicitement d'une lecture du code a affirmé au testeur
+// Reivax66 que « rien n'est allé chercher la pochette du disque », huit jours
+// après la livraison de #2109 et quatre heures après la publication de la
+// v0.9.127 qui la contient. Ce fichier mort disait exactement cela, en Rust.
+// Le garde `tests/pochette_radio_source_unique.rs` empêche qu'un deuxième
+// réapparaisse.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -798,27 +813,34 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` pour la même raison que [`Self::update_queue_info`] : les trois
+    /// appels de `restore_queue_metadata` (longueur, répétition, aléatoire) se
+    /// suivent au démarrage, sur une zone qui n'est pas encore en mémoire. Les
+    /// laisser en `get_mut` reviendrait à corriger un des trois et laisser ses
+    /// deux sœurs jeter la valeur restaurée en silence.
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.shuffle = enabled;
-                if enabled {
-                    // Build a fresh order around the currently playing track so
-                    // the next advance goes to a different track.
-                    state.shuffle_order = generate_shuffle_order(
-                        state.queue_length.max(0) as usize,
-                        state.queue_position.max(0) as usize,
-                    );
-                    state.shuffle_index = if state.shuffle_order.is_empty() {
-                        -1
-                    } else {
-                        0
-                    };
+            let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            });
+            state.shuffle = enabled;
+            if enabled {
+                // Build a fresh order around the currently playing track so
+                // the next advance goes to a different track.
+                state.shuffle_order = generate_shuffle_order(
+                    state.queue_length.max(0) as usize,
+                    state.queue_position.max(0) as usize,
+                );
+                state.shuffle_index = if state.shuffle_order.is_empty() {
+                    -1
                 } else {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                }
+                    0
+                };
+            } else {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
             }
         }
         self.emit(PlaybackEvent {
@@ -828,12 +850,19 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` : voir [`Self::update_queue_info`]. Le mode de répétition
+    /// restauré au démarrage tombait dans le vide sur une zone pas encore en
+    /// mémoire, alors que le journal annonçait la restauration.
     pub async fn set_repeat(&self, zone_id: i64, mode: RepeatMode) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.repeat = mode;
-            }
+            zones
+                .entry(zone_id)
+                .or_insert_with(|| ZoneState {
+                    zone_id,
+                    ..Default::default()
+                })
+                .repeat = mode;
         }
         self.emit(PlaybackEvent {
             event: "repeat".into(),
@@ -892,32 +921,54 @@ impl PlaybackManager {
         }
     }
 
+    /// Longueur et position de la file pour cette zone.
+    ///
+    /// `entry` et non `get_mut` : la zone n'est PAS forcément déjà en mémoire
+    /// quand on lui annonce sa file. Au démarrage, `restore_queue_metadata`
+    /// appelle cette fonction AVANT que quoi que ce soit n'ait créé l'état de
+    /// zone — et `restore_playback_positions`, qui le crée d'habitude, saute
+    /// justement les zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque. La
+    /// longueur restaurée partait alors à la poubelle en silence, la zone
+    /// démarrait avec `queue_length = 0`, et `next_position()` — qui rend
+    /// `None` dès que la file est vide — concluait « file terminée » à la fin
+    /// du premier morceau : le sondeur arrêtait la zone alors que l'écran, lui,
+    /// lit la file en base et affichait toujours les pistes suivantes.
+    ///
+    /// C'est ce piège exact que deux appelants de `routes/playback.rs`
+    /// contournaient déjà chacun dans leur coin, en réaffirmant la longueur
+    /// APRÈS `play()` (« silent no-op when the zone's in-memory state doesn't
+    /// exist yet »). Leurs sœurs — `Orchestrator::play_from_queue`, le repli
+    /// « Lire » sans corps de requête, `queue_add` — ne l'avaient pas. On
+    /// bouche le trou une fois, à la source.
     pub async fn update_queue_info(&self, zone_id: i64, position: i64, length: i64) {
         let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.queue_position = position;
-            state.queue_length = length;
-            if state.shuffle {
-                let len = length.max(0) as usize;
-                let pos = position.max(0) as usize;
-                if len == 0 {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                } else if state.shuffle_order.len() != len {
-                    // Queue length changed (tracks added/removed, or the order
-                    // was lost across a restart — it is not persisted). Rebuild
-                    // around the current track.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
-                    // Sync the cursor to the track now playing so the next
-                    // advance follows the order from here.
-                    state.shuffle_index = idx as i64;
-                } else {
-                    // Position not in the order (shouldn't happen) — rebuild.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                }
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.queue_position = position;
+        state.queue_length = length;
+        if state.shuffle {
+            let len = length.max(0) as usize;
+            let pos = position.max(0) as usize;
+            if len == 0 {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
+            } else if state.shuffle_order.len() != len {
+                // Queue length changed (tracks added/removed, or the order
+                // was lost across a restart — it is not persisted). Rebuild
+                // around the current track.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
+            } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
+                // Sync the cursor to the track now playing so the next
+                // advance follows the order from here.
+                state.shuffle_index = idx as i64;
+            } else {
+                // Position not in the order (shouldn't happen) — rebuild.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
             }
         }
     }
@@ -1166,6 +1217,67 @@ mod tests {
         assert_eq!(ev.event, "repeat");
         assert_eq!(ev.zone_id, 3);
         assert_eq!(ev.data["mode"], "all");
+    }
+
+    /// #1924 (Tades, fil forum 1471) — « je vois bien la piste que je souhaite
+    /// écouter dans la file d'attente et la lecture en cours est finie depuis
+    /// cinq minutes », et rien ne part.
+    ///
+    /// Le scénario reproduit ici est celui du démarrage du serveur.
+    /// `restore_queue_metadata` (tune-server/src/startup.rs) annonce à la zone
+    /// sa longueur de file, son mode de répétition et son aléatoire — dans cet
+    /// ordre — avant que quoi que ce soit n'ait créé son état en mémoire. Le
+    /// créateur habituel, `restore_playback_positions`, saute justement les
+    /// zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque.
+    ///
+    /// Les trois écritures se faisaient alors en `get_mut` : trois no-op
+    /// silencieux, suivis d'un `info!` qui annonçait la restauration. La zone
+    /// démarrait avec `queue_length = 0`, `next_position()` rendait `None` dès
+    /// le premier `if queue_length == 0`, et le sondeur concluait « file
+    /// terminée » à la fin du premier morceau — alors que l'écran, qui lit la
+    /// file en base, affichait toujours les suivantes.
+    ///
+    /// Aucune horloge, aucune course : le test tient sur l'ordre des appels.
+    #[tokio::test]
+    async fn la_file_restauree_au_demarrage_survit_a_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.update_queue_info(7, 0, 3).await;
+        pm.set_repeat(7, RepeatMode::Off).await;
+        pm.set_shuffle(7, false).await;
+
+        let state = pm.get_state(7).await;
+        assert_eq!(
+            state.queue_length, 3,
+            "la longueur restaurée doit atteindre l'état de zone, pas le vide"
+        );
+        assert_eq!(state.queue_position, 0);
+        assert_eq!(
+            crate::poller::PositionPoller::next_position(&state),
+            Some(1),
+            "sans la longueur, next_position rend None et le sondeur arrête la \
+             zone à la fin du premier morceau, file pleine à l'écran"
+        );
+    }
+
+    /// Les deux sœurs du même trio. Corriger `update_queue_info` seule aurait
+    /// laissé la répétition et l'aléatoire restaurés tomber dans le vide sur
+    /// une zone dont l'état n'existe pas encore.
+    #[tokio::test]
+    async fn repetition_et_aleatoire_restaures_atteignent_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.set_repeat(9, RepeatMode::All).await;
+        pm.set_shuffle(9, true).await;
+
+        let state = pm.get_state(9).await;
+        assert_eq!(
+            state.repeat,
+            RepeatMode::All,
+            "le mode de répétition restauré doit tenir"
+        );
+        assert!(state.shuffle, "l'aléatoire restauré doit tenir");
     }
 
     #[test]

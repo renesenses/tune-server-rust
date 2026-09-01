@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -234,7 +235,7 @@ async fn export_library_audit_csv(
                  WHERE t.file_path LIKE ? ESCAPE '\\' AND (t.source IS NULL OR t.source = '' OR t.source = 'local')",
                 &[&prefix],
             )
-            .unwrap_or_default();
+            .ou_defaut_journalise();
         for r in rows {
             bdd.push(tune_core::library::audit::PisteBdd {
                 id: r.first().and_then(|v| v.as_i64()).unwrap_or(0),

@@ -1,7 +1,6 @@
 //! Les concerts des artistes de la bibliothèque, en [`TunePlugin`] (#2363).
 //!
-//! Extrait mot pour mot du cœur toujours-compilé, sans changer un
-//! comportement :
+//! Extrait du cœur toujours-compilé :
 //!
 //! - `tune-core/src/cloud/concert_alerts.rs` — la tâche de fond qui pousse
 //!   toutes les 24 h les artistes de la bibliothèque vers
@@ -15,6 +14,22 @@
 //! Bertrand a tranché le 29/08 : la fonction sera un plugin. Le cœur nu cesse
 //! donc de parler à un service tiers, et la tâche de fond ne tourne plus que
 //! chez ceux qui ont installé le plugin.
+//!
+//! # L'extraction a été rebasée sur #2892, pas sur la version d'avant
+//!
+//! Ce greffon a d'abord été écrit comme un portage littéral de
+//! `concert_alerts.rs` **tel qu'il était le 29/08**. Entre-temps, le 30/08,
+//! #2892 a réécrit ce même fichier dans la ligne de release (+275 / −38) :
+//! l'abonnement porte désormais sur TOUTE la bibliothèque et non plus sur les
+//! seuls artistes identifiés par un MusicBrainz ID.
+//!
+//! La fusion rendait un conflit `modify/delete` : la PR supprime le fichier,
+//! la ligne de release le réécrit. Prendre la suppression — le réflexe, puisque
+//! c'est l'intention de la PR — aurait annulé #2892 **sans qu'aucun test ne
+//! rougisse**, le greffon compilant parfaitement avec l'ancienne requête. Le
+//! comportement de #2892 a donc été reporté ici, et il est gardé par des tests
+//! (`tune-server/tests/concerts_plugin.rs`) qui portent sur le fait de base :
+//! un artiste sans MBID est abonné comme les autres.
 //!
 //! # Ce que ce plugin ne fait PAS, et pourquoi
 //!
@@ -56,6 +71,21 @@ use tune_core::event_bus::TuneEvent;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
+
+/// Le nuage n'accepte pas plus de 200 artistes par appel (`artists => max:200`).
+///
+/// Publique pour que le test de découpage lise la VRAIE borne : un test qui
+/// réécrirait `200` à la main resterait vert si le code changeait de taille de
+/// lot et se remettait à couper.
+pub const LOT: usize = 200;
+
+/// Plafond de sécurité, en artistes. Une bibliothèque ordinaire en compte
+/// quelques milliers (1 747 sur le serveur de référence, soit 9 appels) ; ce
+/// plafond n'existe que pour qu'une bibliothèque pathologique ne parte pas en
+/// centaines de requêtes. Une troncature est TOUJOURS signalée dans le journal :
+/// un abonnement silencieusement amputé se lit comme « ce groupe ne joue nulle
+/// part » côté utilisateur.
+pub const PLAFOND: usize = 5_000;
 
 /// Services de l'hôte remis au plugin à la construction.
 ///
@@ -185,66 +215,171 @@ async fn concerts_a_venir(
 }
 
 // ---------------------------------------------------------------------------
-// Le cloud — repris tel quel de tune-core/src/cloud/concert_alerts.rs
+// Le cloud — repris de tune-core/src/cloud/concert_alerts.rs, dans son état
+// après #2892 (40f9342c) : la lecture (`recuperer_concerts`) est inchangée,
+// l'abonnement porte désormais sur toute la bibliothèque. Voir l'en-tête.
 // ---------------------------------------------------------------------------
 
-/// Pousse les artistes de la bibliothèque (ceux qui ont un MusicBrainz ID)
-/// comme abonnements de concerts. Rend le nombre d'artistes abonnés.
+/// Les artistes de la bibliothèque, prêts à être abonnés.
 ///
-/// La borne de 200 est celle du cloud (`'artists' => 'required|array|max:200'`) :
-/// les deux sont cohérentes, ce n'est pas un défaut. Elle mordra sur les
-/// grandes bibliothèques bien identifiées le jour où le verrou d'identification
-/// MBID sera levé, pas avant.
+/// ⚠️ LE MBID N'EST PLUS EXIGÉ. Cette requête filtrait `musicbrainz_id IS NOT
+/// NULL`, ce qui plafonnait la fonction à la part identifiée de la bibliothèque
+/// — quelques pour cent sur une installation ordinaire.
+///
+/// Mesure du 30/08/2026 contre l'agenda Ticketmaster, sur les 1 747 artistes du
+/// serveur de référence : 881 d'entre eux (50,4 %) sont reconnus par leur seul
+/// NOM, mais seules 460 des attractions correspondantes portent un lien
+/// MusicBrainz. Exiger le MBID écartait donc la moitié des concerts que la
+/// source sait rendre, en plus de tous les artistes non identifiés localement.
+///
+/// Le MBID reste envoyé quand on l'a : c'est la meilleure identité disponible,
+/// il a simplement cessé d'être une condition d'entrée.
+///
+/// `GROUP BY name` parce que la même personne peut apparaître sur plusieurs
+/// lignes — l'une identifiée, l'autre non. Le nuage classe désormais par nom
+/// replié : envoyer deux fois le même artiste ne ferait que gonfler la charge.
+///
+/// # Pourquoi cette fonction est publique
+///
+/// Elle l'est pour être **observable depuis un test**. Dans le cœur, cet apport
+/// (#2892) était gardé par un `#[cfg(test)] mod tests` interne au fichier. Un
+/// greffon n'a pas ce luxe : ses tests vivent dans `tune-server`
+/// (`tests/concerts_plugin.rs`), de l'autre côté de la frontière de crate. Sans
+/// ce point d'observation, la seule voie serait le HTTP vers `mozaiklabs.fr`,
+/// et le fait de base — « un artiste sans MBID part quand même » — redeviendrait
+/// invérifiable, c'est-à-dire effaçable en silence. C'est exactement ce que
+/// cette PR a failli faire.
+pub fn artistes_de_la_bibliotheque(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+    // `PLAFOND` est injecté plutôt qu'écrit en dur : si le `LIMIT` et le seuil
+    // d'alerte divergeaient, la troncature redeviendrait silencieuse — le
+    // défaut même que ce code corrige.
+    let sql = format!(
+        "SELECT name, MAX(musicbrainz_id) FROM artists \
+         WHERE name IS NOT NULL AND name != '' \
+         GROUP BY name ORDER BY name \
+         LIMIT {PLAFOND}"
+    );
+
+    let rows = backend
+        .query_many(&sql, &[])
+        .map_err(|e| format!("query: {e}"))?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let nom = r.first().and_then(|v| v.as_string())?;
+            if nom.is_empty() {
+                return None;
+            }
+            let mbid = r
+                .get(1)
+                .and_then(|v| v.as_string())
+                .filter(|m| !m.is_empty());
+
+            Some(json!({
+                "artist_name": nom,
+                "musicbrainz_artist_id": mbid,
+            }))
+        })
+        .collect())
+}
+
+/// Pousse les artistes de la bibliothèque comme abonnements de concerts.
+/// Rend le nombre d'artistes abonnés.
+///
+/// ⚠️ ORDRE DE DÉPLOIEMENT. Cette fonction envoie des artistes SANS
+/// `musicbrainz_artist_id`. Le nuage ne l'accepte que depuis site-mozaiklabs#185
+/// (30/08/2026) ; une version antérieure répondait 422 sur la charge entière.
+/// Le nuage se déploie en continu et cette version de Tune passe par un train de
+/// release, donc l'ordre est acquis en pratique — mais il faut le savoir avant
+/// de rejouer ce code sur une instance pointant vers un nuage figé.
 pub async fn synchroniser_abonnements(
     backend: &Arc<dyn DbBackend>,
     http_client: &reqwest::Client,
     instance_id: &str,
 ) -> Result<usize, String> {
-    let rows = backend
-        .query_many(
-            "SELECT DISTINCT musicbrainz_id, name FROM artists \
-             WHERE musicbrainz_id IS NOT NULL AND musicbrainz_id != '' \
-             LIMIT 200",
-            &[],
-        )
-        .map_err(|e| format!("query: {e}"))?;
+    let artistes = artistes_de_la_bibliotheque(backend)?;
 
-    if rows.is_empty() {
+    if artistes.is_empty() {
         debug!("concert_alerts_no_artists");
         return Ok(0);
     }
 
-    let artists: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "musicbrainz_artist_id": r.first().and_then(|v| v.as_string()),
-                "artist_name": r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-            })
-        })
-        .collect();
-
-    let body = json!({
-        "instance_id": instance_id,
-        "artists": artists,
-    });
-
-    let resp = http_client
-        .post(format!("{CONCERTS_API}/subscribe"))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("concert subscribe: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("concert subscribe: HTTP {}", resp.status()));
+    if artistes.len() >= PLAFOND {
+        warn!(
+            plafond = PLAFOND,
+            "concert_subscriptions_tronquees: bibliotheque au-dela du plafond, \
+             les artistes suivants ne seront pas abonnes"
+        );
     }
 
-    let result: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-    let count = result["subscribed"].as_i64().unwrap_or(0) as usize;
-    info!(count, "concert_subscriptions_synced");
-    Ok(count)
+    // Un seul appel ne peut porter que 200 artistes : au-delà, l'ancienne
+    // requête coupait à 200 sans le dire. On découpe et on additionne.
+    let mut total = 0usize;
+    let mut ignores = 0usize;
+    let mut lots_en_echec = 0usize;
+    let nombre_de_lots = artistes.len().div_ceil(LOT);
+
+    for lot in artistes.chunks(LOT) {
+        let body = json!({
+            "instance_id": instance_id,
+            "artists": lot,
+        });
+
+        let resp = http_client
+            .post(format!("{CONCERTS_API}/subscribe"))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+
+        // Un lot en échec ne condamne pas les autres : mieux vaut abonner
+        // 1 500 artistes sur 1 747 que zéro parce que le huitième appel a
+        // rencontré une coupure réseau.
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!(statut = %r.status(), "concert_subscribe_lot_refuse");
+                lots_en_echec += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, "concert_subscribe_lot_echoue");
+                lots_en_echec += 1;
+                continue;
+            }
+        };
+
+        let result: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "concert_subscribe_lot_illisible");
+                lots_en_echec += 1;
+                continue;
+            }
+        };
+
+        total += result["subscribed"].as_i64().unwrap_or(0) as usize;
+        // Le nuage écarte les noms qui ne désignent aucun artiste
+        // (« Various Artists », « Unknown »...). Les compter permet de voir
+        // d'un coup d'œil si une bibliothèque est surtout faite de compilations.
+        ignores += result["ignored"].as_i64().unwrap_or(0) as usize;
+    }
+
+    if lots_en_echec == nombre_de_lots {
+        return Err(format!(
+            "concert subscribe: {nombre_de_lots} lot(s) en echec"
+        ));
+    }
+
+    info!(
+        count = total,
+        ignores,
+        lots = nombre_de_lots,
+        lots_en_echec,
+        "concert_subscriptions_synced"
+    );
+    Ok(total)
 }
 
 /// Récupère les concerts à venir pour les artistes auxquels cette instance

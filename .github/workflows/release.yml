@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -46,14 +45,46 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      # Symetrique de « Verify web-client version matches release tag », plus
+      # bas. Le client web avait sa garde ; le SERVEUR n'en avait aucune.
+      # Vecu sur la v0.9.128 : le tag a ete pose alors que Cargo.toml declarait
+      # encore 0.9.127. Les artefacts sont partis, et le binaire repond DEUX
+      # versions selon qui demande — `tune_core::version()` lit TUNE_VERSION
+      # (pose depuis le tag) et dit 0.9.128, tandis que tout `env!(
+      # "CARGO_PKG_VERSION")` dit 0.9.127 : `tune-server --version`,
+      # `routes/mediasync.rs` (`server_version`) et les trois greffons. Un
+      # testeur annonce alors une version qu'il n'execute pas.
+      - name: Verify workspace version matches release tag
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # Meme regle que pour le client : on compare la base X.Y.Z, le
+          # suffixe -rcN vit sur le tag git seul.
+          TAG_BASE="${TAG_VERSION%%-*}"
+          WS_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          [ -n "$WS_VERSION" ] || { echo "::error::version introuvable dans [workspace.package] de Cargo.toml"; exit 1; }
+          if [ "$TAG_BASE" != "$WS_VERSION" ]; then
+            echo "::error::Cargo.toml [workspace.package] declare $WS_VERSION alors que le tag vaut $TAG_BASE."
+            echo "::error::Commiter le bump du workspace AVANT de taguer, puis relancer cette release."
+            exit 1
+          fi
+          echo "workspace version $WS_VERSION == base du tag $TAG_BASE"
+      - name: Lire le SHA web du manifeste
+        id: web
+        shell: bash
+        run: |
+          PLAN=".release/${GITHUB_REF_NAME}.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          # The web client mirrors the server's branch topology: RC tags
-          # (v*-rc*) build from tune-web-client's release/v0.9 (0.9.x); stable
-          # v0.8.x tags build from its main. Keeps the two version lines apart.
-          ref: ${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}
+          ref: ${{ steps.web.outputs.sha }}
+          path: .web-client
       - name: Verify web-client version matches release tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: .web-client
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           # Compare the base X.Y.Z only: a pre-release tag (v0.9.0-rc1) ships the
@@ -71,12 +102,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: .web-client/package-lock.json
       - run: npm ci
+        working-directory: .web-client
       - run: npm run build
+        working-directory: .web-client
       - uses: actions/upload-artifact@v4
         with:
           name: web-client
-          path: dist/
+          path: .web-client/dist/
           retention-days: 1
 
   build:
@@ -366,12 +400,33 @@ jobs:
             # « A timestamp was expected but was not found ». C'est arrive sur
             # la v0.9.119 (x86_64-apple-darwin) : panne d'Apple, rien de local.
             # On reessaie donc, au lieu de perdre le train sur un aleas reseau.
+            # #1641 — permission de chargement de bibliothèque. Le runtime
+            # durci (`--options runtime`) active la validation de bibliothèque :
+            # tune-server ne peut alors charger QUE des dylibs de sa propre Team
+            # ID. L'analyse acoustique (CLAP) fait un `dlopen` sur la
+            # `libonnxruntime.dylib` de Microsoft, signée adhoc et SANS Team ID —
+            # le noyau la refusait, et la jauge restait à 0 % sur tout macOS.
+            # Le plist ne porte AUCUN commentaire XML. Un commentaire contenant
+            # deux tirets consecutifs est illegal en XML, et AMFI — le lecteur
+            # de plist qu'appelle « codesign --entitlements » — refuse alors le
+            # FICHIER ENTIER (« AMFIUnserializeXML: syntax error »), codesign
+            # sort en erreur, et ce job tombe en plein train de publication.
+            # Or toute prose sur ce sujet contient deux tirets consecutifs.
+            # L'explication vit donc ici et dans tune-core/src/audio/runtime.rs,
+            # jamais dans le plist. Un test la verrouille.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            # Le troisième argument est le fichier de permissions, vide pour les
+            # binaires qui n'en ont pas besoin (ffmpeg, airplay-daemon).
             sign_horodate() {
-              local cible="$1" identifiant="$2" i
+              local cible="$1" identifiant="$2" droits="$3" i
               for i in 1 2 3 4 5; do
-                if codesign --force --options runtime --timestamp \
-                     --identifier "$identifiant" --sign "$IDENTITY" "$cible"; then
-                  return 0
+                if [ -n "$droits" ]; then
+                  codesign --force --options runtime --timestamp \
+                    --entitlements "$droits" \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
+                else
+                  codesign --force --options runtime --timestamp \
+                    --identifier "$identifiant" --sign "$IDENTITY" "$cible" && return 0
                 fi
                 echo "::warning::codesign --timestamp a echoue sur $cible (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
                 sleep $((i * 15))
@@ -379,14 +434,25 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
-            sign_horodate package/tune-server fr.mozaiklabs.tune-server
+            sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
-              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon
+              sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
             fi
             if [ -f package/ffmpeg ]; then
-              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg
+              sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg ""
             fi
             codesign --verify --strict --verbose=2 package/tune-server
+            # Garde #1641 : une signature qui « réussit » sans porter la
+            # permission repart pour un train entier de macOS sans analyse
+            # acoustique, et personne ne le voit avant le rapport d'un testeur.
+            # On relit donc la signature PRODUITE, pas la commande écrite.
+            if codesign -d --entitlements - --xml package/tune-server 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — package/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::package/tune-server est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib sur macOS (#1641)."
+              exit 1
+            fi
           elif [ "$RUNNER_OS" = "macOS" ]; then
             echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
@@ -699,7 +765,12 @@ jobs:
           PLIST
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
-            codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # #1641 — même permission que pour le tarball, et pour la même
+            # raison : sans elle le runtime durci refuse le `dlopen` de
+            # libonnxruntime.dylib et l'analyse acoustique reste à 0 %. Le .app
+            # était le SECOND chemin macOS, aussi nu que le premier.
+            DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
+            codesign --force --options runtime --entitlements "$DROITS" --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
             # signing) so the bundle stays valid and notarization does not reject
             # an unsigned executable.
@@ -710,6 +781,18 @@ jobs:
               codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
             fi
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
+            # Garde #1641, jumelle de celle du tarball : on relit la signature
+            # produite sur le binaire IMBRIQUÉ, celui qui fera le `dlopen`.
+            # Signer le .app par-dessus ne resigne pas ce binaire, mais un
+            # `--force` mal placé le ferait — et la permission repartirait en
+            # silence.
+            if codesign -d --entitlements - --xml "$APP/Contents/Resources/tune-server" 2>/dev/null \
+                 | grep -q "com.apple.security.cs.disable-library-validation"; then
+              echo "OK — $APP/Contents/Resources/tune-server porte disable-library-validation (#1641)"
+            else
+              echo "::error::Le tune-server du .app est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib (#1641)."
+              exit 1
+            fi
           fi
           DMG_DIR="dmg-staging"
           mkdir -p "$DMG_DIR"
@@ -1212,7 +1295,7 @@ jobs:
   # au chargement sur un `needs` vers un job inexistant — et la release ne
   # serait jamais publiée.
   publish:
-    name: Publish release (drop the draft)
+    name: Stage release (keep the draft)
     needs: [build, release]
     if: >-
       always()
@@ -1222,10 +1305,14 @@ jobs:
     timeout-minutes: 15  # Publish release — <1 min
     permissions:
       contents: write
+    outputs:
+      promoted: ${{ steps.gate.outputs.promoted }}
+      version: ${{ steps.gate.outputs.version }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Vérifier que la release est complète, puis la publier
+      - name: Vérifier que la release staged est complète
+        id: gate
         run: |
           TAG="${GITHUB_REF_NAME}"
           # Ce qui est publié doit être vérifiable : SHA256SUMS est la
@@ -1236,15 +1323,74 @@ jobs:
             echo "::error::SHA256SUMS absent de $TAG — la release reste en brouillon."
             exit 1
           fi
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "Release $TAG publiée."
+          DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          [ "$DRAFT" = true ] || {
+            echo "::error::$TAG est déjà publique avant la promotion coordonnée"
+            exit 1
+          }
+          echo "promoted=false" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Release $TAG complète et conservée en brouillon."
+
+  stage-docker:
+    name: Stage Docker image
+    needs: publish
+    # Un workflow appele ne peut PAS obtenir plus de permissions que le job
+    # qui l'appelle. `docker.yml` demande `packages: write` pour pousser
+    # l'image ; ce workflow-ci n'accorde globalement que `contents: write`.
+    # Sans ce bloc, GitHub refuse le fichier ENTIER avant de lancer le
+    # moindre job — `startup_failure`, zero job, aucun message dans les
+    # journaux. C'est ce qui a bloque le train de la v0.9.128 le 30/08 :
+    # trois tentatives identiques, et ni actionlint ni le dry-run du
+    # controleur ne peuvent l'attraper (l'un ne resout pas les permissions
+    # entre workflows, l'autre s'arrete aux tags).
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  stage-os:
+    name: Stage Tune OS images
+    needs: publish
+    uses: ./.github/workflows/trigger-os-images.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}
+    secrets: inherit
+
+  staging-complete:
+    name: Release staging complete
+    needs: [publish, stage-docker, stage-os]
+    if: >-
+      always()
+      && needs.publish.result == 'success'
+      && needs.stage-docker.result == 'success'
+      && needs.stage-os.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Attester la matrice staged
+        run: |
+          {
+            echo "## v${{ needs.publish.outputs.version }} entierement staged"
+            echo
+            echo "- GitHub Release serveur : draft"
+            echo "- Docker : staging-v${{ needs.publish.outputs.version }}"
+            echo "- Tune OS : trois images et leurs checksums sur une release draft"
+            echo "- aucun canal stable promu"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   homebrew:
     name: Update Homebrew tap
     needs: publish
     # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
     # or `brew upgrade` would move stable users onto an RC.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Update Homebrew tap — <1 min
     steps:
@@ -1346,7 +1492,10 @@ jobs:
     # assets, mais rien ne lui disait jusqu'ici que la liste était finie.
     needs: [publish, homebrew]
     # Stable tags only — a pre-release must not update the public download page.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 10  # Update mozaiklabs.fr/download — <1 min
     steps:
@@ -1379,7 +1528,10 @@ jobs:
     name: Trigger Android build (tune-server-flutter)
     needs: [publish]
     # Stable tags only — un client ne se construit pas sur une pre-release.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: >-
+      needs.publish.outputs.promoted == 'true'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15  # Trigger Android build — <1 min
     steps:

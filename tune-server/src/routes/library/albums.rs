@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -260,7 +261,7 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
              ORDER BY LOWER(TRIM(format))",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.as_string())
         .collect();
@@ -270,7 +271,7 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
             "SELECT DISTINCT sample_rate FROM albums WHERE sample_rate IS NOT NULL ORDER BY sample_rate",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| row.into_iter().next()?.as_i64())
         .collect();
@@ -729,7 +730,7 @@ pub(super) async fn merge_duplicate_albums_route(
     let dupes: Vec<(String, String)> = state
         .backend
         .query_many(&dupes_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|row| {
             let title = row.first()?.as_string()?;

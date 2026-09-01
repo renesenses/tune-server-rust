@@ -29,6 +29,43 @@ impl BluosOutput {
         format!("http://{}:{}", self.host, self.port)
     }
 
+    /// L'URL `/Add` envoyee au Node, construite a UN SEUL endroit.
+    ///
+    /// `play_media` et `set_next_media` la fabriquaient chacun de leur cote,
+    /// quinze lignes identiques au caractere pres. Ce sont deux soeurs du meme
+    /// chemin : toute correction portee a l'une (l'encodage du parametre `url`
+    /// est le candidat nomme par #1996) aurait laisse l'autre nue, et le defaut
+    /// gapless ne se voit qu'a la fin du morceau — la ou il est le plus cher a
+    /// diagnostiquer. Une seule construction, deux appelants.
+    ///
+    /// BluOS attend `url` SANS re-encodage : `.query()` doublerait l'encodage
+    /// de `http://` dans l'URL de flux, et le Node echouerait en silence. Les
+    /// autres parametres, eux, sont bien encodes.
+    ///
+    /// Le texte « en cours de lecture » du Node se pose via title1/title2/
+    /// title3, PAS via title/artist/album : la BluOS Custom Integration API
+    /// impose « title1, title2 and title3 MUST be used […] Do not use values
+    /// such as album, artist and name ». Le Node ignore silencieusement les
+    /// mauvais noms (Bilou, fil « Lecture BluOS »). D'ou title1=titre,
+    /// title2=artiste, title3=album — les trois lignes qu'il relit dans son
+    /// XML de statut (`<title1>…` a `get_status`).
+    fn build_add_url(&self, media: &PlayMedia<'_>) -> String {
+        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
+        if let Some(t) = media.title {
+            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
+        }
+        if let Some(a) = media.artist {
+            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
+        }
+        if let Some(al) = media.album {
+            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
+        }
+        if let Some(img) = media.cover_url {
+            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
+        }
+        add_url
+    }
+
     async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
         let url = format!("{}/{}", self.base_url(), path);
         let resp = self
@@ -153,28 +190,8 @@ impl OutputTarget for BluosOutput {
         // bluos_stop). Queue entries also render their title1/2/3 lines on the
         // Node display, where the custom-stream play showed the title only.
         //
-        // BluOS expects the url parameter without re-encoding — .query()
-        // would double-encode http:// in the stream URL, causing silent failure.
-        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
-        // The Node's now-playing text is set via title1/title2/title3, NOT
-        // title/artist/album: the BluOS Custom Integration API mandates
-        // "title1, title2 and title3 MUST be used […] Do not use values such as
-        // album, artist and name". The Node silently ignores title/artist/album
-        // (Bilou, forum "Lecture BluOS"). Map title1=track title,
-        // title2=artist, title3=album — the three now-playing lines the Node
-        // reads back in its status XML (<title1>… at get_status).
-        if let Some(t) = media.title {
-            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
-        }
-        if let Some(a) = media.artist {
-            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
-        }
-        if let Some(al) = media.album {
-            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
-        }
-        if let Some(img) = media.cover_url {
-            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
-        }
+        // Construction partagee avec `set_next_media` : cf `build_add_url`.
+        let add_url = self.build_add_url(media);
         let add_resp = self
             .client
             .get(&add_url)
@@ -187,6 +204,17 @@ impl OutputTarget for BluosOutput {
             .await
             .map_err(|e| format!("bluos Add read: {e}"))?;
         if !add_status.is_success() {
+            // Meme angle mort que #1874, sur l'autre facon de refuser : on
+            // savait que le Node avait dit non, jamais A QUOI. Le refus par
+            // code HTTP n'ecrivait rien du tout dans le journal — l'`Err` remonte
+            // a l'utilisateur, pas au diagnostic.
+            warn!(
+                device = %self.name,
+                add_url = %add_url,
+                status = %add_status,
+                reply = %truncate_body(&add_body),
+                "bluos_add_http_error"
+            );
             return Err(format!(
                 "bluos Add: HTTP {add_status} — {}",
                 truncate_body(&add_body)
@@ -354,23 +382,11 @@ impl OutputTarget for BluosOutput {
         // fetched at end of track — no stream_request, Node stopped at pos=0
         // for ~25 s until the poller killed the zone (stopped_early_waiting →
         // bluos_stop).
-        // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
-        let mut add_url = format!("{}/Add?url={}", self.base_url(), media.url);
-        // Same title1/title2/title3 mapping as play_media (the Node ignores
-        // title/artist/album), so the gapless-staged next track also carries its
-        // now-playing text instead of only the cover.
-        if let Some(t) = media.title {
-            add_url.push_str(&format!("&title1={}", urlencoding::encode(t)));
-        }
-        if let Some(a) = media.artist {
-            add_url.push_str(&format!("&title2={}", urlencoding::encode(a)));
-        }
-        if let Some(al) = media.album {
-            add_url.push_str(&format!("&title3={}", urlencoding::encode(al)));
-        }
-        if let Some(img) = media.cover_url {
-            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
-        }
+        // Exactement la meme URL que `play_media` — meme constructeur, y compris
+        // le title1/title2/title3 (le Node ignore title/artist/album), pour que
+        // la piste preparee en gapless porte elle aussi son texte et pas
+        // seulement sa pochette. Cf `build_add_url`.
+        let add_url = self.build_add_url(media);
         // La reponse etait jetee en entier — statut ET corps. Un Node qui
         // repondait 404, ou qui acceptait l'appel sans rien mettre en file,
         // etait indiscernable d'un Node qui a bien pris la piste suivante.
@@ -395,14 +411,31 @@ impl OutputTarget for BluosOutput {
         let add_status = add_resp.status();
         let add_body = add_resp.text().await.unwrap_or_default();
         if !add_status.is_success() {
+            warn!(
+                device = %self.name,
+                add_url = %add_url,
+                status = %add_status,
+                reply = %truncate_body(&add_body),
+                "bluos_add_http_error_gapless"
+            );
             return Err(format!(
                 "bluos Add (gapless): HTTP {add_status} — {}",
                 truncate_body(&add_body)
             ));
         }
         if queue_stayed_empty(&add_body) {
+            // `add_url` manquait ici, et NULLE PART ailleurs sur ce chemin.
+            //
+            // #1874 posait le probleme en une phrase — « l'URL envoyee n'est
+            // journalisee que sur le chemin qui reussit » — et la PR #1870 l'a
+            // reglee pour `play_media` seulement. La soeur gapless est restee
+            // nue : on y savait que le Node avait laisse sa file vide, jamais
+            // sur QUELLE URL. C'est precisement le champ qui a permis d'ecarter
+            // l'hypothese d'encodage sur l'autre chemin (#1996) ; sans lui, le
+            // meme diagnostic est impossible ici.
             warn!(
                 device = %self.name,
+                add_url = %add_url,
                 reply = %truncate_body(&add_body),
                 "bluos_set_next_queue_still_empty"
             );
@@ -547,5 +580,232 @@ mod tests {
         // ne connait pas le dialecte ne doit pas remplir le journal.
         assert!(!queue_stayed_empty("<ok/>"));
         assert!(!queue_stayed_empty(""));
+    }
+
+    // ── L'URL envoyee au Node : une construction, deux chemins de refus ────
+    //
+    // #1874 : « l'URL envoyee n'est journalisee que sur le chemin qui reussit ».
+    // La PR #1870 a corrige `play_media` ; `set_next_media` est restee nue, et
+    // aucun des deux refus par code HTTP n'ecrivait quoi que ce soit.
+
+    /// Le flux exact du journal de Bilou du 20/08/2026 (#1996), champ par champ.
+    /// C'est la seule URL `/Add` du dossier dont on ait la trace ecrite.
+    const FLUX_BILOU: &str =
+        "http://192.168.1.12:8888/stream/968625a7-3a25-48a1-a86a-b962ce981046.flac";
+    const POCHETTE_BILOU: &str =
+        "http://192.168.1.12:8888/api/v1/library/artwork/8050fd92adf127e5743911262ca65407";
+
+    fn media_bilou(url: &str) -> PlayMedia<'_> {
+        PlayMedia {
+            url,
+            mime_type: "audio/flac",
+            title: Some("Come on In"),
+            artist: Some("Bridge City Sinners"),
+            album: Some("Bridge City Sinners"),
+            cover_url: Some(POCHETTE_BILOU),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn l_url_add_reproduit_celle_du_journal_de_bilou() {
+        // `url` part BRUT (le re-encoder casserait `http://` cote Node) tandis
+        // que title1/2/3 et image sont encodes. L'asymetrie est deliberee ;
+        // elle est ici figee sur la seule trace ecrite qu'on ait du terrain.
+        let node = BluosOutput::new(
+            "Salon".into(),
+            "bluos-192.168.1.23-11000".into(),
+            "192.168.1.23".into(),
+            11000,
+        );
+        assert_eq!(
+            node.build_add_url(&media_bilou(FLUX_BILOU)),
+            format!(
+                "http://192.168.1.23:11000/Add?url={FLUX_BILOU}\
+                 &title1=Come%20on%20In\
+                 &title2=Bridge%20City%20Sinners\
+                 &title3=Bridge%20City%20Sinners\
+                 &image=http%3A%2F%2F192.168.1.12%3A8888%2Fapi%2Fv1%2Flibrary%2Fartwork%2F8050fd92adf127e5743911262ca65407"
+            )
+        );
+    }
+
+    #[test]
+    fn un_media_sans_metadonnees_n_ajoute_aucun_parametre_vide() {
+        let node = BluosOutput::new("Salon".into(), "d".into(), "192.168.1.23".into(), 11000);
+        let nu = PlayMedia {
+            url: FLUX_BILOU,
+            mime_type: "audio/flac",
+            ..Default::default()
+        };
+        assert_eq!(
+            node.build_add_url(&nu),
+            format!("http://192.168.1.23:11000/Add?url={FLUX_BILOU}")
+        );
+    }
+
+    // ── Banc d'essai : un Node bouchonne, en local ────────────────────────
+    //
+    // Aucun trafic ne sort de la machine. Le bouchon LIT la requete avant de
+    // repondre (axum s'en charge) — un mock qui ferme sans lire provoque un RST
+    // qui detruit la reponse en vol.
+
+    #[derive(Clone, Default)]
+    struct JournalCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct NodeBouchon {
+        /// Les URI `/Add` recues, path + query, telles quelles.
+        recues: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        code_add: axum::http::StatusCode,
+        corps_add: String,
+    }
+
+    async fn add_bouchon(
+        axum::extract::State(etat): axum::extract::State<NodeBouchon>,
+        uri: axum::http::Uri,
+    ) -> (axum::http::StatusCode, String) {
+        etat.recues.lock().unwrap().push(uri.to_string());
+        (etat.code_add, etat.corps_add.clone())
+    }
+
+    async fn demarrer_bouchon(etat: NodeBouchon) -> (u16, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/Add", axum::routing::get(add_bouchon))
+            .route(
+                "/Clear",
+                axum::routing::get(|| async { ADD_EMPTY.to_string() }),
+            )
+            .route(
+                "/Play",
+                axum::routing::get(|| async { PLAY_PAUSE.to_string() }),
+            )
+            .with_state(etat);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn le_refus_gapless_nomme_l_url_envoyee_comme_le_fait_play_media() {
+        // LA contre-epreuve de #1874 sur la soeur oubliee par #1870.
+        //
+        // Le Node accepte l'appel gapless et laisse sa file vide — exactement la
+        // reponse du terrain. L'avertissement doit dire CE QU'IL a refuse, pas
+        // seulement qu'il a refuse. Sans le champ `add_url`, ce test tombe.
+        let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, tache) = demarrer_bouchon(NodeBouchon {
+            recues: recues.clone(),
+            code_add: axum::http::StatusCode::OK,
+            corps_add: ADD_EMPTY.to_string(),
+        })
+        .await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let media = media_bilou(FLUX_BILOU);
+        let attendu = node.build_add_url(&media);
+        // `set_default` et non `with_default` : la closure de `with_default` ne
+        // peut pas `await`, et un `block_on` imbrique figerait l'executeur
+        // mono-thread du test avec le bouchon dedans.
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.set_next_media(&media).await;
+        drop(garde);
+        tache.abort();
+
+        // Une preparation gapless ratee degrade vers une transition normale :
+        // elle ne doit PAS interrompre la lecture en cours.
+        assert!(issue.is_ok(), "{issue:?}");
+
+        let log = journal.texte();
+        assert!(log.contains("bluos_set_next_queue_still_empty"), "{log}");
+        assert!(
+            log.contains("add_url="),
+            "le refus gapless doit porter l'URL envoyee : {log}"
+        );
+        assert!(
+            log.contains("968625a7-3a25-48a1-a86a-b962ce981046.flac"),
+            "l'URL de flux doit etre lisible dans le journal : {log}"
+        );
+        assert!(
+            log.contains("title1=Come%20on%20In"),
+            "les parametres envoyes doivent etre lisibles : {log}"
+        );
+
+        // Et le chemin gapless envoie EXACTEMENT ce que `build_add_url` fabrique
+        // — c'est ce qui empeche les deux soeurs de diverger a nouveau.
+        let recues = recues.lock().unwrap().clone();
+        assert_eq!(recues.len(), 1, "{recues:?}");
+        assert!(
+            attendu.ends_with(&recues[0]),
+            "envoye={} attendu={attendu}",
+            recues[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn un_add_refuse_par_code_http_nomme_aussi_l_url_envoyee() {
+        // L'autre facon de refuser : le Node repond 404. Rien n'etait journalise
+        // du tout — l'`Err` remonte a l'utilisateur, jamais au diagnostic.
+        let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, tache) = demarrer_bouchon(NodeBouchon {
+            recues,
+            code_add: axum::http::StatusCode::NOT_FOUND,
+            corps_add: "<nothing/>".to_string(),
+        })
+        .await;
+        let node = BluosOutput::new("Salon".into(), "d".into(), "127.0.0.1".into(), port);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let media = media_bilou(FLUX_BILOU);
+        let garde = tracing::subscriber::set_default(abonne);
+        let issue = node.play_media(&media).await;
+        drop(garde);
+        tache.abort();
+
+        assert!(issue.is_err(), "un Add en 404 doit remonter une erreur");
+        let log = journal.texte();
+        assert!(log.contains("bluos_add_http_error"), "{log}");
+        assert!(
+            log.contains("968625a7-3a25-48a1-a86a-b962ce981046.flac"),
+            "le refus par code HTTP doit nommer l'URL envoyee : {log}"
+        );
     }
 }
