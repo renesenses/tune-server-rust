@@ -398,7 +398,13 @@ pub(super) async fn album_tracks(
 /// Une clé n'est ajoutée que pour les pistes qui en portent réellement une
 /// (`get_key_for_tracks` a déjà écarté les valeurs vides) : une piste sans
 /// tag sort exactement comme avant, sans champ supplémentaire.
-fn attach_track_tags(
+///
+/// ⚠️ `pub(super)` et non privée : les AUTRES surfaces de pistes
+/// (`super::tracks`) ressortent le MÊME champ sous le MÊME nom (#1388). Un
+/// second recopieur écrit à côté aurait fini par diverger — l'écran aurait vu
+/// `dynamic_range` sur les pistes d'un album et rien, ou autre chose, dans la
+/// table des titres.
+pub(super) fn attach_track_tags(
     items: Vec<tune_core::db::models::Track>,
     tags: &[(&str, &std::collections::HashMap<i64, String>)],
 ) -> Vec<Value> {

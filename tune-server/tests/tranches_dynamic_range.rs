@@ -1,4 +1,6 @@
-//! Classer et filtrer les albums par tranches de Dynamic Range (#2144).
+//! Classer et filtrer les albums par tranches de Dynamic Range (#2144), et
+//! ressortir le Dynamic Range PAR PISTE sur toutes les surfaces de pistes
+//! (#1388).
 //!
 //! Seconde moitié de la demande de Patatorz (fil forum 1418, miroir #1699) :
 //! la première — lire le tag et l'afficher — est livrée depuis la v0.9.82
@@ -37,23 +39,30 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
 
 /// Une bibliothèque de six albums dont on connaît le DR d'avance.
 ///
-/// | album    | tag `dr_album` | ce qu'il éprouve                       |
-/// |----------|----------------|----------------------------------------|
-/// | Alpha    | `6`            | un master compressé                    |
-/// | Bravo    | `14`           | un master dynamique                    |
-/// | Charlie  | `9`            | l'entre-deux                           |
-/// | Delta    | *(aucun)*      | le cas de LOIN le plus courant         |
-/// | Echo     | `DR12.5`       | ce que `normalise_dr` recopie tel quel |
-/// | Foxtrot  | `0`            | DR0 est une MESURE, pas une absence    |
+/// Chaque album porte UNE piste, d'identifiant égal au sien.
+///
+/// | album    | `dr_album` | `dr_track` | ce qu'il éprouve                          |
+/// |----------|------------|------------|-------------------------------------------|
+/// | Alpha    | `6`        | `7`        | les deux tags DIFFÈRENT (#1388)           |
+/// | Bravo    | `14`       | `14`       | un master dynamique                       |
+/// | Charlie  | `9`        | *(aucun)*  | album tagué, piste NON : témoin vert       |
+/// | Delta    | *(aucun)*  | *(aucun)*  | le cas de LOIN le plus courant            |
+/// | Echo     | `DR12.5`   | *(aucun)*  | ce que `normalise_dr` recopie tel quel    |
+/// | Foxtrot  | `0`        | `0`        | DR0 est une MESURE, pas une absence       |
+///
+/// ⚠️ Alpha porte `dr_track = 7` alors que son album vaut `6` : c'est la seule
+/// façon de prouver que les routes de pistes lisent bien le tag de la PISTE et
+/// non l'agrégat d'album. Deux valeurs égales auraient laissé passer une route
+/// qui se trompe de clé.
 fn bibliotheque() -> axum::Router {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    for (n, (titre, dr)) in [
-        ("Alpha", Some("6")),
-        ("Bravo", Some("14")),
-        ("Charlie", Some("9")),
-        ("Delta", None),
-        ("Echo", Some("DR12.5")),
-        ("Foxtrot", Some("0")),
+    for (n, (titre, dr, dr_piste)) in [
+        ("Alpha", Some("6"), Some("7")),
+        ("Bravo", Some("14"), Some("14")),
+        ("Charlie", Some("9"), None),
+        ("Delta", None, None),
+        ("Echo", Some("DR12.5"), None),
+        ("Foxtrot", Some("0"), Some("0")),
     ]
     .into_iter()
     .enumerate()
@@ -93,8 +102,44 @@ fn bibliotheque() -> axum::Router {
                 )
                 .expect("insertion du tag DR");
         }
+        if let Some(v) = dr_piste {
+            // Le tag `DYNAMIC RANGE` de la PISTE, lu au scan et rangé sous
+            // `dr_track` (#1806). C'est la matière du #1388.
+            state
+                .backend
+                .execute(
+                    &format!(
+                        "INSERT INTO track_metadata (track_id, key, value) \
+                         VALUES ({id}, 'dr_track', '{v}')"
+                    ),
+                    &[],
+                )
+                .expect("insertion du tag DR de piste");
+        }
     }
     tune_server::routes::router(state)
+}
+
+/// La piste rendue pour un album donné, retrouvée par son titre.
+fn piste(body: &Value, titre: &str) -> Value {
+    let attendu = format!("{titre} — piste");
+    body.get("items")
+        .and_then(Value::as_array)
+        .expect("la liste doit rendre des items")
+        .iter()
+        .find(|t| t.get("title").and_then(Value::as_str) == Some(attendu.as_str()))
+        .unwrap_or_else(|| panic!("piste « {attendu} » absente de la réponse"))
+        .clone()
+}
+
+/// Le DR annoncé pour une piste : `Some(valeur)`, ou `None` quand la clé est
+/// ABSENTE — ce qui n'est PAS la même chose qu'un zéro.
+fn dr_de(t: &Value) -> Option<String> {
+    t.get("dynamic_range").map(|v| {
+        v.as_str()
+            .unwrap_or_else(|| panic!("`dynamic_range` doit être une chaîne, vu {v}"))
+            .to_string()
+    })
 }
 
 fn titres(body: &Value) -> Vec<String> {
@@ -351,5 +396,116 @@ async fn la_selection_de_dr_retrecit_les_effectifs_des_autres_facettes_2144() {
         soi["dr"].as_array().map(Vec::len),
         Some(4),
         "les quatre valeurs restent proposées malgré DR14 coché"
+    );
+}
+
+/// La TABLE DES TITRES rend le Dynamic Range de chaque piste (#1388).
+///
+/// C'est la moitié du ticket qui manquait : depuis #2809 le DR par piste ne
+/// sortait que sur `/library/albums/{id}/tracks`. La table des titres, qui
+/// affiche pourtant la même ligne de qualité par piste (fréquence, bits,
+/// format), n'avait aucun champ à lire — la colonne DR y était impossible.
+///
+/// L'épreuve porte sur la VALEUR rendue, jamais sur un code HTTP : la route
+/// répondait déjà 200 avant, en taisant le champ.
+#[tokio::test]
+async fn la_table_des_titres_rend_le_dynamic_range_par_piste_1388() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&body), 6, "la table des titres reste entière");
+
+    assert_eq!(
+        dr_de(&piste(&body, "Alpha")).as_deref(),
+        Some("7"),
+        "le tag de la PISTE (7), pas celui de l'album (6)"
+    );
+    assert_eq!(dr_de(&piste(&body, "Bravo")).as_deref(), Some("14"));
+    assert_eq!(
+        dr_de(&piste(&body, "Foxtrot")).as_deref(),
+        Some("0"),
+        "DR0 est la mesure d'un master saturé : elle se rend, elle ne se tait pas"
+    );
+
+    // Les TÉMOINS VERTS : une piste sans tag sort exactement comme avant.
+    assert_eq!(
+        dr_de(&piste(&body, "Charlie")),
+        None,
+        "l'album est tagué DR9 mais la piste ne l'est pas : aucune clé — \
+         recopier l'agrégat d'album ici serait un mensonge sur la piste"
+    );
+    assert_eq!(dr_de(&piste(&body, "Delta")), None);
+    assert_eq!(dr_de(&piste(&body, "Echo")), None);
+    // Et l'absence est une ABSENCE, pas un `null` que le client devrait
+    // distinguer d'un zéro.
+    assert!(
+        piste(&body, "Delta").get("dynamic_range").is_none(),
+        "la clé ne doit pas apparaître à `null`"
+    );
+    // Aucun autre champ n'a bougé.
+    assert_eq!(piste(&body, "Alpha")["format"], "flac");
+}
+
+/// Le chemin FILTRÉ de la table des titres rend le même champ (#1388).
+///
+/// `list_tracks` a deux branches — filtrée et non filtrée — et elles
+/// sérialisent la liste chacune de leur côté. Corriger une seule aurait donné
+/// une colonne DR qui disparaît dès qu'une pastille du rail est cochée.
+#[tokio::test]
+async fn le_chemin_filtre_de_la_table_des_titres_rend_aussi_le_dr_1388() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/tracks?limit=50&dr=6").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(total(&body), 1, "la tranche DR6 ne retient qu'Alpha");
+    assert_eq!(
+        dr_de(&piste(&body, "Alpha")).as_deref(),
+        Some("7"),
+        "album filtré sur DR6, piste annoncée à DR7 : les deux tags sont \
+         distincts et chacun reste à sa place"
+    );
+}
+
+/// La FICHE d'une piste rend le Dynamic Range (#1388).
+#[tokio::test]
+async fn la_fiche_d_une_piste_rend_le_dynamic_range_1388() {
+    let app = bibliotheque();
+
+    let (status, alpha) = get(&app, "/api/v1/library/tracks/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dr_de(&alpha).as_deref(), Some("7"));
+    assert_eq!(alpha["title"], "Alpha — piste", "la fiche reste la fiche");
+
+    let (_, foxtrot) = get(&app, "/api/v1/library/tracks/6").await;
+    assert_eq!(dr_de(&foxtrot).as_deref(), Some("0"), "DR0 se rend");
+
+    let (status, charlie) = get(&app, "/api/v1/library/tracks/3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        dr_de(&charlie),
+        None,
+        "piste non taguée : la charge utile est celle d'avant, sans clé"
+    );
+}
+
+/// TÉMOIN VERT de #2809 : les pistes d'un album rendent toujours leur DR.
+///
+/// Ce chemin-là était déjà livré ; il est recopié ici parce que le champ y est
+/// désormais produit par une fonction PARTAGÉE avec les routes de pistes. Si
+/// la mise en commun cassait la sortie d'origine, c'est ce test qui rougirait.
+#[tokio::test]
+async fn les_pistes_d_un_album_rendent_toujours_leur_dr_2809() {
+    let app = bibliotheque();
+    let (status, body) = get(&app, "/api/v1/library/albums/1/tracks").await;
+    assert_eq!(status, StatusCode::OK);
+    let pistes = body.as_array().expect("un tableau de pistes");
+    assert_eq!(pistes.len(), 1);
+    assert_eq!(dr_de(&pistes[0]).as_deref(), Some("7"));
+
+    let (_, charlie) = get(&app, "/api/v1/library/albums/3/tracks").await;
+    let pistes = charlie.as_array().expect("un tableau de pistes");
+    assert_eq!(
+        dr_de(&pistes[0]),
+        None,
+        "album DR9, piste non taguée : rien ne se recopie"
     );
 }
