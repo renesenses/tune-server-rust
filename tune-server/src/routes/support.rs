@@ -79,8 +79,9 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::list_tickets(&state.http_client, &auth).await,
+        support::list_tickets(&state.http_client, &auth, base.as_deref()).await,
         &headers,
     )
 }
@@ -124,6 +125,7 @@ async fn create_json(
         Ok(Json(p)) => p,
         Err(rej) => return rej.into_response(),
     };
+    let base = base_url(&state);
     finish(
         support::create_ticket(
             &state.http_client,
@@ -136,6 +138,7 @@ async fn create_json(
                 system: payload.system,
                 logs: payload.logs,
             },
+            base.as_deref(),
         )
         .await,
         &headers,
@@ -233,8 +236,10 @@ async fn create_multipart(
         );
     }
 
+    let base = base_url(&state);
     finish(
-        support::create_ticket_multipart(&state.http_client, &auth, fields, files).await,
+        support::create_ticket_multipart(&state.http_client, &auth, fields, files, base.as_deref())
+            .await,
         &headers,
     )
 }
@@ -530,8 +535,9 @@ async fn detail(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::get_ticket(&state.http_client, &auth, id).await,
+        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
 }
@@ -546,8 +552,16 @@ async fn reply(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::reply(&state.http_client, &auth, id, &payload.body).await,
+        support::reply(
+            &state.http_client,
+            &auth,
+            id,
+            &payload.body,
+            base.as_deref(),
+        )
+        .await,
         &headers,
     )
 }
@@ -563,10 +577,26 @@ async fn mark_read(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::mark_read(&state.http_client, &auth, id).await,
+        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
+}
+
+/// Racine du nuage à interroger, `None` pour la production.
+///
+/// Même réglage que le SSO, le marché de greffons, les couvertures
+/// communautaires et la validation de licence : `mozaik_base_url`. Sans lui, le
+/// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
+/// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
+/// (#2916).
+fn base_url(state: &AppState) -> Option<String> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
