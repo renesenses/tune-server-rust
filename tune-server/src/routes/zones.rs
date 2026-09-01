@@ -6962,6 +6962,12 @@ mod backend_local_annonce_tests {
             "fell_back",
             "fallback_reason",
             "fallback_detail",
+            // #2207 — le PÉRIPHÉRIQUE réellement ouvert, face au demandé. Le
+            // champ fait partie du contrat même quand rien n'a encore joué :
+            // il vaut alors `null`, ce qui est la réponse honnête. C'est son
+            // ABSENCE de la charge utile qui serait la régression — le client
+            // n'aurait de nouveau que le journal pour savoir où sort le son.
+            "device",
         ] {
             assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
         }
