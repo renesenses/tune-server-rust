@@ -181,10 +181,13 @@ fn build_device_list(
     all_output_info: &[Value],
 ) -> Vec<Value> {
     // Même dédoublonnage que POST /devices/scan : un appareil qui s'annonce
-    // sous plusieurs identités (mDNS + SSDP, cf. #1880) est regroupé par hôte,
-    // les identités secondaires rabattues dans capabilities["alternatives"].
+    // sous plusieurs identités (mDNS + SSDP, cf. #1880) est regroupé, les
+    // identités secondaires rabattues dans capabilities["alternatives"].
     // Sans ce repli, GET /devices renvoyait chaque identité comme une entrée
     // distincte et la barre latérale affichait l'appareil en double (#2452).
+    // Le regroupement se fait sur l'identité annoncée (stable_id), à défaut
+    // sur (hôte, nom) — et NON sur l'hôte seul, qui ramenait à une seule
+    // entrée les dix platines annoncées par un même serveur Lyrion (#2942).
     let deduped = dedup_devices(discovered);
 
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2427,6 +2430,77 @@ mod list_devices_dedup_tests {
         assert_eq!(
             items[0].get("registered").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// Dix platines Squeezebox annoncées en renderers DLNA par le même serveur
+    /// Lyrion : chacune porte l'adresse du LMS, son propre nom et son propre
+    /// UDN (#2942, signalement de Sergio sur le fil forum 208).
+    fn platines_derriere_un_lms() -> Vec<DiscoveredDevice> {
+        const PIECES: [&str; 10] = [
+            "Salon", "Cuisine", "Chambre", "Bureau", "Cave", "Garage", "Terrasse", "Atelier",
+            "Couloir", "Grenier",
+        ];
+        PIECES
+            .iter()
+            .enumerate()
+            .map(|(n, piece)| {
+                let mut d = DiscoveredDevice::new(
+                    format!("dlna-uuid:lms-{n}"),
+                    format!("Squeezebox {piece}"),
+                    OutputType::Dlna,
+                    "192.168.1.10".into(),
+                    9000 + n as u16,
+                );
+                d.stable_id = Some(format!("uuid:lms-{n}"));
+                d
+            })
+            .collect()
+    }
+
+    #[test]
+    fn liste_garde_les_appareils_distincts_derriere_une_meme_adresse() {
+        // #2942 — GET /devices n'en renvoyait qu'UNE : le repli groupait sur
+        // l'adresse seule. Le fait mesuré est le nombre d'entrées rendues.
+        let mut devices = platines_derriere_un_lms();
+        // TÉMOIN, vert des deux côtés : le Marantz sous ses deux identités
+        // reste UNE entrée — c'est ce que #1880/#2452 exigent.
+        devices.extend(marantz_deux_identites());
+
+        let items = build_device_list(devices, &std::collections::HashSet::new(), &[]);
+
+        assert_eq!(
+            items.len(),
+            11,
+            "dix platines + un Marantz replié = 11 entrées, obtenu : {:?}",
+            items
+                .iter()
+                .map(|i| i.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        );
+        let platines: Vec<&str> = items
+            .iter()
+            .filter(|i| i.get("host").and_then(Value::as_str) == Some("192.168.1.10"))
+            .filter_map(|i| i.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            platines.len(),
+            10,
+            "les dix platines doivent être listées, obtenu : {platines:?}"
+        );
+        // TÉMOIN : une seule entrée pour le Marantz, l'identité UPnP en primaire.
+        let marantz: Vec<&Value> = items
+            .iter()
+            .filter(|i| i.get("host").and_then(Value::as_str) == Some("192.168.1.50"))
+            .collect();
+        assert_eq!(
+            marantz.len(),
+            1,
+            "les deux identités d'un même appareil restent UNE entrée, obtenu : {marantz:?}"
+        );
+        assert_eq!(
+            marantz[0].get("id").and_then(Value::as_str),
+            Some("uuid:56fcb4ae-8f52-4a80-9d1c-000000000000")
         );
     }
 
