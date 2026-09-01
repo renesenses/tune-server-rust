@@ -17,6 +17,28 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
 const MISS_GRACE_CYCLES: u32 = 3;
+/// Plancher du `CACHE-CONTROL: max-age` d'un serveur multimédia.
+///
+/// UPnP Device Architecture 1.1 §1.2.2 impose `max-age >= 1800 s` et demande
+/// au device de se réannoncer AVANT l'échéance (à un instant aléatoire
+/// inférieur à la moitié de `max-age`). Un serveur conforme se réannonce donc
+/// au moins toutes les ~900 s : le silence de 1800 s est, par construction du
+/// protocole, la tolérance que le protocole lui-même définit.
+///
+/// On plafonne par le bas et jamais par le haut : un serveur qui annonce
+/// `max-age=7200` a le droit de se taire deux heures, et le croire mort au
+/// bout de trente minutes le ferait disparaître alors qu'il est vivant —
+/// exactement le travers que #2139 interdit.
+const MEDIA_SERVER_MIN_MAX_AGE: Duration = Duration::from_secs(1800);
+/// Au-delà de ce silence, un serveur multimédia est présenté comme NON
+/// JOIGNABLE — marqué, pas retiré (c'est la voie retenue par Bertrand dans le
+/// fil forum 1425 : « marquer ceux qui ne répondent plus plutôt que de les
+/// retirer »).
+///
+/// 900 s = trois cycles de `PERIODIC_RESCAN_INTERVAL`, et aussi la cadence de
+/// réannonce d'un serveur conforme au plancher UPnP. Un serveur vivant qui
+/// rate UN cycle — voire deux — reste donc affiché comme joignable.
+const MEDIA_SERVER_STALE_AFTER: Duration = Duration::from_secs(900);
 /// Backoff (seconds) between SSDP probes at startup while NO device has been
 /// found yet. On a fresh boot the network interface and DLNA/USB renderers are
 /// often not ready for the first few seconds; probing quickly with this backoff
@@ -36,6 +58,62 @@ pub enum SsdpEvent {
     DeviceDiscovered(Box<DiscoveredDevice>),
     DeviceLost(String),
     MediaServerDiscovered(MediaServerInfo),
+    /// Un serveur multimédia a disparu, et la disparition est CONFIRMÉE : soit
+    /// un `ssdp:byebye`, soit un `max-age` écoulé — dans les deux cas suivi
+    /// d'une sonde unicast qui a échoué. Sans cette variante le registre
+    /// `media_servers` n'avait aucun moyen d'oublier (#2139).
+    MediaServerLost(String),
+}
+
+/// Sort d'un serveur multimédia à la fin d'un cycle de balayage SSDP.
+///
+/// Fonction pure, séparée de la boucle réseau : c'est ELLE qui porte la
+/// tolérance, et c'est elle qu'on teste. Voir [`media_server_verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaServerVerdict {
+    /// Revu pendant ce cycle : rien à faire, l'horodatage est rafraîchi.
+    Seen,
+    /// Silencieux, mais toujours dans sa fenêtre `max-age`. On le GARDE. Il
+    /// peut être marqué non joignable dans l'interface, il n'est pas retiré.
+    Silent,
+    /// `max-age` écoulé sans réannonce. Candidat au retrait — jamais retiré
+    /// sur ce seul verdict : une sonde unicast doit d'abord échouer.
+    ExpiredNeedsProbe,
+}
+
+/// Décide du sort d'un serveur multimédia à la fin d'un cycle de balayage.
+///
+/// Le piège de #2139 est de faire disparaître un appareil bien vivant : perdre
+/// sa zone en pleine écoute est PIRE que voir un fantôme dans une liste. D'où
+/// trois garde-fous empilés, et non un seul seuil :
+///
+/// 1. toute réannonce — NOTIFY `ssdp:alive` ou réponse à un M-SEARCH — remet
+///    l'horloge à zéro (`Seen`) ;
+/// 2. le silence n'est fatal qu'au-delà du `max-age` ANNONCÉ par le serveur,
+///    plancher UPnP de 1800 s. À la cadence de balayage de repos
+///    (`IDLE_SCAN_INTERVAL`, 120 s), c'est **au minimum quinze cycles
+///    consécutifs manqués** avant même d'être candidat ;
+/// 3. le verdict `ExpiredNeedsProbe` n'est pas un retrait : l'appelant doit
+///    encore obtenir un échec de [`unicast_probe`] sur la `LOCATION`.
+///
+/// Le critère est un TEMPS ÉCOULÉ, pas un nombre de cycles manqués, et c'est
+/// délibéré : `process_responses` est appelée aussi bien par la boucle de
+/// balayage que par le récepteur de NOTIFY, une réponse à la fois. Un décompte
+/// de cycles y dériverait — chaque datagramme d'un appareil VOISIN compterait
+/// comme un cycle manqué pour tous les autres. Une horloge, non.
+pub fn media_server_verdict(
+    seen_this_cycle: bool,
+    age: Duration,
+    max_age: Duration,
+) -> MediaServerVerdict {
+    if seen_this_cycle {
+        return MediaServerVerdict::Seen;
+    }
+    if age >= max_age.max(MEDIA_SERVER_MIN_MAX_AGE) {
+        MediaServerVerdict::ExpiredNeedsProbe
+    } else {
+        MediaServerVerdict::Silent
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -51,6 +129,42 @@ pub struct MediaServerInfo {
     /// affiche `host:port` ; sans ce champ elle rendait « 192.168.1.41: »
     /// (#1615).
     pub port: u16,
+    /// Dernière annonce reçue de ce serveur — NOTIFY `ssdp:alive` ou réponse à
+    /// un M-SEARCH. C'est l'horodatage qui manquait totalement à #2139 : sans
+    /// lui le registre ne pouvait ni oublier, ni marquer.
+    ///
+    /// Non sérialisé : `Instant` n'a pas de représentation absolue. La route
+    /// expose l'ÂGE en secondes, qui est ce dont l'interface a besoin.
+    #[serde(skip)]
+    pub last_seen: Instant,
+    /// `CACHE-CONTROL: max-age` annoncé par le serveur, plancher UPnP appliqué
+    /// à la lecture (voir `MEDIA_SERVER_MIN_MAX_AGE`).
+    #[serde(skip)]
+    pub max_age: Duration,
+}
+
+impl MediaServerInfo {
+    /// Depuis combien de temps ce serveur n'a plus donné signe de vie.
+    pub fn age(&self) -> Duration {
+        self.last_seen.elapsed()
+    }
+
+    /// Vu assez récemment pour être présenté comme JOIGNABLE.
+    ///
+    /// Purement cosmétique : un serveur non joignable reste dans le registre
+    /// et reste navigable. C'est le marquage demandé dans le fil, pas un
+    /// retrait déguisé.
+    pub fn is_reachable(&self) -> bool {
+        media_server_reachable(self.age())
+    }
+}
+
+/// Le marquage, en fonction pure du seul âge — testable sans fabriquer
+/// d'`Instant` dans le passé (`Instant::checked_sub` rend `None` sur une
+/// machine démarrée depuis moins longtemps que le recul demandé, ce qui rend
+/// un test bâti là-dessus instable en CI).
+pub fn media_server_reachable(age: Duration) -> bool {
+    age < MEDIA_SERVER_STALE_AFTER
 }
 
 #[derive(Debug)]
@@ -59,6 +173,9 @@ struct SsdpResponse {
     usn: String,
     _server: Option<String>,
     _st: Option<String>,
+    /// `CACHE-CONTROL: max-age=N`, en secondes, quand l'en-tête est présent.
+    /// SSDP porte ce signal depuis toujours ; il était simplement jeté.
+    max_age: Option<u64>,
 }
 
 pub struct SsdpScanner {
@@ -91,6 +208,14 @@ struct ScannerState {
     // to the same bare uuid — this set debounces the burst so only ONE probe runs
     // per device instead of ~10-15 redundant ones (forum #1183).
     byebye_pending: HashSet<String>,
+    /// Serveurs multimédia connus, avec leur fraîcheur.
+    ///
+    /// Ils ne sont PAS dans `devices` : ce ne sont pas des sorties, et la
+    /// branche `is_media_server()` de `process_responses` faisait `continue`
+    /// avant toute création d'appareil. C'est la raison exacte pour laquelle
+    /// la boucle de grâce — qui n'itère que sur `devices` — ne les a jamais
+    /// vus, donc jamais expirés (#2139).
+    media_servers: HashMap<String, MediaServerInfo>,
     initial_scan_done: bool,
     last_periodic_rescan: Instant,
 }
@@ -112,6 +237,24 @@ impl ScannerState {
             .map(|(id, _)| id)
     }
 
+    /// Oublier un serveur multimédia. C'est la **seule** porte de sortie du
+    /// registre, partagée par les deux chemins de disparition (`ssdp:byebye`
+    /// confirmé, `max-age` écoulé puis sonde échouée) — pour qu'il n'y ait
+    /// qu'un endroit à relire quand on se demande ce qui retire un serveur.
+    ///
+    /// La `LOCATION` part avec l'entrée : sans cela le `!known` de
+    /// `process_responses` continuerait de croire le serveur connu, et il ne
+    /// serait JAMAIS réenregistré quand il revient.
+    ///
+    /// Rend l'entrée retirée, ou `None` si l'identifiant ne désignait pas un
+    /// serveur multimédia connu (cas courant : un `byebye` de renderer).
+    fn oublier_serveur_multimedia(&mut self, id: &str) -> Option<MediaServerInfo> {
+        let ms = self.media_servers.remove(id)?;
+        self.known_locations.remove(id);
+        self.miss_count.remove(id);
+        Some(ms)
+    }
+
     fn new() -> Self {
         Self {
             devices: HashMap::new(),
@@ -119,6 +262,7 @@ impl ScannerState {
             miss_count: HashMap::new(),
             create_failures: HashMap::new(),
             byebye_pending: HashSet::new(),
+            media_servers: HashMap::new(),
             initial_scan_done: false,
             last_periodic_rescan: Instant::now(),
         }
@@ -292,8 +436,17 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                                 &usn,
                                 &advert.location,
                             );
+                            // `to` et `st` : sans eux la trace dit qu'une
+                            // réponse n'est pas partie, sans dire à qui ni pour
+                            // quelle identité — donc sans permettre d'agir
+                            // (#2417, même défaut).
                             if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(error = %e, "ssdp_msearch_reply_failed");
+                                debug!(
+                                    to = %addr,
+                                    st = %st_reply,
+                                    error = %e,
+                                    "ssdp_msearch_reply_failed"
+                                );
                             }
                         }
                     }
@@ -310,7 +463,12 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                                 &adv.location,
                             );
                             if let Err(e) = socket.send_to(resp.as_bytes(), addr).await {
-                                debug!(error = %e, "ssdp_renderer_msearch_reply_failed");
+                                debug!(
+                                    to = %addr,
+                                    st = %st_reply,
+                                    error = %e,
+                                    "ssdp_renderer_msearch_reply_failed"
+                                );
                             }
                         }
                     }
@@ -352,6 +510,26 @@ async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sen
                                     debug!(id = %dev_id, "ssdp_byebye_probe_ok");
                                 } else {
                                     info!(id = %dev_id, "ssdp_byebye_confirmed_lost");
+                                    // Un `byebye` de serveur multimédia passait
+                                    // déjà par ici — la sonde trouve sa
+                                    // LOCATION dans `known_locations` — mais
+                                    // n'émettait qu'un `DeviceLost`, que le
+                                    // registre `media_servers` n'écoute pas.
+                                    // On émet AUSSI `MediaServerLost` quand
+                                    // l'identifiant en est un (#2139). Le
+                                    // `DeviceLost` est conservé tel quel :
+                                    // aucun consommateur existant ne change de
+                                    // comportement.
+                                    let was_media_server = state
+                                        .lock()
+                                        .await
+                                        .oublier_serveur_multimedia(&dev_id)
+                                        .is_some();
+                                    if was_media_server {
+                                        let _ = event_tx
+                                            .send(SsdpEvent::MediaServerLost(dev_id.clone()))
+                                            .await;
+                                    }
                                     let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
                                 }
                             });
@@ -579,9 +757,14 @@ fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
     let mut usn = None;
     let mut server = None;
     let mut st = None;
+    let mut max_age = None;
 
     for line in text.lines() {
         let line = line.trim();
+        if let Some(secs) = parse_cache_control_max_age(line) {
+            max_age = Some(secs);
+            continue;
+        }
         if let Some(val) = line
             .strip_prefix("LOCATION:")
             .or_else(|| line.strip_prefix("Location:"))
@@ -621,7 +804,26 @@ fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
         usn: usn.unwrap_or_default(),
         _server: server,
         _st: st,
+        max_age,
     })
+}
+
+/// `CACHE-CONTROL: max-age = 1800` → `Some(1800)`.
+///
+/// Les en-têtes SSDP sont insensibles à la casse et les serveurs sont
+/// désordonnés : `max-age=1800`, `max-age = 1800`, `no-cache, max-age=1800`.
+/// On accepte tout ça, et rien d'autre.
+fn parse_cache_control_max_age(line: &str) -> Option<u64> {
+    let lower = line.to_lowercase();
+    let value = lower.strip_prefix("cache-control:")?;
+    for part in value.split(',') {
+        let part = part.trim();
+        if let Some(n) = part.strip_prefix("max-age") {
+            let n = n.trim_start().strip_prefix('=')?.trim();
+            return n.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 fn device_id_from_usn(usn: &str) -> String {
@@ -696,6 +898,16 @@ fn build_renderer_device(
         Some(desc.model_name.clone())
     };
     device.location = Some(location.to_string());
+    // `id` est l'identifiant que l'APPELANT nous impose — pour un re-sondage,
+    // celui qu'il a persisté. Le descripteur, lui, vient d'annoncer le sien :
+    // sans le publier ici, `reregister_known_renderers` comparait `dev.id` à
+    // l'identifiant qu'il venait de passer en argument, une tautologie qui a
+    // rendu sa garde « UUID changed » morte depuis #1126 (#2639).
+    device.stable_id = if desc.udn.is_empty() {
+        None
+    } else {
+        Some(desc.udn.clone())
+    };
 
     device.capabilities.insert(
         "service_urls".into(),
@@ -725,7 +937,28 @@ fn build_renderer_device(
 /// renderer classification (openhome → Openhome; media renderer or bare
 /// AVTransport → Dlna; anything else → None).
 pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDevice> {
-    let desc = fetch_device_description(location).await.ok()?;
+    // Ce `None` couvrait DEUX causes que rien ne distinguait, et son seul
+    // appelant (`discovery_setup::reregister_known_renderers`) les résumait
+    // toutes deux par un unique `known_renderer_probe_failed` : « l'appareil
+    // n'a pas répondu / a répondu autre chose qu'un descriptif » et « ce n'est
+    // pas un lecteur ». Les gestes attendus sont pourtant opposés — rallumer
+    // l'appareil, ou aller voir ce que sert cette adresse (#2665).
+    //
+    // Le cas du descriptif ILLISIBLE, lui, est journalisé au niveau `warn`
+    // avec l'adresse, la nature du corps et un extrait borné par
+    // `fetch_device_description` : inutile de le redire ici.
+    let desc = match fetch_device_description(location).await {
+        Ok(desc) => desc,
+        Err(e) => {
+            debug!(
+                id = %dev_id,
+                location = %location,
+                error = %e,
+                "probe_renderer_description_failed"
+            );
+            return None;
+        }
+    };
     let host = host_from_location(location).unwrap_or_default();
     let port = port_from_location(location);
 
@@ -734,6 +967,15 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
     } else if desc.is_media_renderer() || desc.has_av_transport() {
         OutputType::Dlna
     } else {
+        // Issue distincte de la précédente : l'adresse répond, son descriptif
+        // se lit, mais il ne décrit pas un lecteur.
+        debug!(
+            id = %dev_id,
+            location = %location,
+            device_type = %desc.device_type,
+            friendly_name = %desc.friendly_name,
+            "probe_renderer_not_a_renderer"
+        );
         return None;
     };
 
@@ -797,6 +1039,15 @@ async fn process_responses(
         } else {
             let mut st = state.lock().await;
             st.miss_count.remove(&dev_id);
+            // Réannonce d'un serveur déjà connu : on remet son horloge à zéro.
+            // C'est CE point qui garantit qu'un serveur bien vivant qui a raté
+            // un cycle — Wi-Fi qui hoquette, annonce perdue — ne disparaît
+            // pas : la seule réapparition suffit à annuler tout le compte à
+            // rebours (#2139).
+            if let Some(ms) = st.media_servers.get_mut(&dev_id) {
+                ms.last_seen = Instant::now();
+                ms.max_age = max_age_from_response(&resp);
+            }
         }
     }
 
@@ -844,6 +1095,8 @@ async fn process_responses(
                             content_directory_url: full_cd_url,
                             host,
                             port,
+                            last_seen: Instant::now(),
+                            max_age: max_age_from_response(&resp),
                         };
                         // Record the media server as known so later SSDP cycles
                         // skip it (see the `!known` gate above). Renderers are
@@ -853,14 +1106,18 @@ async fn process_responses(
                         // duplicate `ssdp_media_server_discovered` entries that
                         // drowned the playback traces in tester logs and made
                         // DLNA issues undiagnosable (#954).
-                        state
-                            .lock()
-                            .await
-                            .known_locations
-                            .insert(dev_id.clone(), resp.location.clone());
+                        {
+                            let mut st = state.lock().await;
+                            st.known_locations
+                                .insert(dev_id.clone(), resp.location.clone());
+                            // Le registre de fraîcheur, sans lequel rien
+                            // n'expire (#2139).
+                            st.media_servers.insert(dev_id.clone(), ms.clone());
+                        }
                         info!(
                             id = %dev_id,
                             name = %ms.name,
+                            location = %ms.location,
                             cd_url = %ms.content_directory_url,
                             "ssdp_media_server_discovered"
                         );
@@ -1012,13 +1269,68 @@ async fn process_responses(
             if let Some(mut device) = st.devices.remove(&dev_id) {
                 device.available = false;
                 st.miss_count.remove(&dev_id);
-                st.known_locations.remove(&dev_id);
-                info!(id = %dev_id, name = %device.name, "ssdp_device_lost");
+                // L'adresse est retirée ici : la lire AVANT, pour pouvoir la
+                // journaliser. C'est elle que la sonde unicast vient
+                // d'interroger sans réponse (#2417) — sans elle, la trace dit
+                // qu'un lecteur a disparu et laisse chercher lequel.
+                let location = st.known_locations.remove(&dev_id);
+                info!(
+                    id = %dev_id,
+                    name = %device.name,
+                    location = %location.as_deref().unwrap_or("inconnue"),
+                    "ssdp_device_lost"
+                );
                 drop(st);
                 let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
             }
         }
     }
+
+    // Expiration des serveurs multimédia — le registre qui n'oubliait jamais.
+    //
+    // Séparée de la boucle ci-dessus parce que le critère n'est pas le même :
+    // un renderer répond aux M-SEARCH à chaque cycle, alors qu'un serveur
+    // multimédia peut légitimement ne s'annoncer que spontanément, et donc
+    // rester silencieux jusqu'à son `max-age`. Compter des cycles manqués sur
+    // un tel serveur le ferait disparaître alors qu'il est parfaitement vivant.
+    let mut expired: Vec<String> = Vec::new();
+    {
+        let st = state.lock().await;
+        for (id, ms) in st.media_servers.iter() {
+            if media_server_verdict(seen_ids.contains(id), ms.age(), ms.max_age)
+                == MediaServerVerdict::ExpiredNeedsProbe
+            {
+                expired.push(id.clone());
+            }
+        }
+    }
+
+    for ms_id in expired {
+        // Dernière chance, et elle compte : un serveur qui répond encore sur sa
+        // LOCATION est vivant, quoi qu'ait dit (ou tu) le multicast.
+        if unicast_probe(state, &ms_id).await {
+            let mut st = state.lock().await;
+            if let Some(ms) = st.media_servers.get_mut(&ms_id) {
+                ms.last_seen = Instant::now();
+            }
+            debug!(id = %ms_id, "ssdp_media_server_probe_ok");
+            continue;
+        }
+        let mut st = state.lock().await;
+        if let Some(ms) = st.oublier_serveur_multimedia(&ms_id) {
+            info!(id = %ms_id, name = %ms.name, "ssdp_media_server_expired");
+            drop(st);
+            let _ = event_tx.send(SsdpEvent::MediaServerLost(ms_id)).await;
+        }
+    }
+}
+
+/// `max-age` retenu pour un serveur, plancher UPnP appliqué.
+fn max_age_from_response(resp: &SsdpResponse) -> Duration {
+    resp.max_age
+        .map(Duration::from_secs)
+        .unwrap_or(MEDIA_SERVER_MIN_MAX_AGE)
+        .max(MEDIA_SERVER_MIN_MAX_AGE)
 }
 
 async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
@@ -1392,6 +1704,7 @@ mod tests {
             usn: usn.to_string(),
             _server: None,
             _st: None,
+            max_age: None,
         }
     }
 
@@ -1573,6 +1886,102 @@ mod tests {
 <meta charset=\"utf-8\">\
 </head><body>Tune</body></html>";
 
+    /// Description minimale d'un MediaServer : assez riche pour emprunter le
+    /// chemin `ssdp_media_server_discovered`, sans AVTransport afin que la
+    /// sonde MinimalDMR d'un premier échec ne le transforme pas en renderer.
+    const MEDIA_SERVER_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>Tune Server</friendlyName>
+    <manufacturer>MozAIk Labs</manufacturer>
+    <modelName>Tune</modelName>
+    <UDN>uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>
+        <controlURL>/upnp/ContentDirectory/control</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    #[derive(Clone, Copy)]
+    enum LocationScenario {
+        /// La même URL rend d'abord du HTML, puis un descripteur valide.
+        Intermittent,
+        /// Deux URL portent le même UUID : l'une échoue, l'autre réussit.
+        DeuxLocations,
+    }
+
+    /// Serveur déterministe des deux scénarios que le journal de #2417 ne
+    /// permettait pas de séparer. Toute route non décrite rend 404, notamment
+    /// les sondes MinimalDMR : aucun repli ne doit court-circuiter les traces.
+    async fn spawn_location_scenario_server(scenario: LocationScenario) -> std::net::SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let intermittent_requests = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let intermittent_requests = intermittent_requests.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let tete = String::from_utf8_lossy(&req);
+                    let chemin = tete
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+
+                    let reponse = match (scenario, chemin) {
+                        (LocationScenario::Intermittent, "/intermittent.xml") => {
+                            if intermittent_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Some(("text/html", PAGE_HTML))
+                            } else {
+                                Some(("text/xml", MEDIA_SERVER_XML))
+                            }
+                        }
+                        (LocationScenario::DeuxLocations, "/mauvaise.xml") => {
+                            Some(("text/html", PAGE_HTML))
+                        }
+                        (LocationScenario::DeuxLocations, "/bonne.xml") => {
+                            Some(("text/xml", MEDIA_SERVER_XML))
+                        }
+                        _ => None,
+                    };
+
+                    let resp = if let Some((content_type, body)) = reponse {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
     /// Un serveur web ordinaire à l'adresse annoncée en LOCATION : il rend
     /// `PAGE_HTML` sur `description_path`, et **404 partout ailleurs**.
     ///
@@ -1655,6 +2064,50 @@ mod tests {
         }
     }
 
+    /// L'UDN annonce par le descripteur doit ressortir de `build_renderer_device`.
+    ///
+    /// `id` est l'identifiant que l'APPELANT impose ; pour un re-sondage, celui
+    /// qu'il a persiste. Sans `stable_id`, `reregister_known_renderers`
+    /// comparait `dev.id` a l'argument qu'il venait de passer — une tautologie
+    /// qui a rendu sa garde « UUID changed » morte depuis #1126, et qui
+    /// reecrivait le Marantz 20 ms apres que l'autre magasin l'avait efface
+    /// (#2639).
+    #[test]
+    fn le_descripteur_publie_l_udn_qu_il_annonce_pas_celui_qu_on_lui_impose() {
+        use super::super::xml_parser::ServiceDescription;
+        let desc = DeviceDescription {
+            device_type: "urn:schemas-denon-com:device:AiosDevice:1".to_string(),
+            friendly_name: "Marantz ND8006".to_string(),
+            manufacturer: "Marantz".to_string(),
+            model_name: "ND8006".to_string(),
+            // Ce que l'appareil rend le 28/08 …
+            udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65".to_string(),
+            services: vec![ServiceDescription {
+                service_type: "urn:schemas-upnp-org:service:AVTransport:1".to_string(),
+                control_url: "/ctrl".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // … contre ce que le magasin porte encore.
+        let persiste = "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26";
+        let dev = build_renderer_device(
+            persiste,
+            "http://192.0.2.11:60006/upnp/desc/aios_device/aios_device.xml",
+            // Adresse de documentation (RFC 5737) : jamais dans un cache ARP.
+            "192.0.2.11".to_string(),
+            60006,
+            OutputType::Dlna,
+            &desc,
+        );
+        assert_eq!(dev.id, persiste, "la cle de zone reste celle de l'appelant");
+        assert_eq!(
+            dev.stable_id.as_deref(),
+            Some("uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65"),
+            "sans l'UDN reellement annonce, aucune garde ne peut voir le desaccord"
+        );
+    }
+
     #[tokio::test]
     async fn l_echec_de_creation_nomme_la_location_fautive() {
         use tracing::instrument::WithSubscriber;
@@ -1710,6 +2163,421 @@ mod tests {
              sans elle on ne peut pas savoir quelle adresse rend du HTML.\n\
              attendu quelque part dans la ligne : {location}\n\
              ligne obtenue : {ligne}"
+        );
+    }
+
+    #[tokio::test]
+    async fn une_location_intermittente_est_identique_sur_l_echec_et_le_succes() {
+        use tracing::instrument::WithSubscriber;
+
+        let addr = spawn_location_scenario_server(LocationScenario::Intermittent).await;
+        let location = format!("http://{addr}/intermittent.xml");
+        let annonce = || {
+            announcement(
+                &location,
+                "uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67::urn:schemas-upnp-org:device:MediaServer:1",
+            )
+        };
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        async {
+            // Premier passage : HTML, donc échec. La sonde MinimalDMR relit la
+            // même URL mais ne trouve aucun AVTransport. Deuxième passage :
+            // descripteur MediaServer valide, donc succès.
+            process_responses(&state, &tx, vec![annonce()]).await;
+            process_responses(&state, &tx, vec![annonce()]).await;
+        }
+        .with_subscriber(abonne)
+        .await;
+
+        let texte = journal.texte();
+        let echec = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_create_failed"))
+            .unwrap_or_else(|| panic!("aucune trace d'échec :\n{texte}"));
+        let succes = texte
+            .lines()
+            .find(|l| l.contains("ssdp_media_server_discovered"))
+            .unwrap_or_else(|| panic!("aucune trace de succès :\n{texte}"));
+
+        assert!(
+            echec.contains(&location) && succes.contains(&location),
+            "une URL intermittente doit ressortir IDENTIQUE sur les deux traces.\n\
+             attendu : {location}\n\
+             échec   : {echec}\n\
+             succès  : {succes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deux_locations_du_meme_uuid_restent_distinctes_dans_les_traces() {
+        use tracing::instrument::WithSubscriber;
+
+        let addr = spawn_location_scenario_server(LocationScenario::DeuxLocations).await;
+        let mauvaise = format!("http://{addr}/mauvaise.xml");
+        let bonne = format!("http://{addr}/bonne.xml");
+        let usn =
+            "uuid:e4e0480f-1b70-4183-80cc-acc1d40edf67::urn:schemas-upnp-org:device:MediaServer:1";
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, _rx) = mpsc::channel(32);
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        process_responses(
+            &state,
+            &tx,
+            vec![announcement(&mauvaise, usn), announcement(&bonne, usn)],
+        )
+        .with_subscriber(abonne)
+        .await;
+
+        let texte = journal.texte();
+        let echec = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_create_failed"))
+            .unwrap_or_else(|| panic!("aucune trace d'échec :\n{texte}"));
+        let succes = texte
+            .lines()
+            .find(|l| l.contains("ssdp_media_server_discovered"))
+            .unwrap_or_else(|| panic!("aucune trace de succès :\n{texte}"));
+
+        assert!(
+            echec.contains(&mauvaise) && !echec.contains(&bonne),
+            "l'échec doit nommer seulement sa LOCATION.\n\
+             mauvaise : {mauvaise}\nbonne : {bonne}\nligne : {echec}"
+        );
+        assert!(
+            succes.contains(&bonne) && !succes.contains(&mauvaise),
+            "le succès doit nommer seulement sa LOCATION.\n\
+             bonne : {bonne}\nmauvaise : {mauvaise}\nligne : {succes}"
+        );
+    }
+
+    // ── Le même angle mort, sur l'autre bout du cycle de vie (#2417) ──────
+    //
+    // `ssdp_device_create_failed` n'était pas le seul échec muet du module :
+    // `ssdp_device_lost` déclare un appareil disparu et ne nomme que son UUID
+    // et son nom d'usage. Or c'est une sonde unicast sur une URL précise qui
+    // vient d'échouer — `unicast_probe` lit `known_locations[dev_id]`, s'y
+    // connecte, et jette l'erreur ET l'adresse (`Err(_) => false`). Le journal
+    // dit donc qu'un lecteur a disparu, sans dire quelle adresse a cessé de
+    // répondre : impossible de la curler, de vérifier si l'appareil a changé
+    // d'IP, ou de distinguer une panne réseau d'un renderer éteint. Même
+    // défaut, même correction : l'URL est sous la main, elle doit sortir.
+    #[tokio::test]
+    async fn la_perte_d_un_appareil_nomme_la_location_devenue_muette() {
+        use tracing::instrument::WithSubscriber;
+
+        // Un port qu'on ouvre puis qu'on referme : l'adresse est plausible et
+        // la sonde unicast de dernière chance échouera à coup sûr, vite.
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ecoute.local_addr().unwrap();
+        drop(ecoute);
+        let location = format!("http://{addr}/upnp/description.xml");
+
+        const DEV_ID: &str = "uuid:129b92ad-826c-4b86-a905-7ea60f4a9e8c";
+
+        let state = Arc::new(Mutex::new(ScannerState::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+        {
+            let mut st = state.lock().await;
+            st.devices.insert(
+                DEV_ID.to_string(),
+                DiscoveredDevice::new(
+                    DEV_ID.to_string(),
+                    "Ampli du salon".to_string(),
+                    OutputType::Dlna,
+                    "127.0.0.1".to_string(),
+                    addr.port(),
+                ),
+            );
+            st.known_locations
+                .insert(DEV_ID.to_string(), location.clone());
+        }
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        // Aucune annonce pendant tout le délai de grâce : l'appareil est
+        // déclaré perdu au dernier cycle, après l'échec de la sonde unicast.
+        async {
+            for _ in 0..MISS_GRACE_CYCLES {
+                process_responses(&state, &tx, Vec::new()).await;
+            }
+        }
+        .with_subscriber(abonne)
+        .await;
+
+        assert!(
+            state.lock().await.devices.is_empty(),
+            "l'appareil aurait dû être déclaré perdu au bout de \
+             {MISS_GRACE_CYCLES} cycles sans annonce ; le test ne passerait \
+             pas par ssdp_device_lost"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(SsdpEvent::DeviceLost(_))),
+            "l'événement DeviceLost aurait dû être émis"
+        );
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_device_lost"))
+            .unwrap_or_else(|| panic!("aucune trace ssdp_device_lost dans le journal :\n{texte}"));
+
+        assert!(
+            ligne.contains(&location),
+            "la trace de perte ne nomme pas la LOCATION devenue muette ; \
+             sans elle on ne sait pas quelle adresse a cessé de répondre.\n\
+             attendu quelque part dans la ligne : {location}\n\
+             ligne obtenue : {ligne}"
+        );
+    }
+}
+
+/// #2139 — l'expiration des serveurs multimédia.
+///
+/// Le registre `media_servers` n'avait ni retrait, ni marquage, ni horodatage :
+/// un serveur qu'on éteignait restait listé pour toute la vie du processus
+/// (Jean Valjean, fil forum 1425). Ces tests fixent les trois comportements
+/// attendus, dont le plus important est le TROISIÈME : un serveur bien vivant
+/// qui rate un cycle ne doit PAS disparaître.
+#[cfg(test)]
+mod expiration_serveurs_multimedia {
+    use super::*;
+
+    /// `max-age` écoulé sans réannonce ⇒ candidat au retrait.
+    ///
+    /// Le verdict ne retire rien à lui seul — il DEMANDE la sonde. C'est le
+    /// contrat : `ExpiredNeedsProbe`, pas `Expired`.
+    #[test]
+    fn max_age_ecoule_sans_reannonce_declenche_le_retrait() {
+        let v = media_server_verdict(false, Duration::from_secs(1801), MEDIA_SERVER_MIN_MAX_AGE);
+        assert_eq!(
+            v,
+            MediaServerVerdict::ExpiredNeedsProbe,
+            "un serveur muet au-delà de son max-age doit devenir candidat au retrait"
+        );
+    }
+
+    /// LE test qui compte : un cycle manqué, puis réannonce ⇒ AUCUN retrait.
+    ///
+    /// Deux moments distincts sont vérifiés, parce que le défaut peut se
+    /// glisser dans l'un ou l'autre :
+    /// 1. pendant le silence, le verdict est `Silent` — on garde ;
+    /// 2. à la réannonce, le verdict est `Seen` — l'horloge repart.
+    #[test]
+    fn un_cycle_manque_puis_reannonce_ne_retire_rien() {
+        // Trois cycles de repos manqués (3 × 120 s), très au-delà de ce qu'un
+        // trou de Wi-Fi produit, et pourtant : on garde.
+        let silence = Duration::from_secs(3 * 120);
+        assert_eq!(
+            media_server_verdict(false, silence, MEDIA_SERVER_MIN_MAX_AGE),
+            MediaServerVerdict::Silent,
+            "trois cycles manqués ne suffisent pas à retirer un serveur multimédia"
+        );
+
+        // Le serveur se réannonce : quel que soit son âge accumulé, le verdict
+        // repasse à `Seen`.
+        assert_eq!(
+            media_server_verdict(true, Duration::from_secs(9_999), MEDIA_SERVER_MIN_MAX_AGE),
+            MediaServerVerdict::Seen,
+            "une réannonce doit annuler tout compte à rebours en cours"
+        );
+    }
+
+    /// Le `max-age` ANNONCÉ prime quand il dépasse le plancher : un serveur qui
+    /// réclame deux heures de silence a le droit de se taire deux heures.
+    #[test]
+    fn un_max_age_genereux_est_respecte() {
+        let deux_heures = Duration::from_secs(7200);
+        assert_eq!(
+            media_server_verdict(false, Duration::from_secs(3600), deux_heures),
+            MediaServerVerdict::Silent,
+            "une heure de silence sur un max-age de deux heures ne justifie aucun retrait"
+        );
+        assert_eq!(
+            media_server_verdict(false, Duration::from_secs(7201), deux_heures),
+            MediaServerVerdict::ExpiredNeedsProbe
+        );
+    }
+
+    /// Un `max-age` sous le plancher UPnP ne raccourcit pas la tolérance.
+    /// Des serveurs annoncent `max-age=60` ; les croire mort au bout d'une
+    /// minute est exactement le clignotement qu'on refuse.
+    #[test]
+    fn un_max_age_sous_le_plancher_est_releve() {
+        assert_eq!(
+            media_server_verdict(false, Duration::from_secs(120), Duration::from_secs(60)),
+            MediaServerVerdict::Silent,
+            "un max-age bavard ne doit pas descendre sous le plancher UPnP de 1800 s"
+        );
+    }
+
+    /// Le marquage : un serveur silencieux est signalé NON JOIGNABLE bien avant
+    /// d'être retiré. C'est la voie retenue dans le fil — marquer, pas retirer.
+    #[test]
+    fn un_serveur_silencieux_est_marque_avant_d_etre_retire() {
+        assert!(
+            media_server_reachable(Duration::from_secs(60)),
+            "vu il y a une minute : joignable"
+        );
+
+        let silence = Duration::from_secs(1000);
+        assert!(
+            !media_server_reachable(silence),
+            "muet depuis 1000 s : marqué non joignable"
+        );
+        assert_eq!(
+            media_server_verdict(false, silence, MEDIA_SERVER_MIN_MAX_AGE),
+            MediaServerVerdict::Silent,
+            "marqué non joignable, mais TOUJOURS PAS retiré"
+        );
+    }
+
+    /// Un serveur tout juste enregistré est joignable, et son âge part de zéro.
+    #[test]
+    fn un_serveur_frais_est_joignable() {
+        let ms = MediaServerInfo {
+            id: "uuid:minim-1".into(),
+            name: "MinimServer".into(),
+            manufacturer: "Minim".into(),
+            model: "MinimServer".into(),
+            location: "http://192.0.2.10:9790/desc.xml".into(),
+            content_directory_url: "http://192.0.2.10:9790/cd".into(),
+            host: "192.0.2.10".into(),
+            port: 9790,
+            last_seen: Instant::now(),
+            max_age: MEDIA_SERVER_MIN_MAX_AGE,
+        };
+        assert!(ms.is_reachable());
+        assert!(ms.age() < Duration::from_secs(5));
+    }
+
+    /// `CACHE-CONTROL` était reçu et jeté. On le lit, dans les formes que les
+    /// serveurs écrivent réellement.
+    #[test]
+    fn cache_control_max_age_est_lu() {
+        assert_eq!(
+            parse_cache_control_max_age("CACHE-CONTROL: max-age=1800"),
+            Some(1800)
+        );
+        assert_eq!(
+            parse_cache_control_max_age("Cache-Control: max-age = 3600"),
+            Some(3600)
+        );
+        assert_eq!(
+            parse_cache_control_max_age("cache-control: no-cache, max-age=120"),
+            Some(120)
+        );
+        assert_eq!(parse_cache_control_max_age("CACHE-CONTROL: no-cache"), None);
+        assert_eq!(parse_cache_control_max_age("SERVER: Linux/1.0"), None);
+    }
+
+    /// Une réponse SSDP complète : le `max-age` remonte jusqu'au champ, avec le
+    /// plancher appliqué.
+    #[test]
+    fn le_max_age_de_la_reponse_remonte_avec_son_plancher() {
+        let brut = b"HTTP/1.1 200 OK\r\n\
+                     CACHE-CONTROL: max-age=7200\r\n\
+                     LOCATION: http://192.0.2.10:9790/desc.xml\r\n\
+                     USN: uuid:minim-1::urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n";
+        let resp = parse_ssdp_response(brut).expect("réponse analysable");
+        assert_eq!(resp.max_age, Some(7200));
+        assert_eq!(max_age_from_response(&resp), Duration::from_secs(7200));
+
+        let sans = b"HTTP/1.1 200 OK\r\n\
+                     LOCATION: http://192.0.2.10:9790/desc.xml\r\n\
+                     USN: uuid:minim-1::urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n";
+        let resp = parse_ssdp_response(sans).expect("réponse analysable");
+        assert_eq!(resp.max_age, None);
+        assert_eq!(
+            max_age_from_response(&resp),
+            MEDIA_SERVER_MIN_MAX_AGE,
+            "sans en-tête, le plancher UPnP fait foi"
+        );
+    }
+}
+
+/// #2139 — la porte de sortie du registre, celle qu'un `ssdp:byebye` confirmé
+/// et un `max-age` écoulé empruntent tous les deux.
+#[cfg(test)]
+mod porte_de_sortie_serveurs_multimedia {
+    use super::*;
+
+    fn enregistrer(st: &mut ScannerState, id: &str) {
+        st.media_servers.insert(
+            id.to_string(),
+            MediaServerInfo {
+                id: id.to_string(),
+                name: "MinimServer".into(),
+                manufacturer: "Minim".into(),
+                model: "MinimServer".into(),
+                location: format!("http://192.0.2.10:9790/{id}.xml"),
+                content_directory_url: "http://192.0.2.10:9790/cd".into(),
+                host: "192.0.2.10".into(),
+                port: 9790,
+                last_seen: Instant::now(),
+                max_age: MEDIA_SERVER_MIN_MAX_AGE,
+            },
+        );
+        st.known_locations
+            .insert(id.to_string(), format!("http://192.0.2.10:9790/{id}.xml"));
+    }
+
+    /// `byebye` confirmé ⇒ retrait, et retrait COMPLET : plus rien dans le
+    /// registre ni dans les LOCATION connues, sinon la découverte suivante
+    /// croirait le serveur déjà connu et ne le réenregistrerait jamais.
+    #[test]
+    fn un_byebye_confirme_retire_le_serveur_de_partout() {
+        let mut st = ScannerState::new();
+        enregistrer(&mut st, "uuid:minim-1");
+        st.miss_count.insert("uuid:minim-1".into(), 2);
+
+        let retire = st.oublier_serveur_multimedia("uuid:minim-1");
+
+        assert!(retire.is_some(), "le serveur doit être retiré");
+        assert_eq!(retire.unwrap().name, "MinimServer");
+        assert!(
+            !st.media_servers.contains_key("uuid:minim-1"),
+            "le registre doit l'avoir oublié"
+        );
+        assert!(
+            !st.known_locations.contains_key("uuid:minim-1"),
+            "sa LOCATION doit être oubliée, sinon il ne sera jamais redécouvert"
+        );
+        assert!(!st.miss_count.contains_key("uuid:minim-1"));
+    }
+
+    /// Un `byebye` de renderer passe par le même chemin : il ne doit RIEN
+    /// retirer du registre des serveurs.
+    #[test]
+    fn un_byebye_de_renderer_ne_touche_pas_au_registre_des_serveurs() {
+        let mut st = ScannerState::new();
+        enregistrer(&mut st, "uuid:minim-1");
+
+        assert!(
+            st.oublier_serveur_multimedia("uuid:un-renderer").is_none(),
+            "un identifiant qui n'est pas un serveur multimédia ne rend rien"
+        );
+        assert!(
+            st.media_servers.contains_key("uuid:minim-1"),
+            "le serveur voisin ne doit pas être emporté"
         );
     }
 }

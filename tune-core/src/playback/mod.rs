@@ -3,7 +3,22 @@ pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
-pub mod radio_handler;
+// `radio_handler` a été retiré ici (#3018). C'était une SECONDE lecture des
+// métadonnées radio, sans aucun appelant depuis sa création : un
+// `RadioMetadataHandler` complet, avec sa propre structure `IcyMetadata`
+// homonyme de la vraie, dont `fetch_icy_metadata` rendait `cover_url: None`
+// sans condition. La lecture vivante est `crate::radio_metadata` — elle relit
+// `visual` (Radio France), `cover` (Radio Paradise) et `StreamUrl` (ICY), et
+// c'est `crate::poller::vignette_du_pas_radio` qui arbitre pochette du titre
+// contre logo de la station.
+//
+// Pourquoi la suppression compte : le 30/08/2026, une réponse au fil forum 104
+// se réclamant explicitement d'une lecture du code a affirmé au testeur
+// Reivax66 que « rien n'est allé chercher la pochette du disque », huit jours
+// après la livraison de #2109 et quatre heures après la publication de la
+// v0.9.127 qui la contient. Ce fichier mort disait exactement cela, en Rust.
+// Le garde `tests/pochette_radio_source_unique.rs` empêche qu'un deuxième
+// réapparaisse.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,6 +66,20 @@ pub struct NowPlaying {
     pub album_id: Option<i64>,
     #[serde(default)]
     pub artist_id: Option<i64>,
+    /// Débit CONSTANT du flux source, en kbit/s, quand la source le nomme
+    /// elle-même. `None` veut dire « on ne sait pas » — et rien n'est affiché.
+    ///
+    /// Il existe pour le 128 kbit/s de Bandcamp (#2074) : la qualité était
+    /// annoncée sur l'écran Bandcamp — « un flux à 128 kbit/s doit être
+    /// annoncé comme tel partout où il apparaît »,
+    /// `plugins/tune-bandcamp/src/lib.rs` — puis se perdait au passage en
+    /// zone, où le chemin du signal n'affichait plus qu'un « MP3 »
+    /// indiscernable d'un 320. Un fichier local n'en a pas besoin : sa
+    /// résolution réelle est déjà lue au scan.
+    ///
+    /// `#[serde(default)]` : un client plus ancien ne l'envoie pas.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl NowPlaying {
@@ -87,6 +116,11 @@ impl NowPlaying {
             year: track.year,
             album_id: track.album_id,
             artist_id: track.artist_id,
+            // Une piste de la bibliothèque n'annonce pas de débit : sa
+            // résolution réelle est lue au scan et déjà portée ci-dessus. Le
+            // champ existe pour les flux distants qui, eux, nomment leur
+            // encodage (#2074).
+            bitrate_kbps: None,
         }
     }
 }
@@ -155,6 +189,9 @@ pub struct ZoneState {
     /// historique pour les sorties qui ne publient pas encore cette sonde.
     #[serde(skip)]
     pub output_signal_path: Option<crate::outputs::traits::OutputSignalPathStatus>,
+    /// Compteurs DSP observés par la sortie pendant la piste courante.
+    #[serde(skip)]
+    pub output_dsp_metrics: Option<crate::outputs::traits::OutputDspMetrics>,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -203,6 +240,23 @@ pub struct ZoneState {
     /// (server-initiated, no owner) rather than misattributed to a person.
     #[serde(default)]
     pub session_profile_id: Option<i64>,
+    /// Ce que l'auditeur a demande en lancant cette session : le TYPE de
+    /// l'objet sur lequel il a clique « Lire » (`track`, `album`, `playlist`,
+    /// `artist`, `label`) et son identifiant. Pose par le gestionnaire de
+    /// `POST /zones/:id/play` a partir du corps de la requete ; relu par
+    /// l'orchestrateur au moment d'ecrire `listen_history`.
+    ///
+    /// Meme mecanique que `session_profile_id`, et pour la meme raison : les
+    /// avances automatiques (autoplay, gapless, file d'attente) reutilisent la
+    /// zone sans y toucher, donc elles heritent du contexte — la deuxieme
+    /// piste d'une playlist reste une ecoute « playlist ».
+    ///
+    /// `None` = l'appelant n'a pas dit d'ou venait le geste. On ecrit NULL
+    /// plutot que de deviner : une intention inventee est pire qu'une absence.
+    #[serde(default)]
+    pub session_context_type: Option<String>,
+    #[serde(default)]
+    pub session_context_id: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -221,6 +275,29 @@ pub struct ZoneState {
     /// ne doit pas faire repartir l'ancrage de zéro.
     #[serde(default)]
     pub metadata_changed_at_ms: Option<i64>,
+    /// Instant où Tune a CONSTATÉ que la lecture de cette zone navigateur
+    /// n'était reçue par aucun onglet — pas l'instant présent, celui du
+    /// constat.
+    ///
+    /// `output_reach` ne pouvait dire `browser_unattended` que d'une zone
+    /// en `Playing` : la valeur retombait à `"ok"` dès que la lecture
+    /// cessait, et le bandeau qui porte cette explication disparaissait avec
+    /// elle. Or la lecture cesse précisément à cet instant-là — soit parce
+    /// que l'utilisateur arrête une zone muette, soit parce que le poller
+    /// l'abandonne au MÊME seuil que celui qui déclenche le bandeau
+    /// (`DELAI_SILENCE_ETABLI`, #2630). Le seul message qui explique le
+    /// silence s'effaçait donc au geste qu'il était censé prévenir : Pierre M
+    /// l'a vu passer et l'a rapporté de travers, ce qui a détourné
+    /// l'instruction de #2571 pendant plusieurs échanges (#2588).
+    ///
+    /// Horodater le CONSTAT sépare la durée du défaut de la durée de son
+    /// affichage. Effacé par `play()` : une nouvelle lecture rouvre la
+    /// question, la réponse d'avant ne vaut plus.
+    ///
+    /// `#[serde(skip)]`, comme `last_play_started_at` : après une
+    /// restauration d'état on ne conclut rien.
+    #[serde(skip)]
+    pub browser_unattended_at: Option<Instant>,
 }
 
 /// Vrai quand la nouvelle métadonnée now-playing change d'identité
@@ -266,6 +343,7 @@ impl Default for ZoneState {
             resolving: false,
             dop_active: false,
             output_signal_path: None,
+            output_dsp_metrics: None,
             position_ms: 0,
             volume: 0.5,
             muted: false,
@@ -283,7 +361,10 @@ impl Default for ZoneState {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         }
     }
 }
@@ -328,6 +409,9 @@ pub struct PlaybackEvent {
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
+    /// Inhibition de veille agrégée : une zone qui s'arrête ne la relâche pas
+    /// tant qu'une autre joue encore (#2108).
+    sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor,
     /// Un [`crate::audio::tap::ZoneTap`] par zone — le tap PCM que le
     /// forwarder de niveaux alimente et que les plugins d'analyse consomment.
     /// Verrou synchrone : accès courts, jamais tenus à travers un await.
@@ -351,6 +435,7 @@ impl PlaybackManager {
         Self {
             zones: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor::new(),
             zone_taps: std::sync::Mutex::new(HashMap::new()),
             levels_gens: std::sync::Mutex::new(HashMap::new()),
         }
@@ -490,6 +575,21 @@ impl PlaybackManager {
             .output_signal_path = value;
     }
 
+    pub async fn set_output_dsp_metrics(
+        &self,
+        zone_id: i64,
+        value: Option<crate::outputs::traits::OutputDspMetrics>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        zones
+            .entry(zone_id)
+            .or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            })
+            .output_dsp_metrics = value;
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -528,6 +628,10 @@ impl PlaybackManager {
         // Stamp the (re)start instant so the orchestrator can coalesce a
         // redundant controller double-dispatch of this same track (#1271).
         state.last_play_started_at = Some(Instant::now());
+        // Une nouvelle lecture rouvre la question « quelqu'un reçoit-il ce
+        // son ? » : le constat de silence précédent ne décrit plus rien
+        // (#2588).
+        state.browser_unattended_at = None;
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
         state.now_playing = Some(np);
@@ -542,6 +646,7 @@ impl PlaybackManager {
         }
 
         let data = now_playing_event_data(state);
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "started".into(),
             zone_id,
@@ -555,6 +660,7 @@ impl PlaybackManager {
             state.state = PlayState::Paused;
             state.paused_at = Some(Instant::now());
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "paused".into(),
             zone_id,
@@ -568,6 +674,7 @@ impl PlaybackManager {
             state.state = PlayState::Playing;
             state.paused_at = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "resumed".into(),
             zone_id,
@@ -592,6 +699,7 @@ impl PlaybackManager {
         } else {
             serde_json::json!({})
         };
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
@@ -611,11 +719,20 @@ impl PlaybackManager {
             state.position_ms = 0;
             state.metadata_changed_at_ms = None;
         }
+        self.sync_sleep_inhibition(&zones);
         self.emit(PlaybackEvent {
             event: "stopped".into(),
             zone_id,
             data: serde_json::json!({}),
         });
+    }
+
+    fn sync_sleep_inhibition(&self, zones: &HashMap<i64, ZoneState>) {
+        self.sleep_inhibitor.set_active(
+            zones
+                .values()
+                .any(|state| state.state == PlayState::Playing),
+        );
     }
 
     /// Stamp a stall-recovery restart for this zone. Called by the OAAT stall
@@ -628,6 +745,26 @@ impl PlaybackManager {
         if let Some(state) = zones.get_mut(&zone_id) {
             state.last_restart_at = Some(Instant::now());
         }
+    }
+    /// Consigner — ou lever — le constat « aucun onglet ne reçoit le son de
+    /// cette zone ».
+    ///
+    /// `true` horodate le constat À CET INSTANT ; tant qu'il reste vrai, la
+    /// marque est rafraîchie, si bien qu'elle date toujours du DERNIER instant
+    /// où le silence a été observé, et non du premier. `false` la lève : la
+    /// zone est de nouveau reçue, il n'y a plus rien à expliquer.
+    ///
+    /// Deux appelants, une seule chose dite : la vue des zones, qui ne peut
+    /// annoncer `browser_unattended` à un client sans que le serveur en garde
+    /// trace, et le poller, qui abandonne la lecture au même seuil et
+    /// l'arrêterait sinon sans laisser d'explication derrière lui (#2588).
+    pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.browser_unattended_at = unattended.then(Instant::now);
     }
 
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
@@ -676,27 +813,34 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` pour la même raison que [`Self::update_queue_info`] : les trois
+    /// appels de `restore_queue_metadata` (longueur, répétition, aléatoire) se
+    /// suivent au démarrage, sur une zone qui n'est pas encore en mémoire. Les
+    /// laisser en `get_mut` reviendrait à corriger un des trois et laisser ses
+    /// deux sœurs jeter la valeur restaurée en silence.
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.shuffle = enabled;
-                if enabled {
-                    // Build a fresh order around the currently playing track so
-                    // the next advance goes to a different track.
-                    state.shuffle_order = generate_shuffle_order(
-                        state.queue_length.max(0) as usize,
-                        state.queue_position.max(0) as usize,
-                    );
-                    state.shuffle_index = if state.shuffle_order.is_empty() {
-                        -1
-                    } else {
-                        0
-                    };
+            let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+                zone_id,
+                ..Default::default()
+            });
+            state.shuffle = enabled;
+            if enabled {
+                // Build a fresh order around the currently playing track so
+                // the next advance goes to a different track.
+                state.shuffle_order = generate_shuffle_order(
+                    state.queue_length.max(0) as usize,
+                    state.queue_position.max(0) as usize,
+                );
+                state.shuffle_index = if state.shuffle_order.is_empty() {
+                    -1
                 } else {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                }
+                    0
+                };
+            } else {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
             }
         }
         self.emit(PlaybackEvent {
@@ -706,12 +850,19 @@ impl PlaybackManager {
         });
     }
 
+    /// `entry` : voir [`Self::update_queue_info`]. Le mode de répétition
+    /// restauré au démarrage tombait dans le vide sur une zone pas encore en
+    /// mémoire, alors que le journal annonçait la restauration.
     pub async fn set_repeat(&self, zone_id: i64, mode: RepeatMode) {
         {
             let mut zones = self.zones.lock().await;
-            if let Some(state) = zones.get_mut(&zone_id) {
-                state.repeat = mode;
-            }
+            zones
+                .entry(zone_id)
+                .or_insert_with(|| ZoneState {
+                    zone_id,
+                    ..Default::default()
+                })
+                .repeat = mode;
         }
         self.emit(PlaybackEvent {
             event: "repeat".into(),
@@ -735,6 +886,34 @@ impl PlaybackManager {
             .session_profile_id = profile_id;
     }
 
+    /// Enregistrer ce que l'auditeur a demande en lancant cette session.
+    ///
+    /// Meme `entry` que `set_session_profile`, et pour la meme raison : le
+    /// gestionnaire pose le contexte AVANT que le premier `play()` ne cree la
+    /// zone, sinon la premiere piste — la seule dont l'intention soit connue —
+    /// partirait sans contexte.
+    ///
+    /// Ecrase toujours, y compris avec `None` : un nouveau geste de lecture
+    /// remplace le precedent. Sans cela, jouer une piste isolee apres une
+    /// playlist laisserait la piste marquee « playlist ».
+    ///
+    /// Aucun evenement emis — c'est de l'attribution interne, pas de l'etat
+    /// d'interface.
+    pub async fn set_session_context(
+        &self,
+        zone_id: i64,
+        context_type: Option<String>,
+        context_id: Option<String>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        z.session_context_type = context_type;
+        z.session_context_id = context_id;
+    }
+
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
@@ -742,32 +921,54 @@ impl PlaybackManager {
         }
     }
 
+    /// Longueur et position de la file pour cette zone.
+    ///
+    /// `entry` et non `get_mut` : la zone n'est PAS forcément déjà en mémoire
+    /// quand on lui annonce sa file. Au démarrage, `restore_queue_metadata`
+    /// appelle cette fonction AVANT que quoi que ce soit n'ait créé l'état de
+    /// zone — et `restore_playback_positions`, qui le crée d'habitude, saute
+    /// justement les zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque. La
+    /// longueur restaurée partait alors à la poubelle en silence, la zone
+    /// démarrait avec `queue_length = 0`, et `next_position()` — qui rend
+    /// `None` dès que la file est vide — concluait « file terminée » à la fin
+    /// du premier morceau : le sondeur arrêtait la zone alors que l'écran, lui,
+    /// lit la file en base et affichait toujours les pistes suivantes.
+    ///
+    /// C'est ce piège exact que deux appelants de `routes/playback.rs`
+    /// contournaient déjà chacun dans leur coin, en réaffirmant la longueur
+    /// APRÈS `play()` (« silent no-op when the zone's in-memory state doesn't
+    /// exist yet »). Leurs sœurs — `Orchestrator::play_from_queue`, le repli
+    /// « Lire » sans corps de requête, `queue_add` — ne l'avaient pas. On
+    /// bouche le trou une fois, à la source.
     pub async fn update_queue_info(&self, zone_id: i64, position: i64, length: i64) {
         let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.queue_position = position;
-            state.queue_length = length;
-            if state.shuffle {
-                let len = length.max(0) as usize;
-                let pos = position.max(0) as usize;
-                if len == 0 {
-                    state.shuffle_order.clear();
-                    state.shuffle_index = -1;
-                } else if state.shuffle_order.len() != len {
-                    // Queue length changed (tracks added/removed, or the order
-                    // was lost across a restart — it is not persisted). Rebuild
-                    // around the current track.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
-                    // Sync the cursor to the track now playing so the next
-                    // advance follows the order from here.
-                    state.shuffle_index = idx as i64;
-                } else {
-                    // Position not in the order (shouldn't happen) — rebuild.
-                    state.shuffle_order = generate_shuffle_order(len, pos);
-                    state.shuffle_index = 0;
-                }
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.queue_position = position;
+        state.queue_length = length;
+        if state.shuffle {
+            let len = length.max(0) as usize;
+            let pos = position.max(0) as usize;
+            if len == 0 {
+                state.shuffle_order.clear();
+                state.shuffle_index = -1;
+            } else if state.shuffle_order.len() != len {
+                // Queue length changed (tracks added/removed, or the order
+                // was lost across a restart — it is not persisted). Rebuild
+                // around the current track.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
+            } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
+                // Sync the cursor to the track now playing so the next
+                // advance follows the order from here.
+                state.shuffle_index = idx as i64;
+            } else {
+                // Position not in the order (shouldn't happen) — rebuild.
+                state.shuffle_order = generate_shuffle_order(len, pos);
+                state.shuffle_index = 0;
             }
         }
     }
@@ -860,6 +1061,7 @@ mod tests {
             resolving: false,
             dop_active: false,
             output_signal_path: None,
+            output_dsp_metrics: None,
             now_playing: Some(NowPlaying {
                 track_id: Some(42),
                 title: "Song".into(),
@@ -885,7 +1087,10 @@ mod tests {
             last_restart_at: None,
             last_play_started_at: None,
             session_profile_id: None,
+            session_context_type: None,
+            session_context_id: None,
             metadata_changed_at_ms: None,
+            browser_unattended_at: None,
         };
         let v = now_playing_event_data(&state);
         // Full NowPlaying is serialised…
@@ -962,6 +1167,36 @@ mod tests {
         assert!(data["metadata_age_ms"].as_i64().unwrap() >= 0);
     }
 
+    /// #2588 — le constat de silence tient à travers l'arrêt, et pas au-delà
+    /// de la lecture suivante.
+    #[tokio::test]
+    async fn le_constat_de_silence_survit_a_larret_et_meurt_a_la_relecture() {
+        let pm = PlaybackManager::new();
+        let np = || NowPlaying {
+            title: "Track".into(),
+            ..Default::default()
+        };
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une lecture qui démarre n'a encore rien à expliquer"
+        );
+        pm.note_browser_unattended(4, true).await;
+        pm.stop(4).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_some(),
+            "l'arrêt ne doit pas emporter l'explication du silence"
+        );
+        pm.play(4, np()).await;
+        assert!(
+            pm.get_state(4).await.browser_unattended_at.is_none(),
+            "une nouvelle lecture rouvre la question"
+        );
+        // Et la vue peut lever le constat sans attendre l'échéance.
+        pm.note_browser_unattended(4, true).await;
+        pm.note_browser_unattended(4, false).await;
+        assert!(pm.get_state(4).await.browser_unattended_at.is_none());
+    }
     #[tokio::test]
     async fn set_shuffle_emits_event() {
         let pm = PlaybackManager::new();
@@ -982,6 +1217,67 @@ mod tests {
         assert_eq!(ev.event, "repeat");
         assert_eq!(ev.zone_id, 3);
         assert_eq!(ev.data["mode"], "all");
+    }
+
+    /// #1924 (Tades, fil forum 1471) — « je vois bien la piste que je souhaite
+    /// écouter dans la file d'attente et la lecture en cours est finie depuis
+    /// cinq minutes », et rien ne part.
+    ///
+    /// Le scénario reproduit ici est celui du démarrage du serveur.
+    /// `restore_queue_metadata` (tune-server/src/startup.rs) annonce à la zone
+    /// sa longueur de file, son mode de répétition et son aléatoire — dans cet
+    /// ordre — avant que quoi que ce soit n'ait créé son état en mémoire. Le
+    /// créateur habituel, `restore_playback_positions`, saute justement les
+    /// zones dont la dernière piste venait d'un service (pas de
+    /// `last_track_id`) ou dont la piste a disparu de la bibliothèque.
+    ///
+    /// Les trois écritures se faisaient alors en `get_mut` : trois no-op
+    /// silencieux, suivis d'un `info!` qui annonçait la restauration. La zone
+    /// démarrait avec `queue_length = 0`, `next_position()` rendait `None` dès
+    /// le premier `if queue_length == 0`, et le sondeur concluait « file
+    /// terminée » à la fin du premier morceau — alors que l'écran, qui lit la
+    /// file en base, affichait toujours les suivantes.
+    ///
+    /// Aucune horloge, aucune course : le test tient sur l'ordre des appels.
+    #[tokio::test]
+    async fn la_file_restauree_au_demarrage_survit_a_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.update_queue_info(7, 0, 3).await;
+        pm.set_repeat(7, RepeatMode::Off).await;
+        pm.set_shuffle(7, false).await;
+
+        let state = pm.get_state(7).await;
+        assert_eq!(
+            state.queue_length, 3,
+            "la longueur restaurée doit atteindre l'état de zone, pas le vide"
+        );
+        assert_eq!(state.queue_position, 0);
+        assert_eq!(
+            crate::poller::PositionPoller::next_position(&state),
+            Some(1),
+            "sans la longueur, next_position rend None et le sondeur arrête la \
+             zone à la fin du premier morceau, file pleine à l'écran"
+        );
+    }
+
+    /// Les deux sœurs du même trio. Corriger `update_queue_info` seule aurait
+    /// laissé la répétition et l'aléatoire restaurés tomber dans le vide sur
+    /// une zone dont l'état n'existe pas encore.
+    #[tokio::test]
+    async fn repetition_et_aleatoire_restaures_atteignent_une_zone_pas_encore_en_memoire() {
+        let pm = PlaybackManager::new();
+
+        pm.set_repeat(9, RepeatMode::All).await;
+        pm.set_shuffle(9, true).await;
+
+        let state = pm.get_state(9).await;
+        assert_eq!(
+            state.repeat,
+            RepeatMode::All,
+            "le mode de répétition restauré doit tenir"
+        );
+        assert!(state.shuffle, "l'aléatoire restauré doit tenir");
     }
 
     #[test]
@@ -1102,5 +1398,35 @@ mod tests {
         pm.set_resolving(2, true).await;
         pm.stop_and_clear(2).await;
         assert!(!pm.get_state(2).await.resolving);
+    }
+
+    /// #2108 — la garde de veille appartient à l'ensemble des zones, pas à la
+    /// dernière commande reçue. Une pause ne doit jamais endormir le serveur
+    /// si une autre zone continue de jouer.
+    #[tokio::test]
+    async fn inhibition_de_veille_suit_la_derniere_zone_qui_joue() {
+        let pm = super::PlaybackManager::new();
+        assert!(!pm.sleep_inhibitor.requested());
+
+        pm.play(1, super::NowPlaying::default()).await;
+        assert!(pm.sleep_inhibitor.requested());
+
+        pm.play(2, super::NowPlaying::default()).await;
+        pm.pause(1).await;
+        assert!(
+            pm.sleep_inhibitor.requested(),
+            "la zone 2 joue encore : la pause de la zone 1 ne libère rien"
+        );
+
+        pm.stop(2).await;
+        assert!(
+            !pm.sleep_inhibitor.requested(),
+            "la dernière zone active est arrêtée : la garde doit être libérée"
+        );
+
+        pm.resume(1).await;
+        assert!(pm.sleep_inhibitor.requested());
+        pm.stop_and_clear(1).await;
+        assert!(!pm.sleep_inhibitor.requested());
     }
 }

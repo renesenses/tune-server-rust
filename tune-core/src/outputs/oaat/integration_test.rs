@@ -427,9 +427,18 @@ mod tests {
             payload.iter().all(|byte| *byte == 0),
             "L=-R doit donner un downmix mono nul byte-for-byte"
         );
-        let last = &packets.last().unwrap().0;
+        let (last, last_payload) = packets.last().unwrap();
         assert!(last.flags.contains(PacketFlags::LAST_PACKET));
-        assert_eq!(last.sample_offset, 2_400);
+        assert!(
+            !last_payload.is_empty(),
+            "LAST doit etre porte par le dernier payload audio reel"
+        );
+        assert_eq!(last_payload.len() % 2, 0);
+        assert_eq!(
+            last.sample_offset + (last_payload.len() / 2) as u64,
+            2_400,
+            "l offset de debut et le dernier payload doivent couvrir exactement 50 ms"
+        );
         output.stop().await.ok();
     }
 
@@ -915,8 +924,22 @@ mod tests {
                 .all(|(_, payload)| payload.iter().all(|byte| *byte == 0)),
             "le témoin silencieux doit rester nul byte-for-byte après conversion"
         );
-        let second_last = &second_packets.last().expect("LAST piste 2").0;
-        assert_eq!(second_last.sample_offset, 22_050);
+        let (second_last, second_last_payload) = second_packets.last().expect("LAST piste 2");
+        assert!(
+            second_last
+                .flags
+                .contains(oaat_core::wire::PacketFlags::LAST_PACKET)
+        );
+        assert!(
+            !second_last_payload.is_empty(),
+            "LAST piste 2 doit etre porte par le dernier payload audio reel"
+        );
+        assert_eq!(second_last_payload.len() % 4, 0);
+        assert_eq!(
+            second_last.sample_offset + (second_last_payload.len() / 4) as u64,
+            22_050,
+            "l offset de debut et le dernier payload doivent couvrir exactement 500 ms"
+        );
 
         output.stop().await.ok();
         http_handle.abort();
@@ -1757,7 +1780,7 @@ mod tests {
     /// des en-têtes sont cohérents avec la position réelle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_bytes_reach_the_endpoint_unaltered() {
-        let dir = std::env::temp_dir().join(format!("tune-dsd-proof-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-dsd-proof");
         std::fs::create_dir_all(&dir).unwrap();
         let dsf_path = dir.join("proof.dsf");
         // 9 blocs/canal ≈ 0,21 s de DSD64 : assez court pour un test,
@@ -1830,7 +1853,7 @@ mod tests {
     /// le second flux doit rester exact au bit près malgré l'abort du premier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_second_play_is_bit_exact_after_aborting_the_first() {
-        let dir = std::env::temp_dir().join(format!("tune-dsd-proof2-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-dsd-proof2");
         std::fs::create_dir_all(&dir).unwrap();
         let path_a = dir.join("a.dsf");
         let path_b = dir.join("b.dsf");
@@ -2000,7 +2023,7 @@ mod tests {
     #[cfg(feature = "oaat")]
     fn politique_pcm_n_accepte_que_les_contre_propositions_reellement_convertibles() {
         use crate::outputs::oaat::output::{
-            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+            PolitiqueAdaptation, ReponseNegociation, Verdict, juger_reponse,
         };
         use oaat_controller::EndpointResponse;
         use oaat_core::format::{AudioFormat, ChannelLayout};
@@ -2012,12 +2035,16 @@ mod tests {
         pcm.channels = 1;
         pcm.channel_layout = ChannelLayout::Mono;
         pcm.bits_per_sample = 16;
-        let cible = juger_reponse(
+        let cible = match juger_reponse(
             &contrat,
             ReponseNegociation::Recue(&EndpointResponse::FormatCounter(pcm)),
             PolitiqueAdaptation::PcmEntier,
         )
-        .expect("24/96/stéréo vers 16/48/mono passe par le convertisseur PCM");
+        .expect("24/96/stéréo vers 16/48/mono passe par le convertisseur PCM")
+        {
+            Verdict::Accord(c) => c,
+            autre => panic!("attendu un accord, reçu {autre:?}"),
+        };
         assert_eq!(cible.format, AudioFormat::PcmS16le);
         assert_eq!(cible.sample_rate, 48_000);
         assert_eq!(cible.channels, 1);
@@ -2156,7 +2183,7 @@ mod tests {
     #[cfg(feature = "oaat")]
     fn juger_reponse_decide_les_huit_issues() {
         use crate::outputs::oaat::output::{
-            PolitiqueAdaptation, ReponseNegociation, juger_reponse,
+            PolitiqueAdaptation, ReponseNegociation, Verdict, juger_reponse,
         };
         use oaat_controller::EndpointResponse;
 
@@ -2176,19 +2203,29 @@ mod tests {
             .is_ok()
         );
 
-        // 2. accord sur un AUTRE flux -> refus. Une reponse en retard prise
-        //    pour la bonne decale toute la suite (#2282).
+        // 2. accord sur un AUTRE flux -> RELIQUAT, ni accord ni refus.
+        //
+        // Ce n'est pas notre accord (#2282, on ne joue pas dessus), mais ce
+        // n'est pas non plus un refus : c'est la reponse de la session
+        // precedente restee dans la file. La traiter comme un refus arretait
+        // la zone du testeur au moindre saut de piste rapide, alors que son
+        // appareil avait repondu correctement — pour le flux d'avant.
         let accord_etranger = EndpointResponse::FormatAccept(oaat_core::message::FormatAccept {
             stream_id: "flux-precedent".into(),
         });
-        assert!(
-            juger_reponse(
-                &contrat,
-                ReponseNegociation::Recue(&accord_etranger),
-                PolitiqueAdaptation::ExacteSeulement,
-            )
-            .is_err(),
-            "un accord pour un autre flux n'est pas notre accord"
+        let verdict = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&accord_etranger),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect("une reponse en retard s'ecarte, elle ne fait pas echouer la negociation");
+        assert_eq!(
+            verdict,
+            Verdict::Reliquat {
+                flux: "flux-precedent".into()
+            },
+            "le flux ecarte doit etre nomme : sans lui le journal ne dit pas \
+             QUELLE session tardive a parle"
         );
 
         // 3. contre-proposition identique -> on joue.
@@ -2267,5 +2304,103 @@ mod tests {
         )
         .expect_err("le silence n'est pas un accord");
         assert!(!r.raison.is_empty(), "un refus sans motif ne sert a rien");
+    }
+
+    /// TOUTE reponse portant un identifiant de flux etranger s'ecarte, quel
+    /// que soit son type — signalement Steve Taylor, DigiOne Signature.
+    ///
+    /// ## Ce que ce test empeche de revenir
+    ///
+    /// Avant lui, `juger_reponse` rendait pour ces trois cas un
+    /// `RefusNegociation { reconnectable: false }`. Ce refus remontait au
+    /// garde-fou du poller, qui arretait la zone : une lecture coupee parce
+    /// qu'une reponse de la piste PRECEDENTE trainait dans la file. Le
+    /// declencheur etait banal — enchainer des sauts de piste rapides.
+    ///
+    /// La contre-epreuve a ete faite : en remettant `refus(flux_etranger(..))`
+    /// a la place de `reliquat(..)` dans l'un quelconque des trois bras, ce
+    /// test echoue. Il ne se contente donc pas de decrire le code actuel.
+    ///
+    /// Le `FormatReject` etranger compte autant que les deux autres : un refus
+    /// adresse a une session close n'a aucune raison de condamner la suivante.
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn toute_reponse_d_un_flux_perime_s_ecarte_au_lieu_d_arreter_la_zone() {
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, Verdict, juger_reponse,
+        };
+        use oaat_controller::EndpointResponse;
+
+        let contrat = contrat_pcm();
+        let perime = "tune-2";
+        assert_ne!(
+            contrat.stream_id, perime,
+            "le flux de reference doit differer, sinon le test ne teste rien"
+        );
+
+        let mut contre_etrangere = contre_de(&contrat);
+        contre_etrangere.stream_id = perime.into();
+
+        let etrangeres = [
+            (
+                "accord",
+                EndpointResponse::FormatAccept(oaat_core::message::FormatAccept {
+                    stream_id: perime.into(),
+                }),
+            ),
+            (
+                "contre-proposition",
+                EndpointResponse::FormatCounter(contre_etrangere),
+            ),
+            (
+                "refus",
+                EndpointResponse::FormatReject(oaat_core::message::FormatReject {
+                    stream_id: perime.into(),
+                    reason: "cadence non supportee".into(),
+                }),
+            ),
+            // Un message HORS negociation compte autant : il arrive par le
+            // meme canal. C'est l'un d'eux — NextTrackReady — qui tombait
+            // dans le fourre-tout « reponse inattendue » sans qu'on regarde
+            // son `stream_id`, et arretait la zone.
+            //
+            // Steve Taylor, 29/08/2026, DigiOne Signature : DEUX echecs de
+            // formes DIFFERENTES a six minutes d'intervalle. Celui de 13h31
+            // est un FormatCounter en retard, couvert plus haut. Celui de
+            // 13h25 ne l'etait pas :
+            //   « reponse inattendue pendant la negociation de format :
+            //     StreamStats(StreamStats { stream_id: "tune-1", ... }) »
+            // Il negociait `tune-2` et recevait les statistiques de `tune-1`,
+            // le flux qu'il venait d'arreter.
+            (
+                "piste suivante prete",
+                EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
+                    stream_id: perime.into(),
+                }),
+            ),
+        ];
+
+        for (nom, reponse) in etrangeres {
+            let verdict = juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&reponse),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .unwrap_or_else(|refus| {
+                panic!(
+                    "un {nom} adresse au flux {perime} ne doit PAS faire echouer la \
+                     negociation de {} : c'est un reliquat, pas un refus — la zone \
+                     etait arretee pour cela. Recu : {}",
+                    contrat.stream_id, refus.raison
+                )
+            });
+            assert_eq!(
+                verdict,
+                Verdict::Reliquat {
+                    flux: perime.into()
+                },
+                "un {nom} etranger doit s'ecarter en nommant son flux"
+            );
+        }
     }
 }

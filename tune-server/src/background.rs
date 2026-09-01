@@ -36,6 +36,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_concert_alerts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
+    // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
+    // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
+    // un réglage que plus personne ne relisait. Un test de câblage garde la
+    // ligne.
+    crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config.port);
@@ -112,12 +117,20 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// portant la signature de rognage, soit aucune sur une bibliothèque saine.
 ///
 /// Toute correction future du lecteur devra incrémenter ce suffixe.
+///
+/// `_v2` → `_v3` (#1865) : la passe ouvrait le chemin de la base TEL QUEL,
+/// c'est-à-dire en NFC. Sur un fichier venu de macOS ou d'un partage SMB, dont
+/// le nom est en NFD, `probe_duration_ms` rendait `None` — la piste comptait
+/// pour « illisible », puis le témoin GLOBAL était posé et la passe ne
+/// repassait jamais. Le suffixe la fait repasser une fois, avec le repli de
+/// graphie ; la requête ne rend que les pistes portant la signature de
+/// rognage, donc aucune sur une bibliothèque saine.
 fn spawn_mp3_duration_repair(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {
         let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
         if reglages
-            .get("mp3_duration_repair_done_v2")
+            .get("mp3_duration_repair_done_v3")
             .ok()
             .flatten()
             .is_some()
@@ -154,7 +167,7 @@ fn spawn_mp3_duration_repair(state: &AppState) {
 
         if candidats.is_empty() {
             info!(sans_taille, "mp3_duration_repair_rien_a_faire");
-            let _ = reglages.set("mp3_duration_repair_done_v2", "1");
+            let _ = reglages.set("mp3_duration_repair_done_v3", "1");
             return;
         }
 
@@ -164,6 +177,10 @@ fn spawn_mp3_duration_repair(state: &AppState) {
         let mut reparees = 0usize;
         let mut inchangees = 0usize;
         let mut illisibles = 0usize;
+        // Distinct d'`illisibles` : un fichier ABSENT n'est pas un fichier
+        // qu'on n'arrive pas à lire, et les confondre est ce qui a fait passer
+        // 135 pistes NFD pour de la casse (#1865).
+        let mut introuvables = 0usize;
 
         for ligne in &candidats {
             let (Some(id), Some(chemin), Some(ancienne)) = (
@@ -174,7 +191,18 @@ fn spawn_mp3_duration_repair(state: &AppState) {
                 continue;
             };
 
-            let chemin_clone = chemin.clone();
+            // Le chemin de la base est en NFC ; le fichier peut être en NFD
+            // sur le disque. On résout la graphie réelle avant d'ouvrir, et on
+            // n'écrit RIEN dans `tracks.file_path` : la base reste NFC (#1865).
+            let Some(sur_disque) =
+                tune_core::library::local_path::resolve_existing_local_path(&chemin)
+            else {
+                introuvables += 1;
+                debug!(id, chemin = %chemin, "mp3_duration_repair_chemin_introuvable");
+                continue;
+            };
+
+            let chemin_clone = sur_disque;
             let reelle = tokio::task::spawn_blocking(move || {
                 tune_core::metadata::probe_duration_ms(std::path::Path::new(&chemin_clone))
             })
@@ -209,9 +237,14 @@ fn spawn_mp3_duration_repair(state: &AppState) {
 
         info!(
             total,
-            reparees, inchangees, illisibles, sans_taille, "mp3_duration_repair_termine"
+            reparees,
+            inchangees,
+            illisibles,
+            introuvables,
+            sans_taille,
+            "mp3_duration_repair_termine"
         );
-        let _ = reglages.set("mp3_duration_repair_done_v2", "1");
+        let _ = reglages.set("mp3_duration_repair_done_v3", "1");
     });
 }
 
@@ -415,6 +448,13 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 if location.is_empty() || outputs.contains(&d.id) {
                     continue;
                 }
+                // #1280 — appareil que l'utilisateur a fait taire : ce lot de
+                // démarrage enregistrait la sortie sans rien demander, donc
+                // l'appareil revenait proposé à chaque redémarrage.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_appareil_ignore");
+                    continue;
+                }
                 if let Ok(desc) =
                     tune_core::discovery::xml_parser::fetch_device_description(location).await
                 {
@@ -436,6 +476,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 format!("{base}{av}"),
                                 format!("{base}{rc}"),
                                 cm_url,
+                            )
+                            .with_upnp_events(
+                                crate::startup::create_oh_listener().await,
+                                crate::discovery_setup::urls_evenements_dlna(
+                                    &d.host,
+                                    d.port,
+                                    &desc.event_sub_urls(),
+                                ),
+                            )
+                            .with_upnp_silence(
+                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;
@@ -454,6 +505,12 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // (Fabien: "Salon: AIRPLAY" zone came back after update).
                 if zone_repo.is_device_hidden(&d.id) {
                     info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_hidden_skipping");
+                    continue;
+                }
+                // #1280 — appareil ignoré : aucune zone, sous aucune de ses
+                // identités.
+                if crate::discovery_setup::appareil_ignore(&state.backend, d) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_appareil_ignore");
                     continue;
                 }
 
@@ -908,8 +965,23 @@ fn spawn_heartbeat(state: &AppState) {
             }
         };
 
+        let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(backend.clone());
+
         loop {
             let plan = heartbeat_plan(tune_core::cloud::telemetry::TelemetryReporter::is_enabled());
+
+            // Registre des executions automatisees (#2080) : un cycle = une
+            // ligne. Le battement est la seule passe dont l'echec est INVISIBLE
+            // — rien ne change cote utilisateur quand mozaiklabs.fr ne repond
+            // plus, et le `debug!` qui le signale n'est meme pas actif par
+            // defaut. Un serveur premium dont la licence cesse d'etre validee
+            // se decouvre aujourd'hui trente jours plus tard, a l'expiration de
+            // la grace hors-ligne. Ici, ca se lit.
+            //
+            // Cadence horaire et retention a 50 : le registre garde environ
+            // deux jours de battements. C'est le bon ordre de grandeur pour
+            // « depuis quand ca ne passe plus », pas pour un historique long.
+            let suivi = registre.ouvrir(tune_core::db::task_run_repo::TACHE_BATTEMENT_COEUR);
 
             // Marqueur de vivacite LOCAL, utilise pour la detection de crash au
             // demarrage suivant. Il ne quitte jamais la machine : il reste donc
@@ -931,6 +1003,28 @@ fn spawn_heartbeat(state: &AppState) {
                 // Opt-out : rien ne part sur le reseau, et la charge utile n'est
                 // meme pas collectee. Les droits premium, eux, continuent d'etre
                 // rafraichis — voir `heartbeat_plan`.
+                if plan.refresh_account {
+                    refresh_account_premium(&backend, &license, &services).await;
+                }
+                suivi.rien_a_faire(Some(
+                    "telemetrie desactivee — marqueur local seulement, rien n'est parti",
+                ));
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                continue;
+            }
+
+            if let Some(backoff) = tune_core::cloud::rate_limit::active(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+            ) {
+                debug!(
+                    scope = backoff.scope,
+                    until_epoch = backoff.until_epoch,
+                    retry_after_seconds = backoff.retry_after_seconds,
+                    "heartbeat_deferred_rate_limit"
+                );
+                // Le heartbeat cloud est differe, pas le rafraichissement SSO :
+                // les deux routes ont des compteurs distincts.
                 if plan.refresh_account {
                     refresh_account_premium(&backend, &license, &services).await;
                 }
@@ -1074,6 +1168,29 @@ fn spawn_heartbeat(state: &AppState) {
             // with the authoritative tier / expiry.
             let ls = license.license_state().await;
 
+            // Grâce hors ligne (#1999) : tracer AVANT la coupure, pas après.
+            // La dégradation ne se signalait que par un `warn!` au quatorzième
+            // jour ; ici on écrit une ligne par heure dès que la revalidation
+            // date de plus de deux jours, avec le compte à rebours. Jamais la
+            // clé ni un identifiant d'achat — que des dates et des compteurs.
+            if let Some(g) = tune_core::license::offline_grace(&ls) {
+                match g.phase {
+                    tune_core::license::GracePhase::Grace => info!(
+                        source = ?g.source,
+                        days_since_validation = g.days_since_validation,
+                        days_remaining = g.days_remaining,
+                        total_days = g.total_days,
+                        "license_offline_grace_active (premium intact)"
+                    ),
+                    tune_core::license::GracePhase::Expired => info!(
+                        source = ?g.source,
+                        total_days = g.total_days,
+                        "license_offline_grace_lapsed (premium suspended until next successful validation)"
+                    ),
+                    tune_core::license::GracePhase::Ok => {}
+                }
+            }
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
@@ -1090,6 +1207,13 @@ fn spawn_heartbeat(state: &AppState) {
                 "server_id": server_id,
             });
 
+            // Verdict du cycle pour le registre. Le motif ne porte QUE le code
+            // HTTP ou un mot : ni URL, ni cle de licence, ni empreinte
+            // materielle — la charge utile en contient trois, le registre
+            // aucune.
+            let mut verdict = tune_core::db::task_run_repo::Verdict::Echec;
+            let mut motif = String::from("hote injoignable");
+
             match client
                 .post("https://mozaiklabs.fr/api/v1/heartbeat")
                 .header("Accept", "application/json")
@@ -1098,6 +1222,8 @@ fn spawn_heartbeat(state: &AppState) {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
+                    verdict = tune_core::db::task_run_repo::Verdict::Succes;
+                    motif = format!("accepte ({})", resp.status().as_u16());
                     debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
 
                     // Parse license validation data from the response body.
@@ -1216,12 +1342,22 @@ fn spawn_heartbeat(state: &AppState) {
                     }
                 }
                 Ok(resp) => {
+                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        tune_core::cloud::rate_limit::defer_from_headers(
+                            &settings,
+                            tune_core::cloud::rate_limit::CloudScope::InstanceHeartbeat,
+                            resp.headers(),
+                        );
+                    }
                     debug!(status = %resp.status(), "heartbeat_rejected");
+                    motif = format!("refuse ({})", resp.status().as_u16());
                 }
                 Err(e) => {
                     debug!(error = %e, "heartbeat_failed");
                 }
             }
+
+            suivi.terminer(verdict, None, Some(&motif));
 
             // Refresh the account premium (SSO) from /api/v1/user so a lapsed
             // subscription is picked up without waiting for the offline grace or
@@ -1415,15 +1551,45 @@ fn spawn_bio_sync(state: &AppState) {
     });
 }
 
-/// Best-effort, once at boot: fill in missing station logos from the
-/// mozaiklabs.fr radio directory so the seeded default stations show a vignette
-/// instead of the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
+/// Delais avant de retenter le rattrapage des logos, quand l'annuaire est
+/// injoignable. Un serveur d'appliance demarre AVANT que le reseau soit la —
+/// la box negocie, le Wi-Fi s'associe, le VPN monte. La passe unique de
+/// demarrage tombait alors dans le vide et il fallait redemarrer pour
+/// retenter : aucune vignette de station jusque-la (#2421).
+///
+/// On s'arrete des que l'annuaire repond, meme s'il ne connait pas toutes les
+/// stations : une station absente de l'annuaire ne s'y trouvera pas davantage
+/// au dixieme essai.
+const RATTRAPAGE_LOGOS_DELAIS_SECS: [u64; 3] = [30, 120, 600];
+
+/// Best-effort, at boot: fill in missing station logos from the mozaiklabs.fr
+/// radio directory so the seeded default stations show a vignette instead of
+/// the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
 fn spawn_radio_logo_refresh(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
-        let n = crate::routes::radios::refresh_radio_logos(&state).await;
-        if n > 0 {
-            tracing::info!(updated = n, "radio_logos_backfilled_at_startup");
+        let mut delais = RATTRAPAGE_LOGOS_DELAIS_SECS.iter();
+        loop {
+            let bilan = crate::routes::radios::refresh_radio_logos(&state).await;
+            // Trace INCONDITIONNELLE. Elle ne s'ecrivait que si des logos
+            // avaient ete poses — c'est-a-dire jamais dans les deux cas ou
+            // elle aurait servi : annuaire injoignable, et stations absentes
+            // de l'annuaire. Le journal ne permettait donc pas de separer
+            // « je n'ai pas trouve » de « je n'ai pas pu chercher ».
+            tracing::info!(
+                updated = bilan.updated,
+                sans_logo = bilan.sans_logo,
+                annuaire_injoignable = bilan.annuaire_injoignable,
+                "radio_logos_backfilled_at_startup"
+            );
+            if !bilan.annuaire_injoignable {
+                return;
+            }
+            let Some(secs) = delais.next() else {
+                tracing::warn!("radio_logos_directory_unreachable_giving_up");
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
         }
     });
 }
@@ -1478,7 +1644,10 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// n'a pas pu départager :
 ///
 /// - `stream_sessions` : une session est créée par piste et n'est ramassée
-///   qu'au bout de **trente minutes** (`cleanup_stale_sessions`). Chacune tient
+///   qu'après **trente minutes SANS un octet servi** (`cleanup_stale_sessions`).
+///   Le critère était l'âge absolu depuis la création ; il est désormais
+///   l'inactivité, doublée d'un plafond absolu de vingt-quatre heures en
+///   filet (#2536). Chacune tient
 ///   un canal de 128 morceaux. Un compteur qui monte avec la lecture et
 ///   redescend au repos désigne ce cache ; un compteur plat innocente le
 ///   chemin de lecture, et c'est aussi une réponse.
@@ -1775,6 +1944,19 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        let system_default_device_id = crate::startup::first_system_default_name(
+            new_devices_to_zone
+                .iter()
+                .map(|(device_id, _, is_default)| (device_id.as_str(), *is_default)),
+        )
+        .map(str::to_owned);
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
             // When ASIO is configured, don't create new zones for WASAPI
@@ -1791,44 +1973,33 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 dev_name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Ce chemin etait le SEUL des cinq a ne pas consulter le reglage :
-            // `startup.rs`, et les trois chemins de decouverte de
-            // `discovery_setup.rs` (SSDP, mDNS, fournisseur) le lisent tous.
-            // #1577 n'avait couvert que le demarrage.
-            //
-            // Le defaut se voit surtout au basculement ASIO -> WASAPI (#1770,
-            // DEvir). Tant qu'ASIO est configure, le `continue` ci-dessus
-            // suspend la creation : les endpoints WASAPI sont enregistres dans
-            // l'`OutputRegistry` mais n'obtiennent AUCUNE ligne en base. Au
-            // premier tick apres la bascule, la retenue saute d'un coup et
-            // chaque endpoint reclame sa zone. Supprimer toutes les zones juste
-            // avant ne protege de rien : `delete_all` masque des lignes, or il
-            // n'y en avait aucune a masquer. L'utilisateur cree UNE zone et en
-            // voit apparaitre une par peripherique dans les deux minutes.
-            //
-            // On ne bloque que la CREATION : une zone deja existante est
-            // renvoyee telle quelle par `get_or_create`, donc la reconnexion
-            // d'un peripherique connu reste intacte, reglage decoche ou non.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            // #1770 : le rescan peut créer au plus UNE zone, celle de la sortie
+            // système. Les autres sorties restent enregistrées pour que
+            // l'interface puisse les proposer à la création manuelle. Une zone
+            // déjà connue est reconnectée normalement.
+            let zone_exists = zone_repo
+                .get_by_device_id(device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action =
+                crate::startup::local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == crate::startup::LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_hotplug_zone_auto_create_disabled_skipping"
+                    "local_audio_hotplug_zone_manual_creation_required"
+                );
+                state.event_bus.emit(
+                    "device.discovered",
+                    serde_json::json!({
+                        "id": device_id,
+                        "name": dev_name,
+                        "type": "local",
+                        "hotplug": true,
+                        "zone_creation": "manual",
+                    }),
                 );
                 continue;
             }
@@ -2122,5 +2293,68 @@ mod heartbeat_server_id_tests {
             "le server_id du heartbeat doit venir du meme accesseur que la \
              telemetrie et que le pont"
         );
+    }
+
+    /// Le battement inscrit son cycle au registre des executions (#2080), et
+    /// sur les DEUX sorties : l'envoi reel, et l'opt-out ou rien ne part.
+    ///
+    /// Sans la seconde, un serveur telemetrie eteinte n'aurait aucune ligne, et
+    /// « le battement ne tourne plus » serait indistinguable de « le battement
+    /// tourne mais n'envoie rien, comme demande ».
+    #[test]
+    fn le_battement_inscrit_chaque_cycle_au_registre() {
+        let source = include_str!("background.rs");
+        let corps = source
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de spawn_heartbeat introuvable");
+
+        assert_eq!(
+            corps.matches("TACHE_BATTEMENT_COEUR").count(),
+            1,
+            "un cycle = une ligne : le registre doit etre ouvert une fois par \
+             tour de boucle, pas plusieurs"
+        );
+        assert!(
+            corps.contains("suivi.rien_a_faire"),
+            "l'opt-out telemetrie doit fermer sa ligne en `rien a faire`, pas \
+             la laisser ouverte jusqu'au prochain redemarrage"
+        );
+        assert!(
+            corps.contains("suivi.terminer(verdict"),
+            "le cycle qui a envoye doit fermer sa ligne avec son verdict"
+        );
+    }
+
+    /// La charge utile du battement porte la cle de licence et l'empreinte
+    /// materielle. Le registre, lui, ne doit porter qu'un code HTTP.
+    #[test]
+    fn le_registre_du_battement_ne_recopie_ni_cle_ni_empreinte() {
+        let source = include_str!("background.rs");
+        let corps = source
+            .split("fn spawn_heartbeat")
+            .nth(1)
+            .expect("spawn_heartbeat introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de spawn_heartbeat introuvable");
+
+        for ligne in corps.lines().filter(|l| l.contains("motif =")) {
+            for interdit in [
+                "license_key",
+                "hardware_fingerprint",
+                "instance_id",
+                "server_id",
+                "hostname",
+            ] {
+                assert!(
+                    !ligne.contains(interdit),
+                    "le motif inscrit au registre ne doit pas porter `{interdit}` : {ligne}"
+                );
+            }
+        }
     }
 }

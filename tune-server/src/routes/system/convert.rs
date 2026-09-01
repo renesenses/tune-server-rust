@@ -50,7 +50,12 @@ pub(super) async fn convert_track(
         }
     };
 
-    // 2. Read the file
+    // 2. Read the file — sous la graphie que le disque accepte. Le chemin de
+    //    la base est en NFC ; sur un fichier au nom décomposé, la conversion
+    //    échouait en « read: No such file or directory » alors que la piste se
+    //    joue (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(&file_path)
+        .unwrap_or(file_path);
     let file_bytes = match tokio::fs::read(&file_path).await {
         Ok(b) => b,
         Err(e) => {

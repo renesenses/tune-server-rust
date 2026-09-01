@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
@@ -22,7 +23,7 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
             "SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '') GROUP BY genre, genres",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|row| {
             (
@@ -220,7 +221,7 @@ pub(super) async fn rename_genre(
     // Collect the rows that need rewriting from both tables.
     let collect = |table: &str| -> Vec<(i64, String, String)> {
         let sql = format!("SELECT id, genre, genres FROM {table}");
-        let rows = state.backend.query_many(&sql, &[]).unwrap_or_default();
+        let rows = state.backend.query_many(&sql, &[]).ou_defaut_journalise();
         rows.into_iter()
             .filter_map(|cols| {
                 let id = cols.first().and_then(|v| v.as_i64())?;
@@ -305,7 +306,7 @@ pub(super) async fn list_genres(
             "SELECT genre, genres FROM albums WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|row| {
             (

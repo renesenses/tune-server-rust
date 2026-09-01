@@ -58,6 +58,73 @@ fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     }
 }
 
+/// Entrelacer les blocs de métadonnées ICY dans un morceau du corps.
+///
+/// Rend la charge découpée sur la fenêtre `icy-metaint` annoncée, un bloc de
+/// métadonnées inséré à chaque frontière. `depuis_meta` est le nombre d'octets
+/// déjà servis dans la fenêtre courante ; il est mis à jour.
+///
+/// **Il se compte depuis le PREMIER octet du corps de la réponse, en-tête WAV
+/// compris.** Le renderer, lui, compte comme ça : c'est la définition d'ICY. Ne
+/// compter que le PCM décalerait chaque bloc de 44 octets, et l'appareil lirait
+/// un octet de son comme longueur de métadonnées — du bruit à la place du
+/// morceau. Le piège ne se voyait pas tant que le canal restait fermé.
+///
+/// `bloc` n'est appelé que lorsqu'un bloc part réellement : c'est lui qui relit
+/// le titre courant, et le relire à chaque morceau de PCM ne servirait à rien.
+fn decoupe_icy(
+    charge: &[u8],
+    depuis_meta: &mut usize,
+    bloc: &dyn Fn() -> Vec<u8>,
+) -> Vec<bytes::Bytes> {
+    let mut sorties = Vec::new();
+    let mut offset = 0usize;
+    while offset < charge.len() {
+        let restant = ICY_METAINT.saturating_sub(*depuis_meta);
+        let fin = (offset + restant).min(charge.len());
+        if fin > offset {
+            sorties.push(bytes::Bytes::copy_from_slice(&charge[offset..fin]));
+            *depuis_meta += fin - offset;
+            offset = fin;
+        }
+        if *depuis_meta >= ICY_METAINT {
+            sorties.push(bytes::Bytes::from(bloc()));
+            *depuis_meta = 0;
+        }
+    }
+    sorties
+}
+
+/// Réponse HEAD d'un flux radio live, sans créer de session ni contacter la
+/// station. Le MediaServer publie une URL stable avant que le renderer fasse
+/// son GET ; ce point d'entrée partage donc exactement le contrat du HEAD
+/// d'une session radio déjà créée.
+pub fn live_radio_head_response(mime_type: &str, req_headers: &HeaderMap) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(mime_type).expect("valid radio MIME type"),
+    );
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
+
+    let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
+    if accepts_chunked_live_stream(ua) {
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+    } else {
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        headers.insert(
+            "Content-Length",
+            HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
+        );
+    }
+
+    (StatusCode::OK, headers).into_response()
+}
+
 impl RadioConsumerGuard {
     fn new(session: std::sync::Arc<StreamSession>) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
@@ -148,6 +215,13 @@ pub async fn handle_head(
         "stream_head_request"
     );
 
+    if is_radio {
+        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
+        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
+        // même pas (#1689).
+        return live_radio_head_response(&session.info.mime_type, &req_headers);
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -155,25 +229,7 @@ pub async fn handle_head(
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 
-    if is_radio {
-        headers.insert(
-            "transferMode.dlna.org",
-            HeaderValue::from_static("Streaming"),
-        );
-        // Le HEAD doit annoncer le même contrat que le GET qui suit, sans quoi
-        // un lecteur qui sonde d'abord conclut « pas de longueur » et n'essaie
-        // même pas (#1689).
-        let ua = req_headers.get("User-Agent").and_then(|v| v.to_str().ok());
-        if accepts_chunked_live_stream(ua) {
-            headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
-        } else {
-            headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-            headers.insert(
-                "Content-Length",
-                HeaderValue::from(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN),
-            );
-        }
-    } else if session.is_channel().await {
+    if session.is_channel().await {
         // Conversion à la volée : le canal ne rejoue aucun octet passé. Le HEAD
         // doit dire la même vérité que la DIDL (DLNA.ORG_OP=00) — annoncer
         // Accept-Ranges ici invite le renderer à seeker un tuyau (DMP-A8,
@@ -237,11 +293,20 @@ pub async fn handle_stream(
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // `wants_icy` est lu ICI, avant les branches fichier et mandataire, pour
+    // qu'il figure sur CHAQUE `stream_request` : le journal de Jean Valjean ne
+    // portait pas une ligne « icy », et rien ne permettait de savoir si son
+    // renderer avait demandé les métadonnées ou non (#2161).
+    let wants_icy = req_headers
+        .get("Icy-MetaData")
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
     info!(
         stream_id,
         range = range_hdr,
         agent = user_agent.as_deref().unwrap_or("-"),
         format = %session.info.format,
+        wants_icy,
         "stream_request"
     );
     session.first_request.notify_waiters();
@@ -379,21 +444,48 @@ pub async fn handle_stream(
         );
     }
 
-    let wants_icy = req_headers
-        .get("Icy-MetaData")
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
+    // ── Pourquoi une RADIO ouvre le canal ICY sans titre de session ──
+    //
+    // `StreamSession::track_title` / `track_artist` sont posés à `None` par
+    // `StreamSession::new` et ne sont écrits NULLE PART ailleurs du dépôt :
+    // ce sont des champs sans mutabilité intérieure sur une structure qui part
+    // aussitôt dans un `Arc`. La condition d'origine
+    // (`wants_icy && track_title.is_some()`) était donc TOUJOURS fausse :
+    // `icy-metaint` n'était jamais annoncé, et le rafraîchissement du titre
+    // ajouté par #1473 (`publish_radio_now` → `radio_now`) restait injoignable.
+    // C'est ce que montre le journal de Jean Valjean : pas une ligne « icy »
+    // (Marantz ND8006 + Radio Paradise, #2161).
+    //
+    // Une radio n'a de toute façon pas de titre au moment où sa session est
+    // créée — il n'existe pas encore. Il arrive plus tard, par le poller, et se
+    // relit à chaque bloc dans le registre `radio_now`. C'est exactement le cas
+    // où le canal ICY sert : le seul flux dont le titre change en cours de
+    // route. On l'ouvre donc sur `is_radio`, et le renderer qui n'a pas
+    // demandé `Icy-MetaData: 1` ne voit, lui, strictement aucun changement.
+    let has_icy = wants_icy
+        && (session.is_radio || session.track_title.is_some() || session.track_artist.is_some());
 
-    if wants_icy && (session.track_title.is_some() || session.track_artist.is_some()) {
+    if has_icy {
         headers.insert("icy-metaint", HeaderValue::from(ICY_METAINT as u64));
     }
+
+    // Sans cette ligne, ce défaut n'est pas diagnosticable à distance : le
+    // journal du testeur ne disait ni si son renderer avait demandé l'ICY, ni
+    // si on le lui avait accordé — deux allers-retours pour la même personne.
+    info!(
+        stream_id,
+        agent = user_agent.as_deref().unwrap_or("-"),
+        wants_icy,
+        has_icy,
+        is_radio,
+        "icy_metadata_negotiated"
+    );
 
     let sr = session.info.sample_rate;
     let bd = session.info.bit_depth;
     let ch = session.info.channels;
     let dur_ms = session.info.duration_ms;
 
-    let has_icy = wants_icy && (session.track_title.is_some() || session.track_artist.is_some());
     // Bloc ICY de repli : celui de la piste au moment de la connexion. Pour un
     // fichier il ne changera jamais, et c'est correct. Pour une RADIO il est
     // reconstruit a chaque emission depuis le titre courant (voir plus bas) —
@@ -419,6 +511,30 @@ pub async fn handle_stream(
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
     let compteur = session.clone();
     let flux = async_stream::stream! {
+        // Fenêtre ICY : elle se compte depuis le PREMIER octet du corps, donc
+        // en-tête WAV compris (voir `decoupe_icy`). Le compteur vit ici, et non
+        // dans la boucle, pour cette seule raison.
+        let mut bytes_since_meta: usize = 0;
+        // Le bloc à insérer : le titre courant s'il a été publié par le poller,
+        // sinon celui de la connexion. Relu à CHAQUE insertion — c'est la seule
+        // chose que le renderer verra changer sans qu'on relance quoi que ce soit.
+        //
+        // La POCHETTE se relit ici au même titre que l'artiste. Elle était prise
+        // sur `session.cover_url`, capturé une fois hors de la boucle — un champ
+        // qui vaut TOUJOURS `None` (posé par `StreamSession::new`, écrit nulle
+        // part), donc `StreamUrl='…'` ne partait jamais et l'écran du renderer
+        // gardait la première image (Serge Asselin, RS250A, fil 1529). Le repli
+        // sur `icy_cover` reste pour les sessions non-radio, le jour où ce champ
+        // sera renseigné.
+        let bloc_icy_courant = || match tune_core::http::streamer::radio_now(&icy_stream_id) {
+            Some(np) => build_icy_metadata(
+                np.artist.as_deref(),
+                Some(&np.title),
+                np.cover.as_deref().or(icy_cover.as_deref()),
+            ),
+            None => icy_block.clone(),
+        };
+
         if is_wav && !wav_header_included {
             // Live radio: a Lavf renderer needs the 0xFFFF_FFFF
             // indeterminate-length header to keep reading until the connection
@@ -430,18 +546,14 @@ pub async fn handle_stream(
                 // advertises the TRUE sample rate/channels (FIP is 48000, not
                 // the placeholder 44100). Fall back to the StreamInfo values if
                 // the decoder hasn't populated them within a short window.
-                use std::sync::atomic::Ordering::Relaxed;
-                if session.detected_sample_rate.load(Relaxed) == 0 {
+                if session.detected_output_format().is_none() {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         data_ready.notified(),
                     )
                     .await;
                 }
-                let det_sr = session.detected_sample_rate.load(Relaxed);
-                let det_ch = session.detected_channels.load(Relaxed);
-                let real_sr = if det_sr != 0 { det_sr } else { sr };
-                let real_ch = if det_ch != 0 { det_ch } else { ch };
+                let (real_sr, real_ch) = session.detected_output_format().unwrap_or((sr, ch));
                 if bounded_live {
                     build_wav_header_bounded_live(real_ch, real_sr, bd)
                 } else {
@@ -453,34 +565,16 @@ pub async fn handle_stream(
             // header_skip n'est non nul que sur une reprise `bytes=N-` d'une
             // radio bornée : le lecteur a déjà lu l'en-tête et veut le PCM.
             if header_skip < hdr.len() {
-                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr[header_skip..]));
+                let entete = &hdr[header_skip..];
+                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(entete));
+                bytes_since_meta += entete.len();
             }
         }
 
-        if has_icy {
-            let mut bytes_since_meta: usize = 0;
+        if has_icy && !is_radio {
             while let Some(chunk) = session.recv_chunk().await {
-                let mut offset = 0;
-                while offset < chunk.len() {
-                    let remaining = ICY_METAINT - bytes_since_meta;
-                    let end = (offset + remaining).min(chunk.len());
-                    yield Ok(bytes::Bytes::copy_from_slice(&chunk[offset..end]));
-                    bytes_since_meta += end - offset;
-                    offset = end;
-                    if bytes_since_meta >= ICY_METAINT {
-                        // Relire le titre courant a CHAQUE emission : c'est la
-                        // seule chose que le renderer verra changer.
-                        let block = match tune_core::http::streamer::radio_now(&icy_stream_id) {
-                            Some((artist, title)) => build_icy_metadata(
-                                artist.as_deref(),
-                                Some(&title),
-                                icy_cover.as_deref(),
-                            ),
-                            None => icy_block.clone(),
-                        };
-                        yield Ok(bytes::Bytes::from(block));
-                        bytes_since_meta = 0;
-                    }
+                for part in decoupe_icy(&chunk, &mut bytes_since_meta, &bloc_icy_courant) {
+                    yield Ok(part);
                 }
             }
         } else if is_radio {
@@ -538,7 +632,27 @@ pub async fn handle_stream(
                     _ = &mut superseded => continue,
                     maybe_chunk = session.recv_chunk() => {
                         match maybe_chunk {
-                            Some(chunk) => yield Ok(bytes::Bytes::from(chunk)),
+                            // Le direct passe TOUJOURS par cette boucle-ci, ICY
+                            // ou pas : c'est elle qui tient le canal PCM à un
+                            // seul consommateur. Router la radio vers la boucle
+                            // simple ci-dessus pour lui ajouter des
+                            // métadonnées aurait rendu les micro-coupures de
+                            // `radio_stream_concurrent_consumer` (.15). Le
+                            // canal ICY ne fait qu'entrelacer des blocs dans
+                            // les octets déjà servis.
+                            Some(chunk) => {
+                                if has_icy {
+                                    for part in decoupe_icy(
+                                        &chunk,
+                                        &mut bytes_since_meta,
+                                        &bloc_icy_courant,
+                                    ) {
+                                        yield Ok(part);
+                                    }
+                                } else {
+                                    yield Ok(bytes::Bytes::from(chunk));
+                                }
+                            }
                             None => {
                                 // recv returned None → the PCM channel was closed
                                 // (all senders, incl. the keep-alive, dropped). A
@@ -1287,7 +1401,9 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_chunked_live_stream, corps_compte, parse_range_start};
+    use super::{
+        ICY_METAINT, accepts_chunked_live_stream, corps_compte, decoupe_icy, parse_range_start,
+    };
 
     /// La sonde du DMP-A8, en modèle réduit : une connexion ouvre le flux
     /// d'une conversion (DSD→WAV), puis une seconde arrive pendant que la
@@ -1650,6 +1766,30 @@ mod tests {
     }
 
     #[test]
+    fn le_head_radio_stable_reutilise_le_contrat_live_du_renderer() {
+        let mut req = axum::http::HeaderMap::new();
+        req.insert("User-Agent", "Marantz ND8006".parse().unwrap());
+        let rep = super::live_radio_head_response("audio/wav", &req);
+        let expected_length = LIVE_BOUNDED_TOTAL_LEN.to_string();
+
+        assert_eq!(rep.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            rep.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("audio/wav")
+        );
+        assert_eq!(
+            rep.headers()
+                .get("Content-Length")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_length.as_str())
+        );
+        assert!(rep.headers().get("Accept-Ranges").is_some());
+        assert!(rep.headers().get("Transfer-Encoding").is_none());
+    }
+
+    #[test]
     fn bounded_live_header_matches_the_announced_content_length() {
         // Le lecteur qui reçoit le contrat fichier lit Content-Length ET les
         // tailles de l'en-tête : les trois doivent concorder et rester
@@ -1697,6 +1837,269 @@ mod tests {
         assert_eq!(parse_range_start("bytes=-500"), None);
         assert_eq!(parse_range_start("bytes=abc-"), None);
         assert_eq!(parse_range_start("chunks=0-"), None);
+    }
+
+    // ───────────────────────── #2161 — le titre d'une radio ─────────────────
+    //
+    // Le renderer DLNA restait figé sur le nom de la station. Rien ne partait :
+    // `has_icy` était conditionné à `session.track_title`, jamais renseigné.
+    // Ces trois épreuves sont hermétiques — aucune socket, aucune station.
+
+    /// Une session radio servie à un renderer qui demande l'ICY, avec le PCM
+    /// déjà en file et l'émetteur fermé : le corps est complet et fini.
+    async fn corps_radio(
+        stream_id: &str,
+        agent: &str,
+        demande_icy: bool,
+        octets_pcm: usize,
+    ) -> (axum::http::HeaderMap, Vec<u8>) {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let mut session = StreamSession::new(stream_id.to_string(), info, false, 64);
+        session.is_radio = true;
+        let session = std::sync::Arc::new(session);
+        // Sans format détecté, l'en-tête attend le décodeur dix secondes.
+        session.publish_detected_output_format(44100, 2);
+
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let mut reste = octets_pcm;
+        while reste > 0 {
+            let n = reste.min(8192);
+            tx.send(vec![0xAA; n]).await.expect("pcm");
+            reste -= n;
+        }
+        drop(tx);
+        session.close_sender().await;
+
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(stream_id.to_string(), session)].into_iter().collect(),
+        ));
+
+        let mut req = axum::http::HeaderMap::new();
+        req.insert("User-Agent", agent.parse().unwrap());
+        if demande_icy {
+            req.insert("Icy-MetaData", "1".parse().unwrap());
+        }
+        let rep =
+            super::handle_stream(Path(format!("{stream_id}.wav")), State(sessions), req).await;
+        let entetes = rep.headers().clone();
+
+        let mut corps = rep.into_body().into_data_stream();
+        let mut octets = Vec::new();
+        while let Some(Ok(b)) = corps.next().await {
+            octets.extend_from_slice(&b);
+        }
+        (entetes, octets)
+    }
+
+    /// Le canal ICY doit s'ouvrir pour un DIRECT, alors même que la session n'a
+    /// aucun titre — elle n'en a jamais : `track_title` est posé à `None` par
+    /// `StreamSession::new` et n'est écrit nulle part. La condition d'origine
+    /// était donc toujours fausse, `icy-metaint` n'était jamais annoncé, et le
+    /// rafraîchissement de #1473 restait injoignable (journal de Jean Valjean :
+    /// pas une ligne « icy »).
+    #[tokio::test]
+    async fn un_direct_ouvre_le_canal_icy_sans_titre_de_session() {
+        let (entetes, _) = corps_radio(
+            "i2161-ouverture",
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            4096,
+        )
+        .await;
+
+        assert_eq!(
+            entetes.get("icy-metaint").and_then(|v| v.to_str().ok()),
+            Some("16384"),
+            "un direct demandé avec Icy-MetaData: 1 doit annoncer la fenêtre ICY"
+        );
+    }
+
+    /// Le bloc porte le titre COURANT — celui que le poller vient de publier,
+    /// pas celui de la connexion — et il tombe au 16384ᵉ octet **du corps**,
+    /// en-tête WAV compris. Un bloc décalé de 44 octets ferait lire au renderer
+    /// un octet de son comme longueur de métadonnées : du bruit.
+    #[tokio::test]
+    async fn le_bloc_icy_tombe_a_la_bonne_fenetre_et_porte_le_titre_courant() {
+        use tune_core::http::streamer::{forget_radio_now, publish_radio_now};
+
+        let sid = "i2161-fenetre";
+        forget_radio_now(sid);
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into(), None);
+
+        let (_, corps) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            20_000,
+        )
+        .await;
+        forget_radio_now(sid);
+
+        assert!(
+            corps.starts_with(b"RIFF"),
+            "le corps commence par l'en-tête WAV"
+        );
+        assert!(
+            corps.len() > 16_400,
+            "corps trop court pour porter un bloc : {} octets",
+            corps.len()
+        );
+        assert_eq!(
+            corps[16_383], 0xAA,
+            "l'octet qui précède la frontière doit encore être du son — \
+             l'en-tête WAV compte dans la fenêtre ICY"
+        );
+
+        let longueur = corps[16_384] as usize;
+        assert!(
+            longueur > 0,
+            "un bloc vide au moment où un titre est publié"
+        );
+        let charge = &corps[16_385..16_385 + longueur * 16];
+        assert!(
+            charge.starts_with(b"StreamTitle='"),
+            "le bloc doit commencer EXACTEMENT au 16384e octet du corps ; \
+             ici l'octet de longueur lu vaut {longueur} et ce qui suit n'est pas \
+             un bloc ICY — la fenêtre est décalée"
+        );
+        let texte = String::from_utf8_lossy(charge);
+        assert!(
+            texte.contains("StreamTitle='Miles Davis - So What';"),
+            "le bloc doit porter le titre courant, pas celui de la connexion : {texte:?}"
+        );
+    }
+
+    /// La POCHETTE du morceau courant doit partir dans le bloc, au même titre
+    /// que son titre.
+    ///
+    /// C'est le second témoignage de #2161 : « la pochette et le titre ne
+    /// change pas sur le RS250A […] demeure avec la pochette et le titre de la
+    /// première écoute » (Serge Asselin, fil 1529). La pochette était lue sur
+    /// `session.cover_url`, capturé UNE FOIS hors de la boucle — et ce champ
+    /// vaut toujours `None` : posé par `StreamSession::new`, écrit nulle part
+    /// du dépôt, exactement comme `track_title` l'était. `StreamUrl='…'` ne
+    /// quittait donc jamais ce serveur.
+    #[tokio::test]
+    async fn le_bloc_icy_porte_la_pochette_courante() {
+        use tune_core::http::streamer::{forget_radio_now, publish_radio_now};
+
+        let sid = "i2161-pochette";
+        forget_radio_now(sid);
+        publish_radio_now(
+            sid,
+            Some("Miles Davis".into()),
+            "So What".into(),
+            Some("https://img.radioparadise.com/covers/l/sowhat.jpg".into()),
+        );
+
+        let (_, corps) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            20_000,
+        )
+        .await;
+        forget_radio_now(sid);
+
+        let longueur = corps[16_384] as usize;
+        let charge = &corps[16_385..16_385 + longueur * 16];
+        let texte = String::from_utf8_lossy(charge);
+        assert!(
+            texte.contains("StreamUrl='https://img.radioparadise.com/covers/l/sowhat.jpg';"),
+            "le bloc doit porter la pochette publiée par le poller : {texte:?}"
+        );
+        assert!(
+            texte.contains("StreamTitle='Miles Davis - So What';"),
+            "le titre doit rester présent à côté de la pochette : {texte:?}"
+        );
+    }
+
+    /// Sans pochette publiée, le bloc reste ce qu'il était : un `StreamTitle`
+    /// seul. On n'invente pas d'URL, et un `StreamUrl=''` vide serait pire que
+    /// pas de champ du tout — le renderer effacerait l'image qu'il affiche.
+    #[tokio::test]
+    async fn sans_pochette_publiee_le_bloc_ne_porte_aucun_streamurl() {
+        use tune_core::http::streamer::{forget_radio_now, publish_radio_now};
+
+        let sid = "i2161-sans-pochette";
+        forget_radio_now(sid);
+        publish_radio_now(sid, Some("Miles Davis".into()), "So What".into(), None);
+
+        let (_, corps) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            20_000,
+        )
+        .await;
+        forget_radio_now(sid);
+
+        let longueur = corps[16_384] as usize;
+        let charge = &corps[16_385..16_385 + longueur * 16];
+        let texte = String::from_utf8_lossy(charge);
+        assert!(
+            !texte.contains("StreamUrl"),
+            "aucun StreamUrl ne doit partir quand la station n'en donne pas : {texte:?}"
+        );
+    }
+
+    /// Piège du chantier : un renderer qui n'a pas demandé l'ICY ne doit RIEN
+    /// voir changer. Pas d'en-tête `icy-metaint`, et pas un octet inséré dans
+    /// le flux — sans quoi on aurait dégradé la lecture de tous ceux qui
+    /// ignorent les métadonnées en cours de route.
+    #[tokio::test]
+    async fn un_renderer_qui_ne_demande_pas_l_icy_recoit_le_flux_intact() {
+        let (entetes, corps) = corps_radio(
+            "i2161-intact",
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            false,
+            20_000,
+        )
+        .await;
+
+        assert!(
+            entetes.get("icy-metaint").is_none(),
+            "aucune fenêtre ICY ne doit être annoncée sans Icy-MetaData: 1"
+        );
+        assert_eq!(
+            corps.len(),
+            44 + 20_000,
+            "l'en-tête WAV puis le PCM, octet pour octet"
+        );
+        assert!(
+            corps[44..].iter().all(|o| *o == 0xAA),
+            "aucun octet de métadonnées ne doit s'être glissé dans le son"
+        );
+    }
+
+    /// La frontière tombe exactement sur la fin d'un morceau : le bloc part
+    /// quand même, et la fenêtre repart à zéro.
+    #[test]
+    fn la_decoupe_icy_insere_un_bloc_a_chaque_frontiere() {
+        let bloc = || vec![1u8, 0x42];
+        let mut depuis = 0usize;
+
+        let sorties = decoupe_icy(&vec![0u8; ICY_METAINT], &mut depuis, &bloc);
+        let plat: Vec<u8> = sorties.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(plat.len(), ICY_METAINT + 2);
+        assert_eq!(&plat[ICY_METAINT..], &[1u8, 0x42]);
+        assert_eq!(depuis, 0, "la fenêtre repart à zéro après un bloc");
+
+        // Un morceau plus petit que la fenêtre passe sans rien insérer.
+        let sorties = decoupe_icy(&[0u8; 10], &mut depuis, &bloc);
+        assert_eq!(sorties.iter().map(|b| b.len()).sum::<usize>(), 10);
+        assert_eq!(depuis, 10);
     }
 }
 

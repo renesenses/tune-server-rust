@@ -676,7 +676,10 @@ fn import_zones(
                 &[
                     &z["output_type"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
                     &z["output_device_id"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    &z["volume"].as_i64().unwrap_or(50) as &dyn ToSqlValue,
+                    // #2886 — `as_i64()` rendait None des que le volume
+                    // sauvegarde portait une virgule, et la restauration
+                    // reposait alors 50 % en travers du reglage de l'utilisateur.
+                    &z["volume"].as_f64().unwrap_or(50.0) as &dyn ToSqlValue,
                     &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                     &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
@@ -699,7 +702,10 @@ fn import_zones(
                     &name.to_string() as &dyn ToSqlValue,
                     &z["output_type"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
                     &z["output_device_id"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    &z["volume"].as_i64().unwrap_or(50) as &dyn ToSqlValue,
+                    // #2886 — `as_i64()` rendait None des que le volume
+                    // sauvegarde portait une virgule, et la restauration
+                    // reposait alors 50 % en travers du reglage de l'utilisateur.
+                    &z["volume"].as_f64().unwrap_or(50.0) as &dyn ToSqlValue,
                     &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                     &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,

@@ -28,7 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError
@@ -39,6 +39,28 @@ SEMVER_RE = re.compile(
     r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:-(?P<pre>[0-9A-Za-z.-]+))?$"
 )
 P0_VERIFICATION_PENDING_LABEL = "release:verification-pending"
+# Exemption « terrain » : une P0 dont le traitement est suspendu faute de
+# reproduction, de materiel ou d'informations du testeur ne peut pas etre
+# fermee par nous — la garder bloquante gelerait la ligne de release pour une
+# duree qui ne depend pas de l'equipe.
+#
+# Elle ne bloque donc pas, MAIS elle doit se voir. Une exemption silencieuse
+# recreerait exactement le defaut qu'on vient de supprimer : cinq releases
+# publiees sur un preflight rouge sans que personne le remarque. Chaque P0
+# exemptee est donc annoncee, avec son numero, dans le RESUME du job — pas
+# seulement dans le journal, que personne ne deroule.
+P0_FIELD_BLOCKED_LABEL = "bloque:terrain"
+
+# Known people may use more than one clone or process, but these two addresses
+# must never cross owners. Keep this deliberately narrow: the release gate is
+# meant to reject the mixed pairs that have already forged attribution, not to
+# turn every future contributor into an allow-list entry.
+MIXED_IDENTITY_PAIRS = {
+    ("bertrand", "jp@robbe.net"),
+    ("renesenses", "jp@robbe.net"),
+    ("jean-philippe robbe", "renesenses@gmail.com"),
+    ("jprobbe", "renesenses@gmail.com"),
+}
 
 
 @dataclass
@@ -46,6 +68,8 @@ class CheckResult:
     name: str
     passed: bool
     detail: str
+    # Avertissements remontes au resume du job (voir emit_job_summary).
+    warnings: list[str] = field(default_factory=list)
 
 
 def parse_semver(tag: str) -> Optional[tuple]:
@@ -121,12 +145,143 @@ def check_version_bump(tag: str) -> CheckResult:
     )
 
 
-def classify_open_p0_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split actionable P0 issues into blockers and merged fixes to verify.
+def check_identity_contract(
+    identities: list[tuple[str, str, str]], name: str
+) -> CheckResult:
+    """Reject known name/email mixtures without imposing a contributor allow-list."""
+    mixed = [
+        f"{role}={person} <{email}>"
+        for role, person, email in identities
+        if (person.strip().casefold(), email.strip().casefold())
+        in MIXED_IDENTITY_PAIRS
+    ]
+    rendered = "; ".join(
+        f"{role}={person} <{email}>" for role, person, email in identities
+    )
+    if mixed:
+        return CheckResult(
+            name,
+            False,
+            "mixed Git identity: " + "; ".join(mixed),
+        )
+    return CheckResult(name, True, rendered)
+
+
+def check_release_commit_identity() -> CheckResult:
+    """Validate the author and committer stored on the commit being released."""
+    revision = os.environ.get("GITHUB_SHA") or "HEAD"
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce",
+                revision,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CheckResult("release_identity", False, f"cannot read Git identity: {exc}")
+    fields = proc.stdout.rstrip("\n").split("\x00")
+    if proc.returncode != 0 or len(fields) != 4:
+        detail = proc.stderr.strip() or "unexpected git show output"
+        return CheckResult("release_identity", False, detail)
+    return check_identity_contract(
+        [("author", fields[0], fields[1]), ("committer", fields[2], fields[3])],
+        "release_identity",
+    )
+
+
+def _parse_git_var_identity(value: str) -> Optional[tuple[str, str]]:
+    """Parse `git var GIT_*_IDENT` without depending on its timestamp."""
+    match = re.match(r"^(.*) <([^<>]+)> \d+ [+-]\d{4}$", value.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def check_planned_git_identity() -> CheckResult:
+    """Validate the identities Git would use for the next local commit."""
+    identities: list[tuple[str, str, str]] = []
+    for role, variable in [
+        ("author", "GIT_AUTHOR_IDENT"),
+        ("committer", "GIT_COMMITTER_IDENT"),
+    ]:
+        try:
+            proc = subprocess.run(
+                ["git", "var", variable],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return CheckResult("planned_identity", False, f"cannot run git var: {exc}")
+        parsed = _parse_git_var_identity(proc.stdout) if proc.returncode == 0 else None
+        if parsed is None:
+            detail = proc.stderr.strip() or f"cannot parse {variable}"
+            return CheckResult("planned_identity", False, detail)
+        identities.append((role, parsed[0], parsed[1]))
+    return check_identity_contract(identities, "planned_identity")
+
+
+def self_test_identity_contract() -> None:
+    valid = check_identity_contract(
+        [
+            ("author", "Jean-Philippe ROBBE", "jp@robbe.net"),
+            ("committer", "Bertrand", "renesenses@gmail.com"),
+        ],
+        "test",
+    )
+    assert valid.passed, valid
+
+    forged_author = check_identity_contract(
+        [("author", "Bertrand", "jp@robbe.net")], "test"
+    )
+    assert not forged_author.passed, forged_author
+    assert "Bertrand <jp@robbe.net>" in forged_author.detail
+
+    forged_committer = check_identity_contract(
+        [("committer", "Jean-Philippe ROBBE", "renesenses@gmail.com")], "test"
+    )
+    assert not forged_committer.passed, forged_committer
+
+    # Unknown contributors remain valid: this is a consistency guard, not an
+    # allow-list that silently bars a new maintainer from making a release.
+    unknown = check_identity_contract(
+        [("author", "Nouvelle Mainteneuse", "maintainer@example.org")], "test"
+    )
+    assert unknown.passed, unknown
+
+    assert _parse_git_var_identity("Bertrand <renesenses@gmail.com> 1 +0200") == (
+        "Bertrand",
+        "renesenses@gmail.com",
+    )
+    assert _parse_git_var_identity("invalid") is None
+
+
+def classify_open_p0_issues(
+    issues: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split actionable P0 issues into blockers, fixes to verify, exemptions.
 
     `keep-open`, `en-cours`, assignment and work locks deliberately have no
-    special meaning here. Only the exact verification label breaks the
-    release/closure circularity, and epics remain excluded as before.
+    special meaning here. Two labels, and two only, take a P0 off the blocking
+    list, and epics remain excluded as before:
+
+    - `release:verification-pending` : le correctif est fusionne, l'issue
+      attend la release pour etre verifiee. Sans elle, la release attend la
+      fermeture et la fermeture attend la release.
+    - `bloque:terrain` : le traitement est suspendu faute de reproduction, de
+      materiel ou d'informations du terrain.
+
+    Les deux listes sont calculees INDEPENDAMMENT l'une de l'autre : une P0
+    qui porte les deux etiquettes apparait dans les deux, donc deux fois dans
+    le resume. C'est voulu — une exemption doit etre bruyante, pas discrete.
     """
 
     def labels(issue: dict) -> set[str]:
@@ -146,12 +301,16 @@ def classify_open_p0_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]
         for issue in actionable
         if P0_VERIFICATION_PENDING_LABEL in labels(issue)
     ]
+    field_blocked = [
+        issue for issue in actionable if P0_FIELD_BLOCKED_LABEL in labels(issue)
+    ]
     blocking = [
         issue
         for issue in actionable
         if P0_VERIFICATION_PENDING_LABEL not in labels(issue)
+        and P0_FIELD_BLOCKED_LABEL not in labels(issue)
     ]
-    return blocking, awaiting_verification
+    return blocking, awaiting_verification, field_blocked
 
 
 def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
@@ -164,10 +323,19 @@ def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e.code}")
     except Exception as e:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e}")
-    blocking, awaiting_verification = classify_open_p0_issues(issues)
+    blocking, awaiting_verification, field_blocked = classify_open_p0_issues(issues)
     pending_nums = ", ".join(
         f"#{issue['number']}" for issue in awaiting_verification[:10]
     )
+    # Un avertissement PAR issue exemptee, avec son numero et son titre : c'est
+    # ce que le resume du job affichera, et c'est la seule trace qu'une P0 est
+    # sortie du chemin bloquant.
+    warnings = [
+        f"P0 #{issue['number']} ne bloque PAS la release — exemptee par "
+        f"`{P0_FIELD_BLOCKED_LABEL}` : "
+        f"{str(issue.get('title') or '').strip()[:120]}"
+        for issue in field_blocked
+    ]
     if blocking:
         nums = ", ".join(f"#{issue['number']}" for issue in blocking[:10])
         pending_detail = (
@@ -176,18 +344,34 @@ def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
             if awaiting_verification
             else ""
         )
+        exempt_detail = (
+            f"; {len(field_blocked)} exemptees par {P0_FIELD_BLOCKED_LABEL}"
+            if field_blocked
+            else ""
+        )
         return CheckResult(
             "no_p0_issues",
             False,
-            f"{len(blocking)} blocking P0 issues open: {nums}{pending_detail}",
+            f"{len(blocking)} blocking P0 issues open: {nums}"
+            f"{pending_detail}{exempt_detail}",
+            warnings,
         )
-    if awaiting_verification:
-        return CheckResult(
-            "no_p0_issues",
-            True,
-            f"0 blocking P0 issues; {len(awaiting_verification)} awaiting "
-            f"release verification: {pending_nums}",
-        )
+    if awaiting_verification or field_blocked:
+        parts = ["0 blocking P0 issues"]
+        if awaiting_verification:
+            parts.append(
+                f"{len(awaiting_verification)} awaiting release verification: "
+                f"{pending_nums}"
+            )
+        if field_blocked:
+            exempt_nums = ", ".join(
+                f"#{issue['number']}" for issue in field_blocked[:10]
+            )
+            parts.append(
+                f"{len(field_blocked)} exemptees par "
+                f"{P0_FIELD_BLOCKED_LABEL}: {exempt_nums}"
+            )
+        return CheckResult("no_p0_issues", True, "; ".join(parts), warnings)
     return CheckResult("no_p0_issues", True, "0 blocking P0 issues (epics excluded)")
 
 
@@ -210,23 +394,60 @@ def self_test_p0_classification() -> None:
         issue(4, "P0", P0_VERIFICATION_PENDING_LABEL),
         issue(5, "P0", "epic"),
         issue(6, "P0", pull_request=True),
+        issue(7, "P0", P0_FIELD_BLOCKED_LABEL),
+        issue(8, "P0", P0_VERIFICATION_PENDING_LABEL, P0_FIELD_BLOCKED_LABEL),
+        # Contre-exemple : une etiquette qui RESSEMBLE a l'exemption n'en est
+        # pas une. Seul le nom exact sort une P0 du chemin bloquant.
+        issue(9, "P0", "bloque:arbitrage"),
     ]
-    blocking, awaiting = classify_open_p0_issues(examples)
-    assert [value["number"] for value in blocking] == [1, 2, 3]
-    assert [value["number"] for value in awaiting] == [4]
+    blocking, awaiting, exempt = classify_open_p0_issues(examples)
+    assert [value["number"] for value in blocking] == [1, 2, 3, 9], blocking
+    assert [value["number"] for value in awaiting] == [4, 8], awaiting
+    assert [value["number"] for value in exempt] == [7, 8], exempt
 
     original_github_api = globals()["github_api"]
     try:
         globals()["github_api"] = lambda _path, _token=None: examples
         mixed = check_no_p0_issues("owner/repo", None)
         assert not mixed.passed
-        assert "3 blocking P0 issues open: #1, #2, #3" in mixed.detail
-        assert "1 awaiting release verification: #4" in mixed.detail
+        assert "4 blocking P0 issues open: #1, #2, #3, #9" in mixed.detail
+        assert "2 awaiting release verification: #4, #8" in mixed.detail
 
         globals()["github_api"] = lambda _path, _token=None: [examples[3]]
         pending_only = check_no_p0_issues("owner/repo", None)
         assert pending_only.passed
         assert pending_only.detail.endswith("awaiting release verification: #4")
+        assert pending_only.warnings == []
+
+        # Contrat 1 — une P0 SANS exemption bloque toujours.
+        globals()["github_api"] = lambda _path, _token=None: [examples[0]]
+        bare = check_no_p0_issues("owner/repo", None)
+        assert not bare.passed, bare
+        assert "1 blocking P0 issues open: #1" in bare.detail
+
+        # Contrat 2 — une P0 `bloque:terrain` ne bloque pas, et son NUMERO
+        # apparait dans un avertissement destine au resume du job.
+        globals()["github_api"] = lambda _path, _token=None: [examples[6]]
+        exempted = check_no_p0_issues("owner/repo", None)
+        assert exempted.passed, exempted
+        assert f"exemptees par {P0_FIELD_BLOCKED_LABEL}: #7" in exempted.detail
+        assert len(exempted.warnings) == 1, exempted.warnings
+        assert "#7" in exempted.warnings[0]
+        assert P0_FIELD_BLOCKED_LABEL in exempted.warnings[0]
+        summary = render_job_summary("v9.9.9", "owner/repo", None, [exempted])
+        assert "#7" in summary, summary
+        assert "Avertissements" in summary, summary
+
+        # Une exemption ne rachete PAS une autre P0 bloquante.
+        globals()["github_api"] = lambda _path, _token=None: [
+            examples[0],
+            examples[6],
+        ]
+        mixed_exempt = check_no_p0_issues("owner/repo", None)
+        assert not mixed_exempt.passed, mixed_exempt
+        assert "1 blocking P0 issues open: #1" in mixed_exempt.detail
+        assert f"1 exemptees par {P0_FIELD_BLOCKED_LABEL}" in mixed_exempt.detail
+        assert "#7" in " ".join(mixed_exempt.warnings)
     finally:
         globals()["github_api"] = original_github_api
 
@@ -401,10 +622,10 @@ def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
             False,
             f"{len(failures)} failed: {', '.join(failures[:5])}",
         )
-    # Jobs that haven't finished yet are NOT a failure: preflight runs
-    # concurrently with the multi-platform Build jobs, so those are always
-    # "in progress" at tag time. Only actually-failed runs (handled above)
-    # block. Each build still gates itself via its own job status.
+    # Jobs that haven't finished yet are NOT a failure: the current preflight
+    # check and other workflows triggered by the tag can still be running.
+    # Only actually-failed runs (handled above) block. Release itself cannot
+    # start building before this reusable workflow has succeeded.
     pending = [r["name"] for r in runs if r.get("status") != "completed"]
     if pending:
         return CheckResult(
@@ -417,6 +638,72 @@ def check_ci_status(repo: str, sha: str, token: Optional[str]) -> CheckResult:
         True,
         f"all {len(runs)} check-runs green",
     )
+
+
+# ─── Resume du job ────────────────────────────────────────────────────
+
+
+def render_job_summary(
+    tag: str,
+    repo: str,
+    sha: Optional[str],
+    checks: list[CheckResult],
+) -> str:
+    """Markdown du resume de job : etat de chaque controle + avertissements.
+
+    Le journal d'un job ne se deroule pas : il faut ouvrir le run, ouvrir le
+    job, ouvrir l'etape. Le resume, lui, s'affiche sur la page du run. Une
+    exemption de P0 qui n'apparaitrait que dans le journal serait une
+    exemption invisible — c'est-a-dire le defaut qu'on corrige.
+    """
+    lines = [
+        f"## Preflight {tag}",
+        "",
+        f"`{repo}` @ `{sha[:10] if sha else '?'}`",
+        "",
+        "| | Controle | Detail |",
+        "| :-: | --- | --- |",
+    ]
+    for check in checks:
+        marker = "✅" if check.passed else "❌"
+        detail = check.detail.replace("|", "\\|")
+        lines.append(f"| {marker} | `{check.name}` | {detail} |")
+    warnings = [w for check in checks for w in check.warnings]
+    if warnings:
+        lines += ["", "### ⚠️ Avertissements", ""]
+        lines += [f"- ⚠️ {w.replace('|', chr(92) + '|')}" for w in warnings]
+    failed = [c for c in checks if not c.passed]
+    lines += [""]
+    if failed:
+        lines.append(
+            f"**{len(failed)} controle(s) en echec : "
+            + ", ".join(f"`{c.name}`" for c in failed)
+            + "** — la release ne peut pas partir."
+        )
+    else:
+        lines.append(f"**Les {len(checks)} controles passent.**")
+    return "\n".join(lines) + "\n"
+
+
+def emit_job_summary(
+    tag: str,
+    repo: str,
+    sha: Optional[str],
+    checks: list[CheckResult],
+) -> None:
+    """Ecrit le resume dans $GITHUB_STEP_SUMMARY et annote les avertissements."""
+    for warning in (w for check in checks for w in check.warnings):
+        print(f"::warning title=Preflight::{warning}")
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(render_job_summary(tag, repo, sha, checks))
+    except OSError as e:
+        # Ne jamais faire echouer le preflight sur l'ecriture du resume : le
+        # verdict des controles prime.
+        print(f"::warning::resume du job non ecrit ({e})")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────
@@ -451,6 +738,11 @@ def main() -> int:
         help="run local counter-examples without GitHub or cargo",
     )
     ap.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="validate the author/committer Git would use for the next commit",
+    )
+    ap.add_argument(
         "--skip",
         default="",
         help="comma-separated check names to skip (advanced, use sparingly)",
@@ -464,10 +756,16 @@ def main() -> int:
 
     if args.self_test:
         self_test_p0_classification()
-        print("preflight P0 classification self-test: PASS")
+        self_test_identity_contract()
+        print("preflight self-tests: PASS")
         return 0
+    if args.identity_only:
+        result = check_planned_git_identity()
+        marker = "PASS" if result.passed else "FAIL"
+        print(f"[{marker}] {result.name} — {result.detail}")
+        return 0 if result.passed else 1
     if not args.version:
-        ap.error("--version is required unless --self-test is used")
+        ap.error("--version is required unless --self-test or --identity-only is used")
 
     tag = args.version
     if not tag.startswith("v"):
@@ -488,6 +786,7 @@ def main() -> int:
 
     run("semver", lambda: check_semver(tag))
     run("version_bump", lambda: check_version_bump(tag))
+    run("release_identity", check_release_commit_identity)
     run("no_p0_issues", lambda: check_no_p0_issues(repo, token))
     run("no_release_todos", check_no_release_todos)
     run("cahier_de_recette", lambda: check_cahier_de_recette(tag))
@@ -505,7 +804,10 @@ def main() -> int:
     for c in checks:
         marker = "[PASS]" if c.passed else "[FAIL]"
         print(f"  {marker}  {c.name:25s}  {c.detail}")
+        for w in c.warnings:
+            print(f"  [WARN]  {c.name:25s}  {w}")
     print("─" * 70)
+    emit_job_summary(tag, repo, sha, checks)
     failed = [c for c in checks if not c.passed]
     if failed:
         print(f"  → {len(failed)} check(s) failed: " + ", ".join(c.name for c in failed))

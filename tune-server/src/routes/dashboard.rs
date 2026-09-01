@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -199,7 +200,7 @@ async fn wrapped(
                 &year_end,
             ],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -219,7 +220,7 @@ async fn wrapped(
                 &year_end,
             ],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -243,7 +244,7 @@ async fn wrapped(
                 &year_end,
             ],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
         .collect();

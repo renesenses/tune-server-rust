@@ -213,8 +213,13 @@ pub fn rank_by_vector(
 /// dans un format analysable (FLAC…), on copie son embedding : même
 /// enregistrement, même acoustique.
 ///
-/// Jumelle = titre + artiste normalisés (lower/trim) identiques ET durée à
-/// ±1 s — la clé du dédoublonnage des résultats d'ambiance, en plus strict.
+/// Jumelle = titre + artiste normalisés via [`crate::library::track_matcher::normalize`]
+/// (casse, accents, suffixes d'édition « (Remastered) »/« (Deluxe) »/feat.,
+/// blancs surnuméraires) identiques ET durée à ±1 s. C'est la lettre de
+/// l'issue : un repiquage SACD est presque toujours étiqueté avec un suffixe
+/// d'édition que la FLAC ne porte pas — un simple lower/trim ne les
+/// appariait pas. La durée à ±1 s reste le discriminant qui écarte les
+/// autres versions (live/edit) une fois les suffixes tombés.
 /// La copie porte `source = 'inherited:<id>'` ; seuls les vecteurs ANALYSÉS
 /// du modèle courant servent de source (jamais d'héritage en chaîne). Au
 /// changement de modèle, les hérités du vieux modèle sont purgés puis
@@ -234,7 +239,7 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
 
     // 2. Cibles : pistes des formats exclus, sans embedding.
     let targets = match backend.query_many(
-        "SELECT t.id, lower(trim(t.title)), lower(trim(coalesce(a.name, ''))), t.duration_ms \
+        "SELECT t.id, t.title, coalesce(a.name, ''), t.duration_ms \
          FROM tracks t LEFT JOIN artists a ON a.id = t.artist_id \
          WHERE lower(t.format) IN ('dsd', 'dsf', 'dff', 'dsdiff') \
            AND NOT EXISTS (SELECT 1 FROM track_audio_embedding e WHERE e.track_id = t.id)",
@@ -250,7 +255,7 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
     // 3. Sources : vecteurs ANALYSÉS du modèle courant (métadonnées seules,
     //    pas les blobs — on ne les lit qu'au moment de copier).
     let sources = match backend.query_many(
-        "SELECT e.track_id, lower(trim(t.title)), lower(trim(coalesce(a.name, ''))), \
+        "SELECT e.track_id, t.title, coalesce(a.name, ''), \
                 t.duration_ms, e.analyzed_at \
          FROM track_audio_embedding e \
          JOIN tracks t ON t.id = e.track_id \
@@ -261,6 +266,7 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
         Ok(r) => r,
         Err(_) => return 0,
     };
+    let normalize = crate::library::track_matcher::normalize;
     let mut by_key: std::collections::HashMap<(String, String), Vec<(i64, i64, i64)>> =
         std::collections::HashMap::new();
     for r in &sources {
@@ -274,7 +280,7 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
         };
         let at = r.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
         by_key
-            .entry((title, artist))
+            .entry((normalize(&title), normalize(&artist)))
             .or_default()
             .push((id, dur, at));
     }
@@ -289,6 +295,7 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
         ) else {
             continue;
         };
+        let (title, artist) = (normalize(&title), normalize(&artist));
         if title.is_empty() {
             continue;
         }
@@ -380,6 +387,29 @@ mod inherit_tests {
 
         // Idempotent : rien de nouveau au second passage.
         assert_eq!(inherit_from_local_twins(&backend), 0);
+    }
+
+    #[test]
+    fn le_suffixe_d_edition_et_les_accents_ne_cachent_plus_la_jumelle() {
+        // La lettre de #1732 : normalisation via track_matcher::normalize.
+        // Un repiquage SACD étiqueté « (Remastered 2003) » avec un titre
+        // accentué doit trouver sa jumelle FLAC au titre nu — le lower/trim
+        // d'origine ne les appariait pas.
+        let backend = setup();
+        let flac = mk_track(&backend, "Deja Vu", "flac", 248_000);
+        let dsd = mk_track(&backend, "Déjà Vu (Remastered 2003)", "dsf", 248_300);
+        let v = store_analysed(&backend, flac);
+
+        assert_eq!(inherit_from_local_twins(&backend), 1);
+        assert_eq!(fetch_one(&backend, dsd).as_deref(), Some(v.as_slice()));
+        let src = backend
+            .query_one(
+                "SELECT source FROM track_audio_embedding WHERE track_id = ?",
+                &[&dsd as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        assert_eq!(src.as_deref(), Some(format!("inherited:{flac}").as_str()));
     }
 
     #[test]

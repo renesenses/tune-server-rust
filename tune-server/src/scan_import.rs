@@ -162,7 +162,69 @@ pub fn build_track_row(
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
     track.comments = meta.comment.clone();
+
+    // Dernière frontière avant TrackRepo. Le walker nettoie déjà les tags à
+    // leur lecture, mais ce constructeur est public et partagé avec l'auto-
+    // scan : aucun appelant ne doit pouvoir réintroduire un NUL ou un BOM dans
+    // une colonne texte. `file_path` reste l'adresse physique exacte ; la
+    // réécrire rendrait le fichier existant impossible à rouvrir.
+    let corrections = sanitize_track_row_text(&mut track);
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %sf.path,
+            corrections = ?corrections,
+            "scan_import_unsafe_text_sanitized_at_db_boundary"
+        );
+    }
     track
+}
+
+fn sanitize_track_row_text(track: &mut Track) -> Vec<tune_core::metadata::TextCorrection> {
+    fn clean(
+        field: &str,
+        value: &mut Option<String>,
+        corrections: &mut Vec<tune_core::metadata::TextCorrection>,
+    ) {
+        let Some(raw) = value.as_deref() else {
+            return;
+        };
+        let (sanitized, mut found) =
+            tune_core::metadata::sanitize_untrusted_single_line_text(raw, field);
+        if !found.is_empty() {
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+
+    let (title, mut corrections) =
+        tune_core::metadata::sanitize_untrusted_single_line_text(&track.title, "title");
+    if !corrections.is_empty() {
+        track.title = title;
+    }
+    clean("album_title", &mut track.album_title, &mut corrections);
+    clean("artist_name", &mut track.artist_name, &mut corrections);
+    clean("album_artist", &mut track.album_artist, &mut corrections);
+    clean("disc_subtitle", &mut track.disc_subtitle, &mut corrections);
+    clean("format", &mut track.format, &mut corrections);
+    clean("isrc", &mut track.isrc, &mut corrections);
+    clean("genre", &mut track.genre, &mut corrections);
+    clean("genres", &mut track.genres, &mut corrections);
+    clean("composer", &mut track.composer, &mut corrections);
+    clean("label", &mut track.label, &mut corrections);
+    clean(
+        "musicbrainz_recording_id",
+        &mut track.musicbrainz_recording_id,
+        &mut corrections,
+    );
+
+    if let Some(raw) = track.comments.as_deref() {
+        let (sanitized, mut found) = tune_core::metadata::sanitize_untrusted_text(raw, "comments");
+        if !found.is_empty() {
+            track.comments = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+    }
+    corrections
 }
 
 /// Batch-stateful importer that resolves a scanned file's artist and album in
@@ -557,46 +619,34 @@ impl TrackImporter {
         }
 
         // Check for a local artist image (artist.jpg/png next to the tracks).
+        //
+        // La mise en cache est passée dans `tune_core::library::artwork` pour
+        // être adressée par le CONTENU (#1444) et testable : la même
+        // `artist.jpg` recopiée dans les N dossiers d'album d'un artiste
+        // n'écrit plus qu'UNE entrée de cache. L'entrée héritée, adressée par
+        // le chemin, reste sondée d'abord — aucune URL déjà distribuée ne
+        // bouge. Rien n'est enregistré si l'écriture du cache échoue, sinon la
+        // base annonce « a une image » sans rien sur le disque (carré gris +
+        // saut définitif).
         if let Some(ref art) = track_artist {
             if art.image_path.is_none() {
-                if let Some(parent) = std::path::Path::new(&sf.path).parent() {
-                    for name in &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"] {
-                        let candidate = parent.join(name);
-                        if candidate.exists() {
-                            let hash = tune_core::library::artwork::artwork_hash(
-                                &candidate.to_string_lossy(),
-                            );
-                            let ext = candidate
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("jpg");
-                            // Only record the image if the cache write succeeded —
-                            // otherwise the DB claims "has image" with nothing on
-                            // disk (grey square + permanent skip).
-                            let saved = std::fs::read(&candidate).ok().and_then(|data| {
-                                tune_core::library::artwork::save_to_cache(
-                                    &data,
-                                    &self.cache_dir,
-                                    &hash,
-                                    ext,
-                                )
-                            });
-                            if saved.is_none() {
-                                tracing::warn!(
-                                    artist = %art.name,
-                                    candidate = %candidate.display(),
-                                    "artist_image_cache_write_failed_not_recording"
-                                );
-                                continue;
-                            }
-                            let mut updated_artist = tune_core::db::models::Artist::clone(art);
-                            updated_artist.image_path = Some(hash);
-                            updated_artist.image_source = Some("local".to_string());
-                            if let Err(e) = self.artist_repo.update(&updated_artist) {
-                                tracing::warn!(error = %e, "artist_image_update_failed");
-                            }
-                            break;
+                match tune_core::library::artwork::folder_artist_image_hash(
+                    std::path::Path::new(&sf.path),
+                    &self.cache_dir,
+                ) {
+                    Some(hash) => {
+                        let mut updated_artist = tune_core::db::models::Artist::clone(art);
+                        updated_artist.image_path = Some(hash);
+                        updated_artist.image_source = Some("local".to_string());
+                        if let Err(e) = self.artist_repo.update(&updated_artist) {
+                            tracing::warn!(error = %e, "artist_image_update_failed");
                         }
+                    }
+                    None => {
+                        tracing::trace!(
+                            artist = %art.name,
+                            "artist_image_absente_ou_non_mise_en_cache"
+                        );
                     }
                 }
             }
@@ -644,6 +694,7 @@ mod tests {
         ScannedFile {
             path: path.to_string(),
             metadata: None,
+            unsupported: None,
             audio_hash: Some("hash-1".into()),
             file_size: 4096,
             mtime: 1_700_000_000,
@@ -951,5 +1002,63 @@ mod tests {
         assert_eq!(track.duration_ms, 0);
         assert_eq!(track.genres, None);
         assert_eq!(track.composer, None);
+    }
+
+    #[test]
+    fn build_track_row_ne_persiste_aucun_nul_ni_bom_hors_adresse_physique() {
+        let meta = TrackMetadata {
+            title: Some("Titre\0cache".into()),
+            album: Some("Album\u{feff}Live".into()),
+            album_artist: Some("Lisa\0Strings".into()),
+            disc_subtitle: Some("Disque\u{feff}I".into()),
+            format: Some("flac\0".into()),
+            isrc: Some("FR\u{feff}123".into()),
+            genre: Some("Jazz\0Fusion".into()),
+            genres: vec!["Jazz\u{feff}Fusion".into()],
+            credits: vec![TrackCredit {
+                name: "Miles\0Davis".into(),
+                role: "composer".into(),
+                instrument: None,
+            }],
+            label: Some("Columbia\u{feff}Records".into()),
+            musicbrainz_recording_id: Some("rec\0id".into()),
+            comment: Some("ligne 1\nligne\0 2".into()),
+            ..Default::default()
+        };
+        let scanned = sf("/m/Jacobs, Lisa\u{feff}The Strings/01.flac");
+        let track = build_track_row(
+            &meta,
+            &scanned,
+            Some(7),
+            Some(3),
+            "Lisa\0\u{feff}The Strings",
+        );
+
+        let persisted_text = [
+            Some(track.title.as_str()),
+            track.album_title.as_deref(),
+            track.artist_name.as_deref(),
+            track.album_artist.as_deref(),
+            track.disc_subtitle.as_deref(),
+            track.format.as_deref(),
+            track.isrc.as_deref(),
+            track.genre.as_deref(),
+            track.genres.as_deref(),
+            track.composer.as_deref(),
+            track.label.as_deref(),
+            track.musicbrainz_recording_id.as_deref(),
+            track.comments.as_deref(),
+        ];
+        assert!(
+            persisted_text
+                .into_iter()
+                .flatten()
+                .all(|value| !value.contains(['\0', '\u{feff}']))
+        );
+        assert_eq!(track.comments.as_deref(), Some("ligne 1\nligne 2"));
+        assert_eq!(
+            track.file_path.as_deref(),
+            Some("/m/Jacobs, Lisa\u{feff}The Strings/01.flac")
+        );
     }
 }

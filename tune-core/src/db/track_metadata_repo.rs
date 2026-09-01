@@ -55,6 +55,18 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+
+    /// One key, many tracks, ONE query. `id_list` is a comma-joined list of
+    /// trusted i64 ids (see `TrackRepo::list_by_ids` for the same rationale):
+    /// inlining them avoids a variable-length placeholder list that would have
+    /// to be built differently for each dialect. Only `key` is bound.
+    pub fn get_key_for_tracks<D: SqlDialect>(d: &D, id_list: &str) -> String {
+        format!(
+            "SELECT track_id, value FROM track_metadata \
+             WHERE key = {} AND track_id IN ({id_list})",
+            d.placeholder(1)
+        )
+    }
 }
 
 pub struct TrackMetadataRepo {
@@ -92,6 +104,48 @@ impl TrackMetadataRepo {
             let value = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
             if !key.is_empty() {
                 map.insert(key, value);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Read ONE extended-metadata key for a whole set of tracks in a single
+    /// query, e.g. `grouping` for every track of an album (#2130).
+    ///
+    /// Values that are empty or whitespace-only are dropped, so a present-but-
+    /// blank tag is indistinguishable from an absent one — the caller can treat
+    /// "no entry" as "nothing to display". An empty `track_ids` runs no query
+    /// at all; otherwise `track_id IN (…) AND key = ?` is served by the table's
+    /// own primary key `(track_id, key)`, so the cost is one index seek per
+    /// track and zero rows returned when nobody carries the key — which is what
+    /// GROUPING costs today on the libraries measured for #2130.
+    pub fn get_key_for_tracks(
+        &self,
+        key: &str,
+        track_ids: &[i64],
+    ) -> Result<HashMap<i64, String>, String> {
+        if track_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let id_list = track_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = self.dialect_sql(
+            |d| sql::get_key_for_tracks(d, &id_list),
+            |d| sql::get_key_for_tracks(d, &id_list),
+        );
+        let params: [&dyn ToSqlValue; 1] = [&key];
+        let rows = self.db.query_many(&sql, &params)?;
+        let mut map = HashMap::new();
+        for cols in rows {
+            let Some(track_id) = cols.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let value = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+            if !value.trim().is_empty() {
+                map.insert(track_id, value);
             }
         }
         Ok(map)
@@ -328,6 +382,79 @@ mod tests {
 
         let results = repo.search_by_value("deutsche", 10).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// Deux pistes, un seul appel : la clé demandée est ramenée pour chaque
+    /// piste qui la porte, et pour elle seule (#2130).
+    fn setup_db_two_tracks() -> SqliteDb {
+        let db = setup_db();
+        db.execute_batch(
+            "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, disc_number, track_number, channels)
+             VALUES (2, 'Test Track 2', 1, 1, 300000, 1, 2, 2);
+             INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, disc_number, track_number, channels)
+             VALUES (3, 'Test Track 3', 1, 1, 300000, 1, 3, 2);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn get_key_for_tracks_reads_one_key_across_tracks() {
+        let db = setup_db_two_tracks();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "grouping", "Sonates").unwrap();
+        repo.set(2, "grouping", "Bonus").unwrap();
+        repo.set(1, "composer", "Bach").unwrap();
+
+        let map = repo.get_key_for_tracks("grouping", &[1, 2, 3]).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&1).unwrap(), "Sonates");
+        assert_eq!(map.get(&2).unwrap(), "Bonus");
+        assert!(map.get(&3).is_none());
+    }
+
+    #[test]
+    fn get_key_for_tracks_ignores_tracks_outside_the_id_list() {
+        let db = setup_db_two_tracks();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "grouping", "Sonates").unwrap();
+        repo.set(2, "grouping", "Bonus").unwrap();
+
+        let map = repo.get_key_for_tracks("grouping", &[2]).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&2).unwrap(), "Bonus");
+    }
+
+    #[test]
+    fn get_key_for_tracks_drops_blank_values() {
+        let db = setup_db_two_tracks();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "grouping", "   ").unwrap();
+        repo.set(2, "grouping", "").unwrap();
+
+        let map = repo.get_key_for_tracks("grouping", &[1, 2]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    /// Une liste d'identifiants vide rend une carte vide, sans erreur.
+    ///
+    /// ⚠️ Ce test ne prouve PAS le court-circuit `track_ids.is_empty()` : SQLite
+    /// accepte `IN ()` et le tient pour toujours faux, si bien que retirer le
+    /// court-circuit laisse ce test vert (vérifié par mutation le 28/08/2026).
+    /// Le court-circuit reste indispensable pour PostgreSQL, où `IN ()` est une
+    /// erreur de syntaxe — et ce banc de test ne parle que SQLite. Ne pas le
+    /// retirer en se fiant à cette couverture.
+    #[test]
+    fn get_key_for_tracks_empty_ids_returns_empty_map() {
+        let db = setup_db_two_tracks();
+        let repo = TrackMetadataRepo::new(db);
+        repo.set(1, "grouping", "Sonates").unwrap();
+
+        let map = repo.get_key_for_tracks("grouping", &[]).unwrap();
+        assert!(map.is_empty());
     }
 
     #[test]

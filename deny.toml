@@ -17,7 +17,13 @@ ignore = [
     # instant 0.1 — unmaintained (RUSTSEC-2024-0384), superseded by web-time.
     # Transitive only. No vulnerability; a native build never hits its wasm path.
     "RUSTSEC-2024-0384",
-    # audiopus_sys 0.2.2 — unmaintained (RUSTSEC-2026-0150). Tiré par audiopus,
+    # RETIRÉ (#2251) — audiopus_sys 0.2.2 / RUSTSEC-2026-0150 : la dépendance
+    # n'existe plus. `tune-core` passe désormais par `opus 0.4.0` (liaison sûre)
+    # au-dessus d'`opusic-sys 0.7.5`, qui embarque libopus 1.6.1 ; les deux sont
+    # maintenus. Le commentaire d'origine est conservé ci-dessous, en historique
+    # de ce qui a été payé pour vivre avec la crate abandonnée :
+    #
+    # « audiopus_sys 0.2.2 — unmaintained (RUSTSEC-2026-0150). Tiré par audiopus,
     # lui-même dépendance de tune-ffi et tune-karaoke. C'est une crate `-sys` de
     # liaison vers libopus : elle n'a pas de code d'exécution propre, et aucune
     # vulnérabilité n'est signalée — seulement l'absence de mainteneur.
@@ -26,7 +32,20 @@ ignore = [
     # la 0.9.58, sans que personne puisse le savoir : le rapport n'affichait que
     # les avertissements de doublons, jamais l'erreur. À revisiter si audiopus
     # migre, ou si un jour un CVE tombe dessus — auquel cas cette ligne saute.
-    "RUSTSEC-2026-0150",
+    #
+    # Précision d'inventaire (#2251) : la dépendance n'est PAS que mobile.
+    # `audiopus` est une dépendance dure, non optionnelle et non conditionnée à
+    # la cible, de `tune-core` — donc de TOUTES les cibles livrées, du .so
+    # Android au binaire Windows. Le seul défaut concret que l'avis reproche
+    # (un `cmake_minimum_required` antérieur à 3.5, que CMake 4.x refuse) est
+    # déjà neutralisé ici : `.cargo/config.toml` pose
+    # `CMAKE_POLICY_VERSION_MINIMUM=3.5` pour tous les builds, `Cross.toml` le
+    # repasse dans le conteneur musl. Le remplacement lui-même reste un
+    # arbitrage ouvert — options et coûts dans #2251.
+    #
+    # Cette liste doit rester identique à celle de `.cargo/audit.toml` et à
+    # l'entrée `ignore:` du job `audit` de `.github/workflows/ci.yml`. »
+    #
     # NOTE: the wasmtime advisories RUSTSEC-2026-0222/0223 were resolved by the
     # bump to wasmtime 47.0.3 and are no longer ignored.
 ]

@@ -9,7 +9,7 @@ use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
@@ -95,6 +95,34 @@ fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
 
     // Ultimate fallback
     16
+}
+
+/// La profondeur du **conteneur** PCM qui portera une source de `bd` bits.
+///
+/// Tout ce qui est en aval — l'en-tête WAV, `convert_pcm_bit_depth`,
+/// `StreamingPcmByteAdapter` — ne sait écrire que 16, 24 ou 32 bits, et le
+/// contrôle existait déjà sur la **cible** (`stream target bit depth …`,
+/// `PCM source bit depth …`) mais nulle part sur la profondeur **lue dans le
+/// fichier** : `resolve_bit_depth` rend `bits_per_sample` sans le borner.
+///
+/// On arrondit vers le **haut**, jamais vers le bas : le décalage de
+/// droitisation devient `32 - conteneur`, si bien qu'une source de 20 bits est
+/// droitisée sur 24 avec quatre zéros en poids faibles. Aucun bit n'est perdu,
+/// et la largeur annoncée redevient celle des octets réellement écrits — c'est
+/// ce désaccord-là qui faisait lire des trames de 32 bits dans des octets de
+/// 16 (#2157).
+///
+/// La même règle vaut pour la profondeur **de sortie** négociée par
+/// l'orchestrateur : `encode_wav`, `pcm_to_i32` (FLAC) et `convert_pcm_bit_depth`
+/// n'écrivent que 16, 24 ou 32 bits. Une cible hors de cet ensemble n'est pas
+/// « approximative », elle est ININSCRIPTIBLE — voir `transcode_source_to_file`
+/// (#1437).
+pub(crate) fn container_bit_depth(bd: u16) -> u16 {
+    match bd {
+        0..=16 => 16,
+        17..=24 => 24,
+        _ => 32,
+    }
 }
 
 /// Rebuild the decoder after `Error::ResetRequired` from `next_packet`.
@@ -499,6 +527,32 @@ fn pcm_bytes_to_i32(data: &[u8], bit_depth: u16) -> Result<Vec<i32>, String> {
     Ok(samples)
 }
 
+/// Requantifier un échantillon **droitisé** de `from_bd` vers `to_bd` bits.
+///
+/// Droitisé veut dire qu'un échantillon de 24 bits occupe les bits 0..23 du
+/// `i32`. Passer d'une profondeur à l'autre est donc un décalage — et **ce
+/// décalage EST le niveau**. L'omettre ne perd pas un bit de poids faible : il
+/// laisse l'échantillon `to_bd - from_bd` rangs trop bas, c'est-à-dire une
+/// division par `2^(to_bd - from_bd)`.
+///
+/// La table précédente n'énumérait que 16, 24 et 32 et rendait l'échantillon
+/// **inchangé** pour toute autre profondeur source. Or `resolve_bit_depth` rend
+/// `bits_per_sample` tel quel, et FLAC, WAV, AIFF et WavPack déclarent
+/// légalement 8, 12 ou 20 bits. La sortie locale (cpal/WASAPI) est la seule à
+/// demander `to_bd = 32` : une source de 20 bits y sortait donc `2^12` fois
+/// trop bas, soit **−72 dB** — audible mais noyé, exactement « son très très
+/// faible quasi inaudible » (#2157). En 16 bits de sortie, le même trou faisait
+/// pire : `*s as i16` tronquait un mot de 20 bits et **repliait** le signal.
+fn requantize(sample: i32, from_bd: u16, to_bd: u16) -> i32 {
+    let from = from_bd.clamp(1, 32);
+    let to = to_bd.clamp(1, 32);
+    if to >= from {
+        sample << (to - from)
+    } else {
+        sample >> (from - to)
+    }
+}
+
 /// Convert right-justified i32 samples from one bit depth to another,
 /// producing raw PCM bytes at the target depth.
 ///
@@ -509,40 +563,21 @@ pub(super) fn convert_pcm_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -
         24 => samples
             .iter()
             .map(|s| {
-                let v = match from_bd {
-                    32 => *s >> 8,
-                    16 => (*s as i32) << 8,
-                    _ => *s,
-                };
-                let b = v.to_le_bytes();
+                let b = requantize(*s, from_bd, 24).to_le_bytes();
                 [b[0], b[1], b[2]]
             })
             .flat_map(|a| a.into_iter())
             .collect(),
         32 => samples
             .iter()
-            .map(|s| {
-                let v = match from_bd {
-                    24 => *s << 8,
-                    16 => (*s as i32) << 16,
-                    _ => *s,
-                };
-                v.to_le_bytes()
-            })
+            .map(|s| requantize(*s, from_bd, 32).to_le_bytes())
             .flat_map(|a| a.into_iter())
             .collect(),
         _ => {
             // 16-bit output
             samples
                 .iter()
-                .flat_map(|s| {
-                    let v = match from_bd {
-                        32 => (*s >> 16) as i16,
-                        24 => (*s >> 8) as i16,
-                        _ => *s as i16,
-                    };
-                    v.to_le_bytes()
-                })
+                .flat_map(|s| (requantize(*s, from_bd, 16) as i16).to_le_bytes())
                 .collect()
         }
     }
@@ -586,29 +621,17 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
 }
 
 pub fn can_decode_native(file_path: &str) -> bool {
-    let ext = Path::new(file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    matches!(
-        ext.as_str(),
-        "flac"
-            | "mp3"
-            | "wav"
-            | "m4a"
-            | "aac"
-            | "alac"
-            | "ogg"
-            | "oga"
-            | "opus"
-            | "aiff"
-            | "aif"
-            | "dsf"
-            | "dff"
-            | "wv"
-            | "ape"
-    )
+    super::support::native_decoder_supports_file(Path::new(file_path))
+}
+
+fn reject_unsupported_library_audio(file_path: &str) -> Result<(), String> {
+    match super::support::decoder_rejection(Path::new(file_path)) {
+        Some(unsupported) => Err(format!(
+            "format non pris en charge : {} ({})",
+            unsupported.report_key, unsupported.reason
+        )),
+        None => Ok(()),
+    }
 }
 
 fn is_wavpack(file_path: &str) -> bool {
@@ -782,37 +805,43 @@ fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
 /// Le chemin vit-il sur un montage RÉSEAU ?
 ///
 /// Décision par le type de système de fichiers du point de montage, lu dans
-/// `/proc/mounts` (Linux) ou via `statfs` (macOS). En cas de doute — type
+/// `/proc/mounts` (Linux/Android) ou via `statfs` (plateformes Apple). En cas de doute — type
 /// inconnu, lecture impossible — on répond `false` : ne pas copier est le
 /// choix le moins coûteux, le décodeur lira sur place.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
-            return false;
-        };
-        montage_reseau_depuis_mounts(&mounts, &chemin.to_string_lossy())
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    montage_reseau_depuis_mounts(&mounts, &chemin.to_string_lossy())
+}
+
+#[cfg(target_vendor = "apple")]
+fn chemin_sur_montage_reseau(chemin: &Path) -> bool {
+    // Darwin : statfs donne le nom du système de fichiers.
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let Ok(c) = CString::new(chemin.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut st = MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // macOS : statfs donne le nom du système de fichiers.
-        use std::ffi::CString;
-        use std::mem::MaybeUninit;
-        let Ok(c) = CString::new(chemin.as_os_str().as_encoded_bytes()) else {
-            return false;
-        };
-        let mut st = MaybeUninit::<libc::statfs>::uninit();
-        if unsafe { libc::statfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
-            return false;
-        }
-        let st = unsafe { st.assume_init() };
-        let genre = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }
-            .to_string_lossy()
-            .to_lowercase();
-        const TYPES_RESEAU_MAC: &[&str] = &["nfs", "smbfs", "webdav", "afpfs", "cifs", "ftp", "9p"];
-        TYPES_RESEAU_MAC.iter().any(|t| genre == *t)
-    }
+    let st = unsafe { st.assume_init() };
+    let genre = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .to_lowercase();
+    const TYPES_RESEAU_MAC: &[&str] = &["nfs", "smbfs", "webdav", "afpfs", "cifs", "ftp", "9p"];
+    TYPES_RESEAU_MAC.iter().any(|t| genre == *t)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn chemin_sur_montage_reseau(_chemin: &Path) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1014,6 +1043,10 @@ pub fn decode_to_pcm(
     if let Some(channels) = target_channels {
         checked_channels(channels, "requested PCM format")?;
     }
+    // Même contrat que le scanner : un fichier exclu du catalogue ne peut pas
+    // redevenir implicitement « transcodable » sur un autre chemin de lecture.
+    // Pour DFF, l'en-tête distingue ici DSD brut de DST compressé.
+    reject_unsupported_library_audio(file_path)?;
     // Stage network/external sources to a fast local temp before decoding so the
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
@@ -1059,11 +1092,6 @@ pub fn decode_to_pcm(
             decode_ape_to_pcm(&fp, seek_s, max_duration_s)
         }))
         .unwrap_or_else(|_| Err("ape: decoder panicked (corrupt file?)".into()))
-    } else if ext == "wma" || ext == "asf" {
-        // WMA/ASF partait vers ffmpeg — un binaire externe retiré du projet.
-        Err(format!(
-            "format non pris en charge : {ext} (WMA/ASF n'a plus de decodeur depuis le retrait de ffmpeg)"
-        ))
     // Ogg-Vorbis / Ogg-FLAC (.ogg / .oga) is decoded NATIVELY by symphonia (the
     // "ogg" demuxer + "vorbis"/"flac" codec features are enabled). Il n'existe
     // plus aucun repli externe : tout ce qui n'est pas décodé ici l'est par
@@ -1080,7 +1108,7 @@ pub fn decode_to_pcm(
         || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
     {
         // symphonia demuxes the container (mkv/ogg features) but has no Opus
-        // decoder, so the packets are fed to libopus via audiopus. This gives
+        // decoder, so the packets are fed to libopus via the `opus` crate. This gives
         // native Opus playback and restores YouTube→DLNA sound (forum #940).
         decode_opus_to_pcm(file_path, None, None, seek_s, max_duration_s)
     } else {
@@ -1126,7 +1154,7 @@ fn ogg_stream_is_opus(file_path: &str) -> bool {
 ///
 /// symphonia demuxes the WebM/Ogg container (the `mkv`/`ogg` features) but has
 /// no Opus codec, so we pull the raw Opus packets and decode them with libopus
-/// (audiopus). Opus is always 48 kHz internally; we return native 48 kHz / 16
+/// (the `opus` crate). Opus is always 48 kHz internally; we return native 48 kHz / 16
 /// bit and let the caller's encoder follow that rate. This gives native .opus /
 /// Ogg-Opus playback and restores YouTube→DLNA audio (forum #940 and the
 /// Opus/Ogg-Vorbis support request): before this, Opus streams decoded to
@@ -1148,10 +1176,7 @@ fn decode_opus_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    use audiopus::{
-        Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder,
-        packet::Packet as OpusPacket,
-    };
+    use opus::{Channels, Decoder as OpusDecoder};
 
     let file = File::open(file_path).map_err(|e| format!("open opus: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -1171,10 +1196,10 @@ fn decode_opus_to_pcm(
     let track = format
         .default_track(TrackType::Audio)
         .ok_or("opus: no audio track")?;
-    let track_id = track.id;
+    let mut track_id = track.id;
     // Timebase to map packet.pts → sample index @ 48 kHz. Opus is always
     // 1/48000, but honour the container's declared timebase if present.
-    let time_base = track.time_base;
+    let mut time_base = track.time_base;
     let ch: usize = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => {
             p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
@@ -1190,7 +1215,7 @@ fn decode_opus_to_pcm(
 
     // Coarse container seek to land near the target page before sample-accurate
     // skipping. Best-effort: on failure we still skip from the start via pts.
-    let skip_frames: i64 = if seek_s > 0.0 {
+    let mut skip_frames: i64 = if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         if let Some(time) = Time::try_new(seconds, nanos) {
@@ -1207,8 +1232,8 @@ fn decode_opus_to_pcm(
         0
     };
 
-    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, channels_enum)
-        .map_err(|e| format!("opus decoder init: {e}"))?;
+    let mut decoder =
+        OpusDecoder::new(48_000, channels_enum).map_err(|e| format!("opus decoder init: {e}"))?;
 
     // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
     let mut out_buf = vec![0i16; 5760 * ch];
@@ -1226,6 +1251,52 @@ fn decode_opus_to_pcm(
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => {
+                // Chained Ogg-Opus boundary (icecast rip, concatenated files).
+                // Symphonia's OggReader starts a new physical stream and
+                // returns `ResetRequired`; treating it as EOF truncated the
+                // track to its first link — the output signalled a natural end
+                // a few seconds in and the poller replayed the head of the
+                // track over and over (#1270, « boucle de 2-3 s »). The
+                // Vorbis/FLAC-in-Ogg path got this guard in #1632
+                // (`rebuild_decoder_after_ogg_chain_reset`); this is the same
+                // guard specialised for libopus: re-fetch the track, rebuild
+                // the decoder, keep pulling packets.
+                let Some(track) = format.default_track(TrackType::Audio) else {
+                    break;
+                };
+                let new_ch = match &track.codec_params {
+                    Some(CodecParameters::Audio(p)) => {
+                        p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+                    }
+                    _ => 2,
+                }
+                .clamp(1, 2);
+                if new_ch != ch {
+                    // The PCM contract (channel count) is already announced —
+                    // a mid-stream layout change cannot be represented. Stop
+                    // at the boundary, which is the pre-fix behaviour.
+                    tracing::warn!(
+                        file = file_path,
+                        expect_channels = ch,
+                        channels = new_ch,
+                        "ogg_opus_chain_params_changed_stopping_at_boundary"
+                    );
+                    break;
+                }
+                let Ok(dec) = OpusDecoder::new(48_000, channels_enum) else {
+                    break;
+                };
+                decoder = dec;
+                track_id = track.id;
+                time_base = track.time_base;
+                // The seek point was consumed in the first link and pts
+                // restarts at 0 in the new physical stream — never re-skip,
+                // or the head of every following link would be dropped.
+                skip_frames = 0;
+                debug!(file = file_path, track_id, "ogg_opus_chain_decoder_rebuilt");
+                continue;
+            }
             Err(_) => break,
         };
         if packet.track_id != track_id {
@@ -1242,15 +1313,16 @@ fn decode_opus_to_pcm(
             }
             None => packet.pts.get(),
         };
-        let opus_pkt = match OpusPacket::try_from(&packet.data[..]) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let sig = match MutSignals::try_from(&mut out_buf[..]) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("opus output buffer: {e}")),
-        };
-        let n = match decoder.decode(Some(opus_pkt), sig, false) {
+        // `opus::Decoder::decode` prend les octets du paquet tels quels et rend
+        // le nombre d'échantillons PAR CANAL — même contrat que l'`audiopus`
+        // qu'il remplace (#2251). Les enveloppes `Packet` / `MutSignals`
+        // d'`audiopus` ne faisaient que valider « paquet non vide » et « tampon
+        // de sortie dimensionnable » : le premier est déjà garanti par le
+        // `packet.data.is_empty()` ci-dessus, le second par `out_buf`, alloué à
+        // 5760 échantillons par canal (la plus grande trame Opus @ 48 kHz).
+        // Un paquet illisible reste ignoré plutôt que fatal : un Ogg concaténé
+        // peut porter des pages parasites à la jonction de deux flux.
+        let n = match decoder.decode(&packet.data, &mut out_buf, false) {
             Ok(n) => n,
             Err(_) => continue,
         };
@@ -1312,6 +1384,7 @@ pub fn decode_to_pcm_streaming(
         None,
         None,
         0.0,
+        None,
     )
 }
 
@@ -1333,6 +1406,7 @@ pub fn decode_to_pcm_streaming_with_notify(
         Some(data_ready),
         None,
         0.0,
+        None,
     )
 }
 
@@ -1356,6 +1430,7 @@ pub fn decode_to_pcm_streaming_with_levels(
         Some(data_ready),
         Some(levels_tx),
         0.0,
+        None,
     )
 }
 
@@ -1380,6 +1455,37 @@ pub fn decode_to_pcm_streaming_seeked(
         Some(data_ready),
         Some(levels_tx),
         seek_s,
+        None,
+    )
+}
+
+/// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
+/// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
+/// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
+pub fn decode_http_range_to_pcm_streaming_seeked(
+    source: super::http_range::HttpRangeSource,
+    codec_hint: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    let source_name = format!("flux-distant.{codec_hint}");
+    decode_to_pcm_streaming_inner(
+        &source_name,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
+        Some(Box::new(source)),
     )
 }
 
@@ -1393,6 +1499,7 @@ fn decode_to_pcm_streaming_inner(
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
+    source_override: Option<Box<dyn MediaSource>>,
 ) -> Result<(u16, u32), String> {
     if target_sample_rate == Some(0) {
         return Err("stream target sample rate must be greater than zero".into());
@@ -1407,6 +1514,7 @@ fn decode_to_pcm_streaming_inner(
             "stream target bit depth {bit_depth} is unsupported (expected 16, 24 or 32)"
         ));
     }
+    reject_unsupported_library_audio(file_path)?;
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -1469,7 +1577,7 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Opus (native .opus / Ogg-Opus, or Opus-in-WebM) has no symphonia codec —
-    // it is decoded with libopus (audiopus) via decode_to_pcm, then streamed as
+    // it is decoded with libopus (the `opus` crate) via decode_to_pcm, then streamed as
     // chunks. Before this the streaming path fed Opus to symphonia's
     // make_audio_decoder, which failed → the stream produced no audio and (for
     // local files) looped every ~2 s. `.ogg`/`.oga` is sniffed: OpusHead → here,
@@ -1540,7 +1648,7 @@ fn decode_to_pcm_streaming_inner(
 
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
-    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape" | "wma" | "asf") {
+    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -1608,8 +1716,20 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
-    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = if let Some(source) = source_override {
+        MediaSourceStream::new(source, Default::default())
+    } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+        let source = crate::audio::staged_growth::SeekableGrowingSource::open(file_path, growth)
+            .map_err(|e| format!("open (staged growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
+            .map_err(|e| format!("open (growing): {e}"))?;
+        MediaSourceStream::new(Box::new(source), Default::default())
+    } else {
+        let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+        MediaSourceStream::new(Box::new(file), Default::default())
+    };
 
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
@@ -1645,7 +1765,10 @@ fn decode_to_pcm_streaming_inner(
         .map_err(|e| format!("decoder: {e}"))?;
 
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
-    let source_bd = resolve_bit_depth(&audio_params);
+    // Borné au conteneur PCM : c'est cette valeur qui sert AUSSI de `shift`
+    // de droitisation et de `from_bd` de conversion, les trois doivent donc
+    // désigner la même largeur d'octets (#2157).
+    let source_bd = container_bit_depth(resolve_bit_depth(&audio_params));
     let shift = 32u16.saturating_sub(source_bd);
 
     // Use target_bit_depth if provided, otherwise use the source's native depth.
@@ -2347,7 +2470,10 @@ fn decode_symphonia(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    let source_bd = resolve_bit_depth(&audio_params);
+    // Borné au conteneur PCM : c'est cette valeur qui sert AUSSI de `shift`
+    // de droitisation et de `from_bd` de conversion, les trois doivent donc
+    // désigner la même largeur d'octets (#2157).
+    let source_bd = container_bit_depth(resolve_bit_depth(&audio_params));
 
     // Seek if requested. On a non-seekable source (e.g. a FLAC over SMB with no
     // seektable) `format.seek` fails and the reader stays at position 0. If we
@@ -3147,12 +3273,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // chunk->i32 conversion and in-place trim. No real .dsf fixtures existed.
     #[test]
     fn decode_dsf_end_to_end_silence() {
-        let path = std::env::temp_dir().join("tune_test_dsf_silence.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x55 = 01010101, LSB-first -> alternating +1/-1 -> near silence.
         write_test_dsf(p, 0x55);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(out.sample_rate, 176_400);
         assert_eq!(out.bit_depth, 24);
@@ -3173,12 +3299,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_end_to_end_negative_dc() {
-        let path = std::env::temp_dir().join("tune_test_dsf_negdc.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         // 0x00 = all bits 0 -> all -1.0 -> strong negative DC.
         write_test_dsf(p, 0x00);
         let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!out.samples_i32.is_empty());
         let mid = out.samples_i32[out.samples_i32.len() / 2];
@@ -3190,12 +3316,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[test]
     fn decode_dsf_stereo_vers_mono_respecte_les_trames() {
-        let path = std::env::temp_dir().join("tune_test_dsf_mono_contract.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let stereo = decode_to_pcm(p, Some(176_400), None, 0.0, 0.0).unwrap();
         let mono = decode_to_pcm(p, Some(176_400), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(stereo.channels, 2);
         assert_eq!(mono.channels, 1);
@@ -3209,7 +3335,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_dsf_mono_entete_et_payload_sont_alignes() {
-        let path = std::env::temp_dir().join("tune_test_dsf_stream_mono.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         write_test_dsf(path.to_str().unwrap(), 0x55);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3224,6 +3351,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
@@ -3232,7 +3360,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         assert_eq!(decoder.await.unwrap().unwrap(), (24, 176_400));
-        std::fs::remove_file(path).ok();
 
         let header = chunks.first().expect("WAV header DSD->PCM");
         assert_eq!(u16::from_le_bytes([header[22], header[23]]), 1);
@@ -3259,12 +3386,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     // instead of converting all of it and trimming (the DSD hang, Sandro's DSF).
     #[test]
     fn decode_dsf_bounded_stops_early() {
-        let path = std::env::temp_dir().join("tune_test_dsf_bounded.dsf");
+        let dsf = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        let path = dsf.path().to_path_buf();
         let p = path.to_str().unwrap();
         write_test_dsf(p, 0x55);
         let full = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
         let bounded = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.005).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert!(!bounded.samples_i32.is_empty());
         assert!(
@@ -3296,7 +3423,24 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(can_decode_native("song.dff"));
         assert!(can_decode_native("song.ape"));
         assert!(can_decode_native("song.wv"));
-        assert!(!can_decode_native("song.wma")); // WMA requires external FFmpeg
+        assert!(!can_decode_native("song.wma")); // aucun décodeur WMA livré
+    }
+
+    #[test]
+    fn dff_dst_n_est_jamais_annonce_ni_envoye_comme_decodable() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tune_decode_dff_dst_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("album.dff");
+        std::fs::write(&path, super::super::support::dff_dst_minimal_fixture()).unwrap();
+
+        assert!(!can_decode_native(path.to_str().unwrap()));
+        let error = match decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0) {
+            Ok(_) => panic!("un DFF/DST ne doit jamais atteindre le décodeur DSD brut"),
+            Err(error) => error,
+        };
+        assert!(error.contains("aucun décodeur DST"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3334,13 +3478,11 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// payload doivent raconter la même chose.
     #[test]
     fn la_cible_est_un_contrat_sur_le_payload_symphonia() {
-        let dir = std::env::temp_dir().join("tune_target_decode");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("stereo_96000_24.wav");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stereo_96000_24.wav");
         ecrire_wav_96k_24_stereo(&path, 9_600);
 
         let d = decode_to_pcm(path.to_str().unwrap(), Some(44_100), Some(1), 0.0, 0.0).unwrap();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(d.sample_rate, 44_100);
         assert_eq!(d.channels, 1);
@@ -3353,7 +3495,8 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_wav_entete_et_payload_partagent_le_format_cible() {
-        let path = std::env::temp_dir().join("tune_stream_target_96000_24.wav");
+        let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = wav.path().to_path_buf();
         ecrire_wav_96k_24_stereo(&path, 9_600);
         let path_for_decode = path.to_string_lossy().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -3368,6 +3511,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
                 None,
                 None,
                 0.0,
+                None,
             )
         });
 
@@ -3376,7 +3520,6 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             chunks.push(chunk);
         }
         let result = decoder.await.unwrap().unwrap();
-        std::fs::remove_file(path).ok();
 
         assert_eq!(result, (16, 44_100));
         let header = chunks.first().expect("WAV header");
@@ -3505,8 +3648,10 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("tune_chained_vorbis_{}.ogg", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "{}.ogg",
+            crate::test_scratch::scratch_name("tune_chained_vorbis")
+        ));
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
@@ -3556,6 +3701,132 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(
             result.samples_i32.iter().any(|s| *s != 0),
             "decoded Opus PCM must not be all silence (the pre-fix failure mode)"
+        );
+    }
+
+    #[test]
+    fn decode_chained_ogg_opus_decodes_past_first_link() {
+        // Two Ogg-Opus physical streams back-to-back (an icecast rip, or
+        // `cat a.opus b.opus`). Symphonia signals the mid-file boundary with
+        // `Error::ResetRequired`; the Opus loop treated it as EOF, truncating
+        // playback to the first link — natural end a few seconds in, poller
+        // replays the head of the track: the same « boucle de 2-3 s » of
+        // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
+        let single = std::fs::read(fixture_path("test.opus")).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "{}.opus",
+            crate::test_scratch::scratch_name("tune_chained_opus")
+        ));
+        let mut chained = single.clone();
+        chained.extend_from_slice(&single);
+        std::fs::write(&path, &chained).unwrap();
+
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
+        let _ = std::fs::remove_file(&path);
+        let result = result.unwrap();
+
+        // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
+        // stop at the first boundary (~2 s).
+        assert!(
+            result.duration_s > 3.0,
+            "chained Ogg-Opus must decode past the first chain boundary, got {} s",
+            result.duration_s
+        );
+        assert!(
+            result.samples_i32.iter().any(|s| *s != 0),
+            "chained Ogg-Opus PCM must not be all silence"
+        );
+    }
+
+    /// Empreinte du signal réellement décodé par libopus (#2251).
+    ///
+    /// `decode_opus` ci-dessus contrôle le contenant : cadence, canaux, durée,
+    /// « pas tout à zéro ». Rien n'y contrôle le **contenu**. Or c'est
+    /// exactement là que se cachait le risque du remplacement d'`audiopus_sys`
+    /// (abandonnée, RUSTSEC-2026-0150) par `opus`/`opusic-sys` : un remplaçant
+    /// qui compile et rend le bon nombre d'échantillons du mauvais son
+    /// passerait toute la suite actuelle sans un rouge.
+    ///
+    /// La fixture `test.opus` est un 440 Hz stéréo **asymétrique** : le canal
+    /// gauche est deux fois plus fort que le droit. On vérifie donc la
+    /// fréquence, le rapport gauche/droite, le niveau et le nombre de trames.
+    /// On ne fige aucun condensat : le décodage Opus n'est pas garanti
+    /// bit-à-bit d'une libopus à l'autre (RFC 8251), une empreinte spectrale
+    /// tolérante l'est.
+    ///
+    /// ⚠ Les bornes absolues ci-dessous restent larges (±20 %) à dessein :
+    /// elles sont là pour attraper un gain divisé ou doublé, pas pour
+    /// départager deux libopus conformes. Ce sont les grandeurs **relatives**
+    /// — rapport gauche/droite, dominance spectrale, nombre de trames — qui
+    /// portent la discrimination fine.
+    ///
+    /// Cette largeur a servi : elle a laissé passer sans retouche le passage
+    /// d'`audiopus_sys 0.2.2` (qui sondait `pkg-config` avant de retomber sur
+    /// sa copie embarquée figée sur xiph `7b05f44`, mars 2021, donc une
+    /// libopus différente d'une machine à l'autre) à `opusic-sys 0.7.5`, qui
+    /// embarque la 1.6.1 et la lie toujours en statique — même libopus
+    /// partout, désormais.
+    ///
+    /// Valeurs observées : 96 960 trames, rms G = 2877,6, rms D = 1442,1,
+    /// crête = 4140, dominante 440 Hz.
+    #[test]
+    fn decode_opus_fixture_garde_le_profil_du_signal() {
+        use crate::audio::opus_ogg::{channel_f64, goertzel_power, rms};
+
+        let path = fixture_path("test.opus");
+        let d = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert_eq!(d.sample_rate, 48_000);
+        assert_eq!(d.channels, 2);
+
+        // Nombre de trames : contrat de découpage (pre-skip + granulepos).
+        // Un remplaçant qui compte autrement doit être regardé de près, pas
+        // adopté en silence.
+        assert_eq!(
+            d.samples_i32.len() / 2,
+            96_960,
+            "le nombre de trames décodées a changé — pre-skip ou fin de flux \
+             traités différemment"
+        );
+
+        let left = channel_f64(&d.samples_i32, 2, 0);
+        let right = channel_f64(&d.samples_i32, 2, 1);
+
+        // Fenêtre de 0,5 s prise après l'attaque : 24 000 échantillons =
+        // nombre entier de périodes à 440 et 880 Hz, Goertzel exact.
+        let seg =
+            |ch: &[f64]| -> Vec<f64> { ch.iter().skip(9_600).take(24_000).copied().collect() };
+        for (name, ch) in [("gauche", &left), ("droit", &right)] {
+            let s = seg(ch);
+            assert_eq!(s.len(), 24_000, "fenêtre {name} incomplète");
+            let p440 = goertzel_power(&s, 48_000.0, 440.0);
+            let p880 = goertzel_power(&s, 48_000.0, 880.0);
+            let p220 = goertzel_power(&s, 48_000.0, 220.0);
+            assert!(
+                p440 > 100.0 * p880.max(1.0) && p440 > 100.0 * p220.max(1.0),
+                "canal {name} : la fixture est un 440 Hz, on mesure \
+                 p220={p220:.1} p440={p440:.1} p880={p880:.1} — cadence fausse \
+                 ou flux brouillé ?"
+            );
+        }
+
+        // Asymétrie gauche/droite ≈ 2 : attrape l'inversion des canaux et le
+        // repli mono, qu'aucun autre test de ce fichier ne verrait.
+        let (rl, rr) = (rms(&left), rms(&right));
+        let ratio = rl / rr.max(1.0);
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "rapport gauche/droite = {ratio:.2} (attendu ≈2,0 ; rms G={rl:.0}, \
+             rms D={rr:.0}) — canaux inversés, repliés en mono, ou gain faux"
+        );
+        assert!(
+            (2_300.0..=3_460.0).contains(&rl),
+            "niveau du canal gauche dérivé : rms={rl:.0} (attendu ≈2878, ±20 %)"
+        );
+
+        let peak = d.samples_i32.iter().map(|s| s.abs()).max().unwrap_or(0);
+        assert!(
+            (3_310..=4_970).contains(&peak),
+            "crête dérivée : {peak} (attendue ≈4140, ±20 %) — gain ou profondeur faux"
         );
     }
 
@@ -3732,6 +4003,115 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
         // Output is exactly 2 bytes per sample (16-bit).
         assert_eq!(out.len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // #2157 — la profondeur source hors {16, 24, 32}
+    // ---------------------------------------------------------------
+
+    /// CONTRE-ÉPREUVE de non-régression : sur les trois profondeurs que la
+    /// table énumérait, `requantize` doit rendre EXACTEMENT ce que rendaient
+    /// les bras codés en dur. Si ce test tombe, le correctif a déplacé le
+    /// niveau d'un flux qui marchait, et c'est le correctif qui est faux.
+    #[test]
+    fn requantize_reproduit_a_l_identique_les_trois_profondeurs_connues() {
+        // Les couples (from, to) et le décalage que le code d'origine appliquait.
+        let attendu: &[(u16, u16, i32)] = &[
+            (24, 32, 8),   // `*s << 8`
+            (16, 32, 16),  // `(*s as i32) << 16`
+            (32, 32, 0),   // `*s`
+            (32, 24, -8),  // `*s >> 8`
+            (16, 24, 8),   // `(*s as i32) << 8`
+            (24, 24, 0),   // `*s`
+            (32, 16, -16), // `(*s >> 16) as i16`
+            (24, 16, -8),  // `(*s >> 8) as i16`
+            (16, 16, 0),   // `*s as i16`
+        ];
+        for &(from, to, decalage) in attendu {
+            for echantillon in [0i32, 1, -1, 12345, -12345, 0x0034_5678, -0x0034_5678] {
+                let origine = if decalage >= 0 {
+                    echantillon << decalage
+                } else {
+                    echantillon >> (-decalage)
+                };
+                assert_eq!(
+                    requantize(echantillon, from, to),
+                    origine,
+                    "requantize({echantillon}, {from}, {to}) s'écarte de la table d'origine"
+                );
+            }
+        }
+    }
+
+    /// Le défaut lui-même : une source de 20 bits servie à la sortie locale,
+    /// qui demande toujours 32 bits, sortait `2^12` fois trop bas — −72 dB.
+    #[test]
+    fn une_source_de_20_bits_ne_sort_plus_72_db_trop_bas() {
+        // Pleine échelle sur 20 bits, droitisée : 0x0007_FFFF.
+        let pleine_echelle_20 = 0x0007_FFFFi32;
+        let octets = convert_pcm_bit_depth(&[pleine_echelle_20], 20, 32);
+        let sorti = i32::from_le_bytes([octets[0], octets[1], octets[2], octets[3]]);
+
+        // Le décalage de 12 rangs remet les 20 bits en haut du mot de 32.
+        assert_eq!(sorti, pleine_echelle_20 << 12);
+
+        // Formulé comme l'entend le testeur : le niveau ne doit plus être
+        // divisé par 4096. Avant le correctif, `sorti` valait 0x0007_FFFF.
+        let rapport = sorti as f64 / (pleine_echelle_20 << 12) as f64;
+        assert!(
+            (rapport - 1.0).abs() < 1e-12,
+            "atténuation résiduelle : rapport {rapport}"
+        );
+        assert_ne!(
+            sorti, pleine_echelle_20,
+            "l'échantillon est resté droitisé sur 20 bits — c'est le défaut #2157"
+        );
+    }
+
+    /// Le même trou en sortie 16 bits ne se contentait pas d'atténuer : il
+    /// **repliait** le signal, parce qu'un mot de 20 bits ne tient pas dans un
+    /// `i16` et que `*s as i16` tronque.
+    #[test]
+    fn une_source_de_20_bits_ne_se_replie_plus_en_16_bits() {
+        let pleine_echelle_20 = 0x0007_FFFFi32; // positif, proche du maximum
+        let octets = convert_pcm_bit_depth(&[pleine_echelle_20], 20, 16);
+        let sorti = i16::from_le_bytes([octets[0], octets[1]]);
+
+        // 20 -> 16 bits : quatre rangs de moins, le signe est conservé.
+        assert_eq!(sorti, (pleine_echelle_20 >> 4) as i16);
+        assert!(
+            sorti > 0,
+            "repliement : un maximum positif est ressorti {sorti}"
+        );
+        // L'ancien `*s as i16` rendait 0xFFFF, soit -1.
+        assert_ne!(sorti, -1);
+    }
+
+    /// La normalisation qui empêche `shift`, `from_bd` et la largeur d'octets
+    /// de diverger. Arrondi vers le HAUT : aucun bit source n'est perdu.
+    #[test]
+    fn container_bit_depth_arrondit_vers_le_conteneur_superieur() {
+        assert_eq!(container_bit_depth(8), 16);
+        assert_eq!(container_bit_depth(12), 16);
+        assert_eq!(container_bit_depth(16), 16);
+        assert_eq!(container_bit_depth(20), 24);
+        assert_eq!(container_bit_depth(24), 24);
+        assert_eq!(container_bit_depth(32), 32);
+        // Une profondeur absurde ne doit pas produire un décalage de 32 rangs,
+        // qui paniquerait.
+        assert_eq!(container_bit_depth(0), 16);
+        assert_eq!(container_bit_depth(64), 32);
+    }
+
+    /// `requantize` est bornée : un `bd` nul ou aberrant ne doit jamais
+    /// produire un décalage >= 32, qui panique en Rust.
+    #[test]
+    fn requantize_ne_panique_sur_aucune_profondeur() {
+        for from in [0u16, 1, 8, 12, 16, 20, 24, 32, 64, u16::MAX] {
+            for to in [0u16, 1, 8, 12, 16, 20, 24, 32, 64, u16::MAX] {
+                let _ = requantize(1234, from, to);
+            }
+        }
     }
 
     #[test]

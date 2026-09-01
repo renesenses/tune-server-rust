@@ -3,6 +3,78 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// Réponse impulsionnelle en domaine temporel, indépendante d'un flux.
+///
+/// La configuration conserve volontairement les taps et leur cadence source :
+/// une instance [`Convolver`] est un état de traitement lié à un nombre de
+/// canaux et doit être reconstruite quand le format du flux change (#2210).
+#[derive(Clone)]
+pub struct ConvolverConfig {
+    impulse_response: Arc<[Vec<f32>]>,
+    sample_rate: u32,
+}
+
+impl ConvolverConfig {
+    pub fn new(impulse_response: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("la cadence de la réponse impulsionnelle doit être positive".into());
+        }
+        if impulse_response.is_empty() || impulse_response.iter().any(Vec::is_empty) {
+            return Err("la réponse impulsionnelle doit contenir des taps sur chaque canal".into());
+        }
+        Ok(Self {
+            impulse_response: impulse_response.into(),
+            sample_rate,
+        })
+    }
+
+    pub fn from_wav(path: &str) -> Result<Self, String> {
+        let (impulse_response, sample_rate) = Convolver::read_wav_ir(path)?;
+        Self::new(impulse_response, sample_rate)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn source_channels(&self) -> usize {
+        self.impulse_response.len()
+    }
+
+    /// Bâtir le moteur pour le format réellement négocié.
+    ///
+    /// Aucun rééchantillonnage silencieux : l'utilisateur reçoit la cadence à
+    /// laquelle réexporter son filtre. Une IR mono est explicitement dupliquée
+    /// sur tous les canaux ; tout autre écart de layout est refusé.
+    pub fn build_for(
+        &self,
+        block_size: usize,
+        target_sample_rate: u32,
+        target_channels: usize,
+    ) -> Result<Convolver, String> {
+        if target_channels == 0 {
+            return Err("le flux ne contient aucun canal audio".into());
+        }
+        if self.sample_rate != target_sample_rate {
+            return Err(format!(
+                "Réponse impulsionnelle à {} Hz incompatible avec le flux à {target_sample_rate} Hz ; réexportez le filtre à {target_sample_rate} Hz",
+                self.sample_rate
+            ));
+        }
+        let adapted = if self.impulse_response.len() == target_channels {
+            self.impulse_response.to_vec()
+        } else if self.impulse_response.len() == 1 {
+            vec![self.impulse_response[0].clone(); target_channels]
+        } else {
+            return Err(format!(
+                "Réponse impulsionnelle à {} canaux incompatible avec le flux à {target_channels} canaux ; fournissez une IR mono ou une IR à {target_channels} canaux",
+                self.impulse_response.len()
+            ));
+        };
+        Ok(Convolver::new(&adapted, block_size))
+    }
+}
+
 /// Partitioned overlap-save FFT convolver for real-time FIR filtering.
 ///
 /// Processes audio in fixed-size blocks using FFT convolution.
@@ -220,8 +292,8 @@ impl Convolver {
 
     /// Load an impulse response from a WAV file (any sample rate / channels).
     pub fn from_wav(path: &str, block_size: usize) -> Result<Self, String> {
-        let (ir, _sr) = Self::read_wav_ir(path)?;
-        Ok(Self::new(&ir, block_size))
+        let config = ConvolverConfig::from_wav(path)?;
+        Ok(Self::new(&config.impulse_response, block_size))
     }
 
     /// Read the raw taps of a WAV impulse response (per channel) plus its
@@ -304,23 +376,7 @@ impl Convolver {
         target_sr: u32,
         target_channels: usize,
     ) -> Result<Self, String> {
-        let (ir, sr) = Self::read_wav_ir(path)?;
-        if sr != target_sr {
-            return Err(format!(
-                "IR sample rate {sr} Hz != stream rate {target_sr} Hz — export the FIR at {target_sr} Hz"
-            ));
-        }
-        let adapted = if ir.len() == target_channels {
-            ir
-        } else if ir.len() == 1 {
-            vec![ir[0].clone(); target_channels]
-        } else {
-            return Err(format!(
-                "IR has {} channels, stream has {target_channels}",
-                ir.len()
-            ));
-        };
-        Ok(Self::new(&adapted, block_size))
+        ConvolverConfig::from_wav(path)?.build_for(block_size, target_sr, target_channels)
     }
 
     /// Remettre le moteur à zéro : plus rien de la piste précédente.
@@ -822,6 +878,49 @@ mod tests {
         assert!((samples[latence * 2 + 1] - 0.5).abs() < 0.01);
     }
 
+    /// #2210 — la cadence n'est plus une métadonnée jetée après lecture du
+    /// WAV. Chacune des cadences réellement livrées doit produire un moteur
+    /// seulement pour un flux de même cadence.
+    #[test]
+    fn la_configuration_est_liee_aux_cadences_441_48_96_et_192_khz() {
+        for sample_rate in [44_100, 48_000, 96_000, 192_000] {
+            let config = ConvolverConfig::new(vec![vec![1.0, 0.5]], sample_rate).unwrap();
+            let convolver = config
+                .build_for(4, sample_rate, 2)
+                .expect("une IR mono de même cadence doit être dupliquée");
+            assert_eq!(convolver.channels(), 2);
+
+            let other_rate = if sample_rate == 48_000 {
+                96_000
+            } else {
+                48_000
+            };
+            let error = config
+                .build_for(4, other_rate, 2)
+                .err()
+                .expect("une cadence différente doit être refusée");
+            assert!(error.contains(&sample_rate.to_string()), "{error}");
+            assert!(error.contains(&other_rate.to_string()), "{error}");
+            assert!(error.contains("réexportez"), "{error}");
+        }
+    }
+
+    #[test]
+    fn seule_une_ir_mono_est_dupliquee_implicitement() {
+        let mono = ConvolverConfig::new(vec![vec![1.0]], 48_000).unwrap();
+        assert_eq!(mono.build_for(4, 48_000, 8).unwrap().channels(), 8);
+
+        let stereo = ConvolverConfig::new(vec![vec![1.0], vec![0.5]], 48_000).unwrap();
+        let error = stereo
+            .build_for(4, 48_000, 6)
+            .err()
+            .expect("un layout non mono doit correspondre exactement");
+        assert!(
+            error.contains("2 canaux") && error.contains("6 canaux"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn from_wav_skips_extra_chunks_before_data() {
         // Identity IR (4 taps, 16-bit mono @48k) with a spurious LIST chunk
@@ -854,10 +953,10 @@ mod tests {
         let riff_size = (wav.len() - 8) as u32;
         wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        let path = std::env::temp_dir().join("tune_ir_extrachunks_test.wav");
+        let ir_file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let path = ir_file.path().to_path_buf();
         std::fs::write(&path, &wav).unwrap();
         let mut conv = Convolver::from_wav(path.to_str().unwrap(), 4).unwrap();
-        std::fs::remove_file(&path).ok();
 
         let latence = conv.latency_frames();
         let attendu = [1.0f32, 0.5, 0.25, 0.125];
@@ -991,7 +1090,7 @@ mod tests {
     /// fichiers mono, jamais un stereo (Daniel, 24/08/2026).
     #[test]
     fn deux_filtres_mono_deviennent_un_stereo_par_canal() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("gauche.wav");
         let d = dir.join("droite.wav");
@@ -1031,7 +1130,7 @@ mod tests {
     /// convoluer a deux cadences decalerait un canal par rapport a l'autre.
     #[test]
     fn deux_cadences_differentes_sont_refusees() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-sr-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir-sr");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");
@@ -1058,7 +1157,7 @@ mod tests {
     /// impulsions de signes opposes doivent ressortir de signes opposes.
     #[test]
     fn le_stereo_combine_convolue_chaque_canal_avec_son_filtre() {
-        let dir = std::env::temp_dir().join(format!("tune-fir-conv-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune-fir-conv");
         std::fs::create_dir_all(&dir).unwrap();
         let g = dir.join("g.wav");
         let d = dir.join("d.wav");

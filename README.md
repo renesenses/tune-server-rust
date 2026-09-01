@@ -17,6 +17,20 @@ TUNE_AUTO_SCAN=true \
 
 Open `http://localhost:8085` in a browser.
 
+### Debian / Ubuntu
+
+```bash
+# amd64, ou tune-server_<version>_arm64.deb sur un Raspberry Pi
+sudo apt install ./tune-server_<version>_amd64.deb
+```
+
+Installs the server as a systemd service under a dedicated `tune` user, starts
+it, and serves the web client on `http://localhost:8888`. Configuration lives in
+`/etc/default/tune-server`. Requires Debian 12 / Ubuntu 22.04 or newer
+(glibc 2.35). See `packaging/deb/README.Debian` for the full layout, and
+`scripts/build-deb.sh` to rebuild the package from any published release
+tarball.
+
 ### Docker
 
 ```bash

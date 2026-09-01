@@ -151,6 +151,21 @@ const MIGRATION_TABLES: &[&str] = &[
     "tags",
     "item_tags",
     "favorites",
+    // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
+    // seraient perdus à la bascule SQLite → PostgreSQL.
+    "favorite_facets",
+    // Albums masqués (#1391). Sans cette ligne, les albums masqués
+    // réapparaîtraient tous à la bascule SQLite → PostgreSQL.
+    "hidden_items",
+    // « Ces deux albums ne sont pas des doublons » (#1276). Sans cette ligne,
+    // l'arbitrage serait perdu à la bascule SQLite → PostgreSQL, et la fusion
+    // de doublons emporterait au scan suivant ce que l'utilisateur avait
+    // explicitement protégé.
+    "album_distinct_pairs",
+    // Appareils ignorés (#1280). Sans cette ligne, tous les appareils que
+    // l'utilisateur a fait taire réapparaîtraient à la bascule
+    // SQLite → PostgreSQL.
+    "ignored_devices",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -430,7 +445,10 @@ CREATE TABLE IF NOT EXISTS listen_history (
     cover_url TEXT,
     source_id TEXT,
     album_id TEXT,
-    profile_id TEXT
+    profile_id TEXT,
+    context_type TEXT,
+    context_id TEXT,
+    context_position TEXT
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
@@ -478,6 +496,17 @@ CREATE TABLE IF NOT EXISTS profiles (
     password_hash_v2 TEXT
 );
 
+-- Favoris de VALEUR de facette (label…), #2442. Pas de colonne `id` : la clé
+-- naturelle est la clé primaire. `profile_id` en TEXT comme partout ici (la
+-- copie lie tout en texte) ; la migration 036 la ramène en BIGINT après coup.
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, facet, value)
+);
+
 CREATE TABLE IF NOT EXISTS favorites (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL DEFAULT 1,
@@ -495,6 +524,47 @@ CREATE TABLE IF NOT EXISTS favorites (
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_name TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_artist TEXT;
 ALTER TABLE favorites ADD COLUMN IF NOT EXISTS item_path TEXT;
+
+-- Albums masqués (#1391). Tout en TEXT comme le reste de ce schéma (la copie
+-- lie chaque valeur en texte) ; la migration 041 ramène `profile_id` et
+-- `item_id` en BIGINT après coup, comme 038 pour `favorite_facets`.
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    item_type TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
+
+-- « Ces deux albums ne sont pas des doublons » (#1276). Tout en TEXT comme le
+-- reste de ce schéma (la copie lie chaque valeur en texte) ; la migration 042
+-- ramène `profile_id`, `album_a_id` et `album_b_id` en BIGINT après coup,
+-- comme 041 pour `hidden_items`.
+CREATE TABLE IF NOT EXISTS album_distinct_pairs (
+    profile_id TEXT NOT NULL DEFAULT '1',
+    album_a_id TEXT NOT NULL,
+    album_b_id TEXT NOT NULL,
+    a_name TEXT,
+    a_artist TEXT,
+    b_name TEXT,
+    b_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+
+-- Appareils ignorés (#1280). Tout en TEXT — comme la migration 044, qui
+-- déclare exactement les mêmes colonnes : rien à rattraper après la copie,
+-- contrairement à `hidden_items` et `favorite_facets`.
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
 CREATE TABLE IF NOT EXISTS streaming_favorites (
@@ -691,7 +761,31 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
     fetched_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
+-- Registre des executions automatisees (#2080 ; migration PG 039). Present ici
+-- pour la meme raison que `lyrics_cache` juste au-dessus : une base creee par
+-- cette bascule sqlite->pg enregistre schema_version 99 et ne rejoue donc
+-- jamais les scripts PG numerotes. Sans ce bloc, une telle base n'aurait pas
+-- de `task_runs` du tout, et la route d'observabilite rendrait une erreur SQL.
+--
+-- Cette table n'est PAS dans `MIGRATION_TABLES` : ses `boot_id` designent des
+-- incarnations d'un processus qui tournait sur l'AUTRE moteur. L'historique
+-- d'observabilite recommence avec le nouveau moteur, deliberement.
+CREATE TABLE IF NOT EXISTS task_runs (
+    boot_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms BIGINT,
+    outcome TEXT NOT NULL,
+    items BIGINT,
+    detail TEXT,
+    PRIMARY KEY (boot_id, task, seq)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
@@ -784,6 +878,12 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;
+-- listen_history: ce que l'auditeur a demande (SQLite migration v84, #2441)
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
+-- listen_history: ou l'auditeur en etait dans cet objet (SQLite migration v94,
+-- #2441). TEXT comme album_id / profile_id ici : ce schema porte tout en TEXT.
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';

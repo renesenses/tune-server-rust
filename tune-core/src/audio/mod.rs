@@ -22,6 +22,7 @@ pub mod eq;
 pub mod eq_presets;
 pub mod faststart;
 pub mod formats;
+pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
@@ -33,12 +34,17 @@ pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
+pub mod soft_mute;
 pub mod staged_growth;
+pub mod support;
 pub mod tap;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
+pub mod volume_scale;
 pub mod wav;
 pub mod wavpack;
 

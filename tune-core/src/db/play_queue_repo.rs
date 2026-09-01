@@ -639,20 +639,34 @@ impl PlayQueueRepo {
     /// This is the basis of "Play Next" (position = current + 1): a streaming
     /// item added while a local album plays now lands right after the current
     /// track instead of at the end of the album (Sandro S1).
+    ///
+    /// Renvoie la position **réelle** de la première ligne insérée, `None`
+    /// quand `items` est vide — aucune ligne, donc aucune position.
+    ///
+    /// Cette valeur n'est pas décorative : `position` est **ramenée** dans
+    /// `0..=max_pos + 1`. Un client qui demande « juste après la piste en
+    /// cours » sur une file plus courte que son calcul obtient un ajout en FIN
+    /// de file, et l'écriture réussit dans les deux cas. Sans la position
+    /// effective, un appelant ne peut pas distinguer les deux (#2079) : il ne
+    /// lui reste qu'à relire toute la file pour savoir ce qu'il vient de faire.
     pub fn insert_at(
         &self,
         zone_id: i64,
         items: &[QueueInput],
         position: Option<i64>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<i64>, String> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let max_pos_sql = self.dialect_sql(sql::max_position_any, sql::max_position_any);
         let shift_sql = self.dialect_sql(sql::shift_positions, sql::shift_positions);
         let insert_local_sql = self.dialect_sql(sql::insert_local_at, sql::insert_local_at);
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
         let n = items.len() as i64;
+        // Renseignée DANS la transaction, lue après elle : `write_tx` peut
+        // rejouer la fermeture (base occupée), et c'est le dernier passage —
+        // celui qui a réellement commité — qui doit gagner.
+        let mut start_effectif: i64 = 0;
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             let max_pos: i64 = tx
@@ -661,6 +675,7 @@ impl PlayQueueRepo {
                 .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
                 .unwrap_or(-1);
             let start = position.unwrap_or(max_pos + 1).clamp(0, max_pos + 1);
+            start_effectif = start;
             // Open a gap of `n` at `start` (no-op when appending at the end).
             let sp: [&dyn ToSqlValue; 3] = [&n, &zone_id, &start];
             tx.execute(&shift_sql, &sp)?;
@@ -700,12 +715,13 @@ impl PlayQueueRepo {
                 }
             }
             Ok(())
-        })
+        })?;
+        Ok(Some(start_effectif))
     }
 
     /// Append items at the end of the unified queue.
     pub fn append(&self, zone_id: i64, items: &[QueueInput]) -> Result<(), String> {
-        self.insert_at(zone_id, items, None)
+        self.insert_at(zone_id, items, None).map(|_| ())
     }
 
     /// Remove the item at `position` (source-agnostic) and close the gap.
@@ -1515,6 +1531,57 @@ mod tests {
         for (i, e) in q.iter().enumerate() {
             assert_eq!(e.position, i as i64, "positions must stay contiguous");
         }
+    }
+
+    #[test]
+    fn insert_at_rend_la_position_effective_pas_celle_demandee() {
+        // #2079 — « Lecture suivante » réussit toujours, y compris quand la
+        // position demandée n'existe pas : `insert_at` la ramène en fin de
+        // file. Les deux issues sont des `Ok`, et rien ne les distinguait.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let mut t = Track::new(format!("L{i}"));
+            t.file_path = Some(format!("/{i}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        let locals: Vec<QueueInput> = ids.iter().map(|id| local(*id)).collect();
+        repo.append(1, &locals).unwrap();
+
+        // Un vrai « juste après la piste en cours » : demandé 1, obtenu 1.
+        let suivant = repo
+            .insert_at(1, &[streaming("q1", "Q One")], Some(1))
+            .unwrap();
+        assert_eq!(suivant, Some(1), "la position demandée était tenable");
+
+        // Une position hors file : demandée 99, la piste atterrit en FIN de
+        // file — trois lignes occupent 0..2, donc en 3. C'est le cas que
+        // l'appelant doit pouvoir distinguer.
+        let ramene = repo
+            .insert_at(1, &[streaming("q2", "Q Two")], Some(99))
+            .unwrap();
+        assert_eq!(
+            ramene,
+            Some(3),
+            "hors file, l'insertion est ramenée en fin de file — et le dit"
+        );
+        assert_ne!(ramene, Some(99), "on rend le résultat, pas la demande");
+
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 4);
+        assert_eq!(q[1].source_id.as_deref(), Some("q1"));
+        assert_eq!(q[3].source_id.as_deref(), Some("q2"));
+
+        // Un ajout en fin de file (position None) rend lui aussi sa position.
+        assert_eq!(
+            repo.insert_at(1, &[streaming("q3", "Q Three")], None)
+                .unwrap(),
+            Some(4)
+        );
+        // Rien à insérer : aucune ligne, donc aucune position à annoncer.
+        assert_eq!(repo.insert_at(1, &[], Some(0)).unwrap(), None);
     }
 
     #[test]

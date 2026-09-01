@@ -923,6 +923,66 @@
     "ro": "Creează o aplicație și copiază token-ul.",
     "sv": "Skapa ett program och kopiera token."
   },
+  "svctok.radiofrance.purpose": {
+    "fr": "Podcasts et émissions de Radio France.",
+    "en": "Radio France podcasts and shows.",
+    "de": "Podcasts und Sendungen von Radio France.",
+    "es": "Pódcasts y programas de Radio France.",
+    "it": "Podcast e programmi di Radio France.",
+    "zh": "Radio France 播客与节目。",
+    "ja": "Radio France のポッドキャストと番組。",
+    "ko": "Radio France 팟캐스트와 프로그램.",
+    "ro": "Podcasturi și emisiuni Radio France.",
+    "sv": "Poddar och program från Radio France."
+  },
+  "svctok.radiofrance.pricing": {
+    "fr": "API gratuite.",
+    "en": "Free API.",
+    "de": "Kostenlose API.",
+    "es": "API gratuita.",
+    "it": "API gratuita.",
+    "zh": "免费 API。",
+    "ja": "無料 API。",
+    "ko": "무료 API.",
+    "ro": "API gratuit.",
+    "sv": "Gratis API."
+  },
+  "svctok.radiofrance.step1": {
+    "fr": "Crée un compte sur developers.radiofrance.fr.",
+    "en": "Create an account at developers.radiofrance.fr.",
+    "de": "Erstelle ein Konto auf developers.radiofrance.fr.",
+    "es": "Crea una cuenta en developers.radiofrance.fr.",
+    "it": "Crea un account su developers.radiofrance.fr.",
+    "zh": "在 developers.radiofrance.fr 创建账户。",
+    "ja": "developers.radiofrance.fr でアカウントを作成します。",
+    "ko": "developers.radiofrance.fr에서 계정을 만드세요.",
+    "ro": "Creează un cont pe developers.radiofrance.fr.",
+    "sv": "Skapa ett konto på developers.radiofrance.fr."
+  },
+  "svctok.radiofrance.step2": {
+    "fr": "Demande l'accès à l'API Open Radio France.",
+    "en": "Request access to the Open Radio France API.",
+    "de": "Beantrage Zugang zur Open-Radio-France-API.",
+    "es": "Solicita acceso a la API Open Radio France.",
+    "it": "Richiedi l'accesso all'API Open Radio France.",
+    "zh": "申请 Open Radio France API 的访问权限。",
+    "ja": "Open Radio France API へのアクセスを申請します。",
+    "ko": "Open Radio France API 접근 권한을 신청하세요.",
+    "ro": "Solicită acces la API-ul Open Radio France.",
+    "sv": "Begär åtkomst till Open Radio France-API:et."
+  },
+  "svctok.radiofrance.step3": {
+    "fr": "Copie la clé API et colle-la ici.",
+    "en": "Copy the API key and paste it here.",
+    "de": "Kopiere den API-Schlüssel und füge ihn hier ein.",
+    "es": "Copia la clave API y pégala aquí.",
+    "it": "Copia la chiave API e incollala qui.",
+    "zh": "复制 API 密钥并粘贴到这里。",
+    "ja": "API キーをコピーしてここに貼り付けます。",
+    "ko": "API 키를 복사해 여기에 붙여 넣으세요.",
+    "ro": "Copiază cheia API și lipește-o aici.",
+    "sv": "Kopiera API-nyckeln och klistra in den här."
+  },
   "svctok.tidal.purpose": {
     "fr": "Streaming hi-res + années + couvertures.",
     "en": "Hi-res streaming + years + covers.",
@@ -1150,6 +1210,18 @@
     "ko": "Genius token이 설정되지 않았습니다.",
     "ro": "Token Genius neconfigurat.",
     "sv": "Genius-token är inte konfigurerad."
+  },
+  "svctok.err.radiofranceNotConfigured": {
+    "fr": "Clé API Radio France non configurée.",
+    "en": "Radio France API key not configured.",
+    "de": "Radio-France-API-Schlüssel nicht konfiguriert.",
+    "es": "Clave API de Radio France no configurada.",
+    "it": "Chiave API Radio France non configurata.",
+    "zh": "Radio France API 密钥未配置。",
+    "ja": "Radio France の API キーが設定されていません。",
+    "ko": "Radio France API 키가 설정되지 않았습니다.",
+    "ro": "Cheia API Radio France neconfigurată.",
+    "sv": "Radio France-API-nyckeln är inte konfigurerad."
   },
   "ai.nextTrack": {
     "fr": "Piste suivante : {title}",
@@ -1606,5 +1678,193 @@
     "ko": "이 네트워크 공유에 연결할 수 없습니다. 서버가 켜져 있고 접근 가능한지, 저장된 자격 증명이 여전히 유효한지 확인하세요.",
     "ro": "Această partajare de rețea este inaccesibilă. Verificați dacă serverul este pornit și accesibil și dacă datele de autentificare salvate sunt încă valide.",
     "sv": "Den här nätverksresursen går inte att nå. Kontrollera att servern är påslagen och nåbar och att de sparade inloggningsuppgifterna fortfarande är giltiga."
+  },
+  "settings.communityContribution.label": {
+    "fr": "Partager mes métadonnées enrichies avec la communauté",
+    "en": "Share my enriched metadata with the community"
+  },
+  "settings.communityContribution.description": {
+    "fr": "Quand ce réglage est activé, Tune envoie au cloud communautaire mozaiklabs.fr les biographies d'artistes et d'albums de votre bibliothèque (nom de l'artiste, titre de l'album, identifiant MusicBrainz, texte de la biographie, source, licence et langue) ainsi que les images d'artistes récupérées automatiquement, accompagnées d'un identifiant d'installation anonyme. Ni vos fichiers, ni vos chemins de dossiers, ni votre historique d'écoute ne sont concernés. Désactivé par défaut : tant que vous ne l'activez pas, aucune de ces données ne quitte votre machine.",
+    "en": "When this setting is on, Tune sends your library's artist and album biographies (artist name, album title, MusicBrainz ID, biography text, source, licence and language) plus the artist images it fetched automatically to the mozaiklabs.fr community cloud, together with an anonymous installation identifier. Your files, your folder paths and your listening history are not involved. Off by default: until you turn it on, none of this data leaves your machine."
+  },
+  "settings.replayGainSource.off": {
+    "fr": "Désactivé",
+    "en": "Off",
+    "de": "Deaktiviert",
+    "es": "Desactivado",
+    "it": "Disattivato",
+    "zh": "已停用",
+    "ja": "無効",
+    "ko": "사용 안 함",
+    "ro": "Dezactivat",
+    "sv": "Av"
+  },
+  "settings.replayGainSource.file_tags": {
+    "fr": "Tags des fichiers",
+    "en": "File tags",
+    "de": "Datei-Tags",
+    "es": "Etiquetas de los archivos",
+    "it": "Tag dei file",
+    "zh": "文件标签",
+    "ja": "ファイルのタグ",
+    "ko": "파일 태그",
+    "ro": "Etichetele fișierelor",
+    "sv": "Filernas taggar"
+  },
+  "settings.replayGainSource.tags_then_analysis": {
+    "fr": "Tags des fichiers, puis analyse",
+    "en": "File tags, then analysis",
+    "de": "Datei-Tags, dann Analyse",
+    "es": "Etiquetas de los archivos, luego análisis",
+    "it": "Tag dei file, poi analisi",
+    "zh": "文件标签，然后分析",
+    "ja": "ファイルのタグ、次に解析",
+    "ko": "파일 태그, 그다음 분석",
+    "ro": "Etichetele fișierelor, apoi analiză",
+    "sv": "Filernas taggar, sedan analys"
+  },
+  "radio.recherche.aucunResultat": {
+    "fr": "Aucune station de ce nom dans le catalogue Tune. Vous pouvez l'ajouter par son adresse de flux.",
+    "en": "No station by that name in the Tune catalogue. You can add it using its stream address.",
+    "de": "Kein Sender dieses Namens im Tune-Katalog. Sie können ihn über seine Stream-Adresse hinzufügen.",
+    "es": "Ninguna emisora con ese nombre en el catálogo de Tune. Puede añadirla mediante su dirección de flujo.",
+    "it": "Nessuna stazione con questo nome nel catalogo Tune. È possibile aggiungerla tramite il suo indirizzo di flusso.",
+    "zh": "Tune 目录中没有该名称的电台。您可以通过其流地址添加它。",
+    "ja": "その名前の放送局は Tune のカタログにありません。ストリームのアドレスを使って追加できます。",
+    "ko": "해당 이름의 방송국이 Tune 카탈로그에 없습니다. 스트림 주소로 직접 추가할 수 있습니다.",
+    "ro": "Niciun post cu acest nume în catalogul Tune. Îl puteți adăuga folosind adresa fluxului său.",
+    "sv": "Ingen station med det namnet i Tune-katalogen. Du kan lägga till den med dess strömadress."
+  },
+  "radio.recherche.echec": {
+    "fr": "La recherche de stations n'a pas pu aboutir : le catalogue n'a pas répondu. Ce n'est pas une station manquante — réessayez, et redémarrez Tune si cela persiste.",
+    "en": "The station search could not complete: the catalogue did not answer. This is not a missing station — try again, and restart Tune if it persists.",
+    "de": "Die Sendersuche konnte nicht abgeschlossen werden: Der Katalog hat nicht geantwortet. Das ist kein fehlender Sender — versuchen Sie es erneut und starten Sie Tune neu, falls es weiterhin auftritt.",
+    "es": "La búsqueda de emisoras no pudo completarse: el catálogo no respondió. No se trata de una emisora ausente: inténtelo de nuevo y reinicie Tune si persiste.",
+    "it": "La ricerca delle stazioni non è andata a buon fine: il catalogo non ha risposto. Non si tratta di una stazione mancante: riprovare e riavviare Tune se il problema persiste.",
+    "zh": "电台搜索未能完成：目录没有响应。这不是电台缺失——请重试，若持续出现请重启 Tune。",
+    "ja": "放送局の検索を完了できませんでした。カタログが応答していません。放送局が存在しないわけではありません。再試行し、続く場合は Tune を再起動してください。",
+    "ko": "방송국 검색을 완료하지 못했습니다. 카탈로그가 응답하지 않았습니다. 방송국이 없는 것이 아닙니다. 다시 시도하고, 계속되면 Tune을 다시 시작하세요.",
+    "ro": "Căutarea posturilor nu a putut fi finalizată: catalogul nu a răspuns. Nu este vorba de un post lipsă — reîncercați și reporniți Tune dacă persistă.",
+    "sv": "Stationssökningen kunde inte slutföras: katalogen svarade inte. Det handlar inte om en saknad station — försök igen och starta om Tune om det kvarstår."
+  },
+  "radio.url.vide": {
+    "fr": "L'adresse du flux est vide. Collez l'adresse complète de la station, par exemple https://example.net/stream.mp3",
+    "en": "The stream address is empty. Paste the station's full address, for example https://example.net/stream.mp3",
+    "de": "Die Stream-Adresse ist leer. Fügen Sie die vollständige Adresse des Senders ein, zum Beispiel https://example.net/stream.mp3",
+    "es": "La dirección del flujo está vacía. Pegue la dirección completa de la emisora, por ejemplo https://example.net/stream.mp3",
+    "it": "L'indirizzo del flusso è vuoto. Incollare l'indirizzo completo della stazione, ad esempio https://example.net/stream.mp3",
+    "zh": "流地址为空。请粘贴电台的完整地址，例如 https://example.net/stream.mp3",
+    "ja": "ストリームのアドレスが空です。放送局の完全なアドレスを貼り付けてください。例: https://example.net/stream.mp3",
+    "ko": "스트림 주소가 비어 있습니다. 방송국의 전체 주소를 붙여넣으세요. 예: https://example.net/stream.mp3",
+    "ro": "Adresa fluxului este goală. Lipiți adresa completă a postului, de exemplu https://example.net/stream.mp3",
+    "sv": "Strömadressen är tom. Klistra in stationens fullständiga adress, till exempel https://example.net/stream.mp3"
+  },
+  "radio.url.separateurFaux": {
+    "fr": "L'adresse commence par « {debut} » : après « {schema} » il faut deux-points, pas ce caractère. Écrivez « {schema}:// » et la station se lira.",
+    "en": "The address starts with “{debut}”: after “{schema}” a colon is required, not that character. Write “{schema}://” and the station will play.",
+    "de": "Die Adresse beginnt mit „{debut}“: nach „{schema}“ muss ein Doppelpunkt stehen, nicht dieses Zeichen. Schreiben Sie „{schema}://“, dann wird der Sender abgespielt.",
+    "es": "La dirección empieza por «{debut}»: después de «{schema}» hacen falta dos puntos, no ese carácter. Escriba «{schema}://» y la emisora se reproducirá.",
+    "it": "L'indirizzo inizia con «{debut}»: dopo «{schema}» servono i due punti, non quel carattere. Scrivere «{schema}://» e la stazione verrà riprodotta.",
+    "zh": "地址以「{debut}」开头：「{schema}」之后必须是冒号，而不是该字符。请写成「{schema}://」，电台即可播放。",
+    "ja": "アドレスが「{debut}」で始まっています。「{schema}」の後ろは、この文字ではなくコロンが必要です。「{schema}://」と書けば再生されます。",
+    "ko": "주소가 “{debut}”로 시작합니다. “{schema}” 뒤에는 이 문자가 아니라 콜론이 와야 합니다. “{schema}://”로 쓰면 방송이 재생됩니다.",
+    "ro": "Adresa începe cu „{debut}”: după „{schema}” trebuie două puncte, nu acest caracter. Scrieți „{schema}://” și postul se va reda.",
+    "sv": "Adressen börjar med ”{debut}”: efter ”{schema}” krävs ett kolon, inte det tecknet. Skriv ”{schema}://” så spelas stationen upp."
+  },
+  "radio.url.sansSchema": {
+    "fr": "L'adresse du flux doit commencer par http:// ou https://, et « {debut} » ne commence par ni l'un ni l'autre. Collez l'adresse complète du flux, pas seulement le nom du site.",
+    "en": "The stream address must start with http:// or https://, and “{debut}” starts with neither. Paste the full stream address, not just the site name.",
+    "de": "Die Stream-Adresse muss mit http:// oder https:// beginnen; „{debut}“ tut das nicht. Fügen Sie die vollständige Stream-Adresse ein, nicht nur den Namen der Website.",
+    "es": "La dirección del flujo debe empezar por http:// o https://, y «{debut}» no empieza por ninguno de los dos. Pegue la dirección completa del flujo, no solo el nombre del sitio.",
+    "it": "L'indirizzo del flusso deve iniziare con http:// o https://, e «{debut}» non inizia con nessuno dei due. Incollare l'indirizzo completo del flusso, non solo il nome del sito.",
+    "zh": "流地址必须以 http:// 或 https:// 开头，而「{debut}」两者皆非。请粘贴完整的流地址，而不只是网站名称。",
+    "ja": "ストリームのアドレスは http:// または https:// で始まる必要がありますが、「{debut}」はどちらでもありません。サイト名だけでなく、ストリームの完全なアドレスを貼り付けてください。",
+    "ko": "스트림 주소는 http:// 또는 https://로 시작해야 하는데 “{debut}”은(는) 둘 다 아닙니다. 사이트 이름이 아니라 스트림의 전체 주소를 붙여넣으세요.",
+    "ro": "Adresa fluxului trebuie să înceapă cu http:// sau https://, iar „{debut}” nu începe cu niciuna dintre ele. Lipiți adresa completă a fluxului, nu doar numele site-ului.",
+    "sv": "Strömadressen måste börja med http:// eller https://, och ”{debut}” börjar med ingetdera. Klistra in strömmens fullständiga adress, inte bara webbplatsens namn."
+  },
+  "radio.url.schemaNonLisible": {
+    "fr": "Tune ne sait ouvrir que les flux http:// et https:// ; « {schema}:// » n'est pas pris en charge.",
+    "en": "Tune can only open http:// and https:// streams; “{schema}://” is not supported.",
+    "de": "Tune kann nur Streams über http:// und https:// öffnen; „{schema}://“ wird nicht unterstützt.",
+    "es": "Tune solo puede abrir flujos http:// y https://; «{schema}://» no es compatible.",
+    "it": "Tune può aprire solo flussi http:// e https://; «{schema}://» non è supportato.",
+    "zh": "Tune 只能打开 http:// 和 https:// 流；不支持「{schema}://」。",
+    "ja": "Tune が開けるのは http:// と https:// のストリームだけです。「{schema}://」には対応していません。",
+    "ko": "Tune은 http:// 및 https:// 스트림만 열 수 있습니다. “{schema}://”는 지원하지 않습니다.",
+    "ro": "Tune poate deschide doar fluxuri http:// și https://; „{schema}://” nu este acceptat.",
+    "sv": "Tune kan bara öppna strömmar via http:// och https://; ”{schema}://” stöds inte."
+  },
+  "radio.url.sansHote": {
+    "fr": "L'adresse n'indique aucun serveur après « {schema}:// ». Il manque le nom d'hôte, par exemple {schema}://example.net/stream.mp3",
+    "en": "The address names no server after “{schema}://”. The host name is missing, for example {schema}://example.net/stream.mp3",
+    "de": "Die Adresse nennt nach „{schema}://“ keinen Server. Der Hostname fehlt, zum Beispiel {schema}://example.net/stream.mp3",
+    "es": "La dirección no indica ningún servidor después de «{schema}://». Falta el nombre de host, por ejemplo {schema}://example.net/stream.mp3",
+    "it": "L'indirizzo non indica alcun server dopo «{schema}://». Manca il nome host, ad esempio {schema}://example.net/stream.mp3",
+    "zh": "地址在「{schema}://」之后没有指明服务器。缺少主机名，例如 {schema}://example.net/stream.mp3",
+    "ja": "「{schema}://」の後にサーバーが指定されていません。ホスト名が抜けています。例: {schema}://example.net/stream.mp3",
+    "ko": "“{schema}://” 뒤에 서버가 지정되어 있지 않습니다. 호스트 이름이 빠졌습니다. 예: {schema}://example.net/stream.mp3",
+    "ro": "Adresa nu indică niciun server după „{schema}://”. Lipsește numele gazdei, de exemplu {schema}://example.net/stream.mp3",
+    "sv": "Adressen anger ingen server efter ”{schema}://”. Värdnamnet saknas, till exempel {schema}://example.net/stream.mp3"
+  },
+  "radio.url.espace": {
+    "fr": "L'adresse du flux contient un espace, ce qu'une adresse de flux ne comporte jamais. Vérifiez qu'elle n'a pas été coupée au collage.",
+    "en": "The stream address contains a space, which a stream address never has. Check that it was not broken when pasted.",
+    "de": "Die Stream-Adresse enthält ein Leerzeichen, was bei einer Stream-Adresse nie vorkommt. Prüfen Sie, ob sie beim Einfügen abgeschnitten wurde.",
+    "es": "La dirección del flujo contiene un espacio, algo que nunca ocurre en una dirección de flujo. Compruebe que no se haya cortado al pegarla.",
+    "it": "L'indirizzo del flusso contiene uno spazio, cosa che non accade mai in un indirizzo di flusso. Verificare che non sia stato troncato durante l'incollaggio.",
+    "zh": "流地址中包含空格，而流地址从不含空格。请检查粘贴时是否被截断。",
+    "ja": "ストリームのアドレスに空白が含まれています。ストリームのアドレスに空白は入りません。貼り付けの際に途中で切れていないか確認してください。",
+    "ko": "스트림 주소에 공백이 들어 있습니다. 스트림 주소에는 공백이 없습니다. 붙여넣을 때 잘리지 않았는지 확인하세요.",
+    "ro": "Adresa fluxului conține un spațiu, ceea ce nu se întâmplă niciodată la o adresă de flux. Verificați dacă nu a fost tăiată la lipire.",
+    "sv": "Strömadressen innehåller ett mellanslag, vilket en strömadress aldrig gör. Kontrollera att den inte klipptes av vid inklistringen."
+  },
+  "podcasts.radiofrance.cleAbsente": {
+    "fr": "La source Radio France nécessite une clé API. Renseignez le réglage « radiofrance_api_key » pour l'activer.",
+    "en": "The Radio France source requires an API key. Set the “radiofrance_api_key” setting to enable it.",
+    "de": "Die Radio-France-Quelle benötigt einen API-Schlüssel. Hinterlegen Sie die Einstellung „radiofrance_api_key“, um sie zu aktivieren.",
+    "es": "La fuente Radio France requiere una clave API. Configure el ajuste «radiofrance_api_key» para activarla.",
+    "it": "La sorgente Radio France richiede una chiave API. Impostare «radiofrance_api_key» per attivarla.",
+    "zh": "Radio France 源需要 API 密钥。请填写“radiofrance_api_key”设置以启用。",
+    "ja": "Radio France ソースには API キーが必要です。設定「radiofrance_api_key」を入力すると有効になります。",
+    "ko": "Radio France 소스를 사용하려면 API 키가 필요합니다. \"radiofrance_api_key\" 설정을 입력하면 활성화됩니다.",
+    "ro": "Sursa Radio France necesită o cheie API. Completați setarea „radiofrance_api_key” pentru a o activa.",
+    "sv": "Källan Radio France kräver en API-nyckel. Ange inställningen ”radiofrance_api_key” för att aktivera den."
+  },
+  "support.tropDeRequetes": {
+    "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie un peu plus tard.",
+    "en": "The support service has received too many requests from this server and is refusing further ones for now. Try again a little later.",
+    "de": "Der Support-Dienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuchen Sie es etwas später erneut.",
+    "es": "El servicio de soporte ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Vuelve a intentarlo un poco más tarde.",
+    "it": "Il servizio di assistenza ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova un po' più tardi.",
+    "zh": "支持服务收到本服务器发来的请求过多，暂时拒绝后续请求。请稍后再试。",
+    "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。少し時間をおいて再試行してください。",
+    "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. 잠시 후 다시 시도하세요.",
+    "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou puțin mai târziu.",
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen lite senare."
+  },
+  "support.tropDeRequetesDelai": {
+    "fr": "Le service de support a reçu trop de requêtes depuis ce serveur et refuse les suivantes pour le moment. Réessaie dans {minutes} min.",
+    "en": "The support service has received too many requests from this server and is refusing further ones for now. Try again in {minutes} min.",
+    "de": "Der Support-Dienst hat von diesem Server zu viele Anfragen erhalten und lehnt weitere vorerst ab. Versuchen Sie es in {minutes} Min. erneut.",
+    "es": "El servicio de soporte ha recibido demasiadas solicitudes desde este servidor y de momento rechaza las siguientes. Vuelve a intentarlo dentro de {minutes} min.",
+    "it": "Il servizio di assistenza ha ricevuto troppe richieste da questo server e per ora rifiuta le successive. Riprova tra {minutes} min.",
+    "zh": "支持服务收到本服务器发来的请求过多，暂时拒绝后续请求。请在 {minutes} 分钟后重试。",
+    "ja": "サポートサービスはこのサーバーから多すぎるリクエストを受け取ったため、しばらく後続のリクエストを拒否します。{minutes} 分後に再試行してください。",
+    "ko": "지원 서비스가 이 서버에서 너무 많은 요청을 받아 당분간 이후 요청을 거부합니다. {minutes}분 후에 다시 시도하세요.",
+    "ro": "Serviciul de asistență a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încercați din nou peste {minutes} min.",
+    "sv": "Supporttjänsten har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
+  },
+  "metadata.enrich.cleLastfmAbsente": {
+    "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
+    "en": "Biography enrichment requires a Last.fm API key. Set the “lastfm_api_key” setting to enable it.",
+    "de": "Die Anreicherung der Biografien benötigt einen Last.fm-API-Schlüssel. Hinterlegen Sie die Einstellung „lastfm_api_key“, um sie zu aktivieren.",
+    "es": "El enriquecimiento de biografías requiere una clave API de Last.fm. Configure el ajuste «lastfm_api_key» para activarlo.",
+    "it": "L'arricchimento delle biografie richiede una chiave API Last.fm. Impostare «lastfm_api_key» per attivarlo.",
+    "zh": "补全艺人简介需要 Last.fm API 密钥。请填写“lastfm_api_key”设置以启用。",
+    "ja": "経歴の補完には Last.fm の API キーが必要です。設定「lastfm_api_key」を入力すると有効になります。",
+    "ko": "전기 보강에는 Last.fm API 키가 필요합니다. \"lastfm_api_key\" 설정을 입력하면 활성화됩니다.",
+    "ro": "Îmbogățirea biografiilor necesită o cheie API Last.fm. Completați setarea „lastfm_api_key” pentru a o activa.",
+    "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den."
   }
 }

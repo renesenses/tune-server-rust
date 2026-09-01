@@ -24,7 +24,10 @@ git push origin main --tags
 # 3. Watch all five workflows go green
 gh run list --limit 6
 
-# 4. If something breaks, roll back via the dispatch workflow
+# 4. Review and merge the generated tag -> main PR with a merge commit
+#    (never squash/rebase; the workflow never arms auto-merge)
+
+# 5. If something breaks, roll back via the dispatch workflow
 gh workflow run rollback.yml \
   --field version=v0.8.NN \
   --field previous_version=v0.8.27 \
@@ -35,8 +38,9 @@ Everything else is described below.
 
 ## 1. Pre-flight checks
 
-The `Preflight` workflow runs automatically on tag push (and via
-manual dispatch). It blocks if any of the following fails:
+The `Release` workflow calls `Preflight` as its first job on every tag push.
+`Preflight` also remains available via manual dispatch for dry runs. The
+release cannot start building if any of the following fails:
 
 - Tag is not valid semver (`vMAJOR.MINOR.PATCH[-PRE]`)
 - Tag is not strictly greater than the version in `Cargo.toml`
@@ -51,10 +55,10 @@ manual dispatch). It blocks if any of the following fails:
 - `cargo deny check` reports a license or duplicate-dep issue
 - The CI status for the commit is not green
 
-The workflow surfaces a failed status check on the commit; the release
-pipeline does NOT automatically halt — that decision is yours. If the
-preflight is red the right move is almost always to fix the underlying
-issue first.
+The workflow surfaces a failed status check on the commit and the `web-client`
+job has an explicit `needs: preflight` dependency. A red preflight therefore
+skips all build and publication jobs. Fix the underlying issue, then retry the
+tag workflow; a red check from a separate workflow is not treated as a gate.
 
 `release:verification-pending` has a deliberately narrow lifecycle: add it
 only after the correcting commit is merged into the release branch and its
@@ -76,6 +80,21 @@ Or locally:
 ```bash
 python3 scripts/preflight-check.py --version v0.8.28 --no-ci-check
 ```
+
+## Post-release sync to `main`
+
+After a successful stable `Release` run, `post-release-main-sync.yml` checks
+that the public release has non-empty, SHA-256-addressed assets, then prepares
+or reuses the branch `post-release/<tag>-vers-main` and opens a PR to `main`.
+The operation is idempotent: rerunning it verifies the existing branch and PR;
+it never rewrites the branch and never merges the PR.
+
+Review conflicts and let the complete PR battery finish, then merge by merge
+commit so that the published tag remains an identifiable ancestor of `main`.
+If repository policy forbids `GITHUB_TOKEN` from opening pull requests, provide
+a fine-grained `MAIN_SYNC_TOKEN` with `Contents: write` and
+`Pull requests: write` on this repository. No such token is needed when the
+native Actions permission is enabled.
 
 ## CI batches for bug fixes
 
@@ -139,12 +158,11 @@ git tag v0.8.NN
 git push origin main --tags
 ```
 
-Six workflows kick off on the tag push:
+The tag push starts the following release-related workflows:
 
 | Workflow | Purpose |
 |---|---|
-| `Preflight` | Status check (blocks nothing automatically, see above) |
-| `Release` | Builds 5 platform binaries (Linux x64/arm64, macOS x64/arm64, Windows x64), creates the GitHub Release, then runs the Homebrew + Forum jobs |
+| `Release` | Calls `Preflight` first; only after it passes, builds 6 platform binaries (Linux x64/arm64 GNU/arm64 musl, macOS x64/arm64, Windows x64), creates the GitHub Release, then runs the Homebrew + Forum jobs |
 | `Docker` | Builds multi-arch image (linux/amd64 + linux/arm64) and pushes to `renesenses/tune:vN.N.N` + `:latest` on Docker Hub |
 | `Changelog` | Generates `RELEASE_NOTES.md` via git-cliff, opens a PR back to main that refreshes `CHANGELOG.md` |
 | `Tests (PostgreSQL)` | Runs the engine + postgres-skeleton tests against a live `postgres:16-alpine` service container |
@@ -244,8 +262,9 @@ changelog by design.
 
 If you really need to bypass automation:
 
-- **Skip preflight**: tag push triggers preflight but does not block
-  release — just ignore the red status check.
+- **Preflight has no implicit bypass**: resolve the blocking condition and
+  rerun the tag workflow. An emergency bypass requires a reviewed workflow
+  change; ignoring a red check cannot publish a release.
 - **Skip Homebrew**: comment out `secrets.HOMEBREW_TAP_TOKEN` in the
   job's `if`, or simply don't have the secret set.
 - **Skip Forum**: same pattern with `FORUM_TOKEN`.

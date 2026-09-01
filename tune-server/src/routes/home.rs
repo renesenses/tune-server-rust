@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -7,6 +8,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::home_queries::{self, HISTORIQUE_VERS_ALBUM};
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -45,6 +47,29 @@ fn ph(engine: Engine, idx: usize) -> String {
         Engine::Sqlite => SqliteDialect.placeholder(idx),
         Engine::Postgres => PostgresDialect.placeholder(idx),
     }
+}
+
+/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
+/// celui de l'album. Partage entre les recommandations et les « top mixes »,
+/// qui prenaient tous deux le genre d'un album homonyme (#2731).
+///
+/// ATTENTION : telle quelle, cette requete ECHOUE sur les deux moteurs —
+/// `WHERE genre IS NOT NULL` est ambigu entre `t.genre` et `a.genre`, et
+/// l'erreur est avalee par le `unwrap_or_default` des appelants. La jointure
+/// est corrigee ici pour le jour ou la requete sera reveillee ; la reveiller
+/// releve d'un arbitrage produit (cf. le test
+/// `les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre`), pas du
+/// defaut d'homonymie.
+fn sql_top_genres() -> String {
+    format!(
+        "SELECT genre, COUNT(*) as cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) as genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
+               WHERE genre IS NOT NULL AND genre != '') \
+         GROUP BY genre ORDER BY cnt DESC LIMIT 5"
+    )
 }
 
 /// Aggregated home page: returns all sections in a single response.
@@ -121,53 +146,1203 @@ async fn continue_listening(
     Ok(Json(json!(items)))
 }
 
+/// Combien de contextes distincts on ramene avant de filtrer.
+///
+/// Un contexte `album` peut disparaitre a l'enrichissement (disque termine),
+/// une playlist peut avoir ete supprimee : sans marge, la section rendrait
+/// moins d'entrees que demande alors qu'il en existe. Quatre fois la demande,
+/// borne a 80 — au-dela on paierait un tri pour des entrees que personne ne
+/// verra jamais, la section n'en affichant qu'une poignee.
+fn marge_de_contextes(limit: i64) -> i64 {
+    limit.saturating_mul(4).clamp(1, 80)
+}
+
+/// Les cinq natures que `contexte_de_lecture` (tune-server/src/routes/
+/// playback.rs) sait ecrire, telles que FabienM les a enumerees.
+const CONTEXTES_AFFICHES: [&str; 5] = ["album", "playlist", "artist", "label", "track"];
+
+/// « Continuer l'ecoute » : ce que l'auditeur a demande en dernier, et OU il
+/// en etait — pas « les albums qu'il n'a pas finis ».
+///
+/// # Le defaut corrige (#2441, FabienM, fil forum 1557)
+///
+/// La requete partait de `albums`, groupait par `a.id` et se terminait par
+/// `HAVING listened_tracks < a.track_count`. Elle ne POUVAIT rien rendre
+/// d'autre qu'un album de la bibliotheque locale : « si je choisis de jouer
+/// une playlist complete, je m'attends a voir cette playlist » n'avait aucune
+/// chance d'etre satisfait, quelle que soit l'interface.
+///
+/// # L'arbitrage rendu — objet courant + position, pas l'instantane de la file
+///
+/// On stocke le TYPE du contexte, son IDENTIFIANT et le RANG (migrations 84 et
+/// 94), et on rouvre l'objet en se placant au bon endroit. On n'enregistre
+/// PAS la file entiere :
+/// * pour un artiste ou un label, la file est batie par une requete qui change
+///   d'un jour a l'autre — « conserver l'ordre » n'y a pas de sens ;
+/// * ecrire la file a chaque ecoute couterait un facteur dix sur le volume de
+///   `listen_history`, pour alimenter une section d'accueil.
+///
+/// En lecture aleatoire on RE-TIRE : le rang est laisse NULL a l'ecriture
+/// (`rang_a_retenir`, tune-core/src/orchestrator.rs), et l'entree se rouvre au
+/// debut plutot que de faire semblant de rejouer le meme tirage.
+///
+/// # Seconde decision — le filtre « album non fini » ne vaut que pour un album
+///
+/// `listened_tracks < track_count` disparait pour les quatre autres natures :
+/// un titre isole ou une playlist n'a aucune notion d'« incomplet », et l'y
+/// appliquer les aurait fait disparaitre aussitot ecrits.
+///
+/// # Les lignes SANS contexte ne sont pas perdues
+///
+/// Une base en service porte des milliers de lignes anterieures a la migration
+/// 84, a `context_type` NULL. Ne rendre que des contextes VIDERAIT la section
+/// le jour de la mise a jour. L'ancienne requete est donc conservee telle
+/// quelle en second rang, et ses albums sont fusionnes avec les contextes —
+/// dedoublonnes par identifiant d'album, le contexte primant puisque lui seul
+/// porte le rang.
 fn fetch_continue_listening(
     state: &AppState,
     limit: i64,
     zone_id: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    // When a zone_id filter is provided, only show albums that were listened
+    // When a zone_id filter is provided, only show entries that were listened
     // to on that zone.  This ensures the "continue listening" section matches
     // the user's currently selected zone (B-09 fix).
     let zone_filter = match zone_id {
         Some(zid) => format!("AND lh.zone_id = {zid} "),
         None => String::new(),
     };
-    let p1 = ph(engine, 1);
-    let sql = format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
-               COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
-        FROM listen_history lh \
-        JOIN albums a ON lh.album_title = a.title \
-        LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
-        {zone_filter}\
-        GROUP BY a.id \
-        HAVING listened_tracks < a.track_count \
-        ORDER BY MAX(lh.listened_at) DESC \
-        LIMIT {p1}"
-    );
-    let params: [&dyn ToSqlValue; 1] = [&limit];
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
-    Ok(rows
+
+    let mut items = contextes_recents(state, limit, &zone_filter);
+
+    // Second rang : les albums DEDUITS, pour les lignes qui ne disent rien de
+    // leur contexte. Deux garde-fous contre le doublon :
+    //
+    // * en SQL, `SUM(CASE WHEN context_type IS NULL ...)` — un album dont
+    //   toutes les lignes portent un contexte est deja rendu par le premier
+    //   rang, en mieux (il a le rang) ;
+    // * en Rust, `deja` — tout album deja represente, y compris derriere un
+    //   contexte `track`. Une piste jouee seule ne doit pas faire remonter en
+    //   plus son disque : « Tune doit refleter la realite de ce qu'a voulu
+    //   faire l'auditeur », pas doubler chaque geste.
+    //
+    // Le comptage, lui, reste sur TOUTES les lignes (HISTORIQUE_VERS_ALBUM
+    // inchange depuis #2731) : n'avancer que sur les lignes sans contexte
+    // sous-estimerait un disque commence avant la mise a jour et poursuivi
+    // apres.
+    //
+    // DEUX ecritures imposees par PostgreSQL, mesurees sur une base reelle
+    // (#2860) — SQLite tolerait les deux, et l'erreur etait avalee par le
+    // `unwrap_or_default()` ci-dessous, donc la section disparaissait sans un
+    // seul message :
+    //
+    // * `GROUP BY a.id` seul ne suffit pas. La dependance fonctionnelle de
+    //   PostgreSQL ne couvre que les colonnes de la table dont on groupe la
+    //   cle primaire ; `ar.name` vient d'une AUTRE table :
+    //     ERROR: column "ar.name" must appear in the GROUP BY clause
+    //            or be used in an aggregate function
+    //   C'est la meme correction que `resoudre_albums` porte deja.
+    //
+    // * `HAVING listened_tracks < ...` ne marche pas non plus. Un alias de la
+    //   liste SELECT n'existe pas encore quand le HAVING est evalue :
+    //     ERROR: column "listened_tracks" does not exist
+    //   (l'alias reste legal en ORDER BY et en GROUP BY, lui.) On repete donc
+    //   l'agregat.
+    let deja: std::collections::HashSet<i64> = items
         .iter()
-        .map(|cols| {
-            let album_id = cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+        .filter_map(|(_, item)| item["album_id"].as_i64())
+        .collect();
+    let sql = home_queries::continue_listening_albums_deduits(engine, &zone_filter);
+    let marge = marge_de_contextes(limit);
+    let params: [&dyn ToSqlValue; 1] = [&marge];
+    for cols in state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+    {
+        let album_id = cols.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        if deja.contains(&album_id) {
+            continue;
+        }
+        let titre = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+        let dernier = cols.get(8).and_then(|v| v.as_string()).unwrap_or_default();
+        items.push((
+            dernier,
             json!({
                 "id": album_id,
                 "album_id": album_id,
-                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                "album_title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                // Ces lignes ne DISENT pas qu'il s'agissait d'un album : c'est
+                // deduit de la jointure. On le declare quand meme « album »,
+                // c'est ce que la section montrait deja — mais sans rang, qui
+                // n'a jamais ete ecrit pour elles.
+                "context_type": "album",
+                "context_id": album_id.to_string(),
+                "position": Value::Null,
+                "title": titre.clone(),
+                "album_title": titre,
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "year": cols.get(3).and_then(|v| v.as_i64()),
                 "cover_path": cols.get(4).and_then(|v| v.as_string()),
                 "genre": cols.get(5).and_then(|v| v.as_string()),
                 "listened_tracks": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
                 "track_count": cols.get(7).and_then(|v| v.as_i64()),
-            })
+                "source": "local",
+            }),
+        ));
+    }
+
+    // Le plus recent d'abord, toutes natures confondues : l'auditeur relit son
+    // geste le plus recent, pas « les albums puis les playlists ».
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.truncate(limit.max(0) as usize);
+    Ok(items.into_iter().map(|(_, item)| item).collect())
+}
+
+/// La derniere ecoute de chaque contexte distinct, enrichie de quoi l'afficher.
+///
+/// Rend `(date d'ecoute, entree)` pour que l'appelant fusionne avec le second
+/// rang sans avoir a relire la date dans le JSON.
+fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(String, Value)> {
+    let engine = state.backend.engine();
+    let marge = marge_de_contextes(limit);
+    let natures = CONTEXTES_AFFICHES
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // La ligne la PLUS RECENTE de chaque contexte : c'est elle qui porte le
+    // rang atteint, et les champs d'affichage de repli. La jointure sur le
+    // MAX plutot qu'une fonction de fenetrage — les deux moteurs la
+    // comprennent, `ROW_NUMBER() OVER` n'existe pas sur toutes les versions de
+    // SQLite embarquees.
+    let p1 = ph(engine, 1);
+    let sql = format!(
+        "SELECT lh.context_type, lh.context_id, lh.listened_at, \
+                lh.context_position, lh.title, lh.artist_name, lh.album_title, \
+                lh.cover_url, lh.album_id, lh.source \
+         FROM listen_history lh \
+         JOIN (SELECT context_type, context_id, MAX(listened_at) as dernier \
+               FROM listen_history lh \
+               WHERE lh.context_type IN ({natures}) \
+                 AND lh.context_id IS NOT NULL \
+                 {zone_filter}\
+               GROUP BY context_type, context_id) d \
+           ON d.context_type = lh.context_type \
+          AND d.context_id = lh.context_id \
+          AND d.dernier = lh.listened_at \
+         WHERE lh.context_type IN ({natures}) \
+         {zone_filter}\
+         ORDER BY lh.listened_at DESC \
+         LIMIT {p1}"
+    );
+    let params: [&dyn ToSqlValue; 1] = [&marge];
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
+
+    // Deux lignes d'un meme contexte peuvent porter la MEME `listened_at` (la
+    // seconde est a la seconde pres) : la jointure sur le MAX les rend toutes
+    // les deux. On garde la premiere, l'ordre etant deja decroissant.
+    let mut vues = std::collections::HashSet::new();
+    let brut: Vec<_> = rows
+        .iter()
+        .filter_map(|cols| {
+            let nature = cols.first().and_then(|v| v.as_string())?;
+            let id = cols.get(1).and_then(|v| v.as_string())?;
+            vues.insert((nature.clone(), id.clone()))
+                .then_some((nature, id, cols))
         })
-        .collect())
+        .collect();
+
+    let albums = resoudre_albums(state, &brut);
+    let playlists = resoudre_par_id(state, &brut, "playlist", "playlists");
+    let artistes = resoudre_par_id(state, &brut, "artist", "artists");
+
+    brut.into_iter()
+        .filter_map(|(nature, id, cols)| {
+            let dernier = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+            let rang = cols.get(3).and_then(|v| v.as_i64());
+            let titre_piste = cols.get(4).and_then(|v| v.as_string()).unwrap_or_default();
+            let artiste = cols.get(5).and_then(|v| v.as_string());
+            let titre_album = cols.get(6).and_then(|v| v.as_string());
+            let pochette = cols.get(7).and_then(|v| v.as_string());
+            let album_id = cols.get(8).and_then(|v| v.as_i64());
+            let source = cols
+                .get(9)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "local".into());
+
+            // Socle commun : ce que TOUTES les natures portent. Les champs
+            // d'album restent presents et nuls hors album — les clients
+            // deployes lisent `album_id` sans savoir qu'un type existe, mieux
+            // vaut un champ nul qu'un champ absent.
+            let mut item = json!({
+                "context_type": nature,
+                "context_id": id,
+                "position": rang,
+                "source": source,
+                "id": album_id.unwrap_or(0),
+                "album_id": album_id,
+                "artist_name": artiste,
+                "album_title": titre_album,
+                "cover_path": pochette,
+                "year": Value::Null,
+                "genre": Value::Null,
+                "listened_tracks": Value::Null,
+                "track_count": Value::Null,
+                "title": titre_piste,
+            });
+            let o = item.as_object_mut()?;
+
+            match nature.as_str() {
+                "album" => {
+                    // Album LOCAL : titre, artiste, pochette et avancement
+                    // viennent de la bibliotheque. C'est la SEULE nature ou le
+                    // filtre « pas encore fini » s'applique — un disque termine
+                    // n'a plus rien a « continuer ».
+                    if let Some(a) = albums.get(&id) {
+                        if let (Some(lus), Some(total)) = (a.listened_tracks, a.track_count) {
+                            if total > 0 && lus >= total {
+                                return None;
+                            }
+                        }
+                        o.insert("id".into(), json!(a.id));
+                        o.insert("album_id".into(), json!(a.id));
+                        o.insert("title".into(), json!(a.title));
+                        o.insert("album_title".into(), json!(a.title));
+                        o.insert("artist_name".into(), json!(a.artist_name));
+                        o.insert("year".into(), json!(a.year));
+                        o.insert("cover_path".into(), json!(a.cover_path));
+                        o.insert("genre".into(), json!(a.genre));
+                        o.insert("listened_tracks".into(), json!(a.listened_tracks));
+                        o.insert("track_count".into(), json!(a.track_count));
+                    } else {
+                        // Album de STREAMING (`context_id` non numerique) ou
+                        // disque disparu de la bibliotheque : la ligne
+                        // d'historique porte son titre et sa pochette, elles
+                        // suffisent a l'afficher. Pas d'avancement — on ne
+                        // connait pas le nombre de pistes.
+                        o.insert("title".into(), json!(titre_album.clone()));
+                    }
+                }
+                "playlist" => {
+                    // Playlist LOCALE : son nom fait foi. Une playlist de
+                    // streaming n'a pas de ligne dans `playlists` et son nom
+                    // n'est cache NULLE PART en base — l'entree part avec son
+                    // `context_id` et sa `source`, a charge du client de la
+                    // nommer. Mieux qu'un titre de piste presente pour un nom
+                    // de playlist.
+                    o.insert("title".into(), json!(playlists.get(&id)));
+                    o.insert("album_id".into(), Value::Null);
+                    o.insert("album_title".into(), Value::Null);
+                }
+                "artist" => {
+                    // L'artiste demande, pas celui de la derniere piste jouee :
+                    // sur une compilation ils different.
+                    let nom = artistes.get(&id).cloned().or(artiste);
+                    o.insert("title".into(), json!(nom.clone()));
+                    o.insert("artist_name".into(), json!(nom));
+                    o.insert("album_id".into(), Value::Null);
+                    o.insert("album_title".into(), Value::Null);
+                }
+                "label" => {
+                    // Un label n'a NI table NI identifiant : l'onglet Labels
+                    // lit une facette et selectionne par CHAINE (meme constat
+                    // qu'a la migration 85). `context_id` EST donc le nom du
+                    // label, et il est son propre titre.
+                    o.insert("title".into(), json!(id));
+                    o.insert("album_id".into(), Value::Null);
+                    o.insert("album_title".into(), Value::Null);
+                }
+                // "track" : le titre de la piste est deja en place, et
+                // `album_id` / `album_title` restent renseignes pour que le
+                // client puisse remonter au disque qui la porte.
+                _ => {}
+            }
+
+            Some((dernier, item))
+        })
+        .collect()
+}
+
+/// Ce qu'un album de la bibliotheque apporte a une entree, une fois resolu.
+struct AlbumResolu {
+    id: i64,
+    title: String,
+    artist_name: Option<String>,
+    year: Option<i64>,
+    cover_path: Option<String>,
+    genre: Option<String>,
+    listened_tracks: Option<i64>,
+    track_count: Option<i64>,
+}
+
+/// Resout d'UN COUP les contextes `album` dont l'identifiant designe un album
+/// local, avec leur avancement. Une requete pour toute la section, pas une par
+/// tuile : l'accueil est sur le chemin du premier affichage.
+///
+/// Les identifiants sont interpoles apres avoir ete convertis en `i64` — ce
+/// sont des entiers, pas des chaines d'origine inconnue, exactement comme le
+/// filtre de zone juste au-dessus.
+fn resoudre_albums(
+    state: &AppState,
+    brut: &[(String, String, &Vec<tune_core::db::backend::SqlValue>)],
+) -> std::collections::HashMap<String, AlbumResolu> {
+    let ids: Vec<i64> = brut
+        .iter()
+        .filter(|(nature, _, _)| nature == "album")
+        .filter_map(|(_, id, _)| id.parse::<i64>().ok())
+        .collect();
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let liste = ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    // GROUP BY exhaustif, et non `GROUP BY a.id` : la dependance fonctionnelle
+    // de PostgreSQL ne couvre que les colonnes de la table dont on groupe la
+    // cle primaire — `ar.name` vient d'une AUTRE table et ferait echouer la
+    // requete sur ce moteur.
+    let sql = format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
+                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
+         FROM albums a \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         LEFT JOIN listen_history lh ON {HISTORIQUE_VERS_ALBUM} \
+         WHERE a.id IN ({liste}) \
+         GROUP BY a.id, a.title, ar.name, a.year, a.cover_path, a.genre, a.track_count"
+    );
+    state
+        .backend
+        .query_many(&sql, &[])
+        .ou_defaut_journalise()
+        .iter()
+        .filter_map(|cols| {
+            let id = cols.first().and_then(|v| v.as_i64())?;
+            Some((
+                id.to_string(),
+                AlbumResolu {
+                    id,
+                    title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    artist_name: cols.get(2).and_then(|v| v.as_string()),
+                    year: cols.get(3).and_then(|v| v.as_i64()),
+                    cover_path: cols.get(4).and_then(|v| v.as_string()),
+                    genre: cols.get(5).and_then(|v| v.as_string()),
+                    listened_tracks: cols.get(6).and_then(|v| v.as_i64()),
+                    track_count: cols.get(7).and_then(|v| v.as_i64()),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Le NOM des objets d'une nature donnee, resolus d'un coup dans leur table.
+///
+/// Sert `playlist` (table `playlists`) et `artist` (table `artists`), qui
+/// portent toutes deux une colonne `name` et un identifiant entier. Un
+/// identifiant non numerique — playlist de streaming — n'entre pas dans la
+/// requete : il n'a rien a y trouver.
+fn resoudre_par_id(
+    state: &AppState,
+    brut: &[(String, String, &Vec<tune_core::db::backend::SqlValue>)],
+    nature: &str,
+    table: &str,
+) -> std::collections::HashMap<String, String> {
+    let ids: Vec<i64> = brut
+        .iter()
+        .filter(|(n, _, _)| n == nature)
+        .filter_map(|(_, id, _)| id.parse::<i64>().ok())
+        .collect();
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let liste = ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT id, name FROM {table} WHERE id IN ({liste})");
+    state
+        .backend
+        .query_many(&sql, &[])
+        .ou_defaut_journalise()
+        .iter()
+        .filter_map(|cols| {
+            let id = cols.first().and_then(|v| v.as_i64())?;
+            let nom = cols.get(1).and_then(|v| v.as_string())?;
+            Some((id.to_string(), nom))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests_homonymes {
+    use super::*;
+
+    /// Les deux disques de Tades : un « Live » de Police et un « Live » de
+    /// Pulp, meme titre au caractere pres, cinq pistes chacun.
+    /// Rend `(id du Live de Police, id du Live de Pulp)`.
+    fn deux_live(state: &AppState, genre: Option<&str>) -> (i64, i64) {
+        let b = &state.backend;
+        let poser = |artiste: &str| -> i64 {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            let artiste_id = b.last_insert_rowid();
+            b.execute(
+                "INSERT INTO albums (title, artist_id, track_count, genre) \
+                 VALUES ('Live', ?1, 5, ?2)",
+                &[&artiste_id as &dyn ToSqlValue, &genre as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let police = poser("The Police");
+        let pulp = poser("Pulp");
+        (police, pulp)
+    }
+
+    fn ecoute(state: &AppState, titre: &str, artiste: Option<&str>, album_id: Option<i64>) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES (?1, ?2, 'Live', ?3, '2026-08-28T22:45:00Z')",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Le defaut de Tades (#2731, fil 1600) : ecouter le « Live » de Pulp
+    /// faisait remonter celui de Police, et le compteur d'avancement
+    /// additionnait les pistes des deux.
+    #[test]
+    fn le_live_de_pulp_ne_fait_pas_remonter_celui_de_police() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        ecoute(&state, "Disco 2000", Some("Pulp"), Some(pulp));
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+        assert_eq!(
+            items[0]["listened_tracks"].as_i64(),
+            Some(2),
+            "le compteur ne doit compter que les pistes de CET album"
+        );
+        assert_ne!(items[0]["album_id"].as_i64(), Some(police));
+    }
+
+    /// `record_listen` ne connait l'album que par la piste locale : une ecoute
+    /// en flux (`track_id` absent) et toute ligne anterieure a la migration
+    /// `add_listen_history_source_id_album_id` ont `album_id` a NULL. Joindre
+    /// sur le seul identifiant VIDERAIT la section pour ces gens-la — le repli
+    /// titre + artiste doit tenir.
+    #[test]
+    fn une_ecoute_sans_album_id_reste_rattachee_par_titre_et_artiste() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(pulp));
+        assert_eq!(items[0]["artist_name"].as_str(), Some("Pulp"));
+    }
+
+    /// Sans artiste NI identifiant, un titre qui ne designe QU'UN album reste
+    /// rattache : perdre l'entree serait pire que la garder. C'est la seconde
+    /// branche de `find_album_by_identity` — titre seul, mais non ambigu.
+    #[test]
+    fn une_ecoute_sans_artiste_ni_identifiant_n_est_pas_perdue() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            1,
+            "la section ne doit pas se vider : {items:?}"
+        );
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// Sans artiste NI identifiant, un titre PARTAGE par deux disques ne
+    /// designe rien. Le rattacher aux deux, c'est le defaut de Tades par
+    /// l'autre porte : le « Live » de Police remontait sans avoir ete joue.
+    /// `find_album_by_identity` refuse ce repli depuis #1391 (« ok » de daoud
+    /// vs « OK » de Talvin Singh) ; la section s'aligne.
+    #[test]
+    fn une_ecoute_sans_artiste_sur_un_titre_ambigu_ne_rattache_rien() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        deux_live(&state, None);
+        ecoute(&state, "Piste inconnue", None, None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "un titre partage par deux albums ne designe aucun des deux : {items:?}"
+        );
+    }
+
+    /// Une chaine vide n'est pas un artiste. Traitee comme une valeur, elle ne
+    /// s'egalait a rien : l'album disparaissait de la section au lieu de
+    /// retomber sur le titre seul. `find_album_by_identity` teste
+    /// `artist.is_empty()`, pas la nullite.
+    #[test]
+    fn un_artiste_vide_vaut_artiste_inconnu() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Live', ?1, 5)",
+            &[&artiste_id as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seul = b.last_insert_rowid();
+        ecoute(&state, "Piste inconnue", Some(""), None);
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+    }
+
+    /// LIMITE FIGEE, pas un comportement souhaite. `record_listen` ecrit le
+    /// titre d'album tel que le fournisseur de flux le rend ; `albums` le
+    /// porte tel que le scanner l'a lu des etiquettes. Les favoris
+    /// rapprochent « Live » et « LIVE » depuis #1391 ; cette section, non —
+    /// elle compare octet a octet et perd l'ecoute.
+    ///
+    /// Ce n'est pas un oubli : le `LOWER` a ete ecrit, puis MESURE. Sur
+    /// 45 000 albums et 5 000 lignes d'historique, `fetch_continue_listening`
+    /// passe de **19 ms a 83 662 ms** — l'index
+    /// `idx_albums_title ON albums(title COLLATE NOCASE)` ne sert plus la
+    /// comparaison. Le rendre gratuit demande un index d'expression aux
+    /// quatre endroits du schema, et PostgreSQL n'a pas de `COLLATE NOCASE`.
+    /// C'est un chantier de schema, pas la confusion de deux albums (#2731).
+    ///
+    /// Si ce test se met a echouer, c'est que quelqu'un a rendu la casse
+    /// indifferente : verifier d'abord qu'il a paye l'index, sinon l'accueil
+    /// met une minute et demie a s'afficher.
+    #[test]
+    fn la_casse_separe_encore_une_ecoute_de_son_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, _pulp) = deux_live(&state, None);
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
+                 VALUES ('Common People', 'pulp', 'LIVE', '2026-08-28T22:45:00Z')",
+                &[],
+            )
+            .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "limite connue : « LIVE » ne rejoint pas « Live » — voir le cout \
+             mesure sur HISTORIQUE_VERS_ALBUM avant de changer ceci : {items:?}"
+        );
+    }
+
+    /// Constat de bordure, releve en voulant eprouver le meme defaut du cote
+    /// des recommandations : `sql_top_genres` ne rend RIEN, sur les deux
+    /// moteurs. `WHERE genre IS NOT NULL` se heurte a `t.genre` et `a.genre`
+    /// — « ambiguous column name: genre » — et l'erreur est avalee par le
+    /// `unwrap_or_default` de l'appelant. « A decouvrir » tire donc toujours
+    /// au hasard, et « top mixes » est toujours vide.
+    ///
+    /// Consequence pour #2731 : la jointure corrigee dans `sql_top_genres` et
+    /// le `NOT EXISTS` des recommandations sont ecrits juste, mais aucun test
+    /// ne peut les atteindre tant que cette requete ne s'execute pas. Reveiller
+    /// la requete change ce que l'accueil AFFICHE (le hasard cede la place aux
+    /// albums d'un genre, qui peuvent etre zero) : c'est un arbitrage produit,
+    /// pas le defaut de Tades. Il est laisse hors de ce correctif, et ce test
+    /// le fige pour qu'on ne le decouvre pas deux fois.
+    #[test]
+    fn les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, Some("Rock"));
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+
+        assert!(
+            state.backend.query_many(&sql_top_genres(), &[]).is_err(),
+            "si cette requete se met a repondre, les deux jointures corrigees \
+             deviennent testables — et « A decouvrir » cesse d'etre aleatoire"
+        );
+    }
+}
+
+/// #2441 — « Continuer l'ecoute » doit refleter CE QUE l'auditeur a demande.
+///
+/// FabienM, fil forum 1557 : « si je choisis d'ecouter un titre alors je
+/// m'attends a voir ce titre » ; « si je choisis de jouer une playlist
+/// complete, je m'attends a voir cette playlist » ; « idem si je decide de
+/// jouer un artiste ou un label ».
+///
+/// CONTRE-EPREUVE — chacun de ces tests devient ROUGE sur la requete d'avant
+/// le correctif. Elle partait de `albums` (`JOIN albums a ON ...`,
+/// `GROUP BY a.id`) : une playlist, un artiste, un label, un titre isole n'en
+/// sortaient JAMAIS, et la section rendait `[]`. Les quatre premiers tests
+/// echouent donc sur `items.len() == 1`, et le cinquieme sur `context_type`,
+/// ce champ n'ayant jamais existe dans la charge utile.
+///
+/// Une nature par test, deliberement : un test qui ne couvrirait que l'album
+/// laisserait les quatre autres nus — c'est exactement le defaut qu'on corrige.
+#[cfg(test)]
+mod tests_contextes {
+    use super::*;
+
+    /// Une ecoute qui DIT d'ou venait le geste. `rang` a `None` = tirage
+    /// aleatoire ou ligne d'avant la migration 94.
+    fn ecoute_avec_contexte(
+        state: &AppState,
+        titre: &str,
+        artiste: Option<&str>,
+        album: Option<&str>,
+        album_id: Option<i64>,
+        nature: &str,
+        contexte_id: &str,
+        rang: Option<i64>,
+        quand: &str,
+    ) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, source, \
+                  context_type, context_id, context_position, listened_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'local', ?5, ?6, ?7, ?8)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &album as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &nature as &dyn ToSqlValue,
+                    &contexte_id as &dyn ToSqlValue,
+                    &rang as &dyn ToSqlValue,
+                    &quand as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn poser_album(state: &AppState, artiste: &str, titre: &str, pistes: i64) -> i64 {
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (name) VALUES (?1)",
+            &[&artiste as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES (?1, ?2, ?3)",
+            &[
+                &titre as &dyn ToSqlValue,
+                &artiste_id as &dyn ToSqlValue,
+                &pistes as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        b.last_insert_rowid()
+    }
+
+    // --- PLAYLIST ---------------------------------------------------------
+
+    /// « Si je choisis de jouer une playlist complete, je m'attends a voir
+    /// cette playlist » — et a la retrouver a la piste ou je l'avais laissee.
+    #[test]
+    fn une_playlist_remonte_comme_playlist_avec_son_nom_et_son_rang() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist_id = state.backend.last_insert_rowid();
+        ecoute_avec_contexte(
+            &state,
+            "So What",
+            Some("Miles Davis"),
+            Some("Kind of Blue"),
+            None,
+            "playlist",
+            &playlist_id.to_string(),
+            Some(6),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            1,
+            "la playlist n'apparait pas : la section repart-elle de `albums` ? {items:?}"
+        );
+        assert_eq!(items[0]["context_type"], "playlist");
+        assert_eq!(items[0]["context_id"], playlist_id.to_string());
+        assert_eq!(
+            items[0]["title"], "Route de nuit",
+            "c'est le NOM de la playlist qui doit s'afficher, pas le titre de \
+             la derniere piste jouee"
+        );
+        assert_eq!(
+            items[0]["position"].as_i64(),
+            Some(6),
+            "sans le rang, on rouvrirait la bonne playlist a sa premiere piste"
+        );
+    }
+
+    /// Une playlist ecoutee EN ENTIER reste dans la section. C'est la seconde
+    /// decision de l'arbitrage : le filtre « moins de pistes ecoutees que le
+    /// total » ne vaut que pour un album. Une playlist n'a aucune notion
+    /// d'« incomplet » — la lui appliquer l'aurait fait disparaitre aussitot
+    /// ecrite.
+    #[test]
+    fn une_playlist_finie_reste_dans_la_section() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Courte')", &[])
+            .unwrap();
+        let playlist_id = state.backend.last_insert_rowid();
+        for (n, titre) in ["A", "B", "C"].iter().enumerate() {
+            ecoute_avec_contexte(
+                &state,
+                titre,
+                None,
+                None,
+                None,
+                "playlist",
+                &playlist_id.to_string(),
+                Some(n as i64),
+                &format!("2026-08-28T22:4{n}:00Z"),
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "la playlist finie a disparu : {items:?}");
+        assert_eq!(items[0]["context_type"], "playlist");
+        assert_eq!(
+            items[0]["position"].as_i64(),
+            Some(2),
+            "c'est le rang de la DERNIERE ecoute qui doit etre retenu"
+        );
+    }
+
+    /// Une playlist de STREAMING n'a pas de ligne dans `playlists` et son nom
+    /// n'est cache nulle part en base. LIMITE ASSUMEE : l'entree remonte avec
+    /// son type, son identifiant et sa source, mais SANS titre — c'est au
+    /// client de la nommer aupres du service. Afficher a la place le titre de
+    /// la derniere piste serait un mensonge.
+    #[test]
+    fn une_playlist_de_streaming_remonte_sans_titre_mais_avec_sa_source() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, source, context_type, context_id, listened_at) \
+                 VALUES ('So What', 'qobuz', 'playlist', 'qb-playlist-99', \
+                         '2026-08-28T22:45:00Z')",
+                &[],
+            )
+            .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "l'entree a ete perdue : {items:?}");
+        assert_eq!(items[0]["context_type"], "playlist");
+        assert_eq!(items[0]["context_id"], "qb-playlist-99");
+        assert_eq!(items[0]["source"], "qobuz");
+        assert!(
+            items[0]["title"].is_null(),
+            "pas de nom en base : mieux vaut un titre nul que le titre de la \
+             piste presente pour un nom de playlist — {items:?}"
+        );
+    }
+
+    // --- ARTISTE ----------------------------------------------------------
+
+    /// « Idem si je decide de jouer un artiste ». Le nom affiche est celui de
+    /// l'ARTISTE DEMANDE, pas celui de la derniere piste jouee : sur une
+    /// compilation les deux different.
+    #[test]
+    fn un_artiste_remonte_comme_artiste_avec_le_nom_demande() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO artists (name) VALUES ('Miles Davis')", &[])
+            .unwrap();
+        let artiste_id = state.backend.last_insert_rowid();
+        ecoute_avec_contexte(
+            &state,
+            "Sur une compilation",
+            Some("Artiste invite"),
+            None,
+            None,
+            "artist",
+            &artiste_id.to_string(),
+            Some(3),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "l'artiste n'apparait pas : {items:?}");
+        assert_eq!(items[0]["context_type"], "artist");
+        assert_eq!(items[0]["title"], "Miles Davis");
+        assert_eq!(
+            items[0]["artist_name"], "Miles Davis",
+            "c'est l'artiste DEMANDE qui compte, pas « Artiste invite » lu sur \
+             la derniere ligne d'historique"
+        );
+        assert_eq!(items[0]["position"].as_i64(), Some(3));
+    }
+
+    // --- LABEL ------------------------------------------------------------
+
+    /// « Idem si je decide de jouer [...] un label ». Un label n'a NI table NI
+    /// identifiant : l'onglet Labels lit une facette et selectionne par
+    /// CHAINE. `context_id` EST donc le nom du label, et il est son propre
+    /// titre.
+    #[test]
+    fn un_label_remonte_comme_label_et_est_son_propre_titre() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_avec_contexte(
+            &state,
+            "Take Five",
+            Some("Dave Brubeck"),
+            None,
+            None,
+            "label",
+            "Blue Note",
+            Some(11),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "le label n'apparait pas : {items:?}");
+        assert_eq!(items[0]["context_type"], "label");
+        assert_eq!(items[0]["context_id"], "Blue Note");
+        assert_eq!(items[0]["title"], "Blue Note");
+        assert_eq!(items[0]["position"].as_i64(), Some(11));
+    }
+
+    // --- TITRE ISOLE ------------------------------------------------------
+
+    /// « Si je choisis d'ecouter un titre alors je m'attends a voir ce titre ».
+    /// L'album reste renseigne — il permet de remonter au disque qui porte la
+    /// piste — mais ce n'est plus lui qu'on affiche.
+    #[test]
+    fn un_titre_isole_remonte_comme_titre_et_non_comme_son_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Different Class", 12);
+        ecoute_avec_contexte(
+            &state,
+            "Common People",
+            Some("Pulp"),
+            Some("Different Class"),
+            Some(album),
+            "track",
+            "7",
+            Some(0),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "le titre n'apparait pas : {items:?}");
+        assert_eq!(items[0]["context_type"], "track");
+        assert_eq!(
+            items[0]["title"], "Common People",
+            "c'est le TITRE qui doit s'afficher, pas « Different Class » — le \
+             defaut exact releve par FabienM"
+        );
+        assert_eq!(
+            items[0]["album_id"].as_i64(),
+            Some(album),
+            "l'album reste connu : le client doit pouvoir remonter au disque"
+        );
+    }
+
+    // --- ALBUM ------------------------------------------------------------
+
+    /// L'album n'a rien perdu : il garde son avancement, et gagne le rang.
+    #[test]
+    fn un_album_remonte_avec_son_avancement_et_son_rang() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Different Class", 12);
+        ecoute_avec_contexte(
+            &state,
+            "Common People",
+            Some("Pulp"),
+            Some("Different Class"),
+            Some(album),
+            "album",
+            &album.to_string(),
+            Some(4),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "albums rendus : {items:?}");
+        assert_eq!(items[0]["context_type"], "album");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(album));
+        assert_eq!(items[0]["title"], "Different Class");
+        assert_eq!(items[0]["artist_name"], "Pulp");
+        assert_eq!(items[0]["listened_tracks"].as_i64(), Some(1));
+        assert_eq!(items[0]["track_count"].as_i64(), Some(12));
+        assert_eq!(items[0]["position"].as_i64(), Some(4));
+    }
+
+    /// L'album, LUI, garde le filtre « pas encore fini » : un disque ecoute en
+    /// entier n'a plus rien a « continuer ». C'est la contre-partie de la
+    /// seconde decision — le filtre ne DISPARAIT pas, il cesse seulement de
+    /// s'appliquer aux natures qui n'ont pas de notion de completude.
+    #[test]
+    fn un_album_termine_disparait_toujours_de_la_section() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Court", "Deux pistes", 2);
+        for (n, titre) in ["Une", "Deux"].iter().enumerate() {
+            ecoute_avec_contexte(
+                &state,
+                titre,
+                Some("Court"),
+                Some("Deux pistes"),
+                Some(album),
+                "album",
+                &album.to_string(),
+                Some(n as i64),
+                &format!("2026-08-28T22:4{n}:00Z"),
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert!(
+            items.is_empty(),
+            "un album ecoute en entier ne se « continue » pas : {items:?}"
+        );
+    }
+
+    // --- LE SOCLE EXISTANT NE DOIT PAS TOMBER -----------------------------
+
+    /// Une base en service porte des milliers de lignes anterieures a la
+    /// migration 84, sans contexte. Si la section ne rendait QUE des
+    /// contextes, elle se viderait le jour de la mise a jour — la pire des
+    /// regressions : le correctif d'un manque d'affichage produisant un
+    /// ecran blanc.
+    #[test]
+    fn les_ecoutes_sans_contexte_alimentent_toujours_la_section() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Different Class", 12);
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('Common People', 'Pulp', 'Different Class', ?1, \
+                         '2026-08-28T22:45:00Z')",
+                &[&album as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "la section s'est videe : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(album));
+        assert_eq!(items[0]["context_type"], "album");
+        assert!(
+            items[0]["position"].is_null(),
+            "ces lignes n'ont jamais porte de rang : le declarer serait \
+             l'inventer"
+        );
+    }
+
+    /// Le meme album ecoute AVANT et APRES la mise a jour ne doit pas
+    /// apparaitre deux fois : le contexte prime, lui seul porte le rang.
+    #[test]
+    fn un_album_vu_par_les_deux_chemins_n_apparait_qu_une_fois() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Different Class", 12);
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('Common People', 'Pulp', 'Different Class', ?1, \
+                         '2026-08-27T10:00:00Z')",
+                &[&album as &dyn ToSqlValue],
+            )
+            .unwrap();
+        ecoute_avec_contexte(
+            &state,
+            "Disco 2000",
+            Some("Pulp"),
+            Some("Different Class"),
+            Some(album),
+            "album",
+            &album.to_string(),
+            Some(2),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "l'album est rendu deux fois : {items:?}");
+        assert_eq!(
+            items[0]["position"].as_i64(),
+            Some(2),
+            "c'est l'entree PORTEUSE DU RANG qui doit survivre au dedoublonnage"
+        );
+    }
+
+    /// Les cinq natures cote a cote, du geste le plus recent au plus ancien.
+    /// L'auditeur relit son histoire, pas « les albums puis le reste ».
+    #[test]
+    fn les_cinq_natures_cohabitent_et_sortent_du_plus_recent_au_plus_ancien() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Different Class", 12);
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist = state.backend.last_insert_rowid();
+        state
+            .backend
+            .execute("INSERT INTO artists (name) VALUES ('Miles Davis')", &[])
+            .unwrap();
+        let artiste = state.backend.last_insert_rowid();
+
+        let gestes: [(&str, String, &str); 5] = [
+            ("album", album.to_string(), "2026-08-28T22:41:00Z"),
+            ("playlist", playlist.to_string(), "2026-08-28T22:42:00Z"),
+            ("artist", artiste.to_string(), "2026-08-28T22:43:00Z"),
+            ("label", "Blue Note".into(), "2026-08-28T22:44:00Z"),
+            ("track", "7".into(), "2026-08-28T22:45:00Z"),
+        ];
+        for (nature, id, quand) in &gestes {
+            ecoute_avec_contexte(
+                &state,
+                "Common People",
+                Some("Pulp"),
+                Some("Different Class"),
+                Some(album),
+                nature,
+                id,
+                Some(1),
+                quand,
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        let natures: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i["context_type"].as_str())
+            .collect();
+        assert_eq!(
+            natures,
+            vec!["track", "label", "artist", "playlist", "album"],
+            "les cinq natures doivent cohabiter, du plus recent au plus \
+             ancien : {items:?}"
+        );
+    }
+
+    /// La borne de la section reste celle qu'on demande, toutes natures
+    /// confondues — la marge interne ne doit pas fuir dans la reponse.
+    #[test]
+    fn la_limite_demandee_est_respectee_toutes_natures_confondues() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        for n in 0..9 {
+            ecoute_avec_contexte(
+                &state,
+                "Take Five",
+                None,
+                None,
+                None,
+                "label",
+                &format!("Label {n}"),
+                Some(0),
+                &format!("2026-08-28T22:4{n}:00Z"),
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 3, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 3, "limite non respectee : {items:?}");
+    }
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
@@ -180,25 +1355,23 @@ async fn recently_added(
     Ok(Json(json!(items)))
 }
 
+/// « Ajoutes recemment ».
+///
+/// GROUP BY exhaustif, et non `GROUP BY a.id` : jumelle exacte du defaut de
+/// « Continuer l'ecoute » (#2860). `ar.name` vient de `artists`, que la
+/// dependance fonctionnelle de PostgreSQL sur `albums.id` ne couvre pas —
+/// `column "ar.name" must appear in the GROUP BY clause or be used in an
+/// aggregate function`, avalee par le `unwrap_or_default()` plus bas. Cette
+/// section-la etait donc vide, elle aussi, sur toute installation PostgreSQL.
 fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
     let seven_days_ago = chrono_epoch_seven_days_ago();
-    let p1 = ph(engine, 1);
-    let p2 = ph(engine, 2);
-    let sql = format!(
-        "SELECT DISTINCT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
-               a.format, a.sample_rate, a.bit_depth, a.track_count, \
-               MAX(t.file_mtime) as newest_mtime \
-        FROM tracks t \
-        JOIN albums a ON t.album_id = a.id \
-        LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE t.file_mtime IS NOT NULL AND t.file_mtime > {p1} \
-        GROUP BY a.id \
-        ORDER BY newest_mtime DESC \
-        LIMIT {p2}"
-    );
+    let sql = home_queries::recently_added(engine);
     let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
     Ok(rows
         .iter()
         .map(|cols| {
@@ -245,17 +1418,8 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     // Find top genres from listen history
     let top_genres: Vec<String> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
-        .unwrap_or_default()
+        .query_many(&sql_top_genres(), &[])
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -269,7 +1433,10 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
                    ORDER BY RANDOM() LIMIT {p1}"
         );
         let params: [&dyn ToSqlValue; 1] = [&limit];
-        let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+        let rows = state
+            .backend
+            .query_many(&sql, &params)
+            .ou_defaut_journalise();
         return Ok(rows
             .iter()
             .map(|cols| {
@@ -300,7 +1467,8 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
          WHERE a.genre IN ({genre_placeholders}) \
-           AND a.title NOT IN (SELECT DISTINCT album_title FROM listen_history WHERE album_title IS NOT NULL) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE {HISTORIQUE_VERS_ALBUM}) \
          ORDER BY RANDOM() \
          LIMIT {limit_ph}"
     );
@@ -316,7 +1484,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     let rows = state
         .backend
         .query_many(&sql, &param_refs)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     Ok(rows
         .iter()
         .map(|cols| {
@@ -341,17 +1509,8 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
         .backend
-        .query_many(
-            "SELECT genre, COUNT(*) as cnt \
-             FROM (SELECT COALESCE(t.genre, a.genre) as genre \
-                   FROM listen_history lh \
-                   LEFT JOIN tracks t ON lh.track_id = t.id \
-                   LEFT JOIN albums a ON lh.album_title = a.title \
-                   WHERE genre IS NOT NULL AND genre != '') \
-             GROUP BY genre ORDER BY cnt DESC LIMIT 5",
-            &[],
-        )
-        .unwrap_or_default()
+        .query_many(&sql_top_genres(), &[])
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
             let genre = cols.first()?.as_string()?;
@@ -379,7 +1538,7 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             let tracks: Vec<Value> = state
                 .backend
                 .query_many(&tracks_sql, &params)
-                .unwrap_or_default()
+                .ou_defaut_journalise()
                 .iter()
                 .map(|cols| {
                     json!({
@@ -451,7 +1610,7 @@ async fn new_in_library(
     let items: Vec<Value> = state
         .backend
         .query_many(&sql, &params)
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({
@@ -467,59 +1626,6 @@ async fn new_in_library(
         .collect();
     Ok(Json(json!(items)))
 }
-
-/// Classement d'un resultat de recherche par rapport au morceau ecoute.
-///
-/// Le rapprochement reste EXACT sur le titre (insensible a la casse) — la
-/// doctrine de la section : mieux vaut rien qu'un rapprochement faux. La
-/// nouveaute est d'assumer la REPRISE : meme titre, autre artiste. Pour un
-/// titre banal (« Angel ») cela produira des homonymes — c'est le prix
-/// explicite de la demande (« des reprises de Billie Jean, il y en a
-/// plein », Bertrand, 25/08), et l'ecran les range sous un libelle
-/// « Reprises » qui assume l'incertitude.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ClasseVersion {
-    /// Le meme enregistrement (meme artiste, meme album) : rien a proposer.
-    MemeEnregistrement,
-    /// Meme artiste, autre album : une autre version au sens strict.
-    AutreVersion,
-    /// Meme titre, autre artiste : une reprise possible.
-    Reprise,
-    /// Titre different : hors sujet.
-    SansRapport,
-}
-
-pub(crate) fn classer_version(
-    titre_ecoute: &str,
-    artiste_ecoute: &str,
-    album_ecoute: &str,
-    titre_trouve: &str,
-    artiste_trouve: &str,
-    album_trouve: &str,
-) -> ClasseVersion {
-    let meme = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
-    if !meme(titre_ecoute, titre_trouve) {
-        return ClasseVersion::SansRapport;
-    }
-    if meme(artiste_ecoute, artiste_trouve) {
-        if meme(album_ecoute, album_trouve) {
-            ClasseVersion::MemeEnregistrement
-        } else {
-            ClasseVersion::AutreVersion
-        }
-    } else {
-        ClasseVersion::Reprise
-    }
-}
-
-/// Cache des recherches de versions : une entree par (service, titre), six
-/// heures. Sans lui, chaque ouverture de l'accueil relancerait jusqu'a une
-/// trentaine de recherches — le plafond de requetes des services n'y
-/// survivrait pas.
-static CACHE_VERSIONS: std::sync::LazyLock<
-    tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
-> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
-const CACHE_VERSIONS_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Les ecoutes recentes examinees pour la recherche STREAMING. Chacune coute
 /// une recherche par service connecte (moins le cache) : ce nombre est le
@@ -563,13 +1669,12 @@ const ECOUTES_STREAMING: usize = 6;
 ///   cela demande les relations d'oeuvre de MusicBrainz, donc un MBID, et la
 ///   couverture MBID de la bibliotheque est encore trop faible pour que le
 ///   resultat soit autre chose qu'un hasard ;
-/// - pas de versions Qobuz : il faudrait une recherche par morceau ecoute,
-///   donc autant d'appels au service, avec le plafond de requetes que cela
-///   suppose. A brancher quand la section aura fait ses preuves en local.
+/// - les versions des services de streaming sont cherchees sur un vivier plus
+///   petit et mises en cache six heures, afin de borner les appels distants.
 ///
-/// Le rapprochement est insensible a la casse mais **exact** sur le titre. Un
-/// « (Live) » colle au titre ne sera pas rapproche : mieux vaut ne rien
-/// proposer qu'un rapprochement faux.
+/// Le rapprochement local est insensible a la casse et strict sur le coeur du
+/// titre : seul un suffixe d'edition delimite par ` (` ou ` [` est admis. Il
+/// ne s'agit pas d'une recherche floue.
 async fn other_versions(
     State(state): State<AppState>,
     Query(p): Query<HomeParams>,
@@ -585,6 +1690,14 @@ async fn other_versions(
     // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
     // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
     // SQLite et PostgreSQL.
+    // Le rapprochement lui-meme est ecrit UNE fois, dans
+    // `routes::versions` : la route par piste (#2372) applique exactement
+    // la meme regle a un vivier different.
+    let predicat = crate::routes::versions::predicat_rapprochement(
+        "lh.title",
+        "lh.artist_name",
+        "lh.album_title",
+    );
     let sql = format!(
         "SELECT DISTINCT lh.title, lh.artist_name, lh.album_title, \
                 t.id, al.id, al.title, al.cover_path, t.duration_ms \
@@ -593,11 +1706,11 @@ async fn other_versions(
               WHERE artist_name IS NOT NULL \
               ORDER BY listened_at DESC \
               LIMIT {ECOUTES_EXAMINEES}) lh \
-        JOIN tracks t ON LOWER(t.title) = LOWER(lh.title) \
+        CROSS JOIN tracks t \
         JOIN albums al ON t.album_id = al.id \
         LEFT JOIN artists ar ON al.artist_id = ar.id \
-        WHERE LOWER(COALESCE(ar.name, '')) = LOWER(lh.artist_name) \
-          AND LOWER(COALESCE(al.title, '')) <> LOWER(COALESCE(lh.album_title, '')) \
+        LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+        WHERE {predicat} \
         ORDER BY lh.listened_at DESC \
         LIMIT {limit}"
     );
@@ -606,7 +1719,7 @@ async fn other_versions(
     // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
     // chacun des trois clients).
     let mut groupes: Vec<Value> = Vec::new();
-    for cols in state.backend.query_many(&sql, &[]).unwrap_or_default() {
+    for cols in state.backend.query_many(&sql, &[]).ou_defaut_journalise() {
         let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
         let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let joue = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
@@ -651,7 +1764,7 @@ async fn other_versions(
     let recentes: Vec<(String, String, String)> = state
         .backend
         .query_many(&sql_recentes, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
             Some((
@@ -663,111 +1776,8 @@ async fn other_versions(
         .collect();
 
     for (titre, artiste, album) in recentes {
-        let mut trouvees: Vec<Value> = Vec::new();
-        for nom_service in ["qobuz", "tidal", "deezer", "spotify"] {
-            let cle_cache = format!("{nom_service}:{}", titre.to_lowercase());
-            let en_cache = {
-                let cache = CACHE_VERSIONS.lock().await;
-                cache.get(&cle_cache).and_then(|(quand, v)| {
-                    (quand.elapsed() < CACHE_VERSIONS_TTL).then(|| v.clone())
-                })
-            };
-            let pistes: Value = if let Some(v) = en_cache {
-                v
-            } else {
-                let arc = {
-                    let registre = state.services.lock().await;
-                    registre.get(nom_service)
-                };
-                let Some(arc) = arc else { continue };
-                let svc = arc.read().await;
-                if !svc.enabled() || !svc.auth_status().await.authenticated {
-                    continue;
-                }
-                let Ok(resultats) = svc.search(&titre, 10).await else {
-                    continue;
-                };
-                drop(svc);
-                let v = json!(resultats.tracks);
-                CACHE_VERSIONS
-                    .lock()
-                    .await
-                    .insert(cle_cache, (std::time::Instant::now(), v.clone()));
-                v
-            };
-            let Some(pistes) = pistes.as_array() else {
-                continue;
-            };
-            for piste in pistes {
-                let t = piste["title"].as_str().unwrap_or_default();
-                let a = piste["artist_name"].as_str().unwrap_or_default();
-                let al = piste["album_title"].as_str().unwrap_or_default();
-                let classe = classer_version(&titre, &artiste, &album, t, a, al);
-                let genre = match classe {
-                    ClasseVersion::AutreVersion => "version",
-                    ClasseVersion::Reprise => "reprise",
-                    _ => continue,
-                };
-                trouvees.push(json!({
-                    "service": nom_service,
-                    "source_id": piste["source_id"],
-                    "title": t,
-                    "artist_name": a,
-                    "album_title": al,
-                    "album_id": piste["album_id"],
-                    "cover_path": piste["cover_path"],
-                    "kind": genre,
-                }));
-            }
-        }
-
-        #[cfg(feature = "bandcamp")]
-        {
-            let cle_cache = format!("bandcamp:{}", titre.to_lowercase());
-            let en_cache = {
-                let cache = CACHE_VERSIONS.lock().await;
-                cache.get(&cle_cache).and_then(|(quand, v)| {
-                    (quand.elapsed() < CACHE_VERSIONS_TTL).then(|| v.clone())
-                })
-            };
-            let pistes: Value = if let Some(v) = en_cache {
-                v
-            } else {
-                {
-                    let v = json!(tune_bandcamp::rechercher_pistes(&titre).await);
-                    CACHE_VERSIONS
-                        .lock()
-                        .await
-                        .insert(cle_cache, (std::time::Instant::now(), v.clone()));
-                    v
-                }
-            };
-            if let Some(pistes) = pistes.as_array() {
-                for piste in pistes {
-                    let t = piste["title"].as_str().unwrap_or_default();
-                    let a = piste["artist_name"].as_str().unwrap_or_default();
-                    let al = piste["album_title"].as_str().unwrap_or_default();
-                    let classe = classer_version(&titre, &artiste, &album, t, a, al);
-                    let genre = match classe {
-                        ClasseVersion::AutreVersion => "version",
-                        ClasseVersion::Reprise => "reprise",
-                        _ => continue,
-                    };
-                    trouvees.push(json!({
-                        "service": "bandcamp",
-                        "source_id": piste["url"],
-                        "title": t,
-                        "artist_name": a,
-                        "album_title": piste["album_title"],
-                        "album_id": Value::Null,
-                        "cover_path": piste["cover_url"],
-                        "kind": genre,
-                        "url": piste["url"],
-                    }));
-                }
-            }
-        }
-
+        let trouvees =
+            crate::routes::versions::versions_streaming(&state, &titre, &artiste, &album).await;
         if trouvees.is_empty() {
             continue;
         }
@@ -796,6 +1806,72 @@ async fn other_versions(
     Ok(Json(json!(groupes)))
 }
 
+#[cfg(test)]
+mod tests_other_versions {
+    use super::*;
+
+    /// Le second appelant du predicat partage (#2638) doit accepter la meme
+    /// variante de titre que la route par piste, sans perdre l'artiste reel
+    /// d'une piste rangee dans une compilation « Artistes divers ».
+    #[tokio::test]
+    async fn accueil_retrouve_une_edition_suffixee_du_titre_ecoute() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Hit Collection', ?1)",
+            &[&divers as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Before The Dawn', ?1)",
+            &[&kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let before = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Running Up That Hill (A Deal With God)', ?1, ?2, 296000, '/before.flac')",
+            &[&before as &dyn ToSqlValue, &kate as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, listened_at) \
+             VALUES ('Running Up that Hill', 'Kate Bush', 'Hit Collection', \
+                     '2026-08-28T09:32:00Z')",
+            &[],
+        )
+        .unwrap();
+
+        let resultat = other_versions(
+            State(state),
+            Query(HomeParams {
+                limit: Some(20),
+                zone_id: None,
+            }),
+        )
+        .await;
+        let Json(groupes) = match resultat {
+            Ok(reponse) => reponse,
+            Err(_) => panic!("la route doit repondre"),
+        };
+
+        let groupes = groupes.as_array().expect("groupes de versions");
+        assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
+        assert_eq!(
+            groupes[0]["versions"][0]["album_title"].as_str(),
+            Some("Before The Dawn")
+        );
+    }
+}
+
 /// Favorite radios + recently played radios.
 async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let items = fetch_radio_picks(&state)?;
@@ -821,7 +1897,7 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
              ORDER BY last_played DESC LIMIT 10",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({
@@ -900,74 +1976,4 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
-}
-
-#[cfg(test)]
-mod tests_versions {
-    use super::{ClasseVersion, classer_version};
-
-    /// « Billie Jean » par Michael Jackson sur un AUTRE album : une version.
-    #[test]
-    fn meme_artiste_autre_album_est_une_version() {
-        assert_eq!(
-            classer_version(
-                "Billie Jean",
-                "Michael Jackson",
-                "Thriller",
-                "billie jean",
-                "MICHAEL JACKSON",
-                "Number Ones"
-            ),
-            ClasseVersion::AutreVersion
-        );
-    }
-
-    /// « Billie Jean » par quelqu'un d'autre : une reprise.
-    #[test]
-    fn autre_artiste_est_une_reprise() {
-        assert_eq!(
-            classer_version(
-                "Billie Jean",
-                "Michael Jackson",
-                "Thriller",
-                "Billie Jean",
-                "Chris Cornell",
-                "Unplugged in Sweden"
-            ),
-            ClasseVersion::Reprise
-        );
-    }
-
-    /// Le même enregistrement ne doit RIEN proposer.
-    #[test]
-    fn meme_enregistrement_est_ecarte() {
-        assert_eq!(
-            classer_version(
-                "Billie Jean",
-                "Michael Jackson",
-                "Thriller",
-                "Billie Jean",
-                "Michael Jackson",
-                "Thriller"
-            ),
-            ClasseVersion::MemeEnregistrement
-        );
-    }
-
-    /// Le titre reste EXACT : « Billie Jean (Live) » est hors sujet — la
-    /// doctrine de la section, inchangée.
-    #[test]
-    fn titre_different_est_sans_rapport() {
-        assert_eq!(
-            classer_version(
-                "Billie Jean",
-                "Michael Jackson",
-                "Thriller",
-                "Billie Jean (Live)",
-                "Michael Jackson",
-                "This Is It"
-            ),
-            ClasseVersion::SansRapport
-        );
-    }
 }

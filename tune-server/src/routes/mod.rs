@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
 pub mod connect;
+pub(crate) mod convert_destination;
 pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
@@ -41,6 +42,7 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+pub mod panne_sql;
 pub mod party;
 pub mod peers;
 pub mod playback;
@@ -84,7 +86,7 @@ pub mod tags;
 pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
-pub mod visualizer;
+pub mod versions;
 pub mod voice;
 pub mod widget;
 pub mod ws;
@@ -362,7 +364,6 @@ pub fn router_with_plugins(
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
         .nest("/outputs", airplay_pairing::router())
-        .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
         .nest("/siri", siri::router())
@@ -606,10 +607,18 @@ mod eq_refresh_guard {
     /// continuait de filtrer (#1986). Elle exige `apply_audiophile_change`,
     /// pour la même raison que l'EQ exige `apply_eq_change` : le cas non local
     /// (DLNA, navigateur) n'est réglé que par un redémarrage de flux.
+    ///
+    /// `zone_*_mono_downmix` (#2362) est la quatrième. Elle n'exige que
+    /// `refresh_zone_mono_downmix`, et non un jumeau « apply_ » : contrairement
+    /// à l'égaliseur et au mode PURE, ce réglage ne s'applique QUE sur la
+    /// sortie locale — c'est le périmètre écrit dans l'issue. Il n'y a donc
+    /// aucun chemin non local à réveiller par un redémarrage de flux, et en
+    /// programmer un ferait redémarrer une zone DLNA pour rien.
     const REGLAGES_A_RAFRAICHIR: &[(&str, &str)] = &[
         ("_eq_profile", "apply_eq_change"),
         ("_crossfeed", "refresh_zone_crossfeed"),
         ("_audiophile", "apply_audiophile_change"),
+        ("_mono_downmix", "refresh_zone_mono_downmix"),
     ];
 
     #[test]

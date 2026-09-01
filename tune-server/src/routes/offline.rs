@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -104,6 +105,10 @@ async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, Ap
     let cache_dir = offline_cache_dir(&settings);
 
     Ok(Json(json!({
+        // Contrat du client web (`getOfflineStatus` / OfflineView). Garder
+        // aussi les noms explicites ci-dessous pour les autres consommateurs.
+        "total": total,
+        "size_bytes": total_size,
         "total_tracks": total,
         "completed": completed,
         "pending": pending,
@@ -594,7 +599,7 @@ async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse
 
     let completed: Vec<(i64, String)> = state.backend
         .query_many("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL", &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
             let id = r.get(0).and_then(|v| v.as_i64())?;
@@ -638,7 +643,7 @@ async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoRespons
             "SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
         .collect();

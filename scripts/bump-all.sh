@@ -32,6 +32,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 VERSION=""
 WITH_CLIENTS=0
 SKIP_WEB_DRIFT=0
@@ -76,6 +78,17 @@ REQUIRED=("$CARGO" "$WEB")
 for f in "${REQUIRED[@]}"; do
     [ -f "$f" ] || { echo "Error: missing $f" >&2; exit 1; }
 done
+
+# Refuse a known mixed name/email pair before changing a single version file.
+# `git var` includes local config and GIT_AUTHOR_*/GIT_COMMITTER_* overrides,
+# so this catches both the poisoned clone and an agent process that overrides
+# an otherwise-correct clone. The release preflight repeats the same contract
+# against the identity stored in the final bump commit.
+if ! command -v python3 &>/dev/null; then
+    echo "Error: python3 is required to verify the release Git identity." >&2
+    exit 1
+fi
+python3 "$SCRIPT_DIR/preflight-check.py" --identity-only
 
 # ------------------------------------------------------------------ Android
 #

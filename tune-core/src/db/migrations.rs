@@ -1170,6 +1170,489 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_network_mounts_identite
     ON network_mounts(mount_type, server, share, mount_path);
 ",
     },
+    Migration {
+        version: 84,
+        name: "listen_history_contexte_de_lecture",
+        // Rendre a chaque ecoute la trace de CE QUE l'auditeur a demande.
+        //
+        // `listen_history` ne conservait rien de l'intention : une piste jouee
+        // seule, la meme depuis une playlist et la meme dans un album complet
+        // produisaient trois lignes rigoureusement identiques. Toute rubrique
+        // voulant « refleter la realite de ce qu'a voulu faire l'auditeur »
+        // (FabienM, fil forum 1557) devait donc repartir de la table `albums`
+        // — ce que fait `fetch_continue_listening`, d'ou « Continuer l'ecoute »
+        // qui ne peut structurellement montrer qu'un album (#2441).
+        //
+        // `context_type` : `track`, `album`, `playlist`, `artist`, `label`.
+        // `context_id` : l'identifiant de cet objet, en TEXT — une playlist
+        // locale a un id numerique, un album Qobuz une chaine.
+        //
+        // Colonnes posees par add_column_if_missing dans le bloc de version,
+        // PAS par un ALTER TABLE ici : c'est la meme regle qu'a la migration
+        // 79, et l'ALTER planterait tout le runner en « duplicate column
+        // name » sur une base qui les a deja.
+        up: "",
+    },
+    Migration {
+        version: 85,
+        name: "favorite_facets",
+        // Mettre un LABEL en favori — et, demain, un genre, un format, une
+        // annee (#2442, FabienM fil 1557).
+        //
+        // Pourquoi une table separee plutot qu'un quatrieme `item_type` dans
+        // `favorites` : `favorites.item_id` est un INTEGER NOT NULL, et un
+        // label N'A PAS D'IDENTITE. Il n'existe ni table `labels`, ni route
+        // bibliotheque : l'onglet Labels lit une FACETTE et selectionne par
+        // CHAINE (`getLibraryFacets(['label'])`). Le faire entrer dans
+        // `favorites` supposerait de promouvoir le label en entite —
+        // normalisation d'un champ libre et sale, identifiants, jointures —
+        // ce qui est hors gabarit ici.
+        //
+        // On stocke donc la valeur telle que la facette la selectionne
+        // aujourd'hui. La colonne `facet` rend la table reutilisable sans
+        // nouvelle migration pour genre / format / annee.
+        //
+        // Pas de colonne `id` : la cle naturelle (profil, facette, valeur) EST
+        // la cle primaire. Cela evite aussi la divergence BIGSERIAL / TEXT que
+        // la bascule SQLite -> PostgreSQL impose a toute colonne `id` (cf. la
+        // migration PG 012 et l'incident #1706).
+        //
+        // `CREATE TABLE IF NOT EXISTS` : idempotent, et sans ALTER TABLE, donc
+        // sans le piege « duplicate column name » sur une base neuve.
+        up: "
+CREATE TABLE IF NOT EXISTS favorite_facets (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    facet TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, facet, value)
+);
+CREATE INDEX IF NOT EXISTS idx_favorite_facets_profile
+    ON favorite_facets(profile_id, facet);
+",
+    },
+    Migration {
+        version: 86,
+        name: "reparer_radios_mortes_de_l_annuaire",
+        // Les stations mortes que l'utilisateur tient de NOTRE annuaire
+        // (`https://mozaiklabs.fr/api/v1/radios`, bouton « + Ajouter a Tune »),
+        // pas du semis. Le bouton insere l'URL sans jamais la sonder
+        // (`tune-server/src/routes/radios.rs`, `add_from_web`) : une entree
+        // morte cote annuaire devient une station muette cote bibliotheque.
+        //
+        // Sondage du 2026-08-28, redirections suivies, sur les 51 entrees que
+        // l'annuaire sert ce jour-la (l'issue #1960 en decrivait 46 le 19/08) :
+        // sept ne rendent pas d'audio. Deux sont deja traitees par la
+        // migration 78 (les webradios Radio France). Restent les cinq d'ici.
+        //
+        // REMPLACEES — meme station, adresse relevee chez l'operateur :
+        //
+        //   * WBGO Jazz : `stream.wbgo.org` ne resout plus (curl 6, « Could not
+        //     resolve host »). wbgo.org publie lui-meme ses deux flux sur sa
+        //     page d'accueil et sur /listen ; le 128k MP3 rend 200 `audio/mpeg`
+        //     et debite bien (638 Ko en 8 s ~ 128 kbit/s).
+        //   * Reggae Classic Mix et Classic Oldies Mix : l'operateur a change
+        //     d'hote et retire ses points FLAC. Son API AzuraCast
+        //     (`https://online.jamminvibezradio.com/api/stations`) donne
+        //     `listen_url` sur `radio.jamminvibezonline.ca` ; les deux points
+        //     `stream.aac` rendent 200 `audio/aac`, les `live.flac` rendent 404.
+        //
+        // RETIREES — aucune adresse de remplacement verifiee :
+        //
+        //   * BBC Radio 3 : `stream.live.vc.bbcmedia.co.uk/bbc_radio_three`
+        //     redirige vers `www.bbc.co.uk` et rend **200 `text/html`**. C'est
+        //     le cas decrit par l'issue : rien n'echoue, l'auditeur n'a que du
+        //     silence. Les flux HLS de la BBC rendent 410 Gone depuis ici, et
+        //     un `.m3u8` ne serait de toute facon pas jouable : `resolve_direct_url`
+        //     ne dereference une playlist qu'en gardant ses lignes en `http`,
+        //     or une playlist HLS ne porte que des segments relatifs. Rien a
+        //     mettre a la place, donc on retire.
+        //   * Caribbean variety mix : la station a disparu de chez l'operateur
+        //     — l'API AzuraCast ne declare plus qu'une seule station publique,
+        //     et `radio.jamminvibezonline.ca/listen/caribbean/stream.aac` rend
+        //     404 comme l'ancienne adresse.
+        //
+        // Cible sur l'URL et jamais sur le nom, comme les migrations 70 et 78 :
+        // le nom est ce que l'utilisateur a pu editer, l'URL est ce qui
+        // identifie le flux mort. Une station que l'utilisateur a lui-meme
+        // repointee vers une adresse qui marche survit donc intacte.
+        // Idempotent : un second passage ne trouve plus rien a corriger.
+        //
+        // Ce que cette migration NE fait PAS : elle ne corrige pas l'annuaire.
+        // Les cinq entrees sont toujours servies par mozaiklabs.fr au moment
+        // d'ecrire ceci ; un clic sur « + Ajouter a Tune » les remet. Le retrait
+        // cote annuaire est une action de donnees sur le site, hors de ce depot
+        // (voir #1960).
+        up: "
+UPDATE radio_stations SET url = 'https://ais-sa8.cdnstream1.com/3630_128.mp3' WHERE url = 'https://stream.wbgo.org/wbgo-hd';
+UPDATE radio_stations SET url = 'https://radio.jamminvibezonline.ca/listen/reggae/stream.aac' WHERE url = 'https://online.jamminvibezradio.com/listen/reggae/live.flac';
+UPDATE radio_stations SET url = 'https://radio.jamminvibezonline.ca/listen/oldies/stream.aac' WHERE url = 'https://online.jamminvibezradio.com/listen/oldies/live.flac';
+DELETE FROM radio_stations WHERE url = 'http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three';
+DELETE FROM radio_stations WHERE url = 'https://online.jamminvibezradio.com/listen/caribbean/live.flac';
+",
+    },
+    Migration {
+        version: 87,
+        name: "temoins_poses_sur_chemin_introuvable",
+        // Rendre leur chance aux pistes que le repli NFC/NFD va desormais
+        // retrouver (#1865).
+        //
+        // Le scanner enregistre les chemins en NFC ; macOS et les partages
+        // SMB/CIFS ecrivent les noms de fichiers en NFD. Les passes de fond
+        // ouvraient le chemin de la base TEL QUEL, recevaient ENOENT, et
+        // posaient quand meme leur temoin — « on a essaye, n'y revenons
+        // pas ». La piste sortait du balayage POUR TOUJOURS. Mesure sur .18
+        // le 28/08/2026 : 135 pistes dont le chemin stocke ne resout pas mais
+        // dont la forme NFD existe ; 114 portaient `rg_analyzed` pour ZERO
+        // `rg_track_gain`, 44 portaient `audio_embed_analyzed` pour ZERO
+        // vecteur.
+        //
+        // Le code ne posera plus ces temoins sur un fichier introuvable (il
+        // pose un report date, qui perime). Mais le code ne rattrape rien tout
+        // seul : les temoins deja en base excluent ces pistes de la requete de
+        // candidats, donc elles ne seront jamais relues. D'ou ce nettoyage.
+        //
+        // POURQUOI CE PREDICAT, ET PAS PLUS LARGE
+        //
+        // On ne retire le temoin que la ou il ne recouvre AUCUN resultat ET ou
+        // le chemin contient au moins un octet non-ASCII — seuls les chemins
+        // accentues peuvent avoir deux graphies Unicode. Sur .18 : 107 pistes
+        // pour ReplayGain (au lieu de 361 sans la clause d'accent) et 50 pour
+        // l'acoustique (au lieu de 53). Un fichier vraiment illisible dont le
+        // nom est accentue sera reessaye UNE fois, puis re-temoigne. C'est le
+        // prix, il est borne.
+        //
+        // `length(CAST(x AS BLOB))` rend des OCTETS la ou `length(x)` rend des
+        // CARACTERES : leur inegalite est le test non-ASCII portable en
+        // SQLite, sans extension regex. (La jumelle PostgreSQL 039 utilise
+        // `octet_length`, qui n'existe pas partout en SQLite ancien.)
+        //
+        // IDEMPOTENTE par construction : ce sont des DELETE. Rejouee, elle ne
+        // trouve plus rien a supprimer. `rg_skipped_oversized` est epargne :
+        // ce refus-la vient d'un calcul sur la duree et le debit, pas d'un
+        // acces disque — il reste valable.
+        //
+        // Ce qui n'est VOLONTAIREMENT pas touche : `rg_album_gain` /
+        // `rg_album_peak`. Les effacer relancerait le calcul d'album
+        // immediatement, donc AVANT que les pistes liberees aient leur gain —
+        // meme resultat, une ecriture de plus. Le gain d'album de ces albums
+        // reste donc legerement approximatif jusqu'a une reprise complete.
+        up: "
+DELETE FROM track_metadata
+WHERE key = 'rg_analyzed'
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    WHERE t.file_path IS NOT NULL
+      AND length(CAST(t.file_path AS BLOB)) <> length(t.file_path)
+      AND NOT EXISTS (SELECT 1 FROM track_metadata g
+                       WHERE g.track_id = t.id AND g.key = 'rg_track_gain')
+      AND NOT EXISTS (SELECT 1 FROM track_metadata s
+                       WHERE s.track_id = t.id AND s.key = 'rg_skipped_oversized')
+  );
+DELETE FROM track_metadata
+WHERE key = 'audio_embed_analyzed'
+  AND track_id IN (
+    SELECT t.id FROM tracks t
+    WHERE t.file_path IS NOT NULL
+      AND length(CAST(t.file_path AS BLOB)) <> length(t.file_path)
+      AND NOT EXISTS (SELECT 1 FROM track_audio_embedding e
+                       WHERE e.track_id = t.id)
+  );
+",
+    },
+    Migration {
+        version: 88,
+        name: "task_runs",
+        // Registre des executions automatisees (#2080).
+        //
+        // Numerotee 88, PAS 87 : la 87 a ete prise par #1865 pendant que
+        // cette PR attendait. Un numero se prend au moment de
+        // l'integration, jamais a l'ouverture — la contiguite l'interdit.
+        //
+        // Tune lance seul une vingtaine de passes — scan de demarrage,
+        // ReplayGain, enrichissement, battement de coeur, nettoyages. Aucune ne
+        // laisse de trace INTERROGEABLE : le journal defile, et quand un
+        // utilisateur ecrit « ca n'a rien fait », on ne peut ni le confirmer ni
+        // l'infirmer. C'est cette table qui repond.
+        //
+        // Ce n'est PAS un journal de plus. Trois proprietes la separent d'une
+        // ligne `info!` :
+        //
+        //   * elle survit au redemarrage (donc on peut comparer deux boots) ;
+        //   * elle est bornee (rentention par passe + par age, cf.
+        //     `task_run_repo`) — une table d'observabilite qui grossit sans fin
+        //     finit par couter plus cher que ce qu'elle observe ;
+        //   * elle ne contient ni chemin, ni cle, ni jeton : des compteurs et
+        //     des verdicts. `detail` passe par un filtre avant l'ecriture.
+        //
+        // PAS DE COLONNE `id`. La cle naturelle (boot_id, task, seq) EST la
+        // cle primaire — meme raison que `favorite_facets` (migration 85) :
+        // toute colonne `id` impose la divergence AUTOINCREMENT / BIGSERIAL, et
+        // la bascule SQLite -> PostgreSQL l'a deja payee cher (#1706).
+        //
+        // `boot_id` est l'identite d'une INCARNATION du processus, tiree une
+        // fois au demarrage. C'est elle qui rend detectable la passe orpheline
+        // (#2002) : au demarrage, toute ligne encore `en_cours` est fermee en
+        // `interrompu`, puisque aucune passe ne survit au processus qui la
+        // portait.
+        //
+        // `started_at` / `finished_at` sont des horodatages ABSOLUS UTC
+        // ISO-8601, jamais un compteur relatif : un « il y a 3 heures » n'est
+        // pas verifiable, une date l'est (lecon de `uptime_seconds`, PR #2632).
+        //
+        // `duration_ms` est mesure sur une horloge MONOTONE cote Rust, pas par
+        // difference des deux dates : un changement d'heure systeme pendant la
+        // passe rendrait la soustraction absurde (negative, meme).
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS, sans ALTER,
+        // donc sans le piege « duplicate column name » sur une base neuve.
+        up: "
+CREATE TABLE IF NOT EXISTS task_runs (
+    boot_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms INTEGER,
+    outcome TEXT NOT NULL,
+    items INTEGER,
+    detail TEXT,
+    PRIMARY KEY (boot_id, task, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome);
+",
+    },
+    Migration {
+        version: 89,
+        name: "hidden_items",
+        // Masquer un album sans toucher aux fichiers (#1391, Jean-Luc Cassé).
+        //
+        // Pourquoi une TABLE et pas une colonne `albums.is_hidden` (ce que
+        // l'issue proposait, sur le modèle de `zones.is_hidden`) : une ligne
+        // `zones` n'est JAMAIS supprimée (son delete est un UPDATE), une ligne
+        // `albums` l'est en routine — purge post-scan, `delete_orphans`,
+        // fusion de doublons, « vider la bibliothèque ». Racine music déplacée
+        // → pistes purgées → album réinséré sous un nouveau rowid → drapeau
+        // perdu. C'est mot pour mot le défaut déjà payé par `favorites`
+        // (cœurs éteints, bug .18 v0.9.50, cf. `favorites_reconcile.rs`).
+        //
+        // On reprend donc la solution qui a réparé les favoris : une table de
+        // marqueurs SANS clé étrangère, portant un instantané d'identité
+        // (`item_name`/`item_artist`) figé au masquage, réconciliée au
+        // démarrage et après chaque scan (`hidden_repo::reconcile`). Le
+        // marqueur survit ainsi au rescan, au déplacement de bibliothèque et
+        // à la bascule SQLite → PostgreSQL.
+        //
+        // PAS DE COLONNE `id` : la clé naturelle (profil, type, item) EST la
+        // clé primaire — même choix que `favorite_facets` (85) et `task_runs`
+        // (88), pour éviter la divergence AUTOINCREMENT / BIGSERIAL que la
+        // bascule SQLite → PostgreSQL impose à toute colonne `id` (#1706).
+        //
+        // `item_type` est libre (`album` seul aujourd'hui) et `profile_id` est
+        // ÉCRIT (toujours 1) mais jamais LU par les filtres : le masquage est
+        // global maintenant, et passera par profil sans migration le jour où
+        // les vues bibliothèque connaîtront le profil.
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS hidden_items (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    item_name TEXT,
+    item_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
+",
+    },
+    Migration {
+        version: 90,
+        name: "semis_radios_annuaire_mozaiklabs",
+        // Le catalogue livré cesse d'être français-seulement (#2119).
+        //
+        // Le semis d'origine (migration 33) pose 24 stations, toutes
+        // `country = 'France'`. Pendant ce temps NOTRE annuaire —
+        // `https://mozaiklabs.fr/api/v1/radios` — en sert 51, de huit pays, et
+        // le serveur le TÉLÉCHARGE DÉJÀ à chaque démarrage… pour n'en garder
+        // que les logos (`refresh_radio_logos`). Une station ajoutée à
+        // l'annuaire n'apparaissait donc dans le Tune de personne, et une
+        // recherche « paradise » ne pouvait structurellement rien rendre.
+        //
+        // Cette migration pose les 25 stations de l'annuaire qui manquaient au
+        // catalogue. Le texte SQL est FIGÉ dans le dépôt et non relevé au
+        // démarrage : une migration ne doit jamais dépendre du réseau. Le
+        // fichier porte en tête le relevé, le sondage des flux et les règles
+        // d'écart — c'est là qu'il faut lire le détail, pas ici.
+        //
+        // Le même fichier est `include_str!` par la migration PostgreSQL 042 :
+        // un seul texte pour les deux bases, donc aucune divergence possible.
+        up: include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_08_30.sql"),
+    },
+    Migration {
+        version: 91,
+        name: "album_distinct_pairs",
+        // « Ces deux albums ne sont PAS des doublons » (#1276, Megalo,
+        // forum-hifi.fr #41831 p.13 : « Tune me trouve des albums doublons
+        // alors que ce sont des releases différentes »).
+        //
+        // Deux chemins rapprochent des albums, et l'issue vise les deux :
+        // `GET /library/albums/grouped` (l'alerte) et
+        // `POST /library/albums/merge-duplicates` (la fusion, qui SUPPRIME la
+        // ligne perdante — le seul des deux qui ne se répare pas).
+        //
+        // Pourquoi une TABLE DE PAIRES sans clé étrangère, et pas une colonne
+        // sur `albums` : une ligne `albums` est supprimée en routine — purge
+        // post-scan, `delete_orphans`, fusion de doublons, « vider la
+        // bibliothèque ». Un couple d'ids nu mourrait au premier déplacement
+        // de racine, et l'arbitrage de l'utilisateur avec. C'est mot pour mot
+        // le défaut déjà payé par `favorites` (#1248) puis évité par
+        // `hidden_items` (#1391).
+        //
+        // On reprend donc la même mécanique : instantané d'identité figé DES
+        // DEUX CÔTÉS (`a_name`/`a_artist`, `b_name`/`b_artist`) et
+        // réconciliation aux cinq mêmes ancrages
+        // (`album_distinct_repo::reconcile`), via le MÊME
+        // `find_album_by_identity` que les favoris et les masquages.
+        //
+        // La paire est rangée en (min, max) par le repo : « A n'est pas un
+        // doublon de B » ne dépend pas de l'ordre, et sans normalisation la
+        // clé primaire laisserait entrer deux fois le même arbitrage.
+        //
+        // PAS DE COLONNE `id` : la clé naturelle (profil, album bas, album
+        // haut) EST la clé primaire — même choix que `favorite_facets` (85),
+        // `task_runs` (88) et `hidden_items` (89), pour éviter la divergence
+        // AUTOINCREMENT / BIGSERIAL de la bascule SQLite → PostgreSQL (#1706).
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS album_distinct_pairs (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    album_a_id INTEGER NOT NULL,
+    album_b_id INTEGER NOT NULL,
+    a_name TEXT,
+    a_artist TEXT,
+    b_name TEXT,
+    b_artist TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, album_a_id, album_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_album_distinct_pairs_b ON album_distinct_pairs(album_b_id);
+",
+    },
+    Migration {
+        version: 92,
+        name: "ignored_devices",
+        // « Ignorer cet appareil » (#1280, Alex Campbell puis Patatorz) : faire
+        // taire un APPAREIL, pas chasser ses zones une par une.
+        //
+        // Pourquoi une table et pas le masquage de zone déjà en place
+        // (`zones.is_hidden` + `hidden_zones_by_host`, #1281) : celui-ci ne
+        // porte que ce qui a DÉJÀ une zone, et seulement pour les zones
+        // réseau. Il laisse l'appareil s'enregistrer comme SORTIE (la
+        // découverte enregistre avant d'atteindre le garde-fou de zone), donc
+        // proposé partout ; et un appareil dont la zone n'a jamais été créée
+        // (`zone_auto_create` à false — le contournement donné au testeur, TV
+        // filtrée, AirPlay 2 sans démon) n'a aucune ligne à masquer.
+        //
+        // Patron `hidden_items` (89, #1391) : table SANS clé étrangère,
+        // instantané d'identité figé à l'insertion. Le marqueur ne dépend
+        // d'aucune ligne `zones` — la purge des zones masquées ne l'emporte
+        // pas — et survit à la bascule SQLite → PostgreSQL.
+        //
+        // AUCUNE troisième notion d'identité : `mac` est celle de #2803
+        // (AirPlay/RAOP, déjà persistée sur `zones.mac`), `host` + `name` est
+        // exactement le couple de `hidden_zones_by_host`. Le NOM est exigé
+        // avec l'hôte pour ne pas bloquer un appareil différent héritant de
+        // l'adresse par le DHCP (leçon du ré-ancrage #1651).
+        //
+        // PAS DE COLONNE `id` : `device_id` EST la clé primaire — même choix
+        // que `favorite_facets` (85), `task_runs` (88) et `hidden_items` (89),
+        // pour éviter la divergence AUTOINCREMENT / BIGSERIAL de la bascule
+        // SQLite → PostgreSQL (#1706). Tout est TEXT : rien à rattraper côté
+        // PG, contrairement à 038 et 041.
+        //
+        // Idempotent : CREATE TABLE / CREATE INDEX IF NOT EXISTS.
+        up: "
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    mac TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    device_type TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
+CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
+",
+    },
+    // « Dans la Smart Collection "World Music" [il] n'a pas les bons albums,
+    // c'est un peu mélangé (Folk, Folk Métal, Folk Rock) » (#1426, Jean
+    // Valjean, forum « F5 obligatoire »).
+    //
+    // Le moteur de règles fait exactement ce qu'on lui demande : le préréglage
+    // livré (migrations 41 puis 47) porte `genre CONTIENT folk`, qui compile en
+    // `t.genre LIKE '%folk%' COLLATE NOCASE`. « Folk Metal » et « Folk Rock »
+    // entrent donc dans la collection PAR CONSTRUCTION. C'est le préréglage qui
+    // promet, par son nom, plus étroit que sa règle — pas
+    // `smart_collections::compile_rule`.
+    //
+    // Seul `folk` passe en égalité stricte. `world` et `ethnic` gardent
+    // « contient », où la sous-chaîne est utile et non trompeuse (« World
+    // Fusion », « Ethnic Jazz ») ; `folk` est le seul des trois dont les dérivés
+    // forment des genres franchement différents. Les tags composés du type
+    // « Folk, World, & Country » restent pris — par la règle `world`, le
+    // `match_mode` étant `any`.
+    //
+    // Patron de la migration 67 (`fix_sans_pochette_rule`, jumelle PG 018) :
+    // UPDATE gardé sur la chaîne de règles EXACTE du semis, donc
+    //   - une collection personnalisée par l'utilisateur n'est jamais touchée,
+    //   - la migration est idempotente par le même garde,
+    //   - et les bibliothèques DÉJÀ installées sont réparées, ce qu'un simple
+    //     changement du semis (`INSERT OR IGNORE`, création seulement) ne fait
+    //     pas.
+    // Sur une installation neuve, 41/47 sèment l'ancienne règle et celle-ci la
+    // corrige dans la même passe.
+    Migration {
+        version: 93,
+        name: "resserrer_folk_dans_world_music",
+        up: "
+UPDATE smart_collections
+SET rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"equals\",\"value\":\"folk\"}]'
+WHERE name LIKE '%World%'
+  AND rules = '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"world\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ethnic\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"folk\"}]';
+",
+    },
+    Migration {
+        version: 94,
+        name: "listen_history_rang_dans_le_contexte",
+        // OU l'auditeur en etait dans l'objet qu'il avait demande.
+        //
+        // La migration 84 a pose CE QU'il avait demande (`context_type` /
+        // `context_id`). Il manquait le RANG : sans lui, « Continuer l'ecoute »
+        // peut rouvrir la bonne playlist, mais toujours a son debut. L'arbitrage
+        // rendu sur #2441 est « objet courant + position », pas l'instantane de
+        // la file entiere — pour un artiste ou un label, la file est batie par
+        // une requete qui change d'un jour a l'autre, « conserver l'ordre » n'y
+        // a aucun sens, et ecrire la file a chaque ecoute couterait un facteur
+        // dix sur le volume, pour une section d'accueil.
+        //
+        // NULL a deux sens, et un seul est « on ne sait pas » :
+        // * ligne anterieure a cette migration — inconnu, on rouvre au debut ;
+        // * ecoute en lecture ALEATOIRE — le rang est deliberement laisse vide.
+        //   Rejouer le meme tirage n'aurait pas de sens : on RE-TIRE. C'est la
+        //   seconde moitie de l'arbitrage, ecrite ici plutot que devinee a la
+        //   lecture, parce que l'etat « aleatoire » de la zone n'existe plus au
+        //   moment ou l'accueil s'affiche.
+        //
+        // Colonne posee par add_column_if_missing dans le bloc de version, PAS
+        // par un ALTER TABLE ici — meme regle qu'aux migrations 79 et 84, et
+        // l'ALTER planterait le runner en « duplicate column name » sur une
+        // base qui l'a deja.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2252,6 +2735,15 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
     add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
+    // Ce que l'auditeur a demande au moment du clic sur « Lire » (migration
+    // 84, #2441). TEXT pour les deux : l'identifiant peut etre un entier
+    // local ou une chaine de service de streaming.
+    add_column_if_missing(db, "listen_history", "context_type", "TEXT");
+    add_column_if_missing(db, "listen_history", "context_id", "TEXT");
+    // Rang de la piste dans cet objet (migration 94, #2441). NULL = inconnu
+    // (ligne d'avant la migration) OU tirage aleatoire, cas ou l'on RE-TIRE
+    // au lieu de rejouer le meme ordre.
+    add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -2607,6 +3099,133 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "bookmarks_position_bigint",
         include_str!("../../migrations/postgres/036_bookmarks_position_bigint.sql"),
     ),
+    // Jumelle de la migration SQLite 84. `listen_history` n'a jamais su d'ou
+    // venait une ecoute : sans ces deux colonnes, la meme piste jouee seule,
+    // depuis une playlist ou dans un album donnent trois lignes identiques,
+    // et aucune rubrique ne peut refleter l'intention de l'auditeur (#2441).
+    (
+        37,
+        "listen_history_contexte_de_lecture",
+        include_str!("../../migrations/postgres/037_listen_history_contexte_de_lecture.sql"),
+    ),
+    // Favori d'une VALEUR de facette — le label d'abord (#2442). Table
+    // separee : `favorites.item_id` est un entier, un label n'a pas
+    // d'identite. Pendant de la migration SQLite 85.
+    // Numerotee 38 : 36 et 37 sont parties dans les lots fusionnes entre-temps,
+    // et la contiguite interdit de reserver un numero d'avance.
+    (
+        38,
+        "favorite_facets",
+        include_str!("../../migrations/postgres/038_favorite_facets.sql"),
+    ),
+    // Jumelle de la migration SQLite 87 (#1865) : retirer les temoins de
+    // passe poses sur des fichiers introuvables faute de repli NFC/NFD, sans
+    // quoi le correctif ne rattrape AUCUNE des bibliotheques deja balayees.
+    // Numerotee 39 : le suivant libre a l'ouverture de la PR, pas un numero
+    // reserve d'avance — la contiguite l'interdit.
+    (
+        39,
+        "temoins_poses_sur_chemin_introuvable",
+        include_str!("../../migrations/postgres/039_temoins_poses_sur_chemin_introuvable.sql"),
+    ),
+    // Registre des executions automatisees (#2080). Jumelle de la migration
+    // SQLite 88. Sans cette entree, la route d'observabilite rendrait une
+    // erreur SQL sur tout le parc PostgreSQL — .15, .18, Docker.
+    //
+    // Numerotee 40, PAS 39 : la 39 a ete prise par #1865 pendant que cette
+    // PR attendait.
+    (
+        40,
+        "task_runs",
+        include_str!("../../migrations/postgres/040_task_runs.sql"),
+    ),
+    // Albums masqués (#1391). Jumelle de la migration SQLite 89 — les deux
+    // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à
+    // tout le parc PostgreSQL et chaque vue bibliothèque y rendrait une
+    // erreur SQL (le filtre « pas masqué » la nomme).
+    (
+        41,
+        "hidden_items",
+        include_str!("../../migrations/postgres/041_hidden_items.sql"),
+    ),
+    // Jumelle de la migration SQLite 90 : le catalogue de radios cesse d'être
+    // français-seulement (#2119). LE MÊME FICHIER que la migration SQLite —
+    // pas une copie : le SQL du semis est volontairement portable
+    // (`INSERT ... SELECT ... WHERE NOT EXISTS`), et deux fichiers jumeaux
+    // finiraient par diverger. Sans cette entrée, tout le parc PostgreSQL —
+    // .15, .18, Docker — resterait aux 24 stations françaises.
+    (
+        42,
+        "semis_radios_annuaire_mozaiklabs",
+        include_str!("../../migrations/radios/annuaire_mozaiklabs_2026_08_30.sql"),
+    ),
+    // « Ces deux albums ne sont pas des doublons » (#1276). Jumelle de la
+    // migration SQLite 91 — mêmes deux listes séparées : sans cette entrée,
+    // la table manquerait à tout le parc PostgreSQL et les deux routes de
+    // rapprochement d'albums y rendraient une erreur SQL.
+    (
+        43,
+        "album_distinct_pairs",
+        include_str!("../../migrations/postgres/043_album_distinct_pairs.sql"),
+    ),
+    // Appareils ignorés (#1280). Jumelle de la migration SQLite 92 — les deux
+    // listes sont SÉPARÉES : écrite d'un seul côté, la table manquerait à tout
+    // le parc PostgreSQL (.15, .18, Docker) et « ignorer cet appareil » y
+    // rendrait une erreur SQL.
+    (
+        44,
+        "ignored_devices",
+        include_str!("../../migrations/postgres/044_ignored_devices.sql"),
+    ),
+    // Jumelle de la SQLite 93 (#1426). C'est une migration de DONNÉES, pas de
+    // schéma : sans elle, le parc PostgreSQL garderait « genre contient folk »
+    // dans le préréglage « World Music » — et donc Folk Metal et Folk Rock —
+    // pour toujours. PostgreSQL ne sème pas les collections intelligentes
+    // lui-même : elles y sont arrivées par la bascule SQLite → PostgreSQL.
+    (
+        45,
+        "resserrer_folk_dans_world_music",
+        include_str!("../../migrations/postgres/045_resserrer_folk_dans_world_music.sql"),
+    ),
+    // #2441 — le RANG dans l'objet demandé. La 037 avait posé CE QUE
+    // l'auditeur avait demandé ; sans le rang, « Continuer l'écoute » rouvre
+    // la bonne playlist mais toujours à sa première piste. NULL vaut aussi
+    // « on re-tire » : en lecture aléatoire, le rang n'est délibérément pas
+    // écrit.
+    (
+        46,
+        "listen_history_rang_dans_le_contexte",
+        include_str!("../../migrations/postgres/046_listen_history_rang_dans_le_contexte.sql"),
+    ),
+    // #2860 — `listen_history.album_id` est TEXT et `albums.id` BIGINT : la
+    // jointure de « Continuer l'ecoute » rend `operator does not exist:
+    // text = bigint`, avalee par `unwrap_or_default()`, donc section vide sur
+    // TOUTE installation PostgreSQL. La 012 convertit deja cette colonne, mais
+    // elle ne l'a jamais vue : `album_id` n'arrive par aucun script numerote,
+    // seulement par ENSURE_COLUMNS, joue APRES. Cette migration rejoue la
+    // conversion maintenant que la colonne existe.
+    (
+        47,
+        "listen_history_album_id_bigint",
+        include_str!("../../migrations/postgres/047_listen_history_album_id_bigint.sql"),
+    ),
+    // #2886 — `zones.volume` passe d'INTEGER a DOUBLE PRECISION. Pas de
+    // jumelle SQLite : SQLite est a typage dynamique et l'affinite INTEGER ne
+    // convertit une decimale que si c'est SANS PERTE, donc une base deja
+    // creee stocke deja 0,4 tel quel. PostgreSQL, lui, REFUSE un f64 dans une
+    // colonne integer — sans cette migration, tout reglage de volume echouerait
+    // sur PG. Le test `un_volume_fractionnaire_survit_a_une_colonne_declaree_integer`
+    // tient l'autre moitie de la preuve.
+    (
+        48,
+        "zones_volume_a_virgule",
+        include_str!("../../migrations/postgres/048_zones_volume_a_virgule.sql"),
+    ),
+    (
+        49,
+        "profile_id_bigint",
+        include_str!("../../migrations/postgres/049_profile_id_bigint.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -2830,6 +3449,130 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    /// #1426 — le préréglage « World Music » livré ne doit plus porter
+    /// « genre CONTIENT folk », qui ramasse « Folk Metal » et « Folk Rock ».
+    /// `world` et `ethnic` gardent « contient », où la sous-chaîne est utile.
+    #[test]
+    fn world_music_livre_avec_folk_en_egalite_stricte() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("le préréglage « World Music » doit être semé");
+
+        assert!(
+            regles.contains(r#"{"field":"genre","operator":"equals","value":"folk"}"#),
+            "folk doit être en égalité stricte : {regles}"
+        );
+        assert!(
+            !regles.contains(r#"{"field":"genre","operator":"contains","value":"folk"}"#),
+            "« contient folk » ramasse Folk Metal et Folk Rock (#1426) : {regles}"
+        );
+        for garde in [
+            "\"contains\",\"value\":\"world\"",
+            "\"contains\",\"value\":\"ethnic\"",
+        ] {
+            assert!(
+                regles.contains(garde),
+                "seul `folk` change ; `world` et `ethnic` restent en « contient » : {regles}"
+            );
+        }
+    }
+
+    /// La correction #1426 est gardée sur la chaîne de règles EXACTE du semis :
+    /// une collection que l'utilisateur a retouchée ne doit JAMAIS être
+    /// réécrite sous ses pieds — c'est la contrepartie de réparer les
+    /// bibliothèques déjà installées.
+    #[test]
+    fn world_music_personnalisee_nest_pas_reecrite() {
+        const SUR_MESURE: &str = r#"[{"field":"genre","operator":"contains","value":"gnawa"}]"#;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        {
+            // On remet la base dans l'état d'un utilisateur qui avait déjà
+            // retouché sa collection AVANT que la 93 n'arrive : règles sur
+            // mesure, et la 93 retirée du registre pour qu'elle rejoue.
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![SUR_MESURE],
+            )
+            .unwrap();
+            // `>= 93` et non `= 93` : le runner repart de MAX(version), donc
+            // effacer la seule 93 ne la ferait PAS rejouer dès qu'une
+            // migration ultérieure existe — le test se serait tu en croyant
+            // prouver quelque chose. Il ne dépend plus de sa place dans la
+            // liste (#2441, migration 94).
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            current_version(&db).unwrap(),
+            latest_version(),
+            "la 93 doit bien avoir rejoué"
+        );
+
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            regles, SUR_MESURE,
+            "une collection personnalisée doit rester intacte (#1426)"
+        );
+        drop(conn);
+
+        // Contre-épreuve DANS le test : sans elle, « rien n'a bougé » serait
+        // aussi vrai d'une migration vide. On repose la chaîne LIVRÉE, on fait
+        // rejouer la 93, et cette fois elle DOIT mordre.
+        const LIVREE: &str = concat!(
+            r#"[{"field":"genre","operator":"contains","value":"world"},"#,
+            r#"{"field":"genre","operator":"contains","value":"ethnic"},"#,
+            r#"{"field":"genre","operator":"contains","value":"folk"}]"#
+        );
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE name LIKE '%World%'",
+                rusqlite::params![LIVREE],
+            )
+            .unwrap();
+            // Même raison qu'au-dessus : c'est le plancher MAX(version) qui
+            // décide de ce qui rejoue.
+            conn.execute("DELETE FROM _migrations WHERE version >= 93", [])
+                .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let regles: String = conn
+            .query_row(
+                "SELECT rules FROM smart_collections WHERE name LIKE '%World%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            regles, LIVREE,
+            "sur la chaîne livrée, la 93 doit mordre — sinon le garde ci-dessus \
+             ne prouve rien"
+        );
+        assert!(regles.contains(r#""operator":"equals","value":"folk""#));
     }
 
     /// Forum #1328 : décalage des paroles par zone. Vérifie la colonne ET son
@@ -3391,6 +4134,431 @@ mod tests {
         );
     }
 
+    /// Le catalogue que Tune LIVRE, relu tel qu'une installation neuve le
+    /// reçoit — pas le texte du semis, la table après migrations.
+    ///
+    /// Contrôle de FORME, jamais de réseau (issue #1960). Sonder les flux
+    /// depuis la CI serait instable et bombarderait des tiers ; ce que ce test
+    /// garde, c'est ce qu'aucune sonde ne rattrape : un champ vide, un doublon,
+    /// un schéma que le lecteur ne sait pas ouvrir.
+    #[test]
+    fn le_catalogue_livre_a_une_forme_valide() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String, String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, url, genre, country FROM radio_stations ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // Plancher, pas égalité : ajouter une station vérifiée ne doit pas
+        // casser le test, la vider en douce doit le casser.
+        assert!(
+            stations.len() >= 20,
+            "le catalogue livré est tombé à {} stations",
+            stations.len()
+        );
+
+        for (name, url, genre, country) in &stations {
+            assert!(!name.trim().is_empty(), "station sans nom pour l'URL {url}");
+            assert!(!url.trim().is_empty(), "station « {name} » sans URL");
+            assert!(!genre.trim().is_empty(), "station « {name} » sans genre");
+            assert!(!country.trim().is_empty(), "station « {name} » sans pays");
+
+            // Les DEUX seuls schémas que le lecteur sait ouvrir : toute lecture
+            // de station finit sur un GET reqwest (`resolve_direct_url` puis
+            // `decode_radio_stream_to_pcm`), et reqwest ne parle que http et
+            // https. Même règle que la validation à la saisie de la PR #2635.
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "station « {name} » : schéma que le lecteur ne sait pas ouvrir — {url}"
+            );
+            assert_eq!(
+                url.trim(),
+                url,
+                "station « {name} » : URL entourée d'espaces — {url:?}"
+            );
+            assert!(
+                !url.contains(' '),
+                "station « {name} » : espace dans l'URL — {url:?}"
+            );
+        }
+
+        let urls: std::collections::HashSet<&str> =
+            stations.iter().map(|(_, u, _, _)| u.as_str()).collect();
+        assert_eq!(
+            urls.len(),
+            stations.len(),
+            "deux stations livrées partagent la même URL"
+        );
+        let names: std::collections::HashSet<&str> =
+            stations.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            stations.len(),
+            "deux stations livrées portent le même nom"
+        );
+    }
+
+    /// Le semis ne doit rien planter qu'une migration ultérieure arrache.
+    ///
+    /// C'est l'erreur que les migrations 70 et 78 ont dû réparer : le semis
+    /// posait des stations mortes, une migration les retirait derrière. Le
+    /// texte du semis et les `DELETE` doivent rester d'accord — sinon une
+    /// installation neuve reçoit une station puis la perd au premier
+    /// redémarrage (issue #1960).
+    #[test]
+    fn le_semis_ne_pose_rien_qu_une_migration_supprime() {
+        let seed = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "seed_default_radios")
+            .expect("la migration de semis des radios a disparu");
+
+        // Relever la 2e chaîne SQL de chaque INSERT, en tenant compte du
+        // quote doublé (`'Mouv'''`) : un split naïf sur `'` décale tout et
+        // rendrait des URL vides — une preuve fabriquée.
+        fn litteraux_sql(ligne: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut chars = ligne.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\'' {
+                    continue;
+                }
+                let mut buf = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\'') if chars.peek() == Some(&'\'') => {
+                            chars.next();
+                            buf.push('\'');
+                        }
+                        Some('\'') | None => break,
+                        Some(c) => buf.push(c),
+                    }
+                }
+                out.push(buf);
+            }
+            out
+        }
+
+        let mut semees: Vec<String> = seed
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("INSERT OR IGNORE INTO radio_stations")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().nth(1))
+            .collect();
+        assert!(
+            semees.len() >= 20,
+            "seulement {} URL relevées dans le semis — le relevé s'est cassé",
+            semees.len()
+        );
+
+        // Le SECOND semis, celui de l'annuaire (migration 90, #2119). Il pose
+        // 25 stations de plus, dont trois que la migration 86 a dû repointer :
+        // s'il reprenait une adresse morte, une installation neuve la
+        // recevrait puis la perdrait — exactement le défaut que ce test garde.
+        // Sa forme est portable (`INSERT ... SELECT ... WHERE NOT EXISTS`), et
+        // l'URL réellement posée est celle de la garde.
+        let annuaire = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "semis_radios_annuaire_mozaiklabs")
+            .expect("le semis de l'annuaire a disparu");
+        let depuis_annuaire: Vec<String> = annuaire
+            .up
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("WHERE NOT EXISTS (SELECT 1 FROM radio_stations WHERE url = ")
+            })
+            .filter_map(|l| litteraux_sql(l).into_iter().next())
+            .collect();
+        assert!(
+            depuis_annuaire.len() >= 25,
+            "seulement {} URL relevées dans le semis de l'annuaire — le relevé s'est cassé",
+            depuis_annuaire.len()
+        );
+        semees.extend(depuis_annuaire);
+        for url in &semees {
+            assert!(
+                url.starts_with("http"),
+                "le relevé du semis a rendu {url:?} au lieu d'une URL"
+            );
+        }
+
+        for m in MIGRATIONS.iter() {
+            for line in m.up.lines() {
+                let line = line.trim();
+                if !line.starts_with("DELETE FROM radio_stations WHERE url = ") {
+                    continue;
+                }
+                let Some(supprimee) = line.split('\'').nth(1) else {
+                    continue;
+                };
+                assert!(
+                    !semees.iter().any(|s| s == supprimee),
+                    "la migration {} ({}) supprime {supprimee}, que le semis pose encore",
+                    m.version,
+                    m.name
+                );
+            }
+        }
+
+        // Même règle pour les REPOINTAGES. La migration 86 remplace l'adresse
+        // de trois stations dont le flux est mort ; elle ne s'applique qu'aux
+        // bases déjà semées, pas aux lignes posées APRÈS elle. Un semis qui
+        // reprendrait l'ancienne adresse livrerait une station muette à toute
+        // installation neuve, sans que rien ne la rattrape jamais.
+        for m in MIGRATIONS.iter() {
+            for line in m.up.lines() {
+                let line = line.trim();
+                if !line.starts_with("UPDATE radio_stations SET url = ") {
+                    continue;
+                }
+                let litteraux = litteraux_sql(line);
+                let (Some(_neuve), Some(ancienne)) = (litteraux.first(), litteraux.get(1)) else {
+                    continue;
+                };
+                assert!(
+                    !semees.iter().any(|s| s == ancienne),
+                    "la migration {} ({}) repointe {ancienne}, que le semis pose encore",
+                    m.version,
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// #2119 — le catalogue LIVRÉ n'est plus français-seulement.
+    ///
+    /// Contre-épreuve permanente : elle se lit sur la table après migrations,
+    /// pas sur le texte du semis. Vider le fichier de l'annuaire, oublier
+    /// d'enregistrer la migration 90, ou la faire arracher par une migration
+    /// ultérieure font tomber ce test — trois façons de reproduire le défaut
+    /// sans s'en apercevoir.
+    #[test]
+    fn le_catalogue_livre_couvre_plusieurs_pays() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let stations: Vec<(String, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name, country FROM radio_stations")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // 24 (semis d'origine) + 25 (annuaire) = 49. Plancher, pas égalité :
+        // ajouter une station vérifiée ne doit pas casser le test.
+        assert!(
+            stations.len() >= 49,
+            "le catalogue livré est retombé à {} stations",
+            stations.len()
+        );
+
+        let pays: std::collections::BTreeSet<&str> =
+            stations.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            pays.len() >= 8,
+            "le catalogue livré ne couvre que {} pays : {pays:?}",
+            pays.len()
+        );
+        // Le symptôme exact du ticket : tout était `France`.
+        let hors_france = stations.iter().filter(|(_, p)| p != "France").count();
+        assert!(
+            hors_france >= 17,
+            "seulement {hors_france} stations hors de France dans le catalogue livré"
+        );
+
+        // Et la station par laquelle le ticket est arrivé (Belkadi Yacine puis
+        // Bilou, fil forum 1506) : une recherche « paradise » ne rendait rien
+        // parce que le catalogue ne la contenait pas.
+        assert!(
+            stations
+                .iter()
+                .any(|(n, _)| n.to_lowercase().contains("paradise")),
+            "Radio Paradise manque toujours au catalogue livré"
+        );
+
+        // Le vocabulaire de `country` est celui du semis d'origine, en
+        // français : mélanger « France » et « FR » dans la même colonne rendrait
+        // la recherche par pays (`radio_repo::search`) et toute facette
+        // illisibles.
+        for (name, country) in &stations {
+            assert!(
+                country.len() > 2,
+                "station « {name} » : pays donné en code ISO (« {country} ») alors que le \
+                 catalogue livré l'écrit en toutes lettres"
+            );
+        }
+    }
+
+    /// Issue #1960 : les stations mortes que l'utilisateur tient de l'annuaire
+    /// et non du semis. Celles qui ont une adresse de remplacement vérifiée
+    /// sont repointées ; les autres partent.
+    #[test]
+    fn les_radios_mortes_de_l_annuaire_sont_reparees() {
+        // (URL morte, URL vivante attendue) — sondées le 2026-08-28.
+        const REMPLACEES: [(&str, &str); 3] = [
+            (
+                "https://stream.wbgo.org/wbgo-hd",
+                "https://ais-sa8.cdnstream1.com/3630_128.mp3",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/reggae/live.flac",
+                "https://radio.jamminvibezonline.ca/listen/reggae/stream.aac",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/oldies/live.flac",
+                "https://radio.jamminvibezonline.ca/listen/oldies/stream.aac",
+            ),
+        ];
+        const RETIREES: [&str; 2] = [
+            "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three",
+            "https://online.jamminvibezradio.com/listen/caribbean/live.flac",
+        ];
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let compter = |url: &str| {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                [url],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Une bibliothèque neuve ne porte aucune des URL MORTES : ni le semis
+        // d'origine (33) ni celui de l'annuaire (90) ne les posent — c'est
+        // précisément ce que garde `le_semis_ne_pose_rien_qu_une_migration_supprime`.
+        for (morte, _) in REMPLACEES {
+            assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
+        }
+        for morte in RETIREES {
+            assert_eq!(compter(morte), 0, "{morte} semée sur une base neuve");
+        }
+
+        // Les URL de REMPLACEMENT, elles, sont désormais semées par la
+        // migration 90 (#2119) : ces trois stations font partie du catalogue
+        // livré, avec l'adresse vérifiée. On mesure donc en DELTA à partir de
+        // ce plancher, sans quoi ce test comparerait à un passé révolu.
+        let plancher: Vec<i64> = REMPLACEES.iter().map(|(_, v)| compter(v)).collect();
+
+        // Bibliothèque existante : l'utilisateur les a ajoutées depuis
+        // l'annuaire, avec le nom et le drapeau favori que le bouton pose.
+        {
+            let conn = db.connection().lock().unwrap();
+            for (morte, _) in REMPLACEES {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country, is_favorite) VALUES ('depuis-annuaire', ?1, 'g', 'XX', 1)",
+                    [morte],
+                )
+                .unwrap();
+            }
+            for morte in RETIREES {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country, is_favorite) VALUES ('depuis-annuaire', ?1, 'g', 'XX', 1)",
+                    [morte],
+                )
+                .unwrap();
+            }
+            // Témoin : une station que l'utilisateur a lui-même repointée. La
+            // migration cible l'URL, pas le nom : elle doit survivre.
+            conn.execute(
+                "INSERT INTO radio_stations (name, url, genre, country) VALUES ('BBC Radio 3', 'https://exemple.invalid/temoin', 'g', 'XX')",
+                [],
+            )
+            .unwrap();
+        }
+        let total_avant = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+
+        // Rejouer la migration est ce que fait la mise à jour d'une base restée
+        // sous la version 86 ; on la force ici, celle-ci étant déjà à jour.
+        {
+            let conn = db.connection().lock().unwrap();
+            let m = MIGRATIONS.iter().find(|m| m.version == 86).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            // Idempotent : un second passage est un non-événement.
+            conn.execute_batch(m.up).unwrap();
+        }
+
+        for (i, (morte, vivante)) in REMPLACEES.iter().enumerate() {
+            assert_eq!(compter(morte), 0, "l'URL morte {morte} est restée");
+            assert_eq!(
+                compter(vivante),
+                plancher[i] + 1,
+                "l'URL de remplacement {vivante} n'a pas été posée"
+            );
+        }
+        for morte in RETIREES {
+            assert_eq!(compter(morte), 0, "la station morte {morte} est restée");
+        }
+
+        // Le remplacement garde la ligne — nom, genre, favori — et ne la
+        // recrée pas : seule l'adresse change.
+        {
+            let conn = db.connection().lock().unwrap();
+            // `name = 'depuis-annuaire'` désigne LA ligne de la fixture : la
+            // station homonyme semée par la migration 90 porte la même adresse
+            // et n'a évidemment pas le drapeau favori de l'utilisateur.
+            let favori: i64 = conn
+                .query_row(
+                    "SELECT is_favorite FROM radio_stations WHERE url = ?1 AND name = 'depuis-annuaire'",
+                    ["https://ais-sa8.cdnstream1.com/3630_128.mp3"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(favori, 1, "le remplacement a perdu le drapeau favori");
+        }
+        assert_eq!(
+            compter("https://exemple.invalid/temoin"),
+            1,
+            "la migration 86 a frappé sur le nom au lieu de l'URL"
+        );
+        let total_apres = {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            total_apres,
+            total_avant - RETIREES.len() as i64,
+            "la migration 86 a retiré autre chose que les deux stations sans remplacement"
+        );
+    }
+
     #[test]
     fn renumber_queue_positions_sql_unifies_position_space() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3477,6 +4645,136 @@ mod tests {
         assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
     }
 
+    /// Migration 87 (#1865) — le prédicat doit viser JUSTE.
+    ///
+    /// Elle retire les témoins de passe qui ne recouvrent aucun résultat sur
+    /// les chemins non-ASCII. Trop large, elle relancerait l'analyse de toute
+    /// une bibliothèque ; trop étroite, elle ne rattraperait rien et le
+    /// correctif resterait sans effet sur les bases déjà balayées.
+    ///
+    /// Le SQL est relu depuis `MIGRATIONS` et rejoué APRÈS coup : cela vérifie
+    /// du même geste que la migration est bien **idempotente** — un DELETE
+    /// rejoué ne trouve plus rien, mais surtout il ne doit pas se mettre à
+    /// mordre sur des lignes qu'il avait épargnées.
+    #[test]
+    fn la_migration_87_ne_retire_que_les_temoins_sans_resultat_sur_chemin_accentue() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let sql = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 87)
+            .expect("migration 87 absente")
+            .up;
+
+        // id, chemin, a un gain / un vecteur ?, oversized ?
+        // Les chemins accentués sont écrits en échappements explicites : un
+        // éditeur qui recomposerait le littéral ferait passer le test sans
+        // qu'il compare quoi que ce soit.
+        let fixtures: &[(i64, &str, bool, bool)] = &[
+            // 1 — accentué, aucun gain, non oversized  → témoin RETIRÉ
+            (1, "/m/Bj\u{00f6}rk/01.flac", false, false),
+            // 2 — accentué mais un gain existe          → témoin GARDÉ
+            (2, "/m/\u{00c9}tienne/02.flac", true, false),
+            // 3 — ASCII, aucun gain                     → témoin GARDÉ
+            (3, "/m/Gramophone/03.flac", false, false),
+            // 4 — accentué, aucun gain, mais oversized  → témoin GARDÉ
+            (4, "/m/N\u{00fa}\u{00f1}ez/04.flac", false, true),
+        ];
+
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1)",
+            &[],
+        )
+        .unwrap();
+        for (id, chemin, avec_resultat, oversized) in fixtures {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path) \
+                 VALUES (?, 'T', 1, 1, ?)",
+                &[id, chemin],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_analyzed', '1')",
+                &[id],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO track_metadata (track_id, key, value) \
+                 VALUES (?, 'audio_embed_analyzed', 'clap')",
+                &[id],
+            )
+            .unwrap();
+            if *avec_resultat {
+                db.execute(
+                    "INSERT INTO track_metadata (track_id, key, value) \
+                     VALUES (?, 'rg_track_gain', '-6.00 dB')",
+                    &[id],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at) \
+                     VALUES (?, 'clap', X'00', 0)",
+                    &[id],
+                )
+                .unwrap();
+            }
+            if *oversized {
+                db.execute(
+                    "INSERT INTO track_metadata (track_id, key, value) \
+                     VALUES (?, 'rg_skipped_oversized', '1')",
+                    &[id],
+                )
+                .unwrap();
+            }
+        }
+
+        let porte = |cle: &str| -> Vec<i64> {
+            let conn = db.connection().lock().unwrap();
+            let mut st = conn
+                .prepare("SELECT track_id FROM track_metadata WHERE key = ?1 ORDER BY track_id")
+                .unwrap();
+            let v: Vec<i64> = st
+                .query_map([cle], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            v
+        };
+
+        assert_eq!(porte("rg_analyzed"), vec![1, 2, 3, 4], "etat de depart");
+        assert_eq!(porte("audio_embed_analyzed"), vec![1, 2, 3, 4]);
+
+        db.execute_batch(sql).unwrap();
+
+        // Seule la piste 1 remplit les trois conditions.
+        assert_eq!(
+            porte("rg_analyzed"),
+            vec![2, 3, 4],
+            "seul le temoin accentue et sans gain doit sauter ; \
+             un gain existant (2), un chemin ASCII (3) et un refus pour \
+             taille (4) sont des decisions valables, pas des ENOENT"
+        );
+        // Cote acoustique, la 4 saute AUSSI : `rg_skipped_oversized` est un
+        // refus propre a ReplayGain (une estimation de memoire de decodage) et
+        // ne dit rien de l'empreinte, qui ne lit que dix secondes. Les deux
+        // regles ne sont donc volontairement pas les memes.
+        assert_eq!(
+            porte("audio_embed_analyzed"),
+            vec![2, 3],
+            "la 2 a un vecteur, la 3 est ASCII ; la 4 n'a pas de vecteur et son \
+             chemin est accentue — `rg_skipped_oversized` ne la protege pas ici"
+        );
+
+        // Rejeu : idempotente, et surtout elle ne mord pas plus loin.
+        db.execute_batch(sql).unwrap();
+        assert_eq!(porte("rg_analyzed"), vec![2, 3, 4], "rejeu idempotent");
+        assert_eq!(porte("audio_embed_analyzed"), vec![2, 3]);
+    }
+
     // The PG numeric-type heal chain (#1220): the migration list must stay
     // contiguous and 1-based so run_pg_migrations applies every step, and the
     // numeric-column-type heal migrations (010/011/013/036) must all be present — a
@@ -3499,7 +4797,45 @@ mod tests {
         // sans toucher a cette ligne fait echouer le job « Test (PostgreSQL) »,
         // qui est le seul a executer ce test — la feature `postgres` n'est pas
         // dans le jeu par defaut.
-        assert_eq!(pg_latest_version(), 36, "latest PG migration must be 36");
+        // 42 : la 41 (`hidden_items`, #1391) était déjà enregistrée sans que
+        // cette ligne soit remontée — ce test ne tourne que dans le job PG,
+        // qui n'exécute pas `-p tune-core`. On la remonte donc de 40 à 42 d'un
+        // coup, en constatant les DEUX ajouts.
+        // 43 : `album_distinct_pairs` (#1276), jumelle de la SQLite 91.
+        // 44 : `ignored_devices` (#1280), jumelle de la SQLite 92. Les numéros
+        // 42 puis 43 ont été pris tour à tour par le semis de radios (#2119)
+        // et par `album_distinct_pairs` (#1276), tous deux fusionnés pendant
+        // que cette branche passait ses portes — d'où le renumérotage, fait
+        // AVANT qu'aucune base ne voie l'ancien numéro.
+        // 45 : `resserrer_folk_dans_world_music` (#1426), jumelle de la
+        // SQLite 93. Migration de DONNÉES : sans jumelle PG, le préréglage
+        // « World Music » garderait « contient folk » sur tout le parc
+        // PostgreSQL.
+        // 46 : `listen_history_rang_dans_le_contexte` (#2441). ⚠️ Cette
+        // migration a été ajoutée SANS remonter la borne ci-dessous : la
+        // branche était donc déjà ROUGE sur ce test avant #2860. Personne ne
+        // l'a vu parce que « Test (PostgreSQL) » est SAUTÉ sur une PR vers
+        // `batch/*` ou `rc/*` sans l'étiquette `ci:full` — c'est cette
+        // PR-ci, qui la porte, qui a réveillé le test.
+        // 47 : `listen_history_album_id_bigint` (#2860). `album_id` était
+        // TEXT contre `albums.id` BIGINT : la jointure de « Continuer
+        // l'écoute » rendait `operator does not exist: text = bigint`, avalé
+        // par `unwrap_or_default()`, donc section vide sur tout le parc
+        // PostgreSQL.
+        // 48 : `zones_volume_a_virgule` (#2886). `zones.volume` était un
+        // INTEGER : sous 0,005 linéaire (−46,0205999133 dB) la valeur
+        // persistée tombait à 0 et la zone se rallumait MUETTE. PAS de jumelle
+        // SQLite — voir le commentaire de l'entrée 48 dans PG_MIGRATIONS.
+        // 49 : `profile_id_bigint` (#2995). `listen_history.profile_id` et
+        // `playlists.profile_id` étaient TEXT sur toute installation
+        // PostgreSQL NATIVE, contre `profiles.id` BIGINT et un `i64` lié :
+        // `PlaylistRepo::list()` rendait `operator does not exist: text =
+        // bigint`, donc liste de playlists vide. Même cause que la 47 —
+        // les colonnes n'arrivent par aucun script numéroté, seulement par
+        // `ENSURE_COLUMNS`, et la 012 qui les vise ne les a jamais vues.
+        // Ce sont les DEUX dernières colonnes dans ce cas : la mesure de
+        // #2995 en compte cinq, dont trois déjà réparées.
+        assert_eq!(pg_latest_version(), 49, "latest PG migration must be 49");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -3928,6 +5264,13 @@ mod tests {
         for (fichier, nom) in [
             ("029_format_lowercase.sql", "format_lowercase"),
             ("030_format_conteneur_dsd.sql", "format_conteneur_dsd"),
+            // #1426 — le préréglage « World Music » est arrivé sur PostgreSQL
+            // par la bascule, jamais par un semis PG : sans jumelle, « contient
+            // folk » y resterait pour toujours.
+            (
+                "045_resserrer_folk_dans_world_music.sql",
+                "resserrer_folk_dans_world_music",
+            ),
         ] {
             assert!(
                 MIGRATIONS.iter().any(|m| m.name == nom),
@@ -3948,6 +5291,65 @@ mod tests {
                 sql.display()
             );
         }
+    }
+
+    /// Le registre des exécutions (#2080) doit exister sur les QUATRE chemins
+    /// par lesquels une base arrive à la vie. Trois suffiraient à faire croire
+    /// que c'est fait.
+    ///
+    /// Le chemin qu'on oublie est le troisième : une base créée par
+    /// l'assistant SQLite → PostgreSQL enregistre `schema_version = 99` et ne
+    /// rejoue **jamais** les scripts PG numérotés. Sur ces bases-là, la
+    /// migration 039 ne s'appliquera pas — ni maintenant, ni jamais. C'est
+    /// exactement la dérive documentée sur `lyrics_cache`.
+    ///
+    /// Ce test lit les SOURCES : il vaut donc quel que soit le jeu de features
+    /// compilé, `PG_MIGRATIONS` vivant derrière `#[cfg(feature = "postgres")]`.
+    #[test]
+    fn le_registre_des_executions_existe_sur_les_quatre_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // 1. Migration SQLite — les bases SQLite existantes ET neuves (le
+        //    runner tourne à chaque démarrage).
+        assert!(
+            MIGRATIONS.iter().any(|m| m.name == "task_runs"),
+            "la migration SQLite `task_runs` a disparu"
+        );
+
+        // 2. Migration PG numérotée — les bases PostgreSQL sur la piste
+        //    numérotée (.15, .18, Docker).
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains("040_task_runs.sql"),
+            "`task_runs` existe côté SQLite mais n'est pas enregistrée dans \
+             PG_MIGRATIONS"
+        );
+        assert!(
+            racine
+                .join("migrations/postgres/040_task_runs.sql")
+                .exists(),
+            "l'entrée PG_MIGRATIONS pointe sur un fichier absent"
+        );
+
+        // 3. `PG_FULL_SCHEMA` — une base montée d'un bloc par la bascule
+        //    SQLite → PostgreSQL, qui ne rejouera aucun script numéroté.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(
+            pg_neuf.contains("CREATE TABLE IF NOT EXISTS task_runs"),
+            "`task_runs` manque à PG_FULL_SCHEMA : une base créée par la \
+             bascule SQLite → PostgreSQL porte schema_version 99 et ne \
+             recevrait JAMAIS la migration 040"
+        );
+
+        // 4. `ENSURE_TABLES` — le rattrapage rejoué à CHAQUE démarrage, seul
+        //    filet pour une base déjà convertie AVANT cette version.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(
+            ensure.contains("CREATE TABLE IF NOT EXISTS task_runs"),
+            "`task_runs` manque à ENSURE_TABLES : les bases PostgreSQL déjà \
+             converties (schema_version 99) resteraient sans registre pour \
+             toujours"
+        );
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
@@ -48,22 +49,32 @@ pub(super) async fn list_duplicates(
     let hash_rows = state
         .backend
         .query_many(&hash_sql, hash_params)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let hash_dups: Vec<Value> = hash_rows
         .iter()
-        .map(|row| {
-            json!({
+        .filter_map(|row| {
+            let file_path = row.get(3).and_then(|v| v.as_string())?;
+            let duplicate_path = row.get(7).and_then(|v| v.as_string())?;
+            if !tune_core::scanner::hasher::files_are_byte_identical(
+                std::path::Path::new(&file_path),
+                std::path::Path::new(&duplicate_path),
+            )
+            .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(json!({
                 "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": row.get(2).and_then(|v| v.as_string()),
-                "file_path": row.get(3).and_then(|v| v.as_string()),
+                "file_path": file_path,
                 "audio_hash": row.get(4).and_then(|v| v.as_string()),
                 "duration_ms": row.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
                 "dup_id": row.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
-                "dup_path": row.get(7).and_then(|v| v.as_string()),
+                "dup_path": duplicate_path,
                 "dup_artist_name": row.get(8).and_then(|v| v.as_string()),
                 "match_type": "audio_hash",
-            })
+            }))
         })
         .collect();
 
@@ -87,7 +98,7 @@ pub(super) async fn list_duplicates(
     let meta_rows = state
         .backend
         .query_many(&meta_sql, meta_params)
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let meta_dups: Vec<Value> = meta_rows
         .iter()
         .map(|row| {
@@ -277,7 +288,10 @@ pub(super) async fn smart_duplicates(
     let limit_val = limit as i64;
     let offset_val = offset as i64;
     let params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
-    let rows = state.backend.query_many(&sql, params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, params)
+        .ou_defaut_journalise();
 
     let items: Vec<Value> = rows
         .iter()

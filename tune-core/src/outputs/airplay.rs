@@ -16,6 +16,112 @@ const BYTES_PER_FRAME: usize = CHANNELS as usize * BYTES_PER_SAMPLE;
 const BYTES_PER_PACKET: usize = FRAMES_PER_PACKET * BYTES_PER_FRAME;
 const RTP_HEADER_SIZE: usize = 12;
 
+#[derive(Debug, Default)]
+struct PositionRtpAirplay {
+    sequence: u16,
+    timestamp: u32,
+}
+
+/// Prochain couple sequence/timestamp que la boucle RTP emettra.
+///
+/// `pause()` le lit pour construire le FLUSH. Le couple est reserve avant
+/// l'envoi UDP : meme si FLUSH croise un datagramme deja en vol, il designe
+/// donc toujours la frontiere qui suit ce datagramme, jamais `0/0` (#2247).
+#[derive(Debug)]
+struct CurseurRtpAirplay {
+    position: std::sync::Mutex<PositionRtpAirplay>,
+    marquer_prochain: AtomicBool,
+}
+
+impl Default for CurseurRtpAirplay {
+    fn default() -> Self {
+        Self {
+            position: std::sync::Mutex::new(PositionRtpAirplay::default()),
+            // Le premier paquet apres RECORD porte aussi le marqueur RTP.
+            marquer_prochain: AtomicBool::new(true),
+        }
+    }
+}
+
+impl CurseurRtpAirplay {
+    fn reinitialiser(&self) {
+        *self
+            .position
+            .lock()
+            .unwrap_or_else(|empoisonne| empoisonne.into_inner()) = PositionRtpAirplay::default();
+        self.marquer_prochain.store(true, Ordering::SeqCst);
+    }
+
+    fn prochain(&self) -> (u16, u32) {
+        let position = self
+            .position
+            .lock()
+            .unwrap_or_else(|empoisonne| empoisonne.into_inner());
+        (position.sequence, position.timestamp)
+    }
+
+    fn reserver(&self, trames: u32, paused: &AtomicBool) -> Option<(u16, u32, bool)> {
+        let mut position = self
+            .position
+            .lock()
+            .unwrap_or_else(|empoisonne| empoisonne.into_inner());
+        // Deuxieme lecture SOUS le meme verrou que `pause()` utilise via
+        // `prochain()`. Si Pause croise la frontiere d'un paquet, soit celui-ci
+        // est deja reserve et FLUSH vise le suivant, soit il ne part pas.
+        if paused.load(Ordering::SeqCst) {
+            return None;
+        }
+        let reservee = (position.sequence, position.timestamp);
+        position.sequence = position.sequence.wrapping_add(1);
+        position.timestamp = position.timestamp.wrapping_add(trames);
+        let marqueur = self.marquer_prochain.swap(false, Ordering::SeqCst);
+        Some((reservee.0, reservee.1, marqueur))
+    }
+
+    fn marquer_reprise(&self) {
+        self.marquer_prochain.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Horloge du cadenceur RTP, distincte du temps media.
+///
+/// La position RTP ne bouge pas pendant une pause. Son origine murale doit en
+/// revanche avancer de la duree de pause, sinon toutes les echeances tombees
+/// dans le passe sont servies en rafale a la reprise (#2247).
+#[derive(Debug)]
+struct HorlogeCadencementRtp {
+    origine: tokio::time::Instant,
+    debut_pause: Option<tokio::time::Instant>,
+}
+
+impl HorlogeCadencementRtp {
+    fn new(origine: tokio::time::Instant) -> Self {
+        Self {
+            origine,
+            debut_pause: None,
+        }
+    }
+
+    fn entrer_pause(&mut self, maintenant: tokio::time::Instant) -> bool {
+        if self.debut_pause.is_some() {
+            return false;
+        }
+        self.debut_pause = Some(maintenant);
+        true
+    }
+
+    fn sortir_pause(&mut self, maintenant: tokio::time::Instant) -> Option<std::time::Duration> {
+        let debut = self.debut_pause.take()?;
+        let duree = maintenant.saturating_duration_since(debut);
+        self.origine += duree;
+        Some(duree)
+    }
+
+    fn echeance(&self, trames: u64) -> tokio::time::Instant {
+        self.origine + std::time::Duration::from_micros(trames * 1_000_000 / SAMPLE_RATE as u64)
+    }
+}
+
 pub struct AirplayOutput {
     name: String,
     device_id: String,
@@ -32,6 +138,7 @@ pub struct AirplayOutput {
     current_uri: Arc<Mutex<Option<String>>>,
     stop_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     rtsp_session: Arc<Mutex<Option<RtspSession>>>,
+    rtp: Arc<CurseurRtpAirplay>,
 }
 
 struct RtspSession {
@@ -60,6 +167,7 @@ impl AirplayOutput {
             current_uri: Arc::new(Mutex::new(None)),
             stop_tx: Arc::new(Mutex::new(None)),
             rtsp_session: Arc::new(Mutex::new(None)),
+            rtp: Arc::new(CurseurRtpAirplay::default()),
         }
     }
 }
@@ -198,7 +306,7 @@ impl RtspSession {
             .await?;
 
         if code != 200 {
-            return Err(format!("SETUP failed: {code}"));
+            return Err(setup_failure_message(code));
         }
 
         for (k, v) in &headers {
@@ -220,8 +328,9 @@ impl RtspSession {
         Ok(())
     }
 
-    async fn record(&mut self) -> Result<(), String> {
-        let mut headers = vec![("Range", "npt=0-"), ("RTP-Info", "seq=0;rtptime=0")];
+    async fn record(&mut self, sequence: u16, timestamp: u32) -> Result<(), String> {
+        let rtp_info = entete_rtp_info(sequence, timestamp);
+        let mut headers = vec![("Range", "npt=0-"), ("RTP-Info", rtp_info.as_str())];
         let session_id = self.session_id.clone().unwrap_or_default();
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
@@ -259,23 +368,45 @@ impl RtspSession {
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let _ = self
+        let (code, _, _) = self
             .send_request("TEARDOWN", "rtsp://127.0.0.1/1", &headers, None)
-            .await;
+            .await
+            .map_err(|error| format!("AirPlay TEARDOWN request failed: {error}"))?;
+        if !(200..300).contains(&code) {
+            return Err(format!("AirPlay TEARDOWN refused by device: {code}"));
+        }
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), String> {
-        let mut headers = vec![("RTP-Info", "seq=0;rtptime=0")];
+    async fn flush(&mut self, sequence: u16, timestamp: u32) -> Result<(), String> {
+        let rtp_info = entete_rtp_info(sequence, timestamp);
+        let mut headers = vec![("RTP-Info", rtp_info.as_str())];
         let session_id = self.session_id.clone().unwrap_or_default();
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
         }
-        let _ = self
+        let (code, _, _) = self
             .send_request("FLUSH", "rtsp://127.0.0.1/1", &headers, None)
-            .await;
+            .await?;
+        if code != 200 {
+            return Err(format!("FLUSH failed: {code}"));
+        }
         Ok(())
     }
+}
+
+fn entete_rtp_info(sequence: u16, timestamp: u32) -> String {
+    format!("seq={sequence};rtptime={timestamp}")
+}
+
+fn setup_failure_message(code: u32) -> String {
+    if code == 403 {
+        return "AirPlay connection refused by the device (403): it may still be in use by \
+                another sender or require pairing; stop other playback, verify AirPlay \
+                access, then retry"
+            .to_string();
+    }
+    format!("AirPlay SETUP failed: {code}")
 }
 
 fn linear_to_airplay_db(volume: f64) -> f64 {
@@ -288,11 +419,11 @@ fn linear_to_airplay_db(volume: f64) -> f64 {
     }
 }
 
-fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8]) -> Vec<u8> {
+fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8], marqueur: bool) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(RTP_HEADER_SIZE + audio.len());
-    // V=2, P=0, X=0, CC=0, M=0, PT=96
+    // V=2, P=0, X=0, CC=0, M selon la frontiere RECORD/FLUSH, PT=96.
     pkt.push(0x80);
-    pkt.push(96);
+    pkt.push(if marqueur { 0xe0 } else { 96 });
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&timestamp.to_be_bytes());
     pkt.extend_from_slice(&ssrc.to_be_bytes());
@@ -396,6 +527,7 @@ impl OutputTarget for AirplayOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.stop().await.ok();
+        self.rtp.reinitialiser();
 
         // Establish RTSP session
         let mut session = RtspSession::connect(&self.host, self.port).await?;
@@ -406,7 +538,8 @@ impl OutputTarget for AirplayOutput {
 
         session.announce().await?;
         session.setup(local_port).await?;
-        session.record().await?;
+        let (sequence, timestamp) = self.rtp.prochain();
+        session.record(sequence, timestamp).await?;
 
         let server_port = session.server_port;
         let target_addr = format!("{}:{}", self.host, server_port);
@@ -433,11 +566,20 @@ impl OutputTarget for AirplayOutput {
         let playing = self.playing.clone();
         let paused = self.paused.clone();
         let position_ms = self.position_ms.clone();
+        let rtp = self.rtp.clone();
         let name = self.name.clone();
 
         tokio::spawn(async move {
-            let result =
-                stream_to_airplay(&url, udp, &playing, &paused, &position_ms, &mut stop_rx).await;
+            let result = stream_to_airplay(
+                &url,
+                udp,
+                &playing,
+                &paused,
+                &position_ms,
+                &mut stop_rx,
+                &rtp,
+            )
+            .await;
 
             if let Err(e) = result {
                 warn!(device = %name, error = %e, "airplay_stream_error");
@@ -453,9 +595,14 @@ impl OutputTarget for AirplayOutput {
 
     async fn pause(&self) -> Result<(), String> {
         self.paused.store(true, Ordering::SeqCst);
+        let (sequence, timestamp) = self.rtp.prochain();
         if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            session.flush().await.ok();
+            if let Err(raison) = session.flush(sequence, timestamp).await {
+                self.paused.store(false, Ordering::SeqCst);
+                return Err(raison);
+            }
         }
+        self.rtp.marquer_reprise();
         Ok(())
     }
 
@@ -468,10 +615,19 @@ impl OutputTarget for AirplayOutput {
         if let Some(tx) = self.stop_tx.lock().await.take() {
             let _ = tx.send(());
         }
-        if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            session.teardown().await.ok();
+        let teardown_error = {
+            let mut session_slot = self.rtsp_session.lock().await;
+            let error = if let Some(session) = session_slot.as_mut() {
+                session.teardown().await.err()
+            } else {
+                None
+            };
+            *session_slot = None;
+            error
+        };
+        if let Some(error) = teardown_error {
+            warn!(device = %self.name, error = %error, "airplay_teardown_failed");
         }
-        *self.rtsp_session.lock().await = None;
         self.playing.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
         info!(device = %self.name, "airplay_stop");
@@ -557,6 +713,7 @@ async fn stream_to_airplay(
     paused: &AtomicBool,
     position_ms: &AtomicU64,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    rtp: &CurseurRtpAirplay,
 ) -> Result<(), String> {
     // Resolve URL to a local file path (downloading HTTP URLs if needed)
     let (local_path, _tmp_guard) = url_to_local_path(url).await?;
@@ -617,7 +774,17 @@ async fn stream_to_airplay(
     let ssrc: u32 = rand_random();
     let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
 
-    diffuser_pcm(&pcm_be, &udp, playing, paused, position_ms, stop_rx, ssrc).await;
+    diffuser_pcm(
+        &pcm_be,
+        &udp,
+        playing,
+        paused,
+        position_ms,
+        stop_rx,
+        ssrc,
+        rtp,
+    )
+    .await;
 
     Ok(())
 }
@@ -649,12 +816,11 @@ async fn diffuser_pcm<S: SortieRtp>(
     position_ms: &AtomicU64,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ssrc: u32,
+    rtp: &CurseurRtpAirplay,
 ) {
-    let mut seq: u16 = 0;
-    let mut timestamp: u32 = 0;
     let mut total_frames: u64 = 0;
     let mut offset: usize = 0;
-    let start_time = tokio::time::Instant::now();
+    let mut horloge = HorlogeCadencementRtp::new(tokio::time::Instant::now());
 
     // Pourquoi un booleen plutot qu'une seconde lecture du receiver :
     // `oneshot::Receiver::try_recv()` CONSOMME. La boucle rend le stop, puis
@@ -676,6 +842,9 @@ async fn diffuser_pcm<S: SortieRtp>(
             break;
         }
 
+        if paused.load(Ordering::Relaxed) {
+            horloge.entrer_pause(tokio::time::Instant::now());
+        }
         while paused.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             if stop_rx.try_recv().is_ok() {
@@ -687,20 +856,29 @@ async fn diffuser_pcm<S: SortieRtp>(
                 break 'paquets;
             }
         }
+        if let Some(duree) = horloge.sortir_pause(tokio::time::Instant::now()) {
+            debug!(
+                pause_ms = duree.as_millis(),
+                "airplay_horloge_recalee_apres_pause"
+            );
+        }
 
         let audio_buf = &pcm_be[offset..offset + BYTES_PER_PACKET];
-        let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf);
+        let Some((seq, timestamp, marqueur)) = rtp.reserver(FRAMES_PER_PACKET as u32, paused)
+        else {
+            // Pause a croise la frontiere entre la garde ci-dessus et la
+            // reservation. Revenir en tete garantit zero paquet apres FLUSH.
+            continue 'paquets;
+        };
+        let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf, marqueur);
         sortie.envoyer(&pkt).await;
 
-        seq = seq.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(FRAMES_PER_PACKET as u32);
         total_frames += FRAMES_PER_PACKET as u64;
         offset += BYTES_PER_PACKET;
         position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
 
         // Pace to real-time: sleep until the next packet is due
-        let target = start_time
-            + std::time::Duration::from_micros(total_frames * 1_000_000 / SAMPLE_RATE as u64);
+        let target = horloge.echeance(total_frames);
         tokio::time::sleep_until(target).await;
     }
 
@@ -725,11 +903,24 @@ async fn diffuser_pcm<S: SortieRtp>(
     {
         let trames = reste / BYTES_PER_FRAME;
         let fin = offset + trames * BYTES_PER_FRAME;
-        let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin]);
-        sortie.envoyer(&pkt).await;
-        total_frames += trames as u64;
-        position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
-        debug!(trames, "airplay_dernier_paquet_partiel");
+        // Une pause peut aussi tomber entre le dernier paquet plein et ce
+        // paquet partiel. Attendre sa vraie reprise au lieu de jeter la fin.
+        let reservation = loop {
+            if let Some(reservation) = rtp.reserver(trames as u32, paused) {
+                break Some(reservation);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if stop_rx.try_recv().is_ok() || !playing.load(Ordering::Relaxed) {
+                break None;
+            }
+        };
+        if let Some((seq, timestamp, marqueur)) = reservation {
+            let pkt = build_rtp_packet(seq, timestamp, ssrc, &pcm_be[offset..fin], marqueur);
+            sortie.envoyer(&pkt).await;
+            total_frames += trames as u64;
+            position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
+            debug!(trames, "airplay_dernier_paquet_partiel");
+        }
     }
 }
 
@@ -744,6 +935,57 @@ fn rand_random() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn setup_403_explains_busy_device_and_pairing() {
+        let message = setup_failure_message(403);
+        assert!(message.contains("another sender"));
+        assert!(message.contains("pairing"));
+        assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn setup_other_status_keeps_the_rtsp_code() {
+        assert_eq!(setup_failure_message(453), "AirPlay SETUP failed: 453");
+    }
+
+    #[tokio::test]
+    async fn teardown_refusal_is_returned_instead_of_discarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"RTSP/1.0 403 Forbidden\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let mut session = RtspSession::connect("127.0.0.1", address.port())
+            .await
+            .unwrap();
+        session.session_id = Some("stale-session".into());
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), session.teardown())
+            .await
+            .expect("TEARDOWN response must not hang")
+            .unwrap_err();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("fake RTSP server must finish")
+            .unwrap();
+
+        assert!(error.contains("TEARDOWN refused by device: 403"));
+        assert!(request.starts_with("TEARDOWN rtsp://127.0.0.1/1 RTSP/1.0"));
+        assert!(request.contains("Session: stale-session\r\n"));
+    }
 
     #[test]
     fn volume_conversion() {
@@ -751,6 +993,71 @@ mod tests {
         assert_eq!(linear_to_airplay_db(1.0), 0.0);
         let half = linear_to_airplay_db(0.5);
         assert!(half < -5.0 && half > -15.0);
+    }
+
+    #[test]
+    fn pause_de_dix_secondes_decale_l_horloge_sans_rafale() {
+        let origine = tokio::time::Instant::now();
+        let une_trame_rtp = std::time::Duration::from_micros(
+            FRAMES_PER_PACKET as u64 * 1_000_000 / SAMPLE_RATE as u64,
+        );
+        let mut horloge = HorlogeCadencementRtp::new(origine);
+
+        // Le premier paquet est parti ; la boucle atteint son echeance puis
+        // observe Pause. Dix secondes plus tard, elle envoie le paquet suivant
+        // immediatement. Seule son echeance SUIVANTE doit rester a ~8 ms.
+        let debut_pause = horloge.echeance(FRAMES_PER_PACKET as u64);
+        assert!(horloge.entrer_pause(debut_pause));
+        let reprise = debut_pause + std::time::Duration::from_secs(10);
+        assert_eq!(
+            horloge.sortir_pause(reprise),
+            Some(std::time::Duration::from_secs(10))
+        );
+
+        let prochaine = horloge.echeance((2 * FRAMES_PER_PACKET) as u64);
+        let intervalle = prochaine.duration_since(reprise);
+        assert!(
+            intervalle >= une_trame_rtp
+                && intervalle <= une_trame_rtp + std::time::Duration::from_micros(1),
+            "apres reprise, cadence attendue ~8 ms, obtenue {intervalle:?}"
+        );
+    }
+
+    #[test]
+    fn flush_et_marqueur_suivent_le_prochain_paquet_reel() {
+        let rtp = CurseurRtpAirplay::default();
+        let en_pause = AtomicBool::new(false);
+
+        assert_eq!(rtp.prochain(), (0, 0));
+        assert_eq!(
+            rtp.reserver(FRAMES_PER_PACKET as u32, &en_pause),
+            Some((0, 0, true))
+        );
+        assert_eq!(rtp.prochain(), (1, FRAMES_PER_PACKET as u32));
+        let (sequence, timestamp) = rtp.prochain();
+        assert_eq!(
+            entete_rtp_info(sequence, timestamp),
+            format!("seq=1;rtptime={FRAMES_PER_PACKET}")
+        );
+
+        assert_eq!(
+            rtp.reserver(FRAMES_PER_PACKET as u32, &en_pause),
+            Some((1, FRAMES_PER_PACKET as u32, false))
+        );
+        rtp.marquer_reprise();
+        assert_eq!(
+            rtp.reserver(FRAMES_PER_PACKET as u32, &en_pause),
+            Some((2, (2 * FRAMES_PER_PACKET) as u32, true)),
+            "le premier paquet apres FLUSH doit porter le marqueur RTP"
+        );
+
+        let pause = AtomicBool::new(true);
+        assert_eq!(rtp.reserver(FRAMES_PER_PACKET as u32, &pause), None);
+        assert_eq!(
+            rtp.prochain(),
+            (3, (3 * FRAMES_PER_PACKET) as u32),
+            "une reservation croisee par Pause ne doit avancer aucun curseur"
+        );
     }
 
     /// La sortie de test : on garde la taille de charge utile de chaque
@@ -788,10 +1095,21 @@ mod tests {
         let playing = AtomicBool::new(true);
         let paused = AtomicBool::new(false);
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         stop_tx.send(()).unwrap();
 
-        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+        diffuser_pcm(
+            &pcm,
+            &sortie,
+            &playing,
+            &paused,
+            &position,
+            &mut stop_rx,
+            1,
+            &rtp,
+        )
+        .await;
 
         assert_eq!(
             sortie.charges(),
@@ -811,6 +1129,7 @@ mod tests {
         let playing = AtomicBool::new(true);
         let paused = AtomicBool::new(false);
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
         // ~8 ms par paquet : le stop tombe apres quelques paquets, jamais
@@ -820,7 +1139,17 @@ mod tests {
             stop_tx.send(()).ok();
         });
 
-        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+        diffuser_pcm(
+            &pcm,
+            &sortie,
+            &playing,
+            &paused,
+            &position,
+            &mut stop_rx,
+            1,
+            &rtp,
+        )
+        .await;
 
         let charges = sortie.charges();
         assert!(
@@ -848,9 +1177,20 @@ mod tests {
         let playing = AtomicBool::new(false);
         let paused = AtomicBool::new(false);
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
-        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+        diffuser_pcm(
+            &pcm,
+            &sortie,
+            &playing,
+            &paused,
+            &position,
+            &mut stop_rx,
+            1,
+            &rtp,
+        )
+        .await;
 
         assert_eq!(
             sortie.charges(),
@@ -867,6 +1207,7 @@ mod tests {
         let playing = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(true));
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
         let p = playing.clone();
@@ -875,7 +1216,17 @@ mod tests {
             p.store(false, Ordering::SeqCst);
         });
 
-        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+        diffuser_pcm(
+            &pcm,
+            &sortie,
+            &playing,
+            &paused,
+            &position,
+            &mut stop_rx,
+            1,
+            &rtp,
+        )
+        .await;
 
         assert_eq!(
             sortie.charges(),
@@ -896,6 +1247,7 @@ mod tests {
         let playing = AtomicBool::new(true);
         let paused = AtomicBool::new(true);
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
@@ -905,7 +1257,16 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1),
+            diffuser_pcm(
+                &pcm,
+                &sortie,
+                &playing,
+                &paused,
+                &position,
+                &mut stop_rx,
+                1,
+                &rtp,
+            ),
         )
         .await
         .expect("Stop doit sortir de Pause sans attendre Resume ni playing=false");
@@ -923,9 +1284,20 @@ mod tests {
         let playing = AtomicBool::new(true);
         let paused = AtomicBool::new(false);
         let position = AtomicU64::new(0);
+        let rtp = CurseurRtpAirplay::default();
         let (_stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
-        diffuser_pcm(&pcm, &sortie, &playing, &paused, &position, &mut stop_rx, 1).await;
+        diffuser_pcm(
+            &pcm,
+            &sortie,
+            &playing,
+            &paused,
+            &position,
+            &mut stop_rx,
+            1,
+            &rtp,
+        )
+        .await;
 
         assert_eq!(
             sortie.charges(),
@@ -942,11 +1314,14 @@ mod tests {
     #[test]
     fn rtp_packet_format() {
         let audio = vec![0u8; BYTES_PER_PACKET];
-        let pkt = build_rtp_packet(42, 12345, 0xDEADBEEF, &audio);
+        let pkt = build_rtp_packet(42, 12345, 0xDEADBEEF, &audio, false);
         assert_eq!(pkt.len(), RTP_HEADER_SIZE + BYTES_PER_PACKET);
         assert_eq!(pkt[0], 0x80);
         assert_eq!(pkt[1], 96);
         assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 42);
+
+        let marque = build_rtp_packet(43, 12697, 0xDEADBEEF, &audio, true);
+        assert_eq!(marque[1], 0xe0);
     }
 
     /// La contre-épreuve de JP Robbe sur #2281, cette fois branchée sur la
@@ -960,14 +1335,14 @@ mod tests {
     /// Ici c'est `pcm_i32_to_l16_be`, la fonction réellement appelée par
     /// `stream_to_airplay`, qui est exercée.
     #[test]
-    fn la_conversion_l16_de_production_sature_un_downmix_51() {
+    fn la_conversion_l16_de_production_reserve_le_headroom_du_downmix_51() {
         let plein = i16::MAX as i32; // source 16 bits à pleine échelle
         // fl, fr, centre, LFE, sl, sr — tous à fond.
         let stereo =
             crate::audio::channels::to_stereo_i32(&[plein, plein, plein, plein, plein, plein], 6);
         assert!(
-            stereo[0] > plein,
-            "le repli doit sommer au-delà de i16 avant saturation : {}",
+            stereo[0] <= plein && stereo[0] > plein - 16,
+            "la matrice doit réserver son headroom avant la conversion L16 : {}",
             stereo[0]
         );
 
@@ -975,9 +1350,8 @@ mod tests {
         assert_eq!(
             i16::from_be_bytes([l16[0], l16[1]]),
             i16::MAX,
-            "la conversion L16 doit saturer, pas reboucler : un cast nu rendait \
-             13563 là où il fallait 32767, soit une distorsion franche sur les \
-             passages forts"
+            "le downmix plein niveau doit rester plein niveau sans dépendre du \
+             saturateur de la conversion L16"
         );
         assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MAX);
     }

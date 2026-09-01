@@ -11,6 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
+use crate::audio::support::{LibraryAudioSupport, UnsupportedLibraryAudio};
 use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadata};
 
 /// Maximum time allowed for reading metadata + computing hash for a single file.
@@ -174,13 +175,10 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Audio extensions recognised by the scanner. Shared with the file watcher
-/// (which excludes "iso": ISO SACD needs the extraction step that only the
-/// full directory walk performs).
-pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
-    "alac", "ape", "iso",
-];
+/// Audio extensions recognised by the scanner. Shared with the decoder
+/// contract and the file watcher (which excludes `iso`: ISO SACD needs the
+/// extraction step that only the full directory walk performs).
+pub use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS as SUPPORTED_EXTENSIONS;
 
 /// Audio (or audio-describing) extensions Tune does NOT read, listed so the scan
 /// report can say WHY files were left out instead of letting them vanish.
@@ -192,15 +190,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// `cue` earns its place even though it is not audio: a `.cue` next to a single
 /// large file is precisely how an album gets stored as one track, so its
 /// presence explains a missing album better than anything else.
-pub const KNOWN_UNREAD_AUDIO: &[&str] = &[
-    "mpc", "mp+", "mpp", // Musepack (Rhorn, #1763)
-    "cue", // feuille de découpe, jamais interprétée
-    "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
-    "m4b", "m4p", // livres audio, achats protégés
-    "dts", "ac3", "eac3", "mka", // conteneurs plutôt vidéo/multicanal
-    "aac", // AAC brut, hors conteneur m4a
-    "ra", "rm", "amr", "spx",
-];
+pub use crate::audio::support::KNOWN_UNREAD_AUDIO_EXTENSIONS as KNOWN_UNREAD_AUDIO;
 
 const SKIP_DIRS: &[&str] = &[
     "duplicates",
@@ -254,9 +244,36 @@ pub fn normalize_path(path: &str) -> String {
 pub struct ScannedFile {
     pub path: String,
     pub metadata: Option<TrackMetadata>,
+    /// Format audio reconnu mais non décodable par le binaire livré.
+    /// Distinct d'un échec de métadonnées : le rapport doit expliquer le choix
+    /// fail-closed sans présenter le fichier comme corrompu.
+    pub unsupported: Option<UnsupportedLibraryAudio>,
     pub audio_hash: Option<String>,
     pub file_size: u64,
     pub mtime: u64,
+}
+
+/// Combien de chemins écartés une liste du rapport de scan retient au plus.
+///
+/// Le rapport doit répondre « lesquels ? », pas « tous » : une bibliothèque
+/// dont 40 000 fichiers `.cue` sont écartés produirait sinon un rapport de
+/// plusieurs mégaoctets, relu à chaque `GET /scan/report`. Les compteurs
+/// (`skipped_unsupported`, `skipped_no_metadata`, `skipped_duplicate`,
+/// `skipped_unsupported_by_ext`) restent, eux, exhaustifs : le plafond borne
+/// l'échantillon nominatif, jamais le décompte.
+pub const PLAFOND_CHEMINS_ECARTES: usize = 500;
+
+/// Ajoute un chemin écarté tant que la liste n'a pas atteint son plafond.
+///
+/// Une seule définition pour les six endroits qui écartent un fichier — deux
+/// dans ce parcours, deux dans la phase de métadonnées, deux dans les boucles
+/// d'import. Le motif « un chemin corrigé, les autres nus » est la façon dont
+/// ce rapport a déjà divergé trois fois (#2012) ; un plafond recopié à la main
+/// six fois divergerait de la même manière.
+pub fn pousser_chemin_ecarte(liste: &mut Vec<String>, chemin: impl Into<String>) {
+    if liste.len() < PLAFOND_CHEMINS_ECARTES {
+        liste.push(chemin.into());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -267,11 +284,28 @@ pub struct ScanStats {
     pub metadata_timeout: usize,
     pub hash_ok: usize,
     pub failed_paths: Vec<String>,
+    pub unsupported_by_ext: std::collections::HashMap<String, usize>,
+    pub unsupported_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers dont le format a été reconnu à la lecture mais
+    /// n'est pas décodable, plafonnés par [`PLAFOND_CHEMINS_ECARTES`].
+    ///
+    /// `unsupported_by_ext` dit « 280 fichiers `.mpc` » ; seul ceci dit
+    /// LESQUELS. C'est la question posée par le testeur (#2050) et celle qui
+    /// manque pour instruire « des fichiers présents dans l'explorateur sont
+    /// absents de Tune » (#2365, #2802).
+    pub unsupported_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+enum ReadFileError {
+    Timeout,
+    Unsupported(UnsupportedLibraryAudio),
+    Other(String),
 }
 
 /// Read metadata (and optionally compute hash) for a single file, with a
-/// [`FILE_TIMEOUT`] guard.  If the underlying I/O does not complete in time
-/// the file is skipped and `Err("timeout")` is returned.
+/// [`FILE_TIMEOUT`] guard. If the underlying I/O does not complete in time,
+/// [`ReadFileError::Timeout`] is returned.
 ///
 /// We spawn a real OS thread because the metadata/hash reads are blocking I/O
 /// that can hang on NAS mounts — `rayon` tasks must not block indefinitely.
@@ -283,12 +317,40 @@ pub struct ScanStats {
 fn read_file_with_retry(
     path: &PathBuf,
     with_hash: bool,
-) -> Result<(Option<TrackMetadata>, Option<String>), String> {
-    match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
-        Err(ref reason) if reason == "timeout" => {
-            read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT)
-        }
+) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
+    let result = match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
+        Err(ReadFileError::Timeout) => read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT),
         other => other,
+    };
+    result.map(|(mut metadata, hash)| {
+        if let Some(meta) = metadata.as_mut() {
+            let corrections = meta.sanitize_text_fields();
+            if !corrections.is_empty() {
+                warn!(
+                    path = %path.display(),
+                    corrections = ?corrections,
+                    "scan_metadata_unsafe_text_sanitized"
+                );
+            }
+        }
+        (metadata, hash)
+    })
+}
+
+/// A path is an address on the real filesystem and cannot be rewritten in the
+/// DB without making the track unopenable. Report the exact unsafe codepoints
+/// and the safe spelling instead; ingest-generated destination components use
+/// the same sanitizer and therefore never create new paths like this.
+fn warn_unsafe_path_text(path: &str) {
+    let (safe_path, corrections) =
+        crate::metadata::sanitize_untrusted_single_line_text(path, "file_path");
+    if !corrections.is_empty() {
+        warn!(
+            path,
+            safe_path,
+            corrections = ?corrections,
+            "scan_path_contains_unsafe_text_preserved_for_io"
+        );
     }
 }
 
@@ -330,19 +392,27 @@ fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
     tag_timeout: Duration,
-) -> Result<(Option<TrackMetadata>, Option<String>), String> {
+) -> Result<(Option<TrackMetadata>, Option<String>), ReadFileError> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
     // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
     let meta_path = path.clone();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = mtx.send(try_read_metadata(&meta_path));
+        let result = match crate::audio::support::library_audio_support(&meta_path) {
+            LibraryAudioSupport::Unsupported(unsupported) => {
+                Err(ReadFileError::Unsupported(unsupported))
+            }
+            LibraryAudioSupport::Supported | LibraryAudioSupport::NotAudio => {
+                try_read_metadata(&meta_path).map_err(ReadFileError::Other)
+            }
+        };
+        let _ = mtx.send(result);
     });
     let metadata = match mrx.recv_timeout(tag_timeout) {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("timeout".to_string()),
+        Err(_) => return Err(ReadFileError::Timeout),
     };
 
     if !with_hash {
@@ -386,6 +456,14 @@ pub struct ListAudioResult {
     /// seule chose qui explique à l'utilisateur pourquoi des albums manquent —
     /// sans quoi ils disparaissent en silence (cf `KNOWN_UNREAD_AUDIO`).
     pub skipped_by_ext: std::collections::HashMap<String, usize>,
+    /// Motif stable associé à chaque clé de `skipped_by_ext`.
+    pub skipped_reasons: std::collections::HashMap<String, String>,
+    /// Les CHEMINS écartés par ce parcours, plafonnés par
+    /// [`PLAFOND_CHEMINS_ECARTES`] et suffixés de leur motif.
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis jetait le chemin (#2050).
+    pub skipped_paths: Vec<String>,
 }
 
 impl ListAudioResult {
@@ -393,6 +471,41 @@ impl ListAudioResult {
         self.files.is_empty() && self.missing_dirs.is_empty()
     }
 }
+
+/// Ce que le parcours des dossiers sait de lui-même **pendant** qu'il tourne.
+///
+/// Le parcours est la phase la plus longue d'un scan complet sur un partage
+/// réseau, et c'était la seule qui ne disait rien : `scan_dir_complete` ne
+/// tombe qu'à la fin d'une racine, `audio_files_listed` qu'à la fin de toutes.
+/// Sur une bibliothèque tenue par un NAS, cela fait plusieurs minutes pendant
+/// lesquelles ni le journal ni l'écran ne distinguent « ça travaille » de
+/// « c'est planté » (#2203, JP Borderies : 3 min 40 sans une ligne, scan
+/// annulé, redémarrage, abandon).
+///
+/// Rien ici n'est calculé pour l'occasion : ces trois valeurs sont déjà tenues
+/// par la boucle de parcours. Elles n'étaient simplement jamais rendues.
+pub struct ProgressionParcours<'a> {
+    /// Fichiers audio retenus depuis le début du parcours, **toutes racines
+    /// confondues**. C'est un compte qui monte, jamais un pourcentage : à cet
+    /// instant le total est inconnu — on ne peut pas savoir combien de
+    /// fichiers restent avant de les avoir parcourus.
+    pub fichiers_vus: usize,
+    /// Racine configurée en cours de parcours.
+    pub racine: &'a str,
+    /// Dossier réellement visité à cet instant. C'est ce qui prouve à
+    /// l'utilisateur que la machine avance, et c'est ce qui nous dit, sur un
+    /// journal de testeur, OÙ un parcours s'est enlisé.
+    pub dossier_courant: &'a str,
+}
+
+/// Cadence des annonces de progression du parcours.
+///
+/// À cadence fixe, jamais par fichier : une bibliothèque de 58 000 fichiers
+/// produirait 58 000 lignes, ce qui noierait le journal et coûterait plus cher
+/// que le parcours lui-même. Deux secondes, c'est la même cadence que
+/// l'émission par lots de la phase d'import (`scan.rs`), pour que l'écran
+/// reçoive un flux régulier d'un bout à l'autre du scan.
+pub const CADENCE_PROGRESSION_PARCOURS: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
@@ -403,11 +516,35 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
 /// substring — deliberately simple, no glob engine). Patterns come from the
 /// `scan_exclude_paths` setting: staging/incoming folders, backup trees, a
 /// sibling's library on a shared NAS…
+///
+/// Ne rend pas compte de son avancement. Les appelants qui ont un écran à
+/// nourrir passent par [`list_audio_files_avec_progression`].
 pub fn list_audio_files_with_excludes(
     dirs: &[String],
     exclude_patterns: &[String],
 ) -> ListAudioResult {
-    let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
+    list_audio_files_avec_progression(
+        dirs,
+        exclude_patterns,
+        CADENCE_PROGRESSION_PARCOURS,
+        &mut |_| {},
+    )
+}
+
+/// Comme [`list_audio_files_with_excludes`], mais rend compte de son
+/// avancement au fil du parcours, au plus une fois par `cadence`.
+///
+/// `on_progress` ne peut RIEN changer au parcours : il ne rend rien, ne reçoit
+/// que des emprunts, et n'est appelé qu'entre deux entrées. L'ordre des
+/// fichiers, les exclusions, les lots et la liste rendue sont identiques à
+/// ceux de `list_audio_files_with_excludes` — cette fonction ajoute de la
+/// visibilité, pas de la logique.
+pub fn list_audio_files_avec_progression(
+    dirs: &[String],
+    exclude_patterns: &[String],
+    cadence: std::time::Duration,
+    on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
+) -> ListAudioResult {
     let excludes: Vec<String> = exclude_patterns
         .iter()
         .map(|p| p.trim().to_lowercase())
@@ -418,6 +555,9 @@ pub fn list_audio_files_with_excludes(
     let mut files = Vec::new();
     let mut skipped_by_ext: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut skipped_reasons: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut skipped_paths: Vec<String> = Vec::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -425,6 +565,19 @@ pub fn list_audio_files_with_excludes(
     // trouble (NAS died mid-walk) — protect the entire root instead of
     // accumulating an unbounded list.
     const MAX_ERROR_SCOPES: usize = 50;
+    // Lignes nominatives émises pour les ISO SACD non extraits avant de passer
+    // au récapitulatif. Même valeur que le plafond des erreurs de parcours :
+    // assez pour montrer des exemples, pas assez pour noyer le journal.
+    const MAX_ISO_WARN: usize = 5;
+    // Horloge des annonces de progression, partagée par TOUTES les racines :
+    // la cadence doit valoir pour le parcours entier, pas se réarmer à chaque
+    // racine. Initialisée dans le passé pour qu'une première annonce parte
+    // aussitôt — c'est celle qui dit à l'écran que le parcours a commencé,
+    // et sans elle une racine lente resterait muette pendant sa première
+    // tranche de cadence.
+    let mut derniere_annonce = std::time::Instant::now()
+        .checked_sub(cadence)
+        .unwrap_or_else(std::time::Instant::now);
     for dir in dirs {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
@@ -483,6 +636,7 @@ pub fn list_audio_files_with_excludes(
 
         let mut dir_file_count = 0usize;
         let mut dir_error_count = 0usize;
+        let mut dir_iso_error_count = 0usize;
 
         let walker = WalkDir::new(&normalized)
             .follow_links(true)
@@ -506,6 +660,38 @@ pub fn list_audio_files_with_excludes(
         for entry in walker {
             match entry {
                 Ok(entry) => {
+                    // Signe de vie du parcours (#2203).
+                    //
+                    // Placé AVANT le filtre `is_file` à dessein : sur un
+                    // partage réseau, le temps ne se passe pas sur les
+                    // fichiers retenus, il se passe à traverser des dossiers
+                    // qui n'en contiennent aucun. Un battement qui ne tomberait
+                    // que sur les fichiers audio se tairait précisément là où
+                    // le parcours s'enlise.
+                    //
+                    // Le test de cadence est un unique `Instant::now()` par
+                    // entrée — quelques dizaines de nanosecondes, à comparer
+                    // au `stat` réseau que le parcours vient de payer.
+                    if derniere_annonce.elapsed() >= cadence {
+                        derniere_annonce = std::time::Instant::now();
+                        let dossier = if entry.file_type().is_dir() {
+                            entry.path()
+                        } else {
+                            entry.path().parent().unwrap_or_else(|| entry.path())
+                        };
+                        let dossier = dossier.to_string_lossy();
+                        info!(
+                            racine = %normalized,
+                            dossier = %dossier,
+                            fichiers = files.len(),
+                            "scan_indexing_progress — parcours en cours"
+                        );
+                        on_progress(ProgressionParcours {
+                            fichiers_vus: files.len(),
+                            racine: &normalized,
+                            dossier_courant: &dossier,
+                        });
+                    }
                     if !entry.file_type().is_file() {
                         continue;
                     }
@@ -523,38 +709,112 @@ pub fn list_audio_files_with_excludes(
                         continue;
                     }
                     let path = entry.path();
-                    // Count the AUDIO files we walk past, by extension. Until now
-                    // a file whose format Tune does not read simply vanished: no
-                    // log, no line in the scan report, nothing. The user sees
-                    // albums missing with no way to learn why — the `.cue` /
-                    // `.mpc` case (Rhorn, #1763), and every future format.
-                    //
-                    // Only KNOWN_UNREAD_AUDIO is counted, never "every unknown
-                    // extension": a music library holds thousands of .jpg, .nfo,
-                    // .m3u and .log, and reporting those would bury the one line
-                    // that matters under noise nobody can act on.
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let lower = ext.to_lowercase();
-                        if KNOWN_UNREAD_AUDIO.contains(&lower.as_str()) {
-                            *skipped_by_ext.entry(lower).or_insert(0) += 1;
+                    // Classer AVANT d'ajouter le chemin : WMA, DST autonome et
+                    // les autres formats audio connus mais non lus restent
+                    // visibles dans le rapport, sans devenir des pistes
+                    // cliquables impossibles à décoder. DFF/DST sera distingué
+                    // plus tard, dans la phase de métadonnées bornée. Les
+                    // fichiers non audio restent silencieux.
+                    match crate::audio::support::library_audio_support_by_extension(path) {
+                        crate::audio::support::LibraryAudioSupport::Unsupported(unsupported) => {
+                            *skipped_by_ext
+                                .entry(unsupported.report_key.clone())
+                                .or_insert(0) += 1;
+                            // Le chemin, pas seulement le décompte : « 280
+                            // fichiers .mpc » ne dit pas lesquels, et c'est
+                            // lesquels que le testeur demande (#2050).
+                            pousser_chemin_ecarte(
+                                &mut skipped_paths,
+                                format!("{} ({})", path.display(), unsupported.reason),
+                            );
+                            skipped_reasons
+                                .entry(unsupported.report_key)
+                                .or_insert_with(|| unsupported.reason.to_string());
+                            continue;
                         }
+                        crate::audio::support::LibraryAudioSupport::NotAudio => continue,
+                        crate::audio::support::LibraryAudioSupport::Supported => {}
                     }
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                        && extensions.contains(ext.to_lowercase().as_str())
-                    {
+
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         // ISO SACD: extract DSF tracks instead of adding the ISO directly
-                        if ext.eq_ignore_ascii_case("iso")
-                            && crate::audio::iso_sacd::is_sacd_iso(path)
-                        {
-                            match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
-                                Ok(dsf_files) => {
-                                    dir_file_count += dsf_files.len();
-                                    files.extend(dsf_files);
+                        if ext.eq_ignore_ascii_case("iso") {
+                            if crate::audio::iso_sacd::is_sacd_iso(path) {
+                                match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
+                                    Ok(dsf_files) => {
+                                        dir_file_count += dsf_files.len();
+                                        files.extend(dsf_files);
+                                    }
+                                    Err(e) => {
+                                        // Le fichier n'entre en base par AUCUN
+                                        // chemin : ni comme ISO, ni comme
+                                        // pistes extraites. Il doit donc être
+                                        // COMPTÉ et NOMMÉ dans le rapport de
+                                        // scan, faute de quoi l'album
+                                        // disparaît sans qu'aucun écran ne le
+                                        // dise — 22 albums SACD chez JeromeQ,
+                                        // pour la seule trace d'un `warn!`
+                                        // dans un fichier de journal (#2992).
+                                        dir_iso_error_count += 1;
+                                        // Quelques lignes détaillées, puis un
+                                        // récapitulatif : un `warn!` par
+                                        // fichier noierait le journal.
+                                        if dir_iso_error_count <= MAX_ISO_WARN {
+                                            warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
+                                        }
+                                        *skipped_by_ext
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert(0) += 1;
+                                        // Le motif technique exact accompagne
+                                        // le CHEMIN — « sacd_extract not
+                                        // found » et « sacd_extract failed »
+                                        // ne demandent pas le même geste.
+                                        pousser_chemin_ecarte(
+                                            &mut skipped_paths,
+                                            format!("{} ({e})", path.display()),
+                                        );
+                                        skipped_reasons
+                                            .entry(
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
+                                                    .to_string(),
+                                            )
+                                            .or_insert_with(|| {
+                                                crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
+                                                    .to_string()
+                                            });
+                                        dir_error_count += 1;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
-                                    dir_error_count += 1;
-                                }
+                            } else {
+                                // `.iso` sans zone SACD : une image de données.
+                                // Elle ne devient pas une piste — la pousser
+                                // dans `files` enverrait une image
+                                // d'installation de 5 Go traverser la phase de
+                                // métadonnées pour finir en piste fantôme.
+                                // Elle est écartée, mais NOMMÉE (#2992).
+                                *skipped_by_ext
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert(0) += 1;
+                                pousser_chemin_ecarte(
+                                    &mut skipped_paths,
+                                    format!(
+                                        "{} ({})",
+                                        path.display(),
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD
+                                    ),
+                                );
+                                skipped_reasons
+                                    .entry(
+                                        crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES.to_string(),
+                                    )
+                                    .or_insert_with(|| {
+                                        crate::audio::iso_sacd::MOTIF_ISO_SANS_ZONE_SACD.to_string()
+                                    });
                             }
                         } else {
                             files.push(path.to_path_buf());
@@ -599,6 +859,17 @@ pub fn list_audio_files_with_excludes(
             );
         }
 
+        // Même patron que ci-dessus : quelques lignes nominatives plafonnées,
+        // puis une ligne qui porte le TOTAL. Sans elle, le journal de JeromeQ
+        // aurait montré cinq ISO là où vingt-deux albums manquaient (#2992).
+        if dir_iso_error_count > MAX_ISO_WARN {
+            warn!(
+                dir = %normalized,
+                total_errors = dir_iso_error_count,
+                "sacd_iso_extract_errors_truncated — additional SACD ISO failures suppressed"
+            );
+        }
+
         info!(
             dir = %normalized,
             files = dir_file_count,
@@ -626,7 +897,10 @@ pub fn list_audio_files_with_excludes(
         let total: usize = par_ext.iter().map(|(_, n)| n).sum();
         let detail = par_ext
             .iter()
-            .map(|(e, n)| format!(".{e}={n}"))
+            .map(|(e, n)| {
+                let reason = skipped_reasons.get(e).map(String::as_str).unwrap_or("");
+                format!(".{e}={n} ({reason})")
+            })
             .collect::<Vec<_>>()
             .join(" ");
         warn!(
@@ -642,6 +916,8 @@ pub fn list_audio_files_with_excludes(
         error_dirs,
         missing_dir_reasons,
         skipped_by_ext,
+        skipped_reasons,
+        skipped_paths,
     }
 }
 
@@ -670,6 +946,7 @@ pub fn scan_files_parallel(
             // Without NFC normalization, metadata readers and DB lookups can
             // fail on paths containing accented characters.
             let path_str: String = path.to_string_lossy().nfc().collect();
+            warn_unsafe_path_text(&path_str);
 
             let file_meta = path.metadata().ok();
             let stat_ok = file_meta.is_some();
@@ -692,13 +969,14 @@ pub fn scan_files_parallel(
                 return ScannedFile {
                     path: path_str,
                     metadata: None,
+                    unsupported: None,
                     audio_hash: None,
                     file_size,
                     mtime,
                 };
             }
 
-            let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
+            let (metadata, audio_hash, unsupported) = match read_file_with_retry(path, with_hash) {
                 Ok((meta, hash)) => {
                     if meta.is_none() {
                         warn!(
@@ -706,9 +984,9 @@ pub fn scan_files_parallel(
                             "scan_file_no_metadata — metadata reader returned None"
                         );
                     }
-                    (meta, hash)
+                    (meta, hash, None)
                 }
-                Err(ref reason) if reason == "timeout" => {
+                Err(ReadFileError::Timeout) => {
                     // Don't drop the file — index it with filename-based metadata
                     // so it still appears in the library. audio_hash stays None so
                     // the next scan re-reads full tags once storage is responsive.
@@ -729,9 +1007,18 @@ pub fn scan_files_parallel(
                             meta.duration_ms = Some(d);
                         }
                     }
-                    (Some(meta), None)
+                    (Some(meta), None, None)
                 }
-                Err(ref err) => {
+                Err(ReadFileError::Unsupported(unsupported)) => {
+                    info!(
+                        path = %path_str,
+                        format = %unsupported.report_key,
+                        reason = unsupported.reason,
+                        "scan_file_unsupported — format reconnu mais non décodable"
+                    );
+                    (None, None, Some(unsupported))
+                }
+                Err(ReadFileError::Other(err)) => {
                     warn!(
                         path = %path_str,
                         error = %err,
@@ -741,13 +1028,14 @@ pub fn scan_files_parallel(
                         .lock()
                         .unwrap()
                         .push((path_str.clone(), err.clone()));
-                    (None, None)
+                    (None, None, None)
                 }
             };
 
             ScannedFile {
                 path: path_str,
                 metadata,
+                unsupported,
                 audio_hash,
                 file_size,
                 mtime,
@@ -761,13 +1049,38 @@ pub fn scan_files_parallel(
         .iter()
         .map(|(p, e)| format!("{} ({})", p, e))
         .collect();
+    let mut unsupported_by_ext = std::collections::HashMap::new();
+    let mut unsupported_reasons = std::collections::HashMap::new();
+    let mut unsupported_paths: Vec<String> = Vec::new();
+    for file in results.iter() {
+        let Some(unsupported) = file.unsupported.as_ref() else {
+            continue;
+        };
+        *unsupported_by_ext
+            .entry(unsupported.report_key.clone())
+            .or_insert(0) += 1;
+        // Le chemin était disponible ici depuis toujours, et jeté (#2050).
+        pousser_chemin_ecarte(
+            &mut unsupported_paths,
+            format!("{} ({})", file.path, unsupported.reason),
+        );
+        unsupported_reasons
+            .entry(unsupported.report_key.clone())
+            .or_insert_with(|| unsupported.reason.to_string());
+    }
     let stats = ScanStats {
         total_files: results.len(),
         metadata_ok: results.iter().filter(|f| f.metadata.is_some()).count(),
-        metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
+        metadata_failed: results
+            .iter()
+            .filter(|f| f.metadata.is_none() && f.unsupported.is_none())
+            .count(),
         metadata_timeout: timed_out,
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
         failed_paths,
+        unsupported_by_ext,
+        unsupported_reasons,
+        unsupported_paths,
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -848,6 +1161,7 @@ pub fn scan_files_batched(
                 .map(|path| {
                     // NFC-normalize: see comment in scan_files_parallel
                     let path_str: String = path.to_string_lossy().nfc().collect();
+                    warn_unsafe_path_text(&path_str);
 
                     let file_meta = path.metadata().ok();
                     let stat_ok = file_meta.is_some();
@@ -870,15 +1184,17 @@ pub fn scan_files_batched(
                         return ScannedFile {
                             path: path_str,
                             metadata: None,
+                            unsupported: None,
                             audio_hash: None,
                             file_size,
                             mtime,
                         };
                     }
 
-                    let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
-                        Ok((meta, hash)) => (meta, hash),
-                        Err(ref reason) if reason == "timeout" => {
+                    let (metadata, audio_hash, unsupported) =
+                        match read_file_with_retry(path, with_hash) {
+                        Ok((meta, hash)) => (meta, hash, None),
+                        Err(ReadFileError::Timeout) => {
                             // Don't drop the file — same fallback as
                             // scan_files_parallel: index it with filename-based
                             // metadata so it still appears in the library.
@@ -890,22 +1206,32 @@ pub fn scan_files_batched(
                                 "scan_file_timeout — tag read timed out, indexing with filename metadata"
                             );
                             batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (Some(tagless_fallback_no_props(path)), None)
+                            (Some(tagless_fallback_no_props(path)), None, None)
                         }
-                        Err(err) => {
+                        Err(ReadFileError::Unsupported(unsupported)) => {
+                            info!(
+                                path = %path_str,
+                                format = %unsupported.report_key,
+                                reason = unsupported.reason,
+                                "scan_file_unsupported — format reconnu mais non décodable"
+                            );
+                            (None, None, Some(unsupported))
+                        }
+                        Err(ReadFileError::Other(err)) => {
                             warn!(
                                 path = %path_str,
                                 error = %err,
                                 "scan_file_failed"
                             );
                             failed_files.lock().unwrap().push((path_str.clone(), err));
-                            (None, None)
+                            (None, None, None)
                         }
                     };
 
                     ScannedFile {
                         path: path_str,
                         metadata,
+                        unsupported,
                         audio_hash,
                         file_size,
                         mtime,
@@ -925,9 +1251,31 @@ pub fn scan_files_batched(
 
         // Update aggregate stats
         aggregate.metadata_ok += batch.iter().filter(|f| f.metadata.is_some()).count();
-        aggregate.metadata_failed += batch.iter().filter(|f| f.metadata.is_none()).count();
+        aggregate.metadata_failed += batch
+            .iter()
+            .filter(|f| f.metadata.is_none() && f.unsupported.is_none())
+            .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
+        for file in batch.iter() {
+            let Some(unsupported) = file.unsupported.as_ref() else {
+                continue;
+            };
+            *aggregate
+                .unsupported_by_ext
+                .entry(unsupported.report_key.clone())
+                .or_insert(0) += 1;
+            // Sœur de la variante par lot ci-dessus : c'est ce chemin-là que
+            // l'un des deux aurait oublié (#2050).
+            pousser_chemin_ecarte(
+                &mut aggregate.unsupported_paths,
+                format!("{} ({})", file.path, unsupported.reason),
+            );
+            aggregate
+                .unsupported_reasons
+                .entry(unsupported.report_key.clone())
+                .or_insert_with(|| unsupported.reason.to_string());
+        }
 
         let failed = failed_files.lock().unwrap();
         if !failed.is_empty() {
@@ -1071,6 +1419,8 @@ mod tests {
         assert!(SUPPORTED_EXTENSIONS.contains(&"mp3"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"dsf"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"ape"));
+        assert!(!SUPPORTED_EXTENSIONS.contains(&"wma"));
+        assert!(!SUPPORTED_EXTENSIONS.contains(&"dst"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"txt"));
     }
 
@@ -1096,6 +1446,9 @@ mod tests {
         // Les formats réclamés sur le forum (Rhorn, #1763).
         assert!(KNOWN_UNREAD_AUDIO.contains(&"mpc"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"cue"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"wma"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"asf"));
+        assert!(KNOWN_UNREAD_AUDIO.contains(&"dst"));
         // Le bruit d'une bibliothèque musicale ne doit JAMAIS y figurer :
         // compter les pochettes et les fichiers de log noierait le seul
         // renseignement exploitable.
@@ -1105,6 +1458,318 @@ mod tests {
                 "{noise} n'est pas de l'audio et polluerait le rapport"
             );
         }
+    }
+
+    #[test]
+    fn wma_asf_et_dst_sont_expliques_sans_etre_catalogues() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_formats_non_lus_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in [
+            "album.wma",
+            "archive.asf",
+            "sacd.dst",
+            "temoin.flac",
+            "cover.jpg",
+        ] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files[0].ends_with("temoin.flac"));
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+        assert_eq!(result.skipped_by_ext.get("asf"), Some(&1));
+        assert_eq!(result.skipped_by_ext.get("dst"), Some(&1));
+        assert!(
+            result
+                .skipped_reasons
+                .get("wma")
+                .is_some_and(|reason| reason.contains("aucun décodeur"))
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get("dst")
+                .is_some_and(|reason| reason.contains("aucun décodeur"))
+        );
+        assert!(!result.skipped_by_ext.contains_key("jpg"));
+    }
+
+    /// Le parcours retient LESQUELS, pas seulement COMBIEN (#2050).
+    ///
+    /// C'est ici que la liste demandée se perdait : le parcours classait le
+    /// fichier, incrémentait `skipped_by_ext`, puis faisait `continue` — le
+    /// chemin n'était écrit nulle part, ni en journal ni en rapport. Le
+    /// décompte « 280 fichiers .mpc » ne permet pas de retrouver un album.
+    #[test]
+    fn le_parcours_nomme_les_fichiers_ecartes_pas_seulement_leur_nombre() {
+        // Chemin suffixé de la clé de tâche : deux agents ont déjà détruit
+        // mutuellement leurs fixtures sous un nom commun.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_chemins_ecartes_i2050");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["album.wma", "sacd.dst", "temoin.flac", "cover.jpg"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("album.wma"),
+            "le chemin du .wma écarté doit figurer dans le rapport, pas seulement \
+             son décompte — c'est la demande de #2050.\nListe obtenue :\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("sacd.dst"),
+            "le .dst écarté doit être nommé lui aussi : un seul motif instrumenté \
+             sur deux laisse l'utilisateur devant une liste incomplète\n{ecartes}"
+        );
+        // Le motif accompagne le chemin : « pourquoi » sans « lequel » ne
+        // servait à rien, « lequel » sans « pourquoi » ne sert pas plus.
+        assert!(
+            ecartes.contains("aucun décodeur"),
+            "chaque chemin doit porter son motif\n{ecartes}"
+        );
+        // Contre-épreuve : le bruit d'une bibliothèque ne doit pas noyer la
+        // liste. Une pochette n'est pas un fichier « ignoré ».
+        assert!(
+            !ecartes.contains("cover.jpg"),
+            "les fichiers non audio n'ont rien à faire dans la liste\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Écrit une image `.iso` creuse de plus de 4 Mo, avec ou sans Master TOC.
+    ///
+    /// Plus de 4 Mo à dessein : c'est le seuil de l'ancien `is_sacd_iso`, celui
+    /// qui prenait toute image de données pour un SACD. Une fixture plus petite
+    /// laisserait la contre-épreuve passer par un autre chemin que celui du
+    /// défaut (#2992).
+    fn image_iso_de_test(dossier: &std::path::Path, nom: &str, sacd: bool) -> std::path::PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        let chemin = dossier.join(nom);
+        let mut fichier = std::fs::File::create(&chemin).unwrap();
+        fichier.seek(SeekFrom::Start(0x800 * 510)).unwrap();
+        fichier
+            .write_all(if sacd { b"SACDMTOC" } else { b"CD001\0\0\0" })
+            .unwrap();
+        // Fichier creux : la taille est annoncée, les octets ne sont pas
+        // écrits — le test ne consomme pas 4 Mo sur disque.
+        fichier.set_len(4_200_000).unwrap();
+        fichier.flush().unwrap();
+        chemin
+    }
+
+    /// Un ISO qui n'entre pas en base doit être COMPTÉ et NOMMÉ (#2992).
+    ///
+    /// Vingt-deux albums SACD de JeromeQ ont disparu de sa bibliothèque sans
+    /// qu'aucun écran ne le dise : la branche `Err` de l'extraction émettait un
+    /// `warn!` et n'alimentait aucun compteur du rapport de scan. Un scan qui
+    /// rend « fichiers=N, erreurs=0 » alors que vingt-deux fichiers ne sont
+    /// jamais entrés est un mensonge.
+    #[test]
+    fn les_iso_ecartes_sont_comptes_et_nommes_dans_le_rapport() {
+        // Sous `target/`, jamais sous `/tmp` : `is_tune_temp_file` écarte tout
+        // ce qui vit dans le dossier temporaire du système, et une fixture
+        // posée là ne serait jamais parcourue. Nom suffixé de la clé de tâche
+        // pour ne pas détruire la fixture d'un autre agent.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_iso_ecartes_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.as_path();
+
+        // Une image portant bien un Master TOC SACD. L'extraction échouera —
+        // `sacd_extract` n'est pas fourni avec Tune, et le contenu est creux —
+        // et c'est exactement le cas du journal de JeromeQ.
+        image_iso_de_test(base, "Breakfast In America.iso", true);
+        // Le faux positif du même journal : une image d'installation.
+        image_iso_de_test(base, "ubuntu-26.04-desktop-amd64.iso", false);
+        std::fs::write(base.join("temoin.flac"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(base);
+
+        // Aucun des deux ISO ne devient une piste : ni comme ISO brut, ni comme
+        // pistes extraites. C'est le fait à expliquer, pas à taire.
+        assert_eq!(
+            result.files.len(),
+            1,
+            "seul le .flac est une piste ; les deux ISO doivent rester dehors.\n\
+             Fichiers retenus : {:?}",
+            result.files
+        );
+        assert!(result.files[0].ends_with("temoin.flac"));
+
+        // 1) L'ISO SACD non extrait est compté sous sa propre clé.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD),
+            Some(&1),
+            "sans ce compteur, le rapport annonce « erreurs : 0 » et l'album \
+             disparaît en silence.\nCompteurs obtenus : {:?}",
+            result.skipped_by_ext
+        );
+        // 2) L'image de données est comptée à part : ce n'est pas le même
+        //    problème et ce n'est pas le même geste pour l'utilisateur.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES),
+            Some(&1),
+            "une image ISO sans zone SACD doit être signalée comme non audio, \
+             pas confondue avec un SACD illisible.\nCompteurs : {:?}",
+            result.skipped_by_ext
+        );
+
+        // 3) Les motifs sont rendus en clair : « sacd_extract » ne dit rien à
+        //    qui lit un rapport de scan.
+        let motif_sacd = result
+            .skipped_reasons
+            .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            motif_sacd.contains("ISO SACD"),
+            "le motif doit nommer le format concerné : {motif_sacd:?}"
+        );
+        assert!(
+            result
+                .skipped_reasons
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES)
+                .is_some_and(|motif| motif.contains("pas de l'audio")),
+            "motifs obtenus : {:?}",
+            result.skipped_reasons
+        );
+
+        // 4) LESQUELS, pas seulement COMBIEN — « 22 ISO écartés » ne permet pas
+        //    de retrouver un album.
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("Breakfast In America.iso"),
+            "le chemin du SACD écarté doit figurer au rapport\n{ecartes}"
+        );
+        assert!(
+            ecartes.contains("ubuntu-26.04-desktop-amd64.iso"),
+            "le chemin de l'image de données doit y figurer aussi\n{ecartes}"
+        );
+        // Le motif technique exact accompagne le chemin : « outil absent » et
+        // « extraction en échec » n'appellent pas la même réponse.
+        assert!(
+            ecartes.contains("sacd_extract"),
+            "la cause technique doit accompagner le chemin\n{ecartes}"
+        );
+        assert!(
+            !ecartes.contains("temoin.flac"),
+            "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// Témoin anti-régression : sans ISO, le parcours rend exactement ce qu'il
+    /// rendait — aucun compteur d'écart n'apparaît de nulle part (#2992).
+    #[test]
+    fn une_bibliotheque_sans_iso_ne_gagne_aucun_ecart() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_iso_n2992");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for nom in ["a.flac", "b.mp3", "c.dsf"] {
+            std::fs::write(base.join(nom), b"fixture").unwrap();
+        }
+        std::fs::write(base.join("cover.jpg"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 3);
+        assert!(
+            result.skipped_by_ext.is_empty(),
+            "aucun écart ne doit être inventé sur une bibliothèque saine : {:?}",
+            result.skipped_by_ext
+        );
+        assert!(result.skipped_paths.is_empty());
+        assert!(result.error_dirs.is_empty());
+    }
+
+    /// Le plafond borne la liste, et le compteur reste exhaustif (#2050).
+    #[test]
+    fn le_plafond_borne_la_liste_sans_borner_le_compte() {
+        let mut liste = Vec::new();
+        for i in 0..(PLAFOND_CHEMINS_ECARTES + 25) {
+            pousser_chemin_ecarte(&mut liste, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(
+            liste.len(),
+            PLAFOND_CHEMINS_ECARTES,
+            "sans plafond, une bibliothèque de 40 000 fichiers écartés produirait \
+             un rapport de plusieurs mégaoctets relu à chaque /scan/report"
+        );
+        // Contre-épreuve : en deçà du plafond, RIEN n'est perdu.
+        let mut courte = Vec::new();
+        for i in 0..3 {
+            pousser_chemin_ecarte(&mut courte, format!("/musique/{i}.mpc"));
+        }
+        assert_eq!(courte.len(), 3);
+        assert_eq!(courte[0], "/musique/0.mpc");
+    }
+
+    #[test]
+    fn dff_dst_est_inventorie_sans_io_puis_refuse_dans_la_phase_bornee() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_dff_dst_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("album.dff");
+        std::fs::write(&path, crate::audio::support::dff_dst_minimal_fixture()).unwrap();
+
+        // L'inventaire ne lit pas l'en-tête : il conserve le DFF pour que la
+        // phase de métadonnées, protégée par FILE_TIMEOUT, le classe.
+        let listed = list_audio_files(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(listed.files, vec![path]);
+        assert!(listed.skipped_by_ext.is_empty());
+
+        let (files, stats) = scan_files_parallel(&listed.files, false, None);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].metadata.is_none());
+        assert_eq!(
+            files[0]
+                .unsupported
+                .as_ref()
+                .map(|unsupported| unsupported.report_key.as_str()),
+            Some("dff-dst")
+        );
+        assert_eq!(stats.metadata_failed, 0);
+        assert!(stats.failed_paths.is_empty());
+        assert_eq!(stats.unsupported_by_ext.get("dff-dst"), Some(&1));
+        assert!(
+            stats
+                .unsupported_reasons
+                .get("dff-dst")
+                .is_some_and(|reason| reason.contains("aucun décodeur DST"))
+        );
+
+        // Le serveur emploie le chemin par lots : il doit porter exactement le
+        // même verdict et les mêmes compteurs que le chemin parallèle direct.
+        let mut batch_files = Vec::new();
+        let batch_stats = scan_files_batched(&listed.files, false, 1, |batch, _, _| {
+            batch_files.extend(batch);
+        });
+        assert_eq!(batch_files.len(), 1);
+        assert!(batch_files[0].unsupported.is_some());
+        assert_eq!(batch_stats.metadata_failed, 0);
+        assert_eq!(batch_stats.unsupported_by_ext.get("dff-dst"), Some(&1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1244,6 +1909,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(filtered.files.len(), 1, "files = {:?}", filtered.files);
         assert!(filtered.files[0].to_string_lossy().contains("keep"));
+    }
+
+    /// #2203 — le parcours doit rendre compte de lui-même PENDANT qu'il
+    /// tourne, pas seulement à la fin.
+    ///
+    /// La contre-épreuve porte sur le point exact du défaut : il ne suffit pas
+    /// qu'une progression soit rendue, il faut qu'elle le soit **avant la
+    /// fin**. Un rapport unique déposé une fois le parcours terminé laisserait
+    /// l'utilisateur devant le même écran muet — c'est précisément ce que
+    /// faisaient déjà `scan_dir_complete` et `audio_files_listed`.
+    #[test]
+    fn le_parcours_rend_compte_avant_la_fin_et_nomme_le_dossier_courant() {
+        // Pas sous temp_dir() : is_tune_temp_file() y écarte tout.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_progression_2203");
+        let _ = std::fs::remove_dir_all(&base);
+        // Plusieurs dossiers, plusieurs fichiers : sans quoi « avant la fin »
+        // n'aurait aucun sens.
+        for sous_dossier in ["disque1", "disque2", "disque3"] {
+            std::fs::create_dir_all(base.join(sous_dossier)).unwrap();
+            for n in 0..4 {
+                std::fs::write(base.join(sous_dossier).join(format!("p{n}.flac")), b"x").unwrap();
+            }
+        }
+        let racine = base.to_string_lossy().to_string();
+
+        let mut annonces: Vec<(usize, String, String)> = Vec::new();
+        // Cadence nulle : on veut observer le mécanisme, pas attendre 2 s.
+        let result = list_audio_files_avec_progression(
+            std::slice::from_ref(&racine),
+            &[],
+            std::time::Duration::ZERO,
+            &mut |p| {
+                annonces.push((
+                    p.fichiers_vus,
+                    p.racine.to_string(),
+                    p.dossier_courant.to_string(),
+                ));
+            },
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Le parcours rend toujours exactement ce qu'il rendait.
+        assert_eq!(result.files.len(), 12, "files = {:?}", result.files);
+
+        assert!(
+            !annonces.is_empty(),
+            "le parcours n'a rendu AUCUNE progression : c'est le silence de #2203 \
+             (3 min 40 sans une ligne chez JP Borderies)"
+        );
+        // « Avant la fin » : au moins une annonce porte un compte
+        // STRICTEMENT inférieur au total. Un unique rapport final en porterait
+        // 12 et ne prouverait rien.
+        assert!(
+            annonces.iter().any(|(vus, _, _)| *vus < 12),
+            "aucune annonce ne précède la fin du parcours — un rapport rendu \
+             une fois tout terminé laisse l'écran muet exactement comme avant. \
+             annonces = {annonces:?}"
+        );
+        // Le compte ne recule jamais : il agrège toutes les racines.
+        for paire in annonces.windows(2) {
+            assert!(
+                paire[1].0 >= paire[0].0,
+                "le compte a reculé : {:?} puis {:?}",
+                paire[0],
+                paire[1]
+            );
+        }
+        // La racine est nommée, et le dossier courant descend réellement dans
+        // l'arborescence — c'est ce qui dit OÙ un parcours s'enlise.
+        assert!(
+            annonces.iter().all(|(_, r, _)| r == &racine),
+            "racine mal rendue : {annonces:?}"
+        );
+        assert!(
+            annonces.iter().any(|(_, _, d)| d.contains("disque1")
+                || d.contains("disque2")
+                || d.contains("disque3")),
+            "le dossier courant ne descend jamais dans l'arborescence : {annonces:?}"
+        );
+    }
+
+    /// La cadence est ce qui empêche une bibliothèque de 58 000 fichiers de
+    /// produire 58 000 lignes de journal. Une cadence longue ⇒ au plus une
+    /// annonce sur un parcours qui dure quelques millisecondes.
+    #[test]
+    fn la_cadence_borne_le_nombre_d_annonces() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_cadence_2203");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for n in 0..50 {
+            std::fs::write(base.join(format!("p{n}.flac")), b"x").unwrap();
+        }
+        let racine = base.to_string_lossy().to_string();
+
+        let mut annonces = 0usize;
+        let result = list_audio_files_avec_progression(
+            std::slice::from_ref(&racine),
+            &[],
+            std::time::Duration::from_secs(3600),
+            &mut |_| annonces += 1,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.files.len(), 50);
+        assert!(
+            annonces <= 1,
+            "la cadence n'est pas respectée : {annonces} annonces pour un \
+             parcours de quelques millisecondes"
+        );
     }
 
     #[test]

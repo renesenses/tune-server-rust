@@ -181,13 +181,19 @@ fn la_boucle_gapless_applique_le_dsp() {
     );
 }
 
-/// Le drainage appartient à la fin EFFECTIVE de la chaîne gapless.
+/// Le drainage appartient à la fin EFFECTIVE de la chaîne gapless, sauf quand
+/// le format source change et impose de remplacer le moteur (#2210).
 ///
 /// La présence d'un `next_media` ne prouve pas qu'une piste suivra : la requête
 /// peut échouer, l'en-tête peut être vide ou non-WAV. Décider avant ces essais
 /// faisait sauter le drainage sans qu'aucune piste soit finalement chaînée.
-/// On verrouille donc l'ordre réel : boucle de chaînage terminée, puis drainage,
-/// puis vidage du resampler — uniquement après EOF naturel.
+/// On verrouille donc les deux seuls cas légitimes :
+///
+/// - même cadence/layout : aucun drainage au milieu de la chaîne ;
+/// - format différent : drainage conditionné, puis reconstruction.
+///
+/// Le drainage final reste après la boucle, avant le vidage du resampler, et
+/// uniquement après EOF naturel.
 #[test]
 fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
     let src = source();
@@ -209,9 +215,25 @@ fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
         .expect("le resampler doit être vidé après la queue du DSP");
     let garde = &prod[fin_chaine..draine];
 
+    let milieu = &prod[debut..fin_chaine];
+    let garde_format = milieu
+        .find("if convolver_format_changed {")
+        .expect("un changement de format gapless doit être traité explicitement (#2210)");
+    let draine_transition = milieu[garde_format..]
+        .find("flush_local_dsp(")
+        .map(|i| garde_format + i)
+        .expect("l'ancien moteur doit rendre sa queue avant d'être remplacé");
+    assert_eq!(
+        milieu.matches("flush_local_dsp(").count(),
+        1,
+        "un seul drainage est permis dans la boucle : celui du changement de format"
+    );
     assert!(
-        !prod[debut..fin_chaine].contains("flush_local_dsp("),
-        "le convolveur est drainé au milieu d'une chaîne gapless (#2296)"
+        !milieu[..garde_format].contains("flush_local_dsp(")
+            && garde_format < draine_transition
+            && milieu[draine_transition..].contains("rebuild_local_convolver("),
+        "le drainage intermédiaire doit rester sous la garde de changement de format \
+         et précéder la reconstruction ; à format identique il briserait le gapless (#2296)"
     );
     assert!(
         garde.contains("if http_eof")

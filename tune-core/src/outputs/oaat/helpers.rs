@@ -240,9 +240,118 @@ pub(super) fn format_rate_display(rate: u32, bits: u16, format: AudioFormat) -> 
     }
 }
 
+/// Payload restant a l'EOF, avec le drapeau de fin porte par le dernier
+/// payload reel. Un flux vide produit tout de meme un unique paquet LAST vide.
+#[derive(Debug)]
+pub(super) struct PayloadFinFlux {
+    pub bytes: Vec<u8>,
+    pub dernier: bool,
+}
+
+/// Decoupe le tampon final sans perdre d'octet.
+///
+/// `taille_trame = Some(n)` impose l'alignement PCM : un residu incomplet est
+/// une erreur de contrat, pas un octet a jeter. `None` conserve chaque octet
+/// d'un format compresse comme FLAC.
+pub(super) fn extraire_payloads_fin_flux(
+    buf: &mut Vec<u8>,
+    taille_paquet: usize,
+    taille_trame: Option<usize>,
+) -> Result<Vec<PayloadFinFlux>, String> {
+    if taille_paquet == 0 {
+        return Err("taille de paquet finale nulle".into());
+    }
+    if let Some(taille_trame) = taille_trame {
+        if taille_trame == 0 {
+            return Err("taille de trame finale nulle".into());
+        }
+        if !taille_paquet.is_multiple_of(taille_trame) {
+            return Err(format!(
+                "taille de paquet {taille_paquet} non alignee sur une trame de {taille_trame} octets"
+            ));
+        }
+        if !buf.len().is_multiple_of(taille_trame) {
+            return Err(format!(
+                "residu PCM de {} octets non aligne sur une trame de {taille_trame} octets",
+                buf.len()
+            ));
+        }
+    }
+
+    if buf.is_empty() {
+        return Ok(vec![PayloadFinFlux {
+            bytes: Vec::new(),
+            dernier: true,
+        }]);
+    }
+
+    let bytes = std::mem::take(buf);
+    let nombre = bytes.len().div_ceil(taille_paquet);
+    Ok(bytes
+        .chunks(taille_paquet)
+        .enumerate()
+        .map(|(index, chunk)| PayloadFinFlux {
+            bytes: chunk.to_vec(),
+            dernier: index + 1 == nombre,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verifier_payloads_finaux(taille: usize, taille_paquet: usize, taille_trame: Option<usize>) {
+        let attendu: Vec<u8> = (0..taille).map(|i| i as u8).collect();
+        let mut buf = attendu.clone();
+        let payloads = extraire_payloads_fin_flux(&mut buf, taille_paquet, taille_trame).unwrap();
+
+        assert!(buf.is_empty());
+        assert_eq!(payloads.iter().filter(|p| p.dernier).count(), 1);
+        assert!(payloads.last().unwrap().dernier);
+        assert!(payloads.iter().all(|p| p.bytes.len() <= taille_paquet));
+        if let Some(taille_trame) = taille_trame {
+            assert!(
+                payloads
+                    .iter()
+                    .all(|p| p.bytes.len().is_multiple_of(taille_trame))
+            );
+        }
+        let obtenu: Vec<u8> = payloads.into_iter().flat_map(|p| p.bytes).collect();
+        assert_eq!(obtenu, attendu);
+    }
+
+    #[test]
+    fn fin_pcm_conserve_toutes_les_trames_mono_stereo_et_24_bits() {
+        for taille_trame in [2, 4, 6] {
+            let taille_paquet = taille_trame * 8;
+            for taille in [
+                0,
+                taille_trame,
+                taille_paquet - taille_trame,
+                taille_paquet,
+                taille_paquet + taille_trame,
+            ] {
+                verifier_payloads_finaux(taille, taille_paquet, Some(taille_trame));
+            }
+        }
+    }
+
+    #[test]
+    fn fin_flac_conserve_tous_les_octets_sans_alignement_pcm() {
+        let taille_paquet = 16;
+        for taille in [0, 1, taille_paquet - 1, taille_paquet, taille_paquet + 1] {
+            verifier_payloads_finaux(taille, taille_paquet, None);
+        }
+    }
+
+    #[test]
+    fn fin_pcm_refuse_un_octet_incomplet_sans_le_jeter() {
+        let mut buf = vec![1, 2, 3];
+        let erreur = extraire_payloads_fin_flux(&mut buf, 16, Some(4)).unwrap_err();
+        assert!(erreur.contains("non aligne"));
+        assert_eq!(buf, vec![1, 2, 3]);
+    }
 
     fn make_wav(sample_rate: u32, channels: u16, bits: u16, data_size: u32) -> Vec<u8> {
         let byte_rate = sample_rate * channels as u32 * bits as u32 / 8;

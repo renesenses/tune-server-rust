@@ -279,6 +279,24 @@ pub trait TunePlugin: Send + Sync {
         true
     }
 
+    /// Whether the plugin manager should OFFER this plugin to the user.
+    ///
+    /// `true` (the default) puts a dormant plugin in the catalogue, where it
+    /// renders as an "Install" button. `false` keeps it out of the catalogue:
+    /// it stays compiled, stays tested, and still loads if
+    /// `plugin_{name}_installed` is set by hand — but the manager stops
+    /// promising it.
+    ///
+    /// [`default_enabled`](Self::default_enabled) cannot express this.
+    /// Returning `false` there makes a plugin opt-in, which is precisely what
+    /// makes it *visible* as installable. A plugin whose routes answer but
+    /// that no screen in the client can reach needs the opposite: present,
+    /// dormant, and silent — otherwise the manager offers an install that
+    /// changes nothing the user can see (#2090).
+    fn catalogued(&self) -> bool {
+        true
+    }
+
     /// The [`PLUGIN_PROTOCOL_VERSION`] this plugin was built against.
     ///
     /// Defaults to the version compiled into the SDK the plugin links, which
@@ -393,13 +411,21 @@ impl PluginLoader {
                 let dormant = enabled.as_deref() == Some("false") || (opt_in && !installed);
                 if dormant {
                     info!(plugin_name = %name, opt_in, "plugin_dormant_not_loaded");
-                    unloaded.push(AvailablePluginInfo {
-                        name: name.clone(),
-                        version: plugin.version().to_string(),
-                        description: plugin.description().to_string(),
-                        config_schema: plugin.config_schema(),
-                        opt_in,
-                    });
+                    // Hors catalogue : le greffon reste compilé, testé et
+                    // chargeable à la main, mais le gestionnaire ne le propose
+                    // pas. Proposer d'installer une chose qu'aucun écran ne
+                    // sait atteindre est un défaut en soi (#2090).
+                    if plugin.catalogued() {
+                        unloaded.push(AvailablePluginInfo {
+                            name: name.clone(),
+                            version: plugin.version().to_string(),
+                            description: plugin.description().to_string(),
+                            config_schema: plugin.config_schema(),
+                            opt_in,
+                        });
+                    } else {
+                        info!(plugin_name = %name, "plugin_hors_catalogue");
+                    }
                     continue;
                 }
             }
@@ -767,6 +793,81 @@ mod tests {
 
         let loaded = loader.setup_all("http://localhost:8888").await;
         assert_eq!(loaded, vec!["opt-in"]);
+        assert!(loader.unloaded_plugins().is_empty());
+    }
+
+    /// Same as [`OptInPlugin`], but kept out of the catalogue (like DJ and
+    /// Karaoke since #2090).
+    struct UncataloguedPlugin;
+
+    #[async_trait]
+    impl TunePlugin for UncataloguedPlugin {
+        fn name(&self) -> &str {
+            "hors-catalogue"
+        }
+        fn version(&self) -> &str {
+            "0.1.0"
+        }
+        fn description(&self) -> &str {
+            "Compiled, but never offered"
+        }
+        fn default_enabled(&self) -> bool {
+            false
+        }
+        fn catalogued(&self) -> bool {
+            false
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Mutation de `opt_in_plugin_dormant_until_installed` : deux greffons
+    /// dormants pour la même raison, un seul catalogué. Le second doit
+    /// disparaître du catalogue, et seulement lui — sinon `catalogued()` ne
+    /// filtrerait rien, ou filtrerait tout.
+    #[tokio::test]
+    async fn uncatalogued_dormant_plugin_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = memory_db();
+        let loader = PluginLoader::new(dir.path().to_path_buf()).with_db(Arc::clone(&db));
+        loader.register(Box::new(OptInPlugin)).await;
+        loader.register(Box::new(UncataloguedPlugin)).await;
+
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert!(loaded.is_empty(), "les deux sont opt-in et non installés");
+
+        let available: Vec<String> = loader
+            .unloaded_plugins()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(
+            available,
+            vec!["opt-in".to_string()],
+            "seul le greffon catalogué doit être proposé (proposés : {available:?})"
+        );
+    }
+
+    /// Hors catalogue ≠ hors service : poser `plugin_{name}_installed` à la
+    /// main le charge quand même. Le greffon cesse d'être promis, il ne cesse
+    /// pas d'exister — c'est ce qui distingue le retrait du catalogue de la
+    /// suppression pure et simple.
+    #[tokio::test]
+    async fn uncatalogued_plugin_still_loads_when_installed_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = memory_db();
+        SettingsRepo::with_backend(Arc::clone(&db))
+            .set("plugin_hors-catalogue_installed", "true")
+            .unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf()).with_db(Arc::clone(&db));
+        loader.register(Box::new(UncataloguedPlugin)).await;
+
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert_eq!(loaded, vec!["hors-catalogue"]);
         assert!(loader.unloaded_plugins().is_empty());
     }
 

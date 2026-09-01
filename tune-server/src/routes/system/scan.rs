@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -60,6 +61,12 @@ impl ScanGate {
                     return Some(ScanLease {
                         gate: self,
                         generation,
+                        // Le balayage acoustique s'efface devant le scan tant
+                        // que cette marque vit (#2469, point 3). Elle est posée
+                        // ICI, dans la seule branche qui délivre un jeton, et
+                        // baissée par le `Drop` du jeton : les deux gestes ne
+                        // peuvent pas se désynchroniser.
+                        _marque_acoustique: tune_core::scanner::activite::MarqueDeScan::poser(),
                     });
                 }
                 Err(current) => observed = current,
@@ -121,6 +128,10 @@ impl ScanGate {
 pub(crate) struct ScanLease<'a> {
     gate: &'a ScanGate,
     generation: u64,
+    /// Tenue pour sa durée de vie seule : elle dit au balayage acoustique qu'un
+    /// scan de bibliothèque tourne. Son `Drop` s'exécute avec celui du jeton,
+    /// donc aussi quand la tâche de scan panique.
+    _marque_acoustique: tune_core::scanner::activite::MarqueDeScan,
 }
 
 impl Drop for ScanLease<'_> {
@@ -145,11 +156,24 @@ pub(crate) fn scan_cancel_requested() -> bool {
 mod scan_gate_tests {
     use super::ScanGate;
 
+    /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
+    /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
+    /// point 3). Deux tests qui tiennent un jeton en même temps se voient donc
+    /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
+    /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
+    /// verrou.
+    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialiser() -> std::sync::MutexGuard<'static, ()> {
+        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
     /// requête tente de démarrer B. Le refus de B ne doit jamais remettre le
     /// bit d'annulation de A à zéro.
     #[test]
     fn un_second_depart_refuse_ne_desarme_pas_stop() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
 
@@ -171,10 +195,43 @@ mod scan_gate_tests {
         );
     }
 
+    /// #2469, point 3 — le jeton de scan doit RENDRE VISIBLE le scan au
+    /// balayage acoustique, et le lui cacher dès qu'il est rendu.
+    ///
+    /// C'est le câblage qui fait vivre la priorité demandée par Thierry
+    /// Clemont : sans lui, `scan_bibliotheque_en_cours()` resterait faux à
+    /// jamais et la garde ajoutée dans `embedding.rs` serait du code mort —
+    /// exactement le défaut que #2469 a déjà rencontré une fois, quand
+    /// `spawn_scan_scheduler` n'était appelé de nulle part.
+    #[test]
+    fn le_jeton_de_scan_efface_le_balayage_acoustique() {
+        use tune_core::scanner::activite::scan_bibliotheque_en_cours;
+
+        let _serialise = serialiser();
+        let gate = ScanGate::new();
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "aucun scan ne tourne avant d'avoir pris la porte"
+        );
+
+        let scan = gate.try_acquire().expect("le scan doit demarrer");
+        assert!(
+            scan_bibliotheque_en_cours(),
+            "un scan qui tourne doit etre visible du balayage acoustique"
+        );
+
+        drop(scan);
+        assert!(
+            !scan_bibliotheque_en_cours(),
+            "la fin du scan doit rendre la main au balayage acoustique"
+        );
+    }
+
     /// Une requête Stop sans propriétaire ne doit pas empoisonner le prochain
     /// scan. C'est l'autre moitié de l'attachement à une génération précise.
     #[test]
     fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         assert!(!gate.request_cancel());
         let _scan = gate.try_acquire().expect("le scan doit demarrer");
@@ -188,6 +245,7 @@ mod scan_gate_tests {
     fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
         use std::sync::{Arc, Barrier, mpsc};
 
+        let _serialise = serialiser();
         let gate = ScanGate::new();
         let depart = Arc::new(Barrier::new(3));
         let maintien = Arc::new(Barrier::new(3));
@@ -265,7 +323,7 @@ pub(crate) const SEUIL_SOUS_ARBRE_VIDE: usize = 100;
 ///
 /// `None` en haut de l'arborescence : `/a.flac` n'a pas de parent nommé, et
 /// `G:` n'en a pas non plus.
-fn dossier_parent(chemin: &str) -> Option<&str> {
+pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
     match chemin.rfind(['/', '\\']) {
         Some(0) | None => None,
         Some(i) => Some(&chemin[..i]),
@@ -362,13 +420,12 @@ pub(crate) fn roots_gone_empty(
 /// fait `replace('/', "\\")` sous `cfg(windows)`, et `track_repo.rs` le dit —
 /// « the server's `MAIN_SEPARATOR` is the separator stored in
 /// `tracks.file_path` », avec l'exemple `G:\Blues 2\%`.
+///
+/// L'implémentation vit désormais dans `tune_core::metadata::enrich_scope` :
+/// l'enrichissement par répertoire (#1660) a besoin du MÊME contrat, et deux
+/// copies de ce prédicat ont déjà divergé trois fois sur le séparateur (#2016).
 pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
-    let d = dossier.trim_end_matches(['/', '\\']);
-    if path == d {
-        return true;
-    }
-    path.strip_prefix(d)
-        .is_some_and(|reste| reste.starts_with('/') || reste.starts_with('\\'))
+    tune_core::metadata::enrich_scope::sous_le_dossier(path, dossier)
 }
 
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
@@ -578,6 +635,243 @@ pub(super) async fn trigger_scan(
     }
 }
 
+/// Ce qu'il est advenu de l'enrichissement automatique lancé après un scan.
+///
+/// Cette passe est le SEUL chemin qui remplit `artists.image_path` tout seul,
+/// et elle est doublement conditionnée : le réglage `enrich_on_scan`, et
+/// `Feature::AutoEnrichment`, réservée au Premium (`tune-core/src/license.rs`,
+/// `all_premium()`). Quand elle ne part pas, elle ne laissait qu'une ligne
+/// `info` au journal — si bien qu'une installation sans licence scanne, ne voit
+/// jamais apparaître une seule vignette d'artiste, et n'a **aucun moyen** de
+/// savoir que la passe n'a pas eu lieu (#2507, Reivax66, TuneOS Fedora sans
+/// licence : « les vignettes des artistes ne s'affichent pas »).
+///
+/// Le rapport de fin de scan porte donc le motif, exactement pour la raison qui
+/// avait fait ajouter `purge_refused` : *un refus qui ne vit que dans les logs
+/// n'existe pas pour l'utilisateur*.
+///
+/// Ce type ne DÉCIDE d'aucune règle d'offre — il ne fait que nommer celle que
+/// le code applique déjà. Le bouton manuel « Enrichir les images artistes »
+/// (`POST /library/artwork/enrich-artists`) ne passe pas par ici et n'est,
+/// lui, soumis à aucune licence ; ce n'est pas à ce type de le changer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuiteDuScan {
+    /// La passe a été lancée.
+    Demarree,
+    /// `enrich_on_scan = false` : l'utilisateur l'a éteinte dans les Réglages.
+    EteinteParReglage,
+    /// Offre gratuite : `Feature::AutoEnrichment` n'est pas accordée.
+    ReserveeAuPremium,
+}
+
+impl SuiteDuScan {
+    /// Les deux conditions, dans l'ordre où le code les applique.
+    ///
+    /// Le manque de licence l'emporte sur le réglage éteint : c'est le refus
+    /// que l'utilisateur ne peut PAS lever depuis les Réglages, donc le seul
+    /// qui mérite d'être annoncé en premier. Annoncer « vous l'avez éteinte »
+    /// à un compte gratuit l'enverrait rallumer un interrupteur qui ne change
+    /// rien.
+    pub(crate) fn decider(enrich_on_scan: bool, sous_licence: bool) -> Self {
+        match (sous_licence, enrich_on_scan) {
+            (false, _) => Self::ReserveeAuPremium,
+            (true, false) => Self::EteinteParReglage,
+            (true, true) => Self::Demarree,
+        }
+    }
+
+    /// La passe part-elle ?
+    pub(crate) fn demarree(self) -> bool {
+        matches!(self, Self::Demarree)
+    }
+
+    /// Code stable du motif, `None` quand la passe part. C'est ce que lisent
+    /// le client et le journal ; il ne doit pas changer sans changer les deux.
+    pub(crate) fn motif(self) -> Option<&'static str> {
+        match self {
+            Self::Demarree => None,
+            Self::EteinteParReglage => Some("disabled_by_setting"),
+            Self::ReserveeAuPremium => Some("premium_required"),
+        }
+    }
+
+    /// Le bloc publié dans les trois rapports de fin de scan.
+    ///
+    /// Construit UNE fois et inséré trois fois : les trois `json!` sont des
+    /// copies manuelles qui ont déjà divergé deux fois (#2012, #2146), et une
+    /// clé posée dans deux d'entre eux sur trois ne casse aucune compilation.
+    pub(crate) fn rapport(self) -> Value {
+        json!({
+            "started": self.demarree(),
+            "skipped_reason": self.motif(),
+        })
+    }
+}
+
+/// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
+/// consommateurs du rapport de fin de scan (#2012).
+///
+/// Ces trois consommateurs sont :
+///
+/// | consommateur | forme | lu par |
+/// |---|---|---|
+/// | réglage `scan_result` | `settings.set("scan_result", …)` | `GET /scan/status` |
+/// | bus d'événements | `library.scan.completed` | le bandeau de fin de scan |
+/// | fichier de rapport | `<db>-scan-report.json` | `GET /scan/report` |
+///
+/// Ils étaient trois `json!` d'une vingtaine de clés, recopiés à la main. Le
+/// mode d'échec est silencieux par construction : ajouter une clé à deux
+/// exemplaires sur trois ne casse aucune compilation et ne fait échouer aucun
+/// test fonctionnel — le champ manque simplement chez un consommateur, et
+/// personne ne s'en aperçoit avant de chercher pourquoi une information
+/// « qu'on envoie pourtant » n'arrive pas. C'est arrivé trois fois :
+///
+/// - `skipped_unsupported_by_ext` et `skipped_unsupported_reasons` (#1763),
+///   dans le seul fichier de rapport — écart VOULU, voir
+///   [`ChiffresDeFinDeScan::rapport_du_fichier`] ;
+/// - `metadata_failed`, dans `scan_result` et le fichier mais PAS sur le bus —
+///   écart non voulu, jamais décidé, résorbé ici en publiant la clé partout ;
+/// - `removed` (#2146), qui ne figurait dans aucun des trois.
+///
+/// Ce type ne DÉCIDE rien : il nomme les chiffres et les met en forme. Les
+/// émissions dégradées de `library.scan.completed` (sorties d'échec précoces,
+/// annulation) ne passent pas par ici — leur charge utile réduite est voulue,
+/// et les uniformiser les rendrait indiscernables d'un scan abouti.
+pub(crate) struct ChiffresDeFinDeScan<'a> {
+    pub(crate) total_discovered: usize,
+    pub(crate) missing_dirs: &'a [String],
+    pub(crate) missing_dir_reasons: &'a [String],
+    pub(crate) error_dirs: &'a [String],
+    /// Ce que la purge a effectivement retiré : le client lit cette clé pour
+    /// le bandeau de fin de scan (#2146).
+    pub(crate) pistes_supprimees: i64,
+    pub(crate) racines_videes: &'a [String],
+    pub(crate) sous_arbres_proteges: &'a [String],
+    pub(crate) pistes_protegees: i64,
+    pub(crate) pistes_hors_perimetre: i64,
+    /// Le plafond volumétrique a-t-il refusé, et sur quel nombre ? C'est ce
+    /// nombre qu'il faut renvoyer dans `?confirm_purge=` pour autoriser la
+    /// purge. 0 = pas de refus. Sans ça, le refus n'existe que dans les logs :
+    /// l'utilisateur ne peut pas connaître le geste à faire.
+    pub(crate) purge_refusee_candidats: i64,
+    pub(crate) scan_stats: &'a tune_core::scanner::walker::ScanStats,
+    pub(crate) inserted: i64,
+    pub(crate) updated: i64,
+    pub(crate) skipped: i64,
+    pub(crate) skipped_unchanged: i64,
+    pub(crate) skipped_duplicate: i64,
+    pub(crate) skipped_no_metadata: i64,
+    pub(crate) skipped_unsupported: i64,
+    pub(crate) db_insert_failed: i64,
+    pub(crate) db_update_failed: i64,
+    pub(crate) artwork_extracted: i64,
+    /// Le sort de la passe d'enrichissement (#2507) — [`SuiteDuScan::rapport`].
+    pub(crate) auto_enrichment: Value,
+    /// Fichiers audio rencontrés mais dont Tune ne lit pas le format, comptés
+    /// par extension (`{"mpc": 280, "cue": 132}`) — #1763.
+    pub(crate) skipped_by_ext: &'a std::collections::HashMap<String, usize>,
+    /// Motif lisible associé à chaque compteur ci-dessus.
+    pub(crate) skipped_reasons: &'a std::collections::HashMap<String, String>,
+    /// Les CHEMINS des fichiers écartés, une liste par motif (#2050).
+    ///
+    /// Les compteurs disent COMBIEN, jamais LESQUELS. Le testeur qui demande
+    /// « la liste des fichiers ignorés » ne peut aujourd'hui l'obtenir pour
+    /// aucun des trois motifs : `skipped_unsupported` n'existe qu'en décompte
+    /// par extension, `skipped_no_metadata` n'existe qu'en `warn!` un fichier
+    /// à la fois, et `skipped_duplicate` n'existe qu'en `debug!` — donc nulle
+    /// part, au niveau de journalisation livré.
+    ///
+    /// Plafonnées à [`tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES`] :
+    /// un échantillon nominatif, adossé à des compteurs exhaustifs.
+    pub(crate) skipped_unsupported_paths: &'a [String],
+    pub(crate) skipped_no_metadata_paths: &'a [String],
+    pub(crate) skipped_duplicate_paths: &'a [String],
+}
+
+impl ChiffresDeFinDeScan<'_> {
+    /// Le rapport de fin de scan, tel que le lisent les trois consommateurs.
+    ///
+    /// Une seule vérité : `scan_result` et `library.scan.completed` le
+    /// publient tel quel, le fichier de `/scan/report` l'étend de deux clés
+    /// (voir [`Self::rapport_du_fichier`]). Toute clé ajoutée ici arrive donc
+    /// chez les trois d'un coup — c'est tout l'objet de ce type.
+    pub(crate) fn rapport(&self) -> Value {
+        json!({
+            "total_files": self.total_discovered,
+            "missing_dirs": self.missing_dirs,
+            "missing_dir_reasons": self.missing_dir_reasons,
+            "error_dirs": self.error_dirs,
+            "removed": self.pistes_supprimees,
+            "emptied_roots": self.racines_videes,
+            "protected_subtrees": self.sous_arbres_proteges,
+            "tracks_protected": self.pistes_protegees,
+            "tracks_out_of_scope": self.pistes_hors_perimetre,
+            "purge_refused": self.purge_refusee_candidats > 0,
+            "purge_refused_candidates": self.purge_refusee_candidats,
+            "parsed": self.scan_stats.total_files,
+            "metadata_ok": self.scan_stats.metadata_ok,
+            // Manquait sur le bus d'événements, et sur lui seul. Aucune
+            // décision ne l'en avait écarté : une recopie a sauté la ligne.
+            "metadata_failed": self.scan_stats.metadata_failed,
+            "metadata_timeout": self.scan_stats.metadata_timeout,
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "skipped": self.skipped,
+            "skipped_unchanged": self.skipped_unchanged,
+            "skipped_duplicate": self.skipped_duplicate,
+            "skipped_no_metadata": self.skipped_no_metadata,
+            "skipped_unsupported": self.skipped_unsupported,
+            "db_insert_failed": self.db_insert_failed,
+            "db_update_failed": self.db_update_failed,
+            "artwork_extracted": self.artwork_extracted,
+            "auto_enrichment": self.auto_enrichment,
+            "failed_paths": self.scan_stats.failed_paths,
+        })
+    }
+
+    /// Le rapport écrit dans `<db>-scan-report.json`, lu par `GET /scan/report`.
+    ///
+    /// Seul écart légitime avec [`Self::rapport`] : l'inventaire des formats
+    /// non lus (#1763). Presque toujours vide ; quand il ne l'est pas, c'est
+    /// la seule chose qui explique à l'utilisateur pourquoi des albums
+    /// manquent, au lieu de le laisser chercher un bug de scanner. Il tient
+    /// dans un fichier qu'on va chercher, pas dans un réglage relu à chaque
+    /// `/scan/status` ni dans un événement diffusé à tous les clients.
+    pub(crate) fn rapport_du_fichier(&self) -> Value {
+        let mut rapport = self.rapport();
+        rapport["skipped_unsupported_by_ext"] = json!(self.skipped_by_ext);
+        // Motif lisible associé à chaque compteur. Additif pour les clients
+        // existants qui ne connaissent que `skipped_unsupported_by_ext`.
+        rapport["skipped_unsupported_reasons"] = json!(self.skipped_reasons);
+        // La liste demandée (#2050). Elle sort par le FICHIER seulement, pour
+        // la même raison que l'inventaire des formats : ce sont des chemins de
+        // l'utilisateur, et le bus d'événements les diffuserait à tous les
+        // clients connectés à chaque fin de scan.
+        rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
+        rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
+        rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // Dire que la liste est un échantillon, plutôt que de laisser croire
+        // qu'elle est complète : une liste muette de 500 entrées face à
+        // 40 000 fichiers écartés se lit comme un rapport faux.
+        rapport["skipped_paths_truncated"] = json!(self.chemins_tronques());
+        rapport
+    }
+
+    /// Au moins une liste de chemins a-t-elle atteint son plafond ?
+    ///
+    /// Comparer aux compteurs ne marcherait pas : `skipped_unsupported` ne
+    /// compte que les fichiers écartés dans la boucle d'import, alors que la
+    /// liste fusionne aussi ceux que le PARCOURS a écartés sans jamais les
+    /// faire entrer dans la boucle. Le plafond, lui, est la même constante des
+    /// deux côtés.
+    fn chemins_tronques(&self) -> bool {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        self.skipped_unsupported_paths.len() >= PLAFOND
+            || self.skipped_no_metadata_paths.len() >= PLAFOND
+            || self.skipped_duplicate_paths.len() >= PLAFOND
+    }
+}
+
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -634,11 +928,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
         .flatten()
         .map(|v| v != "false")
         .unwrap_or(true);
-    let auto_enrich_allowed = enrich_on_scan
-        && state
-            .license
-            .check_feature(tune_core::license::Feature::AutoEnrichment)
-            .await;
+    // La licence est interrogée MÊME quand le réglage vaut `false` : sans cela
+    // le rapport ne saurait pas dire si le compte est Premium, et l'utilisateur
+    // qui rallume le réglage ne découvrirait le second refus qu'au scan suivant.
+    let enrichissement_sous_licence = state
+        .license
+        .check_feature(tune_core::license::Feature::AutoEnrichment)
+        .await;
+    let suite_du_scan = SuiteDuScan::decider(enrich_on_scan, enrichissement_sous_licence);
     tokio::spawn(async move {
         // Le droit reste détenu jusqu'à la fin RÉELLE de la tâche, y compris si
         // spawn_blocking panique. Le Drop du jeton libère alors la génération.
@@ -731,14 +1028,48 @@ pub(crate) async fn spawn_library_scan_confirmee(
         if !exclude_patterns.is_empty() {
             tracing::info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
-        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+        // Le parcours des dossiers est la phase la plus longue d'un scan sur
+        // un partage réseau, et c'était la seule totalement muette : dans la
+        // boucle de `walker.rs` aucune trace n'est émise hors chemin d'erreur,
+        // et le premier `info!` — `scan_dir_complete` — n'arrive qu'une fois
+        // la racine ENTIÈREMENT parcourue. Sur le journal de JP Borderies
+        // (3 226 pistes sur un Synology en SMB) cela donne 3 min 40 sans une
+        // ligne : indiscernable d'un blocage, pour lui comme pour nous
+        // (#2203). Il a annulé, redémarré, puis renoncé — alors que le scan
+        // travaillait.
+        //
+        // On ne change RIEN au parcours : même ordre, mêmes exclusions, même
+        // liste rendue. On lit seulement, à cadence fixe, le compte que la
+        // boucle tenait déjà sans le dire.
+        //
+        // `total: 0` marque la barre comme indéterminée : pendant le parcours
+        // le total est INCONNU par construction — on ne sait combien de
+        // fichiers il y a qu'une fois qu'on les a tous vus. Le client rend
+        // alors « n fichiers » et une barre indéterminée, ce qu'il sait déjà
+        // faire (SettingsView.svelte) : aucun changement web n'est requis.
+        let list_result = tune_core::scanner::walker::list_audio_files_avec_progression(
             &scan_dirs,
             &exclude_patterns,
+            tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
+            &mut |p| {
+                event_bus.emit(
+                    "library.scan.progress",
+                    json!({
+                        "phase": "indexing",
+                        "scanned": p.fichiers_vus as i64,
+                        "added": 0i64,
+                        "total": 0i64,
+                        "current_dir": p.dossier_courant,
+                    }),
+                );
+            },
         );
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
-        let skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_reasons = list_result.skipped_reasons;
+        let mut skipped_unsupported_paths = list_result.skipped_paths;
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -819,14 +1150,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         };
 
-        // Same audio-hash dedup as the auto/startup scan: without it, the
-        // manual scan (the "Scanner" button — the path users actually hit)
-        // happily inserted the same content twice when it exists under two
-        // paths, while the auto scan deduped. (hash, album_id) pairs already
-        // in the library are skipped for NEW inserts only; updates of an
-        // existing path are never affected.
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        // `audio_hash` is a cheap candidate selector, not proof of identity.
+        // Keep the candidate paths so every decision that can hide a track is
+        // confirmed byte-for-byte (#2664).
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
@@ -901,15 +1229,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut updated = 0i64;
         let mut db_insert_failed = 0i64;
         let mut db_update_failed = 0i64;
-        // `skipped` stays the aggregate the UI already shows. The manual scan
-        // never dedups by audio_hash (only the auto/watcher path does), so
-        // everything it skips is either an unchanged file or a file whose
-        // metadata could not be read — broken out below so the report says
-        // which.
+        // `skipped` stays the aggregate the UI already shows. Each cause is
+        // broken out below, including only those duplicate candidates whose
+        // complete files were confirmed byte-for-byte.
         let mut skipped = pre_skipped;
         let mut skipped_unchanged = pre_skipped;
         let mut skipped_duplicate = 0i64;
         let mut skipped_no_metadata = 0i64;
+        let mut skipped_unsupported = 0i64;
+        // Les CHEMINS, en regard des compteurs ci-dessus (#2050). Plafonnés :
+        // voir `PLAFOND_CHEMINS_ECARTES`.
+        let mut skipped_no_metadata_paths: Vec<String> = Vec::new();
+        let mut skipped_duplicate_paths: Vec<String> = Vec::new();
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
@@ -948,6 +1279,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+                let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
                 if !is_pg {
                     // Se nommer : tout `write_tx` concurrent echouera tant que ce
                     // lot tient la connexion, et sans cette etiquette son message
@@ -975,6 +1307,17 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    if let Some(unsupported) = &sf.unsupported {
+                        tracing::info!(
+                            path = %sf.path,
+                            format = %unsupported.report_key,
+                            reason = unsupported.reason,
+                            "scan_track_skipped_unsupported"
+                        );
+                        skipped += 1;
+                        skipped_unsupported += 1;
+                        continue;
+                    }
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         // Counted in the aggregate too, so `processed` can
@@ -982,6 +1325,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         // file made the progress bar stop short of 100%.
                         skipped += 1;
                         skipped_no_metadata += 1;
+                        // Le chemin ne vivait que dans ce `warn!` : hors de
+                        // portée de qui lit le rapport (#2050).
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_no_metadata_paths,
+                            sf.path.clone(),
+                        );
                         continue;
                     }
 
@@ -1016,23 +1365,45 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         track.id = Some(existing_id);
                         to_update.push(track);
                     } else {
-                        // Deduplicate by audio_hash + album_id (same rule as
-                        // the auto scan): identical content already present in
-                        // this album via another path is not inserted again.
+                        // The sampled hash only narrows the candidates. A track
+                        // is skipped solely when a complete byte comparison
+                        // confirms an exact copy in the same album.
                         if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                             let key = (hash.clone(), aid);
-                            if known_hashes.contains(&key) {
+                            let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                            if let Some(existing_path) =
+                                tune_core::scanner::hasher::find_byte_identical_path(
+                                    std::path::Path::new(&sf.path),
+                                    &candidates,
+                                )
+                            {
                                 tracing::debug!(
                                     audio_hash = %hash,
                                     album_id = aid,
                                     path = %sf.path,
+                                    existing_path = %existing_path,
                                     "skip_duplicate_audio_hash"
                                 );
                                 skipped += 1;
                                 skipped_duplicate += 1;
+                                // Ce chemin n'était journalisé qu'en `debug!` :
+                                // invisible au niveau livré, donc introuvable
+                                // même en fouillant les journaux (#2050).
+                                tune_core::scanner::walker::pousser_chemin_ecarte(
+                                    &mut skipped_duplicate_paths,
+                                    format!("{} (identique à {})", sf.path, existing_path),
+                                );
                                 continue;
                             }
-                            known_hashes.insert(key);
+                            if !candidates.is_empty() {
+                                tracing::warn!(
+                                    audio_hash = %hash,
+                                    album_id = aid,
+                                    path = %sf.path,
+                                    candidates = candidates.len(),
+                                    "audio_hash_candidate_not_byte_identical"
+                                );
+                            }
                         }
                         to_insert.push(track);
                     }
@@ -1052,6 +1423,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // Only successful whole batches enter the in-memory index. A
+                // failed insert must never cause a later file to be hidden.
+                if batch_inserted == to_insert.len() as i64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as i64 - batch_inserted;
                 db_update_failed += to_update.len() as i64 - batch_updated;
                 inserted += batch_inserted;
@@ -1124,6 +1509,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         let _ = db.execute_batch("ROLLBACK");
                     }
                 }
+                drop(sqlite_write_guard);
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;
@@ -1162,6 +1548,24 @@ pub(crate) async fn spawn_library_scan_confirmee(
             },
         );
 
+        // Les extensions manifestement non prises en charge sont comptées dès
+        // le parcours. Le cas DFF/DST exige une lecture d'en-tête : elle est
+        // faite dans la phase bornée ci-dessus, puis fusionnée dans le même
+        // contrat de rapport.
+        for (format, count) in &scan_stats.unsupported_by_ext {
+            *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
+        }
+        skipped_reasons.extend(scan_stats.unsupported_reasons.clone());
+        // Même fusion pour les chemins que pour les décomptes : les deux
+        // sources d'« écarté faute de décodeur » aboutissent à une seule liste
+        // (#2050). Le plafond s'applique aussi à la fusion.
+        for chemin in &scan_stats.unsupported_paths {
+            tune_core::scanner::walker::pousser_chemin_ecarte(
+                &mut skipped_unsupported_paths,
+                chemin.clone(),
+            );
+        }
+
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
 
@@ -1182,6 +1586,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut sous_arbres_proteges: Vec<String> = Vec::new();
         let mut pistes_hors_perimetre = 0i64;
         let mut pistes_protegees = 0i64;
+        // Pistes réellement retirées de la base. Hissé pour la même raison que
+        // ses voisines, et pour une de plus : le compte existait déjà, mais il
+        // mourait avec le bloc `else` ci-dessous. Il ne sortait que par le
+        // journal et par un `library.scan.progress` que le client efface dès
+        // l'arrivée de `library.scan.completed` — si bien que le bandeau de fin
+        // de scan annonçait « 0 supprimés » quoi que la purge ait fait (#2146).
+        let mut pistes_supprimees = 0i64;
         // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
         // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
         let mut purge_refusee_candidats = 0i64;
@@ -1284,6 +1695,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
+            pistes_supprimees = pruned;
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,
@@ -1313,6 +1725,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
 
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+        let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
         if !is_pg {
             tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
@@ -1405,7 +1818,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                      WHERE source = 'local' \
                      GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
                     &[],
-                ).unwrap_or_default();
+                ).ou_defaut_journalise();
                 let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
                     (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
                 }).collect();
@@ -1470,6 +1883,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 let _ = db.execute_batch("ROLLBACK");
             }
         }
+        drop(sqlite_write_guard);
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
@@ -1542,6 +1956,47 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_favorites_reconcile_failed"),
+            }
+            // Les albums masqués (#1391) suivent la même mécanique et la même
+            // garde `full_scan_ok` : re-rattachés par identité après un
+            // renouvellement de rowid, purgés seulement sur scan complet sain.
+            match tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(h) if h.changed() > 0 || h.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = h.scanned,
+                        relinked = h.relinked,
+                        deduplicated = h.deduplicated,
+                        deleted = h.deleted,
+                        unresolved = h.unresolved,
+                        "post_scan_hidden_albums_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
+            }
+            // Les paires « ces deux albums ne sont pas des doublons » (#1276)
+            // suivent la même mécanique et la même garde `full_scan_ok` : le
+            // scan est précisément le moment où les rowids d'albums meurent et
+            // renaissent, donc celui où l'arbitrage doit être re-rattaché.
+            match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(d) if d.changed() > 0 || d.unresolved > 0 => {
+                    tracing::info!(
+                        scanned = d.scanned,
+                        relinked = d.relinked,
+                        deduplicated = d.deduplicated,
+                        deleted = d.deleted,
+                        unresolved = d.unresolved,
+                        "post_scan_album_distinct_pairs_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "post_scan_album_distinct_pairs_reconcile_failed")
+                }
             }
         }
 
@@ -1617,6 +2072,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            skipped_unsupported,
             db_insert_failed,
             db_update_failed,
             artwork = artwork_extracted,
@@ -1624,113 +2080,55 @@ pub(crate) async fn spawn_library_scan_confirmee(
             "scan_and_import_complete"
         );
 
+        // UNE seule construction pour les trois consommateurs (#2012). Les
+        // trois `json!` recopiés à la main qui vivaient ici avaient déjà
+        // divergé : `metadata_failed` manquait sur le bus d'événements, et
+        // `skipped_unsupported_by_ext` n'existait que dans le fichier.
+        //
+        // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi, est publié
+        // par `purge_refused*` — voir `ChiffresDeFinDeScan`.
+        let chiffres = ChiffresDeFinDeScan {
+            total_discovered,
+            missing_dirs: &missing_dirs,
+            missing_dir_reasons: &missing_dir_reasons,
+            error_dirs: &error_dirs,
+            pistes_supprimees,
+            racines_videes: &racines_videes,
+            sous_arbres_proteges: &sous_arbres_proteges,
+            pistes_protegees,
+            pistes_hors_perimetre,
+            purge_refusee_candidats,
+            scan_stats: &scan_stats,
+            inserted,
+            updated,
+            skipped,
+            skipped_unchanged,
+            skipped_duplicate,
+            skipped_no_metadata,
+            skipped_unsupported,
+            db_insert_failed,
+            db_update_failed,
+            artwork_extracted,
+            auto_enrichment: suite_du_scan.rapport(),
+            skipped_by_ext: &skipped_by_ext,
+            skipped_reasons: &skipped_reasons,
+            skipped_unsupported_paths: &skipped_unsupported_paths,
+            skipped_no_metadata_paths: &skipped_no_metadata_paths,
+            skipped_duplicate_paths: &skipped_duplicate_paths,
+        };
+        let rapport_scan = chiffres.rapport();
+
         settings
-            .set(
-                "scan_result",
-                &json!({
-                    "total_files": total_discovered,
-                    "missing_dirs": missing_dirs.clone(),
-                    "missing_dir_reasons": missing_dir_reasons.clone(),
-                    "error_dirs": error_dirs.clone(),
-                    // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi.
-                    // (Ces quatre clés étaient écrites DEUX fois — deux
-                    // sessions ont ajouté le même bloc ; `json!` gardait
-                    // silencieusement la dernière.)
-                    "emptied_roots": racines_videes.clone(),
-                    "protected_subtrees": sous_arbres_proteges.clone(),
-                    "tracks_protected": pistes_protegees,
-                    "tracks_out_of_scope": pistes_hors_perimetre,
-                    // Le plafond volumétrique a-t-il refusé, et sur quel
-                    // nombre ? C'est ce nombre qu'il faut renvoyer dans
-                    // `?confirm_purge=` pour autoriser la purge. 0 = pas de
-                    // refus. Sans ça, le refus n'existe que dans les logs :
-                    // l'utilisateur ne peut pas connaître le geste à faire.
-                    "purge_refused": purge_refusee_candidats > 0,
-                    "purge_refused_candidates": purge_refusee_candidats,
-                    "parsed": scan_stats.total_files,
-                    "metadata_ok": scan_stats.metadata_ok,
-                    "metadata_failed": scan_stats.metadata_failed,
-                    "metadata_timeout": scan_stats.metadata_timeout,
-                    "inserted": inserted,
-                    "updated": updated,
-                    "skipped": skipped,
-                    "skipped_unchanged": skipped_unchanged,
-                    "skipped_duplicate": skipped_duplicate,
-                    "skipped_no_metadata": skipped_no_metadata,
-                    "db_insert_failed": db_insert_failed,
-                    "db_update_failed": db_update_failed,
-                    "artwork_extracted": artwork_extracted,
-                    "failed_paths": scan_stats.failed_paths,
-                })
-                .to_string(),
-            )
+            .set("scan_result", &rapport_scan.to_string())
             .ok();
 
-        event_bus.emit(
-            "library.scan.completed",
-            json!({
-                "total_files": total_discovered,
-                "missing_dirs": missing_dirs.clone(),
-                "missing_dir_reasons": missing_dir_reasons.clone(),
-                "error_dirs": error_dirs.clone(),
-                "emptied_roots": racines_videes.clone(),
-                "protected_subtrees": sous_arbres_proteges.clone(),
-                "tracks_protected": pistes_protegees,
-                "tracks_out_of_scope": pistes_hors_perimetre,
-                "purge_refused": purge_refusee_candidats > 0,
-                "purge_refused_candidates": purge_refusee_candidats,
-                "parsed": scan_stats.total_files,
-                "metadata_ok": scan_stats.metadata_ok,
-                "metadata_timeout": scan_stats.metadata_timeout,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "skipped_unchanged": skipped_unchanged,
-                "skipped_duplicate": skipped_duplicate,
-                "skipped_no_metadata": skipped_no_metadata,
-                "db_insert_failed": db_insert_failed,
-                "db_update_failed": db_update_failed,
-                "artwork_extracted": artwork_extracted,
-                "failed_paths": scan_stats.failed_paths,
-            }),
-        );
+        event_bus.emit("library.scan.completed", rapport_scan);
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
         // Write scan report JSON for the /scan/report endpoint
-        let report = serde_json::json!({
-            "total_files": total_discovered,
-            "missing_dirs": missing_dirs.clone(),
-            "missing_dir_reasons": missing_dir_reasons.clone(),
-            "error_dirs": error_dirs.clone(),
-            "emptied_roots": racines_videes.clone(),
-            "protected_subtrees": sous_arbres_proteges.clone(),
-            "tracks_protected": pistes_protegees,
-            "tracks_out_of_scope": pistes_hors_perimetre,
-            "purge_refused": purge_refusee_candidats > 0,
-            "purge_refused_candidates": purge_refusee_candidats,
-            "parsed": scan_stats.total_files,
-            "metadata_ok": scan_stats.metadata_ok,
-            "metadata_failed": scan_stats.metadata_failed,
-            "metadata_timeout": scan_stats.metadata_timeout,
-            "inserted": inserted,
-            "updated": updated,
-            "skipped": skipped,
-            "skipped_unchanged": skipped_unchanged,
-            "skipped_duplicate": skipped_duplicate,
-            "skipped_no_metadata": skipped_no_metadata,
-            "db_insert_failed": db_insert_failed,
-            "db_update_failed": db_update_failed,
-            "artwork_extracted": artwork_extracted,
-            "failed_paths": scan_stats.failed_paths,
-            // Fichiers audio rencontrés mais dont Tune ne lit pas le format,
-            // comptés par extension ({"mpc": 280, "cue": 132}). Presque toujours
-            // vide ; quand il ne l'est pas, c'est la seule chose qui explique à
-            // l'utilisateur pourquoi des albums manquent, au lieu de le laisser
-            // chercher un bug de scanner (#1763).
-            "skipped_unsupported_by_ext": skipped_by_ext,
-        });
+        let report = chiffres.rapport_du_fichier();
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
@@ -1739,7 +2137,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }
 
         // Auto enrichment after scan: Premium only
-        if auto_enrich_allowed {
+        if suite_du_scan.demarree() {
             let enrich_db = db.clone();
             let artist_cache_dir = cache_dir.clone();
             let artist_mbid_db = db.clone();
@@ -1765,6 +2163,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
         } else {
             tracing::info!(
                 enrich_on_scan,
+                licensed = enrichissement_sous_licence,
+                motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
         }
@@ -1828,62 +2228,246 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
     StatusCode::NO_CONTENT
 }
 
-/// Daily scheduled-scan loop. The `/scan/schedule` endpoint has stored
-/// `scan_schedule_enabled` / `scan_schedule_time` ("HH:MM") for ages, but
-/// nothing ever read them back — the clients' toggle was silently a no-op
-/// (the old tune-core ScanScheduler used different keys, an interval model
-/// and a SQLite-only handle, and was never spawned; it is deleted).
+/// Clé de réglage portant la date (locale, ISO) de la dernière occurrence
+/// HONORÉE du scan programmé.
 ///
-/// Checks every 30 s; fires at most once per matching minute; a scan already
-/// in progress skips that day's occurrence instead of stacking.
-pub(crate) fn spawn_scan_scheduler(state: AppState) {
+/// Une date, pas un horodatage : l'unité de l'ordonnanceur est le jour. Deux
+/// dates se comparent sans rien savoir du fuseau, de l'heure d'été, ni de la
+/// durée pendant laquelle le processus a été absent.
+const CLE_DERNIERE_OCCURRENCE: &str = "scan_schedule_last_run";
+
+/// Motifs d'inscription sans scan. Ce sont les événements journalisés tels
+/// quels — un test les cite, ils ne doivent pas diverger silencieusement.
+const MOTIF_AMORCE: &str = "scheduled_scan_baseline";
+const MOTIF_SCAN_DE_DEMARRAGE: &str = "scheduled_scan_covered_by_startup_scan";
+
+/// Ce que l'ordonnanceur doit faire à ce réveil.
+#[derive(Debug, PartialEq, Eq)]
+enum Ordre {
+    /// Désactivé, horaire illisible, ou occurrence déjà honorée.
+    Rien,
+    /// Inscrire l'occurrence SANS scanner ; le motif part au journal.
+    Noter(time::Date, &'static str),
+    /// Inscrire l'occurrence ET lancer le scan.
+    Scanner(time::Date),
+}
+
+/// La dernière occurrence dont l'heure est passée : celle d'aujourd'hui si
+/// l'heure programmée est déjà atteinte, celle d'hier sinon.
+///
+/// C'est le cœur du correctif de #2469. L'ancienne boucle exigeait que
+/// l'horloge affiche EXACTEMENT la minute programmée :
+///
+/// ```text
+/// if now.hour() != sh || now.minute() != sm { continue; }
+/// ```
+///
+/// Une machine éteinte à 21 h 00 — ou simplement endormie, cas que l'issue
+/// signalait comme non examiné — perdait le rendez-vous sans trace. La question
+/// posée ici n'est plus « est-il 21 h 00 ? » mais « l'occurrence de 21 h 00 la
+/// plus récente a-t-elle eu lieu ? », à laquelle un démarrage tardif et un
+/// réveil de veille répondent aussi bien qu'un tour de boucle à l'heure juste.
+fn occurrence_due(now: time::OffsetDateTime, sh: u8, sm: u8) -> Option<time::Date> {
+    if (now.hour(), now.minute()) >= (sh, sm) {
+        Some(now.date())
+    } else {
+        now.date().previous_day()
+    }
+}
+
+/// Toute la décision de l'ordonnanceur, séparée de l'état ambiant pour être
+/// jugée sur une horloge injectée.
+///
+/// Le retard ne s'accumule PAS : quel que soit le nombre de jours manqués, une
+/// seule occurrence est due — la plus récente. Six jours de vacances coûtent
+/// donc un scan, pas six. C'est aussi la raison pour laquelle aucune fenêtre de
+/// rattrapage n'est nécessaire : rattraper une occurrence vieille d'une semaine
+/// coûte exactement le prix d'une occurrence vieille d'un jour, et c'est
+/// précisément au retour de vacances que la bibliothèque est la plus périmée.
+///
+/// `scan_de_demarrage` vaut vrai UNIQUEMENT au premier tour, et seulement si un
+/// scan de démarrage a été lancé (`TUNE_AUTO_SCAN`). Ce scan-là fait déjà le
+/// travail de l'occurrence : elle est donc inscrite sans en lancer un second.
+/// C'est ce qui interdit la cascade au démarrage sans dépendre d'une course —
+/// le fait est connu au boot, pas mesuré 30 secondes plus tard.
+fn decider(
+    active: bool,
+    horaire: &str,
+    now: time::OffsetDateTime,
+    dernier: Option<&str>,
+    scan_de_demarrage: bool,
+) -> Ordre {
+    if !active {
+        return Ordre::Rien;
+    }
+    let Some((sh, sm)) = parse_hhmm(horaire) else {
+        return Ordre::Rien;
+    };
+    let Some(due) = occurrence_due(now, sh, sm) else {
+        return Ordre::Rien;
+    };
+    match dernier.and_then(parse_date_iso) {
+        // Aucune trace exploitable : ni au premier démarrage, ni à la première
+        // montée de version qui porte ce code, ni si la valeur est illisible.
+        // Une absence n'est pas une occurrence manquée — elle ne prouve rien.
+        // On l'inscrit comme point de départ, ce qui interdit le scan-surprise
+        // à la mise à jour ; l'occurrence SUIVANTE, elle, est décidable.
+        None => Ordre::Noter(due, MOTIF_AMORCE),
+        Some(honoree) if honoree < due => {
+            if scan_de_demarrage {
+                Ordre::Noter(due, MOTIF_SCAN_DE_DEMARRAGE)
+            } else {
+                Ordre::Scanner(due)
+            }
+        }
+        Some(_) => Ordre::Rien,
+    }
+}
+
+/// L'état que la boucle traîne d'un tour à l'autre. Un seul champ — mais c'est
+/// celui dont l'oubli remettrait l'option en panne : un drapeau de démarrage
+/// jamais consommé couvrirait TOUTES les occurrences à venir, et le scan
+/// programmé redeviendrait muet sur les machines en `TUNE_AUTO_SCAN`. Il vit
+/// donc ici, hors de la boucle `tokio`, pour qu'un test puisse enchaîner deux
+/// tours et le constater.
+struct Ordonnanceur {
+    /// Vrai tant que le premier tour n'a pas eu lieu ET qu'un scan de démarrage
+    /// a été lancé par ce processus.
+    premier_tour: bool,
+}
+
+impl Ordonnanceur {
+    fn new(scan_de_demarrage: bool) -> Self {
+        Self {
+            premier_tour: scan_de_demarrage,
+        }
+    }
+
+    /// Un tour de boucle réduit à sa décision : ni horloge ambiante, ni base.
+    /// Le drapeau est consommé à CHAQUE tour, y compris ceux qui ne décident
+    /// rien — sinon il survivrait jusqu'à la première occurrence due, des
+    /// heures après que le scan de démarrage soit terminé.
+    fn tour(
+        &mut self,
+        active: bool,
+        horaire: &str,
+        now: time::OffsetDateTime,
+        dernier: Option<&str>,
+    ) -> Ordre {
+        let couvert_par_le_demarrage = std::mem::take(&mut self.premier_tour);
+        decider(active, horaire, now, dernier, couvert_par_le_demarrage)
+    }
+}
+
+fn date_iso(jour: time::Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        jour.year(),
+        jour.month() as u8,
+        jour.day()
+    )
+}
+
+fn parse_date_iso(s: &str) -> Option<time::Date> {
+    let mut parts = s.trim().split('-');
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    let m: u8 = parts.next()?.trim().parse().ok()?;
+    let d: u8 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    time::Date::from_calendar_date(y, time::Month::try_from(m).ok()?, d).ok()
+}
+
+fn noter_occurrence(settings: &SettingsRepo, jour: time::Date) {
+    if let Err(e) = settings.set(CLE_DERNIERE_OCCURRENCE, &date_iso(jour)) {
+        // Une écriture de réglage qui échoue laisse l'occurrence due : la
+        // boucle repassera. C'est le bon sens du risque — mieux vaut réessayer
+        // sur une base cassée que perdre définitivement le rendez-vous.
+        tracing::warn!(error = %e, "scheduled_scan_last_run_persist_failed");
+    }
+}
+
+/// Boucle du scan programmé. Le point d'entrée `/scan/schedule` enregistre
+/// `scan_schedule_enabled` / `scan_schedule_time` ("HH:MM") depuis longtemps ;
+/// **plus rien ne les relisait** : cette fonction n'était appelée de nulle part
+/// depuis la PR #1230, la bascule des clients était donc muette. Elle est
+/// rebranchée dans `spawn_background_tasks`, et un test de non-régression
+/// vérifie que l'appel y figure toujours.
+///
+/// Réveil toutes les 30 s. À chaque tour, l'occurrence la plus récente est-elle
+/// honorée ? Sinon elle part — que le tour tombe à l'heure juste, après un
+/// démarrage tardif ou après un réveil de veille : c'est le MÊME chemin, il n'y
+/// a pas de « rattrapage » séparé à maintenir.
+///
+/// `scan_de_demarrage` dit si un scan de démarrage a été lancé par ce
+/// processus ; il ne vaut que pour le premier tour de boucle.
+pub(crate) fn spawn_scan_scheduler(state: AppState, scan_de_demarrage: bool) {
     tokio::spawn(async move {
-        let mut last_fired: Option<String> = None;
+        let mut ordonnanceur = Ordonnanceur::new(scan_de_demarrage);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let settings = SettingsRepo::with_backend(state.backend.clone());
-            let enabled = settings
+            let active = settings
                 .get("scan_schedule_enabled")
                 .ok()
                 .flatten()
                 .map(|v| v == "true")
                 .unwrap_or(false);
-            if !enabled {
-                continue;
-            }
-            let sched = settings
+            let horaire = settings
                 .get("scan_schedule_time")
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "03:00".into());
-            let Some((sh, sm)) = parse_hhmm(&sched) else {
-                continue;
-            };
-            // Local time: the user sets "03:00" meaning THEIR 3am, and log
-            // timestamps are already local (see run.rs). Fall back to UTC if
-            // the local offset is unavailable (some hardened Linux setups).
+            let dernier = settings.get(CLE_DERNIERE_OCCURRENCE).ok().flatten();
+            // Heure LOCALE : l'utilisateur règle SON 21 h, et les horodatages du
+            // journal sont déjà locaux (run.rs). Repli UTC si l'offset local est
+            // indisponible (certaines configurations Linux durcies).
             let now = time::OffsetDateTime::now_local()
                 .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-            if now.hour() != sh || now.minute() != sm {
+            let due = match ordonnanceur.tour(active, &horaire, now, dernier.as_deref()) {
+                Ordre::Rien => continue,
+                Ordre::Noter(jour, motif) => {
+                    noter_occurrence(&settings, jour);
+                    tracing::info!(occurrence = %date_iso(jour), motif, "scheduled_scan_noted");
+                    continue;
+                }
+                Ordre::Scanner(jour) => jour,
+            };
+            // Même condition que le balayage acoustique, par la MÊME fonction :
+            // une passe de fond ne dispute pas le disque au lecteur (#1310,
+            // #1515). Rien n'est inscrit ici — l'occurrence reste due et
+            // repassera dans 30 s, jusqu'à ce que la musique s'arrête. C'est ce
+            // que demandait Thierry : « dans les mêmes conditions que le scan
+            // CLAP ».
+            if let Some(zone) = tune_core::audio::replaygain::playing_zone_name(&state.backend) {
+                tracing::info!(
+                    zone = %zone,
+                    occurrence = %date_iso(due),
+                    "scheduled_scan_yield_to_playback"
+                );
                 continue;
             }
-            let stamp = format!(
-                "{}-{:02}-{:02} {:02}:{:02}",
-                now.year(),
-                now.month() as u8,
-                now.day(),
-                sh,
-                sm
-            );
-            if last_fired.as_deref() == Some(stamp.as_str()) {
-                continue;
+            // Inscrite AVANT le départ : une occurrence n'est due qu'une fois.
+            // Sinon un scan qui se termine mal relancerait un scan complet
+            // toutes les 30 secondes.
+            noter_occurrence(&settings, due);
+            if spawn_library_scan(state.clone(), false, None).await {
+                tracing::info!(
+                    time = %horaire,
+                    occurrence = %date_iso(due),
+                    "scheduled_scan_triggered"
+                );
+            } else {
+                // La porte unique refuse : un scan tourne DÉJÀ (manuel, ajout de
+                // dossier, ou scan de démarrage encore en cours). Il fait le
+                // travail de l'occurrence, qui est donc honorée — jamais un
+                // second scan, jamais une nouvelle tentative dans 30 s.
+                tracing::info!(
+                    occurrence = %date_iso(due),
+                    "scheduled_scan_covered_by_running_scan"
+                );
             }
-            last_fired = Some(stamp);
-            if !spawn_library_scan(state.clone(), false, None).await {
-                tracing::info!("scheduled_scan_skipped_already_scanning");
-                continue;
-            }
-            tracing::info!(time = %sched, "scheduled_scan_triggered");
         }
     });
 }
@@ -1908,7 +2492,11 @@ pub(super) async fn scan_schedule(State(state): State<AppState>) -> Json<Value> 
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    Json(json!({ "enabled": enabled, "time": time }))
+    // La moitié visible du correctif #2469 : sans la date du dernier passage
+    // réel, l'utilisateur ne peut pas savoir si son scan programmé a eu lieu.
+    // `null` = jamais observé (option fraîchement activée, ou base neuve).
+    let last_run = settings.get(CLE_DERNIERE_OCCURRENCE).ok().flatten();
+    Json(json!({ "enabled": enabled, "time": time, "last_run": last_run }))
 }
 
 #[derive(Deserialize)]
@@ -2802,5 +3390,918 @@ mod tests {
         assert_eq!(super::parse_hhmm("12:60"), None);
         assert_eq!(super::parse_hhmm("noon"), None);
         assert_eq!(super::parse_hhmm(""), None);
+    }
+}
+
+/// Le rapport de fin de scan complet n'est plus construit qu'UNE fois (#2012).
+///
+/// Il l'était trois : `scan_result`, `library.scan.completed` et le fichier de
+/// `/scan/report` étaient trois `json!` d'une vingtaine de clés recopiés à la
+/// main. Ils avaient déjà divergé trois fois — `removed` (#2146) absent des
+/// trois, `metadata_failed` absent du seul bus, `skipped_unsupported_by_ext`
+/// (#1763) présent dans le seul fichier.
+///
+/// Ces tests jugent la construction elle-même, pas le texte du fichier : ils
+/// comparent ce que les trois consommateurs reçoivent réellement. Le garde-fou
+/// textuel qui les précédait n'a plus lieu d'être ici — il ne reste qu'un
+/// exemplaire écrit à la main, celui du scan AUTOMATIQUE (`auto_scan.rs`), et
+/// c'est lui seul que le dernier test surveille.
+#[cfg(test)]
+mod rapport_de_fin_de_scan {
+    use super::{ChiffresDeFinDeScan, SuiteDuScan};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Des chiffres tous DISTINCTS : un rapport qui rangerait deux compteurs
+    /// sous la mauvaise clé passerait inaperçu si tout valait zéro.
+    fn chiffres(stats: &tune_core::scanner::walker::ScanStats) -> ChiffresDeFinDeScan<'_> {
+        // Fuites volontaires : ces `Box::leak` durent le temps du test et
+        // évitent d'écrire une structure porteuse rien que pour tenir les
+        // emprunts.
+        let missing: &[String] = Box::leak(Box::new(["/Volumes/absent".to_string()]));
+        let raisons: &[String] = Box::leak(Box::new(["not mounted".to_string()]));
+        let erreurs: &[String] = Box::leak(Box::new(["/Volumes/erreur".to_string()]));
+        let racines: &[String] = Box::leak(Box::new(["/Volumes/vidée".to_string()]));
+        let proteges: &[String] = Box::leak(Box::new(["/Volumes/protégé".to_string()]));
+        let par_ext: &HashMap<String, usize> =
+            Box::leak(Box::new(HashMap::from([("mpc".to_string(), 280usize)])));
+        let motifs: &HashMap<String, String> = Box::leak(Box::new(HashMap::from([(
+            "mpc".to_string(),
+            "format non pris en charge".to_string(),
+        )])));
+        let non_lus: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/album.mpc (format non pris en charge)".to_string(),
+        ]));
+        let sans_metadonnees: &[String] =
+            Box::leak(Box::new(["/Volumes/musique/muet.wav".to_string()]));
+        let doublons: &[String] = Box::leak(Box::new([
+            "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)".to_string(),
+        ]));
+        ChiffresDeFinDeScan {
+            total_discovered: 1_651,
+            missing_dirs: missing,
+            missing_dir_reasons: raisons,
+            error_dirs: erreurs,
+            pistes_supprimees: 41,
+            racines_videes: racines,
+            sous_arbres_proteges: proteges,
+            pistes_protegees: 7,
+            pistes_hors_perimetre: 13,
+            purge_refusee_candidats: 900,
+            scan_stats: stats,
+            inserted: 101,
+            updated: 102,
+            skipped: 103,
+            skipped_unchanged: 104,
+            skipped_duplicate: 105,
+            skipped_no_metadata: 106,
+            skipped_unsupported: 107,
+            db_insert_failed: 108,
+            db_update_failed: 109,
+            artwork_extracted: 110,
+            auto_enrichment: SuiteDuScan::decider(true, true).rapport(),
+            skipped_by_ext: par_ext,
+            skipped_reasons: motifs,
+            skipped_unsupported_paths: non_lus,
+            skipped_no_metadata_paths: sans_metadonnees,
+            skipped_duplicate_paths: doublons,
+        }
+    }
+
+    fn stats_de_scan() -> tune_core::scanner::walker::ScanStats {
+        tune_core::scanner::walker::ScanStats {
+            total_files: 1_600,
+            metadata_ok: 1_500,
+            metadata_failed: 60,
+            metadata_timeout: 40,
+            failed_paths: vec!["/Volumes/musique/piste.flac".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// Le cœur de #2012 : les trois consommateurs lisent le MÊME rapport.
+    ///
+    /// `scan_result` et `library.scan.completed` reçoivent la valeur telle
+    /// quelle ; le fichier de `/scan/report` l'étend. Sur les clés communes,
+    /// aucun écart n'est tolérable — c'est exactement ce qui a été perdu trois
+    /// fois par recopie.
+    #[test]
+    fn les_trois_consommateurs_recoivent_le_meme_rapport() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+
+        // Ce que reçoivent les trois, dans leur forme réelle.
+        let reglage: serde_json::Value =
+            serde_json::from_str(&c.rapport().to_string()).expect("scan_result est du JSON");
+        let evenement = c.rapport();
+        let fichier = c.rapport_du_fichier();
+
+        assert_eq!(
+            reglage, evenement,
+            "`scan_result` et `library.scan.completed` doivent être identiques (#2012)"
+        );
+
+        let commun = evenement.as_object().expect("un objet");
+        let du_fichier = fichier.as_object().expect("un objet");
+        for (cle, valeur) in commun {
+            assert_eq!(
+                du_fichier.get(cle),
+                Some(valeur),
+                "`{cle}` diverge entre le bus d'événements et le fichier de /scan/report (#2012)"
+            );
+        }
+
+        // Le seul écart, et il est voulu : l'inventaire des formats non lus
+        // (#1763) ne sort que par le fichier. Le test le NOMME, pour qu'un
+        // écart ajouté par mégarde ne se glisse pas dans son ombre.
+        let ajouts: Vec<&String> = du_fichier
+            .keys()
+            .filter(|k| !commun.contains_key(*k))
+            .collect();
+        assert_eq!(
+            ajouts,
+            // Ordre alphabétique : c'est celui des clés d'un objet
+            // `serde_json`, pas celui où on les a écrites.
+            vec![
+                "skipped_duplicate_paths",
+                "skipped_no_metadata_paths",
+                "skipped_paths_truncated",
+                "skipped_unsupported_by_ext",
+                "skipped_unsupported_paths",
+                "skipped_unsupported_reasons",
+            ],
+            "seuls l'inventaire des formats non lus (#1763) et la liste nominative des \
+             fichiers écartés (#2050) doivent distinguer /scan/report — les chemins de \
+             l'utilisateur ne partent pas sur le bus, qui est diffusé à tous les clients"
+        );
+    }
+
+    /// Les valeurs sont justes, et rangées sous la bonne clé.
+    ///
+    /// Une factorisation qui intervertirait deux compteurs produirait un
+    /// rapport unique — et faux partout à la fois.
+    #[test]
+    fn les_valeurs_publiees_sont_celles_du_scan() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+        let r = c.rapport_du_fichier();
+
+        assert_eq!(r["total_files"], serde_json::json!(1_651));
+        assert_eq!(r["parsed"], serde_json::json!(1_600));
+        assert_eq!(r["metadata_ok"], serde_json::json!(1_500));
+        // Manquait sur le bus d'événements, et sur lui seul, avant #2012.
+        assert_eq!(r["metadata_failed"], serde_json::json!(60));
+        assert_eq!(r["metadata_timeout"], serde_json::json!(40));
+        // Le bandeau de fin de scan lit `removed` (#2146).
+        assert_eq!(r["removed"], serde_json::json!(41));
+        assert_eq!(r["emptied_roots"], serde_json::json!(["/Volumes/vidée"]));
+        assert_eq!(
+            r["protected_subtrees"],
+            serde_json::json!(["/Volumes/protégé"])
+        );
+        assert_eq!(r["tracks_protected"], serde_json::json!(7));
+        assert_eq!(r["tracks_out_of_scope"], serde_json::json!(13));
+        // Le nombre à renvoyer dans `?confirm_purge=` (#1943).
+        assert_eq!(r["purge_refused"], serde_json::json!(true));
+        assert_eq!(r["purge_refused_candidates"], serde_json::json!(900));
+        assert_eq!(r["inserted"], serde_json::json!(101));
+        assert_eq!(r["updated"], serde_json::json!(102));
+        assert_eq!(r["skipped"], serde_json::json!(103));
+        assert_eq!(r["skipped_unchanged"], serde_json::json!(104));
+        assert_eq!(r["skipped_duplicate"], serde_json::json!(105));
+        assert_eq!(r["skipped_no_metadata"], serde_json::json!(106));
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+        assert_eq!(r["db_insert_failed"], serde_json::json!(108));
+        assert_eq!(r["db_update_failed"], serde_json::json!(109));
+        assert_eq!(r["artwork_extracted"], serde_json::json!(110));
+        assert_eq!(r["auto_enrichment"]["started"], serde_json::json!(true));
+        assert_eq!(r["missing_dirs"], serde_json::json!(["/Volumes/absent"]));
+        assert_eq!(r["missing_dir_reasons"], serde_json::json!(["not mounted"]));
+        assert_eq!(r["error_dirs"], serde_json::json!(["/Volumes/erreur"]));
+        assert_eq!(
+            r["failed_paths"],
+            serde_json::json!(["/Volumes/musique/piste.flac"])
+        );
+        assert_eq!(
+            r["skipped_unsupported_by_ext"],
+            serde_json::json!({"mpc": 280})
+        );
+        assert_eq!(
+            r["skipped_unsupported_reasons"],
+            serde_json::json!({"mpc": "format non pris en charge"})
+        );
+        // La liste demandée (#2050) : LESQUELS, pas seulement COMBIEN. Trois
+        // listes distinctes — un rapport qui rangerait les doublons sous les
+        // formats non lus passerait inaperçu si elles se ressemblaient.
+        assert_eq!(
+            r["skipped_unsupported_paths"],
+            serde_json::json!(["/Volumes/musique/album.mpc (format non pris en charge)"])
+        );
+        assert_eq!(
+            r["skipped_no_metadata_paths"],
+            serde_json::json!(["/Volumes/musique/muet.wav"])
+        );
+        assert_eq!(
+            r["skipped_duplicate_paths"],
+            serde_json::json!([
+                "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)"
+            ])
+        );
+        // Trois listes d'un élément : rien n'est tronqué, et le rapport le dit.
+        assert_eq!(r["skipped_paths_truncated"], serde_json::json!(false));
+    }
+
+    /// Le rapport DIT qu'il est tronqué quand il l'est (#2050).
+    ///
+    /// Sans ce drapeau, un rapport qui nomme 500 fichiers écartés sur 40 000
+    /// se lit comme la liste complète : l'utilisateur conclut que sa
+    /// bibliothèque va bien, et referme le seul outil qui pouvait le
+    /// détromper. Sa contre-épreuve est dans le test précédent, où trois
+    /// listes d'un élément publient `false`.
+    #[test]
+    fn une_liste_au_plafond_est_annoncee_comme_tronquee() {
+        const PLAFOND: usize = tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES;
+        let stats = stats_de_scan();
+        let mut c = chiffres(&stats);
+
+        let pleine: Vec<String> = (0..PLAFOND).map(|i| format!("/musique/{i}.mpc")).collect();
+        let pleine: &[String] = Box::leak(Box::new(pleine));
+        c.skipped_unsupported_paths = pleine;
+
+        let r = c.rapport_du_fichier();
+        assert_eq!(
+            r["skipped_paths_truncated"],
+            serde_json::json!(true),
+            "une liste arrivée au plafond doit être annoncée comme un échantillon"
+        );
+        assert_eq!(
+            r["skipped_unsupported_paths"]
+                .as_array()
+                .expect("un tableau")
+                .len(),
+            PLAFOND,
+            "le plafond borne la liste publiée"
+        );
+        // Les décomptes, eux, restent exhaustifs : c'est ce qui rend
+        // l'échantillon lisible.
+        assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
+    }
+
+    /// Les DEUX scans publient la même liste de fichiers écartés (#2050).
+    ///
+    /// Le scan manuel (`ChiffresDeFinDeScan::rapport_du_fichier`) et le scan
+    /// automatique (`auto_scan.rs`) écrivent le MÊME fichier
+    /// `<db>-scan-report.json`, lu par le même `GET /scan/report`. Une clé
+    /// posée d'un seul côté rend la réponse dépendante de QUEL scan a tourné
+    /// en dernier — l'utilisateur voit sa liste disparaître au redémarrage
+    /// suivant, sans rien avoir changé.
+    ///
+    /// C'est exactement le mode d'échec de #2012, et il ne casse aucune
+    /// compilation : d'où ce garde-fou textuel, le seul qui puisse voir une
+    /// clé manquante dans un `json!` voisin.
+    #[test]
+    fn les_deux_scans_publient_les_memes_listes_de_fichiers_ecartes() {
+        /// Sous leur forme littérale de clé JSON. Chercher le mot nu
+        /// attraperait le nom de la variable Rust et passerait sans qu'aucune
+        /// clé ne soit publiée.
+        const CLES: [&str; 4] = [
+            "\"skipped_unsupported_paths\"",
+            "\"skipped_no_metadata_paths\"",
+            "\"skipped_duplicate_paths\"",
+            "\"skipped_paths_truncated\"",
+        ];
+
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
+            // Commentaires ôtés : raconter l'histoire du défaut ne doit pas
+            // suffire à faire passer le test.
+            let code = texte
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for cle in CLES {
+                assert!(
+                    code.contains(cle),
+                    "{fichier} ne publie pas {cle} — le rapport de /scan/report \
+                     dépendrait alors de quel scan l'a écrit en dernier (#2050)"
+                );
+            }
+        }
+    }
+
+    /// Les trois motifs sont pourvus, pas un seul (#2050).
+    ///
+    /// « Un chemin corrigé, les autres nus » est le défaut qui revient : le
+    /// scan écarte pour trois motifs distincts, et n'en instrumenter qu'un
+    /// laisse l'utilisateur devant une liste qui ne contient pas son fichier,
+    /// sans lui dire que deux autres listes existaient.
+    #[test]
+    fn les_trois_motifs_d_ecart_ont_chacun_leur_liste() {
+        let stats = stats_de_scan();
+        let r = chiffres(&stats).rapport_du_fichier();
+        for cle in [
+            "skipped_unsupported_paths",
+            "skipped_no_metadata_paths",
+            "skipped_duplicate_paths",
+        ] {
+            let liste = r[cle].as_array().unwrap_or_else(|| panic!("{cle} absente"));
+            assert!(!liste.is_empty(), "{cle} est publiée mais toujours vide");
+        }
+    }
+
+    /// Il ne reste qu'UNE construction manuscrite : celle du scan automatique.
+    ///
+    /// `auto_scan.rs` publie son propre rapport — moins de clés, d'autres
+    /// variables — et il émet lui aussi `library.scan.completed`, donc il
+    /// alimente le même bandeau. Il doit porter `removed` (#2146). Ce garde-fou
+    /// vérifie aussi qu'il n'y a plus qu'un exemplaire à surveiller : si un
+    /// second réapparaissait dans `scan.rs`, le compte le dirait.
+    #[test]
+    fn une_seule_construction_manuscrite_subsiste_et_elle_publie_la_purge() {
+        /// La clé, sous sa forme littérale exacte. `"removed"` tout court
+        /// apparaît aussi dans les noms d'événements de journal
+        /// (`post_scan_stale_tracks_removed`) : chercher le mot nu ferait
+        /// passer le test sans qu'aucune clé soit publiée.
+        const CLE_PURGE: &str = "\"removed\":";
+        /// Présent dans tout rapport de fin de scan, et nulle part ailleurs.
+        const MARQUEUR_RAPPORT: &str = "\"artwork_extracted\":";
+
+        let mut examines = 0usize;
+        for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fichier);
+            let texte = fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("lecture de {} : {e}", p.display()));
+            let mut depuis = 0usize;
+            while let Some(rel) = texte[depuis..].find(MARQUEUR_RAPPORT) {
+                let fin = depuis + rel;
+                examines += 1;
+                let debut = texte[..fin]
+                    .rfind("json!(")
+                    .expect("un rapport doit être construit par un json!(");
+                // Commentaires ôtés : raconter l'histoire du défaut ne doit
+                // pas suffire à faire passer le test.
+                let corps = texte[debut..fin]
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    corps.contains(CLE_PURGE),
+                    "{fichier} : la construction de rapport n° {examines} ne publie pas \
+                     {CLE_PURGE}\nLe client lit `d.removed` pour le bandeau de fin de scan (#2146)."
+                );
+                depuis = fin + MARQUEUR_RAPPORT.len();
+            }
+        }
+        // Contrôle positif : sans lui, un marqueur renommé ferait passer le
+        // test en n'examinant RIEN. Deux, c'est la construction unique de
+        // `ChiffresDeFinDeScan::rapport` et celle du scan automatique. Un
+        // troisième compte signale une recopie réintroduite (#2012).
+        assert_eq!(
+            examines, 2,
+            "deux constructions attendues (la source unique de scan.rs et celle d'auto_scan.rs), \
+             {examines} trouvée(s) — le marqueur {MARQUEUR_RAPPORT} a dû être renommé, ou une \
+             recopie manuelle réintroduite (#2012)"
+        );
+    }
+}
+
+/// Ordonnanceur du scan programmé (#2469).
+///
+/// Ces tests jugent `decider`, qui porte TOUTE la décision : la boucle qui
+/// l'entoure ne fait que lire trois réglages et obéir. L'horloge est injectée,
+/// donc « la machine était éteinte de 20 h 55 à 21 h 05 » s'écrit littéralement.
+#[cfg(test)]
+mod scan_scheduler_tests {
+    use super::{MOTIF_AMORCE, MOTIF_SCAN_DE_DEMARRAGE, Ordre, decider};
+    use time::macros::{date, datetime};
+
+    const HORAIRE: &str = "21:00";
+    /// Aucun scan de démarrage : le cas d'un poste ordinaire, `TUNE_AUTO_SCAN`
+    /// valant `false` par défaut (`tune-server/src/config.rs`).
+    const SANS_SCAN_DE_DEMARRAGE: bool = false;
+
+    /// L'occurrence tombe pendant que le serveur tourne : elle part.
+    #[test]
+    fn heure_atteinte_declenche_le_scan() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 21:00 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27))
+        );
+    }
+
+    /// Une minute avant, rien : l'occurrence de la veille est déjà honorée.
+    /// C'est la contre-épreuve du test précédent — sans elle, un `decider` qui
+    /// renverrait toujours `Scanner` passerait pour correct.
+    #[test]
+    fn avant_l_heure_ne_declenche_rien() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 20:59 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Rien
+        );
+    }
+
+    /// La contre-épreuve exigée par #2469, mot pour mot : occurrence à 21 h 00,
+    /// processus absent de 20 h 55 à 21 h 05, redémarrage — le scan doit partir.
+    #[test]
+    fn occurrence_manquee_machine_eteinte_est_rattrapee_au_demarrage() {
+        // Dernier passage : la veille, à l'heure. Le serveur s'arrête à 20 h 55.
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 20:55 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Rien,
+            "rien n'est dû avant l'heure : l'état persisté est bien celui de la veille"
+        );
+        // Redémarrage à 21 h 05, la même trace en base.
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 21:05 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27)),
+            "l'occurrence de 21 h 00 manquée doit partir au démarrage"
+        );
+    }
+
+    /// Le cas de Thierry : machine éteinte toute la nuit, rallumée le lendemain
+    /// matin. L'occurrence de la VEILLE est due — pas celle du jour, qui n'a pas
+    /// encore d'heure.
+    #[test]
+    fn machine_rallumee_le_lendemain_matin_rattrape_l_occurrence_de_la_veille() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27))
+        );
+    }
+
+    /// Le point que l'issue signalait comme NON examiné : un Mac qui dort à
+    /// 21 h 00 n'est pas un Mac éteint, et `tokio::time::sleep` peut se réveiller
+    /// bien après la minute programmée. Ici la minute n'a pas besoin d'être
+    /// touchée — seule compte l'occurrence.
+    #[test]
+    fn reveil_de_veille_tardif_declenche_quand_meme() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 23:47 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27))
+        );
+    }
+
+    /// Une semaine de vacances ne vaut PAS sept scans. Le retard ne s'accumule
+    /// pas : une seule occurrence est due, la plus récente.
+    #[test]
+    fn six_jours_manques_ne_valent_qu_une_seule_occurrence() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:00 UTC),
+                Some("2026-08-20"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 26)),
+            "seule la dernière occurrence échue est due"
+        );
+        // Et une fois celle-là honorée, plus rien avant 21 h.
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:01 UTC),
+                Some("2026-08-26"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Rien
+        );
+    }
+
+    /// Deux démarrages rapprochés après un rendez-vous manqué : le premier
+    /// rattrape, le second ne doit RIEN faire. Un scan coûte cher ; le rallumage
+    /// en rafale (redémarrage, mise à jour, plantage) ne doit pas le multiplier.
+    #[test]
+    fn deux_demarrages_rapproches_ne_scannent_qu_une_fois() {
+        let premier = decider(
+            true,
+            HORAIRE,
+            datetime!(2026-08-28 08:00 UTC),
+            Some("2026-08-26"),
+            SANS_SCAN_DE_DEMARRAGE,
+        );
+        let Ordre::Scanner(jour) = premier else {
+            panic!("le premier démarrage doit rattraper, obtenu {premier:?}");
+        };
+        // Exactement ce que la boucle persiste juste avant de lancer le scan.
+        let persiste = super::date_iso(jour);
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 08:03 UTC),
+                Some(&persiste),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Rien,
+            "le second démarrage relit la trace du premier et ne relance rien"
+        );
+    }
+
+    /// L'autre moitié du « jamais deux scans » : quand `TUNE_AUTO_SCAN` est
+    /// actif, le scan de démarrage fait déjà le travail de l'occurrence manquée.
+    /// Elle est inscrite, pas rejouée — sinon la machine rallumée après un
+    /// rendez-vous manqué scannerait DEUX fois de suite.
+    #[test]
+    fn le_scan_de_demarrage_couvre_l_occurrence_manquee() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26"),
+                true
+            ),
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_SCAN_DE_DEMARRAGE),
+            "l'occurrence est honorée par le scan de démarrage, pas rejouée"
+        );
+    }
+
+    /// Et la couverture ne vaut QUE pour le premier tour : la boucle consomme le
+    /// drapeau avec `std::mem::take`. Trois jours plus tard, une occurrence due
+    /// scanne bel et bien.
+    #[test]
+    fn la_couverture_de_demarrage_ne_vaut_pas_pour_les_jours_suivants() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-31 21:00 UTC),
+                Some("2026-08-30"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 31))
+        );
+    }
+
+    /// Contre-épreuve de la consommation du drapeau : `decider` seul ne peut
+    /// pas la montrer, elle vit dans `Ordonnanceur::tour`. Sans ce test, un
+    /// drapeau jamais consommé passe toutes les autres assertions — et mute
+    /// définitivement le scan programmé sur une machine en `TUNE_AUTO_SCAN`.
+    #[test]
+    fn le_drapeau_de_demarrage_ne_couvre_que_le_premier_tour() {
+        let mut ordonnanceur = super::Ordonnanceur::new(true);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_SCAN_DE_DEMARRAGE),
+            "premier tour : le scan de démarrage couvre l'occurrence manquée"
+        );
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-29 21:00 UTC),
+                Some("2026-08-27")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 29)),
+            "le lendemain, le scan de démarrage est loin derrière : l'occurrence part"
+        );
+    }
+
+    /// Et le drapeau est consommé même par un tour qui ne décide rien : sinon il
+    /// survivrait jusqu'à l'occurrence du soir, des heures après la fin du scan
+    /// de démarrage, et la mangerait.
+    #[test]
+    fn le_drapeau_est_consomme_meme_par_un_tour_sans_occurrence() {
+        let mut ordonnanceur = super::Ordonnanceur::new(true);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:00 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Rien,
+            "au démarrage du matin, rien n'est dû"
+        );
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 21:00 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27)),
+            "le soir même, l'occurrence part normalement"
+        );
+    }
+
+    /// Sans scan de démarrage — le cas par défaut — le premier tour scanne déjà.
+    #[test]
+    fn sans_scan_de_demarrage_le_premier_tour_rattrape() {
+        let mut ordonnanceur = super::Ordonnanceur::new(SANS_SCAN_DE_DEMARRAGE);
+        assert_eq!(
+            ordonnanceur.tour(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-26")
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 27))
+        );
+    }
+
+    /// Réglage désactivé : rien, même avec une occurrence manifestement manquée.
+    #[test]
+    fn reglage_desactive_ne_fait_rien() {
+        assert_eq!(
+            decider(
+                false,
+                HORAIRE,
+                datetime!(2026-08-28 09:30 UTC),
+                Some("2026-08-20"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Rien
+        );
+    }
+
+    /// Aucune trace en base : on AMORCE, on ne scanne pas. Sans cela, la montée
+    /// de version qui porte ce correctif déclencherait un scan complet chez tous
+    /// les utilisateurs ayant la bascule active. Une absence n'est pas une
+    /// occurrence manquée.
+    #[test]
+    fn premiere_observation_amorce_sans_scanner() {
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-27 09:30 UTC),
+                None,
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Noter(date!(2026 - 08 - 26), MOTIF_AMORCE)
+        );
+    }
+
+    /// Activer l'option APRÈS l'heure du jour ne doit pas scanner sur-le-champ,
+    /// et doit scanner le lendemain à l'heure. Les deux moitiés comptent : la
+    /// première seule serait satisfaite par un ordonnanceur mort.
+    #[test]
+    fn activer_le_soir_amorce_puis_scanne_le_lendemain() {
+        let amorce = decider(
+            true,
+            HORAIRE,
+            datetime!(2026-08-27 22:10 UTC),
+            None,
+            SANS_SCAN_DE_DEMARRAGE,
+        );
+        assert_eq!(
+            amorce,
+            Ordre::Noter(date!(2026 - 08 - 27), MOTIF_AMORCE),
+            "activer à 22 h 10 pour 21 h 00 ne doit pas scanner le soir même"
+        );
+        let Ordre::Noter(jour, _) = amorce else {
+            unreachable!()
+        };
+        let persiste = super::date_iso(jour);
+        assert_eq!(
+            decider(
+                true,
+                HORAIRE,
+                datetime!(2026-08-28 21:00 UTC),
+                Some(&persiste),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 28)),
+            "et le lendemain à 21 h 00, il part"
+        );
+    }
+
+    /// Une trace illisible est traitée comme une absence : on amorce. Le piège
+    /// serait de la traiter comme « très ancienne » et de scanner.
+    #[test]
+    fn trace_illisible_amorce_au_lieu_de_scanner() {
+        for corrompu in ["", "hier", "2026-13-01", "2026-08", "2026-08-27-01"] {
+            assert_eq!(
+                decider(
+                    true,
+                    HORAIRE,
+                    datetime!(2026-08-27 22:00 UTC),
+                    Some(corrompu),
+                    SANS_SCAN_DE_DEMARRAGE
+                ),
+                Ordre::Noter(date!(2026 - 08 - 27), MOTIF_AMORCE),
+                "trace « {corrompu} »"
+            );
+        }
+    }
+
+    /// Horaire illisible : rien du tout. Surtout pas un scan quotidien décidé
+    /// par défaut sur une valeur que l'utilisateur n'a pas écrite.
+    #[test]
+    fn horaire_illisible_ne_fait_rien() {
+        for mauvais in ["", "25:00", "21:60", "21h00", "abc"] {
+            assert_eq!(
+                decider(
+                    true,
+                    mauvais,
+                    datetime!(2026-08-27 22:00 UTC),
+                    Some("2026-08-20"),
+                    SANS_SCAN_DE_DEMARRAGE
+                ),
+                Ordre::Rien,
+                "horaire « {mauvais} »"
+            );
+        }
+    }
+
+    /// Minuit : l'occurrence d'aujourd'hui est atteinte dès 00 h 00, et la
+    /// veille reste due tant qu'elle ne l'est pas. Cas limite de
+    /// `previous_day()` sur un changement de mois.
+    #[test]
+    fn minuit_et_changement_de_mois() {
+        assert_eq!(
+            decider(
+                true,
+                "00:00",
+                datetime!(2026-09-01 00:00 UTC),
+                Some("2026-08-31"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 09 - 01))
+        );
+        assert_eq!(
+            decider(
+                true,
+                "23:30",
+                datetime!(2026-09-01 00:10 UTC),
+                Some("2026-08-30"),
+                SANS_SCAN_DE_DEMARRAGE
+            ),
+            Ordre::Scanner(date!(2026 - 08 - 31)),
+            "à 00 h 10, l'occurrence de 23 h 30 due est celle du 31 août"
+        );
+    }
+}
+
+/// L'ordonnanceur a été du CODE MORT pendant des mois : `spawn_scan_scheduler`
+/// n'avait qu'une seule occurrence dans tout le dépôt, sa définition, et la
+/// bascule « scan planifié » des clients était muette depuis la PR #1230.
+///
+/// Aucun test de comportement ne pouvait le voir : ils passaient tous sans que
+/// la boucle tourne jamais. Ce test lit le texte du seul endroit qui la lance et
+/// exige que l'appel y soit — même procédé que le garde-fou de rendement du
+/// balayage acoustique (`embedding.rs`), pour la même raison : ce qui a été
+/// perdu, c'est un APPEL, pas une logique.
+#[cfg(test)]
+mod scan_scheduler_cablage_tests {
+    #[test]
+    fn l_ordonnanceur_est_bien_lance_au_demarrage() {
+        let background = include_str!("../../background.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
+        assert!(
+            background.contains("pub async fn spawn_background_tasks"),
+            "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        assert!(
+            background.contains("scan::spawn_scan_scheduler(state.clone(), config.auto_scan)"),
+            "spawn_scan_scheduler doit être appelé depuis background.rs, en lui \
+             passant `config.auto_scan` — sans cet appel, la bascule « scan \
+             planifié » est sans effet (#2469)"
+        );
+    }
+}
+
+/// Le sort de l'enrichissement automatique d'après scan (#2507).
+///
+/// Reivax66 installe TuneOS Fedora **sans licence**, scanne, et la grille
+/// Artistes n'affiche que des initiales. Les deux conditions de la passe —
+/// `enrich_on_scan` et `Feature::AutoEnrichment` (Premium) — sont appliquées
+/// depuis toujours ; ce qui manquait, c'est de le DIRE ailleurs qu'au journal.
+#[cfg(test)]
+mod suite_du_scan_apres_scan {
+    use super::SuiteDuScan;
+
+    #[test]
+    fn sans_licence_le_motif_est_premium_meme_reglage_allume() {
+        let suite = SuiteDuScan::decider(true, false);
+        assert!(!suite.demarree());
+        assert_eq!(suite.motif(), Some("premium_required"));
+    }
+
+    /// Le cas exact du ticket : réglage à sa valeur par défaut (allumé), pas
+    /// de licence. Le rapport doit porter le motif, pas un simple `false`.
+    #[test]
+    fn le_rapport_publie_started_et_le_motif() {
+        let rapport = SuiteDuScan::decider(true, false).rapport();
+        assert_eq!(rapport["started"], serde_json::json!(false));
+        assert_eq!(
+            rapport["skipped_reason"],
+            serde_json::json!("premium_required")
+        );
+    }
+
+    /// Premium et réglage éteint : c'est un choix de l'utilisateur, et il doit
+    /// se distinguer du refus d'offre — sinon on envoie un abonné Premium
+    /// acheter ce qu'il a déjà.
+    #[test]
+    fn premium_mais_reglage_eteint_est_un_motif_distinct() {
+        let suite = SuiteDuScan::decider(false, true);
+        assert!(!suite.demarree());
+        assert_eq!(suite.motif(), Some("disabled_by_setting"));
+    }
+
+    /// Les deux refus à la fois : le manque de licence l'emporte, parce que
+    /// c'est le seul que les Réglages ne peuvent pas lever.
+    #[test]
+    fn sans_licence_et_reglage_eteint_le_manque_de_licence_lemporte() {
+        assert_eq!(
+            SuiteDuScan::decider(false, false).motif(),
+            Some("premium_required")
+        );
+    }
+
+    /// Contrôle positif : sans lui, un `decider` qui rendrait TOUJOURS un
+    /// refus passerait les quatre tests ci-dessus.
+    #[test]
+    fn premium_et_reglage_allume_la_passe_part_sans_motif() {
+        let suite = SuiteDuScan::decider(true, true);
+        assert!(suite.demarree());
+        assert_eq!(suite.motif(), None);
+        assert_eq!(suite.rapport()["started"], serde_json::json!(true));
+        assert_eq!(suite.rapport()["skipped_reason"], serde_json::Value::Null);
+    }
+}
+
+/// Le sort de la passe d'enrichissement est publié — #2507.
+///
+/// Sans cette clé, une installation sans licence scanne, ne voit aucune
+/// vignette d'artiste, et rien ne lui dit que la passe n'a pas eu lieu.
+///
+/// Ce test était un garde-fou textuel comptant TROIS `json!` recopiés à la
+/// main ; il n'y en a plus qu'un (#2012), et la clé se vérifie désormais sur
+/// la valeur construite plutôt que sur le texte du fichier.
+#[cfg(test)]
+mod rapport_de_scan_publie_le_sort_de_lenrichissement {
+    use super::SuiteDuScan;
+
+    /// Les trois motifs de `SuiteDuScan` traversent le rapport intacts.
+    #[test]
+    fn le_rapport_porte_le_sort_de_la_passe() {
+        for (sous_licence, reglage, motif) in [
+            (true, true, None),
+            (true, false, Some("disabled_by_setting")),
+            (false, true, Some("premium_required")),
+        ] {
+            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport();
+            assert_eq!(bloc["started"], serde_json::json!(motif.is_none()));
+            assert_eq!(
+                bloc["skipped_reason"],
+                match motif {
+                    Some(m) => serde_json::json!(m),
+                    None => serde_json::Value::Null,
+                },
+                "le motif doit rester lisible par le client (#2507)"
+            );
+        }
     }
 }

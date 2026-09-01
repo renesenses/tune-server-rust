@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,9 +8,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::backend::ToSqlValue;
+use tune_core::db::favorite_facets_repo::FavoriteFacetsRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo;
+use tune_core::favorites_sort::TriFavoris;
 use tune_core::license::Feature;
 
 use crate::state::AppState;
@@ -36,9 +39,31 @@ struct FavoriteAction {
     item_id: i64,
 }
 
+/// `item_type` filtre, `sort`/`order` rangent (#2001).
+///
+/// Les deux derniers sont **facultatifs** : absents, la liste est rendue
+/// exactement comme avant (`ORDER BY created_at DESC`), et le code emprunte le
+/// même chemin qu'auparavant. `sort` accepte `added`, `title`, `artist`,
+/// `album` (et leurs équivalents français) ; `order` vaut `asc` par défaut.
 #[derive(Deserialize)]
 struct FavoritesQuery {
     item_type: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
+}
+
+/// Favori de FACETTE (#2442) : un label n'a pas d'identifiant entier, il est
+/// désigné par sa valeur telle que la facette la sélectionne. D'où `value:
+/// String` et non `item_id: i64`.
+#[derive(Deserialize)]
+struct FacetFavoriteAction {
+    facet: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct FacetsQuery {
+    facet: Option<String>,
 }
 
 /// Add a streaming (Tidal/Qobuz/…) item to a profile's favorites. Metadata is
@@ -114,6 +139,10 @@ pub fn router() -> Router<AppState> {
             "/{id}/favorites/streaming/remove",
             post(remove_streaming_favorite),
         )
+        // Favoris de facette (label, et demain genre/format/année) — #2442.
+        .route("/{id}/favorites/facets", get(list_facet_favorites))
+        .route("/{id}/favorites/facets/add", post(add_facet_favorite))
+        .route("/{id}/favorites/facets/remove", post(remove_facet_favorite))
         .route(
             "/{id}/settings",
             get(profile_settings).post(update_profile_settings),
@@ -278,9 +307,11 @@ async fn list_favorites(
     Query(q): Query<FavoritesQuery>,
 ) -> Json<Value> {
     let repo = ProfileRepo::with_backend(state.backend.clone());
-    let items = repo
-        .list_favorites(id, q.item_type.as_deref())
-        .unwrap_or_default();
+    let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        Some(tri) => repo.list_favorites_sorted(id, q.item_type.as_deref(), tri),
+        None => repo.list_favorites(id, q.item_type.as_deref()),
+    }
+    .unwrap_or_default();
     Json(json!(items))
 }
 
@@ -319,7 +350,11 @@ async fn list_streaming_favorites(
     Query(q): Query<FavoritesQuery>,
 ) -> Json<Value> {
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
-    let items = repo.list(id, q.item_type.as_deref()).unwrap_or_default();
+    let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
+        Some(tri) => repo.list_sorted(id, q.item_type.as_deref(), tri),
+        None => repo.list(id, q.item_type.as_deref()),
+    }
+    .unwrap_or_default();
     Json(json!(items))
 }
 
@@ -352,6 +387,54 @@ async fn remove_streaming_favorite(
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.remove(id, &body.item_type, &body.service, &body.service_id) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+// --- Favoris de facette (label…) : une VALEUR, pas un identifiant (#2442) ---
+
+async fn list_facet_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FacetsQuery>,
+) -> Json<Value> {
+    let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
+    // Site nommé par la #2861 : une panne de base rendait `200 []`, que le
+    // client ne distingue pas d'une liste de favoris vide. La réponse reste la
+    // même — retirer ses favoris à quelqu'un parce qu'une requête a échoué
+    // serait pire —, mais l'échec laisse désormais une trace.
+    let items = repo.list(id, q.facet.as_deref()).ou_defaut_journalise();
+    Json(json!(items))
+}
+
+async fn add_facet_favorite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<FacetFavoriteAction>,
+) -> impl IntoResponse {
+    let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
+    match repo.add(id, &body.facet, &body.value) {
+        Ok(_) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        // Une valeur vide est une demande MALFORMÉE, pas une panne du serveur :
+        // un 500 enverrait chercher la cause en base.
+        Err(e) if e == "valeur de facette vide" => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+async fn remove_facet_favorite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<FacetFavoriteAction>,
+) -> impl IntoResponse {
+    let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
+    match repo.remove(id, &body.facet, &body.value) {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) if e == "valeur de facette vide" => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -443,7 +526,7 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
             ),
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -462,7 +545,7 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
             ),
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .map(|cols| {
             json!({
@@ -519,7 +602,7 @@ async fn profile_history(
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {

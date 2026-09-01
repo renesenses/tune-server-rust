@@ -114,13 +114,21 @@ fn verifier(fichier: &str) {
 
 #[test]
 fn tout_job_de_release_a_un_plafond() {
-    verifier("release.yml");
+    for fichier in [
+        "release.yml",
+        "docker.yml",
+        "trigger-os-images.yml",
+        "promote-release.yml",
+    ] {
+        verifier(fichier);
+    }
 }
 
 #[test]
 fn tout_job_de_ci_a_un_plafond() {
     for fichier in [
         "ci.yml",
+        "preflight.yml",
         "test-postgres.yml",
         "refs-issues.yml",
         "widget-ci.yml",
@@ -133,6 +141,117 @@ fn workflow(fichier: &str) -> String {
     let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::read_to_string(racine.join("../.github/workflows").join(fichier))
         .unwrap_or_else(|e| panic!("{fichier} illisible : {e}"))
+}
+
+#[test]
+fn la_release_attend_le_preflight_avant_de_construire() {
+    let release = workflow("release.yml");
+    let jobs = jobs(&release);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de release.yml"))
+    };
+
+    assert!(
+        corps("preflight").contains("uses: ./.github/workflows/preflight.yml"),
+        "Release ne reutilise pas le preflight : deux workflows declenches par le tag peuvent diverger"
+    );
+    assert!(
+        corps("web-client")
+            .lines()
+            .any(|ligne| { cle_de_job(ligne, "needs:") && ligne.trim() == "needs: preflight" }),
+        "le premier job de construction peut demarrer sans attendre le preflight"
+    );
+
+    let preflight = workflow("preflight.yml");
+    assert!(
+        preflight.contains("  workflow_call:"),
+        "preflight.yml ne peut pas etre appele comme dependance de Release"
+    );
+    assert!(
+        !preflight.contains("  push:\n    tags: [\"v*\"]"),
+        "le tag lance encore un second preflight independant et duplique"
+    );
+}
+
+#[test]
+fn le_tag_serveur_est_le_seul_declencheur_et_ne_promeut_rien_directement() {
+    let release = workflow("release.yml");
+    assert!(release.contains("push:\n    tags: [\"v*\"]"));
+
+    for fichier in ["docker.yml", "trigger-os-images.yml", "changelog.yml"] {
+        let source = workflow(fichier);
+        assert!(
+            !source.contains("push:\n    tags:"),
+            "{fichier} publie encore en parallele sur le push du tag"
+        );
+    }
+
+    let jobs = jobs(&release);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de release.yml"))
+    };
+    assert!(corps("stage-docker").contains("uses: ./.github/workflows/docker.yml"));
+    assert!(corps("stage-os").contains("uses: ./.github/workflows/trigger-os-images.yml"));
+    assert!(corps("staging-complete").contains("needs: [publish, stage-docker, stage-os]"));
+    assert!(corps("publish").contains("gh release view"));
+    assert!(!corps("publish").contains("--draft=false"));
+}
+
+#[test]
+fn docker_est_construit_une_fois_en_staging_puis_promu_par_digest() {
+    let docker = workflow("docker.yml");
+    assert!(docker.contains("push: true"));
+    assert!(docker.contains("staging-${{ steps.train.outputs.version }}"));
+    assert!(!docker.contains("format('{0}:latest'"));
+
+    let promotion = workflow("promote-release.yml");
+    assert!(promotion.contains("docker buildx imagetools inspect"));
+    assert!(promotion.contains("docker buildx imagetools create"));
+    assert!(promotion.contains("renesenses/tune:staging-$TAG"));
+    assert!(promotion.contains("--tag renesenses/tune:latest"));
+}
+
+#[test]
+fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
+    let os = workflow("trigger-os-images.yml");
+    for preuve in [
+        "server_sha256_x86_64",
+        "server_sha256_aarch64",
+        "os_sha",
+        "os_tag",
+        "release OS deja publique",
+        "wait_workflow build-iso.yml",
+        "wait_workflow build-rpi-image.yml",
+        "wait_workflow build-x86-image.yml",
+    ] {
+        assert!(
+            os.contains(preuve),
+            "preuve OS absente du workflow: {preuve}"
+        );
+    }
+}
+
+#[test]
+fn la_promotion_est_manuelle_armee_et_idempotente() {
+    let promotion = workflow("promote-release.yml");
+    assert!(promotion.contains("workflow_dispatch:"));
+    assert!(!promotion.contains("  push:"));
+    assert!(promotion.contains("default: true"));
+    assert!(promotion.contains("RELEASE_PROMOTION_ENABLED"));
+    assert!(promotion.contains(".ready == true"));
+    assert!(promotion.contains("release-dry-run"));
+    assert!(promotion.contains("release-promotion"));
+    assert!(
+        promotion
+            .contains("if [ \"$(gh release view \"$TAG\" --json isDraft --jq .isDraft)\" = true ]")
+    );
+    assert!(promotion.contains("Android inchange : absent du manifeste a quatre composants"));
 }
 
 #[test]
@@ -156,6 +275,31 @@ fn les_runs_obsoletes_de_pr_sont_annules() {
 }
 
 #[test]
+fn la_synchronisation_post_release_est_un_outil_de_reparation_manuel() {
+    let garde = workflow("post-release-main-sync.yml");
+    assert!(garde.contains("workflow_dispatch:"));
+    assert!(!garde.contains("workflow_run:"));
+    assert!(garde.contains("pull-requests: write"));
+    assert!(garde.contains("scripts/synchroniser-release-main.py --self-test"));
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(racine.join("../scripts/synchroniser-release-main.py"))
+        .expect("garde-fou post-release lisible");
+    assert!(script.contains("merge-base"));
+    assert!(script.contains("--is-ancestor"));
+    assert!(script.contains("\"pr\",\n            \"create\""));
+    assert!(script.contains("\"pr\", \"reopen\""));
+    assert!(script.contains("refs/heads/{branche}"));
+    assert!(script.contains("PR créée sans auto-merge"));
+    assert!(!script.contains("git reset"));
+    assert!(!script.contains("push --force"));
+    assert!(!script.contains("pr merge"));
+
+    let ci = workflow("ci.yml");
+    assert!(ci.contains("python3 scripts/synchroniser-release-main.py --self-test"));
+}
+
+#[test]
 fn les_pr_empilees_declenchent_la_ci_rapide() {
     let source = workflow("ci.yml");
     let declencheurs = source
@@ -171,11 +315,11 @@ fn les_pr_empilees_declenchent_la_ci_rapide() {
 }
 
 #[test]
-fn la_voie_rapide_est_reservee_aux_bases_batch() {
+fn la_voie_rapide_est_reservee_aux_bases_integration() {
     let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
     let profil = fs::read_to_string(racine.join("../scripts/determiner-profil-ci.sh"))
         .expect("scripts/determiner-profil-ci.sh lisible");
-    assert!(profil.contains("batch/*) printf '%s\\n' rapide"));
+    assert!(profil.contains("batch/*|rc/*) printf '%s\\n' rapide"));
     assert!(profil.contains("*) printf '%s\\n' complet"));
     assert!(profil.contains("FORCER_COMPLET"));
 
@@ -188,6 +332,7 @@ fn la_voie_rapide_est_reservee_aux_bases_batch() {
 
     let postgres = workflow("test-postgres.yml");
     assert!(postgres.contains("!startsWith(github.base_ref, 'batch/')"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'rc/')"));
     assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
 }
 
@@ -215,7 +360,7 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(macos.contains("cargo check --package tune-server"));
 
     // Le noyau reste execute sur chaque correctif Rust. Les suites longues et
-    // les deux plateformes ne sont differees que pour une base batch/*.
+    // les deux plateformes ne sont differees que pour une base batch/* ou rc/*.
     for nom in ["fmt", "test", "clippy", "audit", "ffi"] {
         assert!(
             !corps(nom).contains("needs.impact.outputs.full"),
@@ -302,6 +447,41 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     assert!(impact.contains("bash scripts/verifier-fermeture.sh --autotest"));
     assert!(impact.contains("bash scripts/verifier-refs-issues.sh --autotest"));
     assert!(impact.contains("python3 scripts/preflight-check.py --self-test"));
+}
+
+#[test]
+fn les_alias_linux_stables_sont_crees_avant_les_sommes() {
+    let release = workflow("release.yml");
+    let aliases = release
+        .find("bash scripts/creer-alias-actifs-release.sh artifacts")
+        .expect("release.yml ne cree plus les alias Linux stables");
+    let sommes = release
+        .find("- name: Checksums")
+        .expect("l'etape SHA256SUMS a disparu de release.yml");
+
+    assert!(
+        aliases < sommes,
+        "les alias sont crees apres SHA256SUMS et ne sont donc pas signes"
+    );
+    assert!(release.contains("artifacts/**/*.tar.gz"));
+}
+
+#[test]
+fn le_script_des_alias_release_passe_ses_contre_epreuves() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = racine.join("../scripts/creer-alias-actifs-release.sh");
+    let sortie = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("--autotest")
+        .output()
+        .expect("impossible d'executer l'autotest des alias de release");
+
+    assert!(
+        sortie.status.success(),
+        "autotest des alias en echec:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sortie.stdout),
+        String::from_utf8_lossy(&sortie.stderr)
+    );
 }
 
 /// `setup-rust-toolchain` active son propre `Swatinem/rust-cache` par defaut.
@@ -542,5 +722,149 @@ fn le_tamponnage_du_dmg_reessaie() {
     assert!(
         etape.contains("sleep"),
         "la boucle de reprises n'attend pas entre deux essais"
+    );
+}
+
+/// Garde-fou : toute feature declaree par le serveur est activee par une porte
+/// clippy — la liste des features de `ci.yml` est un INVENTAIRE, pas un
+/// echantillon.
+///
+/// La porte clippy est lancee avec `--no-default-features` et une liste
+/// explicite. Une feature absente de cette liste n'est donc lue par AUCUN
+/// lint : le code qu'elle garde n'est verifie que quand un humain y pense.
+///
+/// Mesure du 31/08/2026, avant ce garde-fou (#2865) — quatre features nues :
+///
+/// | feature | fichiers gardes | lignes du plus gros fichier |
+/// |---|---|---|
+/// | `local-audio` | 16 | `outputs/local.rs`, 10 826 |
+/// | `postgres` | 11 | `db/pg_migrate.rs`, 1 285 |
+/// | `audio-embedding` | 3 | `audio/embedding.rs`, 2 199 |
+/// | `asio` | 3 | (Windows seulement) |
+///
+/// L'issue #2865 ne citait que `audio-embedding`. Le trou le plus gros etait
+/// ailleurs : `--no-default-features` RETIRE `local-audio`, qui est pourtant
+/// dans le `default` des deux crates. Corriger le seul cas cite aurait laisse
+/// dix mille lignes nues — d'ou ce test, qui compte au lieu de citer.
+///
+/// Le test ne credite QUE les features nommees explicitement sur une ligne
+/// `cargo clippy`. Une feature amenee par `default` ne compte pas : c'est
+/// exactement l'illusion qui a coute Bandcamp en 0.9.82 (#1768), ou une
+/// feature posee dans `default` n'atteignait aucun binaire publie.
+#[test]
+fn toute_feature_declaree_est_activee_par_une_porte_clippy() {
+    // Une feature hors porte doit etre INSCRITE ici avec sa raison. La liste
+    // se relit ; un oubli, non.
+    const HORS_PORTE: &[(&str, &str)] = &[
+        (
+            "asio",
+            "`cpal/asio` ne se compile que sous Windows (SDK Steinberg). Les \
+             runners de la porte clippy sont ubuntu-latest. Couverte par le job \
+             `windows-pr`, qui la compile en `cargo check`.",
+        ),
+        (
+            "plugin-http",
+            "activee EN DUR par la declaration de dependance de tune-server \
+             (`tune-core = { …, features = [\"plugin-http\"] }`). Toute porte \
+             qui compile tune-server la compile : elle ne peut pas etre nue.",
+        ),
+    ];
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. Les features declarees par les deux crates qui portent du code garde.
+    let mut declarees: Vec<String> = Vec::new();
+    for manifeste in ["Cargo.toml", "../tune-core/Cargo.toml"] {
+        let source = fs::read_to_string(racine.join(manifeste))
+            .unwrap_or_else(|e| panic!("{manifeste} illisible : {e}"));
+        let mut dedans = false;
+        for ligne in source.lines() {
+            let t = ligne.trim();
+            if t.starts_with('[') {
+                dedans = t == "[features]";
+                continue;
+            }
+            if !dedans || t.starts_with('#') {
+                continue;
+            }
+            let Some((nom, _)) = t.split_once(" = [") else {
+                continue;
+            };
+            let nom = nom.trim();
+            if nom == "default" || nom.is_empty() {
+                continue;
+            }
+            if !declarees.iter().any(|d| d.as_str() == nom) {
+                declarees.push(nom.to_string());
+            }
+        }
+    }
+    assert!(
+        declarees.len() >= 8,
+        "le garde-fou n'a reconnu que {} feature(s) — la forme `nom = [\"…\"]` \
+         des manifestes a change, et ce test ne garde plus rien : {declarees:?}",
+        declarees.len()
+    );
+
+    // 2. Les features activees explicitement par une ligne `cargo clippy`.
+    let ci = workflow("ci.yml");
+    let mut lignes_clippy = 0usize;
+    let mut couvertes: Vec<String> = Vec::new();
+    for ligne in ci.lines() {
+        let t = ligne.trim();
+        if !t.contains("cargo clippy") {
+            continue;
+        }
+        lignes_clippy += 1;
+        let Some(reste) = t.split("--features").nth(1) else {
+            continue;
+        };
+        let Some(liste) = reste.split_whitespace().next() else {
+            continue;
+        };
+        for f in liste.split(',') {
+            let f = f.trim();
+            if !f.is_empty() && !couvertes.iter().any(|c| c.as_str() == f) {
+                couvertes.push(f.to_string());
+            }
+        }
+    }
+    assert!(
+        lignes_clippy > 0,
+        "aucune ligne `cargo clippy` dans ci.yml — le garde-fou ne garde plus rien"
+    );
+
+    // 3. Le verdict.
+    let nues: Vec<&str> = declarees
+        .iter()
+        .map(|f| f.as_str())
+        .filter(|f| !couvertes.iter().any(|c| c.as_str() == *f))
+        .filter(|f| !HORS_PORTE.iter().any(|(nom, _)| *nom == *f))
+        .collect();
+
+    assert!(
+        nues.is_empty(),
+        "ces features ne sont activees par AUCUNE porte clippy de ci.yml : \
+         {nues:?}\n\
+         Le code qu'elles gardent n'est lu par aucun lint — il n'est verifie \
+         que quand un agent y pense a la main (#2865).\n\
+         Deux issues seulement :\n\
+           1. les ajouter a la liste `--features` du job `clippy` ;\n\
+           2. les inscrire dans HORS_PORTE ci-dessus AVEC leur raison, si la \
+         porte ne PEUT pas les compiler (OS, materiel).\n\
+         Features couvertes aujourd'hui : {couvertes:?}"
+    );
+
+    // Une entree de HORS_PORTE qui ne correspond a aucune feature declaree est
+    // une justification perimee : elle rassure sans rien couvrir.
+    let perimees: Vec<&str> = HORS_PORTE
+        .iter()
+        .map(|(nom, _)| *nom)
+        .filter(|nom| !declarees.iter().any(|d| d.as_str() == *nom))
+        .collect();
+    assert!(
+        perimees.is_empty(),
+        "HORS_PORTE justifie des features qui n'existent plus : {perimees:?} — \
+         retirer l'entree plutot que la laisser rassurer"
     );
 }

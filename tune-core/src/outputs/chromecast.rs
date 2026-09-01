@@ -48,6 +48,36 @@ async fn resolve_cast_addresses(
     Ok(addresses)
 }
 
+/// Ce qu'une commande Cast en échec ajoute à son message : le temps réellement
+/// consommé, et le budget dont elle disposait.
+///
+/// **La mesure qui manquait (#2566).** Le journal de Dimitri portait 79 fois
+/// `media status: …` sans jamais dire combien de temps la commande avait duré.
+/// Impossible d'y distinguer les deux causes, qui n'appellent pas le même
+/// travail :
+///
+/// | ce qu'on lit | ce que ça veut dire |
+/// |---|---|
+/// | `after 2003ms of 2000ms budget` | le budget est épuisé — la chaîne est trop lente pour 2 s |
+/// | `after 40ms of 2000ms budget` | l'appareil a refusé, vite et franchement |
+///
+/// Le suffixe part dans le champ `error=` de la ligne déjà journalisée par le
+/// poller : **aucune ligne supplémentaire**, la mesure voyage avec l'erreur
+/// existante.
+///
+/// ⚠️ Ce suffixe MESURE, il ne corrige pas. Savoir si
+/// [`CAST_COMMAND_TIMEOUT`] doit grandir se décide sur ces chiffres, une fois
+/// qu'un journal les portera — pas ici, et pas au jugé : le poller est une
+/// tâche SÉQUENTIELLE sur toutes les zones, allonger le budget d'une sortie
+/// ralentit la détection de fin de piste de toutes les autres.
+fn with_elapsed(error: String, started: Instant, budget: Duration) -> String {
+    format!(
+        "{error} (after {}ms of {}ms budget)",
+        started.elapsed().as_millis(),
+        budget.as_millis()
+    )
+}
+
 async fn run_cast_command<T, F>(
     host: String,
     port: u16,
@@ -59,7 +89,27 @@ where
     T: Send + 'static,
     F: FnOnce(rust_cast::CastDevice<'static>) -> Result<T, String> + Send + 'static,
 {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    // Un seul point de sortie en erreur pour toute la fonction : sinon un
+    // chemin d'échec ajouté plus tard oublierait la mesure.
+    run_cast_command_inner(host, port, timeout, slots, operation, started)
+        .await
+        .map_err(|error| with_elapsed(error, started, timeout))
+}
+
+async fn run_cast_command_inner<T, F>(
+    host: String,
+    port: u16,
+    timeout: Duration,
+    slots: Arc<Semaphore>,
+    operation: F,
+    started: Instant,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(rust_cast::CastDevice<'static>) -> Result<T, String> + Send + 'static,
+{
+    let deadline = started + timeout;
     let permit = tokio::time::timeout(remaining_budget(deadline)?, slots.acquire_owned())
         .await
         .map_err(|_| "chromecast worker deadline elapsed".to_string())?
@@ -102,6 +152,131 @@ fn reusable_session(
     apps.iter()
         .find(|a| a.app_id == app_id)
         .map(|a| (a.transport_id.clone(), a.session_id.clone()))
+}
+
+/// Ce qu'un arrêt de zone envoie à un récepteur Cast.
+///
+/// La décision est isolée ici parce que c'est la SEULE partie de l'arrêt
+/// vérifiable sans matériel : le reste part sur le fil.
+#[derive(Debug, PartialEq, Eq)]
+enum StopPlan {
+    /// Notre lecteur tourne : arrêter le MÉDIA sur son transport. La session
+    /// applicative reste ouverte, donc réutilisable par la lecture suivante.
+    StopMedia { transport_id: String },
+    /// Rien qui nous appartienne ne tourne : appareil au repos, ou occupé par
+    /// une AUTRE application. On n'envoie rien.
+    Leave,
+}
+
+/// Arrêter la lecture SANS quitter l'application du récepteur.
+///
+/// Deux défauts se corrigent d'un même geste ici.
+///
+/// **1. Le carillon après un arrêt (#1953, #2520).** L'ancien arrêt appelait
+/// `receiver.stop_app`, documenté dans notre propre vendor
+/// (`vendor/rust_cast/src/channels/receiver.rs`) comme *« Stops currently
+/// active app »* : il QUITTE l'application. L'appareil retombe au repos,
+/// `reusable_session` ne trouve plus rien, et la lecture suivante repart sur un
+/// `LAUNCH` complet — c'est-à-dire exactement le carillon que la PR #2048 avait
+/// supprimé du changement de piste. FabienM, fil 1482 du 26/08 : *« Dès qu'on
+/// stoppe la chanson et qu'on joue une nouvelle sur la même zone CAST, on
+/// entend le BIP. »* Le canal média expose un arrêt qui n'a pas cet effet
+/// (`vendor/rust_cast/src/channels/media.rs`, `MediaChannel::stop`) : il
+/// invalide la session MÉDIA et laisse l'application en place. C'est déjà par
+/// ce canal-là que passent `pause`, `resume` et `seek` ; l'arrêt était le seul
+/// des quatre à s'adresser au récepteur.
+///
+/// **2. Couper la musique de quelqu'un d'autre.** L'ancien arrêt prenait
+/// `applications.first()` sans regarder `app_id` : sur un appareil occupé par
+/// YouTube ou Spotify, un arrêt de zone Tune quittait LEUR application. On ne
+/// vise plus que la nôtre.
+///
+/// **Pourquoi pas une simple pause ?** Parce que l'orchestrateur détruit la
+/// session de flux juste après l'arrêt (`orchestrator.rs`, `remove_session`) :
+/// un média seulement mis en pause laisserait le récepteur accroché à une URL
+/// morte. `MediaChannel::stop` relâche le média *et* invalide son
+/// `media_session_id` — la piste suivante ne peut donc pas être « reprise »
+/// par erreur, elle passe obligatoirement par un `LOAD` neuf.
+///
+/// **Changement de format en cours de session.** Il n'oblige PAS à relancer le
+/// récepteur, et c'est vérifiable ici : le format n'est porté par aucune des
+/// deux chaînes que la session conserve (`transport_id`, `session_id`). Il est
+/// entièrement redéclaré à chaque `LOAD` par `build_cast_media` — type MIME,
+/// type de flux et durée sortent du `PlayMedia` de la piste, depuis #2248/#2562
+/// qui a justement rendu `stream_type` variable (`Live` pour une webradio,
+/// `Buffered` pour un fichier). Une session conservée d'une radio à un fichier
+/// ne transporte donc aucun format périmé. C'est ce que verrouille
+/// `une_session_conservee_reannonce_le_format_a_chaque_piste`.
+///
+/// **Et l'appareil, on le rend quand ?** Jamais par nous, volontairement : un
+/// `LAUNCH` venu d'un autre expéditeur remplace l'application en cours, donc ne
+/// pas quitter la nôtre ne verrouille personne. ⚠️ Le récepteur par défaut se
+/// met aussi au repos tout seul après une période d'inactivité — durée que je
+/// n'ai pas mesurée. Un arrêt suivi d'une reprise TRÈS tardive peut donc
+/// carillonner malgré ce correctif ; c'est une limite de l'appareil, pas de
+/// Tune.
+fn plan_stop(apps: &[rust_cast::channels::receiver::Application], app_id: &str) -> StopPlan {
+    match reusable_session(apps, app_id) {
+        Some((transport_id, _)) => StopPlan::StopMedia { transport_id },
+        None => StopPlan::Leave,
+    }
+}
+
+/// Le média `LOAD` tel qu'il part sur le fil, construit à partir du contrat
+/// `PlayMedia`. Fonction pure : c'est elle que les tests interrogent, faute de
+/// pouvoir brancher un vrai récepteur Cast.
+fn build_cast_media(media: &super::traits::PlayMedia<'_>) -> rust_cast::channels::media::Media {
+    use rust_cast::channels::media::{Image, Media, Metadata, MusicTrackMediaMetadata, StreamType};
+
+    // Le type de flux et la durée se décident ENSEMBLE, sinon la barre de
+    // progression ment. Une webradio est infinie : `Buffered` fait croire au
+    // récepteur qu'il tient un fichier borné, et une durée sur un flux sans fin
+    // n'existe pas. Les deux se lisent du même `live_stream`, ici et nulle part
+    // ailleurs, pour qu'on ne puisse pas corriger l'un en oubliant l'autre.
+    let (stream_type, duration) = if media.live_stream {
+        (StreamType::Live, None)
+    } else {
+        // 0 est la valeur « inconnu » de plusieurs lignes en base. Annoncer une
+        // piste de durée nulle est pire que n'annoncer aucune durée : le
+        // récepteur affiche une barre déjà terminée. Le champ Cast est en
+        // SECONDES, `PlayMedia` en millisecondes.
+        let seconds = media
+            .duration_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms as f32 / 1000.0);
+        (StreamType::Buffered, seconds)
+    };
+
+    // Même règle pour la numérotation : la ligne de bibliothèque stocke 0 pour
+    // « inconnu », et une piste 0 sur 0 est un chiffre inventé.
+    let positive = |n: Option<u32>| n.filter(|v| *v > 0);
+
+    Media {
+        content_id: media.url.to_string(),
+        content_type: media.mime_type.to_string(),
+        stream_type,
+        duration,
+        metadata: Some(Metadata::MusicTrack(MusicTrackMediaMetadata {
+            album_name: media.album.map(String::from),
+            title: media.title.map(String::from),
+            // `PlayMedia` ne porte pas d'artiste d'album ni de compositeur ni de
+            // date de sortie : les déduire de l'artiste de piste serait annoncer
+            // une valeur que Tune n'a pas mesurée.
+            album_artist: None,
+            artist: media.artist.map(String::from),
+            composer: None,
+            track_number: positive(media.track_number),
+            disc_number: positive(media.disc_number),
+            // `cover_url` est déjà résolue en URL absolue par l'orchestrateur
+            // (`resolve_cover_url`) : le Chromecast va la chercher lui-meme sur
+            // le réseau, un chemin local ne lui servirait à rien.
+            images: media
+                .cover_url
+                .map(|url| vec![Image::new(url.to_string())])
+                .unwrap_or_default(),
+            release_date: None,
+        })),
+    }
 }
 
 pub struct ChromecastOutput {
@@ -165,11 +340,11 @@ impl OutputTarget for ChromecastOutput {
         Some(&self.host)
     }
 
-    async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
-        self.play_url(media.url, media.mime_type, media.title, media.artist)
-            .await
-    }
-
+    /// `play_url` ne porte que quatre champs ; c'est `play_media` qui tient le
+    /// contrat complet, donc c'est ici qu'est la vraie implémentation. La
+    /// délégation va dans ce sens-là, et pas l'inverse : #2248, où le riche
+    /// `PlayMedia` était réduit à URL/MIME/titre/artiste avant même d'arriver
+    /// au constructeur du message `LOAD`.
     async fn play_url(
         &self,
         url: &str,
@@ -177,10 +352,19 @@ impl OutputTarget for ChromecastOutput {
         title: Option<&str>,
         artist: Option<&str>,
     ) -> Result<(), String> {
-        let url = url.to_string();
-        let mime = mime_type.to_string();
-        let title = title.map(String::from);
-        let artist = artist.map(String::from);
+        self.play_media(&super::traits::PlayMedia {
+            url,
+            mime_type,
+            title,
+            artist,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
+        let cast_media = build_cast_media(media);
+        let url = media.url.to_string();
         let host = self.host.clone();
         let port = self.port;
         let name = self.name.clone();
@@ -225,29 +409,7 @@ impl OutputTarget for ChromecastOutput {
 
             device
                 .media
-                .load(
-                    &transport_id,
-                    &session_id,
-                    &rust_cast::channels::media::Media {
-                        content_id: url.clone(),
-                        content_type: mime,
-                        stream_type: rust_cast::channels::media::StreamType::Buffered,
-                        duration: None,
-                        metadata: Some(rust_cast::channels::media::Metadata::MusicTrack(
-                            rust_cast::channels::media::MusicTrackMediaMetadata {
-                                album_name: None,
-                                title,
-                                album_artist: None,
-                                artist,
-                                composer: None,
-                                track_number: None,
-                                disc_number: None,
-                                images: vec![],
-                                release_date: None,
-                            },
-                        )),
-                    },
-                )
+                .load(&transport_id, &session_id, &cast_media)
                 .map_err(|e| format!("load media: {e}"))?;
 
             // `session_reused=false` sur une piste qui n'est pas la première
@@ -331,9 +493,12 @@ impl OutputTarget for ChromecastOutput {
         .await
     }
 
+    /// Voir `plan_stop` : l'arrêt relâche le média, il ne quitte plus
+    /// l'application du récepteur.
     async fn stop(&self) -> Result<(), String> {
         let host = self.host.clone();
         let port = self.port;
+        let name = self.name.clone();
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
         run_cast_command(host, port, timeout, slots, move |device| {
@@ -345,12 +510,38 @@ impl OutputTarget for ChromecastOutput {
                 .receiver
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
-            if let Some(app) = status.applications.first() {
+
+            let app_id =
+                rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver.to_string();
+            let StopPlan::StopMedia { transport_id } = plan_stop(&status.applications, &app_id)
+            else {
+                // Un arrêt réussi n'écrivait AUCUNE ligne : le seul témoin
+                // était le `device_stop_failed` de l'appelant, en cas d'erreur
+                // seulement. Un journal ne pouvait donc pas dire si un arrêt
+                // avait eu lieu — c'est ce qui a manqué pour instruire #2520.
+                info!(device = %name, session_kept = false, "chromecast_stop");
+                return Ok(());
+            };
+
+            device
+                .connection
+                .connect(&transport_id)
+                .map_err(|e| format!("connect transport: {e}"))?;
+            let media_status = device
+                .media
+                .get_status(&transport_id, None)
+                .map_err(|e| format!("media status: {e}"))?;
+            if let Some(entry) = media_status.entries.first() {
                 device
-                    .receiver
-                    .stop_app(&app.session_id)
+                    .media
+                    .stop(&transport_id, entry.media_session_id)
                     .map_err(|e| format!("stop: {e}"))?;
             }
+
+            // `session_kept=true` sur l'arrêt et `session_reused=true` sur la
+            // lecture qui suit : les deux lignes ensemble prouvent que la
+            // session a survécu à l'arrêt, sans avoir à écouter l'enceinte.
+            info!(device = %name, session_kept = true, "chromecast_stop");
             Ok::<(), String>(())
         })
         .await
@@ -678,9 +869,28 @@ mod deadline_tests {
             }
         })
         .await
-        .expect("les workers doivent rendre leur permis apres la deadline");
+        .expect("le faux pair doit voir toutes ses sockets se fermer");
         assert!(maximum.load(Ordering::SeqCst) <= 2);
-        assert_eq!(slots.available_permits(), 2);
+
+        // `active` compte les sockets vues par le FAUX PAIR : il retombe a zero
+        // des que le client ferme. Le permis, lui, appartient a la tache
+        // BLOQUANTE (`let _permit`) et n'est rendu qu'a la fin de celle-ci —
+        // volontairement, pour qu'un appelant expire ne libere pas de capacite
+        // pendant que son worker vit encore. Les deux evenements sont donc
+        // distincts, et sous charge le second traine : conclure sur le premier
+        // faisait echouer ce test sur une COURSE, jamais sur une fuite (gate du
+        // 27/08, 1 rouge sur 2612 en pleine charge, vert isole 4 fois sur 4).
+        //
+        // On attend donc le permis LUI-MEME, borne. Le test garde toute sa
+        // force : une vraie fuite ne rend jamais le permis, l'attente expire,
+        // et l'echec revient.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("les workers doivent rendre leur permis apres la deadline");
         server.abort();
     }
 
@@ -710,6 +920,251 @@ mod deadline_tests {
         let start = Instant::now();
         assert!(output.pause().await.is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// #2566 — ce que le POLLER reçoit ne porte aucun errno.
+    ///
+    /// ⚠️ **Ce test ne TIENT pas la traduction de l'errno**, contrairement à
+    /// ce qu'affirmait sa description d'origine (« EXACTEMENT le chemin de
+    /// Dimitri — un délai de socket qui expire pendant un read »). Son verdict
+    /// dépend d'une COURSE, parce que [`run_cast_command_inner`] arme DEUX
+    /// horloges sur la même échéance : le délai posé sur la socket, et le
+    /// `tokio::time::timeout` qui garde la tâche bloquante.
+    ///
+    /// Mesuré le 30/08 sur Shrek en neutralisant
+    /// `DeadlineTcpStream::as_deadline_error`, deux passages ont donné deux
+    /// verdicts opposés :
+    ///
+    /// | horloge gagnante | message obtenu | verdict |
+    /// |---|---|---|
+    /// | `tokio::time::timeout` | `chromecast command deadline elapsed (after 120ms of 120ms budget)` | **vert** — la traduction manquait pourtant |
+    /// | délai de socket | `connect receiver: Resource temporarily unavailable (os error 11) (after …)` | rouge |
+    ///
+    /// Un garde-fou qui rend un tour sur deux ne garde rien. Ce test reste
+    /// utile pour ce qu'il éprouve VRAIMENT — le **message rendu au poller**,
+    /// dont aucune des deux issues ne doit nommer une ressource occupée — mais
+    /// il ne peut pas servir de preuve du correctif.
+    ///
+    /// La traduction elle-même est tenue par
+    /// [`le_delai_de_la_socket_est_traduit_avant_de_quitter_la_chaine_cast`],
+    /// où aucune horloge asynchrone ne peut prendre les devants.
+    ///
+    /// L'assertion négative porte sur **`os error`** et non sur le texte
+    /// anglais : le texte de l'errno est traduit par la libc selon la locale,
+    /// le suffixe `(os error N)` que Rust ajoute ne l'est pas. C'est donc la
+    /// seule signature portable d'un errno brut remonté tel quel.
+    #[tokio::test]
+    async fn un_delai_depasse_ne_parle_plus_de_ressource_indisponible() {
+        let (port, _active, _maximum, server) = silent_tcp_peer().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(120),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+
+        let error = output.get_status().await.expect_err("le pair se tait");
+
+        assert!(
+            !error.contains("os error"),
+            "l'errno brut ne doit plus remonter au journal : {error}"
+        );
+        assert!(
+            error.contains("deadline elapsed"),
+            "le message doit nommer l'échéance dépassée : {error}"
+        );
+        server.abort();
+    }
+
+    /// #2566 — le garde-fou qui exerce VRAIMENT la traduction de l'errno.
+    ///
+    /// **Le chemin de Dimitri, sans horloge concurrente.** Sa ligne portait
+    /// `media status: Resource temporarily unavailable (os error 35)` : le
+    /// délai posé sur la socket par `DeadlineTcpStream` expire PENDANT un read,
+    /// la socket rend `WouldBlock` — `EAGAIN`, numéro 35 sur macOS — et ce
+    /// texte remontait tel quel jusqu'au journal. C'est cette traduction-là que
+    /// le correctif pose, et c'est elle qui n'était tenue par aucun test :
+    /// tous les autres passent par [`run_cast_command`], dont le
+    /// `tokio::time::timeout` expire à la même échéance et gagne la course.
+    ///
+    /// Ici on tient la chaîne Cast en direct, exactement comme le fait la tâche
+    /// bloquante : le pair accepte la connexion TCP puis se tait, la poignée de
+    /// main TLS écrit son `ClientHello` et attend une réponse qui ne viendra
+    /// pas. Le seul délai en jeu est celui de la socket, donc le message ne
+    /// peut venir que de la traduction.
+    ///
+    /// **Portable entre Linux et macOS, par construction.** Le même événement
+    /// sort en `EAGAIN` numéro **11 sur Linux**, **35 sur macOS**, et en
+    /// `TimedOut` sur Windows ; le texte de l'errno est en plus traduit par la
+    /// libc selon la locale. Aucune de ces trois formes n'est écrite ici :
+    /// l'assertion porte sur le suffixe `(os error` que **Rust** ajoute
+    /// lui-même à tout errno brut, seule signature stable d'un bout à l'autre.
+    /// Le correctif fait le même choix — `is_socket_deadline_error` teste
+    /// `ErrorKind`, jamais un entier.
+    #[test]
+    fn le_delai_de_la_socket_est_traduit_avant_de_quitter_la_chaine_cast() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            // Accepter, puis se taire : garder la socket vivante le temps que
+            // le client épuise son délai. La lâcher plus tôt ferait partir un
+            // FIN, et l'échec ne serait plus une échéance.
+            let accepted = listener.accept();
+            std::thread::sleep(Duration::from_millis(600));
+            drop(accepted);
+        });
+
+        let device = rust_cast::CastDevice::connect_without_host_verification_with_deadline(
+            "127.0.0.1".into(),
+            &[address],
+            Instant::now() + Duration::from_millis(150),
+        )
+        .expect("le pair accepte la connexion TCP");
+        let error = device
+            .connection
+            .connect("receiver-0")
+            .expect_err("le pair ne répond jamais")
+            .to_string();
+
+        assert!(
+            !error.contains("os error"),
+            "l'errno brut ne doit plus quitter la couche Cast : {error}"
+        );
+        assert!(
+            error.contains("Cast command deadline elapsed"),
+            "l'expiration du délai de socket doit se nommer : {error}"
+        );
+        peer.join().expect("le faux pair doit se terminer");
+    }
+
+    /// #2566 — l'échec porte la mesure qui manquait au journal de Dimitri.
+    ///
+    /// Sans elle, impossible de trancher entre « budget épuisé » et
+    /// « l'appareil a refusé » : les 79 lignes du testeur ne portaient aucune
+    /// durée. Le budget annoncé doit être celui de la sortie, pas une constante
+    /// recopiée — d'où les 120 ms explicites ici.
+    #[tokio::test]
+    async fn un_echec_porte_le_temps_ecoule_et_son_budget() {
+        let (port, _active, _maximum, server) = silent_tcp_peer().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(120),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+
+        let error = output.get_status().await.expect_err("le pair se tait");
+
+        assert!(
+            error.contains("of 120ms budget"),
+            "le budget de la commande doit figurer dans l'erreur : {error}"
+        );
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms >= 100,
+            "une commande qui épuise son budget de 120 ms ne peut pas rendre {elapsed_ms} ms"
+        );
+        server.abort();
+    }
+
+    /// La traduction doit rester SÉLECTIVE : elle ne remplace que l'expiration
+    /// d'un délai, jamais une panne de liaison.
+    ///
+    /// Sans ce garde-fou, écrire `as_deadline_error` en écrasant toute erreur
+    /// passerait les autres tests tout en détruisant l'information dans le cas
+    /// qui compte le plus — un appareil qui coupe la liaison.
+    ///
+    /// **Fermer la socket ne suffit PAS à l'éprouver** : une fermeture propre
+    /// rend `Ok(0)`, et c'est rustls — pas la socket — qui en fait une erreur.
+    /// Elle ne traverse donc jamais [`rust_cast::DeadlineTcpStream`], et le
+    /// garde-fou ne garderait rien (vérifié : la mutation « traduire toujours »
+    /// restait verte avec un simple `drop`).
+    ///
+    /// Il faut un vrai errno remonté PAR la socket : `SO_LINGER` à zéro fait
+    /// partir un RST à la fermeture, et le `read` suivant rend
+    /// `ECONNRESET` — la seule forme qui exerce réellement le test de `kind()`.
+    #[tokio::test]
+    async fn une_liaison_coupee_n_est_pas_maquillee_en_echeance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Laisser partir le `ClientHello` avant de couper, sinon le
+                    // client échoue à l'écriture et non à la lecture.
+                    let mut bytes = [0u8; 1024];
+                    let _ = socket.read(&mut bytes).await;
+                    let _ = socket.set_linger(Some(Duration::ZERO));
+                    drop(socket);
+                });
+            }
+        });
+        let output = test_output(port, Duration::from_secs(2), Arc::new(Semaphore::new(1)));
+
+        let error = output
+            .get_status()
+            .await
+            .expect_err("le pair coupe la liaison");
+
+        assert!(
+            !error.contains("deadline elapsed"),
+            "une liaison coupée n'est pas une échéance dépassée : {error}"
+        );
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms < 1_000,
+            "raccrocher est instantané, aucun budget n'est consommé ({elapsed_ms} ms)"
+        );
+        server.abort();
+    }
+
+    /// La mise en forme du suffixe, sans socket : c'est elle que le lecteur du
+    /// journal doit pouvoir comparer d'un coup d'œil (écoulé vs budget).
+    #[test]
+    fn le_suffixe_compare_l_ecoule_au_budget() {
+        let started = Instant::now() - Duration::from_millis(2_003);
+        let message = with_elapsed(
+            "media status: Cast command deadline elapsed".into(),
+            started,
+            Duration::from_secs(2),
+        );
+        assert!(message.starts_with("media status: Cast command deadline elapsed (after 2"));
+        assert!(message.ends_with("ms of 2000ms budget)"));
+    }
+
+    /// Un échec RAPIDE doit rester lisible comme tel : c'est le contre-cas qui
+    /// donne son sens au chiffre. Une connexion refusée n'épuise aucun budget,
+    /// et le suffixe doit le montrer.
+    #[tokio::test]
+    async fn un_refus_immediat_ne_consomme_pas_son_budget() {
+        let closed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let output = test_output(
+            closed_port,
+            Duration::from_secs(2),
+            Arc::new(Semaphore::new(1)),
+        );
+
+        let error = output.get_status().await.expect_err("le port est fermé");
+
+        assert!(error.contains("of 2000ms budget"), "{error}");
+        let elapsed_ms: u128 = error
+            .rsplit_once("(after ")
+            .and_then(|(_, tail)| tail.split_once("ms of"))
+            .map(|(ms, _)| ms.parse().expect("la durée doit être un nombre"))
+            .unwrap_or_else(|| panic!("l'erreur doit porter le temps écoulé : {error}"));
+        assert!(
+            elapsed_ms < 1_000,
+            "un refus immédiat ne doit pas être confondu avec un budget épuisé ({elapsed_ms} ms)"
+        );
     }
 }
 
@@ -777,6 +1232,137 @@ mod session_reuse_tests {
     fn le_lecteur_est_retrouve_meme_derriere_une_autre_application() {
         let apps = vec![app("233637DE"), app(DEFAULT_MEDIA_RECEIVER)];
         assert!(reusable_session(&apps, DEFAULT_MEDIA_RECEIVER).is_some());
+    }
+}
+
+/// #1953, second volet (#2520) : l'ARRÊT ne doit pas fermer la session non
+/// plus.
+///
+/// La réutilisation de session de #2048 ne couvrait que le changement de
+/// piste. FabienM, fil 1482 du 26/08 : *« Cela fonctionne lorsqu'on change de
+/// morceaux sans arrêter celle-ci ! Dès qu'on stoppe la chanson et qu'on joue
+/// une nouvelle sur la même zone CAST, on entend le BIP. »* L'arrêt quittait
+/// l'application ; la lecture suivante devait relancer le récepteur.
+///
+/// Comme pour #2048, ces tests portent sur la DÉCISION — la seule partie
+/// vérifiable sans matériel. Ils ne prouvent rien de l'audible.
+#[cfg(test)]
+mod stop_keeps_session_tests {
+    use super::*;
+    use crate::outputs::traits::PlayMedia;
+    use rust_cast::channels::media::StreamType;
+    use rust_cast::channels::receiver::Application;
+
+    const DEFAULT_MEDIA_RECEIVER: &str = "CC1AD845";
+    const YOUTUBE: &str = "233637DE";
+
+    fn app(app_id: &str) -> Application {
+        Application {
+            app_id: app_id.to_string(),
+            session_id: format!("session-{app_id}"),
+            transport_id: format!("transport-{app_id}"),
+            namespaces: vec![],
+            display_name: app_id.to_string(),
+            status_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn l_arret_vise_le_transport_de_notre_lecteur() {
+        assert_eq!(
+            plan_stop(&[app(DEFAULT_MEDIA_RECEIVER)], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::StopMedia {
+                transport_id: "transport-CC1AD845".to_string()
+            },
+            "l'arrêt doit passer par le canal média de NOTRE session"
+        );
+    }
+
+    #[test]
+    fn notre_lecteur_est_vise_meme_derriere_une_autre_application() {
+        // `applications.first()` rendait YouTube : l'arrêt d'une zone Tune
+        // quittait l'application d'un autre expéditeur.
+        assert_eq!(
+            plan_stop(
+                &[app(YOUTUBE), app(DEFAULT_MEDIA_RECEIVER)],
+                DEFAULT_MEDIA_RECEIVER
+            ),
+            StopPlan::StopMedia {
+                transport_id: "transport-CC1AD845".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn l_arret_ne_touche_pas_l_application_d_un_autre_expediteur() {
+        assert_eq!(
+            plan_stop(&[app(YOUTUBE)], DEFAULT_MEDIA_RECEIVER),
+            StopPlan::Leave,
+            "YouTube occupe l'appareil : Tune n'a rien à y arrêter"
+        );
+    }
+
+    #[test]
+    fn l_arret_sur_un_appareil_au_repos_n_envoie_rien() {
+        assert_eq!(plan_stop(&[], DEFAULT_MEDIA_RECEIVER), StopPlan::Leave);
+    }
+
+    /// Garde-fou de CONTENU, et non de comportement : l'appel part sur le fil,
+    /// aucun test ne peut l'observer sans un vrai récepteur. Le seul témoin
+    /// rejouable est donc le source lui-même. Le marqueur est épelé en deux
+    /// morceaux pour que ce test ne se contredise pas tout seul.
+    #[test]
+    fn le_module_ne_quitte_plus_l_application_du_recepteur() {
+        let source = include_str!("chromecast.rs");
+        let marqueur = concat!("stop_", "app(");
+        assert!(
+            !source.contains(marqueur),
+            "quitter l'application fait carillonner l'enceinte à la lecture \
+             suivante (#1953, #2520) : l'arrêt passe par le canal média"
+        );
+    }
+
+    /// Le changement de format ne justifie PAS de relancer le récepteur.
+    ///
+    /// La session ne conserve que deux chaînes (`transport_id`, `session_id`).
+    /// Le format, lui, est redéclaré en entier à chaque `LOAD` — et depuis
+    /// #2248/#2562 `stream_type` et `duration` en font partie, ce qui n'était
+    /// pas le cas quand la réutilisation de session a été écrite. Une session
+    /// conservée d'une webradio à un fichier ne peut donc pas servir un format
+    /// périmé.
+    #[test]
+    fn une_session_conservee_reannonce_le_format_a_chaque_piste() {
+        let radio = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/radio-7",
+            mime_type: "audio/mpeg",
+            live_stream: true,
+            ..Default::default()
+        });
+        let fichier = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/42",
+            mime_type: "audio/flac",
+            duration_ms: Some(337_000),
+            ..Default::default()
+        });
+
+        // Les trois champs qui portent le format se lisent ensemble : un seul
+        // qui traînerait de la piste précédente ferait mentir le récepteur.
+        assert_eq!(
+            (
+                radio.content_type.as_str(),
+                radio.stream_type,
+                radio.duration
+            ),
+            ("audio/mpeg", StreamType::Live, None)
+        );
+        assert_eq!(
+            (
+                fichier.content_type.as_str(),
+                fichier.stream_type,
+                fichier.duration
+            ),
+            ("audio/flac", StreamType::Buffered, Some(337.0_f32))
+        );
     }
 }
 
@@ -893,5 +1479,172 @@ mod cast_tls_tests {
             UnixTime::now(),
         );
         assert!(res.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod load_message_tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------
+    // #2248 — le message LOAD doit PORTER le contrat PlayMedia.
+    //
+    // Impossible de brancher un vrai récepteur Cast ici : ce qu'on interroge
+    // est le `Media` exact remis à `device.media.load(...)`, c'est-à-dire la
+    // charge utile du message LOAD, champ par champ.
+    // ---------------------------------------------------------------------
+
+    use crate::outputs::traits::PlayMedia;
+    use rust_cast::channels::media::{Image, Metadata, MusicTrackMediaMetadata, StreamType};
+
+    fn music_metadata(
+        media: &rust_cast::channels::media::Media,
+    ) -> &rust_cast::channels::media::MusicTrackMediaMetadata {
+        match media.metadata.as_ref().expect("LOAD sans metadata") {
+            Metadata::MusicTrack(m) => m,
+            other => panic!("metadata attendue MusicTrack, obtenue {other:?}"),
+        }
+    }
+
+    /// Une piste de bibliothèque telle que l'orchestrateur la remet aujourd'hui
+    /// (`orchestrator.rs`, construction de `PlayMedia`) : tout est renseigné en
+    /// amont, rien n'est inventé ici.
+    fn piste_complete() -> PlayMedia<'static> {
+        PlayMedia {
+            url: "http://192.168.1.18:8888/stream/42",
+            mime_type: "audio/flac",
+            title: Some("Blue in Green"),
+            artist: Some("Miles Davis"),
+            album: Some("Kind of Blue"),
+            cover_url: Some("http://192.168.1.18:8888/api/v1/library/artwork/ab12cd"),
+            duration_ms: Some(337_000),
+            track_number: Some(3),
+            disc_number: Some(1),
+            live_stream: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn un_fichier_est_buffered_et_porte_sa_duree_en_secondes() {
+        let media = build_cast_media(&piste_complete());
+
+        assert_eq!(media.content_id, "http://192.168.1.18:8888/stream/42");
+        assert_eq!(media.content_type, "audio/flac");
+        assert_eq!(media.stream_type, StreamType::Buffered);
+        // 337 000 ms = 337 s, et le champ Cast est en SECONDES.
+        assert_eq!(media.duration, Some(337.0_f32));
+    }
+
+    /// Le message LOAD *exact* : une seule égalité de structure, pour que le
+    /// diff d'un échec montre TOUS les champs manquants d'un coup et non le
+    /// premier seulement.
+    #[test]
+    fn un_fichier_porte_son_album_sa_pochette_et_ses_numeros() {
+        let media = build_cast_media(&piste_complete());
+
+        assert_eq!(
+            music_metadata(&media),
+            &MusicTrackMediaMetadata {
+                title: Some("Blue in Green".to_string()),
+                artist: Some("Miles Davis".to_string()),
+                album_name: Some("Kind of Blue".to_string()),
+                track_number: Some(3),
+                disc_number: Some(1),
+                images: vec![Image::new(
+                    "http://192.168.1.18:8888/api/v1/library/artwork/ab12cd".to_string()
+                )],
+                // Tune ne connaît ni l'artiste d'album ni le compositeur ni la
+                // date à cette frontière : les inventer serait annoncer une
+                // valeur non mesurée.
+                album_artist: None,
+                composer: None,
+                release_date: None,
+            }
+        );
+    }
+
+    #[test]
+    fn une_radio_est_annoncee_live_et_sans_duree() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://192.168.1.18:8888/stream/radio-7",
+            mime_type: "audio/mpeg",
+            title: Some("FIP"),
+            artist: Some("Radio France"),
+            live_stream: true,
+            ..Default::default()
+        });
+
+        // Buffered sur un flux infini est sémantiquement faux : le récepteur
+        // croit tenir un fichier et affiche une barre de progression qui ment.
+        assert_eq!(media.stream_type, StreamType::Live);
+        assert_eq!(media.duration, None);
+    }
+
+    #[test]
+    fn une_duree_inconnue_ne_devient_jamais_zero() {
+        // Ne jamais annoncer une valeur qu'on n'a pas mesurée : 0.0 s ferait
+        // afficher une piste de durée nulle, pire que pas de durée du tout.
+        let inconnue = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            duration_ms: None,
+            ..Default::default()
+        });
+        assert_eq!(inconnue.duration, None);
+
+        // Certaines lignes stockent 0 pour « inconnu » : il ne doit pas
+        // franchir la frontière non plus.
+        let zero = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            duration_ms: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(zero.duration, None);
+    }
+
+    #[test]
+    fn les_numeros_a_zero_valent_inconnu_et_ne_partent_pas() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            track_number: Some(0),
+            disc_number: Some(0),
+            ..Default::default()
+        });
+        let m = music_metadata(&media);
+        assert_eq!(m.track_number, None);
+        assert_eq!(m.disc_number, None);
+    }
+
+    #[test]
+    fn sans_pochette_aucune_image_fantome_n_est_envoyee() {
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            cover_url: None,
+            ..Default::default()
+        });
+        assert!(music_metadata(&media).images.is_empty());
+    }
+
+    #[test]
+    fn play_url_garde_exactement_le_contrat_d_avant() {
+        // `play_url` ne connaît que quatre champs : le message LOAD qu'il
+        // produit doit rester celui d'avant #2248, à l'octet près.
+        let media = build_cast_media(&PlayMedia {
+            url: "http://h/1",
+            mime_type: "audio/flac",
+            title: Some("T"),
+            artist: Some("A"),
+            ..Default::default()
+        });
+        assert_eq!(media.stream_type, StreamType::Buffered);
+        assert_eq!(media.duration, None);
+        let m = music_metadata(&media);
+        assert_eq!(m.album_name, None);
+        assert_eq!(m.track_number, None);
+        assert!(m.images.is_empty());
     }
 }

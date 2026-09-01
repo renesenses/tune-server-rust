@@ -36,7 +36,8 @@
         "hardware_fingerprint"
       ],
       "champs_optionnels": [
-        "session_conflict"
+        "session_conflict",
+        "offline_grace"
       ]
     },
     {
@@ -60,6 +61,27 @@
       ]
     },
     {
+      "route": "/converter/status/{}",
+      "methode": "GET",
+      "type": "(retour de fonction)",
+      "liste": false,
+      "note": "#3002 — l'ecran Convertisseur lisait `state`, `progress`, `converted` et `download_size`, qu'aucune reponse serveur ne portait : barre a 0 %, compteur a 0/N, bouton de telechargement jamais affiche. Absente de la carte parce que `getConversionStatus` ecrit son type sur l'annotation de retour et appelle `fetchJSON()` NU — forme que le cartographe ne voyait pas (corrigee dans le meme lot). Les cinq champs historiques restent exiges : on ajoute, on ne renomme pas.",
+      "champs_obligatoires": [
+        "job_id",
+        "status",
+        "total",
+        "completed",
+        "current_file",
+        "errors",
+        "state",
+        "progress",
+        "converted",
+        "download_size",
+        "error"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/devices",
       "methode": "GET",
       "type": "DiscoveredDevice",
@@ -74,6 +96,8 @@
       "champs_optionnels": [
         "available",
         "capabilities",
+        "zone_hidden",
+        "hidden_zone_device_id",
         "manufacturer",
         "model",
         "mac_address"
@@ -115,6 +139,8 @@
       "champs_optionnels": [
         "available",
         "capabilities",
+        "zone_hidden",
+        "hidden_zone_device_id",
         "manufacturer",
         "model",
         "mac_address"
@@ -220,8 +246,21 @@
       ],
       "champs_optionnels": [
         "art_id",
+        "pochette",
         "quality_note"
       ]
+    },
+    {
+      "route": "/ext/bandcamp/artist",
+      "methode": "GET",
+      "type": "BandcampDiscographie",
+      "liste": false,
+      "champs_obligatoires": [
+        "url",
+        "count",
+        "albums"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/ext/bandcamp/collection",
@@ -285,7 +324,9 @@
       "champs_obligatoires": [
         "tags"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "genres"
+      ]
     },
     {
       "route": "/home",
@@ -296,6 +337,34 @@
         "sections"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/home/artist-releases",
+      "methode": "GET",
+      "type": "ArtistReleaseGroup",
+      "liste": true,
+      "champs_obligatoires": [
+        "artist_name",
+        "is_favorite",
+        "library_albums",
+        "releases"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/home/other-versions",
+      "methode": "GET",
+      "type": "OtherVersionGroup",
+      "liste": true,
+      "champs_obligatoires": [
+        "title",
+        "artist_name",
+        "played_album",
+        "versions"
+      ],
+      "champs_optionnels": [
+        "streaming"
+      ]
     },
     {
       "route": "/library/albums",
@@ -459,6 +528,16 @@
       "champs_optionnels": []
     },
     {
+      "route": "/library/albums/{}/better-quality",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "better"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/library/albums/{}/bio",
       "methode": "GET",
       "type": "(en ligne)",
@@ -469,6 +548,35 @@
       ],
       "champs_optionnels": [
         "release_id"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/reidentify",
+      "methode": "POST",
+      "type": "ReidentifyResult",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "verdict",
+        "tracks_total"
+      ],
+      "champs_optionnels": [
+        "tracks_matched",
+        "tracks_unmatched",
+        "was_identified_before",
+        "previous_release_id",
+        "release_id",
+        "release_group_id",
+        "release_title",
+        "release_artist",
+        "release_date",
+        "release_country",
+        "release_disambiguation",
+        "match_score",
+        "fields_left_as_is",
+        "previous_identification_restored",
+        "searched_title",
+        "searched_artist"
       ]
     },
     {
@@ -665,6 +773,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -696,6 +805,19 @@
       ],
       "champs_optionnels": [
         "artists_without_image"
+      ]
+    },
+    {
+      "route": "/library/artwork/enrich-artists/force",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "message",
+        "artists"
       ]
     },
     {
@@ -917,10 +1039,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -941,10 +1061,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -976,10 +1094,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1000,10 +1116,8 @@
         "match_mode",
         "sort_by",
         "sort_order",
-        "max_albums",
-        "auto_refresh",
-        "created_at",
-        "updated_at"
+        "max_limit",
+        "created_at"
       ],
       "champs_optionnels": [
         "album_count"
@@ -1078,6 +1192,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1116,6 +1231,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1138,6 +1254,16 @@
       ]
     },
     {
+      "route": "/library/tracks/{}/better-quality",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "better"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/library/tracks/{}/credits",
       "methode": "GET",
       "type": "TrackCredit",
@@ -1158,10 +1284,11 @@
       "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
+      "note": "#3002 — exigeait `lyrics`, que le serveur n'envoie pas : il rend `lines`. L'exigence venait de `api.ts:getTrackLyrics`, une fonction SANS AUCUN APPELANT dont `lib/lyrics.ts` documente lui-meme le type comme la forme « historique ». Les vrais consommateurs (NowPlaying, TvView) lisent `data.lines` via `fetchTrackLyrics`. Le serveur avait raison, la carte recopiait un type mort.",
       "champs_obligatoires": [
-        "lyrics",
         "synced",
-        "source"
+        "source",
+        "lines"
       ],
       "champs_optionnels": []
     },
@@ -1246,6 +1373,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -1263,6 +1391,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -1273,6 +1402,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -1284,6 +1414,16 @@
       "liste": false,
       "champs_obligatoires": [
         "url"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/shares/{}",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "shares"
       ],
       "champs_optionnels": []
     },
@@ -1308,6 +1448,25 @@
       "champs_obligatoires": [
         "mount_path",
         "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/smb/mounts",
+      "methode": "GET",
+      "type": "SmbMount",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "server",
+        "share",
+        "mount_path",
+        "username",
+        "active",
+        "mounted",
+        "mount_state",
+        "last_mount_error",
+        "smb_version"
       ],
       "champs_optionnels": []
     },
@@ -1430,17 +1589,6 @@
       ]
     },
     {
-      "route": "/playlists/all",
-      "methode": "GET",
-      "type": "UnifiedPlaylistsResponse",
-      "liste": false,
-      "champs_obligatoires": [
-        "local",
-        "services"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/playlists/diff",
       "methode": "POST",
       "type": "PlaylistDiffResponse",
@@ -1556,6 +1704,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -1691,6 +1840,20 @@
       "champs_optionnels": []
     },
     {
+      "route": "/profiles/{}/favorites/facets{}",
+      "methode": "GET",
+      "type": "FacetFavorite",
+      "liste": true,
+      "champs_obligatoires": [
+        "profile_id",
+        "facet",
+        "value"
+      ],
+      "champs_optionnels": [
+        "created_at"
+      ]
+    },
+    {
       "route": "/profiles/{}/favorites/streaming{}",
       "methode": "GET",
       "type": "StreamingFavorite",
@@ -1706,7 +1869,8 @@
         "title",
         "artist",
         "album",
-        "cover_url"
+        "cover_url",
+        "created_at"
       ]
     },
     {
@@ -1788,6 +1952,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -1805,6 +1970,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -1815,8 +1981,26 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
+      ]
+    },
+    {
+      "route": "/radios/search",
+      "methode": "GET",
+      "type": "RechercheRadios",
+      "liste": false,
+      "champs_obligatoires": [
+        "statut",
+        "code",
+        "portee",
+        "count",
+        "items",
+        "message"
+      ],
+      "champs_optionnels": [
+        "detail"
       ]
     },
     {
@@ -1929,20 +2113,6 @@
       ]
     },
     {
-      "route": "/sonos/discover",
-      "methode": "POST",
-      "type": "SonosSpeaker",
-      "liste": true,
-      "champs_obligatoires": [
-        "uid",
-        "name",
-        "ip",
-        "is_coordinator",
-        "group_uid"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/sonos/speakers",
       "methode": "GET",
       "type": "SonosSpeaker",
@@ -1963,15 +2133,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -1981,15 +2150,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -1999,15 +2167,14 @@
       "liste": false,
       "champs_obligatoires": [
         "enabled",
-        "available",
         "device_name",
         "zone_id",
         "binary_available",
-        "stream_url",
         "active"
       ],
       "champs_optionnels": [
-        "reason"
+        "reason",
+        "error"
       ]
     },
     {
@@ -2042,6 +2209,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -2059,6 +2227,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -2069,6 +2238,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -2150,6 +2320,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2244,6 +2415,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2285,7 +2457,7 @@
       ]
     },
     {
-      "route": "/streaming/{}/artists/{}/albums",
+      "route": "/streaming/{}/artists/{}/albums{}",
       "methode": "GET",
       "type": "Album",
       "liste": true,
@@ -2563,6 +2735,7 @@
         "album_artist",
         "disc_number",
         "disc_subtitle",
+        "grouping",
         "track_number",
         "duration_ms",
         "file_path",
@@ -2613,13 +2786,35 @@
       ]
     },
     {
+      "route": "/support/tickets",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tickets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/support/tickets/{}",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "ticket",
+        "replies"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/system/admin/connections",
       "methode": "GET",
       "type": "AdminConnections",
       "liste": false,
       "champs_obligatoires": [
         "websocket_connections",
-        "http_streamer_sessions"
+        "active_streams",
+        "registered_outputs"
       ],
       "champs_optionnels": []
     },
@@ -2630,7 +2825,6 @@
       "liste": false,
       "champs_obligatoires": [
         "devices",
-        "protocols",
         "device_count"
       ],
       "champs_optionnels": []
@@ -2653,16 +2847,17 @@
       "type": "AdminHealth",
       "liste": false,
       "champs_obligatoires": [
-        "cpu_percent",
-        "ram_mb",
-        "ram_total_mb",
-        "disk_free_gb",
-        "disk_total_gb",
+        "status",
         "uptime_seconds",
-        "uptime_formatted",
-        "open_fds",
-        "pid",
-        "python_threads"
+        "engine",
+        "version",
+        "database",
+        "playback",
+        "outputs",
+        "streaming_services",
+        "scan_status",
+        "disk_free_gb",
+        "disk_total_gb"
       ],
       "champs_optionnels": []
     },
@@ -2687,17 +2882,25 @@
       "champs_optionnels": []
     },
     {
-      "route": "/system/audio-check",
-      "methode": "GET",
-      "type": "AudioCheckResult",
+      "route": "/system/audio/asio-warm-scan/rearm",
+      "methode": "POST",
+      "type": "(en ligne)",
       "liste": false,
       "champs_obligatoires": [
-        "zones",
-        "zones_with_output",
-        "local_outputs",
-        "network_renderers",
-        "has_audio",
-        "issues"
+        "status",
+        "retry",
+        "message",
+        "asio_warm_scan"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/background-tasks",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "tasks"
       ],
       "champs_optionnels": []
     },
@@ -2773,7 +2976,9 @@
         "memory_rss_mb",
         "scan_status"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "asio_warm_scan"
+      ]
     },
     {
       "route": "/system/diagnostics/network",
@@ -2798,6 +3003,20 @@
         "status"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/system/health",
+      "methode": "GET",
+      "type": "SystemHealth",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "components",
+        "version",
+        "server_name"
+      ]
     },
     {
       "route": "/system/health/alerts",
@@ -2898,11 +3117,9 @@
       "liste": false,
       "champs_obligatoires": [
         "status",
-        "music_dirs"
+        "message"
       ],
-      "champs_optionnels": [
-        "full"
-      ]
+      "champs_optionnels": []
     },
     {
       "route": "/system/scan/report",
@@ -2970,6 +3187,16 @@
         "artists",
         "zones",
         "devices"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/system/stop",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "stopping"
       ],
       "champs_optionnels": []
     },
@@ -3071,9 +3298,9 @@
     },
     {
       "route": "/zones",
-      "methode": "POST",
+      "methode": "GET",
       "type": "Zone",
-      "liste": false,
+      "liste": true,
       "champs_obligatoires": [
         "id",
         "name"
@@ -3088,6 +3315,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3105,6 +3333,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3115,6 +3344,60 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
+        "detected_manufacturer",
+        "detected_model"
+      ]
+    },
+    {
+      "route": "/zones",
+      "methode": "POST",
+      "type": "Zone",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "output_device_id",
+        "volume",
+        "group_id",
+        "sync_delay_ms",
+        "state",
+        "current_track",
+        "position_ms",
+        "queue_length",
+        "queue_position",
+        "signal_path",
+        "stereo_pair_id",
+        "stereo_channel",
+        "output_sent",
+        "error",
+        "stream_url",
+        "online",
+        "output_reach",
+        "recovery_started_at",
+        "recovery_attempts",
+        "is_default",
+        "dsd_mode",
+        "lyrics_offset_ms",
+        "dlna_native_flac",
+        "max_sample_rate",
+        "fixed_volume",
+        "alac_passthrough",
+        "aac_passthrough",
+        "autoplay_enabled",
+        "dlna_lpcm",
+        "dlna_cap_16bit",
+        "dlna_wav24",
+        "dlna_play_delay_ms",
+        "upnp_renderer",
+        "gain_trim_db",
+        "brand",
+        "model",
+        "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3204,6 +3487,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3221,6 +3505,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3231,6 +3516,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3254,6 +3540,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3271,6 +3558,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3281,6 +3569,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3288,33 +3577,30 @@
     {
       "route": "/zones/{}/audiophile",
       "methode": "GET",
-      "type": "(en ligne)",
+      "type": "AudiophileModeState",
       "liste": false,
       "champs_obligatoires": [
         "enabled"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
+        "applied_live"
+      ]
     },
     {
       "route": "/zones/{}/audiophile",
       "methode": "POST",
-      "type": "(en ligne)",
+      "type": "AudiophileModeState",
       "liste": false,
       "champs_obligatoires": [
         "enabled"
       ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/zones/{}/crossfade",
-      "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "enabled",
-        "duration"
-      ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "lock_volume",
+        "effective_lock_volume",
+        "applied_live"
+      ]
     },
     {
       "route": "/zones/{}/device-presets",
@@ -3390,6 +3676,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3407,6 +3694,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3417,6 +3705,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3452,6 +3741,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3469,6 +3759,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3479,6 +3770,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3556,6 +3848,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3573,6 +3866,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3583,6 +3877,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3658,6 +3953,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3675,6 +3971,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3685,6 +3982,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3708,6 +4006,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3725,6 +4024,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3735,6 +4035,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3795,6 +4096,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3812,6 +4114,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3822,6 +4125,7 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
@@ -3845,6 +4149,7 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "queue_position",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -3862,6 +4167,7 @@
         "max_sample_rate",
         "fixed_volume",
         "alac_passthrough",
+        "aac_passthrough",
         "autoplay_enabled",
         "dlna_lpcm",
         "dlna_cap_16bit",
@@ -3872,17 +4178,13 @@
         "brand",
         "model",
         "resolving",
+        "dop_active",
         "detected_manufacturer",
         "detected_model"
       ]
     }
   ],
   "non_resolus": [
-    {
-      "route": "/zones",
-      "type": "T>(url: string, options?: RequestInit): Promise<T> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    if (response.status === 402) {\n      try {\n        const body = await response.json();\n        notifications.error(body?.message || 'Tune Premium requis pour cette fonctionnalite');\n      } catch {\n        notifications.error('Tune Premium requis pour cette fonctionnalite');\n      }\n      throw new Error('premium_required');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    } else {\n      // Surface actionable playback failures that callers would otherwise\n      // swallow (they fire play/next/resume without awaiting): a missing local\n      // file or a zone with no output device. Localised so it matches the UI.\n      const key = err.code ? PLAY_ERROR_KEYS[err.code] : undefined;\n      if (key) notifications.error(get(t)(key as any));\n    }\n    throw err;\n  }\n  const text = await response.text();\n  if (text.trimStart().startsWith('<!') || text.trimStart().toLowerCase().startsWith('<html')) {\n    throw new Error('Expected JSON but received HTML — check the endpoint URL');\n  }\n  // A 204, or any 2xx with an empty body, is a success with nothing to parse.\n  // Many mutating endpoints answer that way; treating it as a parse failure\n  // made successful writes surface as errors in the UI (the rating that saved\n  // fine but showed \"Erreur notation\").\n  if (response.status === 204 || text.trim() === '') {\n    return undefined as T;\n  }\n  try {\n    return JSON.parse(text) as T;\n  } catch {\n    throw new Error('Invalid JSON response');\n  }\n}\n\n/** Wrap a promise with a timeout — rejects with an Error after `ms` milliseconds. */\nexport function withTimeout<T>(promise: Promise<T>, ms: number, label = 'request'): Promise<T> {\n  return new Promise<T>((resolve, reject) => {\n    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);\n    promise.then(\n      (v) => { clearTimeout(timer); resolve(v); },\n      (e) => { clearTimeout(timer); reject(e); },\n    );\n  });\n}\n\nasync function fetchVoid(url: string, options?: RequestInit): Promise<void> {\n  let response: Response;\n  try {\n    const token = getToken();\n    const headers: Record<string, string> = {\n      'Accept': 'application/json',\n      'Accept-Language': acceptLang(),\n      'Content-Type': 'application/json',\n      ...profileHeader(),\n    };\n    if (token) headers['Authorization'] = `Bearer ${token}`;\n    response = await fetch(url, {\n      headers,\n      ...options,\n    });\n  } catch (e) {\n    showNetworkError();\n    throw e;\n  }\n  if (!response.ok) {\n    if (response.status === 401) {\n      clearToken();\n      throw new Error('Session expired');\n    }\n    const err = await apiError(response);\n    if (response.status >= 500) {\n      notifications.error(`Server error: ${err.message}`);\n    }\n    throw err;\n  }\n}\n\n// --- Zones ---\n\nexport function getZones() {\n  return fetchJSON<Zone[]",
-      "raison": "type non structurel"
-    },
     {
       "route": "/devices/audio",
       "type": "any",
@@ -3964,11 +4266,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/zone-manager/groups/{}/calibrate",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/zone-manager/zones/{}/health",
       "type": "any",
       "raison": "type non structurel"
@@ -4039,6 +4336,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/network/media-servers/{}/search",
+      "type": "import('./types').MediaServerSearchResult",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/tags/{}",
       "type": "void",
       "raison": "type non structurel"
@@ -4096,11 +4398,6 @@
     {
       "route": "/library/smart-playlists/{}/tracks",
       "type": "any[]",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/system/health",
-      "type": "FederatedSearchResult>(url).then(result => {\n    if (result.local) result.local.tracks = mapStreamingTracks(result.local.tracks);\n    if (result.services) {\n      for (const key of Object.keys(result.services)) {\n        result.services[key].tracks = mapStreamingTracks(result.services[key].tracks);\n        result.services[key].albums = mapStreamingAlbums(result.services[key].albums);\n        // The server's StreamTrack/StreamAlbum carry no `source` field, so a\n        // track played from global search had no source and did nothing\n        // (DEvir). Stamp the service key as the source so play/queue actions\n        // can route these streaming results.\n        for (const t of result.services[key].tracks ?? []) if (t && !t.source) t.source = key;\n        for (const a of result.services[key].albums ?? []) if (a && !a.source) a.source = key;\n      }\n    }\n    return result;\n  });\n}\n\n// --- System ---\n\nexport function getHealth() {\n  return fetchJSON<SystemHealth",
       "raison": "type non structurel"
     },
     {
@@ -4185,8 +4482,8 @@
     },
     {
       "route": "/playlist-manager/backups/{}",
-      "type": "PlaylistSnapshot[]>(url);\n}\n\nexport function getPlaylistSnapshot(id: number) {\n  return fetchJSON<SnapshotDetail",
-      "raison": "type non structurel"
+      "type": "SnapshotDetail",
+      "raison": "type introuvable dans les sources"
     },
     {
       "route": "/playlist-manager/links",
@@ -4240,11 +4537,16 @@
     },
     {
       "route": "/profiles/{}/favorites{}",
-      "type": "Array<{ item_type: string; item_id: number }>",
+      "type": "Array<{ item_type: string; item_id: number; created_at?: string | null }>",
       "raison": "type non structurel"
     },
     {
       "route": "/profiles/{}/favorites/add",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/profiles/{}/favorites/facets/add",
       "type": "any",
       "raison": "type non structurel"
     },
@@ -4256,11 +4558,6 @@
     {
       "route": "/network/shares",
       "type": "any[]",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/network/shares/{}",
-      "type": "any>(url);\n}\n\nexport function listHostShares(hostId: string) {\n  return fetchJSON<{ shares: string[] }",
       "raison": "type non structurel"
     },
     {
@@ -4369,17 +4666,7 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/zones/{}/crossfade",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/zones/{}/normalization",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/zones/{}/dsp",
       "type": "any",
       "raison": "type non structurel"
     },
@@ -4554,6 +4841,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/tracks/{}/versions",
+      "type": "TrackVersions",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/home/recommendations",
       "type": "any[]",
       "raison": "type non structurel"
@@ -4574,13 +4866,18 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/support/tickets/{}/reply",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/profile",
       "type": "Record<string, unknown>",
       "raison": "type non structurel"
     }
   ],
   "resume": {
-    "routes_cartographiees": 223,
-    "appels_non_resolus": 140
+    "routes_cartographiees": 238,
+    "appels_non_resolus": 138
   }
 }

@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -187,7 +188,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // Audio outputs
     let audio_backend_pref = &state.display_audio_backend();
-    let (audio_outputs, audio_backend_name, asio_avail) = {
+    let (audio_outputs, audio_backend_name, asio_avail, audio_backend_status) = {
         #[cfg(feature = "local-audio")]
         {
             let devs: Vec<String> =
@@ -197,12 +198,21 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
                     .collect();
             let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
             let asio = tune_core::outputs::local::asio_available();
-            (devs, name, asio)
+            // #1395 — le rapport de diagnostic est ce que le testeur colle sur
+            // le forum. Il portait le backend ACTIF sans jamais dire lequel
+            // avait été DEMANDÉ ni pourquoi il n'avait pas été honoré : c'est
+            // une capture de journal qu'il a fallu réclamer à Bilou pour
+            // apprendre que son pilote ASIO n'exposait aucune sortie.
+            let status = serde_json::to_value(tune_core::outputs::local::active_backend_status(
+                audio_backend_pref,
+            ))
+            .unwrap_or(serde_json::Value::Null);
+            (devs, name, asio, status)
         }
         #[cfg(not(feature = "local-audio"))]
         {
             let _ = audio_backend_pref;
-            (Vec::<String>::new(), "none", false)
+            (Vec::<String>::new(), "none", false, serde_json::Value::Null)
         }
     };
 
@@ -234,15 +244,38 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "rust_version": tune_core::rustc_version(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // #2117 : `uptime_seconds` mesure BIEN ce processus — il naît d'un
+        // `Instant` posé au démarrage — mais un compteur relatif ne permet pas
+        // de VÉRIFIER que le processus interrogé est le même qu'à l'appel
+        // précédent : il faut le déduire, et la déduction a déjà fait écarter
+        // à tort l'hypothèse d'un redémarrage pendant un diagnostic. L'ancrage
+        // absolu ci-dessous répond sans déduction : il change au redémarrage.
         "uptime_seconds": uptime_secs,
+        "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        // #2154 — une base incomplète ne doit plus pouvoir ignorer des
+        // réglages pendant des mois sans laisser de trace dans le rapport.
+        "zone_settings_ignored": tune_core::db::zone_repo::zone_settings_ignored(),
         "discovered_devices": devices_by_type,
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
         "audio_backend": audio_backend_name,
+        // #1395 — `audio_backend` dit ce qui TOURNE ; il ne disait pas ce qui
+        // avait été DEMANDÉ, ni pourquoi les deux diffèrent. `null` sans
+        // sortie locale compilée.
+        "audio_backend_status": audio_backend_status,
         "asio_available": asio_avail,
+        // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
+        // une ligne WARN que l'utilisateur ne verra jamais.
+        "asio_warm_scan": crate::startup::asio_warm_status(),
+        // #2392 : pourquoi un fournisseur de sortie hors-arbre est inerte.
+        // Absent de la liste = non compilé ; présent avec un `refusal` = droit
+        // manquant, et le refus dit lequel et quoi faire ; présent sans refus
+        // et `devices: 0` = il cherche et ne trouve rien. Ces trois cas
+        // donnaient jusqu'ici le même écran vide.
+        "output_providers": crate::discovery_setup::provider_status_snapshot(),
         "scan_status": {
             "status": scan_status,
             "tracks": tracks,
@@ -303,6 +336,51 @@ fn get_rss_mb() -> Option<u64> {
     {
         None::<u64>
     }
+}
+
+/// La section « fournisseurs de sortie » d'un rapport de bogue.
+///
+/// Vide quand le binaire n'embarque aucun fournisseur hors-arbre : il n'y a
+/// alors rien à dire, et une section vide dans chaque rapport serait du bruit.
+fn section_fournisseurs_de_sortie(instantane: &Value) -> String {
+    let Some(fournisseurs) = instantane["providers"].as_array().filter(|l| !l.is_empty()) else {
+        return String::new();
+    };
+
+    let mut md = String::from("## Output Providers\n");
+    if !instantane["account_linked"].as_bool().unwrap_or(true) {
+        md.push_str(
+            "- ⚠ **No linked Mozaiklabs account** — paid module entitlements travel with the \
+             account, never with the license key, so no paid output module can be active.\n",
+        );
+    }
+    let modules = instantane["licensed_modules"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    md.push_str(&format!(
+        "- Licensed modules: {}\n",
+        if modules.is_empty() { "none" } else { &modules }
+    ));
+
+    for f in fournisseurs {
+        let nom = f["provider"].as_str().unwrap_or("?");
+        let appareils = f["devices"].as_u64().unwrap_or(0);
+        match f["refusal"]["code"].as_str() {
+            Some(code) => md.push_str(&format!(
+                "- {nom}: **idle — {code}** ({})\n",
+                f["refusal"]["message"].as_str().unwrap_or("")
+            )),
+            None => md.push_str(&format!("- {nom}: active, {appareils} device(s)\n")),
+        }
+    }
+    md.push('\n');
+    md
 }
 
 pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {
@@ -367,7 +445,7 @@ pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value>
 
 pub(super) async fn health_alerts(State(state): State<AppState>) -> Json<Value> {
     let alerts = state.health_monitor.alerts().await;
-    Json(json!({ "alerts": alerts }))
+    Json(json!(alerts))
 }
 
 #[derive(Deserialize)]
@@ -579,6 +657,67 @@ fn selectionner_lignes(
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     collect_recent_logs(q.lines.unwrap_or(1000)).await
+}
+
+#[derive(Deserialize)]
+pub(super) struct RegistreQuery {
+    /// Filtrer sur une passe. Sans ce parametre, tout le registre.
+    task: Option<String>,
+    /// Nombre maximum de lignes rendues. Borne a 500 par le registre.
+    limit: Option<i64>,
+}
+
+/// `GET /system/task-runs` — le registre des executions automatisees (#2080).
+///
+/// Ce que cette route repond, et que rien ne repondait avant : « la passe
+/// a-t-elle tourne, quand, combien de temps, et avec quel resultat ». Le
+/// journal defile et se perd ; `/system/background-tasks` ne connait que le
+/// PRESENT (les taches en cours, en memoire, perdues au redemarrage). Ici,
+/// c'est le PASSE, et il survit au redemarrage.
+///
+/// `boot_id` distingue les incarnations du processus : deux executions de boots
+/// differents ne se confondent pas, et c'est ce qui rend lisible « la passe a
+/// ete interrompue par un redemarrage ».
+///
+/// La reponse ne contient ni chemin, ni cle, ni jeton — des compteurs et des
+/// verdicts. Elle peut donc etre collee telle quelle dans un ticket.
+pub(super) async fn task_runs(
+    State(state): State<AppState>,
+    Query(q): Query<RegistreQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(state.backend.clone());
+    let limite = q.limit.unwrap_or(100);
+
+    let runs = registre.lister(q.task.as_deref(), limite).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    let dernieres = registre.resume().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+
+    Ok(Json(json!({
+        // L'incarnation COURANTE. Une ligne qui ne porte pas ce boot_id vient
+        // d'un demarrage anterieur — c'est la lecture qui evite de prendre une
+        // vieille execution pour l'actuelle.
+        "boot_id": tune_core::db::task_run_repo::boot_id(),
+        // Les passes que le registre sait ecrire aujourd'hui. Une passe de
+        // cette liste ABSENTE de `latest` n'a jamais tourne sur cette
+        // installation ; sans la liste, on ne saurait pas la distinguer d'une
+        // passe qu'on aurait oublie de cabler.
+        "wired_tasks": tune_core::db::task_run_repo::TACHES_CABLEES,
+        "retention": {
+            "runs_per_task": tune_core::db::task_run_repo::RETENTION_EXECUTIONS_PAR_PASSE,
+            "days": tune_core::db::task_run_repo::RETENTION_JOURS,
+        },
+        "latest": dernieres,
+        "runs": runs,
+    })))
 }
 
 /// Collect the most recent server logs (tail): log file first, then
@@ -904,6 +1043,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Zones
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
+    let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
+    let asio_warm_scan = crate::startup::asio_warm_status();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
@@ -989,10 +1130,21 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         std::env::consts::ARCH
     ));
     md.push_str(&format!("**Uptime**: {uptime_str}\n"));
+    // #2117 : un rapport de bogue est lu bien après avoir été produit, souvent
+    // à côté d'un journal horodaté. « 1h19 » ne se recoupe avec rien ; une date
+    // de démarrage se recoupe avec tout.
+    md.push_str(&format!(
+        "**Process started**: {}\n",
+        state.process_started_at_rfc3339()
+    ));
     md.push_str(&format!("**PID**: {}\n", std::process::id()));
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
+    md.push_str(&format!(
+        "**ASIO warm scan**: {} — {}\n",
+        asio_warm_scan.state, asio_warm_scan.message
+    ));
     md.push('\n');
 
     md.push_str("## Library\n");
@@ -1010,6 +1162,9 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
+    md.push_str(&format!(
+        "- Zone settings not persisted: {zone_settings_ignored}\n"
+    ));
     md.push('\n');
 
     md.push_str("## Streaming Services\n");
@@ -1037,6 +1192,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     md.push('\n');
+
+    // #2392 : c'est CE bloc qui aurait épargné au bêta-testeur du module
+    // Diretta une réinstallation complète de Fedora. Un rapport de bogue qui
+    // dit « fournisseur diretta, 0 appareil, aucun compte lié » se lit en dix
+    // secondes ; un rapport muet oblige à tout redemander.
+    md.push_str(&section_fournisseurs_de_sortie(
+        &crate::discovery_setup::provider_status_snapshot(),
+    ));
 
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
@@ -1091,6 +1254,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "arch": std::env::consts::ARCH,
         "uptime_seconds": uptime_secs,
         "uptime": uptime_str,
+        "process_started_at": state.process_started_at_rfc3339(),
         "pid": std::process::id(),
         "rss_mb": rss_mb,
         "library": {
@@ -1104,6 +1268,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "count": zone_count,
             "items": zones,
         },
+        "zone_settings_ignored": zone_settings_ignored,
+        "asio_warm_scan": asio_warm_scan,
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
@@ -1278,6 +1444,68 @@ pub(super) async fn audio_check() -> Json<Value> {
     }))
 }
 
+pub(super) async fn asio_warm_scan_status() -> Json<Value> {
+    Json(json!(crate::startup::asio_warm_status()))
+}
+
+/// Retire uniquement le témoin qui interdit le prochain préchauffage.
+///
+/// La tentative attend le redémarrage : énumérer les pilotes ASIO à chaud peut
+/// faire planter le processus ou heurter une sortie qui possède déjà le DAC.
+pub(super) async fn rearm_asio_warm_scan(
+    _admin: crate::auth::RequireAdmin,
+) -> (StatusCode, Json<Value>) {
+    use crate::startup::AsioWarmRearm;
+
+    match crate::startup::rearm_asio_warm_scan() {
+        Ok(AsioWarmRearm::Rearmed) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "rearmed",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::AlreadyReady) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "already_ready",
+                "retry": "next_restart",
+                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::DisabledByEnv) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "asio_warm_scan_disabled_by_env",
+                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Ok(AsioWarmRearm::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "asio_not_supported",
+                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "asio_warm_scan": crate::startup::asio_warm_status(),
+            })),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "asio_warm_scan_rearm_failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "asio_warm_scan_rearm_failed",
+                    "message": error,
+                    "asio_warm_scan": crate::startup::asio_warm_status(),
+                })),
+            )
+        }
+    }
+}
+
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
@@ -1378,6 +1606,24 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "message": format!("Zone {} max latency {}ms", zone_id, m.max_latency_ms),
             }));
         }
+        // #2493 : l'appareil annonce toujours jouer alors que la position a
+        // atteint — ou depasse — la duree de la piste depuis une minute. Le
+        // sondeur ne coupe rien (une duree fausse produit la meme forme qu'une
+        // lecture bloquee), mais il refuse de laisser le diagnostic annoncer
+        // une lecture saine.
+        if m.lecture_au_dela_de_la_duree {
+            issues.push(json!({
+                "severity": "warning",
+                "type": "zone_playback_beyond_duration",
+                "zone_id": zone_id,
+                "message": format!(
+                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
+                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
+                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
+                     dans le journal."
+                ),
+            }));
+        }
     }
     drop(metrics);
 
@@ -1418,6 +1664,16 @@ pub(super) async fn api_docs() -> Json<Value> {
             "GET",
             "/system/api-docs",
             "This endpoint — API documentation",
+        ),
+        (
+            "GET",
+            "/system/audio/asio-warm-scan",
+            "ASIO startup scan fail-safe status",
+        ),
+        (
+            "POST",
+            "/system/audio/asio-warm-scan/rearm",
+            "Allow one ASIO startup scan on the next restart (admin)",
         ),
         ("GET", "/system/telemetry", "Telemetry snapshot (opt-in)"),
         ("POST", "/system/scan", "Trigger library scan"),
@@ -2000,5 +2256,69 @@ mod selection_de_lignes {
         let rapport = lignes_utiles_pour_un_rapport(journal, 200);
         assert!(rapport.contains("add_rejected"));
         assert!(!rapport.contains("sonde a=1"));
+    }
+}
+
+/// #2392 — la section « fournisseurs de sortie » du rapport de bogue.
+#[cfg(test)]
+mod fournisseurs_de_sortie {
+    use super::*;
+
+    /// #2392 : le rapport de bogue doit dire pourquoi un fournisseur payant est
+    /// inerte. C'est le canal qui aurait épargné au bêta-testeur du module
+    /// Diretta une réinstallation complète de son système d'exploitation.
+    #[test]
+    fn le_rapport_dit_quand_un_module_paye_est_inerte_faute_de_compte_lie() {
+        let instantane = serde_json::json!({
+            "account_linked": false,
+            "licensed_modules": [],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": {
+                    "code": "module_account_not_linked",
+                    "message": "link your Mozaiklabs account",
+                },
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: none"), "{md}");
+        assert!(
+            md.contains("diretta: **idle — module_account_not_linked**"),
+            "{md}"
+        );
+    }
+
+    /// Droit présent mais rien sur le réseau : l'autre cas, et il doit se lire
+    /// différemment — sinon on n'a fait que déplacer l'ambiguïté.
+    #[test]
+    fn le_rapport_distingue_un_module_actif_qui_ne_trouve_rien() {
+        let instantane = serde_json::json!({
+            "account_linked": true,
+            "licensed_modules": ["diretta"],
+            "providers": [{
+                "provider": "diretta",
+                "required_module": "diretta",
+                "devices": 0,
+                "refusal": null,
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(!md.contains("No linked Mozaiklabs account"), "{md}");
+        assert!(md.contains("Licensed modules: diretta"), "{md}");
+        assert!(md.contains("diretta: active, 0 device(s)"), "{md}");
+    }
+
+    /// Aucun fournisseur hors-arbre (le cas du binaire public, et l'état avant
+    /// la première passe) : pas de section du tout, pas de bruit.
+    #[test]
+    fn aucun_fournisseur_hors_arbre_najoute_aucune_section() {
+        assert_eq!(section_fournisseurs_de_sortie(&Value::Null), "");
+        assert_eq!(
+            section_fournisseurs_de_sortie(&serde_json::json!({ "providers": [] })),
+            ""
+        );
     }
 }

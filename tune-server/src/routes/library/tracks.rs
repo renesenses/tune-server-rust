@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use lofty::file::TaggedFileExt;
@@ -8,8 +8,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::track_repo::TrackRepo;
+
+use super::query_multi::track_filter_from_raw;
+use crate::error::AppError;
 
 /// Build a JSON array string for the `genres` column from parsed metadata.
 fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
@@ -70,147 +74,80 @@ pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
 }
 
-/// Query parameters for GET /library/tracks — supports pagination + metadata filters.
-/// All filters combine with AND logic.
+/// Query parameters for GET /library/tracks.
+///
+/// ⚠️ **Les facettes ne sont PAS des champs de cette structure.** La
+/// `Deserialize` dérivée refuse une clé en double (`duplicate field`), donc
+/// `?format=aiff&format=flac` rendait 400 tant qu'un champ `format` existait
+/// ici (#2168). Elles se lisent toutes dans `query_multi::track_filter_from_raw`,
+/// à partir de la chaîne de requête BRUTE — qui reprend au passage la
+/// validation de type que `serde` assurait (`?year=abc` → 400).
+///
+/// Ne restent ici que la pagination et ce qui ne peut pas se répéter.
 #[derive(Deserialize, Default)]
 pub(super) struct TrackFilterQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    pub genre: Option<String>,
-    pub year: Option<i32>,
-    pub format: Option<String>,
-    pub sample_rate: Option<i32>,
-    pub bit_depth: Option<i32>,
-    pub source: Option<String>,
-    pub label: Option<String>,
-    pub composer: Option<String>,
-    pub q: Option<String>,
-    pub artist: Option<String>,
-    pub country: Option<String>,
-    pub mood: Option<String>,
-    pub source_media: Option<String>,
-    /// Oxygen folder facet: absolute directory prefix; matches its whole subtree.
-    pub folder: Option<String>,
-    /// Oxygen rating facet: album rating 1-5 (profile 1).
-    pub rating: Option<i32>,
-    /// Oxygen collection facet: manual collection name (resolved to album ids).
+    /// Facette Collections : nom d'une collection manuelle ou intelligente.
+    /// MONOVALUÉE — voir `TrackFilter::collection_ids`.
     pub collection: Option<String>,
-    /// Facette Favoris : `track` ou `album` (profil 1).
-    pub favorite: Option<String>,
-    /// Facette Listes de lecture : nom de la liste.
-    pub playlist: Option<String>,
-    /// Facette Sans étiquette : `genre`, `year`, `artist`, `album` ou `cover`.
-    pub untagged: Option<String>,
-    /// Facette Année d'enregistrement (`albums.original_year`).
-    pub original_year: Option<i32>,
-}
-
-impl TrackFilterQuery {
-    /// Une requête porte-t-elle au moins un filtre ?
-    ///
-    /// Extrait de `list_tracks` pour être testable : tant que l'expression
-    /// vivait en ligne, un champ pouvait en être absent sans qu'aucun test ne
-    /// puisse le dire. C'est arrivé — `original_year` avait été ajouté à la
-    /// suite d'un `;`, donc dans une fermeture `|| …` créée et jetée, et le
-    /// tri par année d'enregistrement partait sur le chemin NON filtré.
-    ///
-    /// Toute facette ajoutée à cette structure doit être ajoutée ici ET dans
-    /// `chaque_facette_compte_comme_un_filtre`.
-    fn has_filters(&self) -> bool {
-        let non_vide = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
-
-        self.genre.is_some()
-            || self.year.is_some()
-            || self.format.is_some()
-            || self.sample_rate.is_some()
-            || self.bit_depth.is_some()
-            || self.source.is_some()
-            || self.label.is_some()
-            || self.composer.is_some()
-            || self.q.is_some()
-            || self.artist.is_some()
-            || self.country.is_some()
-            || self.mood.is_some()
-            || self.source_media.is_some()
-            || self.rating.is_some()
-            || self.original_year.is_some()
-            || non_vide(&self.folder)
-            || non_vide(&self.collection)
-            || non_vide(&self.favorite)
-            || non_vide(&self.playlist)
-            || non_vide(&self.untagged)
-    }
 }
 
 pub(super) async fn list_tracks(
     State(state): State<AppState>,
     Query(p): Query<TrackFilterQuery>,
-) -> Json<Value> {
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, AppError> {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
 
-    let has_filters = p.has_filters();
+    // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
+    // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
+    // et qu'il refuse même en double.
+    let mut filter = track_filter_from_raw(raw.as_deref())?;
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
     // a SMART collection resolves to concrete track ids (its compiled rule query).
     // Manual wins on a name clash. An unknown name → empty album set → matches
     // nothing (the requested collection is simply empty).
-    let (collection_ids, collection_track_ids): (Option<Vec<i64>>, Option<Vec<i64>>) =
-        match p.collection.as_deref().filter(|s| !s.is_empty()) {
-            None => (None, None),
-            Some(name) => {
-                let album_ids = super::facets::collection_album_ids(&state, name);
-                if !album_ids.is_empty() {
-                    (Some(album_ids), None)
-                } else if let Some(track_ids) =
-                    super::facets::smart_collection_track_ids(&state, name)
-                {
-                    (None, Some(track_ids))
-                } else {
-                    (Some(Vec::new()), None)
-                }
-            }
-        };
+    //
+    // ⚠️ Résolution PARTAGÉE avec le compteur de facettes (#1864) : les deux
+    // routes doivent désigner le même ensemble, sinon le rail annonce des
+    // effectifs que cette liste ne rend pas.
+    let scope = p
+        .collection
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|name| super::facets::resolve_collection(&state, name))
+        .unwrap_or_default();
 
-    if has_filters {
-        match repo.list_filtered(
-            p.genre.as_deref(),
-            p.year,
-            p.format.as_deref(),
-            p.sample_rate,
-            p.bit_depth,
-            p.source.as_deref(),
-            p.label.as_deref(),
-            p.composer.as_deref(),
-            p.q.as_deref(),
-            p.artist.as_deref(),
-            p.country.as_deref(),
-            p.mood.as_deref(),
-            p.source_media.as_deref(),
-            p.folder.as_deref(),
-            p.rating,
-            collection_ids.as_deref(),
-            collection_track_ids.as_deref(),
-            p.favorite.as_deref(),
-            p.playlist.as_deref(),
-            p.untagged.as_deref(),
-            p.original_year,
-            limit,
-            offset,
-        ) {
-            Ok((items, total)) => {
-                Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
-            }
+    filter.collection_ids = scope.albums;
+    filter.collection_track_ids = scope.tracks;
+
+    // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
+    // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
+    // suive, la route emprunte le chemin filtré, n'y filtre rien, et rend la
+    // bibliothèque ENTIÈRE en annonçant un filtre actif — c'est exactement ce
+    // que faisait `?favorite=1` avant #2168.
+    if filter.is_active() {
+        match repo.list_filtered(&filter, limit, offset) {
+            Ok((items, total)) => Ok(Json(
+                json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+            )),
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
-                Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+                Ok(Json(
+                    json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
+                ))
             }
         }
     } else {
-        let total = repo.count().unwrap_or(0);
-        let items = match repo.list(limit, offset) {
+        // Même exclusion des albums masqués que le chemin facetté (#1391) :
+        // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
+        let total = repo.count_visible().unwrap_or(0);
+        let items = match repo.list_visible(limit, offset) {
             Ok(tracks) => tracks,
             Err(e) => {
                 tracing::error!(
@@ -223,7 +160,9 @@ pub(super) async fn list_tracks(
                 Vec::new()
             }
         };
-        Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+        Ok(Json(
+            json!({"items": items, "total": total, "limit": limit, "offset": offset}),
+        ))
     }
 }
 
@@ -307,7 +246,13 @@ pub(super) async fn stream_track_audio(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let path = std::path::Path::new(file_path);
+    // La graphie du disque, pas celle de la base : sur un nom décomposé
+    // (macOS, SMB/CIFS), `metadata()` échouait et la route rendait 404 pour un
+    // fichier présent — la même piste partant pourtant sans broncher par le
+    // chemin de lecture de l'orchestrateur, qui, lui, replie déjà (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let path = std::path::Path::new(&file_path);
     let file_size = match tokio::fs::metadata(path).await {
         Ok(m) => m.len(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -361,7 +306,10 @@ pub(super) async fn rescan_track(
         return (StatusCode::BAD_REQUEST, "no file path").into_response();
     };
 
-    let meta = tune_core::metadata::read_metadata(std::path::Path::new(file_path));
+    // #1865 : le chemin stocké est en NFC, le disque peut porter le NFD.
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
+        .unwrap_or_else(|| file_path.clone());
+    let meta = tune_core::metadata::read_metadata(std::path::Path::new(&file_path));
     match meta {
         Some(m) => {
             apply_metadata_to_track(&mut track, &m);
@@ -419,9 +367,13 @@ pub(super) async fn track_all_tags(
 
     let mut result = serde_json::to_value(&track).unwrap_or_default();
 
-    // Try reading raw file tags with lofty
-    if let Some(ref path) = track.file_path {
-        if let Ok(tagged) = lofty::read_from_path(path) {
+    // Try reading raw file tags with lofty — sur la graphie du disque (#1865).
+    if let Some(path) = track
+        .file_path
+        .as_deref()
+        .and_then(tune_core::library::local_path::resolve_existing_local_path)
+    {
+        if let Ok(tagged) = lofty::read_from_path(&path) {
             let tags: Vec<Value> = tagged
                 .tags()
                 .iter()
@@ -755,6 +707,12 @@ pub(super) async fn track_waveform(
         }
     };
 
+    // Le décodeur reçoit la graphie du disque, pas celle de la base : sur les
+    // pistes dont le nom est décomposé, `generate_waveform` rendait un vecteur
+    // vide et la route répondait « file unreadable » pour un fichier qui se
+    // joue très bien (#1865).
+    let file_path = tune_core::library::local_path::resolve_existing_local_path(&file_path)
+        .unwrap_or(file_path);
     let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
     if points.is_empty() {
         return Json(json!({ "track_id": id, "waveform": null, "error": "file unreadable or unsupported format" })).into_response();
@@ -805,11 +763,16 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                     continue;
                 };
 
-                let path = std::path::Path::new(file_path);
-                if !path.exists() {
+                // Passe de fond : sans le repli, toute une bibliothèque venue
+                // d'un Mac est comptée « sautée » et ne voit jamais ses
+                // étiquettes relues — 147 pistes sur 46 877 pour `.18` (#1865).
+                let Some(reel) =
+                    tune_core::library::local_path::resolve_existing_local_path(file_path)
+                else {
                     skipped += 1;
                     continue;
-                }
+                };
+                let path = std::path::Path::new(&reel);
 
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
                     errors += 1;
@@ -1127,8 +1090,17 @@ mod identification_acoustique_tests {
 }
 
 #[cfg(test)]
-mod has_filters_tests {
-    use super::TrackFilterQuery;
+mod filtre_actif_tests {
+    use super::super::query_multi::track_filter_from_raw;
+    use tune_core::db::facet_filter::TrackFilter;
+
+    /// La requête telle qu'elle arrive sur le fil — le chemin de `list_tracks`.
+    fn depuis(raw: &str) -> TrackFilter {
+        match track_filter_from_raw(Some(raw)) {
+            Ok(f) => f,
+            Err(_) => panic!("requête acceptable : {raw}"),
+        }
+    }
 
     /// Le garde-fou de la régression : `original_year` seul DOIT compter comme
     /// un filtre. Il ne comptait pas — il avait atterri après un `;`, dans une
@@ -1136,12 +1108,8 @@ mod has_filters_tests {
     /// faire échouer la compilation. Neuf checks de CI verts ne l'ont pas vu.
     #[test]
     fn annee_denregistrement_seule_est_un_filtre() {
-        let q = TrackFilterQuery {
-            original_year: Some(1969),
-            ..Default::default()
-        };
         assert!(
-            q.has_filters(),
+            depuis("original_year=1969").is_active(),
             "filtrer sur l'année d'enregistrement partait sur le chemin NON filtré"
         );
     }
@@ -1150,99 +1118,422 @@ mod has_filters_tests {
     /// paginée) ne serait jamais emprunté.
     #[test]
     fn une_requete_nue_ne_filtre_rien() {
-        assert!(!TrackFilterQuery::default().has_filters());
+        assert!(!depuis("limit=50&offset=0").is_active());
+        assert!(!TrackFilter::default().is_active());
     }
 
     /// Une chaîne vide n'est pas un filtre : `?favorite=` arrive ainsi depuis
     /// le client quand la facette est désélectionnée.
     #[test]
     fn une_chaine_vide_nest_pas_un_filtre() {
-        let q = TrackFilterQuery {
-            favorite: Some(String::new()),
-            playlist: Some(String::new()),
-            untagged: Some(String::new()),
-            collection: Some(String::new()),
-            folder: Some(String::new()),
-            ..Default::default()
-        };
-        assert!(!q.has_filters(), "une facette vide ne doit pas filtrer");
+        let q = depuis("favorite=&playlist=&untagged=&collection=&folder=&format=&genre=");
+        assert!(!q.is_active(), "une facette vide ne doit pas filtrer");
+    }
+
+    /// ⚠️ Défaut RÉEL corrigé au passage. Avant #2168, une valeur hors du
+    /// vocabulaire fermé comptait comme un filtre (`Option::is_some`) mais ne
+    /// produisait AUCUNE condition SQL (`_ => {}`) : la route empruntait le
+    /// chemin filtré, n'y filtrait rien, et rendait la bibliothèque ENTIÈRE
+    /// avec un total qui la confirmait. `is_active` teste désormais le
+    /// vocabulaire, pas la présence.
+    #[test]
+    fn une_valeur_hors_vocabulaire_ne_rend_plus_toute_la_bibliotheque() {
+        assert!(!depuis("favorite=1").is_active());
+        assert!(!depuis("untagged=mbid").is_active());
+        assert!(depuis("favorite=album").is_active());
+        assert!(depuis("untagged=cover").is_active());
     }
 
     /// Chaque facette, prise SEULE, doit compter. Ce test est la raison d'être
-    /// de l'extraction : il échouera si une facette est ajoutée à la structure
-    /// et oubliée dans `has_filters` — exactement le défaut corrigé ici.
+    /// de l'extraction : il échouera si une facette est ajoutée et oubliée dans
+    /// `TrackFilter::is_active` — exactement le défaut corrigé ici.
     #[test]
     fn chaque_facette_compte_comme_un_filtre() {
-        let cas: Vec<(&str, TrackFilterQuery)> = vec![
-            (
-                "genre",
-                TrackFilterQuery {
-                    genre: Some("Rock".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "year",
-                TrackFilterQuery {
-                    year: Some(1994),
-                    ..Default::default()
-                },
-            ),
-            (
-                "original_year",
-                TrackFilterQuery {
-                    original_year: Some(1969),
-                    ..Default::default()
-                },
-            ),
-            (
-                "rating",
-                TrackFilterQuery {
-                    rating: Some(4),
-                    ..Default::default()
-                },
-            ),
-            (
-                "favorite",
-                TrackFilterQuery {
-                    favorite: Some("1".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "playlist",
-                TrackFilterQuery {
-                    playlist: Some("Ma liste".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "untagged",
-                TrackFilterQuery {
-                    untagged: Some("genre".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "collection",
-                TrackFilterQuery {
-                    collection: Some("Jazz".into()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "folder",
-                TrackFilterQuery {
-                    folder: Some("/mnt/music".into()),
-                    ..Default::default()
-                },
-            ),
+        let cas = [
+            ("genre", "genre=Rock"),
+            ("year", "year=1994"),
+            ("format", "format=flac"),
+            ("sample_rate", "sample_rate=96000"),
+            ("bit_depth", "bit_depth=24"),
+            ("source", "source=local"),
+            ("label", "label=ECM"),
+            ("composer", "composer=Bach"),
+            ("artist", "artist=Miles+Davis"),
+            ("country", "country=FR"),
+            ("mood", "mood=calme"),
+            ("source_media", "source_media=CD"),
+            ("original_year", "original_year=1969"),
+            ("rating", "rating=4"),
+            ("favorite", "favorite=track"),
+            ("playlist", "playlist=Ma+liste"),
+            ("untagged", "untagged=genre"),
+            ("folder", "folder=%2Fmnt%2Fmusic"),
+            ("q", "q=so+what"),
         ];
-        for (nom, q) in cas {
+        for (nom, raw) in cas {
             assert!(
-                q.has_filters(),
+                depuis(raw).is_active(),
                 "la facette « {nom} » ne compte pas comme un filtre"
             );
         }
+        // `collection` ne passe pas par la chaîne brute : la route la résout en
+        // identifiants avant d'appeler `list_filtered`.
+        let sel = TrackFilter {
+            collection_ids: Some(vec![12]),
+            ..Default::default()
+        };
+        assert!(sel.is_active(), "la facette « collection » ne compte pas");
+    }
+
+    /// Le cas de Cyrille (fil 1513) : deux formats et deux fréquences cochés.
+    #[test]
+    fn plusieurs_valeurs_dans_une_meme_facette() {
+        let q = depuis("format=aiff&format=flac&sample_rate=44100&sample_rate=352800");
+        assert_eq!(q.formats, vec!["aiff".to_string(), "flac".to_string()]);
+        assert_eq!(q.sample_rates, vec![44100, 352800]);
+        assert!(q.is_active());
+    }
+
+    /// Rétrocompatibilité : une URL enregistrée avant #2168 (une valeur par
+    /// facette) donne exactement le même filtre.
+    #[test]
+    fn une_url_ancienne_reste_lue_a_lidentique() {
+        let q = depuis("genre=Jazz&format=flac&year=1971&limit=3000");
+        assert_eq!(q.genres, vec!["Jazz".to_string()]);
+        assert_eq!(q.formats, vec!["flac".to_string()]);
+        assert_eq!(q.years, vec![1971]);
+    }
+}
+
+// ── « Autres versions de ce titre » — #2372 ───────────────────────────────
+
+#[derive(Deserialize)]
+pub(super) struct VersionsParams {
+    /// Plafond des versions LOCALES rendues. Le streaming a son propre
+    /// budget, borne par service.
+    limit: Option<i64>,
+    /// Interroger aussi les services de streaming. Vrai par defaut : c'est le
+    /// coeur de la demande de FabienM (« pour les curieux, proposer les
+    /// versions trouvees dans les services streaming »). Le client peut le
+    /// couper pour un premier rendu immediat.
+    streaming: Option<bool>,
+}
+
+/// Rassemble les autres versions d'une piste. Rend `None` si la piste
+/// n'existe pas — le handler en fait un 404.
+///
+/// Sorti du handler pour etre testable sans monter un routeur : les tests
+/// posent une bibliotheque en memoire et appellent directement.
+pub(super) async fn rassembler_versions(
+    state: &AppState,
+    id: i64,
+    limite: i64,
+    avec_streaming: bool,
+) -> Option<Value> {
+    // Le morceau de reference : son titre, son artiste de piste (celui affiche
+    // a l'auditeur) et l'album lui-meme. L'artiste d'album n'est qu'un repli :
+    // sur une compilation « Artistes divers », le premier ferait precisement
+    // perdre les versions de l'interprete reel (#2638).
+    let e = state.backend.engine();
+    let sql = format!(
+        "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, '') \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+         WHERE t.id = {}",
+        crate::routes::versions::marqueur(e, 1)
+    );
+    let cols = state
+        .backend
+        .query_one(&sql, &[&id as &dyn ToSqlValue])
+        .ok()
+        .flatten()?;
+    let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+    let artiste = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+    let album = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+
+    let locales = crate::routes::versions::versions_locales(
+        state,
+        &titre,
+        &artiste,
+        &album,
+        Some(id),
+        limite,
+    );
+    let streaming = if avec_streaming {
+        crate::routes::versions::versions_streaming(state, &titre, &artiste, &album).await
+    } else {
+        Vec::new()
+    };
+
+    // La MEME forme qu'un groupe de `GET /home/other-versions` : l'ecran qui
+    // dessine deja la section d'accueil rend celui-ci sans une ligne de plus.
+    Some(json!({
+        "track_id": id,
+        "title": titre,
+        "artist_name": artiste,
+        "played_album": album,
+        "versions": locales,
+        "streaming": streaming,
+    }))
+}
+
+/// `GET /library/tracks/{id}/versions` — les autres versions de CE titre,
+/// bibliotheque ET services de streaming.
+///
+/// La section d'accueil `GET /home/other-versions` sait deja rapprocher les
+/// versions, mais son vivier est l'historique d'ecoute : un morceau jamais
+/// ecoute recemment n'y apparait jamais. FabienM l'a dit mot pour mot (fil
+/// 1538, 24/08) : « elles se resument aux simples dernieres ecoutes ». Cette
+/// route prend UNE piste en entree — celle designee dans le menu « … » —, et
+/// reutilise le meme rapprochement (`routes::versions`).
+///
+/// 404 quand la piste n'existe pas ; un groupe aux deux listes vides quand
+/// elle existe sans autre version : « aucune autre version connue » est une
+/// reponse, pas une erreur.
+pub(super) async fn track_versions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(p): Query<VersionsParams>,
+) -> impl IntoResponse {
+    let limite = p.limit.unwrap_or(50).clamp(1, 200);
+    let avec_streaming = p.streaming.unwrap_or(true);
+    match rassembler_versions(&state, id, limite, avec_streaming).await {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests_versions_piste {
+    use super::rassembler_versions;
+    use crate::state::AppState;
+    use tune_core::db::backend::ToSqlValue;
+
+    /// Pose « Billie Jean » sur Thriller ET sur Number Ones, plus un morceau
+    /// sans rapport. Rend l'id de la piste de Thriller.
+    fn bibliotheque_de_test(state: &AppState) -> i64 {
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Michael Jackson')", &[])
+            .unwrap();
+        let mj = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Chris Cornell')", &[])
+            .unwrap();
+        let cc = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Thriller', ?1)",
+            &[&mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let thriller = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Number Ones', ?1)",
+            &[&mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let number_ones = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('Euphoria Morning', ?1)",
+            &[&cc as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let euphoria = b.last_insert_rowid();
+
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Billie Jean', ?1, ?2, 294000, '/a.flac')",
+            &[&thriller as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let seed = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('billie jean', ?1, ?2, 289000, '/b.flac')",
+            &[&number_ones as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Une REPRISE : même titre, autre artiste. Le rapprochement LOCAL est
+        // volontairement strict sur l'artiste — elle ne doit pas sortir.
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Billie Jean', ?1, ?2, 301000, '/c.flac')",
+            &[&euphoria as &dyn ToSqlValue, &cc as &dyn ToSqlValue],
+        )
+        .unwrap();
+        // Un morceau sans rapport, sur le MÊME album que la graine.
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+             VALUES ('Beat It', ?1, ?2, 258000, '/d.flac')",
+            &[&thriller as &dyn ToSqlValue, &mj as &dyn ToSqlValue],
+        )
+        .unwrap();
+        seed
+    }
+
+    /// Le cœur de #2372 : depuis UNE piste, l'autre version portée par un
+    /// autre album ressort. Sans historique d'écoute — c'est tout l'objet :
+    /// `GET /home/other-versions` n'aurait rien rendu ici.
+    #[tokio::test]
+    async fn une_piste_donne_ses_autres_versions_sans_historique() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let seed = bibliotheque_de_test(&state);
+
+        let v = rassembler_versions(&state, seed, 50, false)
+            .await
+            .expect("la piste existe");
+
+        assert_eq!(v["title"].as_str(), Some("Billie Jean"));
+        assert_eq!(v["artist_name"].as_str(), Some("Michael Jackson"));
+        assert_eq!(v["played_album"].as_str(), Some("Thriller"));
+        let versions = v["versions"].as_array().expect("un tableau de versions");
+        assert_eq!(
+            versions.len(),
+            1,
+            "une seule autre version attendue, obtenu {versions:?}"
+        );
+        assert_eq!(versions[0]["album_title"].as_str(), Some("Number Ones"));
+        assert_eq!(versions[0]["duration_ms"].as_i64(), Some(289_000));
+    }
+
+    /// La piste de départ ne se propose pas elle-même, et son propre album
+    /// n'entre pas dans la liste.
+    #[tokio::test]
+    async fn la_piste_de_depart_et_son_album_sont_ecartes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let seed = bibliotheque_de_test(&state);
+
+        let v = rassembler_versions(&state, seed, 50, false).await.unwrap();
+        let versions = v["versions"].as_array().unwrap();
+        for ver in versions {
+            assert_ne!(
+                ver["track_id"].as_i64(),
+                Some(seed),
+                "la graine se propose elle-même"
+            );
+            assert_ne!(
+                ver["album_title"].as_str(),
+                Some("Thriller"),
+                "l'album de départ ressort : {ver:?}"
+            );
+        }
+    }
+
+    /// Contre-epreuve de #2638, avec les libelles vus chez FabienM. La graine
+    /// vit sur une compilation attribuee a « Artistes divers », mais porte
+    /// bien Kate Bush comme artiste de piste. Les suffixes d'edition ne
+    /// doivent plus vider la liste locale, et la reprise d'un autre artiste
+    /// reste exclue du rapprochement local.
+    #[tokio::test]
+    async fn running_up_that_hill_retrouve_ses_trois_versions_locales() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO artists (name) VALUES ('Thomas Mery & The desert fox')",
+            &[],
+        )
+        .unwrap();
+        let thomas = b.last_insert_rowid();
+
+        let album = |titre: &str, artiste: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id) VALUES (?1, ?2)",
+                &[&titre as &dyn ToSqlValue, &artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let hit = album("Hit Collection", divers);
+        let before = album("Before The Dawn", kate);
+        let hounds = album("Hounds Of Love", kate);
+        let reprise = album("Label Effervescence Pain Perdu", thomas);
+
+        let piste = |titre: &str, album_id: i64, artiste: i64, chemin: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+                 VALUES (?1, ?2, ?3, 296000, ?4)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &artiste as &dyn ToSqlValue,
+                    &chemin as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let seed = piste("Running Up that Hill", hit, kate, "/hit.flac");
+        piste(
+            "Running Up That Hill (A Deal With God)",
+            before,
+            kate,
+            "/before.flac",
+        );
+        piste(
+            "Running Up That Hill (A Deal With God)",
+            hounds,
+            kate,
+            "/hounds.flac",
+        );
+        piste(
+            "Running Up That Hill (12' Mix) [Bonus Track]",
+            hounds,
+            kate,
+            "/mix.flac",
+        );
+        piste("Running up that hill", reprise, thomas, "/reprise.flac");
+
+        let v = rassembler_versions(&state, seed, 50, false)
+            .await
+            .expect("la piste existe");
+        assert_eq!(v["artist_name"].as_str(), Some("Kate Bush"));
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(versions.len(), 3, "versions rendues : {versions:?}");
+        assert!(versions.iter().all(|x| {
+            x["album_title"].as_str() == Some("Before The Dawn")
+                || x["album_title"].as_str() == Some("Hounds Of Love")
+        }));
+        assert!(
+            versions
+                .iter()
+                .all(|x| { x["album_title"].as_str() != Some("Label Effervescence Pain Perdu") })
+        );
+    }
+
+    /// « Beat It » n'a aucune autre version : un groupe VIDE, pas une erreur.
+    /// Le client en tire « aucune autre version connue ».
+    #[tokio::test]
+    async fn un_morceau_sans_autre_version_rend_un_groupe_vide() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque_de_test(&state);
+        let id: i64 = state
+            .backend
+            .query_one("SELECT id FROM tracks WHERE title = 'Beat It'", &[])
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap();
+
+        let v = rassembler_versions(&state, id, 50, false).await.unwrap();
+        assert_eq!(v["versions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["streaming"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Une piste inconnue rend `None` — le handler en fait un 404, pas un
+    /// groupe vide qui ferait croire à un morceau sans version.
+    #[tokio::test]
+    async fn une_piste_inconnue_n_est_pas_un_groupe_vide() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(
+            rassembler_versions(&state, 999_999, 50, false)
+                .await
+                .is_none()
+        );
     }
 }

@@ -24,6 +24,13 @@ const STREAM_URL_TTL_SECS: u64 = 18_000;
 // killing every fallback attempt when the native path is fully login-gated.
 const YTDLP_TIMEOUT_SECS: u64 = 90;
 
+// InnerTube is periodically closed to unauthenticated clients. Do not pay the
+// same two known failures for every track when yt-dlp is available, but keep
+// probing periodically so a temporary YouTube outage does not become a
+// permanent session-wide fallback.
+const NATIVE_FAILURE_THRESHOLD: u32 = 2;
+const NATIVE_CIRCUIT_COOLDOWN_SECS: u64 = 15 * 60;
+
 // ---------------------------------------------------------------------------
 // Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
 // ---------------------------------------------------------------------------
@@ -145,6 +152,106 @@ struct UrlCache {
     ttl: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeAttemptDecision {
+    Attempt,
+    Probe,
+    Bypass,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeCircuitState {
+    Closed {
+        consecutive_failures: u32,
+    },
+    Open {
+        retry_at: Instant,
+    },
+    /// Exactly one caller probes InnerTube after the cooldown. Other callers
+    /// keep using yt-dlp until that probe reports success or failure.
+    ProbeInFlight {
+        retry_at: Instant,
+    },
+}
+
+/// Session-local circuit breaker for the two unauthenticated InnerTube
+/// surfaces. The state machine is independent from I/O so its time boundaries
+/// and recovery behaviour can be tested deterministically.
+#[derive(Debug)]
+struct NativeExtractionCircuit {
+    state: NativeCircuitState,
+    failure_threshold: u32,
+    cooldown: Duration,
+}
+
+impl NativeExtractionCircuit {
+    fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            state: NativeCircuitState::Closed {
+                consecutive_failures: 0,
+            },
+            failure_threshold,
+            cooldown,
+        }
+    }
+
+    fn decide(&mut self, now: Instant) -> NativeAttemptDecision {
+        match self.state {
+            NativeCircuitState::Closed { .. } => NativeAttemptDecision::Attempt,
+            NativeCircuitState::Open { retry_at } if now >= retry_at => {
+                self.state = NativeCircuitState::ProbeInFlight {
+                    retry_at: now + self.cooldown,
+                };
+                NativeAttemptDecision::Probe
+            }
+            NativeCircuitState::ProbeInFlight { retry_at } if now >= retry_at => {
+                // The previous probe was cancelled before it could report an
+                // outcome. Its lease has expired, so recovery remains possible.
+                self.state = NativeCircuitState::ProbeInFlight {
+                    retry_at: now + self.cooldown,
+                };
+                NativeAttemptDecision::Probe
+            }
+            NativeCircuitState::Open { .. } | NativeCircuitState::ProbeInFlight { .. } => {
+                NativeAttemptDecision::Bypass
+            }
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.state = NativeCircuitState::Closed {
+            consecutive_failures: 0,
+        };
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        match self.state {
+            NativeCircuitState::Closed {
+                consecutive_failures,
+            } => {
+                let failures = consecutive_failures.saturating_add(1);
+                if failures >= self.failure_threshold {
+                    self.state = NativeCircuitState::Open {
+                        retry_at: now + self.cooldown,
+                    };
+                } else {
+                    self.state = NativeCircuitState::Closed {
+                        consecutive_failures: failures,
+                    };
+                }
+            }
+            NativeCircuitState::ProbeInFlight { .. } => {
+                self.state = NativeCircuitState::Open {
+                    retry_at: now + self.cooldown,
+                };
+            }
+            // A request that started before another one opened the circuit may
+            // finish afterwards. The first opening time remains authoritative.
+            NativeCircuitState::Open { .. } => {}
+        }
+    }
+}
+
 impl UrlCache {
     fn new(ttl_secs: u64) -> Self {
         Self {
@@ -194,6 +301,7 @@ struct BrowseCacheEntry {
 pub struct YouTubeService {
     client: Client,
     url_cache: Mutex<UrlCache>,
+    native_extraction_circuit: Mutex<NativeExtractionCircuit>,
     /// General-purpose browse/home cache (30 min TTL).
     browse_cache: Mutex<HashMap<String, BrowseCacheEntry>>,
     browse_cache_ttl: Duration,
@@ -233,6 +341,10 @@ impl YouTubeService {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             url_cache: Mutex::new(UrlCache::new(STREAM_URL_TTL_SECS)),
+            native_extraction_circuit: Mutex::new(NativeExtractionCircuit::new(
+                NATIVE_FAILURE_THRESHOLD,
+                Duration::from_secs(NATIVE_CIRCUIT_COOLDOWN_SECS),
+            )),
             browse_cache: Mutex::new(HashMap::new()),
             browse_cache_ttl: Duration::from_secs(1800), // 30 minutes
             api_key,
@@ -615,12 +727,43 @@ impl YouTubeService {
 
     /// Extract audio stream URL with native API as primary + yt-dlp fallback.
     async fn extract_audio_url(&self, track_id: &str) -> Result<String, String> {
-        // Primary: native YTM /player API (no external dependency)
-        match self.extract_audio_url_native(track_id).await {
-            Ok(url) => return Ok(url),
-            Err(e) => {
-                info!(track_id, error = %e, "ytm_native_extraction_failed_trying_ytdlp");
+        // Bypass is useful only when the fallback actually exists. Without the
+        // managed helper, always retain the chance that this particular track
+        // still works through InnerTube.
+        let ytdlp_available = crate::ytdlp::binary().is_some();
+        let native_decision = if ytdlp_available {
+            self.native_extraction_circuit
+                .lock()
+                .await
+                .decide(Instant::now())
+        } else {
+            NativeAttemptDecision::Attempt
+        };
+
+        if native_decision == NativeAttemptDecision::Probe {
+            info!(track_id, "ytm_native_circuit_probe_started");
+        }
+
+        if matches!(
+            native_decision,
+            NativeAttemptDecision::Attempt | NativeAttemptDecision::Probe
+        ) {
+            // Primary: native YTM /player API (no external dependency).
+            match self.extract_audio_url_native(track_id).await {
+                Ok(url) => {
+                    self.native_extraction_circuit.lock().await.record_success();
+                    return Ok(url);
+                }
+                Err(e) => {
+                    self.native_extraction_circuit
+                        .lock()
+                        .await
+                        .record_failure(Instant::now());
+                    info!(track_id, error = %e, "ytm_native_extraction_failed_trying_ytdlp");
+                }
             }
+        } else {
+            info!(track_id, "ytm_native_circuit_open_using_ytdlp");
         }
 
         // Fallback: yt-dlp subprocess
@@ -1051,6 +1194,8 @@ impl YouTubeService {
             disc_number: None,
             explicit: false,
             isrc: None,
+            composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1185,6 +1330,8 @@ impl YouTubeService {
             disc_number: None,
             explicit: item["isExplicit"].as_bool().unwrap_or(false),
             isrc: None,
+            composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -1378,6 +1525,8 @@ impl YouTubeService {
                         disc_number: None,
                         explicit: false,
                         isrc: None,
+                        composer: None,
+                        artist_id: None,
                         quality: None,
                     });
                 }
@@ -1406,6 +1555,8 @@ impl YouTubeService {
                                 disc_number: None,
                                 explicit: false,
                                 isrc: None,
+                                composer: None,
+                                artist_id: None,
                                 quality: None,
                             });
                         }
@@ -1499,6 +1650,8 @@ impl YouTubeService {
                             disc_number: None,
                             explicit: false,
                             isrc: None,
+                            composer: None,
+                            artist_id: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -1703,6 +1856,8 @@ impl YouTubeService {
                 disc_number: None,
                 explicit: false,
                 isrc: None,
+                composer: None,
+                artist_id: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -1817,6 +1972,8 @@ impl YouTubeService {
                             disc_number: Some(1),
                             explicit: false,
                             isrc: None,
+                            composer: None,
+                            artist_id: None,
                             quality: Some(StreamQuality {
                                 codec: "OPUS".into(),
                                 sample_rate: 48000,
@@ -2123,6 +2280,8 @@ impl YouTubeService {
                 disc_number: None,
                 explicit: false,
                 isrc: None,
+                composer: None,
+                artist_id: None,
                 quality: Some(StreamQuality {
                     codec: "OPUS".into(),
                     sample_rate: 48000,
@@ -2495,6 +2654,8 @@ impl StreamingService for YouTubeService {
             disc_number: None,
             explicit: false,
             isrc: None,
+            composer: None,
+            artist_id: None,
             quality: Some(StreamQuality {
                 codec: "OPUS".into(),
                 sample_rate: 48000,
@@ -3062,6 +3223,67 @@ mod tests {
     fn youtube_service_name() {
         let svc = YouTubeService::new();
         assert_eq!(svc.name(), "youtube");
+    }
+
+    #[test]
+    fn native_circuit_opens_after_threshold_and_bypasses_before_cooldown() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let mut circuit = NativeExtractionCircuit::new(2, cooldown);
+
+        assert_eq!(circuit.decide(start), NativeAttemptDecision::Attempt);
+        circuit.record_failure(start);
+        assert_eq!(circuit.decide(start), NativeAttemptDecision::Attempt);
+        circuit.record_failure(start);
+
+        assert_eq!(
+            circuit.decide(start + cooldown - Duration::from_millis(1)),
+            NativeAttemptDecision::Bypass
+        );
+    }
+
+    #[test]
+    fn native_circuit_allows_exactly_one_probe_after_cooldown() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let mut circuit = NativeExtractionCircuit::new(1, cooldown);
+        circuit.record_failure(start);
+
+        assert_eq!(
+            circuit.decide(start + cooldown),
+            NativeAttemptDecision::Probe
+        );
+        assert_eq!(
+            circuit.decide(start + cooldown),
+            NativeAttemptDecision::Bypass
+        );
+
+        // Cancellation cannot strand the circuit in ProbeInFlight forever.
+        assert_eq!(
+            circuit.decide(start + cooldown + cooldown),
+            NativeAttemptDecision::Probe
+        );
+
+        circuit.record_failure(start + cooldown + cooldown);
+        assert_eq!(
+            circuit.decide(start + cooldown + cooldown + cooldown - Duration::from_millis(1)),
+            NativeAttemptDecision::Bypass
+        );
+    }
+
+    #[test]
+    fn native_circuit_success_closes_and_resets_failure_count() {
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(60);
+        let mut circuit = NativeExtractionCircuit::new(2, cooldown);
+        circuit.record_failure(start);
+        circuit.record_failure(start);
+        assert_eq!(circuit.decide(start), NativeAttemptDecision::Bypass);
+
+        circuit.record_success();
+        assert_eq!(circuit.decide(start), NativeAttemptDecision::Attempt);
+        circuit.record_failure(start);
+        assert_eq!(circuit.decide(start), NativeAttemptDecision::Attempt);
     }
 
     #[test]

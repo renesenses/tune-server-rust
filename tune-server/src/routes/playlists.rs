@@ -125,7 +125,15 @@ async fn create_playlist(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, body.description.as_deref(), profile.id()) {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Ok(id) => match repo.get(id) {
+            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(None) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "playlist created but not found",
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -137,7 +145,11 @@ async fn update_playlist(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.description.as_deref()) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => match repo.get(id) {
+            Ok(Some(playlist)) => Json(json!(playlist)).into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -150,13 +162,22 @@ async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> 
     }
 }
 
-async fn get_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// Une erreur de base ne doit PAS se déguiser en playlist vide (#2797) : le
+/// client ne peut alors pas distinguer « la playlist est vide » de « la
+/// requête a échoué », et l'utilisateur voit une playlist se vider toute
+/// seule. On remonte un 500 explicite.
+async fn get_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
-    Json(json!(tracks))
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!(tracks)))
 }
 
 async fn add_tracks(
@@ -166,7 +187,11 @@ async fn add_tracks(
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
-        Ok(ids) => (StatusCode::CREATED, Json(json!({ "added": ids.len() }))).into_response(),
+        Ok(_) => match repo.get(id) {
+            Ok(Some(playlist)) => (StatusCode::CREATED, Json(json!(playlist))).into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -215,25 +240,43 @@ async fn duplicate_playlist(
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     let original = match repo.get(id) {
         Ok(Some(p)) => p,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let new_name = format!("{} (copy)", original.name);
-    let new_id = match repo.create(&new_name, None, profile.id()) {
-        Ok(id) => id,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        // A database error is not "no such playlist": answering 404 for a
+        // failed read sends the client off looking for a playlist that does
+        // exist (#2798).
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    if !track_ids.is_empty() {
-        repo.add_tracks(new_id, &track_ids, None).ok();
-    }
+    // Reading the source track list used to be `unwrap_or_default()`: a
+    // database error produced an EMPTY copy announced as a success — the same
+    // shape as #2119. A copy whose source we cannot read is a failure.
+    let track_ids = match repo.get_track_ids(id) {
+        Ok(ids) => ids,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
 
-    (
-        StatusCode::CREATED,
-        Json(json!({ "id": new_id, "name": new_name })),
-    )
-        .into_response()
+    let new_name = format!("{} (copy)", original.name);
+    // Create + fill in ONE transaction. A half-copied playlist has no meaning:
+    // either the copy exists complete, or nothing is left behind and the
+    // caller is told so (#2798). The old code created the playlist, then threw
+    // the track-insert error away with `.ok()` and answered 201 anyway.
+    match repo.create_with_tracks(&new_name, None, profile.id(), &track_ids) {
+        Ok((new_id, copied)) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": new_id,
+                "name": new_name,
+                "description": Value::Null,
+                // Persisted rows, not "tracks we meant to copy".
+                "track_count": copied.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(source_playlist = id, error = %e, "playlist_duplicate_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -256,10 +299,14 @@ async fn export_m3u(
         _ => return Err(AppError::not_found("playlist not found")),
     };
 
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    // Exporter un M3U vide sur erreur de base produit un fichier qui a l'air
+    // valide et détruit la playlist chez qui le réimporte (#2797).
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     let mut m3u = String::from("#EXTM3U\n");
     for t in &tracks {
@@ -301,10 +348,12 @@ async fn export_multi_format(
         .ok()
         .flatten()
         .ok_or(AppError::not_found("playlist not found"))?;
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let track_ids = repo
+        .get_track_ids(id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     let (content, content_type, ext) = match format {
         "json" => {
@@ -468,7 +517,21 @@ async fn import_m3u_file(
     // thousands of sequential FTS queries hung the request for minutes and the
     // UI stayed stuck on "loading" until a refresh (Dominique: large M3U
     // freezes). One map lookup replaces the N point queries.
-    let path_to_id = track_repo.get_all_local_file_info().unwrap_or_default();
+    // NOT `unwrap_or_default()`: an index we failed to read used to become an
+    // empty map, so EVERY line fell through to "not found" and the import
+    // answered 201 with 0 matched — a success that describes nothing that
+    // happened (#2798, same shape as #2119). Refuse before writing anything.
+    let path_to_id = match track_repo.get_all_local_file_info() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(error = %e, "m3u_import_file_index_unavailable");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("library index unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     // The FTS fallback (filename→search) stays for paths that don't match
     // exactly, but is BOUNDED: a fully-mismatched huge playlist can't run an
@@ -477,6 +540,11 @@ async fn import_m3u_file(
     const MAX_SEARCH_FALLBACKS: u32 = 500;
     let mut search_fallbacks = 0u32;
     let mut fallback_capped = false;
+    // A search that ERRORS is not a line "absent from the library" — counting
+    // it as not-found told the user their file was wrong when the database had
+    // failed (#2798). Its own bucket, so total = matched + not_found +
+    // lookup_errors always holds.
+    let mut lookup_errors = 0u32;
 
     for line in file_content.lines() {
         let line = line.trim();
@@ -500,13 +568,22 @@ async fn import_m3u_file(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(line);
-            if let Ok(results) = track_repo.search(filename, 1) {
-                if let Some(track) = results.first() {
-                    if let Some(id) = track.id {
+            match track_repo.search(filename, 1) {
+                Ok(results) => {
+                    if let Some(track) = results.first()
+                        && let Some(id) = track.id
+                    {
                         track_ids.push(id);
                         matched += 1;
                         continue;
                     }
+                }
+                Err(e) => {
+                    if lookup_errors == 0 {
+                        tracing::warn!(error = %e, "m3u_import_file_lookup_error");
+                    }
+                    lookup_errors += 1;
+                    continue;
                 }
             }
         } else {
@@ -529,19 +606,22 @@ async fn import_m3u_file(
         );
     }
 
-    // Create playlist and add tracks
+    // Create + fill atomically. The playlist used to be created first and the
+    // track insert dropped with `.ok()`, so a failed insert left an empty
+    // playlist behind AND answered 201 (#2798).
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create(&name, None, profile.id()) {
-        Ok(playlist_id) => {
-            if !track_ids.is_empty() {
-                repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
-            }
+    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+        Ok((playlist_id, imported)) => {
+            let duplicates_skipped = track_ids.len() - imported.len();
             tracing::info!(
                 playlist_id,
                 name = %name,
                 total_entries,
                 matched,
+                imported = imported.len(),
+                duplicates_skipped,
                 not_found = not_found_count,
+                lookup_errors,
                 "m3u_import_file_complete"
             );
             (
@@ -550,12 +630,21 @@ async fn import_m3u_file(
                     "id": playlist_id,
                     "name": name,
                     "total_entries": total_entries,
+                    // Lines resolved to a library track…
                     "matched": matched,
+                    // …and rows actually persisted. They differ when the file
+                    // lists the same track twice: the playlist never holds a
+                    // duplicate, so `matched` alone would over-report.
+                    "imported": imported.len(),
+                    "duplicates_skipped": duplicates_skipped,
                     "not_found": not_found_count,
+                    // Lines we could not look up at all (database error) —
+                    // NOT counted as "not found in your library".
+                    "lookup_errors": lookup_errors,
                     // Sample only (capped) — full count is in `not_found`.
                     "not_found_paths": not_found_paths,
                     "not_found_truncated": (not_found_count as usize) > not_found_paths.len(),
-                    "track_count": track_ids.len(),
+                    "track_count": imported.len(),
                 })),
             )
                 .into_response()
@@ -748,27 +837,29 @@ async fn import_linn_file(
         }
     }
 
+    // Same all-or-nothing creation as the M3U import (#2798): the `.ok()` here
+    // hid a failed track insert behind a 201 and left an empty playlist.
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create(&name, None, profile.id()) {
-        Ok(playlist_id) => {
-            if !track_ids.is_empty() {
-                repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
-            }
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": playlist_id,
-                    "name": name,
-                    "total_entries": total_entries,
-                    "matched": matched,
-                    "not_found": not_found.len(),
-                    "not_found_titles": not_found,
-                    "track_count": track_ids.len(),
-                })),
-            )
-                .into_response()
+    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+        Ok((playlist_id, imported)) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": playlist_id,
+                "name": name,
+                "total_entries": total_entries,
+                "matched": matched,
+                "imported": imported.len(),
+                "duplicates_skipped": track_ids.len() - imported.len(),
+                "not_found": not_found.len(),
+                "not_found_titles": not_found,
+                "track_count": imported.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "linn_import_file_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
@@ -909,37 +1000,63 @@ async fn import_m3u_url(
     };
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
-    let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let playlist_id = match repo.create(&name, None, profile.id()) {
-        Ok(id) => id,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
 
+    // Resolve EVERY line before touching the database. The old order created
+    // the playlist first, then ran one `add_tracks_deduped(...).ok()` per line:
+    // each dropped error still incremented `matched_tracks`, so the response
+    // could claim tracks that were never written, on top of a playlist that
+    // could not be rolled back (#2798).
     let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let mut matched = 0i64;
+    let mut track_ids: Vec<i64> = Vec::new();
+    let mut total_entries = 0u32;
+    let mut not_found = 0u32;
 
     for line in m3u_content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Ok(Some(track)) = track_repo.get_by_path(line)
-            && let Some(id) = track.id
-        {
-            repo.add_tracks_deduped(playlist_id, &[id], None).ok();
-            matched += 1;
+        total_entries += 1;
+        match track_repo.get_by_path(line) {
+            Ok(Some(track)) => match track.id {
+                Some(id) => track_ids.push(id),
+                None => not_found += 1,
+            },
+            Ok(None) => not_found += 1,
+            // A lookup that FAILS is not a track "absent from the library".
+            // Nothing is written yet, so we can still refuse honestly.
+            Err(e) => {
+                tracing::warn!(error = %e, "m3u_import_url_lookup_failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("library lookup failed: {e}"),
+                )
+                    .into_response();
+            }
         }
     }
 
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "id": playlist_id,
-            "name": name,
-            "matched_tracks": matched,
-        })),
-    )
-        .into_response()
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+        Ok((playlist_id, imported)) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": playlist_id,
+                "name": name,
+                "total_entries": total_entries,
+                // Persisted rows — the counter now describes the database,
+                // not the parsing loop's intentions.
+                "matched_tracks": imported.len(),
+                "duplicates_skipped": track_ids.len() - imported.len(),
+                "not_found": not_found,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(name = %name, error = %e, "m3u_import_url_create_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
+    }
 }
 
 // --- Advanced playlist routes ---
@@ -1002,10 +1119,16 @@ async fn get_shared_playlist(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let track_ids = repo.get_track_ids(playlist_id).unwrap_or_default();
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .get_multiple(&track_ids)
-        .unwrap_or_default();
+    // Une erreur de base rendait un partage « vide » indistinguable d'une
+    // playlist réellement vide (#2797) : 500 explicite.
+    let track_ids = match repo.get_track_ids(playlist_id) {
+        Ok(ids) => ids,
+        Err(e) => return AppError::internal(e.to_string()).into_response(),
+    };
+    let tracks = match TrackRepo::with_backend(state.backend.clone()).get_multiple(&track_ids) {
+        Ok(t) => t,
+        Err(e) => return AppError::internal(e.to_string()).into_response(),
+    };
 
     Json(json!({
         "playlist": playlist,
@@ -1035,10 +1158,13 @@ async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) ->
     for tid in &track_ids {
         let (title, artist, present) = match trepo.get(*tid) {
             Ok(Some(t)) => {
+                // Repli de graphie NFC/NFD (#1865) : un `Path::exists()`
+                // nu declarait « indisponible » des pistes bien presentes,
+                // ecrites en NFD par macOS ou un partage SMB.
                 let ok = t
                     .file_path
                     .as_deref()
-                    .map(|p| std::path::Path::new(p).exists())
+                    .map(|p| !tune_core::library::local_path::resolve_local_path(p).is_missing())
                     .unwrap_or(false);
                 (t.title, t.artist_name.unwrap_or_default(), ok)
             }
@@ -1232,10 +1358,12 @@ async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> i
         match track_repo.get(*tid) {
             Ok(Some(t)) if t.file_path.is_some() => {
                 let path = t.file_path.as_ref().unwrap();
-                if std::path::Path::new(path).exists() {
-                    recovered += 1;
-                } else {
+                // Meme repli qu'au-dessus (#1865) : « encore manquante » ne
+                // doit pas vouloir dire « ecrite dans l'autre forme Unicode ».
+                if tune_core::library::local_path::resolve_local_path(path).is_missing() {
                     missing += 1;
+                } else {
+                    recovered += 1;
                 }
             }
             _ => missing += 1,

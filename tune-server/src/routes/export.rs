@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -182,7 +183,12 @@ async fn export_library_audit_csv(
         avertissements.push(format!("{e}: erreur de lecture en cours de parcours"));
     }
     for (ext, n) in &liste.skipped_by_ext {
-        avertissements.push(format!("{n} fichier(s) .{ext} ignorés (extension non lue)"));
+        let raison = liste
+            .skipped_reasons
+            .get(ext)
+            .map(String::as_str)
+            .unwrap_or("extension non lue");
+        avertissements.push(format!("{n} fichier(s) .{ext} ignorés ({raison})"));
     }
 
     let mut disque: Vec<tune_core::library::audit::FichierDisque> = Vec::new();
@@ -229,7 +235,7 @@ async fn export_library_audit_csv(
                  WHERE t.file_path LIKE ? ESCAPE '\\' AND (t.source IS NULL OR t.source = '' OR t.source = 'local')",
                 &[&prefix],
             )
-            .unwrap_or_default();
+            .ou_defaut_journalise();
         for r in rows {
             bdd.push(tune_core::library::audit::PisteBdd {
                 id: r.first().and_then(|v| v.as_i64()).unwrap_or(0),

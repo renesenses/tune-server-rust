@@ -1,8 +1,44 @@
-# cargo-audit ignore list — kept in sync with deny.toml's [advisories] ignore
-# and the CI cargo-audit step. The release preflight runs bare `cargo audit`,
-# which reads THIS file (not deny.toml), so the allowlist must live here too.
+# cargo-audit — liste d'exceptions RustSec, tenue en phase avec `deny.toml`
+# (section `[advisories] ignore`) et avec l'etape `audit` de
+# `.github/workflows/ci.yml`. Le preflight de release lance `cargo audit` nu,
+# qui lit CE fichier et pas `deny.toml` : sans les deux, les listes derivent.
+#
+# ## Pourquoi `deny = ["warnings"]` (#2251)
+#
+# Un avis `informational = "unmaintained"` n'est PAS une vulnerabilite : par
+# defaut `cargo audit` l'affiche, puis sort en 0. Mesure sur `release/v0.9`
+# (e608df16) : trois avis affiches, « warning: 3 allowed warnings found »,
+# code de sortie 0. RUSTSEC-2026-0150 (audiopus_sys abandonne) est donc apparu
+# le 21/05/2026 sans jamais rougir nulle part — `deny.toml` le bloquait bien,
+# mais il avait deja ete range dans SA liste d'exceptions, et les deux autres
+# listes ne le connaissaient pas.
+#
+# Avec `deny = ["warnings"]`, tout avis informatif NON liste ci-dessous fait
+# echouer l'audit. Contre-epreuve faite : en retirant RUSTSEC-2026-0150 de la
+# liste, `cargo audit` rend « error: 1 denied warning found! » et sort en 1.
+#
+# Le prix a payer : chaque nouvel avis informatif bloque la CI tant qu'on ne
+# l'a pas soit corrige, soit inscrit ici AVEC une raison et une date. C'est
+# exactement l'effet recherche — un avis ne peut plus passer en silence.
 [advisories]
-# The wasmtime advisories RUSTSEC-2026-0222/0223 were fixed by bumping wasmtime
-# to 47.0.3 (the "no drop-in bump" excuse no longer holds), so the ignore list
-# is empty again — cargo audit now blocks on any new advisory.
-ignore = []
+ignore = [
+    # paste 1.0.15 — non maintenu (RUSTSEC-2024-0436, 07/10/2024). Tire
+    # transitivement par lofty / notify. Macro procedurale : aucun code a
+    # l'execution, aucune vulnerabilite. A revoir quand lofty/notify migrent.
+    "RUSTSEC-2024-0436",
+    # instant 0.1 — non maintenu (RUSTSEC-2024-0384, 01/09/2024), remplace par
+    # web-time. Transitif uniquement ; un build natif ne touche jamais son
+    # chemin wasm.
+    "RUSTSEC-2024-0384",
+    # RUSTSEC-2026-0150 (audiopus_sys 0.2.2 abandonne) a ete RETIRE d'ici : la
+    # dependance elle-meme a disparu. `tune-core` passe par `opus 0.4.0` /
+    # `opusic-sys 0.7.5`, tous deux maintenus (#2251). Il n'y a donc plus
+    # d'exception a porter, et `cargo tree -i audiopus_sys` ne rend plus rien.
+]
+
+[output]
+# Tout avis informatif non liste ci-dessus fait echouer l'audit.
+deny = ["warnings"]
+format = "terminal"
+quiet = false
+show_tree = false

@@ -45,22 +45,48 @@ impl SupportAuth {
     }
 }
 
+/// Un ticket tel que le client web l'a composé.
+///
+/// `logs` et `system` sont **le diagnostic** : le markdown produit par
+/// `/system/bug-report/markdown` et la fiche système. mozaiklabs matérialise
+/// `logs` en pièce jointe `diagnostic.md` à la création du ticket. Sans eux,
+/// le ticket arrive sans journal alors que le client a coché « joindre les
+/// journaux » et annonce l'envoi réussi.
+#[derive(Default)]
+pub struct NewTicket {
+    pub subject: String,
+    pub body: String,
+    pub category: Option<String>,
+    pub zone: Option<String>,
+    pub system: Option<Value>,
+    pub logs: Option<String>,
+}
+
+/// Corps JSON envoyé à mozaiklabs pour l'ouverture d'un ticket.
+///
+/// Extrait de [`create_ticket`] pour être vérifiable sans réseau : c'est
+/// exactement ici que `logs` et `system` étaient perdus.
+fn ticket_payload(ticket: &NewTicket) -> Value {
+    json!({
+        "subject": ticket.subject,
+        "body": ticket.body,
+        "category": ticket.category,
+        "zone": ticket.zone,
+        "system": ticket.system,
+        "logs": ticket.logs,
+        "tune_version": crate::version(),
+        "platform": std::env::consts::OS,
+    })
+}
+
 /// Ouvre un ticket. Injecte automatiquement la version de Tune et l'OS —
 /// le SAV voit la config sans la demander.
 pub async fn create_ticket(
     http_client: &reqwest::Client,
     auth: &SupportAuth,
-    subject: &str,
-    body: &str,
-    category: Option<&str>,
+    ticket: &NewTicket,
 ) -> SupportResult {
-    let payload = json!({
-        "subject": subject,
-        "body": body,
-        "category": category,
-        "tune_version": crate::version(),
-        "platform": std::env::consts::OS,
-    });
+    let payload = ticket_payload(ticket);
 
     let resp = auth
         .apply(http_client.post(SUPPORT_API))
@@ -165,7 +191,7 @@ pub async fn reply(
     body: &str,
 ) -> SupportResult {
     let resp = auth
-        .apply(http_client.post(format!("{SUPPORT_API}/{id}/reply")))
+        .apply(http_client.post(reply_url(id)))
         .json(&json!({ "body": body }))
         .timeout(TIMEOUT)
         .send()
@@ -173,6 +199,44 @@ pub async fn reply(
         .map_err(request_error)?;
 
     parse(resp).await
+}
+
+/// Mémorise la lecture d'un fil : les réponses du SAV antérieures cessent de
+/// compter dans `unread_count`.
+///
+/// Dernier appel du support qui partait encore du NAVIGATEUR vers
+/// mozaiklabs.fr, avec la clé de licence dans le corps (#2559). Depuis une page
+/// servie par le serveur Tune — `http://192.168.1.18:8888`, `http://localhost:8888` —
+/// l'origine diffère de `https://mozaiklabs.fr` : le navigateur bloquait la
+/// requête par CORS, et `localhost` n'y échappe pas. En passant par ici, la clé
+/// ne quitte plus le serveur et l'appel est de même origine pour la page.
+pub async fn mark_read(
+    http_client: &reqwest::Client,
+    auth: &SupportAuth,
+    id: i64,
+) -> SupportResult {
+    let resp = auth
+        .apply(http_client.post(read_url(id)))
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(request_error)?;
+
+    parse(resp).await
+}
+
+/// URL de réponse à un ticket.
+///
+/// Le singulier n'est pas un détail : mozaiklabs expose `…/reply` ET son alias
+/// `…/replies`, et se tromper de forme rendrait un 404 que le relais
+/// propagerait tel quel. Isolé pour être vérifié par un test.
+fn reply_url(id: i64) -> String {
+    format!("{SUPPORT_API}/{id}/reply")
+}
+
+/// URL de marquage « lu » d'un ticket.
+fn read_url(id: i64) -> String {
+    format!("{SUPPORT_API}/{id}/read")
 }
 
 /// 502 Bad Gateway quand mozaiklabs est injoignable (réseau, timeout).
@@ -187,17 +251,275 @@ fn request_error(e: reqwest::Error) -> (u16, Value) {
 /// si la réponse n'est pas du JSON).
 async fn parse(resp: reqwest::Response) -> SupportResult {
     let status = resp.status().as_u16();
+    // Les en-têtes se lisent AVANT `resp.text()`, qui consomme la réponse.
+    let retry_after = super::rate_limit::retry_after_secs(resp.headers());
     let text = resp.text().await.map_err(|e| {
         (
             502u16,
             json!({ "error": "support_read_body", "detail": e.to_string() }),
         )
     })?;
-    let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+
+    build_result(status, &text, retry_after)
+}
+
+/// Délai avant nouvelle tentative annoncé par mozaiklabs, en secondes.
+///
+/// `Retry-After` (RFC 9110) est posé en delta-secondes par le limiteur de
+/// Laravel ; `X-RateLimit-Reset` (horodatage Unix) sert de repli quand le
+/// premier manque. La forme HTTP-date de `Retry-After` n'est pas interprétée :
+/// mozaiklabs n'en émet pas, et deviner vaut moins que ne rien dire.
+///
+/// Rend `None` si rien n'est exploitable — l'interface affiche alors un
+/// message sans délai, jamais un délai inventé (#2178).
+/// Construit le `SupportResult` à partir du statut, du corps brut et du délai
+/// lu dans les en-têtes.
+///
+/// Sur **429** (limite d'envoi du relais mozaiklabs), le corps est enrichi de
+/// deux champs que le client n'avait pas : `error: "rate_limited"`, motif
+/// stable à traduire, et `retry_after`, le nombre de secondes avant nouvelle
+/// tentative quand mozaiklabs l'annonce. Sans eux le client ne recevait que le
+/// statut nu et affichait « Une erreur est survenue. Réessaie dans un instant.
+/// (429) », qui ne dit ni ce qui s'est passé ni quand réessayer (#2178).
+///
+/// Le corps d'origine est conservé : on n'écrase jamais un `error` déjà posé
+/// par mozaiklabs.
+fn build_result(status: u16, text: &str, retry_after: Option<u64>) -> SupportResult {
+    let mut value: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({ "raw": text }));
 
     if (200..300).contains(&status) {
-        Ok(value)
-    } else {
-        Err((status, value))
+        return Ok(value);
+    }
+
+    if status == 429 {
+        // Un corps non-objet (tableau, chaîne, `null`) ne peut pas porter les
+        // champs : on le range sous `upstream` plutôt que de le perdre.
+        if !value.is_object() {
+            value = json!({ "upstream": value });
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.entry("error").or_insert_with(|| json!("rate_limited"));
+            if let Some(secs) = retry_after {
+                obj.insert("retry_after".to_string(), json!(secs));
+            }
+        }
+    }
+
+    Err((status, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn err_body(result: SupportResult) -> (u16, Value) {
+        result.expect_err("un statut hors 2xx doit rendre une erreur")
+    }
+
+    #[test]
+    fn retry_after_lit_les_delta_secondes() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("59"));
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), Some(59));
+    }
+
+    #[test]
+    fn retry_after_absent_rend_none() {
+        assert_eq!(
+            crate::cloud::rate_limit::retry_after_secs(&HeaderMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_after_illisible_rend_none() {
+        // Forme HTTP-date : non interprétée, et surtout jamais devinée.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
+    }
+
+    #[test]
+    fn retry_after_zero_rend_none() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("0"));
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
+    }
+
+    #[test]
+    fn retry_after_repli_sur_x_ratelimit_reset() {
+        let mut h = HeaderMap::new();
+        let futur = chrono::Utc::now().timestamp() + 120;
+        h.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&futur.to_string()).unwrap(),
+        );
+        let secs = crate::cloud::rate_limit::retry_after_secs(&h)
+            .expect("un reset dans le futur donne un délai");
+        // Bornes larges : la seconde peut tourner entre les deux appels.
+        assert!((115..=120).contains(&secs), "délai inattendu : {secs}");
+    }
+
+    #[test]
+    fn retry_after_reset_passe_rend_none() {
+        let mut h = HeaderMap::new();
+        let passe = chrono::Utc::now().timestamp() - 30;
+        h.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&passe.to_string()).unwrap(),
+        );
+        assert_eq!(crate::cloud::rate_limit::retry_after_secs(&h), None);
+    }
+
+    #[test]
+    fn un_429_avec_retry_after_porte_le_motif_et_le_delai() {
+        // Corps réel du limiteur Laravel : un `message` anglais, rien d'autre.
+        let (status, body) = err_body(build_result(
+            429,
+            r#"{"message":"Too Many Attempts."}"#,
+            Some(3540),
+        ));
+        assert_eq!(status, 429);
+        assert_eq!(body["error"], json!("rate_limited"));
+        assert_eq!(body["retry_after"], json!(3540));
+        // Le corps d'origine survit : le SAV doit pouvoir le lire.
+        assert_eq!(body["message"], json!("Too Many Attempts."));
+    }
+
+    #[test]
+    fn un_429_sans_en_tete_porte_le_motif_sans_delai() {
+        let (status, body) = err_body(build_result(
+            429,
+            r#"{"message":"Too Many Attempts."}"#,
+            None,
+        ));
+        assert_eq!(status, 429);
+        assert_eq!(body["error"], json!("rate_limited"));
+        assert!(
+            body.get("retry_after").is_none(),
+            "sans en-tête, aucun délai ne doit être inventé : {body}"
+        );
+    }
+
+    #[test]
+    fn un_429_a_corps_vide_reste_exploitable() {
+        // mozaiklabs derrière un proxy peut ne rien renvoyer : le motif doit
+        // quand même arriver au client.
+        let (status, body) = err_body(build_result(429, "", Some(60)));
+        assert_eq!(status, 429);
+        assert_eq!(body["error"], json!("rate_limited"));
+        assert_eq!(body["retry_after"], json!(60));
+    }
+
+    #[test]
+    fn un_429_a_corps_non_objet_ne_perd_pas_l_amont() {
+        let (_, body) = err_body(build_result(429, "[1,2]", Some(10)));
+        assert_eq!(body["error"], json!("rate_limited"));
+        assert_eq!(body["retry_after"], json!(10));
+        assert_eq!(body["upstream"], json!([1, 2]));
+    }
+
+    #[test]
+    fn un_429_conserve_le_motif_deja_pose_par_mozaiklabs() {
+        let (_, body) = err_body(build_result(
+            429,
+            r#"{"error":"support_quota_daily"}"#,
+            Some(60),
+        ));
+        assert_eq!(body["error"], json!("support_quota_daily"));
+        assert_eq!(body["retry_after"], json!(60));
+    }
+
+    #[test]
+    fn les_autres_statuts_ne_sont_pas_touches() {
+        // 403 premium refusé : le corps repart tel quel, sans motif ajouté.
+        let (status, body) = err_body(build_result(
+            403,
+            r#"{"message":"Premium only."}"#,
+            Some(60),
+        ));
+        assert_eq!(status, 403);
+        assert!(body.get("error").is_none(), "corps modifié : {body}");
+        assert!(body.get("retry_after").is_none(), "corps modifié : {body}");
+    }
+
+    /// Les chemins amont sont recopiés de `routes/api.php` de site-mozaiklabs :
+    /// `POST /v1/support/tickets/{ticket}/reply` et
+    /// `POST /v1/support/tickets/{ticket}/read`. Une faute de forme rendrait un
+    /// 404 amont, que `parse` propagerait tel quel au client — un « marquer lu »
+    /// silencieusement mort, exactement le défaut qu'on corrige.
+    #[test]
+    fn les_urls_amont_suivent_le_contrat_laravel() {
+        assert_eq!(
+            reply_url(42),
+            "https://mozaiklabs.fr/api/v1/support/tickets/42/reply"
+        );
+        assert_eq!(
+            read_url(42),
+            "https://mozaiklabs.fr/api/v1/support/tickets/42/read"
+        );
+    }
+
+    #[test]
+    fn un_2xx_reste_un_succes() {
+        let value = build_result(201, r#"{"ticket":{"id":7}}"#, None).expect("2xx = succès");
+        assert_eq!(value["ticket"]["id"], json!(7));
+    }
+
+    /// Le chemin JSON — celui d'un ticket SANS pièce jointe manuelle, c'est-à-dire
+    /// la majorité — laissait tomber `logs` et `system`. Le client les envoie,
+    /// mozaiklabs sait les recevoir (`StoreSupportTicketRequest`) et matérialise
+    /// `logs` en pièce jointe `diagnostic.md` ; seul ce corps-ci ne les portait
+    /// pas, et l'envoi rendait quand même un 201 « ticket ouvert ».
+    ///
+    /// Mesuré en production le 2026-08-29 : 39 tickets sur 62 sans le moindre
+    /// journal — exactement ceux qui n'avaient aucune pièce jointe manuelle,
+    /// donc exactement ceux passés par ici.
+    #[test]
+    fn le_corps_json_porte_le_diagnostic() {
+        let ticket = NewTicket {
+            subject: "Coupure DLNA".into(),
+            body: "Le salon s'arrête au bout de dix secondes.".into(),
+            category: Some("bug".into()),
+            zone: Some("Salon".into()),
+            system: Some(json!({ "os": "linux", "zones": 3 })),
+            logs: Some("# Tune Bug Report\n\nERROR dlna_stall".into()),
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert_eq!(
+            payload["logs"], "# Tune Bug Report\n\nERROR dlna_stall",
+            "le diagnostic doit partir avec le ticket"
+        );
+        assert_eq!(payload["system"]["os"], "linux");
+        assert_eq!(payload["zone"], "Salon");
+        assert_eq!(payload["subject"], "Coupure DLNA");
+        assert_eq!(payload["category"], "bug");
+        // Version et OS restent injectées par le serveur, jamais par le client.
+        assert_eq!(payload["tune_version"], crate::version());
+        assert_eq!(payload["platform"], std::env::consts::OS);
+    }
+
+    /// Case décochée, ou serveur sans journal accessible : les champs partent à
+    /// `null`, ce que les règles `nullable` de mozaiklabs acceptent — pas de 422.
+    #[test]
+    fn un_ticket_sans_diagnostic_reste_valide() {
+        let ticket = NewTicket {
+            subject: "Question".into(),
+            body: "Comment activer le DSD ?".into(),
+            ..Default::default()
+        };
+
+        let payload = ticket_payload(&ticket);
+
+        assert!(payload["logs"].is_null());
+        assert!(payload["system"].is_null());
+        assert!(payload["category"].is_null());
+        assert!(payload["zone"].is_null());
     }
 }

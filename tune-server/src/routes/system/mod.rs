@@ -6,9 +6,18 @@ mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
+/// Périmètre de l'explorateur de dossiers (#1275).
+pub(crate) mod explorateur;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 pub(crate) use enrich::gate_enrichment;
+// Même partage, même raison, pour la PORTÉE par répertoire (#1660) : les deux
+// routes d'enrichissement doivent valider un `path` à l'identique — refus des
+// composantes `..`, appartenance à une racine musicale, refus franc plutôt que
+// repli sur la bibliothèque entière. Une seconde validation écrite à côté
+// finirait par diverger, et un repli silencieux enrichirait justement ce que
+// l'utilisateur voulait épargner.
+pub(crate) use enrich::resoudre_portee;
 mod import;
 mod playlist_hub;
 mod plugins;
@@ -18,6 +27,18 @@ pub(crate) mod scan;
 mod tags;
 pub(crate) mod update;
 mod youtube;
+
+/// Nom convivial de cette machine (#2110). Réexporté ici parce que trois
+/// endroits doivent répondre la même chose à « quel serveur est-ce ? » :
+/// `/system/config` (l'étiquette de l'interface), `/system/peer-info`
+/// (ce que les autres serveurs lisent) et les zones unifiées multi-serveur.
+pub(crate) use config::resolve_server_name;
+
+/// Adresses complètes — schéma ET port — auxquelles ce serveur répond depuis
+/// un autre appareil. Réexporté parce que le démarrage les imprime aussi
+/// (#1272) : elles ne doivent exister qu'en UN endroit, sans quoi la console
+/// et l'interface finiraient par annoncer deux adresses différentes.
+pub(crate) use config::server_urls;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -56,6 +77,9 @@ pub fn router() -> Router<AppState> {
         .route("/scan/report", get(scan::scan_report))
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
+        // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit
+        // que leur present (#2080). Survit au redemarrage, borne en taille.
+        .route("/task-runs", get(diagnostics::task_runs))
         .route("/restart", post(config::restart))
         .route("/stop", post(config::stop))
         .route("/database/status", get(database::database_status))
@@ -67,6 +91,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
+        .route("/music-dirs/orphans", get(config::orphan_tracks))
+        .route(
+            "/music-dirs/purge-orphans",
+            post(config::purge_orphan_tracks),
+        )
         .route("/browse-dirs", get(config::browse_dirs))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
@@ -154,6 +183,14 @@ pub fn router() -> Router<AppState> {
         .route("/audio-check", get(diagnostics::audio_check))
         .route("/audio/asio-devices", get(diagnostics::asio_devices))
         .route(
+            "/audio/asio-warm-scan",
+            get(diagnostics::asio_warm_scan_status),
+        )
+        .route(
+            "/audio/asio-warm-scan/rearm",
+            post(diagnostics::rearm_asio_warm_scan),
+        )
+        .route(
             "/telemetry",
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),
         )
@@ -165,7 +202,15 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-metadata", post(enrich::enrich_extended_metadata))
         .route("/enrichment/status", get(enrich::enrichment_status))
         .route("/enrichment/run", post(enrich::enrichment_run))
-        .route("/database/import", post(database::database_import))
+        // La limite globale (50 Mo) coupait l'import bien avant le handler :
+        // l'export d'une bibliothèque ordinaire pèse 256 Mo. Cf #2849 et
+        // `database::IMPORT_DB_BODY_LIMIT`.
+        .route(
+            "/database/import",
+            post(database::database_import).layer(axum::extract::DefaultBodyLimit::max(
+                database::IMPORT_DB_BODY_LIMIT,
+            )),
+        )
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
         .route(

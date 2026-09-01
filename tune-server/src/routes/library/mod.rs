@@ -1,3 +1,4 @@
+mod album_order;
 mod albums;
 mod albums_detailed;
 mod ambiances;
@@ -7,14 +8,18 @@ mod better_quality;
 mod browse;
 mod collections;
 mod credits;
+pub(crate) mod credits_mb;
 mod duplicates;
 mod enrich;
 mod facets;
 mod folder_facet;
 mod genres;
 mod ingest;
+mod lyrics_pass;
 mod proposals;
+mod query_multi;
 mod ratings;
+mod reidentify;
 mod reports;
 mod search;
 mod stats;
@@ -180,6 +185,21 @@ pub fn router() -> Router<AppState> {
         )
         .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
+        // Masquage d'album (#1391). `/albums/hidden` AVANT `/albums/{id}` par
+        // hygiène de lecture — axum fait de toute façon primer le segment
+        // statique, comme pour `/albums/count` et `/albums/recent`.
+        .route("/albums/hidden", get(albums::list_hidden_albums))
+        .route(
+            "/albums/{id}/hide",
+            post(albums::hide_album).delete(albums::unhide_album),
+        )
+        // « Ces deux albums ne sont pas des doublons » (#1276). Même hygiène
+        // que `/albums/hidden` : le segment statique d'abord.
+        .route("/albums/distinct", get(albums::list_distinct_pairs))
+        .route(
+            "/albums/{id}/distinct/{other_id}",
+            post(albums::declare_albums_distinct).delete(albums::revoke_albums_distinct),
+        )
         .route("/albums/filters", get(albums::album_filters))
         .route("/facets", get(facets::library_facets))
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
@@ -208,6 +228,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
+        .route("/tracks/{id}/versions", get(tracks::track_versions))
         .route(
             "/tracks/{id}/synced-lyrics",
             get(tracks::track_synced_lyrics),
@@ -234,6 +255,13 @@ pub fn router() -> Router<AppState> {
             post(credits::enrich_album_credits),
         )
         .route("/enrich-credits", post(credits::enrich_all_credits))
+        // Avancement de la passe ci-dessus (#2799). Même forme que
+        // `/enrich-all/status` : sans elle, le `task_id` rendu par le 202
+        // n'était interrogeable nulle part et l'écran ne pouvait qu'espérer.
+        .route(
+            "/enrich-credits/status",
+            get(credits::enrich_credits_status),
+        )
         // Generic metadata reports (wrong cover / credit / bio / image).
         .route(
             "/reports",
@@ -274,6 +302,10 @@ pub fn router() -> Router<AppState> {
         .route("/genres/{name}/albums", get(genres::genre_albums))
         .route("/recommendations", get(albums::recommendations))
         .route("/stats/completeness", get(stats::completeness_stats))
+        // Paroles (#2172) : l'indicateur d'abord, la passe de fond ensuite.
+        .route("/lyrics/status", get(lyrics_pass::lyrics_status))
+        .route("/lyrics/fetch", post(lyrics_pass::lyrics_fetch))
+        .route("/lyrics/write", post(lyrics_pass::lyrics_write))
         .route("/search", get(search::search))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
@@ -333,6 +365,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}/artwork/rescan",
             post(artwork::rescan_album_artwork),
+        )
+        // Refaire l'identification d'UN album (#2128). Bornée à cet album :
+        // ni scan, ni passe de fond — voir l'en-tête de `reidentify.rs`.
+        .route(
+            "/albums/{id}/reidentify",
+            post(reidentify::reidentify_album),
         )
         .route(
             "/albums/merge-duplicates",

@@ -1,0 +1,56 @@
+name: Notes de version Watch — versions publiees sans fil forum
+
+# Surveille qu'une version publiee sur GitHub finit par avoir son fil de notes
+# sur le forum mozaiklabs, et ouvre une issue quand ce n'est pas le cas.
+#
+# Pourquoi (#2328) : le job « Announce on mozaiklabs forum » de `release.yml` est
+# eteint par `if: false` depuis le 03/06/2026, deliberement — les notes du forum
+# sont ecrites a la main, mieux redigees que le changelog de git-cliff. Le choix
+# tient ; ce qui manquait, c'est le filet. Rien ne signalait qu'une version etait
+# sortie sans annonce : le job saute, la CI est verte, et le premier a s'en
+# apercevoir etait un testeur — qui a annonce le 24/08/2026 qu'il n'utiliserait
+# plus la mise a jour integree faute de savoir ce qu'il installait.
+#
+# Cette sonde ne poste RIEN sur le forum. Elle constate, et elle echoue
+# bruyamment. La redaction reste humaine.
+#
+# Secrets utilises :
+# - FORUM_TOKEN : jeton bearer de l'API forum mozaiklabs
+
+on:
+  schedule:
+    # Toutes les heures a la 25e minute — decale de `forum-watch` (*/30) et de
+    # `uptime-watch` (*/15) pour ne pas concourir avec eux sur l'API forum.
+    - cron: "25 * * * *"
+  workflow_dispatch:
+    inputs:
+      delai_de_grace_minutes:
+        description: "Age minimal d'une version avant de la signaler (minutes)"
+        type: string
+        default: "90"
+      sans_issue:
+        description: "Diagnostic seul — n'ouvre aucune issue"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  veille:
+    name: Versions publiees sans note de version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rapprocher les versions publiees et les fils de notes
+        env:
+          FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
+          # `GITHUB_REPOSITORY` est deja fourni par Actions — le redefinir ici
+          # serait au mieux redondant, au pire refuse.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DELAI_DE_GRACE_MINUTES: ${{ inputs.delai_de_grace_minutes || '90' }}
+          SANS_ISSUE: ${{ inputs.sans_issue && '1' || '0' }}
+        run: bash .github/scripts/notes-de-version-watch.sh

@@ -2,16 +2,21 @@ name: Preflight
 
 # Phase 1 of release autonomy (docs/RELEASE-AUTONOMY-v0.9.50.md).
 #
-# Runs the pre-release checks before any build kicks off. Triggered
-# on push of tag candidates (v*) and via workflow_dispatch for dry
-# runs. Failure of this workflow blocks the release pipeline by
-# producing a failed status check on the commit.
+# Runs the pre-release checks before any build kicks off. Release appelle ce
+# workflow comme sa premiere dependance ; workflow_dispatch reste disponible
+# pour les essais a blanc. Un echec rend donc les jobs de construction
+# ineligibles, au lieu de seulement poser un check rouge independant.
 #
 # Checks performed (each independently pass/fail):
 # - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
 # - version_bump: tag > Cargo.toml workspace version
+# - release_identity: bump author/committer do not mix known maintainers'
+#   names and addresses
 # - no_p0_issues: no blocking P0 issue open; merged fixes awaiting release
-#   verification are reported but do not create a release/closure deadlock
+#   verification (release:verification-pending) are reported but do not create
+#   a release/closure deadlock, and P0 suspended for want of field information
+#   (bloque:terrain) are exempted — LOUDLY: each one is named, with its
+#   number, in the job summary, not only in the log
 # - no_release_todos: no TODO(release) markers in source code (excl. docs/)
 # - cahier_de_recette: a cahier-recette-v{major}.{minor}*.md file exists
 # - cargo_audit: no high-severity CVE in the dependency tree
@@ -22,8 +27,18 @@ name: Preflight
 #   workflow_dispatch on a branch that hasn't had CI yet)
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version to check"
+        required: false
+        default: ""
+        type: string
+      skip_ci_check:
+        description: "Skip the CI status check"
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -45,6 +60,7 @@ jobs:
   preflight:
     name: Pre-release checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -73,13 +89,25 @@ jobs:
       # Le web et le serveur sortent dans la MÊME version, mais rien ne
       # vérifiait leur contrat : deux fois en trois jours, un écran web
       # fusionné a failli partir en appelant une route serveur encore en PR
-      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). On lit main, la
-      # branche depuis laquelle la release construit son bundle.
+      # (Dynamic Range en 0.9.82, Oxygen/Helium en 0.9.84). Le manifeste
+      # identifie désormais le commit web exact construit par la release.
+      - name: Lire le SHA web du manifeste
+        id: web
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        shell: bash
+        run: |
+          PLAN=".release/$RELEASE_VERSION.json"
+          test -f "$PLAN" || { echo "::error::manifeste absent: $PLAN"; exit 1; }
+          WEB_SHA="$(jq -r '.components.web.sha' "$PLAN")"
+          [[ "$WEB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SHA web invalide"; exit 1; }
+          echo "sha=$WEB_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Checkout web client
         uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
-          ref: main
+          ref: ${{ steps.web.outputs.sha }}
           path: .web-client
 
       - name: Contrat d'API web ↔ serveur

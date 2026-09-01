@@ -7,6 +7,7 @@
 //!   including negative results which are retried after 14 days.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,18 @@ use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 /// Negative cache entries (no lyrics found) are retried after this delay.
-const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
+pub const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
+
+/// Process-wide count of LRCLIB replies that told us to slow down (HTTP 429
+/// « Too Many Requests » or 503). Incremented by [`fetch_lrclib_raw`], never
+/// reset — a caller snapshots it before a run and compares afterwards.
+///
+/// LRCLIB is a free community service with no API key: a batch pass that kept
+/// hammering it after a 429 would get the whole instance banned, and that would
+/// also kill the on-demand lookup done while listening. The background pass
+/// (`crate::library::lyrics_pass`) watches this counter and stops on the first
+/// hit. Same idiom as `ARTWORK_RATE_LIMIT_HITS` in `library::artwork`.
+pub static LRCLIB_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -72,6 +84,34 @@ impl LrclibRaw {
                 .as_deref()
                 .is_none_or(|s| s.trim().is_empty())
     }
+}
+
+/// Position de lecture à utiliser pour choisir la ligne de paroles active,
+/// une fois appliqué le décalage `zones.lyrics_offset_ms` de la zone.
+///
+/// **Implémentation de référence unique** du réglage (#2997) : tout code qui
+/// surligne une ligne de paroles pour une zone doit passer par ici plutôt que
+/// de comparer les horodatages à la position brute.
+///
+/// `offset_ms` positif = paroles **retardées**. Le serveur apprend le titre
+/// avant que l'auditeur ne l'entende (tampon de Tune, puis du renderer), donc
+/// les paroles défilent en avance et il faut les retarder : on recule la
+/// position d'autant, ce qui revient à avancer d'autant l'instant où chaque
+/// ligne devient active. Décalage **par zone**, parce que la profondeur du
+/// tampon appartient à l'appareil ; à ne pas confondre avec `sync_delay_ms`,
+/// qui décale l'AUDIO pour aligner deux pièces.
+///
+/// Deux propriétés dont les appelants dépendent :
+/// - un décalage de **zéro** rend la position inchangée, donc exactement le
+///   comportement d'avant ce réglage ;
+/// - le résultat ne descend jamais sous zéro — une position négative n'existe
+///   pas, et laisserait le début du morceau sans ligne active.
+///
+/// C'est le calcul que le client web tient déjà dans `TvView.svelte`
+/// (`syncPos = max(0, pos - lyricsOffsetMs)`) : cette fonction est la même
+/// règle, côté serveur, pour les surfaces qui connaissent la zone.
+pub fn sync_position_ms(position_ms: i64, offset_ms: i32) -> i64 {
+    position_ms.saturating_sub(offset_ms as i64).max(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +177,15 @@ pub async fn fetch_lrclib_raw(
     }
 
     if !resp.status().is_success() {
+        // 429/503 = « ralentis ». On le compte pour que la passe de fond
+        // s'arrête au premier signal au lieu de continuer à cogner.
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            LRCLIB_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+            warn!(status = %resp.status(), "lrclib_rate_limited");
+        }
         return Err(format!("lrclib returned {}", resp.status()));
     }
 
@@ -247,11 +296,31 @@ impl LyricsCacheEntry {
         let Some(ref fetched) = self.fetched_at else {
             return false;
         };
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(NEGATIVE_CACHE_TTL_DAYS);
         // Both engines store `YYYY-MM-DDTHH:MM:SSZ`: lexicographic order is
         // chronological order for this fixed-width format.
-        fetched.as_str() >= cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string().as_str()
+        fetched.as_str() >= negative_retry_cutoff().as_str()
     }
+
+    /// Vrai quand cette entrée **dispense d'interroger LRCLIB** : soit elle
+    /// porte des paroles (les positifs n'expirent pas), soit c'est un échec
+    /// encore frais.
+    ///
+    /// Règle unique partagée par la récupération à la demande
+    /// ([`get_lyrics`]) et par la passe de fond
+    /// (`crate::library::lyrics_pass`) : une recherche déjà payée — y compris
+    /// une recherche **infructueuse** — ne doit jamais être repayée.
+    pub fn spares_a_fetch(&self) -> bool {
+        !self.is_negative() || self.negative_still_fresh()
+    }
+}
+
+/// Horodatage ISO-8601 UTC en deçà duquel un échec en cache est périmé et
+/// mérite une nouvelle tentative. Format à largeur fixe : la comparaison
+/// lexicographique vaut comparaison chronologique, sur les deux moteurs.
+pub fn negative_retry_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(NEGATIVE_CACHE_TTL_DAYS))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 fn dialect_sql(db: &Arc<dyn DbBackend>, f: impl Fn(&dyn SqlDialect) -> String) -> String {
@@ -349,7 +418,7 @@ pub async fn get_lyrics(
 ) -> Result<Lyrics, String> {
     // 1. Try cache.
     if let Some(cached) = load_cache_entry(db, track_id) {
-        if !cached.is_negative() || cached.negative_still_fresh() {
+        if cached.spares_a_fetch() {
             debug!(track_id, "lyrics_cache_hit");
             let lines = cached
                 .synced_lyrics
@@ -407,6 +476,48 @@ pub async fn get_lyrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #2997 : sémantique du décalage de paroles par zone ─────────────────
+
+    #[test]
+    fn decalage_nul_rend_la_position_inchangee() {
+        // TÉMOIN : c'est le cas de toutes les zones existantes. Zéro doit être
+        // l'identité, sinon le correctif déplacerait les paroles de tout le
+        // monde en prétendant ne rien changer.
+        for pos in [0, 1, 12_340, 16_000, 3_600_000] {
+            assert_eq!(sync_position_ms(pos, 0), pos, "position {pos}");
+        }
+    }
+
+    #[test]
+    fn decalage_positif_retarde_les_paroles() {
+        // Positif = paroles retardées : on lit les horodatages comme si l'on
+        // était PLUS TÔT dans le morceau, donc chaque ligne s'active plus tard.
+        assert_eq!(sync_position_ms(16_000, 3_000), 13_000);
+        assert_eq!(sync_position_ms(60_000, 60_000), 0);
+    }
+
+    #[test]
+    fn decalage_negatif_avance_les_paroles() {
+        assert_eq!(sync_position_ms(28_000, -3_000), 31_000);
+    }
+
+    #[test]
+    fn la_position_corrigee_ne_descend_jamais_sous_zero() {
+        // Au tout début d'un morceau, un décalage positif dépasse la position.
+        // Une position négative n'existe pas et laisserait le début du morceau
+        // sans ligne active.
+        assert_eq!(sync_position_ms(1_000, 5_000), 0);
+        assert_eq!(sync_position_ms(0, 60_000), 0);
+    }
+
+    #[test]
+    fn les_bornes_du_reglage_ne_debordent_pas() {
+        // Le réglage est borné à ±60 s par la route ; ces bornes doivent
+        // rester sans surprise même à des positions extrêmes.
+        assert_eq!(sync_position_ms(i64::MAX, -60_000), i64::MAX);
+        assert_eq!(sync_position_ms(i64::MIN, 60_000), 0);
+    }
 
     #[test]
     fn parse_lrc_basic() {

@@ -4,12 +4,14 @@ pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
 pub mod credit_enricher;
+pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
 pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+pub mod reidentify;
 pub mod suggestions;
 pub mod tag_writer;
 
@@ -96,6 +98,187 @@ pub struct TrackMetadata {
     pub comment: Option<String>,
 }
 
+/// One unsafe character removed from untrusted metadata.
+///
+/// `byte_offset` deliberately uses the UTF-8 byte position: it is the offset
+/// that a tag parser, JSON payload or C boundary can reproduce exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextCorrection {
+    pub field: String,
+    pub kind: &'static str,
+    pub codepoint: u32,
+    pub byte_offset: usize,
+}
+
+/// Replace unsafe metadata characters with one visible separator while
+/// preserving the layout characters allowed in textual tags.
+///
+/// NUL is unsafe at every C ABI boundary. U+FEFF is a BOM only at the start of
+/// a text stream and is invisible corruption inside a tag or path component.
+/// Other control characters are equally unsuitable for DB grouping and FTS,
+/// except tab, LF and CR: those three are valid in comments and lyrics. A whole
+/// consecutive run becomes one space so
+/// `"Lisa\0\u{feff}The String Soloists"` does not silently collapse to
+/// `"LisaThe String Soloists"`.
+pub fn sanitize_untrusted_text(raw: &str, field: &str) -> (String, Vec<TextCorrection>) {
+    sanitize_untrusted_text_with_layout(raw, field, true)
+}
+
+/// Single-line variant for titles, identifiers and filesystem components.
+pub fn sanitize_untrusted_single_line_text(
+    raw: &str,
+    field: &str,
+) -> (String, Vec<TextCorrection>) {
+    sanitize_untrusted_text_with_layout(raw, field, false)
+}
+
+fn sanitize_untrusted_text_with_layout(
+    raw: &str,
+    field: &str,
+    preserve_layout: bool,
+) -> (String, Vec<TextCorrection>) {
+    let mut out = String::with_capacity(raw.len());
+    let mut corrections = Vec::new();
+    let mut separator_pending = false;
+
+    for (byte_offset, c) in raw.char_indices() {
+        let kind = if c == '\0' {
+            Some("NUL")
+        } else if c == '\u{feff}' {
+            Some("BOM")
+        } else if c.is_control() && !(preserve_layout && matches!(c, '\t' | '\n' | '\r')) {
+            Some("CONTROL")
+        } else {
+            None
+        };
+
+        if let Some(kind) = kind {
+            corrections.push(TextCorrection {
+                field: field.to_string(),
+                kind,
+                codepoint: c as u32,
+                byte_offset,
+            });
+            separator_pending = true;
+            continue;
+        }
+
+        if separator_pending {
+            if !out.is_empty() && !out.ends_with(char::is_whitespace) && !c.is_whitespace() {
+                out.push(' ');
+            }
+            separator_pending = false;
+        }
+        out.push(c);
+    }
+
+    (out, corrections)
+}
+
+impl TrackMetadata {
+    /// Remove unsafe text from every field that can reach the database.
+    pub fn sanitize_text_fields(&mut self) -> Vec<TextCorrection> {
+        fn sanitize_option(
+            field: &str,
+            value: &mut Option<String>,
+            corrections: &mut Vec<TextCorrection>,
+        ) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (clean, mut found) = sanitize_untrusted_single_line_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!clean.is_empty()).then_some(clean);
+            corrections.append(&mut found);
+        }
+
+        let mut corrections = Vec::new();
+        sanitize_option("title", &mut self.title, &mut corrections);
+        sanitize_option("artist", &mut self.artist, &mut corrections);
+        sanitize_option("album", &mut self.album, &mut corrections);
+        sanitize_option("album_artist", &mut self.album_artist, &mut corrections);
+        sanitize_option(
+            "album_artist_sort",
+            &mut self.album_artist_sort,
+            &mut corrections,
+        );
+        sanitize_option("disc_subtitle", &mut self.disc_subtitle, &mut corrections);
+        sanitize_option("release_date", &mut self.release_date, &mut corrections);
+        sanitize_option("original_date", &mut self.original_date, &mut corrections);
+        sanitize_option("genre", &mut self.genre, &mut corrections);
+        sanitize_option("format", &mut self.format, &mut corrections);
+        sanitize_option("label", &mut self.label, &mut corrections);
+        sanitize_option("catalog_number", &mut self.catalog_number, &mut corrections);
+        sanitize_option(
+            "musicbrainz_recording_id",
+            &mut self.musicbrainz_recording_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_release_id",
+            &mut self.musicbrainz_release_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_artist_id",
+            &mut self.musicbrainz_artist_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_album_artist_id",
+            &mut self.musicbrainz_album_artist_id,
+            &mut corrections,
+        );
+        sanitize_option(
+            "musicbrainz_release_group_id",
+            &mut self.musicbrainz_release_group_id,
+            &mut corrections,
+        );
+        sanitize_option("isrc", &mut self.isrc, &mut corrections);
+        if let Some(raw) = self.comment.as_deref() {
+            let (clean, mut found) = sanitize_untrusted_text(raw, "comment");
+            if !found.is_empty() {
+                self.comment = (!clean.is_empty()).then_some(clean);
+                corrections.append(&mut found);
+            }
+        }
+
+        for (index, genre) in self.genres.iter_mut().enumerate() {
+            let (clean, mut found) =
+                sanitize_untrusted_single_line_text(genre, &format!("genres[{index}]"));
+            if !found.is_empty() {
+                *genre = clean;
+                corrections.append(&mut found);
+            }
+        }
+        self.genres.retain(|genre| !genre.is_empty());
+
+        for (index, credit) in self.credits.iter_mut().enumerate() {
+            for (suffix, value) in [("name", &mut credit.name), ("role", &mut credit.role)] {
+                let (clean, mut found) = sanitize_untrusted_single_line_text(
+                    value,
+                    &format!("credits[{index}].{suffix}"),
+                );
+                if !found.is_empty() {
+                    *value = clean;
+                    corrections.append(&mut found);
+                }
+            }
+            sanitize_option(
+                &format!("credits[{index}].instrument"),
+                &mut credit.instrument,
+                &mut corrections,
+            );
+        }
+        self.credits
+            .retain(|credit| !credit.name.is_empty() && !credit.role.is_empty());
+
+        corrections
+    }
+}
+
 /// Split a multi-genre tag string into individual genres.
 ///
 /// Handles common separators: `;`, `/`, `\\`, and `\0` (null byte, used by
@@ -177,6 +360,38 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(normalize_genre)
         .collect()
+}
+
+/// Assemble la liste des genres d'une piste à partir des valeurs BRUTES du tag.
+///
+/// Un fichier peut porter ses genres de DEUX façons, selon le logiciel qui l'a
+/// gravé, et les deux sont légitimes :
+///
+///   * **plusieurs valeurs** — Vorbis Comment répète le champ (`GENRE=Jazz`,
+///     `GENRE=Fusion`), MP4 répète l'atome `©gen`, ID3v2.4 sépare les valeurs
+///     d'un `TCON` par un octet nul ;
+///   * **une seule chaîne** — ID3v2.3 n'a pas de multivaleur, l'étiqueteur
+///     écrit `TCON = "Jazz; Fusion"` ou `"Jazz/Fusion"`.
+///
+/// Chaque valeur brute est donc redécoupée par `split_genre_tag`, ce qui couvre
+/// aussi les fichiers qui mêlent les deux conventions. Le dédoublonnage passe
+/// par `genre_key` — la clé canonique de la bibliothèque, pas un
+/// `to_lowercase()` réécrit sur place — pour que « Hip-Hop » et « Hip Hop »,
+/// écrits par deux marchands sur le même disque, ne comptent qu'une fois.
+///
+/// L'ordre d'apparition est conservé : le premier genre reste le genre
+/// principal (colonne `tracks.genre`).
+pub fn genres_from_tag_values<S: AsRef<str>>(values: &[S]) -> Vec<String> {
+    let mut vus = std::collections::HashSet::new();
+    let mut sortie = Vec::new();
+    for valeur in values {
+        for g in split_genre_tag(valeur.as_ref()) {
+            if vus.insert(genre_key(&g)) {
+                sortie.push(g);
+            }
+        }
+    }
+    sortie
 }
 
 /// Canonical grouping key for a genre label, insensitive to case AND to the
@@ -477,6 +692,21 @@ impl Id3v2Tags {
     }
     fn genre(&self) -> Option<&str> {
         self.get("TCON")
+    }
+
+    /// TOUTES les trames `TCON`, dans l'ordre du fichier.
+    ///
+    /// `get()` ne rend que la première, ce qui suffit à la plupart des trames
+    /// mais pas au genre : un étiqueteur peut écrire une trame `TCON` par
+    /// genre au lieu d'une seule chaîne séparée. Jumeau du chemin lofty, qui
+    /// lit lui aussi toutes les valeurs depuis #1821 — les deux doivent rendre
+    /// la même liste pour le même fichier.
+    fn genres(&self) -> Vec<&str> {
+        self.text_frames
+            .iter()
+            .filter(|(id, _)| id == "TCON")
+            .map(|(_, v)| v.as_str())
+            .collect()
     }
 
     /// Parse track number from TRCK frame ("7" or "7/11").
@@ -1112,12 +1342,13 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         compilation,
         credits,
     ) = if let Some(ref tags) = id3_tags {
-        let raw_genre = tags.genre().map(|s| s.to_string());
-        let genres = raw_genre
-            .as_deref()
-            .map(split_genre_tag)
-            .unwrap_or_default();
-        let genre = genres.first().cloned().or(raw_genre);
+        // Toutes les trames `TCON`, comme le chemin lofty (#1821).
+        let raw_genres: Vec<&str> = tags.genres();
+        let genres = genres_from_tag_values(&raw_genres);
+        let genre = genres
+            .first()
+            .cloned()
+            .or_else(|| raw_genres.first().map(|s| s.to_string()));
 
         let compilation_str = tags.get("TCMP").unwrap_or("");
         let compilation = matches!(compilation_str, "1" | "true" | "True");
@@ -1400,13 +1631,7 @@ pub(crate) fn album_artiste_du_chemin(
 /// Check if a file has a known audio extension (used to decide whether to
 /// attempt a filesystem-based metadata fallback when lofty fails).
 fn is_known_audio_ext(path: &Path) -> bool {
-    const AUDIO_EXTS: &[&str] = &[
-        "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff",
-        "dst", "alac", "ape",
-    ];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| AUDIO_EXTS.contains(&ext.to_lowercase().as_str()))
+    crate::audio::support::native_decoder_supports(path)
 }
 
 /// Extract basic metadata from the directory structure when lofty successfully
@@ -1823,6 +2048,19 @@ pub fn probe_duration_ms(path: &Path) -> Option<u64> {
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    let mut metadata = try_read_metadata_unsanitized(path)?;
+    let corrections = metadata.sanitize_text_fields();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "metadata_unsafe_text_sanitized"
+        );
+    }
+    Ok(metadata)
+}
+
+fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
@@ -1936,7 +2174,17 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 
     let credits = parse_credits(tag);
 
-    let mut raw_genre = tag.genre().map(|s| s.to_string());
+    // TOUTES les valeurs du tag de genre, pas seulement la première (#1821).
+    // `Accessor::genre()` ne rend que la première : un FLAC gravé avec deux
+    // champs `GENRE`, ou un M4A avec deux atomes `©gen`, perdait tous ses
+    // genres secondaires — alors que le MÊME disque, acheté chez un marchand
+    // qui écrit « Jazz; Fusion » dans un unique `TCON`, les gardait tous les
+    // deux. Le classement dépendait donc du logiciel de gravure, pas de la
+    // musique (DEvir, #1821).
+    let mut raw_genres: Vec<String> = tag
+        .get_strings(ItemKey::Genre)
+        .map(|s| s.to_string())
+        .collect();
     // MP3s carrying two prepended ID3v2 tags (iTunes M4A→MP3 leftover + Mp3Tag
     // re-tag) make lofty merge last-wins, so a stale genre overrides the user's.
     // Read the first tag like every standard player does — no-op unless a second
@@ -1947,14 +2195,16 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
     {
         if let Some(g) = mp3_first_tag_genre_if_dual(path) {
-            raw_genre = Some(g);
+            // Le premier tag REMPLACE la fusion de lofty : c'est tout ce que
+            // lisent les autres lecteurs, valeurs multiples comprises.
+            raw_genres = vec![g];
         }
     }
-    let genres = raw_genre
-        .as_deref()
-        .map(split_genre_tag)
-        .unwrap_or_default();
-    let genre = genres.first().cloned().or(raw_genre);
+    let genres = genres_from_tag_values(&raw_genres);
+    let genre = genres
+        .first()
+        .cloned()
+        .or_else(|| raw_genres.first().cloned());
 
     // lofty can't distinguish ALAC (lossless) from AAC (lossy) in an M4A/MP4
     // container and reports no bit depth for either, so a tagged ALAC file was
@@ -2342,9 +2592,27 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         meta.insert("mb_work_id".into(), v);
     }
 
+    let mut corrections = Vec::new();
+    for (key, value) in &mut meta {
+        let (clean, mut found) = sanitize_untrusted_text(value, key);
+        if !found.is_empty() {
+            *value = clean;
+            corrections.append(&mut found);
+        }
+    }
+    meta.retain(|_, value| !value.is_empty());
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "extended_metadata_unsafe_text_sanitized"
+        );
+    }
+
     meta
 }
 
+#[derive(Debug, Clone)]
 pub struct MetadataUpdate {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -2358,11 +2626,47 @@ pub struct MetadataUpdate {
     pub label: Option<String>,
 }
 
+impl MetadataUpdate {
+    fn sanitized(&self) -> (Self, Vec<TextCorrection>) {
+        fn clean(field: &str, value: &mut Option<String>, corrections: &mut Vec<TextCorrection>) {
+            let Some(raw) = value.as_deref() else {
+                return;
+            };
+            let (sanitized, mut found) = sanitize_untrusted_text(raw, field);
+            if found.is_empty() {
+                return;
+            }
+            *value = (!sanitized.is_empty()).then_some(sanitized);
+            corrections.append(&mut found);
+        }
+
+        let mut update = self.clone();
+        let mut corrections = Vec::new();
+        clean("title", &mut update.title, &mut corrections);
+        clean("artist", &mut update.artist, &mut corrections);
+        clean("album", &mut update.album, &mut corrections);
+        clean("album_artist", &mut update.album_artist, &mut corrections);
+        clean("genre", &mut update.genre, &mut corrections);
+        clean("composer", &mut update.composer, &mut corrections);
+        clean("label", &mut update.label, &mut corrections);
+        (update, corrections)
+    }
+}
+
 pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::TaggedFileExt;
     use lofty::tag::items::Timestamp;
     use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
+
+    let (update, corrections) = update.sanitized();
+    if !corrections.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            corrections = ?corrections,
+            "metadata_tag_input_sanitized"
+        );
+    }
 
     let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
     let tag = tagged.primary_tag_mut().ok_or("no primary tag")?;
@@ -2726,6 +3030,78 @@ mod tests_dossier_de_disque {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_text_preserves_a_visible_word_boundary_and_exact_offsets() {
+        let (clean, corrections) =
+            sanitize_untrusted_text("Jacobs, Lisa\0\u{feff}The\u{0001}String Soloists", "artist");
+        assert_eq!(clean, "Jacobs, Lisa The String Soloists");
+        assert_eq!(corrections.len(), 3);
+        assert_eq!(corrections[0].kind, "NUL");
+        assert_eq!(corrections[0].codepoint, 0);
+        assert_eq!(corrections[0].byte_offset, 12);
+        assert_eq!(corrections[1].kind, "BOM");
+        assert_eq!(corrections[1].codepoint, 0xfeff);
+        assert_eq!(corrections[1].byte_offset, 13);
+        assert_eq!(corrections[2].kind, "CONTROL");
+        assert_eq!(corrections[2].codepoint, 0x01);
+        assert_eq!(corrections[2].byte_offset, 19);
+        assert!(clean.chars().all(|c| c != '\0' && c != '\u{feff}'));
+
+        let clean_multiline = "  ligne 1\nligne 2\t ";
+        assert_eq!(
+            sanitize_untrusted_text(clean_multiline, "lyrics"),
+            (clean_multiline.to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn track_metadata_sanitizes_core_lists_and_nested_credits_before_db() {
+        let mut metadata = TrackMetadata {
+            title: Some("Titre\0cache".into()),
+            artist: Some("Lisa\0\u{feff}The Strings".into()),
+            genres: vec!["Jazz\u{feff}Fusion".into(), "\0".into()],
+            credits: vec![TrackCredit {
+                name: "Chef\0Orchestre".into(),
+                role: "conductor".into(),
+                instrument: Some("violin\u{feff}solo".into()),
+            }],
+            comment: Some("ligne 1\nligne 2".into()),
+            ..Default::default()
+        };
+
+        let corrections = metadata.sanitize_text_fields();
+        assert_eq!(metadata.title.as_deref(), Some("Titre cache"));
+        assert_eq!(metadata.artist.as_deref(), Some("Lisa The Strings"));
+        assert_eq!(metadata.genres, vec!["Jazz Fusion"]);
+        assert_eq!(metadata.credits[0].name, "Chef Orchestre");
+        assert_eq!(
+            metadata.credits[0].instrument.as_deref(),
+            Some("violin solo")
+        );
+        assert_eq!(metadata.comment.as_deref(), Some("ligne 1\nligne 2"));
+        assert_eq!(corrections.len(), 7);
+    }
+
+    #[test]
+    fn tag_update_ne_peut_pas_transmettre_un_nul_a_lofty() {
+        let update = MetadataUpdate {
+            title: Some("A\0B".into()),
+            artist: Some("\u{feff}Artist".into()),
+            album: Some("Album".into()),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            composer: None,
+            label: None,
+        };
+        let (clean, corrections) = update.sanitized();
+        assert_eq!(clean.title.as_deref(), Some("A B"));
+        assert_eq!(clean.artist.as_deref(), Some("Artist"));
+        assert_eq!(corrections.len(), 2);
+    }
 
     #[test]
     fn probe_m4a_props_attrape_un_panic_du_decodeur() {
@@ -3249,14 +3625,13 @@ mod tests {
     #[test]
     fn dsf_fallback_with_valid_header() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join("tune_test_dsf_fallback.dsf");
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
         let buf = build_dsf_bytes(None);
-        std::fs::File::create(&tmp)
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = dsf_dff_fallback(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = dsf_dff_fallback(tmp.path());
         assert!(meta.is_some());
         let meta = meta.unwrap();
         // #1612 : un `.dsf` porte desormais son conteneur, plus « dsd ».
@@ -3285,13 +3660,12 @@ mod tests {
             ("TPUB", "Virgin Records"),
         ]);
         let buf = build_dsf_bytes(Some(&id3_tag));
-        let tmp = std::env::temp_dir().join("tune_test_dsf_id3v2.dsf");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = dsf_dff_fallback(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = dsf_dff_fallback(tmp.path());
         assert!(
             meta.is_some(),
             "dsf_dff_fallback should return Some for DSF with ID3v2"
@@ -3318,8 +3692,9 @@ mod tests {
     #[test]
     fn dsf_fallback_id3v2_overrides_path() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("V_DSF").join("Genesis - Abacab");
-        std::fs::create_dir_all(&dir).ok();
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("V_DSF").join("Genesis - Abacab");
+        std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("07 - Man On The Corner.dsf");
         let id3_tag = build_id3v2_tag(&[
             ("TIT2", "Man On The Corner"),
@@ -3333,8 +3708,6 @@ mod tests {
             .write_all(&buf)
             .unwrap();
         let meta = dsf_dff_fallback(&file_path);
-        std::fs::remove_file(&file_path).ok();
-        std::fs::remove_dir_all(std::env::temp_dir().join("V_DSF")).ok();
         assert!(meta.is_some());
         let meta = meta.unwrap();
         assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
@@ -3387,10 +3760,8 @@ mod tests {
         wav.extend_from_slice(&data);
 
         // Directory convention: .../Artist/Album/NN - Title.wav
-        let dir = std::env::temp_dir()
-            .join("tune_test_untagged_wav")
-            .join("Jean-Luc")
-            .join("Best Of");
+        let base = tempfile::TempDir::new().unwrap();
+        let dir = base.path().join("Jean-Luc").join("Best Of");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("07 - Untagged Song.wav");
         std::fs::File::create(&file)
@@ -3409,8 +3780,6 @@ mod tests {
         // Holds through both fallback paths: tagless_fallback (lofty parsed props)
         // and tagless_fallback_no_props (lofty failed) both normalise to "wav".
         assert_eq!(meta.format.as_deref(), Some("wav"));
-
-        std::fs::remove_dir_all(std::env::temp_dir().join("tune_test_untagged_wav")).ok();
     }
 
     #[test]
@@ -3423,13 +3792,12 @@ mod tests {
         use std::io::Write;
         let id3_tag = build_id3v2_tag(&[("TIT2", "Aurora"), ("TPE1", "Yes"), ("TALB", "Fragile")]);
         let buf = build_dsf_bytes(Some(&id3_tag));
-        let tmp = std::env::temp_dir().join("tune_test_dsf_title_e2e.dsf");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let meta = try_read_metadata(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let meta = try_read_metadata(tmp.path());
         let meta = meta.expect("try_read_metadata should succeed for a tagged DSF");
         assert_eq!(meta.title.as_deref(), Some("Aurora"));
         assert_eq!(meta.artist.as_deref(), Some("Yes"));
@@ -3448,13 +3816,12 @@ mod tests {
         let second = build_id3v2_tag(&[("TCON", "Singer/Songwriter")]);
         let mut buf = first.clone();
         buf.extend_from_slice(&second);
-        let tmp = std::env::temp_dir().join("tune_test_dual_id3v2.mp3");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&buf)
             .unwrap();
-        let g = mp3_first_tag_genre_if_dual(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let g = mp3_first_tag_genre_if_dual(tmp.path());
         assert_eq!(g.as_deref(), Some("Alternatif"));
     }
 
@@ -3464,13 +3831,12 @@ mod tests {
         // None), so lofty's encoding/numeric-genre-aware value is kept.
         use std::io::Write;
         let only = build_id3v2_tag(&[("TIT2", "Song"), ("TCON", "Jazz")]);
-        let tmp = std::env::temp_dir().join("tune_test_single_id3v2.mp3");
-        std::fs::File::create(&tmp)
+        let tmp = tempfile::Builder::new().suffix(".mp3").tempfile().unwrap();
+        std::fs::File::create(tmp.path())
             .unwrap()
             .write_all(&only)
             .unwrap();
-        let g = mp3_first_tag_genre_if_dual(&tmp);
-        std::fs::remove_file(&tmp).ok();
+        let g = mp3_first_tag_genre_if_dual(tmp.path());
         assert_eq!(g, None);
     }
 
@@ -3999,5 +4365,181 @@ mod tests {
         let taille = 4_800_000u64;
         let duree_reelle_a_320k = taille * 8 * 1000 / 320_000;
         assert_eq!(duree_reelle_a_320k, taille / 40);
+    }
+}
+
+/// #1821 — le genre ne doit pas dépendre du logiciel qui a gravé le fichier.
+///
+/// DEvir : « songs purchased from different platforms or labels end up being
+/// categorized under different genres ». La cause mesurée n'est pas le
+/// vocabulaire des marchands, c'est l'ENCODAGE : la même intention « ce disque
+/// est du Jazz ET de la Fusion » s'écrit de deux façons légitimes selon le
+/// format et l'étiqueteur, et Tune n'en lisait qu'une.
+///
+/// Ces épreuves construisent de VRAIS fichiers dans les trois conteneurs qui
+/// couvrent la bibliothèque d'un testeur — FLAC (Vorbis Comment), M4A (atomes
+/// MP4) et MP3 (trames ID3v2) — parce qu'un garde-fou qui ne monterait qu'un
+/// seul format ne dirait rien des deux autres : chacun a sa propre façon de
+/// porter plusieurs valeurs.
+#[cfg(test)]
+mod genres_multivalues_i1821 {
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::prelude::*;
+    use lofty::tag::{ItemKey, ItemValue, TagItem};
+
+    /// Copie d'un gabarit sous un nom qui porte À LA FOIS la clé de l'agent et
+    /// le nom de l'épreuve : deux tests du même binaire ne peuvent pas se voler
+    /// leur fichier, et un nettoyage par glob commun ne peut pas emporter
+    /// celui d'un autre.
+    ///
+    /// ⚠️ Le nom de l'épreuve ne suffisait PAS (#2864) : sans pid, deux
+    /// binaires de test concurrents — deux agents sur la même machine de
+    /// compilation, `/tmp` partagé — visaient le même `i1821-<épreuve>-<nom>`.
+    /// `scratch_name` ajoute le pid ET un compteur ; l'étiquette ne sert plus
+    /// qu'à la lisibilité d'un résidu dans `/tmp`.
+    fn gabarit(nom: &str, epreuve: &str) -> std::path::PathBuf {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(nom);
+        // `nom` porte l'EXTENSION, et lofty choisit son analyseur dessus :
+        // elle doit rester en dernier. Le suffixe unique se glisse donc
+        // avant, jamais après.
+        let copie = std::env::temp_dir().join(format!(
+            "{}-{nom}",
+            crate::test_scratch::scratch_name(&format!("i1821-{epreuve}"))
+        ));
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        copie
+    }
+
+    /// Écrit N valeurs de genre en tant qu'ÉLÉMENTS SÉPARÉS du tag — la façon
+    /// native de Vorbis Comment (champ `GENRE` répété), de MP4 (atome `©gen`
+    /// répété) et d'ID3v2.4 (`TCON` multivalué).
+    fn ecrire_genres_separes(chemin: &std::path::Path, genres: &[&str]) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        for g in genres {
+            tag.push(TagItem::new(
+                ItemKey::Genre,
+                ItemValue::Text((*g).to_string()),
+            ));
+        }
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    /// Écrit les mêmes genres en UNE SEULE chaîne séparée — ce qu'écrit un
+    /// étiqueteur limité à ID3v2.3, qui n'a pas de multivaleur.
+    fn ecrire_genres_en_une_chaine(chemin: &std::path::Path, chaine: &str) {
+        let mut fichier = lofty::read_from_path(chemin).expect("lecture du gabarit");
+        let tag = fichier.primary_tag_mut().expect("tag principal");
+        tag.remove_key(ItemKey::Genre);
+        tag.push(TagItem::new(
+            ItemKey::Genre,
+            ItemValue::Text(chaine.to_string()),
+        ));
+        tag.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+    }
+
+    #[test]
+    fn les_trois_conteneurs_rendent_tous_les_genres_du_tag() {
+        // On récolte les TROIS lectures avant d'affirmer quoi que ce soit :
+        // une assertion posée dans la boucle s'arrêterait au premier format et
+        // ne dirait rien des deux autres — le faux garde-fou exact qu'on veut
+        // éviter ici. Sans le correctif, le message rouge nomme les trois.
+        let lu: Vec<(&str, Vec<String>, Option<String>)> = ["test.flac", "test.m4a", "test.mp3"]
+            .into_iter()
+            .map(|nom| {
+                let chemin = gabarit(nom, "trois-conteneurs");
+                ecrire_genres_separes(&chemin, &["Jazz", "Fusion"]);
+                let meta = super::read_metadata(&chemin).expect("lecture des métadonnées");
+                let _ = std::fs::remove_file(&chemin);
+                (nom, meta.genres, meta.genre)
+            })
+            .collect();
+
+        let attendu = vec!["Jazz".to_string(), "Fusion".to_string()];
+        let perdus: Vec<&str> = lu
+            .iter()
+            .filter(|(_, genres, _)| *genres != attendu)
+            .map(|(nom, _, _)| *nom)
+            .collect();
+        assert!(
+            perdus.is_empty(),
+            "les genres secondaires du tag sont perdus sur {perdus:?} — lu : {lu:?}"
+        );
+        for (nom, _, genre) in &lu {
+            assert_eq!(
+                genre.as_deref(),
+                Some("Jazz"),
+                "{nom} : le genre principal reste le premier du tag"
+            );
+        }
+    }
+
+    #[test]
+    fn les_deux_conventions_decrivent_la_meme_musique() {
+        // Le cœur de #1821 : le même disque, gravé une fois en valeurs
+        // séparées et une fois en chaîne unique, doit se ranger IDENTIQUEMENT.
+        // Avant le correctif, la chaîne unique rendait deux genres et les
+        // valeurs séparées un seul — d'où deux classements pour un seul disque.
+        let separe = gabarit("test.flac", "deux-conventions-separe");
+        ecrire_genres_separes(&separe, &["Jazz", "Fusion"]);
+
+        let unique = gabarit("test.mp3", "deux-conventions-unique");
+        ecrire_genres_en_une_chaine(&unique, "Jazz; Fusion");
+
+        let a = super::read_metadata(&separe).expect("FLAC à valeurs séparées");
+        let b = super::read_metadata(&unique).expect("MP3 à chaîne unique");
+        assert_eq!(
+            a.genres, b.genres,
+            "deux gravures de la même intention donnent deux classements"
+        );
+        assert_eq!(a.genre, b.genre);
+
+        let _ = std::fs::remove_file(&separe);
+        let _ = std::fs::remove_file(&unique);
+    }
+
+    #[test]
+    fn un_genre_unique_reste_intact() {
+        // Contre-garde : le cas courant — un seul genre — ne bouge pas.
+        for nom in ["test.flac", "test.m4a", "test.mp3"] {
+            let chemin = gabarit(nom, "genre-unique");
+            ecrire_genres_separes(&chemin, &["Rock"]);
+            let meta = super::read_metadata(&chemin).expect("lecture");
+            assert_eq!(meta.genres, vec!["Rock".to_string()], "{nom}");
+            assert_eq!(meta.genre.as_deref(), Some("Rock"), "{nom}");
+            let _ = std::fs::remove_file(&chemin);
+        }
+    }
+
+    #[test]
+    fn deux_orthographes_du_meme_genre_ne_comptent_quune_fois() {
+        // Un marchand écrit « Hip-Hop », l'autre « Hip Hop ». Un fichier
+        // regravé peut porter les deux ; `genre_key` — la clé canonique de la
+        // bibliothèque, pas un `to_lowercase()` réécrit sur place — les
+        // ramène à un seul genre.
+        assert_eq!(
+            super::genres_from_tag_values(&["Hip-Hop", "hip hop", "Trip Hop"]),
+            vec!["Hip-Hop".to_string(), "Trip Hop".to_string()]
+        );
+    }
+
+    #[test]
+    fn une_valeur_peut_elle_meme_etre_separee() {
+        // Les deux conventions se mêlent dans un même fichier : deux champs
+        // `GENRE`, dont l'un porte encore un séparateur.
+        assert_eq!(
+            super::genres_from_tag_values(&["Jazz", "Fusion; Latin Jazz"]),
+            vec![
+                "Jazz".to_string(),
+                "Fusion".to_string(),
+                "Latin Jazz".to_string()
+            ]
+        );
     }
 }

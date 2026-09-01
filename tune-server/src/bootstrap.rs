@@ -267,6 +267,13 @@ pub async fn run_with(opts: RunOptions) {
             .init();
     }
 
+    // Image builders alone cannot protect appliances already in the field:
+    // self-update replaces this binary, not /etc.  On Tune OS/Linux, migrate
+    // the historical public SSH password once before exposing the HTTP API.
+    // The embedded policy preserves every password that was already changed.
+    #[cfg(target_os = "linux")]
+    crate::tune_os_password::migrate_legacy_password();
+
     // Bind the HTTP listener BEFORE opening the database. If another
     // tune-server instance is already running (old LaunchAgent, manual
     // install, update race — Jean-Marie/FRIDER #1158), the previous order
@@ -510,6 +517,20 @@ pub async fn run_with(opts: RunOptions) {
     // Listener was bound before the DB was opened (see above) — the socket's
     // backlog has been queueing connections since then.
     info!(%addr, "listening");
+
+    // Dire l'adresse COMPLÈTE, une fois, là où quelqu'un la lit (#1272) :
+    // fenêtre de console Windows ouverte par `start-tune-server.bat`,
+    // `docker logs`, `journalctl`. Elle n'était imprimée nulle part — ni ici,
+    // ni par un installeur — alors que le serveur la calcule déjà pour
+    // l'interface. Voir [`crate::adresse_d_accueil`] pour ce que cela ne
+    // règle PAS : une adresse sans port a besoin du port 80.
+    for ligne in crate::adresse_d_accueil::lignes_d_accueil(
+        config.port,
+        &routes::system::server_urls(config.port),
+    ) {
+        eprintln!("{ligne}");
+        info!(%ligne, "adresse_d_accueil");
+    }
 
     // Auto-resume local zones now that the listener is bound. Wait until the
     // server is actually accepting connections before resuming, so the local

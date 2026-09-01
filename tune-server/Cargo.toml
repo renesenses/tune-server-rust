@@ -39,8 +39,12 @@ karaoke = ["dep:tune-karaoke"]
 #
 # La feature décide si le code est COMPILÉ ; `default_enabled = false` décide
 # s'il TOURNE. Le plugin est donc présent et visible, mais dormant jusqu'à ce
-# que l'utilisateur l'installe. `dj` et `karaoke` restent dans l'angle mort —
-# à trancher séparément.
+# que l'utilisateur l'installe.
+#
+# `dj` et `karaoke` sont tranchés depuis #2090 : compilés dans tous les binaires
+# publiés (voir les lignes `--features` de release.yml) mais HORS CATALOGUE
+# (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
+# écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
 
 [dependencies]
@@ -90,10 +94,23 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+# Test-only : fabriquer des horodatages passés pour rejouer une machine restée
+# hors ligne (tests/licence_grace_visible.rs, #1999).
+chrono = { workspace = true }
 # Test-only: implementing `TunePlugin` and giving it a scratch data dir in
 # tests/plugin_routes.rs.
 async-trait = { workspace = true }
 tempfile = "3"
+# Test-only : fabriquer de vraies pochettes JPEG/PNG et relire les dimensions
+# servies, pour que la contre-épreuve de `?size=` porte sur des pixels et non
+# sur une longueur d'octets (#2996).
+image = { workspace = true }
+# Test-only : `#[tokio::test(start_paused = true)]`. La sonde d'avancement des
+# images d'artistes se relit toutes les trois secondes et la passe qu'elle
+# observe dure des heures — sans horloge virtuelle, l'éprouver coûterait ce
+# temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
+# que dans les cibles de test : le binaire publié ne le compile pas.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "server_contracts"
@@ -111,3 +128,13 @@ path = "tests/plugin_contracts.rs"
 name = "plugin_wasm_contracts"
 path = "tests/plugin_wasm_contracts.rs"
 required-features = ["plugins-wasm"]
+
+# Cible à elle seule, et NON un module de `server_contracts` : le test installe
+# un abonné `tracing` GLOBAL pour lire le journal. `tracing` met en cache, pour
+# tout le processus, la décision « ce point d'appel intéresse-t-il quelqu'un ? »
+# — un abonné posé au milieu d'un binaire qui lance des tests en parallèle rend
+# des captures vides de façon imprévisible (leçon de
+# `tune-core/tests/journal_descriptif_illisible.rs`). Un binaire, un test.
+[[test]]
+name = "panne_sql_journalisee"
+path = "tests/panne_sql_journalisee.rs"

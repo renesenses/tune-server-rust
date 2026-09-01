@@ -4,6 +4,7 @@
 //! entrées séparées : ces routes les rapprochent par titre+artiste, comme
 //! les Doublons, mais dans le sens du service — trouver MIEUX, pas pareil.
 
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Path, State};
 use serde_json::{Value, json};
@@ -53,7 +54,7 @@ pub(super) async fn track_better_quality(
             ),
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     let mut courant: Option<(bool, i64)> = None;
     let mut meilleur: Option<(Value, (bool, i64))> = None;
@@ -110,7 +111,7 @@ pub(super) async fn album_better_quality(
             ),
             &[],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
 
     let mut meilleur: Option<(Value, (bool, i64))> = None;
     for r in rows {

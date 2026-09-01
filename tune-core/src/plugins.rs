@@ -244,19 +244,18 @@ mod tests {
 
     #[tokio::test]
     async fn scan_empty_dir() {
-        let dir = std::env::temp_dir().join("tune_plugins_test_empty");
-        fs::create_dir_all(&dir).ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let mgr = PluginManager::new(dir.clone());
         let plugins = mgr.scan().await.unwrap();
         assert!(plugins.is_empty());
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn scan_with_plugin() {
-        let dir = std::env::temp_dir().join("tune_plugins_test_scan");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let plugin_dir = dir.join("test-plugin");
         fs::create_dir_all(&plugin_dir).unwrap();
 
@@ -275,13 +274,12 @@ mod tests {
         let plugins = mgr.scan().await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].manifest.id, "test-plugin");
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn enable_disable_plugin() {
-        let dir = std::env::temp_dir().join("tune_plugins_test_enable");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let plugin_dir = dir.join("my-plugin");
         fs::create_dir_all(&plugin_dir).unwrap();
 
@@ -307,14 +305,12 @@ mod tests {
         mgr.disable("my-plugin").await.unwrap();
         let info = mgr.get("my-plugin").await.unwrap();
         assert_eq!(info.state, PluginState::Disabled);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn list_active_only() {
-        let dir = std::env::temp_dir().join("tune_plugins_test_active");
-        fs::create_dir_all(&dir).ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let mgr = PluginManager::new(dir.clone());
 
@@ -364,7 +360,5 @@ mod tests {
         let active = mgr.active_plugins().await;
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].manifest.id, "a");
-
-        fs::remove_dir_all(&dir).ok();
     }
 }

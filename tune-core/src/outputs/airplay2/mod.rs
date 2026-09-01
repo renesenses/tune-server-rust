@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::outputs::traits::{
@@ -23,6 +24,7 @@ use crate::outputs::traits::{
 pub mod pairing;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
+const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Airplay2Output {
     name: String,
@@ -40,6 +42,8 @@ pub struct Airplay2Output {
     current_artist: Arc<Mutex<Option<String>>>,
     process: Arc<Mutex<Option<DaemonProcess>>>,
     pairing: Arc<Mutex<PairingPhase>>,
+    transport_command: Mutex<()>,
+    pending_transport: Arc<Mutex<Option<PendingTransport>>>,
 }
 
 /// Pairing progress for an AirPlay 2 receiver, updated by the daemon stdout
@@ -58,8 +62,19 @@ enum PairingPhase {
 }
 
 struct DaemonProcess {
-    child: Child,
-    stdin: tokio::process::ChildStdin,
+    child: Option<Child>,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportConfirmation {
+    Paused,
+    Playing,
+}
+
+struct PendingTransport {
+    expected: TransportConfirmation,
+    response: oneshot::Sender<Result<(), String>>,
 }
 
 impl DaemonProcess {
@@ -101,7 +116,120 @@ impl Airplay2Output {
             current_artist: Arc::new(Mutex::new(None)),
             process: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(PairingPhase::Idle)),
+            transport_command: Mutex::new(()),
+            pending_transport: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn start_event_reader<R>(&self, mut reader: R)
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+    {
+        let playing = self.playing.clone();
+        let paused = self.paused.clone();
+        let position_ms = self.position_ms.clone();
+        let device_name = self.name.clone();
+        let pairing = self.pairing.clone();
+        let pending_transport = self.pending_transport.clone();
+
+        tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        playing.store(false, Ordering::SeqCst);
+                        paused.store(false, Ordering::SeqCst);
+                        if let Some(pending) = pending_transport.lock().await.take() {
+                            let _ = pending.response.send(Err("daemon exited".into()));
+                        }
+                        *pairing.lock().await = PairingPhase::Failed("daemon exited".into());
+                        break;
+                    }
+                    Ok(_) => {
+                        let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) else {
+                            continue;
+                        };
+                        let event = ev["event"].as_str().unwrap_or("");
+                        let confirmation = match event {
+                            "pin_requested" => {
+                                *pairing.lock().await = PairingPhase::PinRequested;
+                                info!(device = %device_name, "airplay2: receiver is showing a pairing PIN");
+                                None
+                            }
+                            "connected" | "paired" => {
+                                *pairing.lock().await = PairingPhase::Connected;
+                                debug!(device = %device_name, "airplay2: connected/paired");
+                                None
+                            }
+                            "playing" => {
+                                playing.store(true, Ordering::SeqCst);
+                                paused.store(false, Ordering::SeqCst);
+                                debug!(device = %device_name, "airplay2: playing");
+                                Some(TransportConfirmation::Playing)
+                            }
+                            "paused" => {
+                                playing.store(true, Ordering::SeqCst);
+                                paused.store(true, Ordering::SeqCst);
+                                debug!(device = %device_name, "airplay2: paused");
+                                Some(TransportConfirmation::Paused)
+                            }
+                            "stopped" | "disconnected" => {
+                                playing.store(false, Ordering::SeqCst);
+                                paused.store(false, Ordering::SeqCst);
+                                debug!(device = %device_name, "airplay2: stopped");
+                                None
+                            }
+                            "status" => {
+                                if let Some(pos) = ev["position_s"].as_f64() {
+                                    position_ms.store((pos * 1000.0) as u64, Ordering::Relaxed);
+                                }
+                                None
+                            }
+                            "error" => {
+                                let msg = ev["message"].as_str().unwrap_or("unknown").to_string();
+                                let pending = pending_transport.lock().await.take();
+                                if let Some(pending) = pending {
+                                    let _ = pending.response.send(Err(msg.clone()));
+                                } else {
+                                    *pairing.lock().await = PairingPhase::Failed(msg.clone());
+                                }
+                                warn!(device = %device_name, error = %msg, "airplay2: daemon error");
+                                None
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(confirmation) = confirmation {
+                            let pending = {
+                                let mut slot = pending_transport.lock().await;
+                                if slot
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.expected == confirmation)
+                                {
+                                    slot.take()
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(pending) = pending {
+                                let _ = pending.response.send(Ok(()));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        playing.store(false, Ordering::SeqCst);
+                        paused.store(false, Ordering::SeqCst);
+                        let msg = format!("daemon read error: {error}");
+                        if let Some(pending) = pending_transport.lock().await.take() {
+                            let _ = pending.response.send(Err(msg.clone()));
+                        }
+                        *pairing.lock().await = PairingPhase::Failed(msg);
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Spawn the daemon, wait for `ready`, and start the single background stdout
@@ -131,63 +259,12 @@ impl Airplay2Output {
             return Err(format!("daemon did not send ready: {line}"));
         }
 
-        let playing = self.playing.clone();
-        let position_ms = self.position_ms.clone();
-        let device_name = self.name.clone();
-        let pairing = self.pairing.clone();
-        tokio::spawn(async move {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => {
-                        *pairing.lock().await = PairingPhase::Failed("daemon exited".into());
-                        break;
-                    }
-                    Ok(_) => {
-                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) {
-                            let event = ev["event"].as_str().unwrap_or("");
-                            match event {
-                                "pin_requested" => {
-                                    *pairing.lock().await = PairingPhase::PinRequested;
-                                    info!(device = %device_name, "airplay2: receiver is showing a pairing PIN");
-                                }
-                                "connected" | "paired" => {
-                                    *pairing.lock().await = PairingPhase::Connected;
-                                    debug!(device = %device_name, "airplay2: connected/paired");
-                                }
-                                "playing" => {
-                                    playing.store(true, Ordering::SeqCst);
-                                    debug!(device = %device_name, "airplay2: playing");
-                                }
-                                "stopped" | "disconnected" => {
-                                    playing.store(false, Ordering::SeqCst);
-                                    debug!(device = %device_name, "airplay2: stopped");
-                                }
-                                "status" => {
-                                    if let Some(pos) = ev["position_s"].as_f64() {
-                                        position_ms.store((pos * 1000.0) as u64, Ordering::Relaxed);
-                                    }
-                                }
-                                "error" => {
-                                    let msg =
-                                        ev["message"].as_str().unwrap_or("unknown").to_string();
-                                    *pairing.lock().await = PairingPhase::Failed(msg.clone());
-                                    warn!(device = %device_name, error = %msg, "airplay2: daemon error");
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        *pairing.lock().await = PairingPhase::Failed("daemon read error".into());
-                        break;
-                    }
-                }
-            }
-        });
+        self.start_event_reader(reader);
 
-        Ok(DaemonProcess { child, stdin })
+        Ok(DaemonProcess {
+            child: Some(child),
+            stdin: Box::new(stdin),
+        })
     }
 
     /// Current pairing progress as a short string for the API/client to poll:
@@ -274,6 +351,35 @@ impl Airplay2Output {
             Err("daemon not running".into())
         }
     }
+
+    async fn send_transport_command(
+        &self,
+        command: &'static str,
+        expected: TransportConfirmation,
+    ) -> Result<(), String> {
+        let _command_guard = self.transport_command.lock().await;
+        let (response, receiver) = oneshot::channel();
+        *self.pending_transport.lock().await = Some(PendingTransport { expected, response });
+
+        if let Err(error) = self.send(&serde_json::json!({"cmd": command})).await {
+            self.pending_transport.lock().await.take();
+            return Err(error);
+        }
+
+        match tokio::time::timeout(TRANSPORT_COMMAND_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(format!(
+                "airplay2: daemon response channel closed after {command}"
+            )),
+            Err(_) => {
+                self.pending_transport.lock().await.take();
+                Err(format!(
+                    "airplay2: daemon did not confirm {command} within {} ms",
+                    TRANSPORT_COMMAND_TIMEOUT.as_millis()
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -291,9 +397,7 @@ impl OutputTarget for Airplay2Output {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        // La reprise restera fausse tant que le daemon AirPlay 2 livré ne
-        // possède pas la commande `resume` (#2238).
-        OutputCapabilities::v1(true, false, false, true, true, false)
+        OutputCapabilities::v1(true, true, false, true, true, false)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -326,14 +430,17 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.send(&serde_json::json!({"cmd": "stop"})).await?;
-        self.paused.store(true, Ordering::SeqCst);
+        self.send_transport_command("pause", TransportConfirmation::Paused)
+            .await?;
         info!(device = %self.name, "airplay2: pause");
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
-        Err("resume not supported by the shipped AirPlay 2 daemon".into())
+        self.send_transport_command("resume", TransportConfirmation::Playing)
+            .await?;
+        info!(device = %self.name, "airplay2: resume");
+        Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -347,7 +454,9 @@ impl OutputTarget for Airplay2Output {
         // Kill daemon process
         let mut proc = self.process.lock().await;
         if let Some(mut daemon) = proc.take() {
-            daemon.child.kill().await.ok();
+            if let Some(child) = daemon.child.as_mut() {
+                child.kill().await.ok();
+            }
         }
         info!(device = %self.name, "airplay2: stop");
         Ok(())
@@ -502,6 +611,113 @@ pub fn daemon_available() -> bool {
 }
 
 #[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn output_for_test() -> Airplay2Output {
+        Airplay2Output::new(
+            "AirPlay 2 test".into(),
+            "127.0.0.1".into(),
+            7000,
+            "fixture".into(),
+            "00:11:22:33:44:55".into(),
+        )
+    }
+
+    async fn install_fake_daemon(
+        output: &Airplay2Output,
+        fail_resume: bool,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
+        let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
+
+        *output.process.lock().await = Some(DaemonProcess {
+            child: None,
+            stdin: Box::new(server_stdin),
+        });
+        output.start_event_reader(BufReader::new(server_stdout));
+
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = commands.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(daemon_stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let name = command["cmd"].as_str().unwrap().to_string();
+                recorded.lock().await.push(name.clone());
+
+                let event = match name.as_str() {
+                    "play" => serde_json::json!({"event": "playing"}),
+                    "pause" => serde_json::json!({"event": "paused"}),
+                    "resume" if fail_resume => serde_json::json!({
+                        "event": "error",
+                        "message": "resume failed: fixture",
+                    }),
+                    "resume" => serde_json::json!({"event": "playing"}),
+                    other => serde_json::json!({
+                        "event": "error",
+                        "message": format!("unexpected command: {other}"),
+                    }),
+                };
+                let line = format!("{}\n", serde_json::to_string(&event).unwrap());
+                daemon_stdout.write_all(line.as_bytes()).await.unwrap();
+            }
+        });
+
+        commands
+    }
+
+    fn media_for_test() -> PlayMedia<'static> {
+        PlayMedia {
+            url: "/tmp/fixture.flac",
+            mime_type: "audio/flac",
+            title: Some("Fixture"),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn play_pause_resume_commands_are_confirmed_by_the_daemon() {
+        let output = output_for_test();
+        let commands = install_fake_daemon(&output, false).await;
+
+        assert!(output.capabilities().can_pause);
+        assert!(output.capabilities().can_resume);
+
+        output.play_media(&media_for_test()).await.unwrap();
+        output.pause().await.unwrap();
+        assert_eq!(
+            output.get_status().await.unwrap().state,
+            TransportState::Paused
+        );
+
+        output.resume().await.unwrap();
+        assert_eq!(
+            output.get_status().await.unwrap().state,
+            TransportState::Playing
+        );
+        assert_eq!(*commands.lock().await, vec!["play", "pause", "resume"]);
+    }
+
+    #[tokio::test]
+    async fn resume_error_keeps_the_published_state_paused() {
+        let output = output_for_test();
+        let commands = install_fake_daemon(&output, true).await;
+
+        output.play_media(&media_for_test()).await.unwrap();
+        output.pause().await.unwrap();
+        let error = output.resume().await.unwrap_err();
+
+        assert!(error.contains("resume failed: fixture"));
+        assert_eq!(
+            output.get_status().await.unwrap().state,
+            TransportState::Paused
+        );
+        assert_eq!(*commands.lock().await, vec!["play", "pause", "resume"]);
+    }
+}
+
+#[cfg(test)]
 mod daemon_path_tests {
     use super::*;
 
@@ -509,7 +725,7 @@ mod daemon_path_tests {
     fn resolves_daemon_bundled_next_to_executable() {
         // The primary native-install path: the daemon sits in the same directory
         // as the tune-server binary, wherever the archive was extracted.
-        let dir = std::env::temp_dir().join(format!("tune_daemon_test_{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune_daemon_test");
         std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);
@@ -529,8 +745,7 @@ mod daemon_path_tests {
         // arm64 Docker ships a 0-byte placeholder so AirPlay 2 falls back to
         // legacy. An existence-only check would pick it and fail to exec (#700):
         // a zero-length candidate must be treated as "no daemon".
-        let dir =
-            std::env::temp_dir().join(format!("tune_daemon_empty_test_{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir("tune_daemon_empty_test");
         std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);

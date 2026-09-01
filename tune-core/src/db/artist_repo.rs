@@ -130,8 +130,35 @@ pub mod sql {
         "SELECT id, name FROM artists WHERE (image_path IS NULL OR image_path = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
+    /// Les artistes dépourvus de biographie — **avec ou sans** identifiant
+    /// MusicBrainz.
+    ///
+    /// ## Ce que la clause `musicbrainz_id != ''` faisait ici (#1311)
+    ///
+    /// Elle écartait de la sélection tout artiste sans MBID. Deux
+    /// conséquences, qui se renforcent :
+    ///
+    /// 1. `batch_enrich_artist_bios` ne les voyait **jamais**. La branche
+    ///    « pas de MBID → tenter Last.fm par le nom » que cette fonction
+    ///    contient était du code mort : la requête garantissait `mbid` non
+    ///    vide, donc la condition `mbid.is_empty()` ne pouvait pas être vraie.
+    /// 2. `enrichment_status` calcule `artists_with_bio = total - len()`
+    ///    (`routes/system/enrich.rs`). Tout artiste sans MBID était donc
+    ///    compté comme *pourvu* d'une biographie. Sur .18, la couverture MBID
+    ///    mesurée est de 0,9 % : le panneau d'enrichissement annonçait donc
+    ///    ~99 % de biographies devant des fiches vides, et
+    ///    `POST /system/enrich-bios` renvoyait un `artists_without_bio`
+    ///    minuscule.
+    ///
+    /// Le pendant image de cette requête, `list_without_image_no_mbid`,
+    /// existe déjà et alimente la « phase 3 » de l'enrichissement des
+    /// vignettes (Discogs + Last.fm par le nom) : le chemin bio n'avait
+    /// jamais reçu le même traitement.
+    ///
+    /// `COALESCE` garde la troisième colonne non nulle : l'appelant lit une
+    /// `String` et reconnaît « pas de MBID » à la chaîne vide.
     pub fn list_without_bio() -> &'static str {
-        "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+        "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists WHERE (bio IS NULL OR bio = '') ORDER BY id"
     }
 
     pub fn count_with_bio() -> &'static str {
@@ -146,11 +173,30 @@ pub mod sql {
         "SELECT id, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    /// ⚠ L'ordre DÉCLARÉ doit suivre l'ordre LIÉ.
+    ///
+    /// `SqliteDialect::placeholder` **ignore l'indice** et rend `?`
+    /// (`db/engine.rs`) : sur SQLite seule la position compte. Cette requête
+    /// déclarait `SET musicbrainz_id = {2} WHERE id = {1}` alors que
+    /// `ArtistRepo::update_mbid` liait `[id, mbid]` — ce qui donnait, une fois
+    /// les `?` numérotés par leur ordre d'apparition,
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>`. Un identifiant
+    /// MusicBrainz n'étant jamais un entier, la clause `WHERE` ne trouvait
+    /// **jamais** de ligne : l'écriture était un no-op silencieux, et l'est
+    /// restée sur toute la ligne 0.9. Postgres, qui numérote ses `$n`,
+    /// n'était pas touché — le défaut ne se voyait donc que sur le moteur par
+    /// défaut, celui de la quasi-totalité des installations.
+    ///
+    /// Conséquence directe sur #2184 : la « phase 1 » de l'enrichissement des
+    /// images d'artistes (`batch_match_artist_mbids`) résolvait des MBID et
+    /// n'en gardait aucun. D'une passe à l'autre, `artists_without_mbid` ne
+    /// bougeait pas et les artistes n'atteignaient jamais les sources d'images
+    /// indexées par MBID (Fanart, TheAudioDB, MusicBrainz/Wikidata).
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
-            d.placeholder(2),
-            d.placeholder(1)
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -616,7 +662,8 @@ impl ArtistRepo {
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         let mbid = usable_musicbrainz_id(Some(mbid));
-        self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
+        // Ordre lié = ordre déclaré : la valeur d'abord, l'identifiant ensuite.
+        self.db.execute(&sql, &[&mbid as &dyn ToSqlValue, &id])?;
         Ok(())
     }
 
@@ -716,6 +763,52 @@ mod tests {
         let a2 = repo.get_or_create("Beatles", None, None).unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    /// #1311 — un artiste sans identifiant MusicBrainz est un artiste sans
+    /// biographie comme un autre.
+    ///
+    /// La requête exigeait un MBID non vide. Elle rendait donc invisibles à
+    /// l'enrichissement la quasi-totalité des artistes d'une bibliothèque
+    /// réelle (0,9 % de MBID mesurés sur .18), et faisait compter chacun
+    /// d'eux comme *pourvu* d'une biographie dans `enrichment_status`.
+    ///
+    /// Contre-épreuve : remettre `AND musicbrainz_id IS NOT NULL AND
+    /// musicbrainz_id != ''` dans `sql::list_without_bio` fait rougir ce
+    /// test, et lui seul.
+    #[test]
+    fn un_artiste_sans_mbid_compte_parmi_ceux_sans_bio() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+
+        // Avec MBID, sans bio — le seul cas que la requête retenait.
+        let mut avec_mbid = Artist::new("Pink Floyd".into());
+        avec_mbid.musicbrainz_id = Some("83d91898-7763-47d7-b03b-b92132375c47".into());
+        repo.create(&avec_mbid).unwrap();
+
+        // Sans MBID, sans bio — le cas courant, jusqu'ici écarté.
+        repo.create(&Artist::new("Bagad Kemper".into())).unwrap();
+
+        // Sans MBID mais AVEC bio — ne doit pas ressortir : c'est bien
+        // l'absence de biographie que la requête sélectionne.
+        let mut deja_pourvu = Artist::new("Alan Stivell".into());
+        deja_pourvu.bio = Some("Harpiste et chanteur breton.".into());
+        repo.create(&deja_pourvu).unwrap();
+
+        let sans_bio = repo.list_without_bio().unwrap();
+        let noms: Vec<&str> = sans_bio.iter().map(|(_, nom, _)| nom.as_str()).collect();
+        assert_eq!(
+            noms,
+            vec!["Pink Floyd", "Bagad Kemper"],
+            "un artiste sans MBID et sans bio doit figurer parmi ceux à enrichir"
+        );
+
+        // La colonne MBID reste lisible pour l'appelant : chaîne vide, pas NULL.
+        let (_, _, mbid_sans) = &sans_bio[1];
+        assert_eq!(
+            mbid_sans, "",
+            "l'absence de MBID doit se lire comme une chaîne vide, pas comme un NULL avalé"
+        );
     }
 
     #[test]
@@ -955,6 +1048,51 @@ mod tests {
 
         let results = repo.search("Jazz", 10).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// `update_mbid` doit ÉCRIRE — sur SQLite aussi.
+    ///
+    /// `SqliteDialect::placeholder` rend `?` quel que soit l'indice, donc
+    /// l'ordre déclaré dans le `format!` ne vaut rien : seul l'ordre des
+    /// paramètres liés compte. La requête déclarait la valeur en `{2}` et
+    /// l'identifiant en `{1}` tout en liant `[id, mbid]`, ce qui produisait
+    /// `SET musicbrainz_id = <id> WHERE id = <mbid>` : zéro ligne touchée.
+    ///
+    /// Sans cette écriture, la phase 1 de l'enrichissement des images
+    /// d'artistes résout des MBID et n'en garde aucun (#2184).
+    #[test]
+    fn update_mbid_ecrit_reellement_le_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Magma".into())).unwrap();
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
+
+        const MBID: &str = "0e1a0b0f-1111-2222-3333-444444444444";
+        repo.update_mbid(id, MBID).unwrap();
+
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().musicbrainz_id.as_deref(),
+            Some(MBID),
+            "le MBID doit être persisté, sinon chaque passe repart de zéro"
+        );
+        assert!(
+            repo.list_without_mbid().unwrap().is_empty(),
+            "l'artiste doit sortir de la liste « sans MBID »"
+        );
+    }
+
+    /// Contre-épreuve du témoin : un identifiant vide reste une absence, il ne
+    /// doit pas se transformer en chaîne vide qui passerait les filtres
+    /// `musicbrainz_id != ''`.
+    #[test]
+    fn update_mbid_vide_laisse_l_artiste_sans_mbid() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        let id = repo.create(&Artist::new("Gong".into())).unwrap();
+
+        repo.update_mbid(id, "   ").unwrap();
+
+        assert_eq!(repo.list_without_mbid().unwrap().len(), 1);
     }
 
     #[test]

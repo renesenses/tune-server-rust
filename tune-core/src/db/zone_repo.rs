@@ -1,10 +1,57 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
+
+/// Nombre d'écritures de réglages de zone que le schéma courant n'a pas pu
+/// conserver. Ce compteur de processus est volontairement monotone : un
+/// rapport de bogue doit dire qu'un mensonge a eu lieu même si l'utilisateur a
+/// depuis refermé l'écran concerné (#2154).
+static ZONE_SETTINGS_IGNORED: AtomicU64 = AtomicU64::new(0);
+
+/// Instantané exposé par les diagnostics du serveur.
+pub fn zone_settings_ignored() -> u64 {
+    ZONE_SETTINGS_IGNORED.load(Ordering::Relaxed)
+}
+
+fn missing_column(error: &str) -> bool {
+    error.contains("no such column") || error.contains("does not exist")
+}
+
+/// Rend visible une écriture que l'ancien code transformait en faux succès.
+///
+/// La base reste utilisable et le serveur continue de tourner, mais l'appelant
+/// reçoit une erreur : une route HTTP ne peut donc plus répondre « enregistré »
+/// quand la valeur n'a jamais atteint le disque. Les écritures internes
+/// best-effort (identité réseau) utilisent aussi cette fonction pour le journal
+/// et le compteur, puis choisissent explicitement de poursuivre.
+fn setting_not_persisted(id: i64, setting: &'static str, error: &str) -> String {
+    let count = ZONE_SETTINGS_IGNORED.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        zone_id = id,
+        setting,
+        error = %error,
+        zone_settings_ignored = count,
+        "zone_setting_not_persisted"
+    );
+    format!("réglage de zone « {setting} » non enregistré : colonne absente du schéma ({error})")
+}
+
+fn visible_setting_write(
+    id: i64,
+    setting: &'static str,
+    result: Result<usize, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if missing_column(&error) => Err(setting_not_persisted(id, setting, &error)),
+        Err(error) => Err(error),
+    }
+}
 
 /// Engine-agnostic SQL builders for zone_repo.
 pub mod sql {
@@ -321,7 +368,17 @@ pub struct Zone {
     pub name: String,
     pub output_type: Option<String>,
     pub output_device_id: Option<String>,
-    pub volume: i32,
+    /// Volume persiste, en POUR-CENT (0..100), a virgule.
+    ///
+    /// #2886 — c'etait un `i32`, et la colonne un `INTEGER`. L'ecriture
+    /// arrondissait `(v * 100).round()`, ce qui coute jusqu'a 3 dB vers
+    /// -37 dB et, **sous 0,005 lineaire (= -46,0205999133 dB exactement)**,
+    /// tombait a 0 : la zone se rallumait MUETTE au redemarrage. La valeur
+    /// commandee est desormais persistee telle quelle.
+    ///
+    /// L'echelle reste 0..100 et non 0..1 : ainsi aucune ligne existante n'a
+    /// besoin d'etre convertie, seul le TYPE de la colonne s'elargit.
+    pub volume: f64,
     pub muted: bool,
     pub online: bool,
     pub gapless_enabled: bool,
@@ -334,6 +391,78 @@ pub struct Zone {
     pub max_sample_rate: Option<u32>,
     pub fixed_volume: bool,
     pub autoplay_enabled: bool,
+}
+
+/// Ce qui se passe quand la file de lecture d'une zone se vide (#2271).
+///
+/// Remplace le booleen `autoplay_enabled`, qui ne savait dire que « oui » ou
+/// « non » alors que la demande d'origine portait sur le CHOIX de la source de
+/// continuation.
+///
+/// **Deux valeurs seulement, et c'est volontaire.** Le socle pose le
+/// mecanisme ; il n'invente aucun mode. Les sources evoquees dans l'issue
+/// (album aleatoire, artiste aleatoire, annee aleatoire, morceaux aleatoires,
+/// radio, favoris, playlist) n'ont a ce jour **aucun comportement attendu
+/// defini** — ni combien de titres, ni dans quel perimetre, ni s'il faut
+/// reapprovisionner quand la file se revide. Les ajouter ici reviendrait a
+/// trancher un arbitrage produit a la place de qui de droit. Chaque mode
+/// nouveau se resume desormais a : definir son comportement, ajouter une
+/// variante, ajouter un bras de `match` dans le bloc « queue ended » du
+/// poller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoplayMode {
+    /// La lecture s'arrete en fin de file. Defaut historique et actuel.
+    #[default]
+    Off,
+    /// Radio d'artistes similaires — **exactement** ce que fait Tune
+    /// aujourd'hui quand `autoplay_enabled` vaut vrai, cascade de replis
+    /// comprise (radio depuis l'historique si aucune graine, radio du service
+    /// de streaming si l'ecoute en cours en vient, generateur genre/BPM
+    /// local, puis repli streaming).
+    Similar,
+}
+
+impl AutoplayMode {
+    /// Le nom du mode dans l'API et dans l'interface.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AutoplayMode::Off => "off",
+            AutoplayMode::Similar => "similar",
+        }
+    }
+
+    /// L'encodage RANGE EN BASE, qui n'est pas le nom d'API.
+    ///
+    /// Les deux modes d'aujourd'hui recouvrent exactement l'ancien booleen :
+    /// on les ecrit donc `"0"` et `"1"`, tels quels. Une version anterieure de
+    /// Tune, qui lit la colonne avec `as_i64()`, continue de comprendre le
+    /// reglage — une bascule vers `similar` puis un retour a une version plus
+    /// ancienne ne perd pas l'autoplay. Un mode reellement nouveau s'ecrira
+    /// sous son nom, et sera alors vu comme « eteint » par les versions qui ne
+    /// le connaissent pas : inevitable, mais reserve aux modes qui n'existent
+    /// pas encore.
+    pub fn as_stocke(&self) -> &'static str {
+        match self {
+            AutoplayMode::Off => "0",
+            AutoplayMode::Similar => "1",
+        }
+    }
+
+    /// Lecture STRICTE, pour valider ce qui arrive par l'API.
+    ///
+    /// `None` = mode inconnu, que la route doit refuser au lieu de le ranger
+    /// en base. C'est le contraire de [`ZoneRepo::get_autoplay_mode`], qui
+    /// doit composer avec ce qui est deja ecrit.
+    pub fn from_str_stocke(s: &str) -> Option<Self> {
+        match s.trim() {
+            "off" | "0" => Some(AutoplayMode::Off),
+            "similar" | "1" => Some(AutoplayMode::Similar),
+            _ => None,
+        }
+    }
+
+    /// Les noms acceptes par `PATCH /zones/{id}`, pour le message de refus.
+    pub const NOMS: [&'static str; 2] = ["off", "similar"];
 }
 
 /// La charge utile `zone` d'une zone qui vient de naitre, dans le contrat que
@@ -372,8 +501,17 @@ pub fn zone_creee_contrat_client(
         // Le TYPE et non la chaine « off » : un renommage de variante suit ici
         // tout seul.
         obj.insert("repeat".into(), json!(crate::playback::RepeatMode::Off));
-        let vol = zone.map(|z| z.volume).unwrap_or(50);
-        obj.insert("volume".into(), json!(vol as f64 / 100.0));
+        let vol = zone.map(|z| z.volume).unwrap_or(50.0);
+        let lineaire = vol / 100.0;
+        obj.insert("volume".into(), json!(lineaire));
+        // #1274 — la lecture en dB accompagne le volume PARTOUT où il sort,
+        // ici comprise : ce contrat-ci est celui d'une zone qui vient de
+        // naitre, et un client qui affiche des dB ne doit pas avoir a
+        // attendre le premier refetch pour en avoir un. `null` = silence.
+        obj.insert(
+            "volume_db".into(),
+            json!(crate::audio::volume_scale::linear_to_db(lineaire)),
+        );
     }
     v
 }
@@ -738,7 +876,8 @@ impl ZoneRepo {
         Ok(())
     }
 
-    pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
+    /// Ecrit le volume en pour-cent (0..100), **sans arrondi** (#2886).
+    pub fn update_volume(&self, id: i64, volume: f64) -> Result<(), String> {
         let sql = self.update_field_sql("volume");
         let params: [&dyn ToSqlValue; 2] = [&volume, &id];
         self.db.execute(&sql, &params)?;
@@ -802,17 +941,7 @@ impl ZoneRepo {
         let val: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("autoplay_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
-        // Column may not exist on pre-v36 databases (Windows migration
-        // failure).  Swallow the error — the feature degrades gracefully
-        // to always-enabled.
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "autoplay_enabled_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "autoplay_enabled", self.db.execute(&sql, &params))
     }
 
     pub fn is_device_hidden(&self, device_id: &str) -> bool {
@@ -864,9 +993,22 @@ impl ZoneRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
     }
 
-    /// Safely read autoplay_enabled for a zone.  Returns false (the default)
-    /// if the column doesn't exist (pre-v36 database).
-    pub fn get_autoplay_enabled(&self, id: i64) -> bool {
+    /// Le mode de continuation de la zone quand la file se vide (#2271).
+    ///
+    /// Lecture TOLERANTE, par opposition a
+    /// [`AutoplayMode::from_str_stocke`] qui valide une entree d'API :
+    ///
+    /// - colonne absente (base pre-v36) ou NULL → `Off`, l'ancien defaut ;
+    /// - entier `0`, ou texte `"0"` / `"off"` → `Off` ;
+    /// - entier non nul, ou texte `"1"` / `"similar"` → `Similar` ;
+    /// - **tout autre texte → `Similar`**, jamais `Off`.
+    ///
+    /// Ce dernier point est deliberé. Un serveur plus recent peut avoir ecrit
+    /// un mode que cette version ne connait pas ; retomber sur `Off`
+    /// COUPERAIT la musique, ce qui est exactement l'inverse de la demande
+    /// d'origine (« n'arretez pas la musique »). On enchaine avec la
+    /// strategie livree plutot que de se taire.
+    pub fn get_autoplay_mode(&self, id: i64) -> AutoplayMode {
         let placeholder = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
@@ -874,13 +1016,58 @@ impl ZoneRepo {
         let sql =
             format!("SELECT COALESCE(autoplay_enabled, 0) FROM zones WHERE id = {placeholder}");
         let params: [&dyn ToSqlValue; 1] = [&id];
-        self.db
+        let Some(val) = self
+            .db
             .query_one(&sql, &params)
             .ok()
             .flatten()
-            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
-            .map(|v| v != 0)
-            .unwrap_or(false)
+            .and_then(|cols| cols.first().cloned())
+        else {
+            return AutoplayMode::Off;
+        };
+        if val.is_null() {
+            return AutoplayMode::Off;
+        }
+        // PostgreSQL declare la colonne TEXT : `'0'` / `'1'` y arrivent en
+        // texte. SQLite, par affinite INTEGER, convertit ces memes chaines en
+        // entiers et ne garde en TEXT que les noms de mode. Les deux moteurs
+        // passent donc par ici avec des variantes differentes pour la MEME
+        // valeur logique.
+        if let Some(s) = val.as_str() {
+            return match s.trim() {
+                "0" | "off" => AutoplayMode::Off,
+                _ => AutoplayMode::Similar,
+            };
+        }
+        match val.as_i64() {
+            Some(0) | None => AutoplayMode::Off,
+            Some(_) => AutoplayMode::Similar,
+        }
+    }
+
+    /// Ecrit le mode de continuation d'une zone (#2271).
+    ///
+    /// **Aucune migration n'est consommee** : la valeur va dans la colonne
+    /// `zones.autoplay_enabled` qui existe deja. Voir
+    /// [`AutoplayMode::as_stocke`] pour l'encodage, choisi pour rester
+    /// relisible par une version anterieure de Tune.
+    pub fn update_autoplay_mode(&self, id: i64, mode: AutoplayMode) -> Result<(), String> {
+        let sql = self.update_field_sql("autoplay_enabled");
+        let val = mode.as_stocke().to_string();
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        visible_setting_write(id, "autoplay_mode", self.db.execute(&sql, &params))
+    }
+
+    /// Safely read autoplay_enabled for a zone.  Returns false (the default)
+    /// if the column doesn't exist (pre-v36 database).
+    ///
+    /// #2271 — POINT DE COMPATIBILITE. Le poller interroge toujours ce
+    /// booleen dans son bloc « queue ended » (`poller.rs`) ; il n'a pas a
+    /// connaitre les modes tant qu'il n'en existe qu'un seul de reellement
+    /// enchainable. « L'autoplay est actif » se lit desormais « le mode n'est
+    /// pas `off` », ce qui reste vrai quel que soit le mode ajoute plus tard.
+    pub fn get_autoplay_enabled(&self, id: i64) -> bool {
+        self.get_autoplay_mode(id) != AutoplayMode::Off
     }
 
     pub fn get_dsd_mode(&self, id: i64) -> String {
@@ -901,14 +1088,7 @@ impl ZoneRepo {
     pub fn update_dsd_mode(&self, id: i64, mode: &str) -> Result<(), String> {
         let sql = self.update_field_sql("dsd_mode");
         let params: [&dyn ToSqlValue; 2] = [&mode.to_string(), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dsd_mode_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dsd_mode", self.db.execute(&sql, &params))
     }
 
     /// Whether this zone forces native FLAC to a DLNA renderer even when the
@@ -933,14 +1113,7 @@ impl ZoneRepo {
     pub fn update_dlna_native_flac(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_native_flac");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_native_flac_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_native_flac", self.db.execute(&sql, &params))
     }
 
     /// Whether this zone serves ALAC straight to the renderer (bit-perfect, no
@@ -965,14 +1138,7 @@ impl ZoneRepo {
     pub fn update_alac_passthrough(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("alac_passthrough");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "alac_passthrough_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "alac_passthrough", self.db.execute(&sql, &params))
     }
 
     /// Servir l'AAC tel quel au renderer, au lieu de le transcoder (#1424).
@@ -997,14 +1163,7 @@ impl ZoneRepo {
     pub fn update_aac_passthrough(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("aac_passthrough");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "aac_passthrough_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "aac_passthrough", self.db.execute(&sql, &params))
     }
 
     /// Whether to transcode lossless to WAV/LPCM (not FLAC) for this DLNA zone.
@@ -1027,14 +1186,7 @@ impl ZoneRepo {
     pub fn update_dlna_lpcm(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_lpcm");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_lpcm_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_lpcm", self.db.execute(&sql, &params))
     }
 
     /// Whether to cap this DLNA zone's output to 16-bit. For renderers that
@@ -1072,14 +1224,7 @@ impl ZoneRepo {
     pub fn update_lyrics_offset_ms(&self, id: i64, offset_ms: i32) -> Result<(), String> {
         let sql = self.update_field_sql("lyrics_offset_ms");
         let params: [&dyn ToSqlValue; 2] = [&(offset_ms as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "lyrics_offset_ms_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "lyrics_offset_ms", self.db.execute(&sql, &params))
     }
 
     pub fn get_dlna_cap_16bit(&self, id: i64) -> bool {
@@ -1101,14 +1246,7 @@ impl ZoneRepo {
     pub fn update_dlna_cap_16bit(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_cap_16bit");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_cap_16bit_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_cap_16bit", self.db.execute(&sql, &params))
     }
 
     /// Whether to serve genuine 24-bit WAV to this DLNA zone. Opt-in, only
@@ -1133,14 +1271,7 @@ impl ZoneRepo {
     pub fn update_dlna_wav24(&self, id: i64, enabled: bool) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_wav24");
         let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_wav24_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_wav24", self.db.execute(&sql, &params))
     }
 
     /// Per-zone SetAVTransportURI→Play delay in ms (0 = use the config default).
@@ -1164,25 +1295,19 @@ impl ZoneRepo {
     pub fn update_dlna_play_delay_ms(&self, id: i64, delay_ms: u64) -> Result<(), String> {
         let sql = self.update_field_sql("dlna_play_delay_ms");
         let params: [&dyn ToSqlValue; 2] = [&(delay_ms as i64), &id];
-        match self.db.execute(&sql, &params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "dlna_play_delay_ms_column_missing_ignoring_update");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        visible_setting_write(id, "dlna_play_delay_ms", self.db.execute(&sql, &params))
     }
 
     /// Persist the renderer's host (IP) on the zone, for host-based dedup.
-    /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
+    /// Best-effort on a pre-migration DB, but never silent: the omission is
+    /// journalised and counted for the diagnostic report (#2154).
     pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {
         let sql = self.update_field_sql("host");
         let params: [&dyn ToSqlValue; 2] = [&host, &id];
         match self.db.execute(&sql, &params) {
             Ok(_) => Ok(()),
-            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                tracing::debug!(id, error = %e, "zone_host_column_missing_ignoring_update");
+            Err(e) if missing_column(&e) => {
+                let _ = setting_not_persisted(id, "host", &e);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1201,8 +1326,8 @@ impl ZoneRepo {
             let params: [&dyn ToSqlValue; 2] = [&mac, &id];
             match self.db.execute(&sql, &params) {
                 Ok(_) => {}
-                Err(e) if e.contains("no such column") || e.contains("does not exist") => {
-                    tracing::debug!(id, error = %e, "zone_mac_column_missing_ignoring_update");
+                Err(e) if missing_column(&e) => {
+                    let _ = setting_not_persisted(id, "mac", &e);
                 }
                 Err(e) => return Err(e),
             }
@@ -1318,6 +1443,41 @@ impl ZoneRepo {
             .ok()?
             .first()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+    }
+
+    /// Zones réseau (DLNA/OpenHome) MASQUÉES à cet hôte — les suppressions
+    /// encore actives de l'utilisateur. Garde-fou #1281 : un appareil qui
+    /// s'annonce sous plusieurs identités SSDP (DLNA + OpenHome, double UUID —
+    /// buchardt A700) ne doit pas ressusciter, via son identité jumelle, la
+    /// zone qui vient d'être supprimée. `is_device_hidden` ne voit que
+    /// l'identité exacte ; ici on retrouve la suppression par l'hôte, et
+    /// l'appelant exige en plus une correspondance de NOM (une IP seule
+    /// n'identifie rien — leçon du ré-ancrage #1651).
+    pub fn hidden_zones_by_host(&self, host: &str) -> Vec<(i64, String)> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, name FROM zones WHERE host = {placeholder} \
+             AND output_type IN ('dlna', 'openhome') \
+             AND COALESCE(is_hidden, 0) = 1 ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&host];
+        // Strong read: la suppression vient parfois d'arriver dans la même
+        // session (même motif que zone_id_by_host).
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|cols| {
+                    let id = cols.first().and_then(|v| v.as_i64())?;
+                    let name = cols.get(1).and_then(|v| v.as_string())?;
+                    Some((id, name))
+                })
+                .collect(),
+            // Colonne `host` absente (base pré-migration) : pas de garde-fou.
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
@@ -1521,7 +1681,9 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         output_type: cols.get(2).and_then(|v| v.as_string()),
         output_device_id: cols.get(3).and_then(|v| v.as_string()),
-        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(20) as i32,
+        // `as_f64` accepte Int, Real ET Text : les trois formes que les deux
+        // moteurs peuvent rendre pour cette colonne (#2886).
+        volume: cols.get(4).and_then(|v| v.as_f64()).unwrap_or(20.0),
         muted: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
         online: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
         gapless_enabled: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
@@ -1567,13 +1729,13 @@ mod tests {
             .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
 
-        repo.update_volume(id, 75).unwrap();
+        repo.update_volume(id, 75.0).unwrap();
         repo.update_muted(id, true).unwrap();
         let updated = repo.get(id).unwrap().unwrap();
-        assert_eq!(updated.volume, 75);
+        assert_eq!(updated.volume, 75.0);
         assert!(updated.muted);
 
         // delete is a soft-delete (is_hidden=1): the row is kept for later
@@ -1993,7 +2155,7 @@ mod tests {
 
         let id = repo.create("Default Zone", None, None).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 50.0);
         assert!(!zone.muted);
         assert!(zone.online);
         assert!(zone.output_type.is_none());
@@ -2022,11 +2184,154 @@ mod tests {
 
         let id = repo.create("Zone", None, None).unwrap();
 
-        repo.update_volume(id, 0).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0);
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
 
-        repo.update_volume(id, 100).unwrap();
-        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100);
+        repo.update_volume(id, 100.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100.0);
+    }
+
+    /// #2886 — le SEUIL, mesure et non estime.
+    ///
+    /// L'ecriture d'avant etait `update_volume(id, (v * 100.0).round() as i32)`.
+    /// `f64::round` arrondit a l'oppose de zero, donc l'entier vaut 0 pour tout
+    /// `v` **strictement inferieur a 0,005** — et 0,005 lineaire, c'est
+    /// `20*log10(0,005) = -46,0205999133 dB` **exactement**. « Environ -46 dB »
+    /// de l'enonce n'est pas une approximation de mesure : c'est ce nombre-la.
+    ///
+    /// Ce test ne touche pas la base : il cloue l'arithmetique qui a servi a
+    /// identifier la conversion fautive, pour que le chiffre ne se perde pas.
+    #[test]
+    fn le_seuil_du_silence_vaut_moins_quarante_six_virgule_zero_deux_db() {
+        const SEUIL_LINEAIRE: f64 = 0.005;
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * SEUIL_LINEAIRE.log10() - SEUIL_DB).abs() < 1e-12,
+            "0,005 lineaire vaut {} dB",
+            20.0 * SEUIL_LINEAIRE.log10()
+        );
+
+        // L'ecriture d'AVANT, reproduite ici pour montrer ou elle bascule.
+        let ecriture_d_avant = |v: f64| (v.clamp(0.0, 1.0) * 100.0).round() as i32;
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE),
+            1,
+            "au seuil : encore audible"
+        );
+        assert_eq!(
+            ecriture_d_avant(SEUIL_LINEAIRE - f64::EPSILON),
+            0,
+            "un ulp sous le seuil : MUET"
+        );
+        // -48 dB, le reglage plausible cite par l'issue.
+        assert_eq!(ecriture_d_avant(10f64.powf(-48.0 / 20.0)), 0);
+    }
+
+    /// #2886 — le couple ECRITURE / RELECTURE, sur toute la plage utile.
+    ///
+    /// C'est le test qui rougit contre le code d'avant : `update_volume`
+    /// arrondissait au pour-cent entier, donc tout reglage qui n'etait pas un
+    /// multiple exact de 1 % revenait ailleurs apres redemarrage. Il rougit
+    /// des -0,25 dB, et il rougit en SILENCE (0) sous -46,0205999133 dB.
+    #[test]
+    fn le_volume_persiste_se_relit_a_l_identique_de_zero_a_moins_quatre_vingts_db() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for n in 0..=320 {
+            let cible_db = -f64::from(n) / 4.0; // 0 → -80 dB par pas de 0,25
+            let lineaire = 10f64.powf(cible_db / 20.0);
+
+            repo.update_volume(id, lineaire * 100.0).unwrap();
+            let relu = repo.get(id).unwrap().unwrap().volume / 100.0;
+
+            assert!(
+                (relu - lineaire).abs() <= 1e-12 * lineaire.max(1e-9),
+                "{cible_db} dB : ecrit {lineaire}, relu {relu} — la persistance a bouge le niveau"
+            );
+            // Et surtout : ce qui etait audible le reste.
+            assert!(
+                relu > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (relu {relu})"
+            );
+        }
+
+        // Le zero commande reste du zero : on ne rallume personne.
+        repo.update_volume(id, 0.0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0.0);
+    }
+
+    /// #2886 — les volumes USUELS ne bougent pas d'un iota.
+    ///
+    /// Temoin anti-regression : un correctif sur le volume touche le niveau
+    /// sonore reel. Chacun de ces reglages est un multiple exact de 1 %, donc
+    /// l'ancien code les rendait deja parfaitement — ils doivent sortir
+    /// EXACTEMENT pareil apres le passage a la virgule.
+    #[test]
+    fn les_volumes_usuels_ne_bougent_pas_d_un_iota() {
+        let repo = ZoneRepo::new(test_db());
+        let id = repo.create("Zone", None, None).unwrap();
+
+        for pour_cent in [
+            0, 1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 99, 100,
+        ] {
+            let pour_cent = f64::from(pour_cent);
+            repo.update_volume(id, pour_cent).unwrap();
+            let relu = repo.get(id).unwrap().unwrap();
+            assert_eq!(
+                relu.volume, pour_cent,
+                "{pour_cent} % : la colonne doit rendre le meme nombre qu'avant"
+            );
+            // Et le lineaire que la lecture en tire est celui d'avant, au bit pres.
+            assert_eq!(relu.volume / 100.0, pour_cent / 100.0);
+        }
+    }
+
+    /// #2886 — pourquoi il n'y a PAS de migration SQLite.
+    ///
+    /// SQLite est a typage dynamique : l'affinite INTEGER ne convertit une
+    /// decimale en entier que si la conversion est SANS PERTE. Une base creee
+    /// avant ce correctif, dont la colonne est encore declaree `INTEGER`,
+    /// stocke donc 0,4 tel quel. Seul PostgreSQL, qui type reellement ses
+    /// colonnes, exige la migration 048.
+    ///
+    /// Ce test le PROUVE sur une table declaree a l'ancienne au lieu de le
+    /// supposer : si un jour SQLite changeait d'avis, il rougirait ici plutot
+    /// que chez un utilisateur.
+    #[test]
+    fn un_volume_fractionnaire_survit_a_une_colonne_declaree_integer() {
+        let backend: Arc<dyn DbBackend> = Arc::new(SqliteDb::open_in_memory().unwrap());
+        backend
+            .execute(
+                "CREATE TABLE zones_ancienne (id INTEGER PRIMARY KEY, volume INTEGER DEFAULT 50)",
+                &[],
+            )
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO zones_ancienne (id, volume) VALUES (1, 50)",
+                &[],
+            )
+            .unwrap();
+
+        let vol: f64 = 0.398_107_170_553_497_2 * 100.0; // -8 dB
+        backend
+            .execute(
+                "UPDATE zones_ancienne SET volume = ? WHERE id = 1",
+                &[&vol as &dyn ToSqlValue],
+            )
+            .unwrap();
+
+        let relu = backend
+            .query_one("SELECT volume FROM zones_ancienne WHERE id = 1", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (relu - vol).abs() < 1e-12,
+            "SQLite a rabote {vol} en {relu} — il FAUDRAIT alors une migration SQLite"
+        );
     }
 
     #[test]
@@ -2230,7 +2535,7 @@ mod tests {
             .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
             .unwrap();
         assert!(created);
-        repo.update_volume(id1, 75).unwrap();
+        repo.update_volume(id1, 75.0).unwrap();
 
         // Soft-delete the zone
         repo.delete(id1).unwrap();
@@ -2406,5 +2711,261 @@ mod fusion_doublons_tests {
 
         assert!(repo.get_dlna_lpcm(seule));
         assert_eq!(repo.count().unwrap(), 1);
+    }
+}
+
+/// #2271 — le mode de continuation remplace le booleen, SANS migration.
+///
+/// La colonne `zones.autoplay_enabled` existe deja : `INTEGER DEFAULT 0` en
+/// SQLite, `TEXT DEFAULT '0'` en PostgreSQL. L'affinite SQLite range une
+/// chaine non numerique telle quelle (`typeof('similar') = 'text'`) tout en
+/// convertissant `'1'`/`'0'` en entiers — la meme colonne porte donc l'ancien
+/// booleen ET le nouveau mode. Aucun numero de migration n'est consomme.
+#[cfg(test)]
+mod autoplay_mode_tests {
+    use super::*;
+
+    fn repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        ZoneRepo::new(db)
+    }
+
+    fn zone(repo: &ZoneRepo) -> i64 {
+        repo.create("Salon", Some("dlna"), Some("uuid:salon"))
+            .unwrap()
+    }
+
+    /// Defaut inchange : une zone neuve n'enchaine rien.
+    #[test]
+    fn zone_neuve_est_eteinte() {
+        let repo = repo();
+        let id = zone(&repo);
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
+        assert!(!repo.get_autoplay_enabled(id));
+    }
+
+    /// LE TEST DE NON-REGRESSION. Une zone dont l'autoplay etait actif avant
+    /// #2271 (booleen ecrit en base par `update_autoplay_enabled`) doit
+    /// continuer a se comporter EXACTEMENT comme avant : le poller lit
+    /// `get_autoplay_enabled` et doit toujours y voir `true`, et le mode
+    /// resolu doit etre la strategie d'aujourd'hui — la radio d'artistes
+    /// similaires.
+    #[test]
+    fn heritage_booleen_actif_se_comporte_comme_avant() {
+        let repo = repo();
+        let id = zone(&repo);
+
+        repo.update_autoplay_enabled(id, true).unwrap();
+
+        assert_eq!(
+            repo.get_autoplay_mode(id),
+            AutoplayMode::Similar,
+            "un `1` en base est la strategie livree : radio d'artistes similaires"
+        );
+        assert!(
+            repo.get_autoplay_enabled(id),
+            "REGRESSION : la zone jouait toute seule, elle doit continuer"
+        );
+    }
+
+    /// Le pendant : un `0` herite reste eteint.
+    #[test]
+    fn heritage_booleen_eteint_reste_eteint() {
+        let repo = repo();
+        let id = zone(&repo);
+        repo.update_autoplay_enabled(id, true).unwrap();
+        repo.update_autoplay_enabled(id, false).unwrap();
+
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
+        assert!(!repo.get_autoplay_enabled(id));
+    }
+
+    /// Le mode ecrit par la nouvelle voie est relu tel quel, et le pont de
+    /// compatibilite que lit le poller le voit actif.
+    #[test]
+    fn mode_similar_est_actif() {
+        let repo = repo();
+        let id = zone(&repo);
+
+        repo.update_autoplay_mode(id, AutoplayMode::Similar)
+            .unwrap();
+
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        assert!(
+            repo.get_autoplay_enabled(id),
+            "le poller lit encore le booleen : il doit voir le mode actif"
+        );
+    }
+
+    /// L'ECRITURE reste celle de l'ancien booleen. Une version anterieure de
+    /// Tune lit cette colonne avec `as_i64()` : si on ecrivait `"similar"` en
+    /// toutes lettres, un retour arriere de version eteindrait l'autoplay en
+    /// silence. Ce test verrouille l'encodage, pas seulement l'aller-retour.
+    #[test]
+    fn les_deux_modes_restent_encodes_comme_l_ancien_booleen() {
+        assert_eq!(AutoplayMode::Off.as_stocke(), "0");
+        assert_eq!(AutoplayMode::Similar.as_stocke(), "1");
+
+        let repo = repo();
+        let id = zone(&repo);
+        repo.update_autoplay_mode(id, AutoplayMode::Similar)
+            .unwrap();
+
+        // Relu comme l'ancien code le relisait : par `as_i64()`.
+        let sql = "SELECT autoplay_enabled FROM zones WHERE id = ?1";
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let brut = repo
+            .db
+            .query_one(sql, &params)
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_i64());
+        assert_eq!(
+            brut,
+            Some(1),
+            "une version anterieure doit encore y voir un autoplay actif"
+        );
+    }
+
+    #[test]
+    fn mode_off_est_eteint() {
+        let repo = repo();
+        let id = zone(&repo);
+        repo.update_autoplay_mode(id, AutoplayMode::Similar)
+            .unwrap();
+        repo.update_autoplay_mode(id, AutoplayMode::Off).unwrap();
+
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
+        assert!(!repo.get_autoplay_enabled(id));
+    }
+
+    /// Aller-retour texte : ce que l'API accepte est ce que la base rend.
+    #[test]
+    fn aller_retour_des_noms_de_mode() {
+        assert_eq!(
+            AutoplayMode::from_str_stocke("off"),
+            Some(AutoplayMode::Off)
+        );
+        assert_eq!(
+            AutoplayMode::from_str_stocke("similar"),
+            Some(AutoplayMode::Similar)
+        );
+        assert_eq!(AutoplayMode::Off.as_str(), "off");
+        assert_eq!(AutoplayMode::Similar.as_str(), "similar");
+        assert_eq!(AutoplayMode::from_str_stocke("random_album"), None);
+    }
+
+    /// Une valeur inconnue en base — un serveur plus recent a ecrit un mode
+    /// que cette version ne connait pas, puis on est redescendu de version —
+    /// ne doit pas COUPER la musique : la demande de Sergio etait « n'arretez
+    /// pas la musique ». On retombe sur la strategie livree, pas sur `off`.
+    #[test]
+    fn valeur_inconnue_ne_coupe_pas_la_musique() {
+        let repo = repo();
+        let id = zone(&repo);
+        let sql = repo.update_field_sql("autoplay_enabled");
+        let val = "random_album".to_string();
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        repo.db.execute(&sql, &params).unwrap();
+
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        assert!(repo.get_autoplay_enabled(id));
+    }
+}
+
+/// #2154 — une écriture impossible ne doit jamais devenir un faux succès.
+#[cfg(test)]
+mod ignored_zone_settings_tests {
+    use super::*;
+
+    /// Schéma volontairement antérieur aux colonnes de réglage. Il représente
+    /// exactement une migration absente, sans dépendre du numéro courant des
+    /// migrations SQLite.
+    fn pre_migration_repo() -> (ZoneRepo, i64) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                output_type TEXT,
+                output_device_id TEXT
+            );",
+        )
+        .unwrap();
+        let repo = ZoneRepo::new(db);
+        let id = repo
+            .create("Ancienne base", Some("dlna"), Some("uuid:ancienne"))
+            .unwrap();
+        (repo, id)
+    }
+
+    #[test]
+    fn les_reglages_utilisateur_refusent_le_faux_succes() {
+        let (repo, id) = pre_migration_repo();
+        let avant = zone_settings_ignored();
+        let resultats = [
+            ("autoplay_enabled", repo.update_autoplay_enabled(id, true)),
+            (
+                "autoplay_mode",
+                repo.update_autoplay_mode(id, AutoplayMode::Similar),
+            ),
+            ("dsd_mode", repo.update_dsd_mode(id, "dop")),
+            ("dlna_native_flac", repo.update_dlna_native_flac(id, true)),
+            ("alac_passthrough", repo.update_alac_passthrough(id, true)),
+            ("aac_passthrough", repo.update_aac_passthrough(id, true)),
+            ("dlna_lpcm", repo.update_dlna_lpcm(id, true)),
+            ("lyrics_offset_ms", repo.update_lyrics_offset_ms(id, 250)),
+            ("dlna_cap_16bit", repo.update_dlna_cap_16bit(id, true)),
+            ("dlna_wav24", repo.update_dlna_wav24(id, true)),
+            (
+                "dlna_play_delay_ms",
+                repo.update_dlna_play_delay_ms(id, 800),
+            ),
+        ];
+
+        for (reglage, resultat) in &resultats {
+            let erreur = resultat
+                .as_ref()
+                .expect_err("une colonne absente ne peut pas répondre succès");
+            assert!(erreur.contains(reglage), "{reglage}: {erreur}");
+            assert!(erreur.contains("non enregistré"), "{reglage}: {erreur}");
+        }
+        assert!(
+            zone_settings_ignored() >= avant + resultats.len() as u64,
+            "chaque omission doit apparaître dans le compteur de diagnostic"
+        );
+    }
+
+    #[test]
+    fn les_deux_messages_de_moteur_sont_reconnus() {
+        assert!(missing_column("execute: no such column: zones.dlna_wav24"));
+        assert!(missing_column(
+            "db error: column \"dlna_wav24\" does not exist"
+        ));
+        assert!(!missing_column("database is locked"));
+
+        let erreur = visible_setting_write(
+            7,
+            "dlna_wav24",
+            Err("db error: column \"dlna_wav24\" does not exist".into()),
+        )
+        .expect_err("PostgreSQL ne doit pas transformer l'absence en succès");
+        assert!(erreur.contains("dlna_wav24"), "{erreur}");
+    }
+
+    #[test]
+    fn l_identite_interne_reste_best_effort_mais_devient_visible() {
+        let (repo, id) = pre_migration_repo();
+        let avant = zone_settings_ignored();
+
+        repo.set_identity(id, "192.0.2.10", Some("00:11:22:33:44:55"))
+            .expect("une ancienne base ne doit pas casser la découverte");
+
+        assert!(
+            zone_settings_ignored() >= avant + 2,
+            "host et mac absents doivent être comptés"
+        );
     }
 }

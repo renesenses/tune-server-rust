@@ -50,7 +50,7 @@ symphonia = { workspace = true }
 # SPIKE (#1145): pure-Rust Monkey's Audio (.ape) decoder, MIT/Apache-2.0.
 # Evaluated as a replacement for the "not supported" fallback. Not production.
 ape-decoder = "0.3.2"
-audiopus = { workspace = true }
+opus = { workspace = true }
 rubato = { workspace = true }
 unicode-normalization = { workspace = true }
 oaat-core = { workspace = true, optional = true }
@@ -119,6 +119,38 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
 
+# `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
+# tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
+# que tune_core, déjà construit (#2213).
+[[test]]
+name = "terminologie_eq"
+path = "tests/terminologie_eq.rs"
+
+# Binaire de test a lui seul, DELIBEREMENT (#2665). `tracing` met en cache pour
+# tout le processus la decision « ce point d appel interesse-t-il quelqu un ? »
+# et le niveau maximal utile ; un abonne pose le temps d un await, dans un
+# binaire qui en cree des dizaines en parallele, se voit priver d evenements de
+# facon imprevisible — capture vide 1 execution sur 6 de la suite du crate,
+# quand le meme test seul passait 8 fois sur 8. Ici l abonne est GLOBAL et ce
+# fichier ne contient qu un test : plus aucun ordonnancement n entre en jeu.
+[[test]]
+name = "journal_descriptif_illisible"
+path = "tests/journal_descriptif_illisible.rs"
+
+# Meme famille, meme raison (#2890) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il tient les deux bords du journal d insertion par lot — le lot
+# nominal est muet au niveau livre, l echec d insertion reste dit.
+[[test]]
+name = "journal_insertion_par_lot"
+path = "tests/journal_insertion_par_lot.rs"
+
+# Meme famille, meme raison (#2566) : abonne `tracing` GLOBAL, donc un binaire
+# a lui seul. Il compte les lignes qu une panne de sondage coute au journal —
+# 79 avant, 9 apres — sans toucher au reseau ni au recul exponentiel.
+[[test]]
+name = "journal_sondage_repos"
+path = "tests/journal_sondage_repos.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
@@ -150,4 +182,5 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Power",
 ] }

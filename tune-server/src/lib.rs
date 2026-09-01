@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+/// L'adresse de première connexion, imprimée au démarrage (#1272).
+mod adresse_d_accueil;
 pub mod auth;
 pub mod auto_resume;
 pub mod auto_scan;
@@ -28,8 +30,11 @@ pub mod scan_import;
 /// L'echelle de dialectes CIFS, partagee par la route de montage et par le
 /// remontage au demarrage. Voir [`smb`] pour ce que leur divergence coutait.
 pub mod smb;
+mod sqlite_write_gate;
 pub mod startup;
 pub mod state;
+#[cfg(target_os = "linux")]
+mod tune_os_password;
 pub mod windows_migrate;
 
 /// The whole server startup, so out-of-tree binaries can compose it with their

@@ -18,6 +18,9 @@ use tracing::{info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::track_metadata_repo::TrackMetadataRepo;
+use crate::library::local_path::{
+    LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
+};
 
 /// Tracks embedded per batch before yielding, mirroring the ReplayGain sweep.
 const TRACK_BATCH: usize = 32;
@@ -109,6 +112,16 @@ fn per_file_pause_ms(settings: &crate::db::settings_repo::SettingsRepo) -> u64 {
 /// it and the track is re-swept (see the candidate query below).
 const SENTINEL: &str = "audio_embed_analyzed";
 
+/// Témoin de REPORT — le pendant de `rg_path_unresolved` pour cette passe.
+///
+/// [`SENTINEL`] veut dire « analysée sous ce modèle ». Il était posé même quand
+/// le fichier n'avait jamais pu être ouvert : sur .18, 44 pistes le portaient
+/// pour **zéro** vecteur en base. Cette clé-ci dit « aucune graphie ne
+/// répondait à telle date », écarte la piste du balayage pour qu'il avance, et
+/// périme au bout de [`crate::library::local_path::PATH_RETRY_AFTER_SECS`]
+/// (#1865).
+const PATH_UNRESOLVED_KEY: &str = "audio_embed_path_unresolved";
+
 /// Pourquoi le décodage n'a pas rendu d'échantillons.
 ///
 /// Le témoin étant posé quoi qu'il arrive, une piste en échec sort du balayage
@@ -135,6 +148,47 @@ impl DecodeFailure {
             Self::Timeout => format!("délai de décodage dépassé ({DECODE_TIMEOUT_SECS} s)"),
             Self::Interrupted(e) => format!("fil de décodage interrompu : {e}"),
             Self::Decode(e) => format!("décodage impossible : {e}"),
+        }
+    }
+}
+
+/// Résultat de la lecture d'une ligne candidate.
+///
+/// La requête garantit normalement un identifiant et un chemin non vide. On
+/// garde néanmoins la distinction : avec un identifiant, une ligne
+/// inexploitable peut être marquée comme traitée ; sans identifiant, aucune
+/// sentinelle ne peut être écrite et l'invariant de base doit être signalé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmbeddingCandidate {
+    Ready { track_id: i64, path: String },
+    MissingPath { track_id: i64 },
+    MissingTrackId,
+}
+
+fn embedding_candidate(row: &[SqlValue]) -> EmbeddingCandidate {
+    let Some(track_id) = row.first().and_then(SqlValue::as_i64) else {
+        return EmbeddingCandidate::MissingTrackId;
+    };
+    match row.get(1).and_then(SqlValue::as_string) {
+        Some(path) if !path.is_empty() => EmbeddingCandidate::Ready { track_id, path },
+        _ => EmbeddingCandidate::MissingPath { track_id },
+    }
+}
+
+fn batch_without_progress(selected: usize, processed: usize, yielded_to_playback: bool) -> bool {
+    selected > 0 && processed == 0 && !yielded_to_playback
+}
+
+fn stamp_embedding_processed(repo: &TrackMetadataRepo, track_id: i64) -> bool {
+    match repo.set(track_id, SENTINEL, MODEL_ID) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                track_id,
+                %error,
+                "audio_embed_sentinel_write_failed"
+            );
+            false
         }
     }
 }
@@ -403,6 +457,17 @@ pub async fn analyze_embedding_batch(
     // holds the MODEL_ID it was stamped under, so a model bump (e.g.
     // clap-audio-2023 → clap-music-2023) makes every track a candidate again and
     // the sweep re-embeds the whole library into the new space, exactly once.
+    //
+    // Le dernier NOT EXISTS écarte les pistes REPORTÉES trop récemment
+    // (#1865) : comparaison en TEXTE sur une estampille rembourrée de zéros,
+    // pas de `CAST(... AS INTEGER)` qui ferait tomber la requête sur
+    // PostgreSQL (`track_metadata.value` est partagée par toutes les clés).
+    let seuil_report = deferral_threshold(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64,
+    );
     let rows = match backend.query_many(
         "SELECT t.id, t.file_path FROM tracks t \
          WHERE t.file_path IS NOT NULL AND t.file_path != '' \
@@ -411,9 +476,13 @@ pub async fn analyze_embedding_batch(
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
                    AND m.value = ?) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
+                   AND m.value > ?) \
          LIMIT ?",
         &[
             &MODEL_ID as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
             &(TRACK_BATCH as i64) as &dyn ToSqlValue,
         ],
     ) {
@@ -434,6 +503,9 @@ pub async fn analyze_embedding_batch(
         .unwrap_or(0) as i64;
 
     let mut done = 0usize;
+    let mut invalid_rows = 0usize;
+    let mut deferred = 0usize;
+    let mut yielded_to_playback = false;
     for r in &rows {
         // Playback can start mid-batch; yield at once so neither the decode
         // nor the inference competes with the audio pipeline (#1515) — the
@@ -443,16 +515,65 @@ pub async fn analyze_embedding_batch(
                 zone = %zone,
                 "audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch"
             );
+            yielded_to_playback = true;
             break;
         }
-        let track_id = match r.first().and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => continue,
+        // Un scan peut démarrer en plein lot — c'est précisément le cas de
+        // Thierry : le balayage tourne, 21 h arrive, le scan programmé part.
+        // Sans cette sortie, le lot en cours continuerait à décoder et à
+        // inférer pendant tout le début du scan (#2469, point 3).
+        if crate::scanner::activite::scan_bibliotheque_en_cours() {
+            info!(
+                "audio_embed_yield_to_library_scan — library scan started, pausing sweep mid-batch"
+            );
+            break;
+        }
+        let (track_id, path) = match embedding_candidate(r) {
+            EmbeddingCandidate::Ready { track_id, path } => (track_id, path),
+            EmbeddingCandidate::MissingPath { track_id } => {
+                invalid_rows += 1;
+                warn!(
+                    track_id,
+                    "audio_embed_candidate_missing_path_marked_processed"
+                );
+                if stamp_embedding_processed(&repo, track_id) {
+                    done += 1;
+                }
+                continue;
+            }
+            EmbeddingCandidate::MissingTrackId => {
+                invalid_rows += 1;
+                warn!(
+                    row = ?r,
+                    "audio_embed_candidate_missing_track_id_unmarkable"
+                );
+                continue;
+            }
         };
-        let path = match r.get(1).and_then(|v| v.as_string()) {
-            Some(p) if !p.is_empty() => p,
-            _ => continue,
+
+        // Le chemin de la base est NFC ; le fichier peut être en NFD sur le
+        // disque (macOS, SMB/CIFS). Résolution AVANT toute décision, et
+        // surtout avant tout témoin (#1865).
+        let sur_disque = match resolve_local_path(&path) {
+            LocalPath::Found(reel) => reel,
+            LocalPath::Missing => {
+                // Introuvable n'est pas indécodable : aucun [`SENTINEL`] ici.
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "audio_embed_path_unresolved — aucune graphie (stockee, NFD, NFC) \
+                     ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(track_id, PATH_UNRESOLVED_KEY, &deferral_stamp(now));
+                // Compté comme progrès : la ligne sort de la prochaine requête.
+                // Sans cela, plus de `TRACK_BATCH` pistes introuvables
+                // bloqueraient la passe entière sur les mêmes lignes.
+                done += 1;
+                continue;
+            }
         };
+        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
 
         // Decode the first 10 s at 48 kHz mono (CLAP's window) off the async
         // runtime; the returned samples carry the source bit depth for scaling.
@@ -460,7 +581,9 @@ pub async fn analyze_embedding_batch(
         // file: on elapse we abandon the await (the blocking thread cannot be
         // cancelled, but one leaked thread is survivable) and move on, stamping
         // the sentinel below so the file is not retried.
-        let p = path.clone();
+        //
+        // `sur_disque` et pas `path` : la graphie que le système a reconnue.
+        let p = sur_disque.clone();
         let decoded = tokio::time::timeout(
             std::time::Duration::from_secs(DECODE_TIMEOUT_SECS),
             tokio::task::spawn_blocking(move || {
@@ -485,6 +608,20 @@ pub async fn analyze_embedding_batch(
         };
         let decoded = match decoded {
             Ok(d) => Some(d),
+            // Le fichier a disparu ENTRE la résolution et le décodage — un
+            // partage qui tombe en cours de passe. Ce n'est pas un fichier
+            // illisible : on reporte au lieu de le figer (#1865).
+            Err(_) if resolve_local_path(&path).is_missing() => {
+                deferred += 1;
+                warn!(
+                    track_id,
+                    path = %path,
+                    "audio_embed_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
+                );
+                let _ = repo.set(track_id, PATH_UNRESOLVED_KEY, &deferral_stamp(now));
+                done += 1;
+                continue;
+            }
             Err(échec) => {
                 warn!(
                     track_id,
@@ -526,8 +663,9 @@ pub async fn analyze_embedding_batch(
         // Stamp the sentinel with the current MODEL_ID whether or not it
         // produced a vector, so a broken or silent file drops out of the sweep
         // (until the next model bump) instead of being retried every pass.
-        let _ = repo.set(track_id, SENTINEL, MODEL_ID);
-        done += 1;
+        if stamp_embedding_processed(&repo, track_id) {
+            done += 1;
+        }
         // Relu à chaque fichier : baisser le débit pendant que l'analyse tourne
         // doit se sentir tout de suite, pas au prochain démarrage du serveur.
         let pause = per_file_pause_ms(&crate::db::settings_repo::SettingsRepo::with_backend(
@@ -538,12 +676,22 @@ pub async fn analyze_embedding_batch(
         }
     }
 
+    if batch_without_progress(rows.len(), done, yielded_to_playback) {
+        warn!(
+            selected = rows.len(),
+            invalid_rows, "audio_embedding_batch_without_progress"
+        );
+    }
+
     // Carry the memory figures on every batch. On 2026-08-10 the sweep's cost
     // had to be reconstructed after the fact from a 5-minute process-wide RSS
     // sampler, which is what let "memory rises while the pass runs" pass for a
     // cause (#1462). Now the pass states its own cost, batch by batch.
     info!(
-        embedded = done,
+        embedded = done - deferred,
+        deferred,
+        selected = rows.len(),
+        invalid_rows,
         rss_mb = process_rss_mb().unwrap_or(0),
         available_mb = available_memory_mb().unwrap_or(0),
         "audio_embedding_batch"
@@ -561,6 +709,18 @@ const THERMAL_RETRY_SECS: u64 = 120;
 /// enough not to spin, short enough that the sweep resumes on its own once
 /// whatever was using the memory (a scan, a transcode) has finished.
 const LOW_MEMORY_RETRY_SECS: u64 = 300;
+/// Délai au-delà duquel la construction de la session ORT est considérée
+/// perdue. Généreux à dessein : bâtir une session depuis un modèle de 287 Mo
+/// prend des secondes, pas des minutes, même sur une machine modeste. Ce
+/// n'est pas un budget de performance, c'est un garde-fou contre un appel qui
+/// ne revient JAMAIS.
+///
+/// Yves Corbat, MacBook Pro M1, nuit du 27 au 28/08/2026 : `audio_runtime_loaded`
+/// à 20:49:12, puis plus une seule ligne acoustique pendant 10 h 30, alors que
+/// le reste du serveur journalisait normalement. Or les quatre issues de ce
+/// bloc journalisent toutes — la passe était donc figée DANS `AudioEmbedder::load`.
+/// L'interface affichait « Analyse en cours 0 % », indéfiniment.
+const MODEL_LOAD_TIMEOUT_SECS: u64 = 300;
 /// Opt-in gate: only "true" enables it (heavy, needs the model downloaded).
 const ENABLED_KEY: &str = "audio_embedding_enabled";
 /// Where the model file goes; falls back to `TUNE_AUDIO_EMBED_MODEL`.
@@ -650,6 +810,12 @@ pub enum PauseAcoustique {
     Aucune,
     /// Une zone joue : l'analyse s'efface devant la lecture (#1515).
     Lecture,
+    /// Une mise à jour de bibliothèque tourne : l'analyse s'efface devant elle
+    /// (#2469, point 3). Thierry Clemont demandait que le scan programmé soit
+    /// « prioritaire sur le scan CLAP » — les deux passes lisent le même disque,
+    /// et l'analyse fait tourner ONNX sur plusieurs fils. Les laisser courir
+    /// ensemble allonge le scan sans rien accélérer.
+    ScanBibliotheque,
     /// Garde thermique (#1576).
     Thermique,
     /// Mémoire disponible sous le seuil.
@@ -665,6 +831,7 @@ impl PauseAcoustique {
         match self {
             PauseAcoustique::Aucune => None,
             PauseAcoustique::Lecture => Some("playback"),
+            PauseAcoustique::ScanBibliotheque => Some("library_scan"),
             PauseAcoustique::Thermique => Some("thermal"),
             PauseAcoustique::Memoire => Some("low_memory"),
             PauseAcoustique::NonPremium => Some("not_premium"),
@@ -681,8 +848,64 @@ fn poser_pause(raison: PauseAcoustique) {
         PauseAcoustique::Thermique => 2,
         PauseAcoustique::Memoire => 3,
         PauseAcoustique::NonPremium => 4,
+        PauseAcoustique::ScanBibliotheque => 5,
     };
     PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Cette pause doit-elle relâcher la session ONNX ?
+///
+/// Oui pour chacune : le modèle CLAP et la session ORT pèsent ~1,2 Go
+/// résidents (mesuré sur .18 le 28/08/2026, v0.9.117 — RSS 195 Mo au
+/// démarrage, 1388 Mo au premier lot), et une passe à l'arrêt ne s'en sert
+/// pas. Seul `Aucune` garde la session : c'est l'état où la passe travaille.
+///
+/// Le `match` est exhaustif et **sans joker**, délibérément : ajouter une
+/// cause de pause devient une erreur de compilation tant que la question
+/// n'est pas tranchée ici, au lieu d'une rétention silencieuse de 1,2 Go
+/// découverte des semaines plus tard sur la machine d'un testeur.
+fn pause_libere_session(pause: PauseAcoustique) -> bool {
+    match pause {
+        PauseAcoustique::Aucune => false,
+        PauseAcoustique::Lecture
+        | PauseAcoustique::Thermique
+        | PauseAcoustique::Memoire
+        | PauseAcoustique::NonPremium
+        // Un scan complet de grosse bibliothèque dure des dizaines de minutes :
+        // c'est la deuxième pause la plus longue après la lecture, et garder
+        // 1,2 Go de modèle CLAP résidents pendant qu'on veut justement libérer
+        // la machine pour le scan serait exactement à contresens.
+        | PauseAcoustique::ScanBibliotheque => true,
+    }
+}
+
+/// Entrer en pause : publier la raison pour l'interface **et** relâcher la
+/// session ONNX quand cette pause l'exige.
+///
+/// Les deux gestes tiennent dans une seule fonction parce que les séparer est
+/// exactement ce qui avait laissé trois `continue` garder le modèle : la pause
+/// « non premium » relâchait, les pauses lecture, thermique et budget mémoire
+/// non — alors que la pause lecture est la plus longue des quatre, puisqu'elle
+/// dure aussi longtemps que quelqu'un écoute.
+fn entrer_en_pause<T>(embedder: &mut Option<T>, pause: PauseAcoustique) {
+    poser_pause(pause);
+    if pause_libere_session(pause) {
+        *embedder = None;
+    }
+}
+
+/// Combien de temps dormir à la fin d'un tour de passe.
+///
+/// Une zone qui joue change tout : la passe doit reboucler VITE, non pour
+/// travailler — la garde de lecture l'en empêchera — mais pour ATTEINDRE cette
+/// garde et lui laisser relâcher la session ORT. Dormir `IDLE_SLEEP_SECS` là
+/// revient à porter le modèle un quart d'heure pour rien.
+///
+/// Le repli long garde tout son sens quand rien ne joue : c'est le cas
+/// « passe drainée », et repasser toutes les deux secondes n'y apporterait
+/// que de la charge.
+fn sieste_de_fin_de_tour(une_zone_joue: bool) -> u64 {
+    if une_zone_joue { 2 } else { IDLE_SLEEP_SECS }
 }
 
 /// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
@@ -692,6 +915,7 @@ pub fn pause_acoustique() -> PauseAcoustique {
         2 => PauseAcoustique::Thermique,
         3 => PauseAcoustique::Memoire,
         4 => PauseAcoustique::NonPremium,
+        5 => PauseAcoustique::ScanBibliotheque,
         _ => PauseAcoustique::Aucune,
     }
 }
@@ -900,12 +1124,25 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Le nombre de fils avec lequel la session courante a été bâtie, pour
         // détecter un changement de réglage.
         let mut loaded_threads = 0usize;
+        // Loquet « le chargement du modèle n'est jamais revenu ». Une tâche
+        // bloquante ne s'annule pas : après un dépassement de délai, le fil
+        // reste pris quelque part dans ORT. Réessayer tous les quarts d'heure
+        // empilerait un fil bloqué de plus à chaque tour, jusqu'à épuiser le
+        // vivier de tâches bloquantes du runtime — et là ce n'est plus
+        // l'analyse acoustique qui tombe, c'est tout ce qui lit un fichier.
+        // On signale une fois, et on s'arrête là jusqu'au redémarrage.
+        let mut load_abandonne = false;
         // Garde thermique de CETTE passe : il porte sa propre hystérésis et
         // journalise ses propres transitions (#1576).
         let mut thermal = crate::audio::thermal::ThermalGate::new();
         // Latch for the playback hold, same style as `low_memory`: one line on
         // the way in, one on the way out, silence in between.
         let mut playback_hold = false;
+        // Vrai tant que la passe est en retrait devant un scan. N'existe que
+        // pour ne journaliser l'entrée et la sortie de retrait qu'UNE fois, et
+        // non toutes les 30 s pendant une heure de scan — même rôle que
+        // `playback_hold`.
+        let mut scan_hold = false;
         // Le modèle est-il là ? Verrou de boucle, pour ne pas relire 287 Mo à
         // chaque tour (voir le bloc de téléchargement plus bas). Et l'instant
         // du dernier essai infructueux, pour espacer les tentatives réseau.
@@ -934,10 +1171,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         "audio_embed_requires_premium — l'analyse acoustique est réservée au premium ; le réglage reste actif et la passe reprendra dès qu'une licence sera validée"
                     );
                 }
-                poser_pause(PauseAcoustique::NonPremium);
                 // On relâche aussi la session ONNX : inutile de garder ~300 Mo
                 // résidents pour une passe qui ne tournera pas.
-                embedder = None;
+                entrer_en_pause(&mut embedder, PauseAcoustique::NonPremium);
                 tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                 continue;
             }
@@ -1020,12 +1256,58 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
                         );
                     }
-                    poser_pause(PauseAcoustique::Lecture);
+                    // On relâche la session ONNX, exactement comme la pause
+                    // « non premium » plus haut, et pour la même raison :
+                    // inutile de garder le modèle résident pour une passe qui
+                    // ne tournera pas. C'est ici que ça compte le plus, parce
+                    // que c'est la pause la plus LONGUE — elle dure tant que
+                    // quelqu'un écoute, soit des heures.
+                    //
+                    // Mesuré sur .18 le 28/08/2026 (v0.9.117) : balayage en
+                    // retrait depuis 09:15, RSS encore figé à 2345 Mo à 09:39,
+                    // dont ~1,2 Go de modèle CLAP tenus pour rien pendant que
+                    // la seule activité était la lecture d'une radio. Le
+                    // rechargement coûte quelques secondes, une seule fois,
+                    // quand la musique s'arrête — et la passe est déjà conçue
+                    // pour reconstruire sa session (`embedder.is_none()`).
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Lecture);
                     tokio::time::sleep(std::time::Duration::from_secs(
                         crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
                     ))
                     .await;
                     continue;
+                }
+
+                // Priorité à la mise à jour de bibliothèque (#2469, point 3).
+                // Thierry Clemont (Tades) demandait que le scan programmé parte
+                // « dans les mêmes conditions que le scan CLAP mais de manière
+                // prioritaire sur le scan CLAP ». La condition de lecture
+                // existait des deux côtés ; la priorité entre les deux passes,
+                // non — elles se disputaient le disque et le CPU, et le scan de
+                // 21 h durait d'autant plus longtemps.
+                //
+                // La garde est posée APRÈS celle de lecture, et cet ordre
+                // compte : la lecture prime sur tout, y compris sur le scan.
+                // Elle relit le drapeau à chaque tour, donc l'analyse repart
+                // d'elle-même à la fin du scan, sans que le scan ait à la
+                // réveiller.
+                if crate::scanner::activite::scan_bibliotheque_en_cours() {
+                    if !scan_hold {
+                        scan_hold = true;
+                        info!(
+                            "audio_embed_yield_to_library_scan — library scan running, acoustic analysis paused until it finishes"
+                        );
+                    }
+                    entrer_en_pause(&mut embedder, PauseAcoustique::ScanBibliotheque);
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
+                    ))
+                    .await;
+                    continue;
+                }
+                if scan_hold {
+                    scan_hold = false;
+                    info!("audio_embed_resumed_library_scan_finished");
                 }
                 if playback_hold {
                     playback_hold = false;
@@ -1036,7 +1318,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // la mémoire, une analyse facultative ne doit jamais mettre la
                 // machine en danger — et ici le danger est physique.
                 if thermal.should_hold("acoustique") {
-                    poser_pause(PauseAcoustique::Thermique);
+                    // Même règle : une machine qui a trop chaud n'a pas non
+                    // plus besoin de porter la session ONNX en attendant.
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Thermique);
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
                 }
@@ -1067,7 +1351,13 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             "audio_embed_paused_low_memory — acoustic analysis is paused until memory frees up; playback and the rest of the library are unaffected"
                         );
                     }
-                    poser_pause(PauseAcoustique::Memoire);
+                    // La plus perverse des trois : la passe s'arrête PARCE QUE
+                    // la mémoire manque, et gardait justement ce qui la
+                    // consomme. Relâcher ici rend au système le plus gros
+                    // poste du processus, ce qui est précisément la condition
+                    // pour que `MIN_AVAILABLE_MB` redevienne atteignable et
+                    // que la passe puisse reprendre.
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Memoire);
                     tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                     continue;
                 }
@@ -1123,9 +1413,31 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         warn!(error = %e, path = %p.display(), "audio_model_unavailable");
                     } else if let Err(e) = ensure_runtime_loaded(&p).await {
                         warn!(error = %e, "audio_runtime_unavailable");
+                    } else if load_abandonne {
+                        // Déjà signalé : on ne réessaie pas, sous peine
+                        // d'empiler les fils bloqués. Voir `load_abandonne`.
                     } else {
-                        match AudioEmbedder::load(&p, threads) {
-                            Ok(e) => {
+                        // Une trace AVANT la tentative. Sans elle, un appel
+                        // qui ne revient pas est indiscernable d'une passe qui
+                        // ne s'est jamais planifiée : le journal s'arrête, un
+                        // point c'est tout, et rien ne dit où. C'est ce qui a
+                        // rendu le cas d'Yves si long à établir.
+                        info!(
+                            model = %p.display(),
+                            intra_threads = threads,
+                            "audio_embedder_loading"
+                        );
+                        // `AudioEmbedder::load` construit une session ORT :
+                        // c'est du travail bloquant, lancé jusqu'ici À MÊME la
+                        // tâche async. Un blocage y figeait donc aussi un fil
+                        // du runtime tokio, au détriment de tout le serveur.
+                        let chemin = p.clone();
+                        let charge = tokio::task::spawn_blocking(move || {
+                            AudioEmbedder::load(&chemin, threads)
+                        });
+                        let delai = std::time::Duration::from_secs(MODEL_LOAD_TIMEOUT_SECS);
+                        match tokio::time::timeout(delai, charge).await {
+                            Ok(Ok(Ok(e))) => {
                                 info!(
                                     model = %p.display(),
                                     intra_threads = threads,
@@ -1134,7 +1446,22 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                                 embedder = Some(e);
                                 loaded_threads = threads;
                             }
-                            Err(e) => warn!(error = %e, "audio_embedder_load_failed"),
+                            Ok(Ok(Err(e))) => warn!(error = %e, "audio_embedder_load_failed"),
+                            // La tâche bloquante a paniqué : sans ce bras, la
+                            // panique restait dans le `JoinError` et personne
+                            // ne l'apprenait.
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "audio_embedder_load_panicked")
+                            }
+                            Err(_) => {
+                                load_abandonne = true;
+                                warn!(
+                                    timeout_s = MODEL_LOAD_TIMEOUT_SECS,
+                                    model = %p.display(),
+                                    intra_threads = threads,
+                                    "audio_embedder_load_timed_out — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; le fil de chargement ne peut pas être repris"
+                                );
+                            }
                         }
                     }
                 }
@@ -1170,7 +1497,24 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+            // Une zone joue à la fin du tour : ne PAS s'endormir un quart
+            // d'heure en gardant la session ORT. Reboucler tout de suite, pour
+            // que la garde de lecture — en haut de cette boucle — la relâche.
+            //
+            // Sans ça, l'interruption d'un lot par la lecture coûtait
+            // IDLE_SLEEP_SECS de rétention. Mesuré sur .18 le 28/08/2026 :
+            // lecture lancée à 11:25:30, session enfin rendue à 11:40:15, soit
+            // 14 min 45 s à porter le modèle pour rien. Le lot avait pourtant
+            // rendu `embedded=0` deux secondes après le début de la lecture —
+            // le repli « rien à faire, dors longtemps » confondait « passe
+            // drainée » et « passe interrompue ».
+            //
+            // Reboucler ne fait pas tourner la boucle à vide : la garde de
+            // lecture, juste après, dort `PLAYBACK_BACKOFF_SECS`. La cadence
+            // pendant l'écoute reste donc celle déjà prévue pour ce cas.
+            let sieste =
+                sieste_de_fin_de_tour(crate::audio::replaygain::any_zone_playing(&backend));
+            tokio::time::sleep(std::time::Duration::from_secs(sieste)).await;
         }
     });
 }
@@ -1200,9 +1544,14 @@ mod tests {
         assert_eq!(PauseAcoustique::default().nom(), None);
     }
 
+    /// L'état de pause est un atomique de processus : deux tests qui
+    /// l'écrivent en parallèle se voleraient mutuellement leur assertion.
+    static ETAT_PAUSE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// La raison posée est celle qu'on relit, et elle s'efface.
     #[test]
     fn la_raison_posee_est_celle_quon_relit() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
         poser_pause(PauseAcoustique::Thermique);
         assert_eq!(pause_acoustique(), PauseAcoustique::Thermique);
         poser_pause(PauseAcoustique::Lecture);
@@ -1211,7 +1560,167 @@ mod tests {
         assert_eq!(pause_acoustique().nom(), None);
     }
 
+    /// **Toute** cause de pause relâche la session ONNX ; seul « la passe
+    /// travaille » la garde.
+    ///
+    /// Le défaut corrigé le 28/08/2026 : trois des quatre pauses gardaient le
+    /// modèle CLAP résident (~1,2 Go mesurés sur .18), dont la pause LECTURE,
+    /// qui dure aussi longtemps que quelqu'un écoute de la musique. Seule la
+    /// pause « non premium » relâchait.
+    #[test]
+    fn toute_pause_relache_la_session_onnx() {
+        assert!(
+            !pause_libere_session(PauseAcoustique::Aucune),
+            "au travail, la passe doit GARDER sa session : la relâcher à chaque tour rechargerait le modèle en boucle"
+        );
+        for raison in [
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
+        ] {
+            assert!(
+                pause_libere_session(raison),
+                "{raison:?} : une passe à l'arrêt ne doit pas garder ~1,2 Go de modèle résident"
+            );
+        }
+    }
+
+    /// Et le geste suit la règle : `entrer_en_pause` repose bien la valeur,
+    /// tout en publiant la raison pour l'interface.
+    #[test]
+    fn entrer_en_pause_repose_la_session_et_publie_la_raison() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut session = Some(());
+        entrer_en_pause(&mut session, PauseAcoustique::Aucune);
+        assert!(
+            session.is_some(),
+            "sans pause, la session doit survivre au passage"
+        );
+
+        for raison in [
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
+        ] {
+            let mut session = Some(());
+            entrer_en_pause(&mut session, raison);
+            assert!(
+                session.is_none(),
+                "{raison:?} : la session ONNX doit être relâchée en entrant en pause"
+            );
+            assert_eq!(
+                pause_acoustique(),
+                raison,
+                "{raison:?} doit rester visible dans l'interface"
+            );
+        }
+        poser_pause(PauseAcoustique::Aucune);
+    }
+
+    /// #2469, point 3 — le retrait devant un scan doit être NOMMÉ. Sans nom
+    /// stable, l'interface afficherait « analyse en pause » sans dire pourquoi,
+    /// et l'utilisateur croirait à un blocage exactement comme dans #2203.
+    #[test]
+    fn le_retrait_devant_un_scan_porte_un_nom_stable() {
+        assert_eq!(
+            PauseAcoustique::ScanBibliotheque.nom(),
+            Some("library_scan"),
+            "le nom part à l'API : le changer casse le client"
+        );
+    }
+
+    /// Le code stocké dans l'atomique doit revenir tel quel. Une collision avec
+    /// un code existant rendrait un retrait indiscernable d'un autre.
+    #[test]
+    fn chaque_pause_a_son_propre_code() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        let toutes = [
+            PauseAcoustique::Aucune,
+            PauseAcoustique::Lecture,
+            PauseAcoustique::Thermique,
+            PauseAcoustique::Memoire,
+            PauseAcoustique::NonPremium,
+            PauseAcoustique::ScanBibliotheque,
+        ];
+        for raison in toutes {
+            poser_pause(raison);
+            assert_eq!(
+                pause_acoustique(),
+                raison,
+                "{raison:?} doit se relire à l'identique"
+            );
+        }
+        let mut noms: Vec<_> = toutes.iter().filter_map(|p| p.nom()).collect();
+        noms.sort_unstable();
+        let avant = noms.len();
+        noms.dedup();
+        assert_eq!(
+            avant,
+            noms.len(),
+            "deux pauses ne peuvent pas porter le même nom"
+        );
+        poser_pause(PauseAcoustique::Aucune);
+    }
+
     use super::*;
+
+    #[test]
+    fn candidate_row_preserves_the_id_when_only_the_path_is_invalid() {
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text("/music/a.flac".into())]),
+            EmbeddingCandidate::Ready {
+                track_id: 42,
+                path: "/music/a.flac".into(),
+            }
+        );
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Int(42), SqlValue::Text(String::new())]),
+            EmbeddingCandidate::MissingPath { track_id: 42 }
+        );
+        assert_eq!(
+            embedding_candidate(&[SqlValue::Text("not-an-id".into()), SqlValue::Null]),
+            EmbeddingCandidate::MissingTrackId
+        );
+    }
+
+    #[test]
+    fn an_unusable_candidate_with_an_id_can_be_stamped_out_of_the_next_batch() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id) VALUES (42, 'Track', 1, 1)",
+            &[],
+        )
+        .unwrap();
+        let repo = TrackMetadataRepo::new(db);
+
+        assert!(stamp_embedding_processed(&repo, 42));
+        assert_eq!(
+            repo.get_all(42).unwrap().get(SENTINEL).map(String::as_str),
+            Some(MODEL_ID)
+        );
+    }
+
+    #[test]
+    fn a_selected_batch_without_progress_is_only_anomaly_without_playback_yield() {
+        assert!(batch_without_progress(3, 0, false));
+        assert!(!batch_without_progress(3, 0, true));
+        assert!(!batch_without_progress(3, 1, false));
+        assert!(!batch_without_progress(0, 0, false));
+    }
 
     #[test]
     fn clap_window_resamples_true_source_rate_to_48k() {
@@ -1490,10 +1999,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn provision_and_embed() {
-        let dir = std::env::temp_dir().join("tune-audio-embed-e2e");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("clap-audio-music-2023.onnx");
+        let dir = tempfile::TempDir::new().unwrap();
+        let model = dir.path().join("clap-audio-music-2023.onnx");
 
         ensure_model(&model).await.expect("download model");
         ensure_runtime_loaded(&model)
@@ -1561,6 +2068,100 @@ mod tests {
     /// Aucun test fonctionnel ne peut garder ce contrat : il faudrait une zone
     /// qui joue, un réseau, et 287 Mo à télécharger en CI. On lit donc la
     /// source, sur le modèle d'`output_provider_seam.rs`.
+    /// Le chargement du modèle doit rester **annoncé, sorti du runtime async
+    /// et borné**. Les trois vont ensemble : c'est leur absence conjointe qui a
+    /// rendu la panne d'Yves Corbat (MacBook Pro M1, 27-28/08/2026) à la fois
+    /// silencieuse et interminable — `audio_runtime_loaded` puis plus une seule
+    /// ligne acoustique pendant 10 h 30, jauge figée à 0 %, et un fil du
+    /// runtime tokio immobilisé au passage.
+    ///
+    /// Garde STRUCTUREL, pas une preuve de comportement : il verrouille la
+    /// forme du bloc, pas ce qu'ORT en fait. Il est donc sensible aux
+    /// renommages — c'est le prix d'un test qui lit son propre source, et
+    /// l'échec dit alors quoi corriger.
+    #[test]
+    fn le_chargement_du_modele_est_annonce_hors_runtime_et_borne() {
+        let source = include_str!("embedding.rs");
+        // ⚠️ Ne chercher QUE dans le code de production. Une première version
+        // de ce test balayait le fichier entier : après un `cargo fmt`, le
+        // motif recherché n'existait plus dans le code, `find` tombait sur la
+        // chaîne littérale DE CE TEST — située plus bas — et l'ordre attendu
+        // était satisfait par construction. Le garde-fou passait au vert sur
+        // un code qui avait perdu la propriété qu'il prétendait verrouiller.
+        let fin_prod = source
+            .find("mod tests {")
+            .expect("le module de test a disparu ou a été renommé");
+        let prod = &source[..fin_prod];
+
+        let annonce = prod
+            .find("\"audio_embedder_loading\"")
+            .expect("la trace AVANT la tentative a disparu : un chargement qui ne revient pas redevient indiscernable d'une passe jamais planifiée");
+        // Tout ce qui doit suivre l'annonce, et rien qui la précède.
+        let apres = &prod[annonce..];
+
+        let pos_appel = apres
+            .find("AudioEmbedder::load(&chemin, threads)")
+            .expect("l'appel de chargement ne suit plus son annonce — soit la trace est passée derrière et ne prévient plus de rien, soit l'appel n'est plus celui qu'on croit");
+        // Le `spawn_blocking` doit envelopper CET appel-ci. Chercher le mot
+        // n'importe où après l'annonce ne suffit pas : la passe en contient un
+        // autre plus bas (l'héritage des jumelles), qui satisfaisait le test
+        // alors même que le chargement était redevenu direct. Vérifié par
+        // contre-épreuve — c'est ce trou qui a laissé passer la variante B.
+        let pos_spawn = apres[..pos_appel]
+            .rfind("spawn_blocking")
+            .expect("le chargement est repassé À MÊME la tâche async : un blocage y fige aussi un fil du runtime tokio, et ce n'est plus seulement l'analyse acoustique qui tombe");
+        assert!(
+            pos_appel - pos_spawn < 120,
+            "le `spawn_blocking` le plus proche est à {} caractères de l'appel : \
+             il en enveloppe probablement un autre, pas celui-ci.",
+            pos_appel - pos_spawn
+        );
+        assert!(
+            apres.contains("tokio::time::timeout(delai, charge)"),
+            "le délai maximal a disparu : un chargement bloqué redevient éternel."
+        );
+        assert!(
+            prod.contains("audio_embedder_load_timed_out"),
+            "un dépassement de délai doit se dire dans le journal, sinon il \
+             remplace un silence par un autre."
+        );
+        assert!(
+            prod.contains("audio_embedder_load_panicked"),
+            "une panique de la tâche bloquante reste sinon enfermée dans le \
+             JoinError, et personne ne l'apprend."
+        );
+    }
+
+    /// Une zone qui joue doit écourter la sieste de fin de tour.
+    ///
+    /// Sinon l'interruption d'un lot par la lecture coûte `IDLE_SLEEP_SECS` de
+    /// rétention de la session ORT. Mesuré sur .18 le 28/08/2026 : lecture
+    /// lancée à 11:25:30, session rendue à 11:40:15 — 14 min 45 s à porter le
+    /// modèle pour rien, parce que le repli long confondait « passe drainée »
+    /// et « passe interrompue ».
+    #[test]
+    fn une_zone_qui_joue_ecourte_la_sieste_de_fin_de_tour() {
+        let en_lecture = sieste_de_fin_de_tour(true);
+        let au_repos = sieste_de_fin_de_tour(false);
+
+        assert_eq!(
+            au_repos, IDLE_SLEEP_SECS,
+            "au repos, la sieste longue garde tout son sens : repasser sans \
+             cesse sur une passe drainée n'apporterait que de la charge"
+        );
+        assert!(
+            en_lecture < au_repos,
+            "pendant la lecture, la passe doit reboucler vite pour ATTEINDRE la \
+             garde de lecture, seule habilitée à relâcher la session ORT — \
+             dormir aussi longtemps qu'au repos, c'est porter le modèle pour rien"
+        );
+        assert!(
+            en_lecture <= 5,
+            "« vite » veut dire quelques secondes : {en_lecture} s laisse encore \
+             la session sur les bras."
+        );
+    }
+
     #[test]
     fn le_telechargement_du_modele_precede_la_cession_a_la_lecture() {
         let source = include_str!("embedding.rs");

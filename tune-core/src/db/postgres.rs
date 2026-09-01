@@ -95,6 +95,28 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             track_number BIGINT,\
             disc_number BIGINT\
         )",
+    // Registre des executions automatisees (#2080). La migration numerotee
+    // 039 le monte sur les bases qui suivent la piste numerotee — mais une
+    // base creee par l'assistant SQLite -> PostgreSQL porte
+    // `schema_version = 99` et ne rejoue JAMAIS les scripts numerotes. Sans
+    // cette entree, ces bases-la n'auraient pas la table, la route
+    // `/system/task-runs` rendrait une erreur SQL et chaque passe cablee
+    // ecrirait dans le vide. C'est exactement la derive documentee sur
+    // `lyrics_cache` dans `PG_FULL_SCHEMA`.
+    "CREATE TABLE IF NOT EXISTS task_runs (\
+            boot_id TEXT NOT NULL,\
+            task TEXT NOT NULL,\
+            seq BIGINT NOT NULL,\
+            started_at TEXT NOT NULL,\
+            finished_at TEXT,\
+            duration_ms BIGINT,\
+            outcome TEXT NOT NULL,\
+            items BIGINT,\
+            detail TEXT,\
+            PRIMARY KEY (boot_id, task, seq)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_task_started ON task_runs(task, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_task_runs_outcome ON task_runs(outcome)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
@@ -115,8 +137,22 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped'",
     "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT",
-    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT",
+    // BIGINT, pas TEXT : `albums.id` est BIGINT, et la jointure de « Continuer
+    // l'ecoute » compare les deux. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et la section disparait en silence (#2860). Sur une
+    // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
+    // la migration 047 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
+    // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
+    // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
+    // exist: text = bigint` et l'historique du profil rend une liste vide.
+    // Meme mecanisme exact qu'`album_id` juste au-dessus (#2860, #2995) : la
+    // colonne n'arrive par aucun script numerote, la 012 ne l'a jamais vue.
+    // Sur une base existante ou elle est deja TEXT, cet ADD est un no-op et
+    // c'est la migration 049 qui la convertit.
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id BIGINT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_type TEXT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source_url TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_license TEXT",
@@ -127,7 +163,13 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT",
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT",
-    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '1'",
+    // BIGINT, pas TEXT : `PlaylistRepo::list()` et `count()` lient le profil en
+    // `i64` (`WHERE p.profile_id = $1`). En TEXT, PostgreSQL rend `operator
+    // does not exist: text = bigint` et la liste des playlists est vide sur
+    // toute installation PostgreSQL native (#2995). Sur une base existante ou
+    // elle est deja TEXT, cet ADD est un no-op et c'est la migration 049 qui la
+    // convertit.
+    "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id BIGINT NOT NULL DEFAULT 1",
     // #1706: heals a queue_items that predates the numbering columns —
     // the CREATE above only fires on a database that has no queue_items
     // at all. BIGINT (not TEXT): the values are bound as i64 and read

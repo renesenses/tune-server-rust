@@ -2,15 +2,7 @@ name: CI
 
 on:
   push:
-    # La ligne de release doit etre couverte comme main : c'est d'elle que
-    # sortent les tags v0.9.x. Sans cela, une PR vers release/v0.9 n'etait
-    # verifiee que par test-postgres.yml (seul workflow dont le trigger
-    # pull_request n'a pas de filtre de branche) — donc ni fmt, ni clippy, ni
-    # cargo test, ni compilation. Trois defauts sont passes ainsi le 8 aout
-    # 2026 et n'ont ete revels qu'en construisant la branche elle-meme : un
-    # test OAAT instable (#1358), une migration PG non declaree (#1364), et
-    # l'incident #875 en juillet avait deja le meme mecanisme.
-    branches: [main, release/v0.9]
+    branches: [main]
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
@@ -54,6 +46,7 @@ jobs:
         env:
           EVENEMENT: ${{ github.event_name }}
           BASE_REF_CI: ${{ github.base_ref }}
+          HEAD_REF_CI: ${{ github.head_ref }}
           FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -74,6 +67,14 @@ jobs:
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             echo "profil complet : $EVENEMENT vers ${BASE_REF_CI:-sans-base}"
+          fi
+
+          # Une promotion RC -> main valide toujours le serveur entier, meme
+          # si le dernier diff ne touche que la CI ou les versions.
+          if [ "$EVENEMENT" = pull_request ] && [ "$BASE_REF_CI" = main ] && [[ "$HEAD_REF_CI" = rc/* ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "promotion $HEAD_REF_CI -> main : batterie complete"
+            exit 0
           fi
 
           case "$EVENEMENT" in
@@ -128,6 +129,7 @@ jobs:
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
+          python3 scripts/synchroniser-release-main.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
         run: |
@@ -175,7 +177,18 @@ jobs:
         with:
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo test -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server --no-default-features --features oaat
+      # `-p tune-bridge` et `cloud-relay` : le chemin de l'ecoute distante
+      # n'etait couvert par AUCUNE porte. Le relais (`tune-bridge`) n'etait ni
+      # teste ni compile ici, et `tune-core/src/cloud/relay.rs` vit derriere
+      # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
+      # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
+      # ne rougisse : une requete de flux distante finissait en 504, muette.
+      #
+      # `-p tune-http-types` et `-p tune-smart-http` : deux caisses extraites
+      # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
+      # porte au lieu de l'y garder — la liste est un inventaire, pas un
+      # echantillon (cf #2865).
+      - run: cargo test -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -444,12 +457,29 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  # La liste `--features` de cette porte est un INVENTAIRE, pas un echantillon :
+  # avec `--no-default-features`, une feature absente d'ici n'est lue par AUCUN
+  # lint. Le test `toute_feature_declaree_est_activee_par_une_porte_clippy`
+  # (tune-server/tests/workflows_bornes.rs) refuse desormais toute feature
+  # declaree qui n'y figure pas — ou qui n'est pas inscrite avec sa raison.
+  #
+  # Mesure du 31/08/2026 (#2865), avant cet elargissement — quatre features
+  # nues : `local-audio` (16 fichiers, dont `outputs/local.rs` et ses 10 826
+  # lignes), `postgres` (11), `audio-embedding` (3), `asio` (3).
+  #
+  # L'issue ne citait que `audio-embedding`. Le plus gros trou etait ailleurs :
+  # `local-audio` est dans le `default` des deux crates, et c'est precisement
+  # `--no-default-features` qui la retirait. Deux agents ont du relancer clippy
+  # a la main sur `local.rs` dans la nuit du 30 au 31/08.
+  #
+  # `asio` reste dehors — `cpal/asio` ne se compile que sous Windows ; le job
+  # `windows-pr` la couvre en `cargo check`.
   clippy:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # clippy — 2 min observe
+    timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -457,7 +487,27 @@ jobs:
           components: clippy
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server --all-targets --no-default-features --features oaat,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
+      # `local-audio` tire cpal, qui lie ALSA : sans ce paquet la porte s'arrete
+      # sur « Package alsa was not found in the pkg-config search path ».
+      # Meme boucle de reprises que les autres jobs — cf release.yml.
+      - name: Install ALSA dev (retry — voir release.yml)
+        timeout-minutes: 18
+        run: |
+          for essai in 1 2 3; do
+            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
+              exit 0
+            fi
+            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep 20
+          done
+          echo "::error::apt injoignable apres 3 essais"
+          exit 1
+      # `-p tune-http-types` et `-p tune-smart-http` : deux caisses extraites
+      # par ce lot. La liste est un inventaire, pas un echantillon (#2865) —
+      # les en sortir reviendrait a retirer ce code de la porte en le
+      # decoupant.
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit
@@ -467,13 +517,34 @@ jobs:
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
+    #
+    # `denyWarnings: true` etend ce blocage aux avis INFORMATIFS (#2251). Par
+    # defaut `cargo audit` affiche un `informational = "unmaintained"` puis sort
+    # en 0 : mesure sur release/v0.9 (e608df16), « warning: 3 allowed warnings
+    # found », code de sortie 0. RUSTSEC-2026-0150 (audiopus_sys abandonne) est
+    # donc apparu le 21/05/2026 sans jamais rougir ici, alors meme que
+    # `deny.toml` le connaissait deja. Un avis informatif ne peut plus arriver
+    # en silence : soit il est corrige, soit il est inscrit dans la liste
+    # ci-dessous AVEC sa raison et sa date.
+    #
+    # La liste doit rester identique a celle de `deny.toml` et de
+    # `.cargo/audit.toml` (le preflight de release lance `cargo audit` nu, qui
+    # ne lit que ce dernier). C'est precisement cette derive qui a rendu
+    # RUSTSEC-2026-0150 invisible ; le test
+    # `les_trois_listes_dexceptions_rustsec_sont_identiques` la refuse
+    # desormais.
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
         with:
-          # Only the unmaintained-warning advisories with no available fix are
-          # ignored (paste, instant — transitive, no runtime path). Kept in sync
-          # with deny.toml. Every vulnerability, wasmtime included, now blocks.
+          denyWarnings: true
+          # Avis « unmaintained » sans correctif disponible, chacun justifie
+          # dans .cargo/audit.toml : paste et instant, tous deux transitifs et
+          # hors du chemin d'execution.
+          #
+          # RUSTSEC-2026-0150 (audiopus_sys) a quitte cette liste : la
+          # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
+          # (#2251). Il n'y a plus d'avis a taire.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
 
   ffi:
@@ -493,14 +564,13 @@ jobs:
     # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
     # jamais remonte jusqu'ici.
     #
-    # Un `cargo check` sur l'hote suffit : il reproduit exactement la resolution
-    # de features du build Android, sans NDK ni compilation croisee.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          target: aarch64-linux-android
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
       # 16 et pas 6 : la boucle fait au pire 3 x (100 + 200) + 2 x 20 = 940 s.
       # A 6 min la marche se fait tuer PENDANT le deuxieme essai — on paie le
@@ -541,3 +611,70 @@ jobs:
       - run: cargo check -p tune-ffi --all-targets
         env:
           RUSTFLAGS: ""
+      # Le check hote ci-dessus ne compile pas les branches `cfg(android)`.
+      # C'est ainsi que le `statfs.f_fstypename` reserve a Darwin a bloque les
+      # .so Android de la 0.9.125 (#2780) sans rougir ici. Une seule ABI suffit
+      # a tenir le contrat de compilation conditionnelle ; la release Flutter
+      # construit ensuite les trois ABI.
+      - name: Vérifier FFI Android ARM64
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ ! -d "$NDK" ]; then
+            echo "::error::NDK Android introuvable sur le runner"
+            exit 1
+          fi
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export ANDROID_NDK_ROOT="$NDK"
+          export CC_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android24-clang"
+          export CXX_aarch64_linux_android="$TOOLCHAIN/aarch64-linux-android24-clang++"
+          export AR_aarch64_linux_android="$TOOLCHAIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/aarch64-linux-android24-clang"
+          cargo check -p tune-ffi --target aarch64-linux-android
+        env:
+          RUSTFLAGS: ""
+
+  # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
+  # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
+  # batterie complete ci-dessus en succes. PostgreSQL reste un required check
+  # separe, porte par test-postgres.yml.
+  release-gate:
+    name: release-gate
+    if: always() && github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs:
+      - impact
+      - fmt
+      - test
+      - test-shipped-features
+      - audio-embedding
+      - windows-pr
+      - macos-pr
+      - clippy
+      - audit
+      - ffi
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuser une branche autre qu'une RC
+        if: startsWith(github.head_ref, 'rc/') == false
+        run: |
+          echo "::error::main n'accepte que les promotions rc/*"
+          exit 1
+
+      - name: Refuser un job absent, ignore ou rouge
+        if: >-
+          needs.impact.result != 'success' ||
+          needs.fmt.result != 'success' ||
+          needs.test.result != 'success' ||
+          needs.test-shipped-features.result != 'success' ||
+          needs.audio-embedding.result != 'success' ||
+          needs.windows-pr.result != 'success' ||
+          needs.macos-pr.result != 'success' ||
+          needs.clippy.result != 'success' ||
+          needs.audit.result != 'success' ||
+          needs.ffi.result != 'success'
+        run: |
+          echo "::error::la batterie complete n'est pas entierement verte"
+          exit 1
+
+      - name: Confirmer la promotion
+        run: echo "RC verte, eligible a la promotion vers main"

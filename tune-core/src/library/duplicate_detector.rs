@@ -1,37 +1,13 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use md5::{Digest, Md5};
 use tracing::{info, warn};
 
 use crate::db::backend::DbBackend;
-
-const HEADER_SKIP: u64 = 8192;
-const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
-
-pub fn compute_audio_hash(file_path: &str) -> Option<String> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return None;
-    }
-
-    let mut file = std::fs::File::open(path).ok()?;
-    use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(HEADER_SKIP)).ok()?;
-
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    let n = file.read(&mut buf).ok()?;
-    if n == 0 {
-        return None;
-    }
-    buf.truncate(n);
-
-    let mut hasher = Md5::new();
-    hasher.update(&buf);
-    Some(format!("{:x}", hasher.finalize()))
-}
+use crate::scanner::hasher::{
+    compute_audio_hash_str, files_are_byte_identical, is_current_audio_hash,
+};
 
 #[derive(Debug, Clone)]
 pub struct DuplicateEntry {
@@ -53,6 +29,40 @@ pub struct DuplicateScanResult {
     pub duplicates_found: usize,
     pub groups: Vec<DuplicateGroup>,
     pub errors: usize,
+}
+
+fn exact_duplicate_groups(hash: String, tracks: Vec<DuplicateEntry>) -> Vec<DuplicateGroup> {
+    let mut exact_partitions: Vec<Vec<DuplicateEntry>> = Vec::new();
+
+    for track in tracks {
+        let mut pending = Some(track);
+        for partition in &mut exact_partitions {
+            let Some(candidate) = pending.as_ref() else {
+                break;
+            };
+            let representative = &partition[0];
+            if files_are_byte_identical(
+                Path::new(&candidate.file_path),
+                Path::new(&representative.file_path),
+            )
+            .unwrap_or(false)
+            {
+                partition.push(pending.take().expect("track still pending"));
+            }
+        }
+        if let Some(track) = pending {
+            exact_partitions.push(vec![track]);
+        }
+    }
+
+    exact_partitions
+        .into_iter()
+        .filter(|partition| partition.len() > 1)
+        .map(|tracks| DuplicateGroup {
+            hash: hash.clone(),
+            tracks,
+        })
+        .collect()
 }
 
 pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanResult {
@@ -98,15 +108,21 @@ pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanRe
     let mut errors = 0;
 
     for (id, file_path, title, existing_hash) in &rows {
-        let h = if let Some(eh) = existing_hash {
-            Some(eh.clone())
+        let current_hash = existing_hash
+            .as_deref()
+            .filter(|hash| is_current_audio_hash(hash))
+            .map(str::to_owned);
+        let h = if current_hash.is_some() {
+            current_hash
         } else {
-            let computed = compute_audio_hash(file_path);
+            let computed = compute_audio_hash_str(file_path);
             if let Some(ref h) = computed {
-                let _ = db.execute(
+                if let Err(error) = db.execute(
                     "UPDATE tracks SET audio_hash = ? WHERE id = ?",
                     &[&h.as_str(), id],
-                );
+                ) {
+                    warn!(%error, track_id = id, path = file_path, "audio_hash_update_failed");
+                }
             }
             computed
         };
@@ -124,10 +140,12 @@ pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanRe
         }
     }
 
+    // The sampled hash only selects inexpensive candidates. It can never by
+    // itself make two tracks duplicates: every reported group is partitioned
+    // by a complete byte-for-byte comparison.
     let groups: Vec<DuplicateGroup> = hash_map
         .into_iter()
-        .filter(|(_, tracks)| tracks.len() > 1)
-        .map(|(hash, tracks)| DuplicateGroup { hash, tracks })
+        .flat_map(|(hash, tracks)| exact_duplicate_groups(hash, tracks))
         .collect();
 
     let duplicates_found: usize = groups.iter().map(|g| g.tracks.len() - 1).sum();
@@ -194,53 +212,53 @@ mod tests {
     fn hash_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let mut data = vec![0u8; HEADER_SKIP as usize + 1024];
+        let mut data = vec![0u8; 16 * 1024];
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         std::fs::write(&path, &data).unwrap();
 
-        let h1 = compute_audio_hash(path.to_str().unwrap());
-        let h2 = compute_audio_hash(path.to_str().unwrap());
+        let h1 = compute_audio_hash_str(path.to_str().unwrap());
+        let h2 = compute_audio_hash_str(path.to_str().unwrap());
         assert!(h1.is_some());
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn hash_nonexistent_file() {
-        let result = compute_audio_hash("/nonexistent/file.flac");
+        let result = compute_audio_hash_str("/nonexistent/file.flac");
         assert!(result.is_none());
     }
 
     #[test]
-    fn hash_empty_audio_portion() {
+    fn hash_tiny_nonempty_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.bin");
         std::fs::write(&path, &[0u8; 100]).unwrap();
-        let result = compute_audio_hash(path.to_str().unwrap());
-        assert!(result.is_none());
+        let result = compute_audio_hash_str(path.to_str().unwrap());
+        assert!(result.is_some());
     }
 
     #[test]
     fn different_files_different_hashes() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut data_a = vec![0u8; HEADER_SKIP as usize + 2048];
+        let mut data_a = vec![0u8; 16 * 1024];
         for (i, b) in data_a.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         let path_a = dir.path().join("a.bin");
         std::fs::write(&path_a, &data_a).unwrap();
 
-        let mut data_b = vec![0xFFu8; HEADER_SKIP as usize + 2048];
+        let mut data_b = vec![0xFFu8; 16 * 1024];
         for (i, b) in data_b.iter_mut().enumerate() {
             *b = ((i + 1) % 256) as u8;
         }
         let path_b = dir.path().join("b.bin");
         std::fs::write(&path_b, &data_b).unwrap();
 
-        let ha = compute_audio_hash(path_a.to_str().unwrap()).unwrap();
-        let hb = compute_audio_hash(path_b.to_str().unwrap()).unwrap();
+        let ha = compute_audio_hash_str(path_a.to_str().unwrap()).unwrap();
+        let hb = compute_audio_hash_str(path_b.to_str().unwrap()).unwrap();
         assert_ne!(ha, hb);
     }
 
@@ -248,10 +266,10 @@ mod tests {
     fn hash_length() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
-        let data = vec![42u8; HEADER_SKIP as usize + 4096];
+        let data = vec![42u8; 16 * 1024];
         std::fs::write(&path, &data).unwrap();
 
-        let h = compute_audio_hash(path.to_str().unwrap()).unwrap();
-        assert_eq!(h.len(), 32); // MD5 hex
+        let h = compute_audio_hash_str(path.to_str().unwrap()).unwrap();
+        assert!(is_current_audio_hash(&h));
     }
 }

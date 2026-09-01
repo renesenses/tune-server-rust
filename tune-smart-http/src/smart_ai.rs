@@ -1,3 +1,28 @@
+//! Générateur de playlists — déterministe, par critères. **Aucune IA ici.**
+//!
+//! Fabien, forum : « Quelle est la différence entre les playlists Smart AI et
+//! le bouton flottant Tune AI ? » (#1360). La réponse : tout. Le bouton
+//! flottant (`POST /ai/query`) est un vrai assistant adossé à Claude ; ce
+//! module-ci repère des mots-clés et construit des **conditions SQL** sur la
+//! bibliothèque locale. Les cinq variantes — ambiance, invite, historique,
+//! découverte, tempo — sont des générateurs déterministes.
+//!
+//! Le nom retenu côté produit est **« Générateur de playlists » / "Playlist
+//! generator"** : c'est celui que le client web livre déjà (tune-web-client
+//! PR #384, sur `main`, dans les onze locales sous la clé `smartai.title`). Ne
+//! pas en inventer un autre — deux noms pour la même chose est le défaut
+//! qu'on corrige.
+//!
+//! ⚠️ **Le préfixe de route `/smart-ai` reste tel quel, volontairement.** Ce
+//! n'est pas un libellé, c'est l'IDENTIFIANT que trois bases de code clientes
+//! comparent littéralement — `tune-web-client/src/lib/api.ts` (les cinq
+//! appels), `tune-server-flutter/lib/services/tune_api_client.dart:1425`,
+//! `tune-server-ipados/…/TuneAPIClient+SmartAutoPlay.swift:14` — et qu'un
+//! contrat publié fige (`docs/contrat-web.json`). Le renommer casserait les
+//! cinq écrans sans rien gagner : aucun utilisateur ne lit une URL d'API. On
+//! garde la valeur, on change le libellé.
+
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -176,7 +201,7 @@ async fn generate_smart_playlist(
     let artist_names: Vec<String> = state
         .backend
         .query_many("SELECT name FROM artists", &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .filter_map(|r| r.first().and_then(|v| v.as_string()))
         .collect();
@@ -208,7 +233,10 @@ async fn generate_smart_playlist(
         params.push(artist as &dyn ToSqlValue);
     }
     params.push(&limit as &dyn ToSqlValue);
-    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -227,8 +255,13 @@ async fn generate_smart_playlist(
         })
         .collect();
 
+    // `name` est un LIBELLÉ affiché, pas un identifiant : il portait « AI: … »
+    // alors que rien ici n'appelle un modèle (#1360). On rend l'invite telle
+    // quelle — exactement ce que l'écran web affiche déjà
+    // (`SmartAIView.svelte`, `playlistName = prompt`), pour qu'une même
+    // génération porte un seul nom sur tous les clients.
     Ok(Json(json!({
-        "name": format!("AI: {}", body.prompt),
+        "name": body.prompt.clone(),
         "prompt": body.prompt,
         "tracks": tracks,
         "total": tracks.len(),
@@ -378,7 +411,7 @@ async fn mood_playlist(
                     &limit as &dyn ToSqlValue,
                 ],
             )
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(decode_track_row)
             .collect()
@@ -529,7 +562,7 @@ async fn similar_to_playlist(
     let rows = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -597,7 +630,7 @@ async fn history_based_playlist(
     let top_genres: Vec<String> = state
         .backend
         .query_many(&top_genres_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -616,7 +649,7 @@ async fn history_based_playlist(
     let top_artist_ids: Vec<i64> = state
         .backend
         .query_many(&top_artists_sql, &[])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_i64()))
         .collect();
@@ -644,7 +677,7 @@ async fn history_based_playlist(
         let artist_tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&artist_limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -687,7 +720,7 @@ async fn history_based_playlist(
         let genre_tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&genre_limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -722,7 +755,7 @@ async fn history_based_playlist(
         all_tracks = state
             .backend
             .query_many(&sql, &[&limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -804,7 +837,7 @@ async fn tempo_match_playlist(
                 &limit as &dyn ToSqlValue,
             ],
         )
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -861,7 +894,7 @@ async fn discovery_playlist(
              LIMIT 5",
             &[],
         )
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
         .collect();
@@ -882,7 +915,7 @@ async fn discovery_playlist(
         let tracks: Vec<Value> = state
             .backend
             .query_many(&sql, &[&limit as &dyn ToSqlValue])
-            .unwrap_or_default()
+            .ou_defaut_journalise()
             .iter()
             .map(|cols| {
                 json!({
@@ -931,7 +964,7 @@ async fn discovery_playlist(
     let tracks: Vec<Value> = state
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
-        .unwrap_or_default()
+        .ou_defaut_journalise()
         .iter()
         .map(|cols| {
             json!({

@@ -1,3 +1,4 @@
+use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -178,6 +179,17 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
+/// Whether the server would accept the manual "next" action as an actual
+/// advance instead of stopping the zone at the end of the queue.
+///
+/// Keep this as a thin projection of the command's own decision.  Rebuilding
+/// the rule from `queue_position` on the client is wrong under shuffle, where
+/// the next item follows the materialised permutation rather than raw queue
+/// order (#2337).
+pub(crate) fn can_skip_next(zone_state: &tune_core::playback::ZoneState) -> bool {
+    tune_core::poller::PositionPoller::next_position_manual(zone_state).is_some()
+}
+
 pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -188,6 +200,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
         "output_device_id": zone_db.as_ref().and_then(|z| z.output_device_id.as_ref()),
         "volume": zone_state.volume,
+        // #1274 — lecture en dB du volume rendu juste au-dessus, jamais d'une
+        // autre source : les deux champs doivent toujours dire la meme chose.
+        "volume_db": tune_core::audio::volume_scale::linear_to_db(zone_state.volume),
         "state": zone_state.state,
         "current_track": zone_state.now_playing.as_ref().map(|np| json!({
             "id": np.track_id,
@@ -213,12 +228,14 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
+        "can_skip_next": can_skip_next(&zone_state),
         "muted": zone_state.muted,
     });
     // Ancrage temporel de la métadonnée courante (paroles radio) — mêmes
     // champs que GET /zones et GET /zones/{id}.
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+        crate::routes::zones::inject_session_context(obj, &zone_state);
     }
     // Include stream_url ONLY for browser playback zones, so the web client can
     // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
@@ -290,9 +307,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             .output_device_id
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+        let audio_backend_pref = state.display_audio_backend();
         #[cfg(feature = "local-audio")]
-        let audio_backend =
-            tune_core::outputs::local::active_backend_name(&state.display_audio_backend());
+        let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
         #[cfg(not(feature = "local-audio"))]
         let audio_backend = "none";
         let wire = match zone_state
@@ -314,6 +331,18 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
+        // #1395 — même raison que pour `signal_path` ci-dessus : c'est CETTE
+        // réponse que `playAndSync` rend à la première piste. Sans le champ
+        // ici, la divergence « réglé ASIO / joué en WASAPI » n'apparaîtrait
+        // qu'à partir de la seconde (forum #1012, Bilou — déjà lui).
+        if let Some(status) = crate::routes::zones::local_backend_status_value(
+            zone.output_type.as_deref(),
+            &audio_backend_pref,
+        ) {
+            v.as_object_mut()
+                .unwrap()
+                .insert("audio_backend_status".into(), status);
+        }
         v.as_object_mut()
             .unwrap()
             .insert("resolving".into(), json!(zone_state.resolving));
@@ -340,7 +369,7 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     zone
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct PlayRequest {
     track_id: Option<i64>,
     track_ids: Option<Vec<i64>>,
@@ -369,6 +398,79 @@ struct PlayRequest {
     sample_rate: Option<u32>,
     bit_depth: Option<u16>,
     media_format: Option<String>,
+    // #2441 — ce que l'auditeur a demande, DIT par l'appelant.
+    //
+    // Le corps porte deja de quoi reconnaitre un album ou une playlist
+    // (`album_id`, `playlist_id`, `streaming_*_id`) : `contexte_de_lecture`
+    // s'en sert. Mais « Toutes les pistes » depuis une page artiste, ou la
+    // lecture d'un label, arrivent comme une simple liste de `track_ids` —
+    // rien dans le corps ne dit d'ou venait le clic. Ces deux champs laissent
+    // le client l'ENONCER ; ils priment sur toute deduction.
+    context_type: Option<String>,
+    context_id: Option<String>,
+}
+
+/// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
+/// les a enumerees (fil forum 1557, 26/08/2026) : « titre, album, playlist,
+/// artiste, label ».
+///
+/// La liste est ici pour que le serveur refuse une valeur inventee plutot que
+/// de laisser n'importe quelle chaine entrer en base : une colonne libre se
+/// remplirait de variantes ("Album", "albums", "PLAYLIST") et le jour ou une
+/// regle d'affichage sera arbitree, elle porterait sur du sable.
+const CONTEXTES_CONNUS: [&str; 5] = ["track", "album", "playlist", "artist", "label"];
+
+/// Ce que l'auditeur a demande, lu dans le corps de `POST /zones/:id/play`.
+///
+/// FabienM pose la regle au point de clic : « le type pris en compte dans ces
+/// rubriques depend de l'endroit ou l'utilisateur a clique sur "Lire" ». Cette
+/// fonction ne fait que la transcrire — elle ne decide RIEN de ce qui sera
+/// affiche ensuite, ce point n'etant pas arbitre (#2441).
+///
+/// L'ordre suit celui du gestionnaire lui-meme, ou les conteneurs priment sur
+/// la piste : un `POST` qui porte a la fois `album_id` et `track_id` met tout
+/// l'album en file, donc c'est bien l'album qui a ete demande.
+///
+/// `(None, None)` quand rien ne permet de trancher — notamment une liste de
+/// `track_ids` nue, qui peut aussi bien venir d'une page artiste que d'une
+/// selection manuelle. On ecrit alors NULL : une intention devinee est pire
+/// qu'une intention absente.
+fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
+    // 1. L'appelant l'a dit explicitement : sa parole prime sur toute
+    //    deduction. C'est la seule voie pour `artist` et `label`.
+    if let Some(t) = body
+        .context_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| CONTEXTES_CONNUS.contains(t))
+    {
+        return (Some(t.to_string()), body.context_id.clone());
+    }
+
+    // 2. Sinon, ce que le corps trahit deja de lui-meme. Les deux premiers cas
+    //    exigent `source` comme le gestionnaire lui-meme : sans service
+    //    nomme, il ne prend pas la branche streaming, et le contexte doit
+    //    decrire ce qui joue vraiment.
+    if let (Some(_), Some(id)) = (&body.source, &body.streaming_album_id) {
+        return ("album".to_string().into(), Some(id.clone()));
+    }
+    if let (Some(_), Some(id)) = (&body.source, &body.streaming_playlist_id) {
+        return ("playlist".to_string().into(), Some(id.clone()));
+    }
+    if let Some(id) = body.album_id {
+        return ("album".to_string().into(), Some(id.to_string()));
+    }
+    if let Some(id) = body.playlist_id {
+        return ("playlist".to_string().into(), Some(id.to_string()));
+    }
+    if let Some(id) = body.track_id {
+        return ("track".to_string().into(), Some(id.to_string()));
+    }
+    // Piste unique en streaming : `source` + `source_id`, sans track_id.
+    if body.source.is_some() && body.source_id.is_some() && body.track_ids.is_none() {
+        return ("track".to_string().into(), body.source_id.clone());
+    }
+    (None, None)
 }
 
 #[derive(Deserialize)]
@@ -378,7 +480,16 @@ struct SeekRequest {
 
 #[derive(Deserialize)]
 struct VolumeRequest {
-    volume: f64,
+    /// Volume linéaire 0..1, le champ historique. `Option` depuis #1274 pour
+    /// laisser passer une requête qui ne parle qu'en dB — les clients
+    /// déployés, eux, l'envoient toujours et ne changent pas de comportement.
+    volume: Option<f64>,
+    /// Atténuation demandée en dB (≤ 0 ; `0` = 100 %). Exclusif avec `volume`.
+    ///
+    /// C'est le réglage que réclame #1274 : un curseur au pour-cent ne permet
+    /// pas de viser −18 dB, et l'écart entre deux crans varie de 0,09 dB en
+    /// haut d'échelle à 6 dB en bas.
+    volume_db: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -567,24 +678,41 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             }
         }
     }
+    // #1274 — cette charge utile est la sérialisation brute de
+    // `PlaybackState`, qui ne porte que le volume linéaire ; le dB s'ajoute
+    // ici, à partir de ce même nombre. `/zones/{id}/status` est la surface que
+    // les clients interrogent en boucle : l'oublier obligerait chacun à
+    // recalculer, c'est-à-dire à diverger.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "volume_db".into(),
+            json!(tune_core::audio::volume_scale::linear_to_db(
+                zone_state.volume
+            )),
+        );
+    }
     Json(v)
 }
 
-/// Replace a zone's queue, retrying briefly on the transient
-/// "cannot start a transaction within a transaction" error.
+/// Replace a zone's queue after taking the SQLite user-write lane.
 ///
 /// A library scan holds a per-batch write transaction on the shared SQLite
 /// connection (BEGIN IMMEDIATE … COMMIT) while releasing the connection mutex
-/// between statements, so a concurrent `set_queue` sees an open transaction and
-/// fails. Each scan batch commits within ~1–2 s, so a few short async waits let
-/// playback replace the queue instead of failing silently and leaving the user
-/// stuck on the current track (Yves: impossible de quitter le dernier MP3
-/// pendant qu'un scan tourne). Non-transient errors return immediately.
+/// between statements. The process-wide lane makes a concurrent `set_queue`
+/// wait for that logical transaction instead of entering it and failing. The
+/// retries remain as a defensive fallback for an unregistered transaction;
+/// non-transient errors still return immediately.
 async fn set_queue_retrying(
     queue_repo: &PlayQueueRepo,
+    sqlite: bool,
     zone_id: i64,
     track_ids: &[i64],
 ) -> Result<(), String> {
+    let _write_guard = if sqlite {
+        Some(crate::sqlite_write_gate::user_queue().await)
+    } else {
+        None
+    };
     const MAX_ATTEMPTS: usize = 12;
     let mut last_err = String::new();
     for attempt in 0..MAX_ATTEMPTS {
@@ -600,6 +728,83 @@ async fn set_queue_retrying(
         }
     }
     Err(last_err)
+}
+
+#[cfg(test)]
+mod sqlite_scan_queue_arbitration_tests {
+    use super::set_queue_retrying;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::models::Track;
+    use tune_core::db::play_queue_repo::PlayQueueRepo;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::track_repo::TrackRepo;
+
+    /// Yves (#1997): while a scan owned the shared SQLite transaction, Play
+    /// exhausted its retries and cleared the requested queue. The user write
+    /// must now wait for the scan batch, then replace the queue byte-for-byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lecture_attend_le_lot_de_scan_puis_conserve_toute_la_file() {
+        let db = SqliteDb::open_in_memory().expect("SQLite in-memory");
+        db.init_schema().expect("schema");
+        db.execute(
+            "INSERT INTO zones (name, output_type) VALUES ('Main', 'local')",
+            &[],
+        )
+        .expect("zone");
+
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        let tracks = TrackRepo::with_backend(backend.clone());
+        let mut first = Track::new("Premier".into());
+        first.file_path = Some("/music/first.flac".into());
+        let mut second = Track::new("Second".into());
+        second.file_path = Some("/music/second.flac".into());
+        let first_id = tracks.create(&first).expect("first track");
+        let second_id = tracks.create(&second).expect("second track");
+
+        // Simulate the logical scan guard plus its manual transaction. Using
+        // the async acquisition here avoids blocking a Tokio worker in a test;
+        // production scan batches acquire the same gate from spawn_blocking.
+        let scan_guard = crate::sqlite_write_gate::user_queue().await;
+        backend
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("scan begin");
+
+        let queue_backend = backend.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut writer = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let queue = PlayQueueRepo::with_backend(queue_backend);
+            set_queue_retrying(&queue, true, 1, &[first_id, second_id]).await
+        });
+        started_rx.await.expect("queue task started");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut writer)
+                .await
+                .is_err(),
+            "the queue write must wait while the scan transaction is open"
+        );
+
+        backend.execute_batch("COMMIT").expect("scan commit");
+        drop(scan_guard);
+        writer
+            .await
+            .expect("queue task")
+            .expect("queue write after scan");
+
+        let queue = PlayQueueRepo::with_backend(backend);
+        let entries = queue.get_queue(1).expect("persisted queue");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.track_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id],
+            "the requested queue must survive the scan arbitration intact"
+        );
+    }
 }
 
 async fn play(
@@ -742,6 +947,24 @@ async fn play(
                 .into_response();
         }
     };
+
+    // #2441 — poser CE QUE l'auditeur vient de demander sur la session de la
+    // zone, avant toute branche : les huit chemins de lecture ci-dessous
+    // construisent chacun leur `PlayRequest`, et l'orchestrateur relira le
+    // contexte depuis l'etat de zone au moment d'ecrire `listen_history` —
+    // exactement comme il le fait deja pour le profil proprietaire.
+    //
+    // Toujours ecraser, meme avec `(None, None)` : ce geste-ci remplace le
+    // precedent. Sinon une piste jouee seule apres une playlist heriterait de
+    // la playlist.
+    //
+    // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
+    // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
+    let (contexte_type, contexte_id) = contexte_de_lecture(&body);
+    state
+        .playback
+        .set_session_context(zone_id, contexte_type, contexte_id)
+        .await;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
@@ -1131,7 +1354,14 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    match set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
+    match set_queue_retrying(
+        &queue_repo,
+        state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
+        zone_id,
+        &track_ids,
+    )
+    .await
+    {
         Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
         Err(e) => {
             // Never proceed on the STALE queue: track 1 would play now and the
@@ -1578,13 +1808,28 @@ async fn set_volume(
     // web ne protège de rien — un autre client, une télécommande ou un appel
     // direct passeraient à côté. La valeur *effective* est renvoyée, ce qui
     // fait remonter le curseur au lieu de le laisser mentir.
-    let volume =
-        tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, body.volume as f32)
-            as f64;
-    if (volume - body.volume).abs() > f64::EPSILON {
+    //
+    // #1274 — la demande peut arriver en linéaire (`volume`) ou en dB
+    // (`volume_db`), jamais dans les deux. La conversion est faite dans
+    // `volume_scale`, une seule fois pour tout le serveur ; ici on ne fait
+    // que traduire un refus en 400 plutôt que de choisir un volume à la place
+    // de l'utilisateur.
+    let demande =
+        match tune_core::audio::volume_scale::demande_lineaire(body.volume, body.volume_db) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_volume", "message": motif })),
+                )
+                    .into_response();
+            }
+        };
+    let volume = tune_core::audio::audiophile::effective_volume(&state.backend, zone_id, demande);
+    if (volume - demande).abs() > f64::EPSILON {
         tracing::debug!(
             zone_id,
-            requested = body.volume,
+            requested = demande,
             applied = volume,
             "volume_forced_by_audiophile_lock"
         );
@@ -1595,7 +1840,15 @@ async fn set_volume(
         .set_volume(zone_id, volume, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "volume": volume })).into_response(),
+        // #1274 — la réponse rend la valeur EFFECTIVE dans les deux unités.
+        // Un client qui règle en dB doit pouvoir constater ce qu'il a obtenu
+        // sans refaire le calcul, et surtout constater quand le verrou PURE
+        // l'a remonté à 100 % : `volume_db` vaudra alors 0.
+        Ok(()) => Json(json!({
+            "volume": volume,
+            "volume_db": tune_core::audio::volume_scale::linear_to_db(volume),
+        }))
+        .into_response(),
         Err(error) => output_command_error_response(error),
     }
 }
@@ -1924,10 +2177,13 @@ async fn queue_add(
     }
 
     let count = inputs.len();
-    if let Err(e) = queue_repo.insert_at(zone_id, &inputs, body.position) {
-        warn!(zone_id, error = %e, "queue_insert_failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
+    let start = match queue_repo.insert_at(zone_id, &inputs, body.position) {
+        Ok(start) => start,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_insert_failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    };
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
     state
@@ -1938,23 +2194,91 @@ async fn queue_add(
     // Le succès aussi doit laisser une trace : c'est elle qui permet de dire à
     // un utilisateur « votre ajout est bien arrivé, à telle position » plutôt
     // que de lui demander de réessayer. `position` vaut `None` pour un ajout
-    // en fin de file, `Some(n)` pour un « Lire ensuite ».
+    // en fin de file, `Some(n)` pour un « Lire ensuite » ; `inserted_at` dit où
+    // la piste a RÉELLEMENT atterri, ce qui n'est pas la même chose (#2079).
     info!(
         zone_id,
         added = count,
         position = ?body.position,
+        inserted_at = ?start,
         queue_length = total,
         "queue_add_ok"
     );
+    let enfiles = decrire_enfilage(&inputs, start);
     state.event_bus.emit(
         "playback.queue.track_added",
-        json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
+        json!({
+            "zone_id": zone_id,
+            "added": count,
+            "queue_length": total,
+            "position": start,
+        }),
     );
     (
         StatusCode::CREATED,
-        Json(json!({ "added": count, "queue_length": total })),
+        // `added` + `queue_length` ne disaient QUE « quelque chose est parti ».
+        // Sandro (#2079, fil forum 1493) allait rouvrir la file après chaque
+        // « Lecture suivante » parce que rien dans la réponse ne nommait la
+        // piste ni ne disait où elle avait atterri — et la parade naturelle,
+        // recliquer, l'enfilait deux fois.
+        //
+        // Les deux champs sont ADDITIFS : le statut reste 201, `added` et
+        // `queue_length` gardent leur sens et leur place, donc aucun client
+        // déployé ne change de comportement.
+        //
+        // `position` est la position EFFECTIVE, pas celle demandée : le dépôt
+        // ramène toute position hors file en fin de file, si bien qu'un « juste
+        // après la piste en cours » calculé sur une file périmée réussit… en
+        // ajoutant à la fin. Renvoyer la demande plutôt que le résultat
+        // rendrait ces deux cas identiques, ce qui est exactement le défaut.
+        Json(json!({
+            "added": count,
+            "queue_length": total,
+            "position": start,
+            "items": enfiles,
+        })),
     )
         .into_response()
+}
+
+/// Ce qui vient d'être enfilé, une entrée par ligne insérée, dans l'ordre des
+/// positions.
+///
+/// Dérivé de `inputs` plutôt que construit au fil des `push` : les trois
+/// chemins d'alimentation (piste de service isolée, lot `tracks[]`, pistes
+/// locales dont l'album) écriraient sinon chacun leur description, et la
+/// quatrième oublierait la sienne — un « enfilé » muet de plus.
+///
+/// N'interroge RIEN : tout est déjà résolu dans `inputs` (le titre d'une piste
+/// de service y est passé par `resolve_streaming_queue_meta`). Un album de
+/// trente pistes ne coûte donc pas trente requêtes de plus.
+fn decrire_enfilage(inputs: &[QueueInput], start: Option<i64>) -> Vec<serde_json::Value> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let position = start.map(|s| s + i as i64);
+            match item {
+                QueueInput::Local { track_id } => json!({
+                    "position": position,
+                    "track_id": track_id,
+                }),
+                QueueInput::Streaming {
+                    source,
+                    source_id,
+                    title,
+                    artist,
+                    ..
+                } => json!({
+                    "position": position,
+                    "source": source,
+                    "source_id": source_id,
+                    "title": title,
+                    "artist": artist,
+                }),
+            }
+        })
+        .collect()
 }
 
 async fn queue_move(
@@ -2397,13 +2721,11 @@ struct CrossfadeSettings {
 
 /// Read the persisted crossfade settings for a zone.
 ///
-/// NOTE: crossfade is not yet applied by the playback engine (the
-/// `CrossfadeHandler` in tune-core is not wired into the transition path).
-/// This endpoint only persists/returns the user's preference so the UI can
-/// round-trip it without a 405 — actually applying the fade is a follow-up.
+/// Crossfade is not applied by the playback engine: report the capability as
+/// unavailable and never echo a stale persisted preference as if it were live.
 async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let enabled = settings
+    let requested_enabled = settings
         .get(&format!("crossfade_enabled:{zone_id}"))
         .ok()
         .flatten()
@@ -2416,31 +2738,66 @@ async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) 
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(3.0);
     Json(json!({
-        "enabled": enabled,
+        "available": false,
+        "enabled": false,
+        "requested_enabled": requested_enabled,
         "duration": duration,
     }))
+}
+
+fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
+    if body.enabled {
+        return Err("crossfade_unavailable");
+    }
+    Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
 }
 
 async fn set_crossfade(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    let duration = match validate_crossfade_update(&body) {
+        Ok(duration) => duration,
+        Err(code) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": code,
+                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let duration = body.duration.unwrap_or(3.0);
-    let _ = settings.set(
-        &format!("crossfade_enabled:{zone_id}"),
-        &body.enabled.to_string(),
-    );
-    let _ = settings.set(
+    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
+        error!(zone_id, %error, "crossfade_disable_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = settings.set(
         &format!("crossfade_duration:{zone_id}"),
         &duration.to_string(),
-    );
+    ) {
+        error!(zone_id, %error, "crossfade_duration_persist_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "crossfade_persist_failed"})),
+        )
+            .into_response();
+    }
     Json(json!({
         "zone_id": zone_id,
-        "crossfade_enabled": body.enabled,
+        "available": false,
+        "crossfade_enabled": false,
         "crossfade_duration": duration,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2560,7 +2917,7 @@ async fn do_transfer(
     // symptôme que le trim par renderer corrige, autant ne plus l'aggraver).
     let target_volume = target_db_zone
         .as_ref()
-        .map(|z| f64::from(z.volume) / 100.0)
+        .map(|z| z.volume / 100.0)
         .unwrap_or(current.volume);
     state.playback.set_volume(target_zone, target_volume).await;
     state
@@ -2657,7 +3014,7 @@ async fn get_alarms(
     let rows = state
         .backend
         .query_many(&sql, &[&zone_id as &dyn ToSqlValue])
-        .unwrap_or_default();
+        .ou_defaut_journalise();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -2877,30 +3234,50 @@ async fn save_queue_as_pin(
 // ---------------------------------------------------------------------------
 
 async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("zone_{zone_id}_audiophile");
-    let val = settings
-        .get(&key)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(json!({ "enabled": false }));
-    Json(val)
+    Json(json!({
+        "enabled": tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id),
+        "lock_volume": tune_core::audio::audiophile::volume_lock_override(
+            &state.backend,
+            zone_id,
+        ),
+        "effective_lock_volume": tune_core::audio::audiophile::volume_lock_enabled(
+            &state.backend,
+            zone_id,
+        ),
+    }))
+}
+
+/// Trois états JSON pour une surcharge : champ absent, `null` (hériter), ou
+/// booléen explicite. `Option<Option<bool>>` sans désérialiseur confondrait les
+/// deux premiers et empêcherait de revenir au réglage global.
+fn nested_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 struct AudiophileChange {
-    enabled: bool,
+    /// Absent quand la requête ne change que la portée du verrou.
+    enabled: Option<bool>,
+    /// `null` = hériter du réglage global, booléen = surcharge de cette zone.
+    #[serde(default, deserialize_with = "nested_option")]
+    lock_volume: Option<Option<bool>>,
     #[serde(default)]
     confirm_full_volume: bool,
 }
 
-/// L'activation de PURE avec le verrou armé est une commande de volume à
-/// 100 %, pas un simple changement d'affichage. Le serveur impose donc la
-/// confirmation à tous les clients, y compris une télécommande ou un appel
-/// direct qui contournerait le client web (#2445).
-fn full_volume_confirmation_required(lock_enabled: bool, body: &AudiophileChange) -> bool {
-    lock_enabled && body.enabled && !body.confirm_full_volume
+/// Toute transition vers « PURE + verrou effectif » est une commande à 100 %,
+/// qu'elle vienne de l'activation de PURE ou de la surcharge par zone. Une
+/// requête qui ne change rien ne redemande pas une confirmation (#2526).
+fn full_volume_confirmation_required(
+    was_full_volume: bool,
+    will_be_full_volume: bool,
+    confirmed: bool,
+) -> bool {
+    !was_full_volume && will_be_full_volume && !confirmed
 }
 
 async fn set_audiophile(
@@ -2908,8 +3285,23 @@ async fn set_audiophile(
     Path(zone_id): Path<i64>,
     Json(body): Json<AudiophileChange>,
 ) -> axum::response::Response {
-    let lock_enabled = tune_core::audio::audiophile::volume_lock_enabled(&state.backend);
-    if full_volume_confirmation_required(lock_enabled, &body) {
+    let current_enabled = tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
+    let current_lock = tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id);
+    let current_override =
+        tune_core::audio::audiophile::volume_lock_override(&state.backend, zone_id);
+    let target_enabled = body.enabled.unwrap_or(current_enabled);
+    let target_override = body.lock_volume.unwrap_or(current_override);
+    let target_lock = target_override.unwrap_or_else(|| {
+        tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
+    });
+    let was_full_volume = current_enabled && current_lock;
+    let will_be_full_volume = target_enabled && target_lock;
+
+    if full_volume_confirmation_required(
+        was_full_volume,
+        will_be_full_volume,
+        body.confirm_full_volume,
+    ) {
         warn!(zone_id, "audiophile_full_volume_confirmation_required");
         return (
             StatusCode::CONFLICT,
@@ -2924,7 +3316,7 @@ async fn set_audiophile(
     // Verrou armé : passer en PURE remonte le volume tout de suite. Sans ça,
     // la zone resterait à 20 % avec un curseur gelé sur 20 % — le pire des
     // deux mondes, ni bit-perfect ni réglable.
-    if lock_enabled && body.enabled {
+    if !was_full_volume && will_be_full_volume {
         let device_id = get_zone_device_id(&state, zone_id);
         if let Err(error) = state
             .orchestrator
@@ -2937,11 +3329,24 @@ async fn set_audiophile(
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
+    let mut stored = serde_json::Map::new();
+    stored.insert("enabled".into(), json!(target_enabled));
+    if let Some(lock_volume) = target_override {
+        stored.insert("lock_volume".into(), json!(lock_volume));
+    }
     // Le témoin de confirmation autorise cette seule requête : il ne devient
     // jamais un réglage persistant qui pourrait autoriser un saut ultérieur.
-    settings
-        .set(&key, &json!({ "enabled": body.enabled }).to_string())
-        .ok();
+    if let Err(error) = settings.set(&key, &Value::Object(stored).to_string()) {
+        error!(zone_id, %error, "audiophile_setting_write_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "audiophile_setting_write_failed",
+                "message": error,
+            })),
+        )
+            .into_response();
+    }
 
     // Repousser l'état vers la sortie qui joue. Sans cet appel, la clé était
     // écrite, la route répondait un succès, et la bascule n'atteignait le son
@@ -2949,10 +3354,16 @@ async fn set_audiophile(
     // ReplayGain continuaient de travailler pendant que le badge PURE
     // s'allumait (#1986). Même famille que #1725 (EQ) et #1786 (crossfeed) —
     // et le garde-fou de `routes/mod.rs` couvre désormais cette clé aussi.
-    let applique_a_chaud = state.orchestrator.apply_audiophile_change(zone_id).await;
+    let applique_a_chaud = if body.enabled.is_some() {
+        state.orchestrator.apply_audiophile_change(zone_id).await
+    } else {
+        false
+    };
     info!(
         zone_id,
-        enabled = body.enabled,
+        enabled = target_enabled,
+        lock_volume = ?target_override,
+        effective_lock_volume = target_lock,
         applique_a_chaud,
         "audiophile_mode_set"
     );
@@ -2961,7 +3372,9 @@ async fn set_audiophile(
     // audible MAINTENANT, ou seulement au prochain flux ? Le témoin de
     // confirmation n'est volontairement jamais renvoyé ni persisté.
     Json(json!({
-        "enabled": body.enabled,
+        "enabled": target_enabled,
+        "lock_volume": target_override,
+        "effective_lock_volume": target_lock,
         "applied_live": applique_a_chaud,
     }))
     .into_response()
@@ -3058,10 +3471,85 @@ pub struct ShuffleAllQuery {
     artist_id: Option<i64>,
 }
 
-/// Maximum number of tracks a single "shuffle all" enqueues. Enqueuing an entire
-/// large library (Yves, 50k) froze the web UI and gains nothing musically — a few
-/// hundred randomly-shuffled tracks is a "shuffle all" for all practical use.
-const SHUFFLE_MAX_TRACKS: i64 = 500;
+// Combien de pistes une lecture aléatoire enfile au maximum.
+//
+// C'était une constante à 500, posée pour fermer le gel d'interface de Jean
+// Valjean (30 000 pistes, #2228). C'est désormais un RÉGLAGE, parce que le
+// besoin INVERSE existe aussi : william veut lire plus de 2 400 pistes et se
+// fait tronquer à 500 sans que rien ne le lui dise (fil 1620, #2901).
+//
+// Le défaut ne bouge pas : qui n'y touche pas garde exactement le
+// comportement de #2228. Bornes, mesures et justification du maximum sont
+// dans `tune_core::playback::queue`.
+use tune_core::playback::queue::shuffle_max_tracks;
+
+/// Une sélection que la base a déjà bornée à `plafond`.
+///
+/// `search()` s'arrête à la limite qu'on lui donne : une liste PLEINE veut
+/// dire « il y en avait peut-être davantage », et on ne sait pas combien. On
+/// rend donc `None` plutôt qu'un total qui serait faux — la même règle que
+/// #2250 : la valeur mesurée, ou rien.
+///
+/// Le plafond est un PARAMÈTRE et non plus une constante : le comparer à une
+/// constante pendant qu'un autre chemin tronque à la valeur configurée
+/// rendrait `capped` faux dès que l'utilisateur relève le réglage.
+fn selection_bornee(
+    pistes: Option<Vec<tune_core::db::models::Track>>,
+    plafond: i64,
+) -> (Vec<i64>, Option<i64>) {
+    let ids: Vec<i64> = pistes
+        .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+        .unwrap_or_default();
+    let total = ((ids.len() as i64) < plafond).then_some(ids.len() as i64);
+    (ids, total)
+}
+
+/// Ce que la lecture aléatoire peut honnêtement dire de sa sélection :
+/// `(a-t-on plafonné, sur combien)`.
+///
+/// Le plafond RESTE — le retirer rouvre le gel d'interface qu'il a été posé
+/// pour fermer (Jean Valjean, 30 000 pistes, #2228). Ce qui doit cesser,
+/// c'est le silence : la réponse annonçait `track_count: 500` sans rien qui
+/// distingue « votre bibliothèque contient 500 pistes » de « elle en contient
+/// 30 412 et j'en ai pris 500 », pendant que le bouton, lui, promet TOUT.
+///
+/// Un total n'est jamais deviné. Sélection de taille inconnue : elle est
+/// arrivée bornée, donc on a bien plafonné — on le dit, sans prétendre savoir
+/// sur combien.
+fn compte_rendu_selection(disponibles: Option<i64>, enfilees: usize) -> (bool, Option<i64>) {
+    match disponibles {
+        Some(n) => (n > enfilees as i64, Some(n)),
+        None => (true, None),
+    }
+}
+
+/// Charge utile de `shuffle_all`.
+///
+/// `track_count` est déjà lu par le client (`LibraryView.svelte`,
+/// `library.shufflePlaying` → « Lecture aléatoire : N pistes »).
+fn reponse_shuffle(
+    zone_id: i64,
+    enfilees: usize,
+    disponibles: Option<i64>,
+    output_sent: bool,
+) -> Value {
+    let (plafonne, total) = compte_rendu_selection(disponibles, enfilees);
+    let mut payload = json!({
+        "zone_id": zone_id,
+        "track_count": enfilees,
+        "tracks_queued": enfilees,
+        "output_sent": output_sent,
+        "capped": plafonne,
+    });
+    // Absent, pas `null` : un total qu'on n'a pas mesuré ne s'annonce pas.
+    if let Some(n) = total {
+        payload
+            .as_object_mut()
+            .expect("json! object")
+            .insert("available_track_count".into(), json!(n));
+    }
+    payload
+}
 
 pub async fn shuffle_all(
     State(state): State<AppState>,
@@ -3069,45 +3557,57 @@ pub async fn shuffle_all(
 ) -> impl IntoResponse {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    // Lu UNE fois par requête, puis passé à toutes les branches. Les cinq
+    // chemins (album, artiste, recherche, genre, bibliothèque entière) et la
+    // troncature finale doivent voir le MÊME plafond : c'est aussi la valeur
+    // sur laquelle la réponse fonde son `capped`.
+    let plafond = shuffle_max_tracks(&state.backend);
 
     // Honor the current library filter context so the shuffle applies to the
     // visible results, not the whole library, and target the caller's zone
     // (Sergio: shuffle from a search result did nothing / played nowhere).
-    let mut all_ids: Vec<i64> = if let Some(aid) = q.album_id {
-        track_repo
+    //
+    // `disponibles` porte la taille RÉELLE de la sélection — mais seulement
+    // là où elle est MESURÉE. `None` veut dire « on ne le sait pas », et dans
+    // ce cas on ne l'invente pas : c'est la même règle que #2250 sur la
+    // résolution annoncée, la valeur qu'on a ou rien.
+    let (mut all_ids, disponibles): (Vec<i64>, Option<i64>) = if let Some(aid) = q.album_id {
+        let ids: Vec<i64> = track_repo
             .list_by_album(aid)
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let n = ids.len() as i64;
+        (ids, Some(n))
     } else if let Some(arid) = q.artist_id {
-        track_repo
+        let ids: Vec<i64> = track_repo
             .list_by_artist(arid)
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let n = ids.len() as i64;
+        (ids, Some(n))
     } else if let Some(sq) = q
         .search_query
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        track_repo
-            .search(sq, 500)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+        selection_bornee(track_repo.search(sq, plafond).ok(), plafond)
     } else if let Some(g) = q.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        track_repo
-            .search(g, 500)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default()
+        selection_bornee(track_repo.search(g, plafond).ok(), plafond)
     } else {
-        // Whole-library shuffle: take a random SHUFFLE_MAX_TRACKS sample straight
+        // Whole-library shuffle: take a random `plafond`-sized sample straight
         // from the DB rather than every row. Enqueuing an entire 50k-track library
         // froze the web UI (rendering the queue) and served no purpose — a random
         // few-hundred is a "shuffle all" in every practical sense (Yves, 50k
         // library). random_ids already returns a random subset, so we don't load
         // the whole table just to discard most of it.
-        track_repo
-            .random_ids(SHUFFLE_MAX_TRACKS)
-            .unwrap_or_default()
+        //
+        // C'est la seule branche où le total est connu sans coût : la
+        // bibliothèque entière se compte.
+        (
+            track_repo.random_ids(plafond).unwrap_or_default(),
+            track_repo.count().ok(),
+        )
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
@@ -3129,7 +3629,7 @@ pub async fn shuffle_all(
 
     // Cap the enqueued set uniformly (a filtered path — album/artist — could also
     // be large). A queue of a few hundred shuffled tracks never freezes the UI.
-    all_ids.truncate(SHUFFLE_MAX_TRACKS as usize);
+    all_ids.truncate(plafond as usize);
 
     let zone_id = q.zone_id.unwrap_or(1);
     // Was `.ok()` — the only call site that swallowed a set_queue failure
@@ -3143,7 +3643,14 @@ pub async fn shuffle_all(
     // immediatement ici, alors que le chemin « Lire » s'accordait 2,4 s
     // (#1997). Une lecture aleatoire lancee pendant un scan vidait donc la
     // file sans meme attendre.
-    match set_queue_retrying(&queue_repo, zone_id, &all_ids).await {
+    match set_queue_retrying(
+        &queue_repo,
+        state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
+        zone_id,
+        &all_ids,
+    )
+    .await
+    {
         Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
         Err(e) => {
             warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
@@ -3180,7 +3687,7 @@ pub async fn shuffle_all(
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
-            let mut resp = json!({ "zone_id": zone_id, "track_count": all_ids.len(), "tracks_queued": all_ids.len(), "output_sent": result.output_sent });
+            let mut resp = reponse_shuffle(zone_id, all_ids.len(), disponibles, result.output_sent);
             if let Some(ref err) = result.error {
                 resp.as_object_mut()
                     .unwrap()
@@ -3269,6 +3776,180 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
         .into_response()
 }
 
+/// Contre-épreuve du booléen envoyé aux clients pour le bouton « suivant ».
+///
+/// Le cas discriminant est une file aléatoire : la position brute peut être la
+/// dernière alors que la permutation a encore une suite, ou l'inverse.  Le
+/// contrat doit suivre la décision de l'endpoint, pas reconstruire une seconde
+/// règle depuis la file visible (#2337).
+#[cfg(test)]
+mod contrat_suivant_tests {
+    use super::can_skip_next;
+    use tune_core::playback::{RepeatMode, ZoneState};
+
+    #[test]
+    fn la_fin_reelle_du_tirage_desactive_meme_si_la_position_brute_n_est_pas_la_derniere() {
+        let state = ZoneState {
+            queue_position: 0,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 4,
+            ..Default::default()
+        };
+
+        assert!(!can_skip_next(&state));
+    }
+
+    #[test]
+    fn la_position_brute_finale_reste_active_si_le_tirage_a_une_suite() {
+        let state = ZoneState {
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 4, 1, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+
+        assert!(can_skip_next(&state));
+    }
+
+    #[test]
+    fn le_saut_manuel_sous_repeat_one_reboucle_comme_l_endpoint() {
+        let state = ZoneState {
+            queue_position: 0,
+            queue_length: 1,
+            repeat: RepeatMode::One,
+            ..Default::default()
+        };
+
+        assert!(can_skip_next(&state));
+    }
+}
+
+/// Le plafond de la lecture aléatoire doit être DIT, pas seulement appliqué.
+///
+/// Rappel du fil 1096 (Jean Valjean, #2228) : une file de 30 000 pistes gelait
+/// l'interface, d'où le plafond. Il RESTE, et son défaut reste 500 — le
+/// retirer rouvrirait ce gel. Depuis #2901 il est réglable jusqu'à 5 000
+/// (borne mesurée) pour ceux qui veulent une file plus longue, mais la
+/// réponse doit dire quand elle a tronqué, quelle que soit la valeur.
+#[cfg(test)]
+mod plafond_aleatoire_tests {
+    use super::{compte_rendu_selection, reponse_shuffle, selection_bornee};
+    use tune_core::playback::queue::SHUFFLE_MAX_TRACKS_DEFAULT;
+
+    /// Le cas de Jean Valjean : 30 412 pistes en bibliothèque, 500 enfilées.
+    /// La réponse doit porter les deux nombres, pas seulement le second.
+    #[test]
+    fn une_bibliotheque_plus_grande_que_le_plafond_dit_les_deux_nombres() {
+        let (plafonne, disponibles) = compte_rendu_selection(Some(30_412), 500);
+        assert!(plafonne);
+        assert_eq!(disponibles, Some(30_412));
+
+        let payload = reponse_shuffle(1, 500, Some(30_412), true);
+        assert_eq!(payload["track_count"], 500);
+        assert_eq!(
+            payload["capped"], true,
+            "la réponse doit DIRE qu'elle a plafonné : sans ce champ, rien ne \
+             distingue « la bibliothèque fait 500 pistes » de « elle en fait \
+             30 412 et j'en ai pris 500 » (#2228)"
+        );
+        assert_eq!(
+            payload["available_track_count"], 30_412,
+            "le total mesuré doit être annoncé, sinon le client ne peut pas \
+             cesser de promettre « toute la bibliothèque »"
+        );
+    }
+
+    /// Une bibliothèque plus petite que le plafond n'a rien été plafonné du
+    /// tout : le dire serait une seconde forme de mensonge.
+    #[test]
+    fn une_bibliotheque_plus_petite_que_le_plafond_n_annonce_aucun_plafond() {
+        let (plafonne, disponibles) = compte_rendu_selection(Some(312), 312);
+        assert!(!plafonne);
+        assert_eq!(disponibles, Some(312));
+
+        let payload = reponse_shuffle(1, 312, Some(312), true);
+        assert_eq!(payload["capped"], false);
+        assert_eq!(payload["available_track_count"], 312);
+    }
+
+    /// Sélection de taille INCONNUE — une recherche revenue pleine.
+    ///
+    /// On a bien plafonné, et on l'annonce ; mais on ne sait pas sur combien,
+    /// et on n'invente donc AUCUN total. C'est la règle de #2250 appliquée à
+    /// un compte au lieu d'une résolution : la valeur mesurée, ou rien.
+    #[test]
+    fn une_selection_de_taille_inconnue_n_invente_pas_son_total() {
+        let (plafonne, disponibles) = compte_rendu_selection(None, 500);
+        assert!(plafonne);
+        assert_eq!(disponibles, None);
+
+        let payload = reponse_shuffle(1, 500, None, true);
+        assert_eq!(payload["capped"], true);
+        assert!(
+            payload.get("available_track_count").is_none()
+                || payload["available_track_count"].is_null(),
+            "un total qu'on n'a pas mesuré ne doit pas être annoncé, \
+             fût-ce à 500 : ce serait un chiffre inventé"
+        );
+    }
+
+    /// `search()` s'arrête à la limite qu'on lui donne : une liste pleine ne
+    /// prouve pas que la sélection faisait exactement cette taille.
+    #[test]
+    fn une_recherche_revenue_pleine_ne_connait_pas_sa_taille() {
+        let pistes = |n: i64| -> Vec<tune_core::db::models::Track> {
+            (0..n)
+                .map(|i| {
+                    let mut t = tune_core::db::models::Track::new(format!("piste {i}"));
+                    t.id = Some(i + 1);
+                    t
+                })
+                .collect()
+        };
+        let (ids, total) = selection_bornee(
+            Some(pistes(SHUFFLE_MAX_TRACKS_DEFAULT)),
+            SHUFFLE_MAX_TRACKS_DEFAULT,
+        );
+        assert_eq!(ids.len(), SHUFFLE_MAX_TRACKS_DEFAULT as usize);
+        assert_eq!(total, None, "liste pleine ⇒ taille réelle inconnue");
+        let mut courte = tune_core::db::models::Track::new("unique".into());
+        courte.id = Some(7);
+        let (ids, total) = selection_bornee(Some(vec![courte]), SHUFFLE_MAX_TRACKS_DEFAULT);
+        assert_eq!(ids, vec![7]);
+        assert_eq!(total, Some(1), "liste incomplète ⇒ taille réelle connue");
+        // Le plafond RELEVÉ : la même liste de 500, sous un plafond de 2 000,
+        // n'est plus pleine — elle connaît donc sa taille, et `capped` sera
+        // faux. Une comparaison restée sur la constante 500 dirait l'inverse,
+        // et la lecture aléatoire annoncerait un plafond qu'elle n'a pas posé.
+        let (ids, total) = selection_bornee(Some(pistes(SHUFFLE_MAX_TRACKS_DEFAULT)), 2_000);
+        assert_eq!(ids.len(), 500);
+        assert_eq!(
+            total,
+            Some(500),
+            "sous un plafond relevé, une liste de 500 n'est plus bornée : \
+             l'annoncer « plafonnée » serait un mensonge de plus"
+        );
+    }
+
+    /// Garde-fou de non-régression : le client lit `track_count` pour son
+    /// message « Lecture aléatoire : N pistes ». Les nouveaux champs ne
+    /// doivent rien déplacer.
+    #[test]
+    fn les_champs_deja_lus_par_le_client_ne_bougent_pas() {
+        let payload = reponse_shuffle(4, 500, Some(30_412), false);
+        assert_eq!(payload["zone_id"], 4);
+        assert_eq!(payload["track_count"], 500);
+        assert_eq!(payload["tracks_queued"], 500);
+        assert_eq!(payload["output_sent"], false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AudiophileChange;
@@ -3284,35 +3965,28 @@ mod tests {
 
     #[test]
     fn pure_avec_verrou_refuse_toute_activation_non_confirmee() {
-        let activation = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: false,
-        };
-        assert!(full_volume_confirmation_required(true, &activation));
-
-        let confirmation = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: true,
-        };
-        assert!(!full_volume_confirmation_required(true, &confirmation));
+        assert!(full_volume_confirmation_required(false, true, false));
+        assert!(!full_volume_confirmation_required(false, true, true));
     }
 
     #[test]
     fn aucune_confirmation_n_est_demandee_sans_montee_de_volume() {
-        let activation_sans_verrou = AudiophileChange {
-            enabled: true,
-            confirm_full_volume: false,
-        };
-        assert!(!full_volume_confirmation_required(
-            false,
-            &activation_sans_verrou
-        ));
+        assert!(!full_volume_confirmation_required(false, false, false));
+        assert!(!full_volume_confirmation_required(true, true, false));
+        assert!(!full_volume_confirmation_required(true, false, false));
+    }
 
-        let desactivation = AudiophileChange {
-            enabled: false,
-            confirm_full_volume: false,
-        };
-        assert!(!full_volume_confirmation_required(true, &desactivation));
+    #[test]
+    fn surcharge_de_verrou_distingue_absent_heritage_et_booleen() {
+        let absent: AudiophileChange = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(absent.enabled, None);
+        assert_eq!(absent.lock_volume, None);
+
+        let heritage: AudiophileChange = serde_json::from_str(r#"{"lock_volume":null}"#).unwrap();
+        assert_eq!(heritage.lock_volume, Some(None));
+
+        let force: AudiophileChange = serde_json::from_str(r#"{"lock_volume":true}"#).unwrap();
+        assert_eq!(force.lock_volume, Some(Some(true)));
     }
 
     #[test]
@@ -3614,5 +4288,158 @@ mod tests_prereglage {
     fn sans_prereglage_il_ny_a_rien_a_appliquer() {
         assert_eq!(prereglage_a_appliquer(None, false), None);
         assert_eq!(prereglage_a_appliquer(None, true), None);
+    }
+}
+
+#[cfg(test)]
+mod tests_contexte_de_lecture {
+    use super::{PlayRequest, contexte_de_lecture};
+
+    /// #2441 — FabienM, fil 1557 : « si je choisis de jouer une playlist
+    /// complete, je m'attends a voir cette playlist ». Aujourd'hui le serveur
+    /// recoit bien `playlist_id` et n'en garde RIEN : l'ecoute est ecrite dans
+    /// `listen_history` sans la moindre trace de son origine.
+    #[test]
+    fn une_playlist_locale_est_reconnue() {
+        let body = PlayRequest {
+            playlist_id: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("playlist".into()), Some("12".into())),
+            "le corps portait `playlist_id` et l'intention s'est perdue (#2441)"
+        );
+    }
+
+    /// « si je choisis de jouer un album complet, je m'attends a voir cet
+    /// album ». Le conteneur prime sur la piste : un corps qui porte les deux
+    /// met tout l'album en file, c'est donc l'album qui a ete demande — la
+    /// meme priorite que le gestionnaire applique pour construire la file.
+    #[test]
+    fn un_album_prime_sur_la_piste_du_meme_corps() {
+        let body = PlayRequest {
+            album_id: Some(7),
+            track_id: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()))
+        );
+    }
+
+    /// « si je choisis d'ecouter un titre alors je m'attends a voir ce titre ».
+    #[test]
+    fn une_piste_seule_dit_track() {
+        let body = PlayRequest {
+            track_id: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("track".into()), Some("99".into()))
+        );
+    }
+
+    /// Un album de streaming garde l'identifiant du service, pas un entier :
+    /// c'est pour cela que la colonne est TEXT.
+    #[test]
+    fn un_album_de_streaming_garde_son_identifiant_texte() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            streaming_album_id: Some("0060254735822".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("0060254735822".into()))
+        );
+    }
+
+    /// « Toutes les pistes » depuis une page artiste arrive comme une liste de
+    /// `track_ids` nue — indiscernable d'une selection manuelle. On n'invente
+    /// pas : NULL. Le client devra ENONCER `context_type` pour ce cas, ce que
+    /// le champ explicite permet.
+    #[test]
+    fn une_liste_de_pistes_nue_ne_se_devine_pas() {
+        let body = PlayRequest {
+            track_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (None, None),
+            "une intention devinee est pire qu'une intention absente"
+        );
+    }
+
+    /// La parole de l'appelant prime : c'est la seule voie pour `artist` et
+    /// `label`, les deux types que le corps ne trahit jamais tout seul.
+    #[test]
+    fn le_type_annonce_prime_sur_la_deduction() {
+        let body = PlayRequest {
+            context_type: Some("artist".into()),
+            context_id: Some("451".into()),
+            track_ids: Some(vec![1, 2, 3]),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("artist".into()), Some("451".into()))
+        );
+    }
+
+    /// Une valeur hors des cinq types enumeres par le testeur est ignoree, pas
+    /// stockee : sinon la colonne se remplirait de variantes et toute regle
+    /// d'affichage future porterait sur du sable. On retombe sur la deduction.
+    #[test]
+    fn un_type_inconnu_est_ignore() {
+        let body = PlayRequest {
+            context_type: Some("Playlist".into()),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_crossfade_indisponible {
+    use super::{CrossfadeSettings, validate_crossfade_update};
+
+    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
+    /// n'en tient compte est un faux succès. L'activation doit échouer avant
+    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    #[test]
+    fn activer_le_faux_crossfade_est_refuse() {
+        let body = CrossfadeSettings {
+            enabled: true,
+            duration: Some(5.0),
+        };
+
+        assert_eq!(
+            validate_crossfade_update(&body),
+            Err("crossfade_unavailable")
+        );
+    }
+
+    #[test]
+    fn desactiver_reste_possible_et_borne_la_preference_de_duree() {
+        let too_long = CrossfadeSettings {
+            enabled: false,
+            duration: Some(99.0),
+        };
+        let default = CrossfadeSettings {
+            enabled: false,
+            duration: None,
+        };
+
+        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
+        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
     }
 }

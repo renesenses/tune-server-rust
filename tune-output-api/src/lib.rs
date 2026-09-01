@@ -228,6 +228,17 @@ pub struct OutputSignalPathStatus {
     pub reasons: Vec<OutputSignalReason>,
 }
 
+/// Compteurs DSP réellement observés par la sortie pendant la piste courante.
+///
+/// Séparé de [`OutputSignalPathStatus`] pour ne pas casser les plugins externes
+/// qui construisent encore cette structure par littéral. Le trait expose une
+/// méthode à défaut `None`, donc l'ajout reste compatible côté source (#2212).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDspMetrics {
+    pub eq_overs: u64,
+    pub eq_non_finite_samples: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSampleTransport {
@@ -552,6 +563,11 @@ pub trait OutputTarget: Send + Sync {
     fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
         None
     }
+
+    /// Compteurs DSP de la piste courante, quand la sortie peut les observer.
+    fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
+        None
+    }
 }
 
 /// A source of out-of-tree outputs, handed to the server at startup.
@@ -568,6 +584,23 @@ pub trait OutputTarget: Send + Sync {
 pub trait OutputProvider: Send + Sync {
     /// Short provider name for logs (e.g. "diretta").
     fn provider_name(&self) -> &str;
+
+    /// The paid module id this provider needs (e.g. `"diretta"`), or `None`
+    /// for a free provider. **Declare it if you are a paid SKU.**
+    ///
+    /// Returning an empty list from [`discover`](Self::discover) when the
+    /// module is not owned is correct, but it is indistinguishable from a
+    /// provider that is absent, mis-compiled, or on a network that does not
+    /// answer — and a beta tester of the Diretta module reinstalled his whole
+    /// system over exactly that ambiguity (#2392). Declaring the module here
+    /// lets the SERVER say, in the logs and in `/system/diagnostics`, that the
+    /// provider is idle *because a paid entitlement is missing* and which one.
+    ///
+    /// Default `None`, so an existing out-of-tree provider keeps compiling and
+    /// behaving exactly as before; opting in is a one-line change.
+    fn required_module(&self) -> Option<&str> {
+        None
+    }
 
     /// Discover the devices reachable right now and build one [`OutputTarget`]
     /// per device. Return every visible device on each call — the server skips

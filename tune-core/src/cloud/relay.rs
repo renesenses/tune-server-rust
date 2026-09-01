@@ -296,20 +296,13 @@ impl RelayClient {
                     match req.send().await {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
-                            let ct = resp
-                                .headers()
-                                .get("content-type")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("application/octet-stream")
-                                .to_string();
                             let content_length = resp
                                 .headers()
                                 .get("content-length")
                                 .and_then(|v| v.to_str().ok())
                                 .and_then(|v| v.parse::<u64>().ok());
 
-                            let mut hdrs = serde_json::Map::new();
-                            hdrs.insert("content-type".to_string(), serde_json::Value::String(ct));
+                            let hdrs = entetes_de_flux(resp.headers());
 
                             let start_msg = serde_json::json!({
                                 "type": "relay.stream_start",
@@ -333,18 +326,16 @@ impl RelayClient {
                                     Ok(bytes) => {
                                         let tx = ws_tx.lock().await;
                                         if let Some(tx) = tx.as_ref() {
-                                            // Binary frame: first 36 bytes = request id (UUID), rest = audio data
-                                            let mut frame = Vec::with_capacity(36 + bytes.len());
-                                            frame.extend_from_slice(
-                                                id.as_bytes().get(..36).unwrap_or(id.as_bytes()),
-                                            );
-                                            // Pad to 36 if id shorter
-                                            while frame.len() < 36 {
-                                                frame.push(0);
-                                            }
-                                            frame.extend_from_slice(&bytes);
-                                            // Send as JSON with base64 would be too slow,
-                                            // so we encode the stream_id in the frame header
+                                            // Trame TEXTE `BINARY:<id>:<base64>`.
+                                            // Le canal vers le relais ne porte
+                                            // que du texte
+                                            // (`mpsc::Sender<String>`), d'ou
+                                            // l'encodage. Une trame binaire
+                                            // prefixee de l'identifiant etait
+                                            // assemblee ici puis jetee sans
+                                            // etre envoyee : elle laissait
+                                            // croire a un second format de fil
+                                            // qui n'a jamais existe.
                                             let _ = tx
                                                 .send(format!(
                                                     "BINARY:{}:{}",
@@ -385,6 +376,86 @@ impl RelayClient {
             }
             _ => {}
         }
+    }
+}
+
+/// En-tetes qu'un flux relaye doit emporter jusqu'au navigateur.
+///
+/// Seul `content-type` traversait. Manquait donc tout ce qui permet a une
+/// balise `<audio>` de se situer dans le morceau : sans `content-range`, une
+/// reponse 206 est invalide et le lecteur abandonne ; sans `accept-ranges`, il
+/// ne tente meme pas de se deplacer ; sans `content-length`, il n'a ni duree
+/// ni barre de progression.
+///
+/// Le repli `application/octet-stream` est conserve : un flux sans type
+/// declare vaut mieux qu'un flux sans en-tete du tout.
+pub(crate) fn entetes_de_flux(
+    entetes: &reqwest::header::HeaderMap,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut sortie = serde_json::Map::new();
+    let type_contenu = entetes
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    sortie.insert(
+        "content-type".to_string(),
+        serde_json::Value::String(type_contenu.to_string()),
+    );
+    for nom in ["content-length", "content-range", "accept-ranges"] {
+        if let Some(valeur) = entetes.get(nom).and_then(|v| v.to_str().ok()) {
+            sortie.insert(
+                nom.to_string(),
+                serde_json::Value::String(valeur.to_string()),
+            );
+        }
+    }
+    sortie
+}
+
+#[cfg(test)]
+mod entetes_de_flux_tests {
+    use super::entetes_de_flux;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn entetes(paires: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (nom, valeur) in paires {
+            h.insert(*nom, HeaderValue::from_str(valeur).unwrap());
+        }
+        h
+    }
+
+    /// Le cas qui rendait le deplacement impossible : une 206 sans
+    /// `content-range` est invalide, le lecteur abandonne la lecture.
+    #[test]
+    fn une_reponse_partielle_emporte_son_content_range() {
+        let sortie = entetes_de_flux(&entetes(&[
+            ("content-type", "audio/flac"),
+            ("content-range", "bytes 100-199/5000"),
+            ("accept-ranges", "bytes"),
+            ("content-length", "100"),
+        ]));
+        assert_eq!(sortie["content-type"], "audio/flac");
+        assert_eq!(sortie["content-range"], "bytes 100-199/5000");
+        assert_eq!(sortie["accept-ranges"], "bytes");
+        assert_eq!(sortie["content-length"], "100");
+    }
+
+    /// Un en-tete absent ne doit pas etre invente : mieux vaut un champ
+    /// manquant qu'un `content-range` faux.
+    #[test]
+    fn aucun_en_tete_nest_fabrique() {
+        let sortie = entetes_de_flux(&entetes(&[("content-type", "audio/flac")]));
+        assert_eq!(sortie.len(), 1);
+        assert!(!sortie.contains_key("content-range"));
+        assert!(!sortie.contains_key("accept-ranges"));
+        assert!(!sortie.contains_key("content-length"));
+    }
+
+    #[test]
+    fn sans_type_declare_le_repli_est_generique() {
+        let sortie = entetes_de_flux(&entetes(&[]));
+        assert_eq!(sortie["content-type"], "application/octet-stream");
     }
 }
 

@@ -1,0 +1,55 @@
+name: Post-release — synchroniser le tag vers main
+
+# La branche par défaut avait dérivé de plus de 800 commits : les crons ajoutés
+# à release/v0.9 existaient sur disque mais GitHub ne les enregistrait jamais.
+# Depuis #2808, le tag est deja contenu dans main avant toute construction.
+# Ce workflow ne subsiste que comme outil manuel de reparation d'un ancien
+# train ; il ne fait plus partie du chemin normal de release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag stable publié à synchroniser (ex. v0.9.126)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: post-release-main-sync-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  preparer-pr:
+    name: Préparer ou vérifier la PR tag → main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Résoudre le tag historique
+        id: release
+        env:
+          TAG_MANUEL: ${{ inputs.tag }}
+        run: |
+          printf 'tag=%s\nrun_sha=\n' "$TAG_MANUEL" >> "$GITHUB_OUTPUT"
+
+      - name: Contre-épreuves du garde-fou
+        run: python3 scripts/synchroniser-release-main.py --self-test
+
+      - name: Préparer ou vérifier la PR sans la fusionner
+        env:
+          # MAIN_SYNC_TOKEN est optionnel : il sert uniquement si le dépôt
+          # interdit au GITHUB_TOKEN de créer des PR. Le repli conserve le
+          # comportement natif dès que ce réglage GitHub est autorisé.
+          GH_TOKEN: ${{ secrets.MAIN_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 scripts/synchroniser-release-main.py
+          --repo "$GITHUB_REPOSITORY"
+          --tag "${{ steps.release.outputs.tag }}"
+          --run-sha "${{ steps.release.outputs.run_sha }}"

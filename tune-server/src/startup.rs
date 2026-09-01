@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tracing::{info, warn};
 
-use tune_core::outputs::oh_events::OpenHomeEventListener;
+use tune_core::outputs::oh_events::UpnpEventListener;
 
 use crate::config::TuneConfig;
 use crate::state::AppState;
@@ -26,6 +27,30 @@ pub(crate) enum AsioWarmDecision {
     SkippedByEnv,
     /// Un balayage précédent a emporté le processus : on ne recommence pas.
     SkippedAfterCrash,
+}
+
+/// État exposé aux diagnostics et à l'interface.
+///
+/// Le chemin reste fourni : c'est la seule pièce qui permettait jusque-là de
+/// réparer le blocage à la main, et il est utile dans un rapport de support.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AsioWarmStatus {
+    pub(crate) supported: bool,
+    pub(crate) state: &'static str,
+    pub(crate) blocked_after_crash: bool,
+    pub(crate) disabled_by_env: bool,
+    pub(crate) can_rearm: bool,
+    pub(crate) retry: &'static str,
+    pub(crate) sentinel_path: String,
+    pub(crate) message: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsioWarmRearm {
+    Rearmed,
+    AlreadyReady,
+    Unsupported,
+    DisabledByEnv,
 }
 
 /// Décide si le balayage ASIO de démarrage peut être tenté.
@@ -59,6 +84,95 @@ fn asio_warm_sentinel_path() -> PathBuf {
         .parent()
         .map(|dir| dir.join(ASIO_WARM_SENTINEL))
         .unwrap_or_else(|| PathBuf::from(ASIO_WARM_SENTINEL))
+}
+
+fn asio_warm_status_at(sentinel: &Path, disabled_by_env: bool, supported: bool) -> AsioWarmStatus {
+    let blocked_after_crash = supported && sentinel.exists();
+    let (state, can_rearm, retry, message) = if !supported {
+        (
+            "unsupported",
+            false,
+            "none",
+            "Le préchauffage ASIO ne concerne que Windows.",
+        )
+    } else if disabled_by_env {
+        (
+            "disabled_by_env",
+            false,
+            "remove_environment_override",
+            "Le balayage ASIO est désactivé par TUNE_DISABLE_ASIO_SCAN.",
+        )
+    } else if blocked_after_crash {
+        (
+            "blocked_after_crash",
+            true,
+            "rearm_then_restart",
+            "Le balayage ASIO est suspendu après un plantage. Réarmez-le puis redémarrez Tune pour tenter une nouvelle fois.",
+        )
+    } else {
+        (
+            "ready",
+            false,
+            "next_restart",
+            "Le balayage ASIO est autorisé au prochain démarrage.",
+        )
+    };
+
+    AsioWarmStatus {
+        supported,
+        state,
+        blocked_after_crash,
+        disabled_by_env,
+        can_rearm,
+        retry,
+        sentinel_path: sentinel.display().to_string(),
+        message,
+    }
+}
+
+pub(crate) fn asio_warm_status() -> AsioWarmStatus {
+    asio_warm_status_at(
+        &asio_warm_sentinel_path(),
+        asio_warm_disabled_by_env(),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn rearm_asio_warm_scan_at(
+    sentinel: &Path,
+    disabled_by_env: bool,
+    supported: bool,
+) -> Result<AsioWarmRearm, String> {
+    if !supported {
+        return Ok(AsioWarmRearm::Unsupported);
+    }
+    // Un bouton ne doit jamais contourner un coupe-circuit posé par
+    // l'exploitant. Tant que l'environnement le demande, le témoin reste là.
+    if disabled_by_env {
+        return Ok(AsioWarmRearm::DisabledByEnv);
+    }
+    match std::fs::remove_file(sentinel) {
+        Ok(()) => Ok(AsioWarmRearm::Rearmed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AsioWarmRearm::AlreadyReady)
+        }
+        Err(error) => Err(format!(
+            "impossible de retirer le témoin ASIO {} : {error}",
+            sentinel.display()
+        )),
+    }
+}
+
+/// Autorise une seule nouvelle tentative au prochain démarrage.
+///
+/// On ne relance pas l'énumération dans le processus courant : une sortie peut
+/// déjà posséder le pilote et le re-sondage à chaud est précisément dangereux.
+pub(crate) fn rearm_asio_warm_scan() -> Result<AsioWarmRearm, String> {
+    rearm_asio_warm_scan_at(
+        &asio_warm_sentinel_path(),
+        asio_warm_disabled_by_env(),
+        cfg!(target_os = "windows"),
+    )
 }
 
 fn asio_warm_disabled_by_env() -> bool {
@@ -134,6 +248,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
+    ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     cleanup_orphan_queues(state);
@@ -195,8 +310,21 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
-    ["enrich_all_status", "artist_artwork_enrich_result"];
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
+    "enrich_all_status",
+    "artist_artwork_enrich_result",
+    // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une
+    // grosse bibliothèque à 1 req/s : un arrêt en cours de route est le cas
+    // NORMAL, pas l'exception. Sans cette ligne, `running` resterait en base
+    // pour toujours — le défaut #2002, à l'identique.
+    crate::routes::library::credits_mb::REGLAGE_AVANCEMENT_CREDITS,
+    // Passe de fond « paroles » (#2172) : sans cette ligne, un arrêt en cours
+    // de passe laisserait `status: "running"` en base pour toujours et le
+    // bouton de relance grisé — exactement le défaut #2002. La constante
+    // plutôt que le littéral : renommer la clé d'un côté ne peut plus
+    // désynchroniser l'autre.
+    tune_core::library::lyrics_pass::SETTING_FILL_RESULT,
+];
 
 /// Les mêmes, dans leur forme dégradée : une chaîne nue, écrite `running` et
 /// jamais relue par personne aujourd'hui. On les neutralise quand même — un
@@ -218,7 +346,12 @@ const DRAPEAUX_AVANCEMENT_ENRICHISSEMENT: [&str; 2] =
 /// ⚠️ Les compteurs sont CONSERVÉS. « Interrompu à 5 650 / 16 261 » se
 /// comprend ; un réglage effacé ne dirait plus rien du tout, et l'utilisateur
 /// ne saurait pas où sa passe s'est arrêtée.
-fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
+/// `pub(crate)` parce que le démarrage n'est plus le seul déclencheur : la fin
+/// d'une passe d'images d'artistes qui s'est arrêtée sans écrire son `done`
+/// applique la MÊME réécriture, tout de suite, sans attendre un redémarrage
+/// (`routes::library::artwork::FinDePasseArtistes`, #2073). Deux règles
+/// séparées auraient divergé au premier champ neutralisé.
+pub(crate) fn avancement_interrompu(brut: &str) -> Option<(String, u64, u64)> {
     let mut valeur = match serde_json::from_str::<serde_json::Value>(brut) {
         Ok(v) => v,
         Err(_) => {
@@ -298,6 +431,49 @@ fn marquer_enrichissements_interrompus(state: &AppState) {
     }
 }
 
+/// Rendre le registre des executions automatisees utilisable pour ce
+/// demarrage (#2080).
+///
+/// Deux gestes, dans cet ORDRE, et l'ordre porte le raisonnement :
+///
+/// 1. **Clore les orphelines.** Toute execution que la base croit encore en
+///    cours a ete ecrite par un processus qui n'existe plus — aucune passe ne
+///    survit au processus qui la portait, et etre ici le prouve. C'est le
+///    defaut #2002 transpose : un `running` fige a jamais verrouillait le
+///    bouton de relance sur une passe morte. Ici on ne verrouille rien, mais un
+///    registre qui affirme pour toujours « ca tourne » serait pire qu'un
+///    registre vide.
+/// 2. **Purger par age.** Apres, jamais avant : une orpheline tres ancienne est
+///    d'abord fermee proprement, puis effacee si elle depasse la retention.
+///    Dans l'autre ordre elle disparaitrait sans avoir jamais ete close, et le
+///    nombre de fermetures journalise ne dirait plus la verite.
+///
+/// Ce doit etre le PREMIER contact avec le registre au demarrage : les passes
+/// cablees ouvrent leurs lignes bien apres, depuis `spawn_background_tasks`.
+fn ouvrir_le_registre_des_executions(state: &AppState) {
+    let registre = tune_core::db::task_run_repo::TaskRunRepo::with_backend(state.backend.clone());
+
+    match registre.clore_orphelines() {
+        Ok(0) => {}
+        Ok(n) => info!(
+            closes = n,
+            boot_id = tune_core::db::task_run_repo::boot_id(),
+            "registre_executions_orphelines_closes — passes que la base croyait encore en cours"
+        ),
+        Err(e) => warn!(error = %e, "registre_executions_cloture_echouee"),
+    }
+
+    match registre.purger_par_age() {
+        Ok(0) => {}
+        Ok(n) => info!(
+            effacees = n,
+            jours = tune_core::db::task_run_repo::RETENTION_JOURS,
+            "registre_executions_purge_par_age"
+        ),
+        Err(e) => warn!(error = %e, "registre_executions_purge_echouee"),
+    }
+}
+
 /// Remove duplicate zones (same output_device_id) and add a unique index to
 /// prevent future duplicates.  Must run before any discovery task starts.
 fn deduplicate_zones(state: &AppState) {
@@ -344,6 +520,45 @@ fn reconcile_favorites(state: &AppState) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "favorites_reconcile_failed"),
+    }
+    // Les albums masqués (#1391) suivent la MÊME mécanique d'instantané et
+    // les mêmes règles de re-rattachement : au démarrage on ne supprime
+    // jamais un marqueur introuvable — un volume pas encore monté peut encore
+    // ramener l'album, et un album masqué qui réapparaîtrait visible est
+    // précisément le bug que la table évite.
+    match tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "hidden_albums_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "hidden_albums_reconcile_failed"),
+    }
+    // Les paires « ces deux albums ne sont pas des doublons » (#1276) suivent
+    // la MÊME mécanique et la même règle : au démarrage on ne supprime jamais
+    // une paire introuvable. Perdre l'arbitrage rouvrirait la fusion
+    // destructrice de `merge-duplicates`, qui SUPPRIME la ligne perdante.
+    match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(state.backend.clone())
+        .reconcile(false)
+    {
+        Ok(stats) if stats.changed() > 0 || stats.unresolved > 0 => {
+            info!(
+                scanned = stats.scanned,
+                relinked = stats.relinked,
+                deduplicated = stats.deduplicated,
+                unresolved = stats.unresolved,
+                "album_distinct_pairs_reconciled_at_startup"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "album_distinct_pairs_reconcile_failed"),
     }
 }
 
@@ -571,7 +786,7 @@ async fn restore_zone_volumes(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
-                let vol = (zone.volume as f64) / 100.0;
+                let vol = zone.volume / 100.0;
                 if zone.fixed_volume {
                     // Contrat « Volume fixe (bit-perfect) » : 100 % est un
                     // ENGAGEMENT, pas un oubli — le DoP meurt au moindre gain
@@ -779,18 +994,36 @@ async fn restore_oaat_groups(state: &AppState) {
 #[cfg(not(feature = "oaat"))]
 async fn restore_oaat_groups(_state: &AppState) {}
 
-/// Create the OpenHome event listener (shared between SSDP handler and outputs).
-pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
-    let server_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".into());
-    match OpenHomeEventListener::new(server_ip).await {
-        Ok(l) => Some(Arc::new(l)),
-        Err(e) => {
-            tracing::warn!(error = %e, "oh_event_listener_init_failed");
-            None
-        }
-    }
+/// LE récepteur GENA du processus. Créé une seule fois, quel que soit l'appelant.
+///
+/// La mémoïsation n'est pas un raffinement : elle lève l'obstacle qui privait
+/// d'évènements tout renderer récupéré au redémarrage (#1126). Ce chemin-là
+/// n'atteignait pas le récepteur du gestionnaire SSDP depuis `AppState`, et en
+/// créer un second aurait couru contre lui pour le port fixe 8890 —
+/// [`UpnpEventListener::new`] retombant alors sur un port éphémère, au
+/// détriment du premier. Une cellule unique rend le même récepteur aux deux, et
+/// la course disparaît au lieu d'être contournée (#2263).
+static RECEPTEUR_EVENEMENTS: tokio::sync::OnceCell<Option<Arc<UpnpEventListener>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Create the UPnP (GENA) event listener, shared between the SSDP handler,
+/// the restart-recovery path and the outputs. Idempotent.
+pub async fn create_oh_listener() -> Option<Arc<UpnpEventListener>> {
+    RECEPTEUR_EVENEMENTS
+        .get_or_init(|| async {
+            let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            match UpnpEventListener::new(server_ip).await {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                    None
+                }
+            }
+        })
+        .await
+        .clone()
 }
 
 /// Persist music_dirs and discogs_token from config/env into the settings DB.
@@ -910,15 +1143,56 @@ async fn resolve_ytdlp(state: &AppState) {
 /// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
 /// fonctionnalités.
 #[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: i32, fixed_volume: bool) -> f64 {
+fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
     if fixed_volume {
         1.0
     } else {
-        (zone_volume as f64 / 100.0).clamp(0.0, 1.0)
+        (zone_volume / 100.0).clamp(0.0, 1.0)
     }
 }
 
-/// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalZoneAction {
+    Create,
+    Reconnect,
+    Skip,
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn first_system_default_name<'a>(
+    devices: impl IntoIterator<Item = (&'a str, bool)>,
+) -> Option<&'a str> {
+    devices
+        .into_iter()
+        .find_map(|(name, is_default)| is_default.then_some(name))
+}
+
+/// Décide quoi faire d'une sortie locale sans toucher à la base.
+///
+/// `is_system_default` ne doit être vrai que pour l'unique sortie sélectionnée
+/// par l'appelant parmi celles que le backend marque `is_default`. Cette
+/// sélection préalable empêche un backend défectueux qui en marquerait deux de
+/// recréer le défaut « une zone par périphérique ».
+pub(crate) fn local_zone_action(
+    zone_exists: bool,
+    auto_create: bool,
+    is_system_default: bool,
+) -> LocalZoneAction {
+    if zone_exists {
+        return LocalZoneAction::Reconnect;
+    }
+    if auto_create && is_system_default {
+        LocalZoneAction::Create
+    } else {
+        LocalZoneAction::Skip
+    }
+}
+
+/// Register local audio output devices (USB DAC, headphones, speakers).
+///
+/// Sur une base neuve, seule la sortie système reçoit automatiquement une
+/// zone. Les autres sorties restent enregistrées dans `OutputRegistry`, donc
+/// proposées par l'interface pour une création manuelle.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
@@ -986,6 +1260,21 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        let auto_create =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("zone_auto_create")
+                .ok()
+                .flatten()
+                .map(|v| v != "false")
+                .unwrap_or(true);
+        // Un backend est censé marquer une seule sortie par défaut. `find`
+        // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
+        let system_default_device_id = first_system_default_name(
+            devices
+                .iter()
+                .map(|dev| (dev.name.as_str(), dev.is_default)),
+        )
+        .map(|name| format!("local:{name}"));
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
@@ -1036,34 +1325,20 @@ pub async fn register_local_outputs(state: &AppState) {
                 dev.name.clone()
             };
 
-            // « Creer les zones automatiquement » vaut ICI aussi.
-            //
-            // Les trois autres chemins de decouverte — SSDP, mDNS et le chemin
-            // fournisseur — consultent tous `zone_auto_create` avant de creer.
-            // Celui-ci, le seul qui s'execute au DEMARRAGE du serveur, ne le
-            // consultait pas : une sortie audio locale se voyait donc attribuer
-            // une zone a chaque lancement, donc a chaque mise a jour, meme
-            // reglage decoche. Une zone deja existante n'est pas concernee
-            // (`get_or_create` la renvoie telle quelle) : on ne bloque que la
-            // creation, jamais la reconnexion.
-            let auto_create =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                    .get("zone_auto_create")
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
-            if !auto_create
-                && zone_repo
-                    .get_by_device_id(&device_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
+            let zone_exists = zone_repo
+                .get_by_device_id(&device_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+            let action = local_zone_action(zone_exists, auto_create, is_system_default);
+            if action == LocalZoneAction::Skip {
                 info!(
                     name = %zone_name,
                     device_id = %device_id,
-                    "local_audio_zone_auto_create_disabled_skipping"
+                    default = is_system_default,
+                    auto_create,
+                    "local_audio_zone_manual_creation_required"
                 );
                 continue;
             }
@@ -1138,10 +1413,13 @@ pub async fn register_local_outputs(state: &AppState) {
 /// musique.
 ///
 /// ⚠️ On lit la table que les ROUTES ecrivent (`mount_type/server/share/…/
-/// active`), pas celle de `mount_manager.rs` (`host/share_name/…/auto_mount`),
-/// qui porte le meme nom, des colonnes differentes, et n'est construite nulle
-/// part hors tests. Batir le remontage sur `auto_mount` interrogerait une table
-/// que le serveur ne remplit jamais.
+/// active`). Une SECONDE definition de `network_mounts` a longtemps coexiste,
+/// dans `tune-core/src/mount_manager.rs` (`host/share_name/…/auto_mount`) :
+/// meme nom, colonnes differentes, jamais construite hors tests. Elle a ete
+/// supprimee par #1914 ; le test `network_mounts_n_a_qu_une_definition_par_moteur`
+/// (tune-core, `db/migrations.rs`) empeche desormais qu'une concurrente
+/// reapparaisse. Batir le remontage sur `auto_mount` interrogerait donc une
+/// colonne qui n'existe plus.
 ///
 /// Chaque montage est independant : un partage injoignable est journalise et
 /// n'empeche ni les autres ni le demarrage. Un NAS eteint ne doit pas empecher
@@ -1349,7 +1627,7 @@ mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
 
-    fn state_with_zone(volume: i32, fixed: bool) -> (AppState, i64) {
+    fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let repo = ZoneRepo::with_backend(state.backend.clone());
         let id = repo
@@ -1368,7 +1646,7 @@ mod restore_zone_volumes_tests {
     /// d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn fixed_volume_zone_restarts_at_full_scale() {
-        let (state, id) = state_with_zone(100, true);
+        let (state, id) = state_with_zone(100.0, true);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1386,7 +1664,7 @@ mod restore_zone_volumes_tests {
     /// le code d'avant (0.2 au lieu de 1.0).
     #[tokio::test]
     async fn non_fixed_zone_at_full_scale_is_restored_verbatim() {
-        let (state, id) = state_with_zone(100, false);
+        let (state, id) = state_with_zone(100.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!(
@@ -1399,11 +1677,11 @@ mod restore_zone_volumes_tests {
     /// le désaccord que #1548 a soigné côté affichage sans le supprimer.
     #[tokio::test]
     async fn memory_agrees_with_db_for_every_stored_level() {
-        for stocke in [0, 20, 55, 99, 100] {
+        for stocke in [0.0, 20.0, 55.0, 99.0, 100.0] {
             let (state, id) = state_with_zone(stocke, false);
             restore_zone_volumes(&state).await;
             let vol = state.playback.get_state(id).await.volume;
-            let attendu = stocke as f64 / 100.0;
+            let attendu = stocke / 100.0;
             assert!(
                 (vol - attendu).abs() < 1e-9,
                 "base {stocke} % / mémoire {vol} — les deux doivent dire la même chose"
@@ -1418,34 +1696,154 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+    }
+
+    /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
+    ///
+    /// `restore_zone_volumes` est le pont entre la colonne et le son après un
+    /// redémarrage. Avec `zones.volume` en `INTEGER`, tout réglage sous
+    /// **0,005 linéaire — soit −46,0205999133 dB exactement** — était persisté
+    /// à 0 : la zone revenait à zéro, indiscernable d'un mute volontaire.
+    ///
+    /// Ce test balaie les deux côtés du seuil mesuré et exige que le niveau
+    /// restauré soit celui qui a été stocké, à l'ulp près.
+    #[tokio::test]
+    async fn un_volume_sous_le_seuil_mesure_ne_revient_pas_muet() {
+        const SEUIL_DB: f64 = -46.020_599_913_279_62;
+        assert!(
+            (20.0 * 0.005f64.log10() - SEUIL_DB).abs() < 1e-12,
+            "le seuil est 20·log10(0,005)"
+        );
+
+        for cible_db in [-40.0, -46.0, SEUIL_DB, SEUIL_DB - 0.001, -48.0, -60.0] {
+            let lineaire: f64 = 10f64.powf(cible_db / 20.0);
+            let (state, id) = state_with_zone(lineaire * 100.0, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            assert!(
+                vol > 0.0,
+                "{cible_db} dB : la zone se rallume MUETTE (volume restauré {vol})"
+            );
+            assert!(
+                (vol - lineaire).abs() < 1e-12,
+                "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
+            );
+            // Et le chemin qui atteint vraiment le son dit la même chose.
+            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+        }
+    }
+
+    /// Témoin anti-régression #2886 : les volumes USUELS ne bougent pas d'un
+    /// iota. Multiples exacts de 1 %, donc déjà parfaits avant le correctif.
+    #[tokio::test]
+    async fn les_volumes_usuels_reviennent_identiques() {
+        for pour_cent in [
+            0.0, 1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 90.0, 99.0, 100.0,
+        ] {
+            let (state, id) = state_with_zone(pour_cent, false);
+            restore_zone_volumes(&state).await;
+            let vol = state.playback.get_state(id).await.volume;
+            let attendu = pour_cent / 100.0;
+            assert!(
+                (vol - attendu).abs() < 1e-12,
+                "{pour_cent} % restauré à {vol} au lieu de {attendu}"
+            );
+        }
     }
 
     /// Un volume ordinaire est restauré tel quel, fixed ou pas.
     #[tokio::test]
     async fn ordinary_volume_is_restored_verbatim() {
-        let (state, id) = state_with_zone(55, false);
+        let (state, id) = state_with_zone(55.0, false);
         restore_zone_volumes(&state).await;
         let vol = state.playback.get_state(id).await.volume;
         assert!((vol - 0.55).abs() < 1e-9, "volume restauré: {vol}");
+    }
+}
+
+#[cfg(test)]
+mod local_zone_creation_policy_tests {
+    use super::*;
+
+    /// #1770 — témoin exact d'une base neuve avec plusieurs sorties : une
+    /// sortie ordinaire ne devient pas une zone, même si l'auto-création est
+    /// laissée à sa valeur par défaut (`true`).
+    #[test]
+    fn fresh_install_creates_only_the_system_default_zone() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Un backend fautif peut marquer plusieurs sorties `is_default`. Tune en
+    /// choisit une seule au lieu de recréer le défaut en bloc.
+    #[test]
+    fn even_two_backend_defaults_select_only_one_system_device() {
+        let devices = [("Speakers", false), ("DAC A", true), ("DAC B", true)];
+        assert_eq!(
+            first_system_default_name(devices),
+            Some("DAC A"),
+            "la première sortie système est l'unique candidate"
+        );
+    }
+
+    /// Le réglage d'opt-out conserve son sens : même la sortie système ne doit
+    /// pas être imposée quand l'utilisateur a coupé l'auto-création.
+    #[test]
+    fn disabled_auto_creation_creates_no_default_zone() {
+        assert_eq!(local_zone_action(false, false, true), LocalZoneAction::Skip);
+    }
+
+    /// Le scénario ASIO → WASAPI de DEvir passe ici : un rescan peut découvrir
+    /// dix sorties mais seule la sortie système devient une zone. Un DAC qui
+    /// devient la sortie système reste donc immédiatement utilisable.
+    #[test]
+    fn hotplug_creates_the_system_zone_but_not_the_other_outputs() {
+        assert_eq!(local_zone_action(false, true, false), LocalZoneAction::Skip);
+        assert_eq!(
+            local_zone_action(false, true, true),
+            LocalZoneAction::Create
+        );
+    }
+
+    /// Contre-épreuve installation existante : le nouveau contrat ne supprime
+    /// ni ne masque les zones déjà enregistrées. Démarrage ou hotplug, elles
+    /// reprennent le chemin `get_or_create` et sont remises en ligne.
+    #[test]
+    fn existing_non_default_zone_is_reconnected_in_both_phases() {
+        assert_eq!(
+            local_zone_action(true, false, false),
+            LocalZoneAction::Reconnect
+        );
+    }
+
+    /// Aucun repli silencieux vers « le premier périphérique » si le backend
+    /// ne sait pas identifier sa sortie système.
+    #[test]
+    fn no_backend_default_means_no_automatic_candidate() {
+        let devices = [("DAC A", false), ("DAC B", false)];
+        assert_eq!(first_system_default_name(devices), None);
     }
 }
 
@@ -1499,6 +1897,57 @@ mod asio_warm_scan_tests {
             path.parent(),
             crate::config::default_log_file_path().parent()
         );
+    }
+
+    /// Le blocage n'est plus une ligne perdue dans le journal : il porte un
+    /// état stable, une phrase et l'action possible pour l'interface.
+    #[test]
+    fn crashed_sentinel_is_visible_and_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        let status = asio_warm_status_at(&sentinel, false, true);
+        assert_eq!(status.state, "blocked_after_crash");
+        assert!(status.blocked_after_crash);
+        assert!(status.can_rearm);
+        assert_eq!(status.retry, "rearm_then_restart");
+        assert!(status.message.contains("Réarmez"));
+        assert_eq!(status.sentinel_path, sentinel.display().to_string());
+    }
+
+    /// Réarmer retire exactement le témoin ; le second appel est idempotent et
+    /// ne transforme pas une absence normale en erreur.
+    #[test]
+    fn explicit_rearm_allows_one_future_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, false, true).unwrap(),
+            AsioWarmRearm::Rearmed
+        );
+        assert!(!sentinel.exists());
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, false, true).unwrap(),
+            AsioWarmRearm::AlreadyReady
+        );
+    }
+
+    /// L'API d'administration n'a pas le droit de défaire le choix explicite
+    /// de l'exploitant ; le fichier reste donc intact.
+    #[test]
+    fn environment_kill_switch_cannot_be_bypassed_by_rearm() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+
+        assert_eq!(
+            rearm_asio_warm_scan_at(&sentinel, true, true).unwrap(),
+            AsioWarmRearm::DisabledByEnv
+        );
+        assert!(sentinel.exists());
     }
 }
 
@@ -1617,6 +2066,100 @@ mod demarrage_sans_doublon_tests {
             1,
             "le marquage des enrichissements interrompus doit etre appele une \
              fois et une seule dans init_state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod registre_executions_tests {
+    use std::sync::Arc;
+
+    use tune_core::db::backend::{DbBackend, ToSqlValue};
+    use tune_core::db::migrations;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::task_run_repo::{TACHE_SCAN_DEMARRAGE, TaskRunRepo, boot_id};
+
+    /// Le registre doit etre ouvert DANS `init_state` : c'est le demarrage du
+    /// processus qui prouve qu'aucune passe encore inscrite « en cours » ne
+    /// tourne. Appele ailleurs — dans une tache de fond, par exemple — il
+    /// fermerait des passes vivantes ou n'en fermerait aucune.
+    #[test]
+    fn le_registre_est_ouvert_au_demarrage() {
+        let source = include_str!("startup.rs");
+        let init = source
+            .split("pub async fn init_state")
+            .nth(1)
+            .expect("init_state introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de init_state introuvable");
+        assert_eq!(
+            init.matches("ouvrir_le_registre_des_executions").count(),
+            1,
+            "l'ouverture du registre doit etre appelee une fois et une seule \
+             dans init_state"
+        );
+    }
+
+    /// L'ordre porte le raisonnement : clore d'abord, purger ensuite. Purger
+    /// en premier effacerait une orpheline ancienne SANS l'avoir close, et le
+    /// nombre de fermetures journalise ne dirait plus la verite.
+    #[test]
+    fn on_clot_les_orphelines_avant_de_purger_par_age() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split("fn ouvrir_le_registre_des_executions")
+            .nth(1)
+            .expect("fonction introuvable")
+            .split("\n}\n")
+            .next()
+            .expect("fin de fonction introuvable");
+        let cloture = corps.find("clore_orphelines").expect("cloture absente");
+        let purge = corps.find("purger_par_age").expect("purge absente");
+        assert!(
+            cloture < purge,
+            "la cloture des orphelines doit preceder la purge par age"
+        );
+    }
+
+    /// Le chemin complet, bout en bout : une passe que la base croit encore en
+    /// cours au demarrage est close, et le bouton — ou l'ecran — ne reste pas
+    /// suspendu a une passe morte (#2002).
+    #[test]
+    fn une_passe_orpheline_survit_au_redemarrage_puis_est_close() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+
+        // Le processus precedent a ouvert un scan et n'est jamais revenu.
+        db.execute(
+            "INSERT INTO task_runs (boot_id, task, seq, started_at, outcome) \
+             VALUES ('boot-mort', ?, 1, '2026-08-27T22:00:00Z', 'en_cours')",
+            &[&TACHE_SCAN_DEMARRAGE as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+        let registre = TaskRunRepo::with_backend(db.clone());
+        assert_eq!(
+            registre.lister(Some(TACHE_SCAN_DEMARRAGE), 1).unwrap()[0].outcome,
+            "en_cours",
+            "temoin : sans cloture, la base ment pour toujours"
+        );
+
+        assert_eq!(registre.clore_orphelines().unwrap(), 1);
+
+        let apres = &registre.lister(Some(TACHE_SCAN_DEMARRAGE), 1).unwrap()[0];
+        assert_eq!(apres.outcome, "interrompu");
+        assert_ne!(
+            apres.boot_id,
+            boot_id(),
+            "la ligne garde son boot d'origine"
+        );
+        assert!(apres.finished_at.is_some());
+        assert!(
+            apres.duration_ms.is_none(),
+            "on n'a jamais vu la fin de cette passe"
         );
     }
 }

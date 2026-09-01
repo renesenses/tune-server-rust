@@ -12,6 +12,9 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::discovery::device::dedup_devices;
+use tune_core::discovery::renderer_identity::{
+    Evidence, IdentityVerdict, RendererIdentity, compare_at_same_location,
+};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::outputs::bluos::BluosOutput;
 use tune_core::outputs::dlna::DlnaOutput;
@@ -38,6 +41,14 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(set_device_buffer),
         )
         .route("/clear", post(clear_devices))
+        // #1280 — « ignorer cet appareil ». Statique avant dynamique : axum
+        // donne déjà la priorité au segment littéral, la ligne est ici pour
+        // que la lecture le montre.
+        .route("/ignored", get(list_ignored_devices))
+        .route(
+            "/{device_id}/ignore",
+            post(ignore_device).delete(unignore_device),
+        )
         .route("/{device_id}", axum::routing::delete(delete_device))
         .route("/{device_id}/pair", post(pair_device))
         .route("/{device_id}/pair/pin", post(pair_device_pin))
@@ -66,11 +77,99 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     let all_output_info = outputs.info_all().await;
     drop(outputs);
 
-    Json(json!(build_device_list(
-        discovered,
-        &registered_ids,
-        &all_output_info
-    )))
+    let mut items = build_device_list(discovered, &registered_ids, &all_output_info);
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    mark_hidden_zones(&mut items, &zone_repo);
+    // #1280 — les appareils ignorés sortent de la liste. Le scanner continue
+    // de les ENTENDRE (Patatorz : « ils peuvent rester détectables ») ; ils
+    // cessent d'être PROPOSÉS.
+    retirer_appareils_ignores(&mut items, &state.backend);
+
+    Json(json!(items))
+}
+
+/// L'identité d'une entrée de `GET /devices`, telle qu'elle est sérialisée.
+fn identite_de_l_entree(item: &Value) -> tune_core::db::ignored_device_repo::DeviceIdentity<'_> {
+    let s = |cle: &str| item.get(cle).and_then(Value::as_str).unwrap_or("");
+    tune_core::db::ignored_device_repo::DeviceIdentity::new(s("id"), s("host"), s("name"))
+        .with_mac(item.get("mac_address").and_then(Value::as_str))
+}
+
+/// Retire de la liste les appareils ignorés (#1280).
+///
+/// Les identités SECONDAIRES comptent : `build_device_list` replie les
+/// jumelles SSDP d'un même appareil dans `capabilities.alternatives`, et
+/// c'est peut-être l'une d'elles que l'utilisateur a fait taire — sans cette
+/// boucle, le Sonos resterait listé sous son identité primaire.
+fn retirer_appareils_ignores(items: &mut Vec<Value>, db: &Arc<dyn DbBackend>) {
+    let repo = tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(db.clone());
+    let ignores = match repo.list() {
+        Ok(ignores) if !ignores.is_empty() => ignores,
+        // Liste vide, ou base pré-migration : rien à retirer.
+        _ => return,
+    };
+    items.retain(|item| {
+        let principale = identite_de_l_entree(item);
+        if ignores
+            .iter()
+            .any(|e| tune_core::db::ignored_device_repo::identity_matches(e, principale))
+        {
+            return false;
+        }
+        let alternatives = item
+            .get("capabilities")
+            .and_then(|c| c.get("alternatives"))
+            .and_then(Value::as_array);
+        let Some(alternatives) = alternatives else {
+            return true;
+        };
+        !alternatives.iter().any(|alt| {
+            let identite = tune_core::db::ignored_device_repo::DeviceIdentity::new(
+                alt.get("id").and_then(Value::as_str).unwrap_or(""),
+                principale.host,
+                alt.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(principale.name),
+            )
+            .with_mac(principale.mac);
+            ignores
+                .iter()
+                .any(|e| tune_core::db::ignored_device_repo::identity_matches(e, identite))
+        })
+    });
+}
+
+/// Rend visible l'état que la découverte connaissait seulement dans ses logs.
+///
+/// Un appareil dédoublonné peut porter plusieurs identités. On conserve donc
+/// l'identité exacte de la zone masquée : le client doit la transmettre à la
+/// route de création pour que celle-ci démasque la bonne ligne et récupère ses
+/// réglages, au lieu de créer une nouvelle zone sur l'identité primaire.
+fn mark_hidden_zones(items: &mut [Value], zone_repo: &ZoneRepo) {
+    for item in items {
+        let hidden_device_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| zone_repo.is_device_hidden(id))
+            .map(str::to_owned)
+            .or_else(|| {
+                item.get("capabilities")
+                    .and_then(|c| c.get("alternatives"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|alternative| alternative.get("id").and_then(Value::as_str))
+                    .find(|id| zone_repo.is_device_hidden(id))
+                    .map(str::to_owned)
+            });
+
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("zone_hidden".into(), json!(hidden_device_id.is_some()));
+            if let Some(device_id) = hidden_device_id {
+                obj.insert("hidden_zone_device_id".into(), json!(device_id));
+            }
+        }
+    }
 }
 
 /// Construit la liste renvoyée par `GET /devices` (et `/devices/list`).
@@ -360,7 +459,19 @@ pub async fn register_manual_device(
                 format!("{base}{rc}"),
                 cm_url,
             )
-            .with_play_delay(delay);
+            .with_play_delay(delay)
+            .with_upnp_events(
+                crate::startup::create_oh_listener().await,
+                crate::discovery_setup::urls_evenements_dlna(
+                    &dev.host,
+                    dev.port,
+                    &desc.event_sub_urls(),
+                ),
+            )
+            .with_upnp_silence(crate::config::resolve_upnp_silence(
+                &state.backend,
+                &device_id,
+            ));
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -453,7 +564,7 @@ async fn reregister_with_backoff(state: &AppState, dev: ManualDevice) {
 const DISCOVERED_DLNA_KEY: &str = "discovered_dlna_devices";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiscoveredDlnaDevice {
+pub struct DiscoveredDlnaDevice {
     /// `uuid:…` — the DLNA device_id; keying the registry by it re-attaches the
     /// existing zone rather than creating a duplicate.
     uuid: String,
@@ -463,6 +574,58 @@ struct DiscoveredDlnaDevice {
     name: String,
     host: String,
     port: u16,
+    // ── Clés de reconnaissance, ajoutées par #2639 ────────────────────────
+    //
+    // Un UDN peut être régénéré par un redémarrage ou une mise à jour de
+    // micrologiciel. Ces trois clés-là ne le sont pas, et permettent de
+    // reconnaître l'appareil malgré la bascule sans confondre deux exemplaires
+    // (cf. `tune_core::discovery::renderer_identity`).
+    //
+    // `#[serde(default)]` : les magasins écrits avant #2639 ne les portent pas
+    // et doivent continuer de se relire — sans quoi `serde_json::from_str`
+    // échouerait et `load_discovered_dlna` rendrait un magasin VIDE, ce qui
+    // effacerait toutes les zones d'un coup. Elles se remplissent au premier
+    // re-sondage réussi.
+    #[serde(default)]
+    mac: String,
+    #[serde(default)]
+    manufacturer: String,
+    #[serde(default)]
+    model: String,
+}
+
+impl DiscoveredDlnaDevice {
+    /// Entrée sans clé de reconnaissance — l'état d'un magasin d'avant #2639.
+    pub fn new(uuid: &str, location: &str, name: &str, host: &str, port: u16) -> Self {
+        Self {
+            uuid: uuid.to_string(),
+            location: location.to_string(),
+            name: name.to_string(),
+            host: host.to_string(),
+            port,
+            mac: String::new(),
+            manufacturer: String::new(),
+            model: String::new(),
+        }
+    }
+
+    /// Ajoute ce que la description (et l'ARP encore chaud) viennent d'apprendre.
+    pub fn with_identity(mut self, mac: &str, manufacturer: &str, model: &str) -> Self {
+        self.mac = mac.to_string();
+        self.manufacturer = manufacturer.to_string();
+        self.model = model.to_string();
+        self
+    }
+
+    fn identity(&self) -> RendererIdentity<'_> {
+        RendererIdentity {
+            udn: &self.uuid,
+            mac: &self.mac,
+            friendly_name: &self.name,
+            manufacturer: &self.manufacturer,
+            model_name: &self.model,
+        }
+    }
 }
 
 fn load_discovered_dlna(backend: &Arc<dyn DbBackend>) -> Vec<DiscoveredDlnaDevice> {
@@ -489,19 +652,26 @@ fn save_discovered_dlna(backend: &Arc<dyn DbBackend>, devices: &[DiscoveredDlnaD
 /// re-probed after a restart. Called from the SSDP discovery path once a
 /// renderer with a LOCATION is registered. Skips the settings write when
 /// nothing changed, so a chatty `ssdp:alive` stream costs nothing.
-pub fn persist_discovered_dlna(
-    backend: &Arc<dyn DbBackend>,
-    uuid: &str,
-    location: &str,
-    name: &str,
-    host: &str,
-    port: u16,
-) {
+pub fn persist_discovered_dlna(backend: &Arc<dyn DbBackend>, entry: &DiscoveredDlnaDevice) {
+    let (uuid, location, name, host) = (
+        entry.uuid.as_str(),
+        entry.location.as_str(),
+        entry.name.as_str(),
+        entry.host.as_str(),
+    );
     let mut devices = load_discovered_dlna(backend);
-    if devices
-        .iter()
-        .any(|d| d.uuid == uuid && d.location == location && d.name == name && d.host == host)
-    {
+    if devices.iter().any(|d| {
+        d.uuid == uuid
+            && d.location == location
+            && d.name == name
+            && d.host == host
+            // Les clés de reconnaissance (#2639) font partie de l'entrée : une
+            // MAC ou un modèle fraîchement relevés doivent être écrits, sinon
+            // le magasin resterait éternellement au niveau « nom seul ».
+            && d.mac == entry.mac
+            && d.manufacturer == entry.manufacturer
+            && d.model == entry.model
+    }) {
         return;
     }
     // Une `LOCATION` = une description racine = UN appareil physique (UPnP).
@@ -511,27 +681,138 @@ pub fn persist_discovered_dlna(
     // cinq lecteurs pour un seul ND8006, re-sondes huit fois chacun au
     // demarrage (#1703).
     devices.retain(|d| d.uuid != uuid && d.location != location);
-    devices.push(DiscoveredDlnaDevice {
-        uuid: uuid.to_string(),
-        location: location.to_string(),
-        name: name.to_string(),
-        host: host.to_string(),
-        port,
-    });
+    devices.push(entry.clone());
     save_discovered_dlna(backend, &devices);
 }
 
-/// Sentinelle : la reponse de l'appareil est DEFINITIVE, pas une panne
-/// passagere.
+/// Pourquoi un re-sondage n'a pas abouti — et ce qu'il faut en faire.
 ///
-/// `register_discovered_dlna` melange deux natures d'echec dans un meme
-/// `Err(String)`. « Je n'arrive pas a joindre l'appareil » se retente ; « ce
-/// que tu as memorise n'est pas un lecteur » ne se retentera jamais avec
-/// succes, et l'entree doit disparaitre du magasin.
-const DEFINITIVE_MARKERS: [&str; 2] = ["is no longer a DLNA Media Renderer", "UUID mismatch at"];
+/// Avant #2639, `register_discovered_dlna` rendait un `Err(String)` que
+/// l'appelant reniflait par sous-chaine (`DEFINITIVE_MARKERS`). Deux causes
+/// sans aucun rapport — « ce n'est pas un lecteur » et « l'identifiant a
+/// change » — partageaient donc la meme branche, le meme traitement
+/// (effacement) et le MEME message de journal
+/// (`discovered_dlna_forgotten_not_a_renderer`). Un Marantz ND8006 bien
+/// vivant disparaissait ainsi sous un message qui annoncait l'autre panne.
+///
+/// Le type porte maintenant la decision, pas le texte : ajouter une cause
+/// oblige a dire ce qu'on en fait, et un message ne peut plus en couvrir deux.
+#[derive(Debug)]
+enum ReprobeFailure {
+    /// L'appareil n'a pas repondu, ou mal : la panne peut etre passagere, on
+    /// retente avec le backoff.
+    Unreachable(String),
+    /// L'appareil a repondu et n'expose plus de quoi jouer. Aucun reessai n'y
+    /// changera rien : l'entree part.
+    NotARenderer,
+    /// L'identifiant a change ET une cle stable prouve que c'est un AUTRE
+    /// materiel a cette adresse. L'entree part, en nommant l'intrus.
+    Replaced {
+        observed_udn: String,
+        observed_name: String,
+        evidence: Evidence,
+    },
+    /// L'identifiant a change et rien ne permet de trancher. On ne detruit
+    /// RIEN : l'entree reste, elle sera resondee.
+    IdentityUnclear { observed_udn: String },
+    /// #1280 — l'utilisateur a fait taire cet appareil. Rien n'est sonde, et
+    /// surtout l'entree RESTE : le deblocage doit pouvoir la ressusciter au
+    /// demarrage suivant, sans quoi ignorer serait une suppression deguisee.
+    Ignore,
+}
 
-fn is_definitive_rejection(err: &str) -> bool {
-    DEFINITIVE_MARKERS.iter().any(|m| err.contains(m))
+impl ReprobeFailure {
+    /// L'entree persistee doit-elle disparaitre du magasin ?
+    ///
+    /// Tout #2639 tient dans cette table. Une entree qui part, c'est une zone
+    /// que l'utilisateur perd : on ne la retire que sur une preuve — l'appareil
+    /// a repondu et n'est plus un lecteur, ou une cle stable designe un AUTRE
+    /// materiel. Un desaccord d'UDN qu'on ne sait pas expliquer ne retire
+    /// RIEN : une zone configuree ne se perd pas sur une ignorance.
+    fn retire_l_entree(&self) -> bool {
+        match self {
+            Self::NotARenderer | Self::Replaced { .. } => true,
+            Self::Unreachable(_) | Self::IdentityUnclear { .. } | Self::Ignore => false,
+        }
+    }
+}
+
+/// Journalise une reponse que l'appareil a donnee et qu'on a comprise, puis
+/// applique la seule decision qui compte pour l'utilisateur : son entree part,
+/// ou elle reste.
+///
+/// Chaque cause a SON message. C'est le fond de #2639 : « pas un lecteur » et
+/// « identite changee » ne menent pas au meme endroit et ne doivent pas
+/// partager une ligne de journal.
+fn appliquer_reponse_comprise(
+    backend: &Arc<dyn DbBackend>,
+    dev: &DiscoveredDlnaDevice,
+    failure: &ReprobeFailure,
+) {
+    match failure {
+        // L'appareil a REPONDU et n'expose plus de quoi jouer. Aucun reessai
+        // n'y changera rien : l'entree part, sinon elle revient a chaque
+        // demarrage.
+        //
+        // Un HEOS Denon/Marantz publie plusieurs identifiants UPnP pour un
+        // seul appareil — media, lecteur, services. Tune les persistait tous :
+        // chez Jean Valjean, CINQ entrees pour un materiel, chacune re-sondee
+        // huit fois a chaque demarrage, soit 80 sondages voues a l'echec
+        // (#1528). Quatre n'ont jamais ete des lecteurs et ne le deviendront
+        // pas.
+        ReprobeFailure::NotARenderer => warn!(
+            uuid = %dev.uuid,
+            nom = %dev.name,
+            location = %dev.location,
+            host = %dev.host,
+            action = "l'appareil a répondu mais n'expose plus AVTransport : \
+                      son entrée est retirée. S'il doit jouer, vérifiez son \
+                      mode réseau/DLNA puis relancez une recherche.",
+            "dlna_oublie_plus_un_lecteur"
+        ),
+        // Un AUTRE materiel occupe cette adresse — prouve par une cle stable,
+        // pas suppose. Garder l'entree ferait piloter la mauvaise piece par la
+        // zone du salon.
+        ReprobeFailure::Replaced {
+            observed_udn,
+            observed_name,
+            evidence,
+        } => warn!(
+            nom_attendu = %dev.name,
+            nom_trouve = %observed_name,
+            location = %dev.location,
+            udn_memorise = %dev.uuid,
+            udn_annonce = %observed_udn,
+            distingue_par = evidence.label(),
+            action = "un AUTRE appareil occupe désormais cette adresse : l'entrée \
+                      mémorisée est retirée pour ne pas faire jouer la mauvaise \
+                      pièce. Rallumez l'appareil attendu, puis relancez une \
+                      recherche — il sera redécouvert.",
+            "dlna_appareil_remplace_entree_retiree"
+        ),
+        // Ni preuve d'identite, ni preuve de substitution. On ne detruit rien.
+        ReprobeFailure::IdentityUnclear { observed_udn } => warn!(
+            nom = %dev.name,
+            location = %dev.location,
+            udn_memorise = %dev.uuid,
+            udn_annonce = %observed_udn,
+            action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
+                      « même appareil redémarré » de « autre appareil à la même \
+                      adresse ». L'entrée est CONSERVÉE et sera re-sondée : aucune \
+                      zone n'est perdue.",
+            "dlna_identite_indecidable_entree_conservee"
+        ),
+        // #1280 — appareil fait taire par l'utilisateur. Deja journalise au
+        // refus, et l'entree reste : elle est ce qui permettra au deblocage de
+        // le faire revenir.
+        ReprobeFailure::Ignore => {}
+        // Filtre par l'appelant, qui gere le backoff. Rien a journaliser ici,
+        // et `retire_l_entree()` rend `false` : le sens de defaut protege.
+        ReprobeFailure::Unreachable(_) => {}
+    }
+    if failure.retire_l_entree() {
+        forget_discovered_dlna(backend, &dev.uuid);
+    }
 }
 
 /// Replie le magasin sur UNE entree par `LOCATION`, en gardant la premiere.
@@ -597,30 +878,20 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
                 info!(uuid = %dev.uuid, name = %name, attempt, "discovered_dlna_reprobed");
                 return;
             }
-            // L'appareil a REPONDU, et sa reponse est definitive : ce qu'on a
-            // memorise n'est pas un lecteur, ou ce n'est plus le meme. Aucun
-            // reessai ne changera ca. On oublie l'entree, sinon elle revient a
-            // chaque demarrage.
-            //
-            // Un HEOS Denon/Marantz publie plusieurs identifiants UPnP pour un
-            // seul appareil — media, lecteur, services. Tune les persistait
-            // tous : chez Jean Valjean, CINQ entrees pour un materiel, chacune
-            // re-sondee huit fois a chaque demarrage, soit 80 sondages voues a
-            // l'echec (#1528). Quatre d'entre elles n'ont jamais ete des
-            // lecteurs et ne le deviendront pas.
-            Err(e) if is_definitive_rejection(&e) => {
-                warn!(uuid = %dev.uuid, host = %dev.host, error = %e, "discovered_dlna_forgotten_not_a_renderer");
-                forget_discovered_dlna(&state.backend, &dev.uuid);
-                return;
-            }
-            Err(e) if attempt == REREGISTER_MAX_ATTEMPTS => {
+            Err(ReprobeFailure::Unreachable(e)) if attempt == REREGISTER_MAX_ATTEMPTS => {
                 warn!(uuid = %dev.uuid, host = %dev.host, attempts = attempt, error = %e, "discovered_dlna_reprobe_gave_up");
                 return;
             }
-            Err(e) => {
+            Err(ReprobeFailure::Unreachable(e)) => {
                 warn!(uuid = %dev.uuid, host = %dev.host, attempt, retry_in_s = delay.as_secs(), error = %e, "discovered_dlna_reprobe_retry");
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(REREGISTER_MAX_DELAY);
+            }
+            // L'appareil a repondu et on a compris sa reponse : elle ne se
+            // retente pas. Chaque cause a son message et sa consequence.
+            Err(comprise) => {
+                appliquer_reponse_comprise(&state.backend, &dev, &comprise);
+                return;
             }
         }
     }
@@ -631,10 +902,28 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
 async fn register_discovered_dlna(
     state: &AppState,
     dev: &DiscoveredDlnaDevice,
-) -> Result<String, String> {
-    let desc = fetch_device_description(&dev.location)
-        .await
-        .map_err(|e| format!("cannot fetch DLNA description from {}: {e}", dev.location))?;
+) -> Result<String, ReprobeFailure> {
+    // #1280 — l'appareil a été fait taire depuis la dernière fois qu'il a été
+    // vu. Le magasin `discovered_dlna` le re-sonderait à chaque démarrage et
+    // le ré-enregistrerait : c'est l'un des chemins par lesquels il
+    // « réapparaît rapidement ». Refus AVANT tout trafic réseau.
+    if tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(state.backend.clone())
+        .is_ignored(
+            tune_core::db::ignored_device_repo::DeviceIdentity::new(
+                &dev.uuid, &dev.host, &dev.name,
+            )
+            .with_mac(Some(dev.mac.as_str())),
+        )
+    {
+        info!(uuid = %dev.uuid, name = %dev.name, "discovered_dlna_appareil_ignore");
+        return Err(ReprobeFailure::Ignore);
+    }
+    let desc = fetch_device_description(&dev.location).await.map_err(|e| {
+        ReprobeFailure::Unreachable(format!(
+            "cannot fetch DLNA description from {}: {e}",
+            dev.location
+        ))
+    })?;
     // La DÉCOUVERTE accepte un appareil dont le `deviceType` n'est pas
     // MediaRenderer dès lors qu'il expose AVTransport (`ssdp.rs`,
     // « ssdp_non_standard_renderer_accepted ») — WiiM, foobar2000, et les
@@ -654,25 +943,69 @@ async fn register_discovered_dlna(
     // est toujours écarté — et le reste des frères HEOS, qui n'exposent aucun
     // de ces services, continue d'être oublié comme le voulait #1528.
     if !desc.is_media_renderer() && !desc.has_av_transport() {
-        return Err(format!(
-            "{} is no longer a DLNA Media Renderer",
-            dev.location
-        ));
+        return Err(ReprobeFailure::NotARenderer);
     }
-    // Guard against IP/LOCATION reuse by another device: only re-attach when the
-    // descriptor's UUID still matches the one we persisted.
-    if desc.udn != dev.uuid {
-        return Err(format!(
-            "UUID mismatch at {}: descriptor '{}' != persisted '{}'",
-            dev.location, desc.udn, dev.uuid
-        ));
+    // ── Un UDN qui change n'est PAS une preuve de substitution (#2639) ─────
+    //
+    // La garde d'origine (« only re-attach when the descriptor's UUID still
+    // matches ») protège d'un vrai risque : le bail DHCP expire, un AUTRE
+    // appareil hérite de l'adresse, et la zone du salon se met à piloter
+    // l'ampli de la chambre. Mais un UDN se régénère aussi tout seul — un
+    // Marantz ND8006 a changé le sien entre le 22 et le 28/08/2026 à LOCATION
+    // inchangée, pendant que son SSDP annonçait encore l'ancien. La garde
+    // effaçait alors l'entrée, donc la zone, sous un message qui annonçait
+    // « pas un lecteur ».
+    //
+    // On demande donc à une clé stable de trancher. La MAC est relevée
+    // maintenant : le `fetch` ci-dessus vient d'échanger du TCP avec l'hôte,
+    // le cache ARP est chaud — c'est exactement ce que fait déjà
+    // `build_renderer_device`. Une absence n'accuse personne (cf.
+    // `renderer_identity`).
+    let observed_mac = tune_core::discovery::mac::arp_lookup(&dev.host).unwrap_or_default();
+    let observed = RendererIdentity {
+        udn: &desc.udn,
+        mac: &observed_mac,
+        friendly_name: &desc.friendly_name,
+        manufacturer: &desc.manufacturer,
+        model_name: &desc.model_name,
+    };
+    // Précondition de `compare_at_same_location` : `desc` sort de
+    // `fetch_device_description(&dev.location)`, donc de l'URL persistée mot
+    // pour mot — même IP, même port, même chemin.
+    match compare_at_same_location(dev.identity(), observed) {
+        IdentityVerdict::NoDisagreement => {}
+        IdentityVerdict::SameHardware(evidence) => {
+            info!(
+                nom = %desc.friendly_name,
+                location = %dev.location,
+                udn_memorise = %dev.uuid,
+                udn_annonce = %desc.udn,
+                reconnu_par = evidence.label(),
+                action = "l'appareil a changé d'identifiant UPnP (redémarrage, mise à jour \
+                          ou réinitialisation). Il reste reconnu : sa zone est conservée, \
+                          rien à faire.",
+                "dlna_identifiant_change_appareil_reconnu"
+            );
+        }
+        IdentityVerdict::OtherHardware(evidence) => {
+            return Err(ReprobeFailure::Replaced {
+                observed_udn: desc.udn.clone(),
+                observed_name: desc.friendly_name.clone(),
+                evidence,
+            });
+        }
+        IdentityVerdict::Undecidable => {
+            return Err(ReprobeFailure::IdentityUnclear {
+                observed_udn: desc.udn.clone(),
+            });
+        }
     }
     let service_urls = desc.service_urls();
     let (Some(av), Some(rc)) = (
         service_urls.get("avtransport"),
         service_urls.get("renderingcontrol"),
     ) else {
-        return Err("media renderer missing AVTransport or RenderingControl".to_string());
+        return Err(ReprobeFailure::NotARenderer);
     };
     let base = format!("http://{}:{}", dev.host, dev.port);
     let device_name = if dev.name.is_empty() {
@@ -694,7 +1027,15 @@ async fn register_discovered_dlna(
         format!("{base}{rc}"),
         cm_url,
     )
-    .with_play_delay(delay);
+    .with_play_delay(delay)
+    .with_upnp_events(
+        crate::startup::create_oh_listener().await,
+        crate::discovery_setup::urls_evenements_dlna(&dev.host, dev.port, &desc.event_sub_urls()),
+    )
+    .with_upnp_silence(crate::config::resolve_upnp_silence(
+        &state.backend,
+        &dev.uuid,
+    ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
     state.outputs.lock().await.register(Box::new(dlna));
@@ -705,6 +1046,17 @@ async fn register_discovered_dlna(
     state.event_bus.emit(
         "device.reconnected",
         json!({ "device_id": &dev.uuid, "name": &device_name, "host": &dev.host }),
+    );
+    // Le magasin apprend les cles de reconnaissance relevees a l'instant (#2639).
+    // C'est ce qui fait qu'un magasin ancien ne reste pas eternellement au
+    // niveau le plus faible : au prochain desaccord d'UDN, la MAC ou le couple
+    // marque/modele trancheront a la place du seul nom. On garde `dev.uuid`
+    // comme cle : c'est l'ancre de la zone, et le SSDP de cet appareil continue
+    // de l'annoncer.
+    persist_discovered_dlna(
+        &state.backend,
+        &DiscoveredDlnaDevice::new(&dev.uuid, &dev.location, &device_name, &dev.host, dev.port)
+            .with_identity(&observed_mac, &desc.manufacturer, &desc.model_name),
     );
     Ok(device_name)
 }
@@ -784,7 +1136,12 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
     let scanner = &state.scanner;
     let devices = scanner.rescan().await;
 
-    let deduped = dedup_devices(devices);
+    // #1280 — les appareils que l'utilisateur a fait taire ne sont ni
+    // enregistrés, ni annoncés, ni listés par ce scan.
+    let deduped: Vec<_> = dedup_devices(devices)
+        .into_iter()
+        .filter(|d| !crate::discovery_setup::appareil_ignore(&state.backend, d))
+        .collect();
 
     let mut registered = 0;
     {
@@ -822,7 +1179,16 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                         format!("{base}{rc}"),
                         cm_url,
                     )
-                    .with_play_delay(delay);
+                    .with_play_delay(delay)
+                    .with_upnp_events(
+                        crate::startup::create_oh_listener().await,
+                        crate::discovery_setup::urls_evenements_dlna(
+                            &d.host,
+                            d.port,
+                            &desc.event_sub_urls(),
+                        ),
+                    )
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
@@ -901,10 +1267,24 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
                 v
             })
             .collect();
+        // #1395 — l'écran qui porte le sélecteur de backend est le premier
+        // endroit où l'écart doit se lire : Bilou choisit ASIO ici, la lecture
+        // sort en WASAPI, et rien ne le lui dit. `backend` (l'actif) ne suffit
+        // pas — sans le demandé à côté, il ne peut pas savoir si c'est son
+        // réglage qui n'a pas pris ou le serveur qui a basculé.
+        //
+        // Additif : `backend` garde exactement sa valeur d'avant.
+        let backend_status = tune_core::outputs::local::active_backend_status(backend);
         Json(json!({
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),
+            "backend_status": backend_status,
             "asio_available": tune_core::outputs::local::asio_available(),
+            // #1268 — la liste des backends que le sélecteur peut proposer,
+            // filtrée par la plateforme du SERVEUR. Le client l'écrivait en
+            // dur (Auto/WASAPI/ASIO), et des machines Debian/Fedora se
+            // voyaient offrir deux technologies Windows.
+            "supported_backends": tune_core::outputs::local::supported_backends(),
         }))
     }
     #[cfg(not(feature = "local-audio"))]
@@ -913,7 +1293,9 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         Json(json!({
             "devices": [],
             "backend": "none",
+            "backend_status": Value::Null,
             "asio_available": false,
+            "supported_backends": [],
         }))
     }
 }
@@ -982,7 +1364,20 @@ async fn device_status(
     };
     let output = output.lock().await;
     match output.get_status().await {
-        Ok(status) => Json(json!(status)).into_response(),
+        Ok(status) => {
+            let mut corps = json!(status);
+            // #2263 — d'où vient ce qu'on vient de rendre. Une position
+            // extrapolée a exactement la même forme qu'une position mesurée :
+            // sans ce champ, rien ne distingue les deux, et le mode « silence
+            // UPnP » deviendrait précisément l'interrupteur muet qu'il ne doit
+            // pas être. Absent pour toute sortie qui n'est pas DLNA — additif.
+            if let Some(dlna) = output.as_any().downcast_ref::<DlnaOutput>()
+                && let Some(obj) = corps.as_object_mut()
+            {
+                obj.insert("upnp_events".into(), json!(dlna.etat_evenements().await));
+            }
+            Json(corps).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -1125,6 +1520,222 @@ async fn delete_device(
         json!({ "device_id": device_id }),
     );
     StatusCode::NO_CONTENT
+}
+
+// ---------------------------------------------------------------------------
+// Appareils ignorés (#1280)
+// ---------------------------------------------------------------------------
+
+/// L'instantané d'identité à figer quand l'utilisateur fait taire un appareil.
+///
+/// Trois sources, dans l'ordre de fiabilité — la première qui répond gagne :
+///
+/// 1. **le scanner vivant**, y compris les identités secondaires repliées dans
+///    `capabilities.alternatives` : c'est là qu'on trouve la MAC, donc la seule
+///    clé qui survive à un changement d'adresse ;
+/// 2. **le registre des sorties**, quand le scanner est entre deux passes ;
+/// 3. **la zone persistée** portant cet identifiant — le geste peut venir de la
+///    liste des zones, où l'appareil n'est plus annoncé.
+///
+/// Si aucune ne répond, l'instantané se réduit à l'identifiant : l'identité
+/// exacte reste bloquée, ce qui est déjà le comportement attendu.
+async fn instantane_d_identite(
+    state: &AppState,
+    device_id: &str,
+) -> tune_core::db::ignored_device_repo::IgnoredDevice {
+    let mut snapshot = tune_core::db::ignored_device_repo::IgnoredDevice {
+        device_id: device_id.to_string(),
+        mac: String::new(),
+        host: String::new(),
+        name: String::new(),
+        device_type: String::new(),
+        created_at: None,
+    };
+
+    // 1. Le scanner vivant — identités secondaires comprises.
+    let vivants = state.scanner.devices().await;
+    let vu = vivants.iter().find(|d| {
+        d.id == device_id
+            || d.capabilities
+                .get("alternatives")
+                .and_then(|a| a.as_array())
+                .is_some_and(|alts| {
+                    alts.iter()
+                        .filter_map(|a| a.get("id")?.as_str())
+                        .any(|id| id == device_id)
+                })
+    });
+    if let Some(d) = vu {
+        snapshot.mac = d.mac_address.clone().unwrap_or_default();
+        snapshot.host.clone_from(&d.host);
+        snapshot.name.clone_from(&d.name);
+        snapshot.device_type = d.device_type.to_string();
+        return snapshot;
+    }
+
+    // 2. Le registre des sorties.
+    let infos = state.outputs.lock().await.info_all().await;
+    if let Some(info) = infos
+        .iter()
+        .find(|i| i.get("device_id").and_then(Value::as_str) == Some(device_id))
+    {
+        let s = |cle: &str| {
+            info.get(cle)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        snapshot.host = s("host");
+        snapshot.name = s("name");
+        snapshot.device_type = s("type");
+        return snapshot;
+    }
+
+    // 3. La zone persistée.
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    if let Ok(Some(zone)) = zone_repo.get_by_device_id(device_id) {
+        snapshot.name = zone.name;
+        snapshot.device_type = zone.output_type.unwrap_or_default();
+    }
+    snapshot
+}
+
+/// `POST /devices/{device_id}/ignore` — faire taire un APPAREIL.
+///
+/// Trois effets, et les trois comptent : l'identité est figée (l'appareil ne
+/// revient plus à aucun scan, sous aucune de ses identités), sa sortie quitte
+/// le registre (il cesse d'être proposé TOUT DE SUITE, sans attendre un
+/// redémarrage), et sa zone est masquée si elle existe (sinon la zone
+/// resterait jouable alors que l'appareil est censé s'être tu).
+async fn ignore_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    if device_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "device_id"}))).into_response();
+    }
+    let snapshot = instantane_d_identite(&state, &device_id).await;
+    let repo =
+        tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(state.backend.clone());
+    if let Err(e) = repo.ignore(&snapshot) {
+        warn!(device_id = %device_id, error = %e, "device_ignore_failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+    }
+
+    // La sortie quitte le registre : sans cela l'appareil resterait proposé
+    // par `GET /devices` jusqu'au prochain redémarrage — exactement le
+    // « il revient » du ticket, à peine déplacé.
+    let infos = {
+        let outputs = state.outputs.lock().await;
+        outputs.info_all().await
+    };
+    {
+        let mut outputs = state.outputs.lock().await;
+        outputs.remove(&device_id);
+        // Les identités JUMELLES du même appareil, enregistrées sous un autre
+        // identifiant : c'est par elles que le Sonos revenait.
+        for info in &infos {
+            let Some(id) = info.get("device_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if id == device_id {
+                continue;
+            }
+            let s = |cle: &str| info.get(cle).and_then(Value::as_str).unwrap_or_default();
+            let identite =
+                tune_core::db::ignored_device_repo::DeviceIdentity::new(id, s("host"), s("name"));
+            if tune_core::db::ignored_device_repo::identity_matches(&snapshot, identite) {
+                outputs.remove(id);
+            }
+        }
+    }
+    forget_manual_device(&state, &device_id);
+
+    // La zone de l'appareil, s'il en a une : masquée, comme une suppression.
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    let mut zones_masquees = Vec::new();
+    if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id)
+        && let Some(zid) = zone.id
+        && zone_repo.delete(zid).is_ok()
+    {
+        zones_masquees.push(zid);
+    }
+    if !snapshot.host.is_empty() || !snapshot.mac.is_empty() {
+        let mac = (!snapshot.mac.is_empty()).then_some(snapshot.mac.as_str());
+        // Masquer une zone la retire des zones VISIBLES, donc l'appel suivant
+        // rend la jumelle. Borne dure quand même : on ne fait pas dépendre la
+        // terminaison d'une écriture en base.
+        for _ in 0..16 {
+            let Some((zid, _, _)) = zone_repo.find_visible_zone_by_identity(&snapshot.host, mac)
+            else {
+                break;
+            };
+            if zones_masquees.contains(&zid) || zone_repo.delete(zid).is_err() {
+                break;
+            }
+            zones_masquees.push(zid);
+        }
+    }
+
+    state.event_bus.emit_typed(
+        tune_core::event_types::EventType::DeviceLost,
+        json!({ "device_id": device_id, "reason": "ignored" }),
+    );
+    info!(
+        device_id = %device_id,
+        name = %snapshot.name,
+        host = %snapshot.host,
+        zones = zones_masquees.len(),
+        "device_ignored"
+    );
+    Json(json!({
+        "ignored": snapshot,
+        "hidden_zone_ids": zones_masquees,
+    }))
+    .into_response()
+}
+
+/// `DELETE /devices/{device_id}/ignore` — débloquer.
+///
+/// Libère TOUTES les identités du même appareil : sans cela, l'utilisateur qui
+/// a fait taire son Sonos devrait deviner l'UUID jumeau pour le récupérer.
+/// Idempotent : débloquer ce qui ne l'était pas rend `released: []`.
+async fn unignore_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    let repo =
+        tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(state.backend.clone());
+    match repo.unignore(&device_id) {
+        Ok(liberes) => {
+            info!(device_id = %device_id, released = liberes.len(), "device_unignored");
+            // L'appareil ne revient qu'au prochain passage de découverte —
+            // l'événement fait recharger Réglages > Réseau, où il réapparaîtra.
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::DeviceDiscovered,
+                json!({ "device_id": device_id, "reason": "unignored" }),
+            );
+            Json(json!({ "released": liberes })).into_response()
+        }
+        Err(e) => {
+            warn!(device_id = %device_id, error = %e, "device_unignore_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+        }
+    }
+}
+
+/// `GET /devices/ignored` — la liste de révision.
+///
+/// Elle rend l'instantané figé, pas l'appareil vivant : un appareil ignoré
+/// n'est plus annoncé nulle part, donc c'est la SEULE vue depuis laquelle il
+/// peut être débloqué.
+async fn list_ignored_devices(State(state): State<AppState>) -> impl IntoResponse {
+    let repo =
+        tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(state.backend.clone());
+    match repo.list() {
+        Ok(items) => Json(json!({ "total": items.len(), "items": items })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,11 +1932,37 @@ mod dlna_reprobe_tests {
     // pour un materiel, chacune re-sondee huit fois a chaque demarrage.
     // Quatre n'ont jamais ete des lecteurs et ne le deviendront pas.
 
+    /// Une panne d'accès reste ré-essayable, et elle SEULE.
+    ///
+    /// Le sens de défaut du re-sondage : on ne retire une entrée que sur une
+    /// réponse qu'on a explicitement comprise. Avant #2639 cette distinction
+    /// se faisait par sous-chaîne (`DEFINITIVE_MARKERS`) ; elle est portée par
+    /// le type, donc le compilateur.
     #[test]
-    fn pas_un_lecteur_est_definitif() {
-        assert!(is_definitive_rejection(
-            "http://192.168.1.11:60006/upnp/desc/aios_device/aios_device.xml is no longer a DLNA Media Renderer"
-        ));
+    fn seul_un_echec_d_acces_est_reessayable() {
+        let injoignable = ReprobeFailure::Unreachable(
+            "cannot fetch DLNA description from http://192.168.1.11:60006/d.xml: timed out".into(),
+        );
+        assert!(matches!(injoignable, ReprobeFailure::Unreachable(_)));
+
+        // Les trois autres causes ne se retentent jamais : deux retirent
+        // l'entrée, la troisième la conserve — mais aucune ne boucle.
+        for cause in [
+            ReprobeFailure::NotARenderer,
+            ReprobeFailure::Replaced {
+                observed_udn: "uuid:b".into(),
+                observed_name: "Ampli chambre".into(),
+                evidence: Evidence::Mac,
+            },
+            ReprobeFailure::IdentityUnclear {
+                observed_udn: "uuid:b".into(),
+            },
+        ] {
+            assert!(
+                !matches!(cause, ReprobeFailure::Unreachable(_)),
+                "une reponse comprise ne doit pas repartir dans le backoff : {cause:?}"
+            );
+        }
     }
 
     /// Les deux chemins doivent appliquer la MÊME tolérance.
@@ -1388,33 +2025,211 @@ mod dlna_reprobe_tests {
         );
     }
 
+    // ── Le verdict d'identite, applique au magasin (#2639) ────────────────
+    //
+    // `compare_at_same_location` est teste sur pieces dans
+    // `tune-core/src/discovery/renderer_identity.rs`. Ici on verifie ce que
+    // l'entree PERSISTEE devient — c'est-a-dire si la zone survit.
+
+    /// L'entree telle que le magasin de Jean Valjean la porte : pas de MAC,
+    /// pas de marque, pas de modele — le format d'avant #2639.
+    fn entree_marantz(backend: &Arc<dyn DbBackend>) {
+        persist_discovered_dlna(
+            backend,
+            &DiscoveredDlnaDevice::new(
+                "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26",
+                AIOS_LOCATION,
+                "Marantz ND8006",
+                "192.168.1.11",
+                60006,
+            ),
+        );
+    }
+
+    /// Ce que le descripteur du Marantz rendait le 28/08/2026 : UDN regenere,
+    /// tout le reste inchange.
+    fn marantz_apres_bascule() -> RendererIdentity<'static> {
+        RendererIdentity {
+            udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+            mac: "",
+            friendly_name: "Marantz ND8006",
+            manufacturer: "Marantz",
+            model_name: "ND8006",
+        }
+    }
+
+    /// La table qui decide si l'utilisateur perd sa zone.
+    ///
+    /// C'est le defaut de #2639 en une assertion : avant, `Replaced` ET
+    /// `IdentityUnclear` retiraient tous deux l'entree, parce que les deux
+    /// n'existaient pas — un seul `Err(String)` couvrait les deux, sous un
+    /// message qui en annoncait une troisieme.
     #[test]
-    fn uuid_qui_ne_correspond_plus_est_definitif() {
-        // L'adresse a ete reprise par un autre appareil : reessayer viserait
-        // le mauvais materiel.
-        assert!(is_definitive_rejection(
-            "UUID mismatch at http://192.168.1.20:8080/desc.xml: descriptor 'uuid:b' != persisted 'uuid:a'"
-        ));
+    fn on_ne_retire_une_entree_que_sur_une_preuve() {
+        assert!(
+            ReprobeFailure::NotARenderer.retire_l_entree(),
+            "l'appareil a repondu et n'est plus un lecteur : l'entree part"
+        );
+        assert!(
+            ReprobeFailure::Replaced {
+                observed_udn: "uuid:c0bfdbad".into(),
+                observed_name: "Ampli chambre".into(),
+                evidence: Evidence::Mac,
+            }
+            .retire_l_entree(),
+            "une cle stable designe un AUTRE materiel : l'entree part"
+        );
+        assert!(
+            !ReprobeFailure::IdentityUnclear {
+                observed_udn: "uuid:c0bfdbad".into(),
+            }
+            .retire_l_entree(),
+            "un desaccord d'UDN sans preuve ne doit RIEN retirer : c'est la \
+             zone de l'utilisateur qui partirait avec"
+        );
+        assert!(
+            !ReprobeFailure::Unreachable("timed out".into()).retire_l_entree(),
+            "un appareil eteint garde sa place"
+        );
+    }
+
+    /// Bout en bout sur le magasin : l'entree du Marantz survit a un UDN
+    /// regenere, et ne survit PAS a une substitution prouvee.
+    #[test]
+    fn la_table_appliquee_au_magasin_garde_ou_retire_la_bonne_entree() {
+        for (cause, doit_rester) in [
+            (
+                ReprobeFailure::IdentityUnclear {
+                    observed_udn: "uuid:c0bfdbad".into(),
+                },
+                true,
+            ),
+            (
+                ReprobeFailure::Replaced {
+                    observed_udn: "uuid:c0bfdbad".into(),
+                    observed_name: "Ampli chambre".into(),
+                    evidence: Evidence::FriendlyName,
+                },
+                false,
+            ),
+            (ReprobeFailure::NotARenderer, false),
+            (ReprobeFailure::Unreachable("timed out".into()), true),
+        ] {
+            let backend = memory_backend();
+            entree_marantz(&backend);
+            let dev = load_discovered_dlna(&backend).remove(0);
+            appliquer_reponse_comprise(&backend, &dev, &cause);
+            assert_eq!(
+                !load_discovered_dlna(&backend).is_empty(),
+                doit_rester,
+                "magasin apres {cause:?}"
+            );
+        }
     }
 
     #[test]
-    fn une_panne_reseau_reste_reessayable() {
-        // Le cas qu'il ne faut SURTOUT pas oublier : un appareil eteint ou
-        // momentanement injoignable doit garder sa place et son backoff.
-        assert!(!is_definitive_rejection(
-            "cannot fetch DLNA description from http://192.168.1.11:60006/d.xml: connection refused"
-        ));
-        assert!(!is_definitive_rejection(
-            "cannot fetch DLNA description from http://192.168.1.11:60006/d.xml: timed out"
-        ));
+    fn un_udn_regenere_ne_fait_pas_disparaitre_la_zone() {
+        let backend = memory_backend();
+        entree_marantz(&backend);
+        let stored = load_discovered_dlna(&backend);
+
+        let verdict = compare_at_same_location(stored[0].identity(), marantz_apres_bascule());
+        assert!(
+            matches!(verdict, IdentityVerdict::SameHardware(_)),
+            "le Marantz doit rester reconnu, or le verdict est {verdict:?}"
+        );
+
+        // Le verdict « meme materiel » ne passe par AUCUNE branche qui efface.
+        // Contre-epreuve directe : l'entree est toujours la, sous son UUID
+        // d'origine — l'ancre de la zone.
+        assert_eq!(load_discovered_dlna(&backend).len(), 1);
+        assert_eq!(
+            load_discovered_dlna(&backend)[0].uuid,
+            "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26",
+            "la cle de zone doit rester la valeur persistee, pas l'UDN du descripteur"
+        );
     }
 
     #[test]
-    fn un_message_inconnu_reste_reessayable() {
-        // Sens de defaut : on n'oublie un appareil que sur une reponse qu'on
-        // a explicitement comprise.
-        assert!(!is_definitive_rejection("boom"));
-        assert!(!is_definitive_rejection(""));
+    fn un_autre_appareil_a_la_meme_adresse_fait_bien_retirer_l_entree() {
+        // Le piege symetrique : la garde d'origine existait pour CA, et elle
+        // doit continuer de fonctionner.
+        let backend = memory_backend();
+        entree_marantz(&backend);
+        let stored = load_discovered_dlna(&backend);
+
+        let intrus = RendererIdentity {
+            udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+            mac: "",
+            friendly_name: "Ampli chambre",
+            manufacturer: "Denon",
+            model_name: "AVR-X2700H",
+        };
+        assert!(
+            matches!(
+                compare_at_same_location(stored[0].identity(), intrus),
+                IdentityVerdict::OtherHardware(_)
+            ),
+            "un autre appareil ne doit jamais heriter de la zone du Marantz"
+        );
+
+        // C'est la branche `Replaced` qui appelle `forget_discovered_dlna` :
+        // on verifie que ce retrait fait bien disparaitre l'entree.
+        forget_discovered_dlna(&backend, "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26");
+        assert!(load_discovered_dlna(&backend).is_empty());
+    }
+
+    #[test]
+    fn le_magasin_apprend_les_cles_de_reconnaissance() {
+        // Un magasin ancien ne doit pas rester eternellement au niveau le plus
+        // faible : apres un re-sondage reussi il porte MAC, marque et modele,
+        // et le desaccord SUIVANT se tranche sur la MAC.
+        let backend = memory_backend();
+        entree_marantz(&backend);
+        persist_discovered_dlna(
+            &backend,
+            &DiscoveredDlnaDevice::new(
+                "uuid:56fcb4ae-e909-1c8d-0080-0006787c2e26",
+                AIOS_LOCATION,
+                "Marantz ND8006",
+                "192.168.1.11",
+                60006,
+            )
+            .with_identity("00:06:78:7C:2E:26", "Marantz", "ND8006"),
+        );
+
+        let stored = load_discovered_dlna(&backend);
+        assert_eq!(stored.len(), 1, "l'entree est mise a jour, pas dupliquee");
+        assert_eq!(stored[0].mac, "00:06:78:7C:2E:26");
+
+        // Meme nom, meme modele, MAC differente : c'est un autre exemplaire.
+        let jumeau = RendererIdentity {
+            udn: "uuid:c0bfdbad-45f0-dfe0-819a-c4bcec2cce65",
+            mac: "00:06:78:AA:BB:CC",
+            friendly_name: "Marantz ND8006",
+            manufacturer: "Marantz",
+            model_name: "ND8006",
+        };
+        assert_eq!(
+            compare_at_same_location(stored[0].identity(), jumeau),
+            IdentityVerdict::OtherHardware(Evidence::Mac)
+        );
+    }
+
+    #[test]
+    fn un_magasin_d_avant_2639_se_relit_sans_perdre_ses_entrees() {
+        // Le risque a ne pas prendre : trois champs ajoutes a une structure
+        // deserialisee depuis un JSON deja en base. Sans `#[serde(default)]`,
+        // `from_str` echoue, `load_discovered_dlna` rend un magasin VIDE, et
+        // toutes les zones DLNA disparaissent d'un coup au premier demarrage.
+        let ancien = r#"[{"uuid":"uuid:56fcb4ae","location":"http://192.168.1.11:60006/d.xml","name":"Marantz ND8006","host":"192.168.1.11","port":60006}]"#;
+        let relu: Vec<DiscoveredDlnaDevice> = serde_json::from_str(ancien)
+            .expect("un magasin ecrit avant #2639 doit continuer de se relire");
+        assert_eq!(relu.len(), 1);
+        assert_eq!(relu[0].name, "Marantz ND8006");
+        assert!(relu[0].mac.is_empty());
+        assert!(relu[0].manufacturer.is_empty());
+        assert!(relu[0].model.is_empty());
     }
 
     // ── Un appareil physique = une LOCATION (#1703) ───────────────────────
@@ -1451,11 +2266,13 @@ mod dlna_reprobe_tests {
         ] {
             persist_discovered_dlna(
                 &backend,
-                uuid,
-                AIOS_LOCATION,
-                "Marantz ND8006",
-                "192.168.1.11",
-                60006,
+                &DiscoveredDlnaDevice::new(
+                    uuid,
+                    AIOS_LOCATION,
+                    "Marantz ND8006",
+                    "192.168.1.11",
+                    60006,
+                ),
             );
         }
 
@@ -1480,19 +2297,23 @@ mod dlna_reprobe_tests {
         let backend = memory_backend();
         persist_discovered_dlna(
             &backend,
-            "uuid:zone-1",
-            "http://192.168.1.11:8080/desc.xml",
-            "Ampli Zone 1",
-            "192.168.1.11",
-            8080,
+            &DiscoveredDlnaDevice::new(
+                "uuid:zone-1",
+                "http://192.168.1.11:8080/desc.xml",
+                "Ampli Zone 1",
+                "192.168.1.11",
+                8080,
+            ),
         );
         persist_discovered_dlna(
             &backend,
-            "uuid:zone-2",
-            "http://192.168.1.11:8081/desc.xml",
-            "Ampli Zone 2",
-            "192.168.1.11",
-            8081,
+            &DiscoveredDlnaDevice::new(
+                "uuid:zone-2",
+                "http://192.168.1.11:8081/desc.xml",
+                "Ampli Zone 2",
+                "192.168.1.11",
+                8081,
+            ),
         );
         assert_eq!(load_discovered_dlna(&backend).len(), 2);
     }
@@ -1502,12 +2323,14 @@ mod dlna_reprobe_tests {
         // Les installations qui tournent deja ont les cinq entrees en base :
         // le repli doit les guerir sans attendre le rejet definitif de #1647.
         let stored: Vec<DiscoveredDlnaDevice> = (0..5)
-            .map(|i| DiscoveredDlnaDevice {
-                uuid: format!("uuid:aios-{i}"),
-                location: AIOS_LOCATION.to_string(),
-                name: "Marantz ND8006".into(),
-                host: "192.168.1.11".into(),
-                port: 60006,
+            .map(|i| {
+                DiscoveredDlnaDevice::new(
+                    &format!("uuid:aios-{i}"),
+                    AIOS_LOCATION,
+                    "Marantz ND8006",
+                    "192.168.1.11",
+                    60006,
+                )
             })
             .collect();
         let collapsed = dedup_dlna_by_location(stored);
@@ -1520,7 +2343,14 @@ mod dlna_reprobe_tests {
 #[cfg(test)]
 mod list_devices_dedup_tests {
     use super::*;
+    use tune_core::db::sqlite::SqliteDb;
     use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn zone_repo() -> ZoneRepo {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        ZoneRepo::new(db)
+    }
 
     fn marantz_deux_identites() -> Vec<DiscoveredDevice> {
         // Cas documenté dans #1880 : le même appareil s'annonce en mDNS
@@ -1648,6 +2478,238 @@ mod list_devices_dedup_tests {
         assert_eq!(
             items[0].get("registered").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn appareil_decouvert_signale_la_zone_masquee_et_son_identite_exacte() {
+        let repo = zone_repo();
+        let hidden_id = "airplay-00:06:78:7C:2E:26";
+        let zone_id = repo
+            .create("Marantz ND8006", Some("airplay"), Some(hidden_id))
+            .unwrap();
+        repo.delete(zone_id).unwrap();
+
+        let mut items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        mark_hidden_zones(&mut items, &repo);
+
+        assert_eq!(
+            items[0].get("zone_hidden").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            items[0]
+                .get("hidden_zone_device_id")
+                .and_then(Value::as_str),
+            Some(hidden_id),
+            "la restauration doit viser l'identité masquée, même secondaire"
+        );
+    }
+
+    #[test]
+    fn appareil_sans_zone_masquee_ne_propose_pas_de_restauration() {
+        let repo = zone_repo();
+        let mut items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        mark_hidden_zones(&mut items, &repo);
+
+        assert_eq!(
+            items[0].get("zone_hidden").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(items[0].get("hidden_zone_device_id").is_none());
+    }
+}
+
+/// #1280 — la liste `GET /devices` ne propose plus les appareils ignorés.
+///
+/// Le ticket est né de CETTE liste : « ils disparaissent bien sur le coup mais
+/// réapparaissent rapidement » (Patatorz). Empêcher la création de zone ne
+/// suffisait donc pas — c'est la proposition qu'il faut faire taire.
+///
+/// Le couple [`un_appareil_ignore_sort_de_la_liste`] /
+/// [`la_meme_liste_sans_blocage_garde_l_appareil`] est la contre-épreuve
+/// PERMANENTE : même liste, même appareil, seule la ligne d'ignorance change.
+/// Un filtre bloqué sur « tout retirer » rend le second rouge, bloqué sur
+/// « ne rien retirer » il rend le premier rouge.
+#[cfg(test)]
+mod liste_appareils_ignores_1280 {
+    use super::*;
+    use tune_core::db::ignored_device_repo::{IgnoredDevice, IgnoredDeviceRepo};
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        Arc::new(db)
+    }
+
+    fn faire_taire(db: &Arc<dyn DbBackend>, device_id: &str, host: &str, name: &str) {
+        IgnoredDeviceRepo::with_backend(db.clone())
+            .ignore(&IgnoredDevice {
+                device_id: device_id.into(),
+                mac: String::new(),
+                host: host.into(),
+                name: name.into(),
+                device_type: "dlna".into(),
+                created_at: None,
+            })
+            .unwrap();
+    }
+
+    /// Un Sonos vu sous DEUX identités au même hôte : `build_device_list` les
+    /// replie en une entrée, l'identité secondaire allant dans
+    /// `capabilities.alternatives`.
+    fn sonos_deux_identites() -> Vec<DiscoveredDevice> {
+        vec![
+            DiscoveredDevice::new(
+                "uuid:sonos-dlna".into(),
+                "Chambre - Sonos One".into(),
+                OutputType::Dlna,
+                "192.168.1.50".into(),
+                1400,
+            ),
+            DiscoveredDevice::new(
+                "uuid:sonos-openhome".into(),
+                "Chambre - Sonos One".into(),
+                OutputType::Openhome,
+                "192.168.1.50".into(),
+                1400,
+            ),
+        ]
+    }
+
+    /// `Router` panique à la CONSTRUCTION sur un conflit de routes. Ce test
+    /// fixe donc que `/ignored` (statique) et `/{device_id}/ignore`
+    /// (dynamique) cohabitent — le serveur ne démarrerait pas sinon.
+    #[test]
+    fn les_routes_d_ignorance_ne_percutent_aucune_route_existante() {
+        let _ = router();
+    }
+
+    #[test]
+    fn un_appareil_ignore_sort_de_la_liste() {
+        let db = base();
+        faire_taire(
+            &db,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        let mut items = build_device_list(
+            sonos_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        retirer_appareils_ignores(&mut items, &db);
+
+        assert!(
+            items.is_empty(),
+            "l'appareil ignoré ne doit plus être proposé, obtenu : {items:?}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE PERMANENTE : la même liste, sans blocage, garde son
+    /// appareil.
+    #[test]
+    fn la_meme_liste_sans_blocage_garde_l_appareil() {
+        let db = base();
+        let mut items = build_device_list(
+            sonos_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        retirer_appareils_ignores(&mut items, &db);
+        assert_eq!(items.len(), 1, "sans blocage, l'appareil reste proposé");
+    }
+
+    /// L'utilisateur a pu faire taire l'appareil depuis son identité
+    /// SECONDAIRE (celle repliée dans `alternatives`). L'entrée, portée par
+    /// l'identité primaire, doit disparaître quand même.
+    #[test]
+    fn ignorer_une_identite_secondaire_retire_l_entree_entiere() {
+        let db = base();
+        let items = build_device_list(
+            sonos_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        let primaire = items[0]
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let secondaire = items[0]
+            .get("capabilities")
+            .and_then(|c| c.get("alternatives"))
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|a| a.get("id"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert_ne!(primaire, secondaire);
+
+        // On fige UNIQUEMENT l'identité secondaire, sans hôte ni nom : seule
+        // la règle d'identité EXACTE peut donc jouer.
+        IgnoredDeviceRepo::with_backend(db.clone())
+            .ignore(&IgnoredDevice {
+                device_id: secondaire,
+                mac: String::new(),
+                host: String::new(),
+                name: String::new(),
+                device_type: "openhome".into(),
+                created_at: None,
+            })
+            .unwrap();
+
+        let mut items = items;
+        retirer_appareils_ignores(&mut items, &db);
+        assert!(
+            items.is_empty(),
+            "faire taire une identité secondaire doit retirer l'appareil, \
+             obtenu : {items:?}"
+        );
+    }
+
+    /// GARDE-FOU ANTI-DHCP (#1651) : un autre appareil ayant hérité de
+    /// l'adresse reste listé.
+    #[test]
+    fn un_autre_appareil_au_meme_hote_reste_liste() {
+        let db = base();
+        faire_taire(
+            &db,
+            "uuid:sonos-dlna",
+            "192.168.1.50",
+            "Chambre - Sonos One",
+        );
+
+        let mut items = build_device_list(
+            vec![DiscoveredDevice::new(
+                "uuid:cabasse".into(),
+                "Cabasse Pearl Akoya".into(),
+                OutputType::Dlna,
+                "192.168.1.50".into(),
+                1400,
+            )],
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        retirer_appareils_ignores(&mut items, &db);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("name").and_then(Value::as_str),
+            Some("Cabasse Pearl Akoya")
         );
     }
 }

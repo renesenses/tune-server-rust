@@ -228,6 +228,21 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
     let scan_done_clone = scan_done.clone();
     tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
+
+        // Registre des executions automatisees (#2080). Ouvert AVANT toute
+        // sortie anticipee : « aucun dossier configure » et « un scan tenait
+        // deja le verrou » sont deux reponses valables a « le scan n'a rien
+        // fait », et un registre qui ne les consignait pas laisserait ces deux
+        // cas indistinguables d'un scan jamais lance.
+        //
+        // Le temoin ferme la ligne sur TOUS les chemins de sortie : `terminer`
+        // en fin de scan, et son `Drop` en `interrompu` partout ailleurs — y
+        // compris le deroulement d'une panique. Il ne couvre pas l'extinction
+        // du processus ; c'est la cloture des orphelines au demarrage suivant
+        // qui s'en charge (`startup::ouvrir_le_registre_des_executions`).
+        let suivi = tune_core::db::task_run_repo::TaskRunRepo::with_backend(db.clone())
+            .ouvrir(tune_core::db::task_run_repo::TACHE_SCAN_DEMARRAGE);
+
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let raw_dirs: Vec<String> = settings
             .get("music_dirs")
@@ -244,6 +259,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            suivi.rien_a_faire(Some("aucun dossier de musique configure"));
             // Mark the scan "done" even on this early exit: the file watcher
             // waits on this flag before it starts watching.
             scan_done_clone.store(true, Ordering::Release);
@@ -256,6 +272,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // et purges concurrentes.
         let Some(scan_lease) = crate::routes::system::scan::try_begin_scan() else {
             info!("auto_scan_skipped_already_scanning");
+            suivi.rien_a_faire(Some("un autre scan tenait deja le verrou"));
             scan_done_clone.store(true, Ordering::Release);
             return;
         };
@@ -279,6 +296,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
+        let mut skipped_by_ext = list_result.skipped_by_ext;
+        let mut skipped_reasons = list_result.skipped_reasons;
+        let mut skipped_unsupported_paths = list_result.skipped_paths;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -306,12 +326,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
+                // Le message d'erreur du moteur peut porter un chemin de base :
+                // on n'inscrit que le motif, pas `e`.
+                suivi.echec("lecture des pistes existantes impossible");
                 scan_done_clone.store(true, Ordering::Release);
                 return;
             }
         };
-        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
-            .get_existing_audio_hash_album_pairs()
+        let mut known_hashes = track_repo
+            .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
         // Keep only files that are new or whose mtime/size changed since the
@@ -385,6 +408,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_unchanged = pre_skipped as u64;
         let mut skipped_duplicate = 0u64;
         let mut skipped_no_metadata = 0u64;
+        let mut skipped_unsupported = 0u64;
+        // Les CHEMINS, en regard des compteurs ci-dessus (#2050). Sœurs de
+        // celles du scan manuel : les deux boucles écartent pour les mêmes
+        // trois motifs, et doivent le dire de la même façon.
+        let mut skipped_no_metadata_paths: Vec<String> = Vec::new();
+        let mut skipped_duplicate_paths: Vec<String> = Vec::new();
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
@@ -408,18 +437,29 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
-                    if db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
-                        // Se nommer : tout `write_tx` concurrent echouera tant
-                        // que ce lot tient la connexion, et sans cette
-                        // etiquette son message n'apprend rien (#1997).
-                        tune_core::db::tx_holder::declarer("scan:auto");
-                    }
+                let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
+                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
+                    // Se nommer : tout `write_tx` concurrent echouera tant
+                    // que ce lot tient la connexion, et sans cette
+                    // etiquette son message n'apprend rien (#1997).
+                    tune_core::db::tx_holder::declarer("scan:auto");
                 }
 
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    if let Some(unsupported) = &sf.unsupported {
+                        tracing::info!(
+                            path = %sf.path,
+                            format = %unsupported.report_key,
+                            reason = unsupported.reason,
+                            "scan_track_skipped_unsupported"
+                        );
+                        skipped += 1;
+                        skipped_unsupported += 1;
+                        continue;
+                    }
                     if sf.metadata.is_none() {
                         tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         // Counted in the aggregate too, so `processed` can
@@ -427,6 +467,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         // file made the progress bar stop short of 100%.
                         skipped += 1;
                         skipped_no_metadata += 1;
+                        // Le chemin ne vivait que dans ce `warn!` (#2050).
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_no_metadata_paths,
+                            sf.path.clone(),
+                        );
                         continue;
                     }
 
@@ -457,22 +502,43 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Deduplicate by audio_hash + album_id: if the same content
-                    // already exists in this album (via a different path), skip it.
+                    // `audio_hash` only selects cheap candidates. Never hide a
+                    // track until an existing path is byte-for-byte identical.
                     if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
                         let key = (hash.clone(), aid);
-                        if known_hashes.contains(&key) {
+                        let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
+                        if let Some(existing_path) =
+                            tune_core::scanner::hasher::find_byte_identical_path(
+                                std::path::Path::new(&sf.path),
+                                &candidates,
+                            )
+                        {
                             tracing::debug!(
                                 audio_hash = %hash,
                                 album_id = aid,
                                 path = %sf.path,
+                                existing_path = %existing_path,
                                 "skip_duplicate_audio_hash"
                             );
                             skipped += 1;
                             skipped_duplicate += 1;
+                            // Journalise en `debug!` seulement : invisible au
+                            // niveau livré, donc introuvable (#2050).
+                            tune_core::scanner::walker::pousser_chemin_ecarte(
+                                &mut skipped_duplicate_paths,
+                                format!("{} (identique à {})", sf.path, existing_path),
+                            );
                             continue;
                         }
-                        known_hashes.insert(key);
+                        if !candidates.is_empty() {
+                            tracing::warn!(
+                                audio_hash = %hash,
+                                album_id = aid,
+                                path = %sf.path,
+                                candidates = candidates.len(),
+                                "audio_hash_candidate_not_byte_identical"
+                            );
+                        }
                     }
 
                     to_insert.push(track);
@@ -483,6 +549,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                if batch_inserted == to_insert.len() as u64 {
+                    for track in &to_insert {
+                        if let (Some(hash), Some(album_id), Some(path)) =
+                            (&track.audio_hash, track.album_id, &track.file_path)
+                        {
+                            known_hashes
+                                .entry((hash.clone(), album_id))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
                 db_insert_failed += to_insert.len() as u64 - batch_inserted;
                 db_update_failed += to_update.len() as u64 - batch_updated;
                 inserted += batch_inserted;
@@ -514,12 +592,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     }
                 }
 
-                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                if is_sqlite {
                     db.execute("COMMIT", &[]).ok();
                     // Liberer meme si le COMMIT a echoue : une etiquette
                     // perimee accuserait un innocent au prochain incident.
                     tune_core::db::tx_holder::liberer();
                 }
+                drop(sqlite_write_guard);
 
                 // Emit scan progress after each batch (throttled every other
                 // batch or 2s), mirroring the manual scan's payload/phase.
@@ -556,6 +635,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         );
 
+        for (format, count) in &stats.unsupported_by_ext {
+            *skipped_by_ext.entry(format.clone()).or_insert(0) += count;
+        }
+        skipped_reasons.extend(stats.unsupported_reasons.clone());
+        // Même fusion que pour les décomptes : les deux sources d'« écarté
+        // faute de décodeur » aboutissent à une seule liste (#2050).
+        for chemin in &stats.unsupported_paths {
+            tune_core::scanner::walker::pousser_chemin_ecarte(
+                &mut skipped_unsupported_paths,
+                chemin.clone(),
+            );
+        }
+
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted();
 
@@ -572,6 +664,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
+        // émet lui aussi `library.scan.completed`. Son rapport ne portait
+        // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
+        // sur ce chemin-là également. Hissé pour que le rapport puisse le
+        // publier (#2146).
+        let mut pistes_supprimees = 0i64;
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
@@ -677,6 +775,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     "auto_scan_tracks_protected_unreadable_dirs"
                 );
             }
+            pistes_supprimees = pruned;
             if pruned > 0 {
                 info!(pruned, "auto_scan_stale_tracks_removed");
             }
@@ -740,6 +839,47 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto_scan_favorites_reconcile_failed"),
             }
+            // Les albums masqués (#1391) suivent la même mécanique : un
+            // rowid renouvelé est re-rattaché par identité, et un marqueur
+            // vraiment introuvable n'est purgé que sur un scan COMPLET sain
+            // (même garde `full_scan_ok`, #1943).
+            match tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(h) if h.changed() > 0 || h.unresolved > 0 => {
+                    info!(
+                        scanned = h.scanned,
+                        relinked = h.relinked,
+                        deduplicated = h.deduplicated,
+                        deleted = h.deleted,
+                        unresolved = h.unresolved,
+                        "auto_scan_hidden_albums_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto_scan_hidden_albums_reconcile_failed"),
+            }
+            // Les paires « pas des doublons » (#1276) : même mécanique, même
+            // garde `full_scan_ok`. Un arbitrage perdu ne se voit pas — il se
+            // paie à la fusion suivante, qui supprime la ligne perdante.
+            match tune_core::db::album_distinct_repo::AlbumDistinctRepo::with_backend(db.clone())
+                .reconcile(full_scan_ok)
+            {
+                Ok(d) if d.changed() > 0 || d.unresolved > 0 => {
+                    info!(
+                        scanned = d.scanned,
+                        relinked = d.relinked,
+                        deduplicated = d.deduplicated,
+                        deleted = d.deleted,
+                        unresolved = d.unresolved,
+                        "auto_scan_album_distinct_pairs_reconciled"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "auto_scan_album_distinct_pairs_reconcile_failed")
+                }
+            }
         }
 
         info!(
@@ -753,6 +893,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             skipped_unchanged,
             skipped_duplicate,
             skipped_no_metadata,
+            skipped_unsupported,
             db_insert_failed,
             db_update_failed,
             artwork = artwork_extracted,
@@ -782,6 +923,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
             "error_dirs": error_dirs.clone(),
+            // Ce que la purge a effectivement retiré. Le client lit cette clé
+            // pour le bandeau de fin de scan (#2146).
+            "removed": pistes_supprimees,
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,
@@ -791,20 +935,62 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unchanged": skipped_unchanged,
             "skipped_duplicate": skipped_duplicate,
             "skipped_no_metadata": skipped_no_metadata,
+            "skipped_unsupported": skipped_unsupported,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
+            "skipped_unsupported_by_ext": skipped_by_ext,
+            "skipped_unsupported_reasons": skipped_reasons,
         });
+
+        // La liste demandée (#2050) — mêmes clés que le scan manuel, sans quoi
+        // le rapport dépendrait de QUEL scan l'a produit. Comme dans
+        // `ChiffresDeFinDeScan::rapport_du_fichier`, elle ne sort QUE par le
+        // fichier : ce sont des chemins de l'utilisateur, et
+        // `library.scan.completed` est diffusé à tous les clients connectés.
+        let mut report_fichier = report.clone();
+        report_fichier["skipped_unsupported_paths"] = serde_json::json!(skipped_unsupported_paths);
+        report_fichier["skipped_no_metadata_paths"] = serde_json::json!(skipped_no_metadata_paths);
+        report_fichier["skipped_duplicate_paths"] = serde_json::json!(skipped_duplicate_paths);
+        report_fichier["skipped_paths_truncated"] = serde_json::json!(
+            [
+                skipped_unsupported_paths.len(),
+                skipped_no_metadata_paths.len(),
+                skipped_duplicate_paths.len(),
+            ]
+            .iter()
+            .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)
+        );
 
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
-        if let Ok(json) = serde_json::to_string_pretty(&report) {
+        if let Ok(json) = serde_json::to_string_pretty(&report_fichier) {
             std::fs::write(&report_path, json).ok();
         }
 
         event_bus.emit("library.scan.completed", report);
+
+        // Le compteur du registre est ce qui a CHANGE, pas ce qui a ete vu :
+        // un scan qui relit 40 000 fichiers inchanges n'a rien fait, et
+        // inscrire 40 000 le ferait passer pour un gros travail.
+        let modifies = inserted as i64 + updated as i64 + pistes_supprimees;
+        let verdict = if modifies == 0 {
+            tune_core::db::task_run_repo::Verdict::RienAFaire
+        } else {
+            tune_core::db::task_run_repo::Verdict::Succes
+        };
+        // Que des compteurs : ni chemin, ni nom de dossier. `missing_dirs` et
+        // `failed_paths` sont des chemins de l'utilisateur — ils restent dans
+        // le rapport de scan, jamais dans le registre.
+        let detail = format!(
+            "{total_discovered} vus, {inserted} ajoutees, {updated} mises a jour, \
+             {pistes_supprimees} retirees, {} dossiers absents",
+            missing_dirs.len()
+        );
+        suivi.terminer(verdict, Some(modifies), Some(&detail));
+
         scan_done_clone.store(true, Ordering::Release);
     });
     scan_done
@@ -894,6 +1080,73 @@ fn settle_partition(
 }
 
 #[cfg(test)]
+mod registre_du_scan_tests {
+    /// Le scan de demarrage inscrit son execution au registre (#2080) sur
+    /// TOUTES ses sorties. Les deux sorties anticipees comptent autant que la
+    /// normale : « aucun dossier configure » et « un scan tenait deja le
+    /// verrou » sont precisement les deux reponses a « le scan n'a rien fait »,
+    /// et sans elles ce cas se lirait comme un scan jamais lance.
+    #[test]
+    fn le_scan_de_demarrage_ferme_sa_ligne_sur_toutes_ses_sorties() {
+        let source = include_str!("auto_scan.rs");
+        let corps = source
+            .split("pub fn spawn_auto_scan")
+            .nth(1)
+            .expect("spawn_auto_scan introuvable")
+            .split("\n    scan_done\n}")
+            .next()
+            .expect("fin de spawn_auto_scan introuvable");
+
+        assert_eq!(
+            corps.matches("TACHE_SCAN_DEMARRAGE").count(),
+            1,
+            "une seule ouverture de ligne pour un scan"
+        );
+        assert_eq!(
+            corps.matches("suivi.rien_a_faire").count(),
+            2,
+            "les deux sorties anticipees (aucun dossier, verrou deja tenu) \
+             doivent chacune fermer la ligne"
+        );
+        assert_eq!(corps.matches("suivi.echec").count(), 1);
+        assert_eq!(corps.matches("suivi.terminer").count(), 1);
+    }
+
+    /// Le rapport de scan contient les chemins de l'utilisateur
+    /// (`missing_dirs`, `failed_paths`). Le registre, lui, ne doit porter que
+    /// des compteurs — il est fait pour etre colle dans un ticket.
+    #[test]
+    fn le_registre_du_scan_ne_recopie_aucun_chemin() {
+        let source = include_str!("auto_scan.rs");
+        let detail = source
+            .split("let detail = format!(")
+            .nth(1)
+            .expect("le detail du registre a change de forme")
+            .split(");")
+            .next()
+            .unwrap();
+
+        for interdit in [
+            "missing_dirs.clone",
+            "failed_paths",
+            "error_dirs",
+            "music_dirs",
+            "file_path",
+            "report_path",
+        ] {
+            assert!(
+                !detail.contains(interdit),
+                "le detail inscrit au registre ne doit pas porter `{interdit}`"
+            );
+        }
+        assert!(
+            detail.contains("missing_dirs.len()"),
+            "seul le NOMBRE de dossiers absents est inscrit, jamais leur nom"
+        );
+    }
+}
+
+#[cfg(test)]
 mod settle_tests {
     use super::settle_partition;
     use std::io::Write;
@@ -912,7 +1165,10 @@ mod settle_tests {
         // there, which would (correctly) exclude the fixtures and mask the logic
         // under test. A unique dir relative to the test cwd (the crate root) is
         // resolved by fs::metadata but never matches starts_with(temp_dir()).
-        let dir = std::path::PathBuf::from(format!(".settle_test_{}", std::process::id()));
+        let dir = std::path::PathBuf::from(format!(
+            ".{}",
+            tune_core::test_scratch::scratch_name("settle_test")
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let stable = dir.join("stable.flac");
@@ -957,6 +1213,162 @@ mod settle_tests {
     }
 }
 
+/// La quatrième porte de suppression — celle du surveillant de fichiers.
+///
+/// Aucun système de fichiers, aucune horloge, aucun minuteur : la liste des
+/// racines illisibles est un paramètre. Ces tests rendent le même verdict sur
+/// n'importe quel hôte, y compris la CI Linux, alors que le défaut qu'ils
+/// couvrent frappe surtout Windows et les partages réseau.
+#[cfg(test)]
+mod surveillant_suppression_tests {
+    use super::verdict_suppression_surveillant as verdict;
+    use crate::routes::system::scan::VerdictPurge;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Le cas normal : le fichier a vraiment disparu d'une racine qui répond.
+    #[test]
+    fn un_fichier_efface_sous_une_racine_saine_part() {
+        assert_eq!(
+            verdict("/mnt/music/Jazz/a.flac", &v(&["/mnt/music"]), &[]),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// La racine qui porte le fichier est tombée : on garde.
+    #[test]
+    fn une_racine_illisible_protege_ses_pistes() {
+        assert_eq!(
+            verdict(
+                "/mnt/music/Jazz/a.flac",
+                &v(&["/mnt/music"]),
+                &v(&["/mnt/music"])
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+    }
+
+    /// PREMIÈRE moitié perdue : `starts_with` nu, et la PREMIÈRE racine qui
+    /// préfixe l'emporte. `/mnt/music2` répond, `/mnt/music22` est tombé —
+    /// l'ancien garde interrogeait `/mnt/music2`, la trouvait lisible, et
+    /// supprimait toute la bibliothèque du partage absent.
+    #[test]
+    fn la_racine_voisine_ne_repond_plus_pour_le_partage_tombe() {
+        let racines = v(&["/mnt/music2", "/mnt/music22"]);
+        let illisibles = v(&["/mnt/music22"]);
+        assert_eq!(
+            verdict("/mnt/music22/Jazz/a.flac", &racines, &illisibles),
+            VerdictPurge::ProtegeIllisible
+        );
+        // Et la voisine, elle, purge normalement : la protection ne déborde pas.
+        assert_eq!(
+            verdict("/mnt/music2/Jazz/a.flac", &racines, &illisibles),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// Même moitié, écriture Windows — `G:\Musique` et `G:\Musique 2`.
+    /// `starts_with` ne voyait pas non plus la frontière d'antislash.
+    #[test]
+    fn la_frontiere_vaut_aussi_en_antislash() {
+        let racines = v(&[r"G:\Musique", r"G:\Musique 2"]);
+        assert_eq!(
+            verdict(
+                r"G:\Musique 2\Jazz\a.flac",
+                &racines,
+                &v(&[r"G:\Musique 2"])
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+        assert_eq!(
+            verdict(r"G:\Musique\Jazz\a.flac", &racines, &[]),
+            VerdictPurge::Supprimer
+        );
+    }
+
+    /// SECONDE moitié perdue : hors périmètre (#1943). L'ancien garde ne
+    /// trouvait aucune racine préfixe, sautait le `if let`, et supprimait
+    /// sans condition. C'est le trou des 21 277 pistes de Yacine.
+    #[test]
+    fn une_piste_sous_aucune_racine_est_conservee() {
+        assert_eq!(
+            verdict("/ancien/montage/Jazz/a.flac", &v(&["/mnt/music"]), &[]),
+            VerdictPurge::HorsPerimetre
+        );
+    }
+
+    /// Aucune racine connue : on ne sait rien, on ne supprime rien.
+    #[test]
+    fn sans_racine_configuree_rien_ne_part() {
+        assert_eq!(
+            verdict("/mnt/music/Jazz/a.flac", &[], &[]),
+            VerdictPurge::HorsPerimetre
+        );
+    }
+
+    /// Contre-épreuve figée : l'ANCIENNE formule du garde, telle qu'elle
+    /// était écrite, sur les deux cas ci-dessus. Elle laissait passer les
+    /// deux suppressions. Ce test échouerait si quelqu'un la réintroduisait
+    /// en croyant qu'elle était équivalente.
+    #[test]
+    fn l_ancien_garde_laissait_passer_les_deux() {
+        let racines = v(&["/mnt/music2", "/mnt/music22"]);
+        let illisible = "/mnt/music22";
+        let ancien_supprimait = |chemin: &str| {
+            // `find` : la PREMIÈRE racine qui préfixe, pas la bonne.
+            match racines.iter().find(|r| chemin.starts_with(r.as_str())) {
+                // La racine trouvée est lisible ⇒ l'ancien code supprimait.
+                Some(root) => root != illisible,
+                // Aucune racine ⇒ l'ancien code supprimait aussi.
+                None => true,
+            }
+        };
+        assert!(
+            ancien_supprimait("/mnt/music22/Jazz/a.flac"),
+            "l'ancien garde retenait /mnt/music2 pour un chemin de /mnt/music22"
+        );
+        assert!(
+            ancien_supprimait("/ancien/montage/Jazz/a.flac"),
+            "l'ancien garde n'avait aucune protection hors périmètre"
+        );
+    }
+}
+
+/// Le surveillant a-t-il le droit de retirer cette piste de la base ?
+///
+/// Le surveillant de fichiers supprime des lignes de `tracks`, comme la purge
+/// de fin de scan — et c'était la seule des quatre portes de suppression
+/// (scan manuel, scan automatique, retrait de racine, surveillant) à ne pas
+/// passer par [`verdict_purge`]. Elle y perdait ses DEUX moitiés :
+///
+/// 1. **La frontière de séparateur.** Le garde testait
+///    `change.path.starts_with(racine)`, un préfixe de NOM : `/mnt/music2`
+///    « contient » alors `/mnt/music22/album/a.flac`. Pire, il retenait la
+///    PREMIÈRE racine qui préfixe — donc si `/mnt/music2` répond et que
+///    `/mnt/music22` est le partage tombé, le garde interroge la mauvaise
+///    racine, la trouve lisible, et supprime. C'est la quatrième occurrence
+///    du défaut de #2016.
+/// 2. **La protection « hors périmètre » (#1943).** Une piste sous AUCUNE
+///    racine configurée ne trouvait aucun garde du tout : `find` rendait
+///    `None`, le `if let` était sauté, et `delete_by_path` partait sans
+///    condition. C'est très exactement le trou par lequel 21 277 pistes de
+///    Yacine ont disparu — un point de montage renommé, l'ancienne racine
+///    plus configurée, personne pour dire « je ne sais pas ».
+///
+/// `racines_illisibles` est la liste des racines dont `read_dir` échoue à cet
+/// instant. Elle est passée en paramètre, et non relue ici, pour que la règle
+/// se teste sans système de fichiers — et pour qu'un lot de mille
+/// suppressions ne paie pas mille `read_dir` sur un partage tombé.
+pub(crate) fn verdict_suppression_surveillant(
+    chemin: &str,
+    racines: &[String],
+    racines_illisibles: &[String],
+) -> crate::routes::system::scan::VerdictPurge {
+    crate::routes::system::scan::verdict_purge(chemin, racines, racines_illisibles, &[], &[], &[])
+}
+
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
 pub fn spawn_file_watcher(
@@ -975,6 +1387,10 @@ pub fn spawn_file_watcher(
     if music_dirs.is_empty() {
         return;
     }
+
+    // Le surveillant supprime des lignes de `tracks` : il doit passer par le
+    // MÊME arbitrage que la purge de fin de scan (#1943).
+    use crate::routes::system::scan::VerdictPurge;
 
     // Normalized roots for the delete guard below — same normalization the
     // watcher applies internally.
@@ -1060,6 +1476,22 @@ pub fn spawn_file_watcher(
                 let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
                 pending_settle = still_writing;
                 let had_changes = !changes.is_empty();
+                // Racines illisibles À CET INSTANT. Calculée une fois par
+                // lot, et seulement s'il porte une suppression : `read_dir`
+                // sur un partage réseau tombé peut bloquer plusieurs
+                // secondes, et un lot en porte des centaines.
+                let racines_illisibles: Vec<String> = if changes
+                    .iter()
+                    .any(|c| c.change_type == tune_core::scanner::watcher::ChangeType::Deleted)
+                {
+                    guard_roots
+                        .iter()
+                        .filter(|r| std::fs::read_dir(r).is_err())
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 for change in changes {
                     // Same exclusions as the scans (re-read per event batch
                     // so setting edits apply without a restart is overkill;
@@ -1188,19 +1620,36 @@ pub fn spawn_file_watcher(
                                     continue;
                                 };
 
-                                // Skip duplicate: same audio content already in this album
+                                // The hash is only a candidate selector. The
+                                // watcher is allowed to skip solely after a
+                                // full byte-for-byte comparison.
                                 if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                    if track_repo
-                                        .exists_by_audio_hash_and_album(hash, aid)
-                                        .unwrap_or(false)
+                                    let candidates = track_repo
+                                        .paths_by_audio_hash_and_album(hash, aid)
+                                        .unwrap_or_default();
+                                    if let Some(existing_path) =
+                                        tune_core::scanner::hasher::find_byte_identical_path(
+                                            std::path::Path::new(&sf.path),
+                                            &candidates,
+                                        )
                                     {
                                         tracing::debug!(
                                             audio_hash = %hash,
                                             album_id = aid,
                                             path = %sf.path,
+                                            existing_path = %existing_path,
                                             "watcher_skip_duplicate_audio_hash"
                                         );
                                         continue;
+                                    }
+                                    if !candidates.is_empty() {
+                                        tracing::warn!(
+                                            audio_hash = %hash,
+                                            album_id = aid,
+                                            path = %sf.path,
+                                            candidates = candidates.len(),
+                                            "watcher_audio_hash_candidate_not_byte_identical"
+                                        );
                                     }
                                 }
 
@@ -1232,17 +1681,30 @@ pub fn spawn_file_watcher(
                                 tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
                                 continue;
                             }
-                            if let Some(root) = guard_roots
-                                .iter()
-                                .find(|r| change.path.starts_with(r.as_str()))
-                                && std::fs::read_dir(root).is_err()
-                            {
-                                tracing::warn!(
-                                    path = %change.path,
-                                    root = %root,
-                                    "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
-                                );
-                                continue;
+                            // Même arbitrage que la purge de fin de scan, et
+                            // par la MÊME fonction : cette règle ne doit
+                            // exister qu'à un endroit (#1943). Ce chemin-ci
+                            // la contournait, et y perdait ses deux moitiés.
+                            match verdict_suppression_surveillant(
+                                &change.path,
+                                &guard_roots,
+                                &racines_illisibles,
+                            ) {
+                                VerdictPurge::ProtegeIllisible => {
+                                    tracing::warn!(
+                                        path = %change.path,
+                                        "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
+                                    );
+                                    continue;
+                                }
+                                VerdictPurge::HorsPerimetre => {
+                                    tracing::warn!(
+                                        path = %change.path,
+                                        "watcher_delete_skipped_out_of_scope — cette piste n'est sous AUCUNE racine configurée, elle n'est pas « disparue » (#1943)"
+                                    );
+                                    continue;
+                                }
+                                VerdictPurge::Supprimer => {}
                             }
                             let track_repo = TrackRepo::with_backend(db.clone());
                             if track_repo.delete_by_path(&change.path).is_ok() {

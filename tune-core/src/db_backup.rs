@@ -139,22 +139,7 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
         return false;
     }
 
-    for suffix in ["-wal", "-shm"] {
-        let wal = db_file.with_file_name(format!(
-            "{}{}",
-            db_file
-                .file_name()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or(""),
-            suffix
-        ));
-        if wal.exists() {
-            let _ = fs::remove_file(&wal);
-        }
-    }
-
-    match fs::copy(&backup_path, db_file) {
+    match replace_database(db_path, &backup_path) {
         Ok(_) => {
             info!(backup = filename, "database_restored");
             true
@@ -164,6 +149,30 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
             false
         }
     }
+}
+
+/// Remplace la base active par le fichier `source`, et rend sa taille.
+///
+/// Extrait de [`restore_backup`] pour que l'import de base
+/// (`/system/database/import`) applique un fichier reçu par le réseau, qui ne
+/// vit pas dans le dossier `backups`. Les deux chemins doivent effacer le `-wal`
+/// et le `-shm` de la base sortante : sans cela SQLite rejoue le journal
+/// par-dessus le fichier fraîchement copié et rend un mélange des deux bases.
+pub fn replace_database(db_path: &str, source: &Path) -> Result<u64, String> {
+    let db_file = Path::new(db_path);
+    let name = db_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid database path: {db_path}"))?;
+
+    for suffix in ["-wal", "-shm"] {
+        let side = db_file.with_file_name(format!("{name}{suffix}"));
+        if side.exists() {
+            let _ = fs::remove_file(&side);
+        }
+    }
+
+    fs::copy(source, db_file).map_err(|e| e.to_string())
 }
 
 fn prune_backups(backup_dir: &Path, stem: &str, ext: &str) {
@@ -232,6 +241,41 @@ mod tests {
         let list = list_backups(db_path.to_str().unwrap());
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].filename, info.filename);
+    }
+
+    /// Le journal de la base SORTANTE doit disparaître avec elle.
+    ///
+    /// C'est la moitié invisible du remplacement : si le `-wal` survit, SQLite
+    /// le rejoue par-dessus le fichier fraîchement copié et rend un mélange des
+    /// deux bases. La contre-épreuve est dans le test : on vérifie que les deux
+    /// annexes existaient bien AVANT l'appel, sinon leur absence après ne
+    /// prouverait rien.
+    #[test]
+    fn replace_database_efface_wal_et_shm_de_la_base_sortante() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        let wal = dir.path().join("tune.db-wal");
+        let shm = dir.path().join("tune.db-shm");
+        fs::write(&db_path, b"ancienne base").unwrap();
+        fs::write(&wal, b"journal de l'ancienne").unwrap();
+        fs::write(&shm, b"index memoire partagee").unwrap();
+        assert!(wal.exists() && shm.exists(), "temoin: les annexes existent");
+
+        let source = dir.path().join("recue.db");
+        fs::write(&source, b"base importee").unwrap();
+
+        let size = replace_database(db_path.to_str().unwrap(), &source).unwrap();
+
+        assert_eq!(fs::read_to_string(&db_path).unwrap(), "base importee");
+        assert_eq!(size, "base importee".len() as u64);
+        assert!(
+            !wal.exists(),
+            "le -wal de la base sortante doit disparaitre"
+        );
+        assert!(
+            !shm.exists(),
+            "le -shm de la base sortante doit disparaitre"
+        );
     }
 
     #[test]
