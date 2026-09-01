@@ -83,6 +83,8 @@ mod reidentification_album;
 mod reprise_position_au_demarrage;
 #[path = "rustsec_allowlists.rs"]
 mod rustsec_allowlists;
+#[path = "serveur_media_criteres_canoniques.rs"]
+mod serveur_media_criteres_canoniques;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
 #[path = "support_relais_marquer_lu.rs"]
