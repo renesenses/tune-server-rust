@@ -979,6 +979,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // spawn_blocking panique. Le Drop du jeton libère alors la génération.
         let _scan_lease = scan_lease;
         let db_for_panic = db.clone();
+        // Le bus est MOVÉ dans la tâche bloquante ci-dessous : sans cette
+        // copie, la sortie par panique n'a plus rien pour parler.
+        let event_bus_pour_panne = event_bus.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
@@ -2237,12 +2240,46 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }).await;
         if let Err(e) = result {
             tracing::error!("scan_task_panicked — {:?}", e);
-            if let Err(e2) = SettingsRepo::with_backend(db_for_panic).set("scan_status", "idle") {
-                tracing::warn!(error = %e2, "scan_status_panic_reset_failed");
-            }
+            cloturer_scan_interrompu(db_for_panic, &event_bus_pour_panne, "panic");
         }
     });
     true
+}
+
+/// Clôt un scan qui s'est arrêté sur une **panique**, et le fait SAVOIR.
+///
+/// La tâche de scan a quatre sorties. Trois annoncent `library.scan.completed` :
+/// la fin normale, l'absence de dossier configuré (#1129) et l'annulation. La
+/// quatrième — la panique de `spawn_blocking` — se contentait de remettre
+/// `scan_status` à `idle` et ne disait rien sur le bus.
+///
+/// Ce n'est pas un cas de figure théorique : les lots sont insérés au fur et à
+/// mesure par `scan_files_batched`, donc une panique SURVENUE APRÈS le premier
+/// lot laisse des albums NEUFS en base et aucun signal pour les annoncer.
+/// L'écran garde son bandeau « scan en cours » et sa liste d'avant, et
+/// l'auditeur ne voit ses nouveautés qu'en rechargeant la page — le symptôme
+/// exact rapporté par Eric (#1393, fil forum, Windows v0.9.61).
+///
+/// `scan_status` retombe bien à `idle`, lui : c'est ce qui rend la panne
+/// silencieuse. Le sondage HTTP dit « plus de scan », le bus ne dit rien, et
+/// les deux surfaces se contredisent sans que personne ne s'en aperçoive.
+///
+/// La charge utile est volontairement DÉGRADÉE, comme celles de l'annulation
+/// (`{"cancelled": true}`) et de l'absence de dossiers (`{"no_dirs": true}`) :
+/// les chiffres d'un scan qui a paniqué ne veulent rien dire, et les habiller
+/// en rapport complet les rendrait indiscernables d'un scan abouti.
+pub(crate) fn cloturer_scan_interrompu(
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+    motif: &str,
+) {
+    if let Err(e) = SettingsRepo::with_backend(backend).set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_panic_reset_failed");
+    }
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "interrupted": true, "reason": motif }),
+    );
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
@@ -4415,5 +4452,85 @@ mod rapport_de_scan_publie_le_sort_de_lenrichissement {
                 "le motif doit rester lisible par le client (#2507)"
             );
         }
+    }
+}
+
+/// #1393 — la sortie par PANIQUE de la tâche de scan ne disait rien au client.
+///
+/// Les deux tests partagent le même harnais et le même appel ; c'est délibéré.
+/// Le premier est le TÉMOIN : la remise de `scan_status` à `idle` existait
+/// déjà avant le correctif, elle est verte des deux côtés, et elle prouve que
+/// le second n'échoue pas parce que le harnais serait cassé, la base absente
+/// ou l'appel jamais atteint. Le second est le FAIT : sans l'émission,
+/// `rx.recv()` expire, et l'auditeur ne voit ses albums qu'en rechargeant la
+/// page.
+#[cfg(test)]
+mod fin_de_scan_interrompu {
+    use super::cloturer_scan_interrompu;
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire")
+    }
+
+    /// TÉMOIN — vert avant comme après le correctif.
+    #[tokio::test]
+    async fn un_scan_interrompu_repose_le_statut_a_idle() {
+        let etat = etat();
+        SettingsRepo::with_backend(etat.backend.clone())
+            .set("scan_status", "scanning")
+            .expect("le réglage doit être inscriptible");
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let statut = SettingsRepo::with_backend(etat.backend.clone())
+            .get("scan_status")
+            .expect("le réglage doit être lisible");
+        assert_eq!(
+            statut.as_deref(),
+            Some("idle"),
+            "un scan qui a paniqué ne doit pas laisser `scan_status` à `scanning`"
+        );
+    }
+
+    /// LE FAIT — rouge avant le correctif.
+    #[tokio::test]
+    async fn une_panique_de_scan_annonce_quand_meme_la_fin_du_scan() {
+        let etat = etat();
+        let mut rx = etat.event_bus.subscribe();
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect(
+                "aucun événement n'est parti : une panique de scan laisse le client \
+                 avec son bandeau et sa liste d'avant, et les albums insérés par les \
+                 lots déjà passés restent invisibles jusqu'au rechargement (#1393)",
+            )
+            .expect("le bus d'événements s'est fermé");
+
+        assert_eq!(
+            ev.event_type,
+            tune_core::event_types::EventType::ScanComplete.as_str(),
+            "c'est le SEUL nom sur lequel le client fait retomber son bandeau de \
+             fin de scan et recharge ses listes"
+        );
+        assert_eq!(
+            ev.data.get("interrupted").and_then(|v| v.as_bool()),
+            Some(true),
+            "le rapport doit se DIRE interrompu : sans ce drapeau il est \
+             indiscernable d'un scan abouti, et le client annoncerait un \
+             succès (charge utile réelle : {})",
+            ev.data
+        );
+        assert_eq!(
+            ev.data.get("reason").and_then(|v| v.as_str()),
+            Some("panic"),
+            "le motif nomme la sortie empruntée (charge utile réelle : {})",
+            ev.data
+        );
     }
 }
