@@ -3107,6 +3107,47 @@ impl PlaybackOrchestrator {
                 error = output_error.as_deref().unwrap_or(""),
                 "output_send_failed_stopping_zone_immediately"
             );
+            // …et le DIRE, pas seulement l'écrire dans le journal du serveur.
+            //
+            // Ce bloc CONNAÎT la cause — le renderer vient de la donner — puis il
+            // la range dans `PlayResult.error` et rend `Ok`. Or `Ok` est ce que
+            // presque tous les appelants lisent comme un succès : le corps de la
+            // réponse n'est relu que par les branches HTTP qui ATTENDENT `play()`
+            // (`POST /zones/:id/play` et ses voisines, via
+            // `build_zone_json_with_result`).
+            //
+            // Partout ailleurs la cause mourait ici : `next` et `previous`
+            // répondent `{"status":"playing"}` depuis un `tokio::spawn` avant même
+            // que l'envoi soit tenté (routes/playback.rs) ; `resume` et `seek`
+            // rendent `Ok(())` ; l'avance automatique, l'autoplay et la relance
+            // de démarrage mort du sondeur écrivent `Ok(_) =>` et poursuivent
+            // comme si la piste avait démarré ; idem pour les alarmes, la reprise
+            // au démarrage, le transfert de zone et l'émulation de renderer UPnP.
+            // Vu de l'auditeur : la zone dit « en lecture », rien ne part, et rien
+            // ne dit pourquoi.
+            //
+            // `zone.playback_error` existe déjà pour six autres échecs de lecture
+            // (périphérique disparu, décodage, volume, radio…) et le serveur le
+            // pousse verbatim à tous les clients (`routes/ws.rs`). Le REFUS D'UNE
+            // SORTIE était le seul échec de lecture à ne pas s'en servir.
+            //
+            // `fatal` pour la même raison qu'en #2630 : la zone s'arrête quinze
+            // lignes plus bas, et sans ce drapeau la fenêtre de grâce
+            // d'après-lecture du client avalerait le message — l'utilisateur
+            // n'aurait, une fois de plus, que le silence.
+            //
+            // Coût nul sur une lecture qui démarre : on n'entre dans ce bloc que
+            // lorsqu'une sortie a EXPLICITEMENT refusé le flux.
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "zone.playback_error",
+                    serde_json::json!({
+                        "zone_id": req.zone_id,
+                        "error": output_error.as_deref().unwrap_or_default(),
+                        "fatal": true,
+                    }),
+                );
+            }
             // La session de flux ne se détruit que si la commande n'a
             // certainement PAS été exécutée. Sur un timeout, elle a pu atteindre
             // un renderer lent : détruire le flux garantit alors qu'il tombe sur
