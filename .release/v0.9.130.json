@@ -1,6 +1,6 @@
 {
   "version": "0.9.130",
-  "ready": false,
+  "ready": true,
   "components": {
     "server": {
       "repository": "renesenses/tune-server-rust",
