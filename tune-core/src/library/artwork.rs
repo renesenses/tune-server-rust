@@ -14,6 +14,27 @@ use tracing::{debug, info, warn};
 /// `FetchOutcome` propagated up the source cascade).
 static ARTWORK_RATE_LIMIT_HITS: AtomicU32 = AtomicU32::new(0);
 
+/// Nombre d'images ramenées **puis refusées par le disque**, incrémenté dans
+/// [`save_to_cache`] — le seul point de passage des deux échecs possibles
+/// (création du répertoire, écriture du fichier).
+///
+/// Sans lui, une passe d'enrichissement compte dans le même `failed` deux
+/// causes opposées : « aucune source n'a d'image pour cet artiste » et
+/// « l'image est en main, le répertoire de cache la refuse ». Les deux
+/// affichent alors le même écran — « terminé, 0 enrichi » — et #2507 s'est
+/// arrêté exactement là : « Le repertoire de cache d artwork n a pas ete
+/// regarde […] Je n ai aucun element pour l affirmer ni pour l ecarter ».
+/// C'est le cas d'une image système dont le répertoire de travail n'est pas
+/// inscriptible : le chemin Linux de `artwork_cache_dir()` est **relatif**
+/// (`artwork_cache`), là où Windows et macOS résolvent un chemin absolu.
+///
+/// Même forme que `ARTWORK_RATE_LIMIT_HITS` juste au-dessus, et pour la même
+/// raison (#1096) : une passe qui « n'a rien trouvé » n'est pas une
+/// bibliothèque vide quand ce compteur est haut — c'est un disque à corriger.
+/// Global au processus (les passes sont sérialisées) ; `Relaxed` suffit à un
+/// compteur de diagnostic.
+static ARTWORK_CACHE_WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
+
 /// Candidate filenames for folder-level cover art.
 ///
 /// On case-insensitive filesystems (NTFS, APFS) duplicates are harmless.
@@ -312,6 +333,7 @@ pub fn store_thumbnail(cache_dir: &Path, bucket: u32, hash: &str, bytes: &[u8]) 
 
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             dir = %cache_dir.display(),
             error = %e,
@@ -327,6 +349,7 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
     if let Err(e) = std::fs::write(&path, data) {
+        ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             path = %path.display(),
             error = %e,
@@ -1341,6 +1364,10 @@ async fn batch_enrich_artist_artwork_inner(
     // downloads THIS run had throttled (429/503) — a "found nothing" run with a
     // high count is retryable, not genuinely empty (#1096).
     let rl_start = ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed);
+    // Même instantané pour les refus du disque : c'est la seule façon de
+    // distinguer « aucune source n'a d'image » de « le cache n'est pas
+    // inscriptible », les deux se présentant sinon comme « 0 enrichi » (#2507).
+    let cw_start = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
@@ -1516,6 +1543,10 @@ async fn batch_enrich_artist_artwork_inner(
                     "enriched": 0,
                     "failed": 0,
                     "community_applied": community_applied,
+                    // La passe communautaire vient de tourner : elle a pu
+                    // ramener des images et se les faire refuser par le disque.
+                    "cache_write_failed":
+                        ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
                 })
                 .to_string(),
             )
@@ -1659,6 +1690,8 @@ async fn batch_enrich_artist_artwork_inner(
                         "community_applied": community_applied,
                         "rate_limit_hits":
                             ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
+                        "cache_write_failed":
+                            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
                     })
                     .to_string(),
                 )
@@ -1787,6 +1820,13 @@ async fn batch_enrich_artist_artwork_inner(
                 // artists are simply absent (#1096).
                 "rate_limit_hits":
                     ARTWORK_RATE_LIMIT_HITS.load(Ordering::Relaxed).saturating_sub(rl_start),
+                // Combien d'images ont été ramenées puis REFUSÉES par le
+                // disque. `failed` les mélange avec les artistes qu'aucune
+                // source ne connaît ; ce compteur-là est le seul qui nomme un
+                // cache non inscriptible, la cause qu'on ne savait ni affirmer
+                // ni écarter sur une image système (#2507).
+                "cache_write_failed":
+                    ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed).saturating_sub(cw_start),
             })
             .to_string(),
         )
@@ -2115,6 +2155,116 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         std::sync::Arc::new(db)
+    }
+
+    // ---------------------------------------------------------------------
+    // #2507 — un cache non inscriptible doit se NOMMER.
+    //
+    // Le fait de base : après le passage, le fichier d'image existe et n'est
+    // pas vide. Quand il n'existe pas, l'enrichissement comptait la fiche dans
+    // le même `failed` qu'un artiste qu'aucune source ne connaît. Les deux
+    // rendaient « terminé, 0 enrichi », et le ticket s'est arrêté là faute de
+    // pouvoir départager (« aucun element pour l affirmer ni pour l ecarter »).
+    // ---------------------------------------------------------------------
+
+    /// Le témoin, sur le fait de base : répertoire inscriptible, le fichier
+    /// d'image existe après le passage et il n'est pas vide. Vert des deux
+    /// côtés du correctif — c'est ce qui prouve que le test rouge ci-dessous
+    /// mesure le refus du disque et non la mécanique d'écriture elle-même.
+    ///
+    /// Il n'affirme rien sur le compteur : celui-ci est global au processus et
+    /// les tests de ce module tournent en parallèle, donc seule une variation
+    /// mesurée autour d'un échec CERTAIN a un sens — c'est ce que fait le test
+    /// suivant, avec des comparaisons qu'une écriture concurrente ne peut que
+    /// renforcer.
+    #[test]
+    fn temoin_cache_inscriptible_le_fichier_existe_et_n_est_pas_vide() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("artwork_cache");
+
+        let hash = cache_fetched_image(b"OCTETS-D-IMAGE", &cache, "jpg")
+            .expect("un répertoire inscriptible doit rendre un condensat");
+
+        let fichier = cache.join(format!("{hash}.jpg"));
+        assert!(fichier.exists(), "le fichier d'image doit exister");
+        assert_eq!(
+            std::fs::read(&fichier).unwrap(),
+            b"OCTETS-D-IMAGE",
+            "le fichier d'image ne doit pas être vide"
+        );
+    }
+
+    /// Le cas signalé : le disque refuse. Rien n'est écrit — et le refus est
+    /// COMPTÉ, donc nommable. Les deux échecs possibles de `save_to_cache`
+    /// sont couverts : la création du répertoire, puis l'écriture du fichier.
+    #[cfg(unix)]
+    #[test]
+    fn un_cache_non_inscriptible_est_compte_et_non_confondu_avec_une_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ferme = dir.path().join("ferme");
+        std::fs::create_dir_all(&ferme).unwrap();
+        std::fs::set_permissions(&ferme, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Sous root, un répertoire en lecture seule n'arrête rien : la mesure
+        // n'aurait aucun sens, on ne la fait pas. On le PROUVE au lieu de le
+        // supposer, sans dépendre de `libc`.
+        if std::fs::write(ferme.join(".sonde"), b"x").is_ok() {
+            std::fs::remove_file(ferme.join(".sonde")).ok();
+            return;
+        }
+
+        // 1) La création du répertoire de cache échoue.
+        let avant = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
+        let sous_dossier = ferme.join("artwork_cache");
+        assert!(
+            cache_fetched_image(b"OCTETS-D-IMAGE", &sous_dossier, "jpg").is_none(),
+            "un répertoire impossible à créer ne peut pas rendre un condensat"
+        );
+        assert!(
+            !sous_dossier.exists(),
+            "aucun fichier d'image ne doit avoir été posé"
+        );
+        assert!(
+            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed) > avant,
+            "le refus du disque doit être compté, sinon il reste indiscernable \
+             d'un artiste dont aucune source n'a d'image (#2507)"
+        );
+
+        // 2) Le répertoire existe déjà, c'est l'écriture qui échoue.
+        let avant = ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed);
+        assert!(
+            cache_fetched_image(b"OCTETS-D-IMAGE", &ferme, "jpg").is_none(),
+            "un répertoire non inscriptible ne peut pas rendre un condensat"
+        );
+        assert!(
+            ARTWORK_CACHE_WRITE_FAILURES.load(Ordering::Relaxed) > avant,
+            "l'échec d'écriture doit être compté au même titre que l'échec de \
+             création du répertoire"
+        );
+
+        // Remis inscriptible : sinon `TempDir` ne peut pas se nettoyer.
+        std::fs::set_permissions(&ferme, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// Tout rapport qui sait dire « on a été bridé » doit aussi savoir dire
+    /// « le disque a refusé » : ce sont les deux raisons pour lesquelles un
+    /// « 0 enrichi » n'est PAS une bibliothèque sans images, et elles se
+    /// lisent au même endroit. Ces `json!` sont des copies manuelles — la même
+    /// configuration a déjà divergé deux fois côté scan (#2012, #2146), et une
+    /// clé posée dans un rapport sur deux ne casse aucune compilation.
+    #[test]
+    fn tout_rapport_qui_dit_le_bridage_dit_aussi_le_refus_du_disque() {
+        let source = include_str!("artwork.rs");
+        let bridage = source.matches("\"rate_limit_hits\":").count();
+        let refus = source.matches("\"cache_write_failed\":").count();
+        assert!(
+            bridage > 0 && refus >= bridage,
+            "{bridage} rapports portent `rate_limit_hits`, seulement {refus} \
+             portent `cache_write_failed` : un « 0 enrichi » y redevient \
+             indiscernable d'un cache non inscriptible (#2507)"
+        );
     }
 
     /// Toutes les cinq fiches, et toujours la dernière.

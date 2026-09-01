@@ -24,7 +24,10 @@ git push origin main --tags
 # 3. Watch all five workflows go green
 gh run list --limit 6
 
-# 4. If something breaks, roll back via the dispatch workflow
+# 4. Review and merge the generated tag -> main PR with a merge commit
+#    (never squash/rebase; the workflow never arms auto-merge)
+
+# 5. If something breaks, roll back via the dispatch workflow
 gh workflow run rollback.yml \
   --field version=v0.8.NN \
   --field previous_version=v0.8.27 \
@@ -77,6 +80,21 @@ Or locally:
 ```bash
 python3 scripts/preflight-check.py --version v0.8.28 --no-ci-check
 ```
+
+## Post-release sync to `main`
+
+After a successful stable `Release` run, `post-release-main-sync.yml` checks
+that the public release has non-empty, SHA-256-addressed assets, then prepares
+or reuses the branch `post-release/<tag>-vers-main` and opens a PR to `main`.
+The operation is idempotent: rerunning it verifies the existing branch and PR;
+it never rewrites the branch and never merges the PR.
+
+Review conflicts and let the complete PR battery finish, then merge by merge
+commit so that the published tag remains an identifiable ancestor of `main`.
+If repository policy forbids `GITHUB_TOKEN` from opening pull requests, provide
+a fine-grained `MAIN_SYNC_TOKEN` with `Contents: write` and
+`Pull requests: write` on this repository. No such token is needed when the
+native Actions permission is enabled.
 
 ## CI batches for bug fixes
 

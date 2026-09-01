@@ -3456,6 +3456,28 @@ pub(crate) enum ReponseNegociation<'a> {
     Timeout,
 }
 
+/// L'issue du jugement d'UNE reponse. Il y en a trois, pas deux (#2555 OAAT,
+/// signalement Steve Taylor sur DigiOne Signature).
+///
+/// La troisieme manquait, et c'est tout le defaut : une reponse portant
+/// l'identifiant d'un flux PERIME etait traitee comme un refus definitif et
+/// non reconnectable. Elle remontait au garde-fou du poller, qui arretait la
+/// zone. Or ce n'est pas un refus — c'est un reliquat de la session
+/// precedente, reste dans `response_rx`, qu'il faut simplement JETER en
+/// continuant d'attendre la reponse qui nous est destinee.
+///
+/// Le correctif de #2282 avait rendu ce decalage VISIBLE au lieu de silencieux,
+/// ce qui etait un progres : avant lui, la reponse etrangere etait prise pour
+/// la bonne et decalait toute la suite. Il ne restait qu'a ne pas confondre
+/// « detecte » avec « fatal ».
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Verdict {
+    /// Le contrat est arrete : la lecture peut partir.
+    Accord(ContratPropose),
+    /// Reponse d'un flux qui n'est plus le notre. A ecarter, sans consequence.
+    Reliquat { flux: String },
+}
+
 /// Un refus de negociation, avec de quoi le remonter jusqu'a l'utilisateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefusNegociation {
@@ -3481,11 +3503,30 @@ impl std::fmt::Display for RefusNegociation {
 /// par `Ok(())` (#2297, JP Robbe). Fonction pure, donc verifiable sur les huit
 /// issues : accord, accord d'un autre flux, contre-proposition identique,
 /// contre-proposition ecartee, refus, reponse hors sujet, fermeture, silence.
+/// L'identifiant de flux que porte un message de l'endpoint, quand il en porte un.
+///
+/// Sert au seul discernement qui compte pendant une negociation : ce message
+/// parle-t-il de MON flux, ou d'un flux precedent dont la reponse traine encore
+/// dans le canal ? Les six variantes du protocole portent un `stream_id` ;
+/// l'ecrire ici plutot que dans le `match` evite d'oublier une variante quand
+/// le protocole en gagnera une.
+fn stream_id_de(reponse: &oaat_controller::EndpointResponse) -> Option<&str> {
+    use oaat_controller::EndpointResponse as R;
+    Some(match reponse {
+        R::FormatAccept(m) => &m.stream_id,
+        R::FormatCounter(m) => &m.stream_id,
+        R::FormatReject(m) => &m.stream_id,
+        R::NextTrackReady(m) => &m.stream_id,
+        R::NextTrackReformat(m) => &m.stream_id,
+        R::StreamStats(m) => &m.stream_id,
+    })
+}
+
 pub(crate) fn juger_reponse(
     contrat: &ContratPropose,
     reponse: ReponseNegociation<'_>,
     politique: PolitiqueAdaptation,
-) -> Result<ContratPropose, RefusNegociation> {
+) -> Result<Verdict, RefusNegociation> {
     let refus = |raison: String, reconnectable: bool| {
         Err(RefusNegociation {
             stream_id: contrat.stream_id.clone(),
@@ -3493,13 +3534,10 @@ pub(crate) fn juger_reponse(
             reconnectable,
         })
     };
-    let flux_etranger = |recu: &str| {
-        format!(
-            "reponse pour le flux {recu} alors qu'on negociait {} — une reponse \
-             en retard prise pour la bonne decale toute la suite",
-            contrat.stream_id
-        )
-    };
+    // Une reponse qui porte l'identifiant d'un AUTRE flux n'est pas un refus :
+    // c'est le reliquat d'une session precedente reste dans `response_rx`. On
+    // l'ecarte et on continue d'attendre la notre, dans le meme delai.
+    let reliquat = |recu: &str| Ok(Verdict::Reliquat { flux: recu.into() });
 
     match reponse {
         ReponseNegociation::Timeout => refus(
@@ -3510,18 +3548,18 @@ pub(crate) fn juger_reponse(
         ReponseNegociation::Recue(recue) => match recue {
             oaat_controller::EndpointResponse::FormatAccept(fa) => {
                 if fa.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fa.stream_id), false)
+                    reliquat(&fa.stream_id)
                 } else {
-                    Ok(contrat.clone())
+                    Ok(Verdict::Accord(contrat.clone()))
                 }
             }
             oaat_controller::EndpointResponse::FormatCounter(fc) => {
                 if fc.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fc.stream_id), false)
+                    reliquat(&fc.stream_id)
                 } else {
                     let cible = ContratPropose::depuis_contre_proposition(fc);
                     let Some(ecart) = contrat.premier_ecart(fc) else {
-                        return Ok(cible);
+                        return Ok(Verdict::Accord(cible));
                     };
                     match politique {
                         PolitiqueAdaptation::ExacteSeulement => refus(
@@ -3533,7 +3571,7 @@ pub(crate) fn juger_reponse(
                         ),
                         PolitiqueAdaptation::PcmEntier => {
                             match construire_adaptateur_pcm(contrat, &cible) {
-                                Ok(_) => Ok(cible),
+                                Ok(_) => Ok(Verdict::Accord(cible)),
                                 Err(cause) => refus(
                                     format!(
                                         "contre-proposition non produisible : {ecart} ; {cause}"
@@ -3547,7 +3585,7 @@ pub(crate) fn juger_reponse(
             }
             oaat_controller::EndpointResponse::FormatReject(fr) => {
                 if fr.stream_id != contrat.stream_id {
-                    refus(flux_etranger(&fr.stream_id), false)
+                    reliquat(&fr.stream_id)
                 } else {
                     refus(
                         format!("format refuse par l'endpoint : {}", fr.reason),
@@ -3555,10 +3593,34 @@ pub(crate) fn juger_reponse(
                     )
                 }
             }
-            autre => refus(
-                format!("reponse inattendue pendant la negociation de format : {autre:?}"),
-                false,
-            ),
+            // Les autres messages du protocole portent EUX AUSSI un
+            // `stream_id`, et le reliquat d'une session precedente arrive par
+            // le meme canal. Les refuser sans regarder cet identifiant arrete
+            // la zone pour un message qui ne nous etait pas destine — c'est le
+            // meme defaut que ci-dessus, une variante plus loin.
+            //
+            // Steve Taylor, 29/08/2026, journal du fil forum : DEUX echecs a
+            // six minutes d'intervalle sur son DigiOne Signature, de formes
+            // differentes. Le second (13h31) est bien un `FormatCounter` en
+            // retard, deja traite plus haut. Le PREMIER (13h25) ne l'est pas :
+            //
+            //   raison=reponse inattendue pendant la negociation de format :
+            //   StreamStats(StreamStats { stream_id: "tune-1", ... })
+            //
+            // Il negociait `tune-2` et recevait les statistiques de `tune-1`,
+            // le flux qu'il venait d'arreter. Sans ce bras, corriger seulement
+            // le cas du FormatCounter lui aurait laisse un echec sur deux.
+            autre => {
+                if let Some(flux) = stream_id_de(autre)
+                    && flux != contrat.stream_id
+                {
+                    return reliquat(flux);
+                }
+                refus(
+                    format!("reponse inattendue pendant la negociation de format : {autre:?}"),
+                    false,
+                )
+            }
         },
     }
 }
@@ -3580,7 +3642,22 @@ pub(crate) fn juger_reponse(
 /// l'a cause, et ne se voit donc pas la ou il est ne.
 ///
 /// Tout le jugement est delegue a `juger_reponse` : ici il ne reste que
-/// l'attente et la trace.
+/// l'attente, le rejet des reliquats et la trace.
+///
+/// ## Pourquoi une BOUCLE, et pourquoi bornee par une echeance
+///
+/// Cette fonction ne lisait qu'UNE reponse. Un saut de piste rapide laisse la
+/// reponse de la piste precedente dans `response_rx` ; la negociation suivante
+/// la lisait, constatait l'identifiant etranger, et remontait un refus non
+/// reconnectable — le poller arretait alors la zone. Le testeur voyait sa
+/// lecture s'arreter alors que son appareil avait repondu correctement, mais
+/// pour la session d'avant.
+///
+/// On boucle donc jusqu'a trouver la reponse qui nous est destinee. L'echeance
+/// est calculee UNE FOIS, avant la boucle : le delai global reste celui du
+/// contrat, et un endpoint qui deverserait des reliquats sans fin ne peut pas
+/// l'etirer. C'est le point a ne pas rater — reinitialiser le delai a chaque
+/// tour rendrait l'attente non bornee.
 async fn attendre_accord_format(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     device_name: &str,
@@ -3588,23 +3665,55 @@ async fn attendre_accord_format(
     politique: PolitiqueAdaptation,
     delai: std::time::Duration,
 ) -> Result<ContratPropose, RefusNegociation> {
-    let recue = tokio::time::timeout(delai, endpoint.response_rx.recv()).await;
+    let echeance = tokio::time::Instant::now() + delai;
+    let mut ecartees: u32 = 0;
 
-    let verdict = match &recue {
-        Ok(Some(reponse)) => juger_reponse(contrat, ReponseNegociation::Recue(reponse), politique),
-        Ok(None) => juger_reponse(contrat, ReponseNegociation::Fermee, politique),
-        Err(_) => juger_reponse(contrat, ReponseNegociation::Timeout, politique),
-    };
+    loop {
+        let restant = echeance.saturating_duration_since(tokio::time::Instant::now());
+        let recue = tokio::time::timeout(restant, endpoint.response_rx.recv()).await;
 
-    if let Err(refus) = &verdict {
-        error!(
-            device = %device_name,
-            stream_id = %refus.stream_id,
-            raison = %refus.raison,
-            "oaat: negociation de format refusee"
-        );
+        let verdict = match &recue {
+            Ok(Some(reponse)) => {
+                juger_reponse(contrat, ReponseNegociation::Recue(reponse), politique)
+            }
+            Ok(None) => juger_reponse(contrat, ReponseNegociation::Fermee, politique),
+            Err(_) => juger_reponse(contrat, ReponseNegociation::Timeout, politique),
+        };
+
+        match verdict {
+            Ok(Verdict::Accord(contrat_arrete)) => {
+                if ecartees > 0 {
+                    info!(
+                        device = %device_name,
+                        stream_id = %contrat.stream_id,
+                        ecartees,
+                        "oaat: negociation aboutie apres avoir ecarte des reponses en retard"
+                    );
+                }
+                return Ok(contrat_arrete);
+            }
+            Ok(Verdict::Reliquat { flux }) => {
+                ecartees = ecartees.saturating_add(1);
+                warn!(
+                    device = %device_name,
+                    stream_id = %contrat.stream_id,
+                    flux_ecarte = %flux,
+                    ecartees,
+                    "oaat: reponse d'un flux perime ecartee, on continue d'attendre"
+                );
+            }
+            Err(refus) => {
+                error!(
+                    device = %device_name,
+                    stream_id = %refus.stream_id,
+                    raison = %refus.raison,
+                    ecartees,
+                    "oaat: negociation de format refusee"
+                );
+                return Err(refus);
+            }
+        }
     }
-    verdict
 }
 
 async fn settle_prefetch(
