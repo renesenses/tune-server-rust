@@ -27,6 +27,21 @@ pub struct IcyMetadata {
 /// endpoints. As a fallback it attempts to read raw ICY metadata from the audio
 /// stream.
 pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Option<IcyMetadata> {
+    fetch_radio_metadata_depuis(RADIOFRANCE_LIVEMETA_BASE, station_name, stream_url).await
+}
+
+/// Le même parcours, la racine `livemeta` en paramètre.
+///
+/// C'est ce que la BBC a déjà fait pour son propre distant (#3139) : la racine
+/// est un paramètre pour que la contre-épreuve puisse dresser un faux service.
+/// **Aucun test de ce dépôt n'appelle une vraie radio** — ni `livemeta`, ni un
+/// flux icecast. Sans ce paramètre, la seule façon d'établir ce que la route
+/// rend pour une station serait de l'interroger pour de vrai.
+async fn fetch_radio_metadata_depuis(
+    livemeta_base: &str,
+    station_name: &str,
+    stream_url: &str,
+) -> Option<IcyMetadata> {
     // Radio France family (FIP, France Inter, France Musique, ...)
     if stream_url.contains("fipradio")
         || stream_url.contains("radiofrance")
@@ -39,7 +54,7 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
         // Fall through to the raw ICY reader rather than querying a channel
         // that belongs to a different station.
         if let Some(channel) = radiofrance_channel_id(station_name, stream_url) {
-            return fetch_radiofrance_metadata(station_name, channel).await;
+            return fetch_radiofrance_metadata(livemeta_base, station_name, channel).await;
         }
     }
 
@@ -68,40 +83,81 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
 // Radio France
 // ---------------------------------------------------------------------------
 
-/// Extract the FIP sub-station qualifier from a station name or stream URL:
-/// `"pop"` for both `FIP Pop` and `.../fippop-hifi.aac`, and an empty string
-/// for the main station.
-///
-/// Everything after the last `fip` is kept, minus the stream-flavour noise
-/// (`-hifi.aac`, `midfi`, the legacy `fipradio.fr` host), so the caller can
-/// tell "this is FIP" from "this is some FIP webradio we do not know".
-fn fip_qualifier(hay: &str) -> String {
-    let Some(index) = hay.rfind("fip") else {
-        return String::new();
-    };
+/// Racine du service `livemeta` de Radio France — public, sans clef ni compte.
+const RADIOFRANCE_LIVEMETA_BASE: &str = "https://api.radiofrance.fr/livemeta/pull";
 
-    hay[index + 3..]
+/// Le qualificatif de webradio porté par un nom de station ou une URL de flux.
+///
+/// `Some("pop")` pour `FIP Pop` comme pour `.../fippop-hifi.aac`,
+/// `Some("baroque")` pour `.../francemusiquebaroque-hifi.aac`, et
+/// `Some("")` — la chaîne **vide** — pour la station principale de la famille.
+///
+/// Tout ce qui suit le dernier `prefixe` est retenu, moins le bruit de
+/// conditionnement du flux (`-hifi.aac`, `midfi`, l'ancien hôte `fipradio.fr`),
+/// pour que l'appelant distingue « c'est la station principale » de « c'est une
+/// webradio, et laquelle ».
+///
+/// **`None` veut dire « ce n'est pas cette station du tout ».** Le préfixe est
+/// bien là, mais collé derrière autre chose : il n'ouvre pas son jeton.
+/// `monpetitfranceinter` contient `franceinter` sans être France Inter — c'est
+/// **Mon Petit France Inter**, une station différente. Lire le mot au milieu
+/// d'un autre lui donnait le canal 1, celui d'une station qu'elle n'est pas
+/// (#3142).
+fn qualificatif_webradio(hay: &str, prefixe: &str) -> Option<String> {
+    let index = hay.rfind(prefixe)?;
+    if hay[..index]
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .filter(|token| {
-            !matches!(
-                *token,
-                "hifi"
-                    | "midfi"
-                    | "lofi"
-                    | "aac"
-                    | "mp3"
-                    | "radio"
-                    | "fr"
-                    | "com"
-                    | "http"
-                    | "https"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+    {
+        return None;
+    }
+
+    Some(
+        hay[index + prefixe.len()..]
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|token| {
+                !matches!(
+                    *token,
+                    "hifi"
+                        | "midfi"
+                        | "lofi"
+                        | "aac"
+                        | "mp3"
+                        | "radio"
+                        | "fr"
+                        | "com"
+                        | "http"
+                        | "https"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Le canal de la station **principale** d'une famille, et rien d'autre.
+///
+/// Un qualificatif — quel qu'il soit — veut dire « c'est une webradio ». Aucune
+/// des familles servies par cette fonction n'a de webradio dotée d'un canal
+/// `livemeta` : le balayage des canaux 1 à 120 du 01/09/2026 n'en a trouvé
+/// aucune (les canaux 11 à 56, 68, 90 et 92 sont les stations locales « ici »).
+/// Rendre le canal de la mère afficherait chez la fille le morceau de la mère.
+/// FIP, la seule famille dont les webradios ont de vrais canaux, garde donc sa
+/// propre table juste en dessous.
+fn canal_principal_ou_rien(hay: &str, prefixe: &str, canal_principal: u32) -> Option<u32> {
+    match qualificatif_webradio(hay, prefixe) {
+        Some(qualificatif) if qualificatif.is_empty() => Some(canal_principal),
+        _ => None,
+    }
+}
+
+/// Le premier préfixe de la liste que `hay` porte, s'il y en a un.
+fn prefixe_reconnu<'a>(hay: &str, prefixes: &[&'a str]) -> Option<&'a str> {
+    prefixes.iter().copied().find(|p| hay.contains(p))
 }
 
 /// Map a station name / stream URL to the Radio France *station id* used by
@@ -123,26 +179,48 @@ fn fip_qualifier(hay: &str) -> String {
 /// Valjean, « Mauvaises Métadonnées sur Fip Cultes, FIP Pop, FIP Sacré
 /// français, FIP Hip-Hop »). The same reasoning applies to any Radio France
 /// station we do not recognise at all: guessing FIP would be inventing.
+///
+/// **La même règle vaut pour les autres familles, et elle n'y était pas
+/// appliquée (#3142).** Onze stations livrées ou ajoutables recevaient le canal
+/// de leur station mère : les neuf webradios de France Musique — Baroque,
+/// Classique Easy, Classique Plus, Concerts, Contemporaine, Jazz, Musiques du
+/// monde, Opéra, Piano Zen — partaient toutes sur le canal 4, celui de France
+/// Musique **principale** ; Mouv Xtra sur le 6 ; Mon Petit France Inter sur le
+/// 1. Elles affichaient donc, pendant des heures, le morceau d'une autre
+/// station : plausible, au bon format, dans le bon genre, et faux.
+///
+/// Il n'y a **pas** de bon numéro à mettre à la place. Le balayage des canaux
+/// `livemeta` 1 à 120 du 01/09/2026 n'a trouvé **aucun** canal de webradio
+/// France Musique (les canaux 11 à 56, 68, 90 et 92 sont les stations locales
+/// « ici »). La correspondance n'était pas fausse par étourderie, elle est
+/// impossible avec cette source. Et le repli ICY ne les rattrape pas : mesuré
+/// flux par flux le 01/09/2026, **aucun** flux `icecast.radiofrance.fr` ne rend
+/// l'en-tête `icy-metaint`, même en réclamant `Icy-MetaData: 1` — pas plus
+/// `francemusiquebaroque-hifi.aac` que `francemusique-hifi.aac` lui-même. Ces
+/// onze stations n'affichent donc plus rien, et c'est le correctif : une
+/// absence propre est honnête, un titre faux ne l'est pas.
 fn radiofrance_channel_id(station_name: &str, stream_url: &str) -> Option<u32> {
     let hay = format!(
         "{} {}",
         station_name.to_lowercase(),
         stream_url.to_lowercase()
     );
-    if hay.contains("franceinter") {
-        Some(1)
-    } else if hay.contains("francemusique") || hay.contains("france-musique") {
-        Some(4)
-    } else if hay.contains("mouv") {
-        Some(6)
-    } else if hay.contains("franceculture") || hay.contains("france-culture") {
-        Some(2)
-    } else if hay.contains("franceinfo") {
-        Some(3)
+    if let Some(prefixe) = prefixe_reconnu(&hay, &["franceinter"]) {
+        canal_principal_ou_rien(&hay, prefixe, 1)
+    } else if let Some(prefixe) = prefixe_reconnu(&hay, &["francemusique", "france-musique"]) {
+        canal_principal_ou_rien(&hay, prefixe, 4)
+    } else if let Some(prefixe) = prefixe_reconnu(&hay, &["mouv"]) {
+        canal_principal_ou_rien(&hay, prefixe, 6)
+    } else if let Some(prefixe) = prefixe_reconnu(&hay, &["franceculture", "france-culture"]) {
+        canal_principal_ou_rien(&hay, prefixe, 2)
+    } else if let Some(prefixe) = prefixe_reconnu(&hay, &["franceinfo"]) {
+        canal_principal_ou_rien(&hay, prefixe, 3)
     } else if hay.contains("fip") {
         // FIP webradios: pick the specific substation, main FIP when there is
         // no qualifier at all, and nothing when the qualifier is unknown.
-        let qualifier = fip_qualifier(&hay);
+        let Some(qualifier) = qualificatif_webradio(&hay, "fip") else {
+            return None;
+        };
         if qualifier.is_empty() {
             Some(7)
         } else if qualifier.contains("rock") {
@@ -185,8 +263,12 @@ fn url_de_pochette(v: Option<&str>) -> Option<String> {
     }
 }
 
-async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<IcyMetadata> {
-    let url = format!("https://api.radiofrance.fr/livemeta/pull/{channel}");
+async fn fetch_radiofrance_metadata(
+    base: &str,
+    station_name: &str,
+    channel: u32,
+) -> Option<IcyMetadata> {
+    let url = format!("{base}/{channel}");
     let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -818,29 +900,82 @@ mod tests {
     fn fip_qualifier_ignores_stream_flavour() {
         // The main station must stay recognisable through every URL shape it
         // ships under, otherwise it would lose its metadata too.
+        let q = |hay: &str| qualificatif_webradio(hay, "fip");
         assert_eq!(
-            fip_qualifier("fip https://icecast.radiofrance.fr/fip-hifi.aac"),
-            ""
+            q("fip https://icecast.radiofrance.fr/fip-hifi.aac").as_deref(),
+            Some("")
         );
         assert_eq!(
-            fip_qualifier(" https://icecast.radiofrance.fr/fip-midfi.mp3"),
-            ""
+            q(" https://icecast.radiofrance.fr/fip-midfi.mp3").as_deref(),
+            Some("")
         );
         assert_eq!(
-            fip_qualifier(" http://direct.fipradio.fr/live/fip-midfi.mp3"),
-            ""
+            q(" http://direct.fipradio.fr/live/fip-midfi.mp3").as_deref(),
+            Some("")
         );
-        assert_eq!(fip_qualifier("fip "), "");
+        assert_eq!(q("fip ").as_deref(), Some(""));
 
         // …while a substation keeps its qualifier, from the name or the URL.
-        assert_eq!(fip_qualifier("fip pop "), "pop");
+        assert_eq!(q("fip pop ").as_deref(), Some("pop"));
         assert_eq!(
-            fip_qualifier(" https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac"),
-            "sacrefrancais"
+            q(" https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac").as_deref(),
+            Some("sacrefrancais")
         );
         assert_eq!(
-            fip_qualifier(" https://icecast.radiofrance.fr/fiprock-hifi.aac"),
-            "rock"
+            q(" https://icecast.radiofrance.fr/fiprock-hifi.aac").as_deref(),
+            Some("rock")
+        );
+    }
+
+    /// Le même découpage, sur les autres familles : la station principale rend
+    /// la chaîne vide, la webradio rend son qualificatif.
+    #[test]
+    fn le_qualificatif_se_lit_aussi_sur_les_autres_familles() {
+        let url = |s: &str| format!("https://icecast.radiofrance.fr/{s}-hifi.aac");
+        assert_eq!(
+            qualificatif_webradio(&url("francemusique"), "francemusique").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            qualificatif_webradio(&url("francemusiquebaroque"), "francemusique").as_deref(),
+            Some("baroque")
+        );
+        assert_eq!(
+            qualificatif_webradio(&url("francemusiqueconcertsradiofrance"), "francemusique")
+                .as_deref(),
+            Some("concertsradiofrance")
+        );
+        assert_eq!(
+            qualificatif_webradio(&url("mouv"), "mouv").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            qualificatif_webradio(&url("mouvxtra"), "mouv").as_deref(),
+            Some("xtra")
+        );
+    }
+
+    /// **La borne de #3142.** Un préfixe collé DERRIÈRE autre chose ne désigne
+    /// pas la station : `monpetitfranceinter` porte bien `franceinter`, mais
+    /// c'est Mon Petit France Inter, pas France Inter. Sans cette borne, la
+    /// station recevait le canal 1 et affichait le morceau de France Inter.
+    #[test]
+    fn un_prefixe_colle_derriere_autre_chose_ne_designe_pas_la_station() {
+        assert_eq!(
+            qualificatif_webradio(
+                "mon petit france inter https://icecast.radiofrance.fr/monpetitfranceinter-hifi.aac",
+                "franceinter"
+            ),
+            None
+        );
+        // Le même mot, seul dans son jeton, reste France Inter.
+        assert_eq!(
+            qualificatif_webradio(
+                "france inter https://icecast.radiofrance.fr/franceinter-hifi.aac",
+                "franceinter"
+            )
+            .as_deref(),
+            Some("")
         );
     }
 
@@ -1247,5 +1382,230 @@ mod tests {
         assert_eq!(meta.artist.as_deref(), Some("A"));
         assert_eq!(meta.station.as_deref(), Some("Faux Flux"));
         assert_eq!(meta.cover_url, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3142 — onze stations affichaient le morceau d'une AUTRE station
+    // -----------------------------------------------------------------------
+    //
+    // ## Le fait de base
+    //
+    // Les neuf webradios de France Musique partaient sur le canal 4, celui de
+    // France Musique **principale** ; Mouv Xtra sur le 6, celui de Mouv' ; Mon
+    // Petit France Inter sur le 1, celui de France Inter. Elles affichaient
+    // donc le morceau d'une autre station : plausible, au bon format, dans le
+    // bon genre, et faux, sans que rien ne le signale.
+    //
+    // ## Pourquoi ne rien afficher, plutôt que corriger le numéro
+    //
+    // Il n'y a pas de bon numéro. Balayage des canaux `livemeta` 1 à 120 le
+    // 01/09/2026 : **aucun** canal de webradio France Musique n'existe.
+    //
+    // ## Pourquoi le repli ICY ne les rattrape pas
+    //
+    // Mesuré flux par flux le 01/09/2026, `Icy-MetaData: 1` réclamé :
+    // `francemusique`, `francemusiquebaroque`, `francemusiqueeasyclassique`,
+    // `francemusiqueclassiqueplus`, `francemusiqueconcertsradiofrance`,
+    // `francemusiquelacontemporaine`, `francemusiquelajazz`,
+    // `francemusiqueopera`, `francemusiquepianozen`, `monpetitfranceinter`,
+    // `fiprock` répondent 200 **sans** en-tête `icy-metaint` et ne portent
+    // aucun `StreamTitle` ; `francemusiqueocoramondial` et `mouvxtra`
+    // répondent 404. Le repli ICY couvre donc **zéro** des onze : le correctif
+    // est bien une absence, pas un basculement de source.
+    //
+    // Aucun test ci-dessous n'appelle une vraie radio : le `livemeta` comme le
+    // flux sont des serveurs montés dans le test.
+
+    /// Les onze du relevé : le nom livré, et le radical du flux Radio France.
+    const ONZE_STATIONS_SANS_SOURCE: &[(&str, &str)] = &[
+        ("France Musique Baroque", "francemusiquebaroque"),
+        (
+            "France Musique Classique Easy",
+            "francemusiqueeasyclassique",
+        ),
+        (
+            "France Musique Classique Plus",
+            "francemusiqueclassiqueplus",
+        ),
+        (
+            "France Musique Concerts",
+            "francemusiqueconcertsradiofrance",
+        ),
+        (
+            "France Musique Contemporaine",
+            "francemusiquelacontemporaine",
+        ),
+        ("France Musique Jazz", "francemusiquelajazz"),
+        (
+            "France Musique Musiques du monde",
+            "francemusiqueocoramondial",
+        ),
+        ("France Musique Opéra", "francemusiqueopera"),
+        ("France Musique Piano Zen", "francemusiquepianozen"),
+        ("Mouv Xtra", "mouvxtra"),
+        ("Mon Petit France Inter", "monpetitfranceinter"),
+    ];
+
+    /// Faux `livemeta`, à la forme que lit `fetch_radiofrance_metadata`.
+    ///
+    /// Chaque canal rend un morceau **qui le nomme** : deux canaux différents
+    /// ne peuvent donc pas rendre le même titre, et une station qui affiche le
+    /// morceau d'une autre se voit au premier coup d'œil.
+    async fn faux_livemeta() -> String {
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            let canal = uri.path().trim_start_matches('/').to_string();
+            axum::Json(json!({
+                "levels": [{ "position": 0, "items": ["pas-en-cours"] }],
+                "steps": {
+                    "pas-en-cours": {
+                        "title": format!("Morceau du canal {canal}"),
+                        "authors": format!("Interprète du canal {canal}"),
+                    }
+                },
+            }))
+        });
+        faux_distant(app).await
+    }
+
+    /// L'adresse de flux d'une station Radio France, servie par le faux flux.
+    ///
+    /// Le radical est celui que Radio France emploie vraiment — c'est lui que
+    /// lit `radiofrance_channel_id` — et l'hôte est local, pour qu'aucun test
+    /// n'appelle une vraie radio.
+    fn adresse_locale(flux: &str, radical: &str) -> String {
+        format!("{flux}/radiofrance/{radical}-hifi.aac")
+    }
+
+    /// **LE FAIT.** Ce que la route rend pour chacune des onze stations.
+    ///
+    /// Rouge avant le correctif : les onze rendaient `Morceau du canal 4`,
+    /// `… 6` ou `… 1`, c'est-à-dire le morceau d'une autre station. Vert
+    /// après : elles ne rendent plus rien.
+    #[tokio::test]
+    async fn aucune_des_onze_stations_ne_rend_le_morceau_d_une_autre() {
+        let livemeta = faux_livemeta().await;
+        let flux = faux_flux(false).await;
+
+        // Ce que rendent, au même instant, les trois stations mères.
+        let mut meres = Vec::new();
+        for (nom, radical) in [
+            ("France Musique", "francemusique"),
+            ("Mouv'", "mouv"),
+            ("France Inter", "franceinter"),
+        ] {
+            let titre =
+                fetch_radio_metadata_depuis(&livemeta, nom, &adresse_locale(&flux, radical))
+                    .await
+                    .unwrap_or_else(|| panic!("« {nom} » doit continuer de rendre son morceau"))
+                    .title;
+            meres.push(titre);
+        }
+
+        // Toutes les onze sont interrogées avant de conclure : un `assert` par
+        // tour s'arrêterait à la première et ne dirait rien des dix autres.
+        let mut fautives = Vec::new();
+        for &(nom, radical) in ONZE_STATIONS_SANS_SOURCE {
+            if let Some(meta) =
+                fetch_radio_metadata_depuis(&livemeta, nom, &adresse_locale(&flux, radical)).await
+            {
+                fautives.push(format!("{nom} → « {} »", meta.title));
+            }
+        }
+        assert!(
+            fautives.is_empty(),
+            "aucune des onze ne doit RIEN afficher — aucun canal livemeta ne les couvre et leurs \
+             flux ne portent pas d'icy-metaint. {} station(s) affichent pourtant un morceau : \
+             {fautives:?}, quand les stations mères rendent {meres:?} au même instant.",
+            fautives.len()
+        );
+    }
+
+    /// **Témoin.** France Musique principale continue de rendre SON morceau.
+    /// Si le correctif éteignait la mère avec ses filles, il serait faux.
+    #[tokio::test]
+    async fn temoin_france_musique_principale_rend_toujours_son_morceau() {
+        let livemeta = faux_livemeta().await;
+        let flux = faux_flux(false).await;
+        let meta = fetch_radio_metadata_depuis(
+            &livemeta,
+            "France Musique",
+            &adresse_locale(&flux, "francemusique"),
+        )
+        .await
+        .expect("France Musique principale doit rendre son morceau");
+        assert_eq!(meta.title, "Morceau du canal 4");
+        assert_eq!(meta.artist.as_deref(), Some("Interprète du canal 4"));
+        assert_eq!(meta.station.as_deref(), Some("France Musique"));
+    }
+
+    /// **Témoin.** Une station couverte par le repli ICY rend bien son titre :
+    /// le chemin qui sert toutes les stations non câblées est intact.
+    #[tokio::test]
+    async fn temoin_une_station_couverte_par_le_repli_icy_rend_son_titre() {
+        let livemeta = faux_livemeta().await;
+        let flux = faux_flux(true).await;
+        let meta =
+            fetch_radio_metadata_depuis(&livemeta, "Radio Machin", &format!("{flux}/machin.mp3"))
+                .await
+                .expect("le repli ICY doit lire le bloc du flux");
+        assert_eq!(meta.title, "B");
+        assert_eq!(meta.artist.as_deref(), Some("A"));
+    }
+
+    /// **Témoin.** Le catalogue Radio France livré, station par station : le
+    /// correctif ne doit éteindre QUE les onze. Toute autre association reste
+    /// exactement celle d'avant.
+    #[test]
+    fn temoin_le_catalogue_radio_france_livre_garde_ses_canaux() {
+        let url = |s: &str| format!("https://icecast.radiofrance.fr/{s}-hifi.aac");
+        for (nom, radical, attendu) in [
+            // Les stations principales.
+            ("FIP", "fip", Some(7)),
+            ("France Musique", "francemusique", Some(4)),
+            ("France Culture", "franceculture", Some(2)),
+            ("France Inter", "franceinter", Some(1)),
+            ("Mouv'", "mouv", Some(6)),
+            // Les webradios FIP qui ont un vrai canal, mesuré.
+            ("FIP Rock", "fiprock", Some(64)),
+            ("FIP Jazz", "fipjazz", Some(65)),
+            ("FIP Groove", "fipgroove", Some(66)),
+            ("FIP Monde", "fipworld", Some(69)),
+            ("FIP Nouveautés", "fipnouveautes", Some(70)),
+            ("FIP Reggae", "fipreggae", Some(71)),
+            ("FIP Electro", "fipelectro", Some(74)),
+            ("FIP Metal", "fipmetal", Some(77)),
+            // Les webradios FIP sans canal : déjà éteintes, elles le restent.
+            ("FIP Pop", "fippop", None),
+            ("FIP Hip-Hop", "fiphiphop", None),
+            ("FIP Sacré français", "fipsacrefrancais", None),
+        ] {
+            assert_eq!(
+                radiofrance_channel_id(nom, &url(radical)),
+                attendu,
+                "« {nom} » doit garder l'association qu'elle avait"
+            );
+        }
+    }
+
+    /// Le même verdict au niveau de la correspondance, station par station :
+    /// aucune des onze ne reçoit de canal.
+    #[test]
+    fn les_onze_stations_ne_recoivent_aucun_canal() {
+        let mut fautives = Vec::new();
+        for &(nom, radical) in ONZE_STATIONS_SANS_SOURCE {
+            let url = format!("https://icecast.radiofrance.fr/{radical}-hifi.aac");
+            if let Some(canal) = radiofrance_channel_id(nom, &url) {
+                fautives.push(format!("{nom} → canal {canal}"));
+            }
+            // Le nom seul suffit aussi — les stations ajoutées à la main ne
+            // portent pas toujours une URL reconnaissable.
+            if let Some(canal) = radiofrance_channel_id(nom, "") {
+                fautives.push(format!("{nom} (nom seul) → canal {canal}"));
+            }
+        }
+        assert!(
+            fautives.is_empty(),
+            "aucune des onze ne doit recevoir de canal, aucun ne les couvre : {fautives:?}"
+        );
     }
 }
