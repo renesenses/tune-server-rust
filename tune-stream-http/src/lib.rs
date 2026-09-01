@@ -733,6 +733,45 @@ pub async fn handle_stream(
                     break;
                 }
 
+                // ── Ne jamais s'endormir avec des octets en main ──
+                //
+                // Le tampon de coalescence n'a qu'un rôle : REGROUPER des
+                // morceaux DÉJÀ disponibles pour écrire >= 64 Ko d'un coup.
+                // Quand le canal est VIDE, il n'y a plus rien à regrouper :
+                // attendre les 64 Ko retient ce qu'on a EN PLUS de ce qui
+                // manque. En face, la sortie locale est bloquée dans un
+                // `reader.read()` sans limite de temps (`outputs/local.rs`,
+                // client construit avec `.timeout(None)`) et ne voit RIEN.
+                //
+                // C'est le motif pour lequel la branche RADIO ci-dessus émet
+                // ses morceaux sans les regrouper : « the coalescing buffer
+                // used for finite tracks adds latency […] can cause […] the
+                // local output's HTTP reader to stall waiting for the first
+                // data ». La branche FINIE — celle de TOUTE conversion WAV
+                // servie à une sortie locale ou OAAT — n'a jamais reçu la
+                // même exemption.
+                //
+                // Le regroupement est INTACT tant que le producteur est en
+                // avance : `buffered > 0` laisse le tampon se remplir et les
+                // trames de 64 Ko partent comme avant.
+                if let Some((buffered, max)) = session.channel_fill().await {
+                    if session.note_channel_fill(buffered, max) {
+                        warn!(
+                            stream_id = %session.id,
+                            bytes_sent = session
+                                .bytes_sent
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            channel_max = max,
+                            "stream_producer_ran_dry — le canal du flux interne a été plein puis \
+                             s'est vidé : le producteur a cessé d'alimenter la session"
+                        );
+                    }
+                    if buffered == 0 && !coalesce_buf.is_empty() {
+                        let restant = std::mem::take(&mut coalesce_buf);
+                        yield Ok(bytes::Bytes::from(restant));
+                    }
+                }
+
                 tokio::select! {
                     biased;
                     _ = &mut superseded => continue,
@@ -1543,6 +1582,188 @@ mod tests {
             octets_sonde.len()
         );
         producteur.await.expect("producteur");
+    }
+
+    /// FAIT DE BASE : les octets réellement délivrés par le flux interne
+    /// pendant que le producteur est MUET et que le canal reste OUVERT.
+    ///
+    /// C'est la situation d'un trou en pleine lecture (#2952) : la sortie
+    /// locale est bloquée dans `reader.read()` sur un client construit avec
+    /// `.timeout(None)` — elle attend indéfiniment, sans rien signaler avant
+    /// 5 s. Pendant ce temps le tampon de coalescence tient jusqu'à 64 Ko
+    /// qu'il ne rendra qu'une fois 64 Ko ATTEINTS. Le producteur étant à sec,
+    /// ce seuil n'arrive jamais : ces octets-là ne sortent JAMAIS.
+    ///
+    /// Avant le correctif : 0 octet délivré, et le corps ne rend rien du tout
+    /// (la lecture au bout de 2 s expire). Après : les 32 768 octets qui
+    /// étaient déjà là partent, puis les suivants au fil de l'eau.
+    #[tokio::test]
+    async fn un_producteur_a_sec_ne_retient_plus_ce_qui_est_deja_la() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("conv".into(), info, false, 8));
+        // L'en-tête voyage DANS le canal sur une conversion : le handler n'en
+        // ajoute pas. On compte donc du PCM nu, sans 44 octets parasites.
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("conv".to_string(), session.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        // Un seul morceau de 32 768 octets — la moitié du seuil de
+        // regroupement — puis PLUS RIEN. Le canal reste ouvert : ce n'est pas
+        // une fin de piste, c'est un trou.
+        tx.send(vec![0xAB; 32_768]).await.expect("morceau");
+
+        let rep = super::handle_stream(
+            Path("conv.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        let premiere = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+            .await
+            .expect(
+                "le flux interne n'a RIEN délivré : les 32 768 octets déjà décodés \
+                 attendent les 64 Ko d'un producteur à sec",
+            )
+            .expect("le corps s'est terminé au lieu de délivrer")
+            .expect("erreur de flux");
+        assert_eq!(
+            premiere.len(),
+            32_768,
+            "le flux devait rendre exactement ce qu'il avait en main"
+        );
+        assert_eq!(
+            session.bytes_sent.load(Relaxed),
+            32_768,
+            "octets délivrés par la session sur la fenêtre : le compteur de \
+             production, pas celui du test"
+        );
+
+        // …et le flux CONTINUE : le morceau suivant part de la même façon.
+        tx.send(vec![0xCD; 32_768]).await.expect("second morceau");
+        let seconde = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+            .await
+            .expect("second morceau jamais délivré")
+            .expect("corps terminé")
+            .expect("erreur de flux");
+        assert_eq!(seconde.len(), 32_768);
+        assert_eq!(session.bytes_sent.load(Relaxed), 65_536);
+    }
+
+    /// TÉMOIN VERT : tant que le producteur est EN AVANCE, le regroupement est
+    /// intact. Le flux écrit toujours des trames de 64 Ko — c'est la raison
+    /// d'être du tampon (moins d'écritures TCP vers un renderer réseau), et le
+    /// correctif ne doit pas la dissoudre.
+    ///
+    /// Quatre morceaux de 32 768 sont DÉJÀ dans un canal de capacité 4 quand
+    /// la connexion arrive : le canal est plein, donc le producteur est en
+    /// avance, exactement comme en régime établi sur une piste locale.
+    #[tokio::test]
+    async fn un_producteur_en_avance_ecrit_toujours_des_trames_de_64_ko() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("plein".into(), info, false, 4));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("plein".to_string(), session.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        for _ in 0..4 {
+            tx.send(vec![0xCD; 32_768]).await.expect("morceau");
+        }
+
+        let rep = super::handle_stream(
+            Path("plein.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        for rang in 0..2 {
+            let trame = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+                .await
+                .expect("trame jamais délivrée")
+                .expect("corps terminé")
+                .expect("erreur de flux");
+            assert_eq!(
+                trame.len(),
+                65_536,
+                "trame {rang} : le regroupement a été dissous alors que le \
+                 producteur était en avance"
+            );
+        }
+    }
+
+    /// TÉMOIN VERT : une fin de piste reste une fin de piste, pas un trou. Le
+    /// producteur émet un morceau puis FERME le canal ; le corps rend ces
+    /// octets-là, exactement, puis se termine.
+    #[tokio::test]
+    async fn une_fin_de_piste_reste_une_fin_de_piste() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("fin".into(), info, false, 8));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        session.close_sender().await;
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("fin".to_string(), session.clone())].into_iter().collect(),
+        ));
+        tx.send(vec![0xEF; 32_768]).await.expect("morceau");
+        drop(tx);
+
+        let rep = super::handle_stream(
+            Path("fin.wav".into()),
+            State(sessions.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+        let mut octets = Vec::new();
+        while let Some(Ok(b)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+                .await
+                .expect("le corps ne s'est jamais terminé")
+        {
+            octets.extend_from_slice(&b);
+        }
+        assert_eq!(
+            octets.len(),
+            32_768,
+            "une fin de piste doit rendre tous ses octets et RIEN de plus"
+        );
     }
 
     /// L'Eversolo DMP-A8 télécharge par tranches : `bytes=0-`, puis il ferme et
