@@ -1896,7 +1896,7 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
 /// none — the vast majority — pay the full price every time.
 fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // Vorbis comments live in the file header; a bounded prefix read finds them
@@ -1974,7 +1974,7 @@ fn normalise_dr(raw: &str) -> String {
 
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // The Vorbis comment block lives in the file header (FLAC metadata blocks
@@ -4399,17 +4399,19 @@ mod genres_multivalues_i1821 {
     /// compilation, `/tmp` partagé — visaient le même `i1821-<épreuve>-<nom>`.
     /// `scratch_name` ajoute le pid ET un compteur ; l'étiquette ne sert plus
     /// qu'à la lisibilité d'un résidu dans `/tmp`.
-    fn gabarit(nom: &str, epreuve: &str) -> std::path::PathBuf {
+    fn gabarit(nom: &str, epreuve: &str) -> crate::test_scratch::ScratchFile {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(nom);
         // `nom` porte l'EXTENSION, et lofty choisit son analyseur dessus :
         // elle doit rester en dernier. Le suffixe unique se glisse donc
         // avant, jamais après.
-        let copie = std::env::temp_dir().join(format!(
-            "{}-{nom}",
-            crate::test_scratch::scratch_name(&format!("i1821-{epreuve}"))
-        ));
+        //
+        // `ScratchFile` et non un chemin nu : la copie disparaît à la sortie
+        // de portée, y compris quand l'épreuve échoue — c'est justement le
+        // cas qui laissait le plus de résidus (#3030).
+        let copie =
+            crate::test_scratch::scratch_file(&format!("i1821-{epreuve}"), &format!("-{nom}"));
         std::fs::copy(&source, &copie).expect("copie du gabarit");
         copie
     }
@@ -4457,7 +4459,6 @@ mod genres_multivalues_i1821 {
                 let chemin = gabarit(nom, "trois-conteneurs");
                 ecrire_genres_separes(&chemin, &["Jazz", "Fusion"]);
                 let meta = super::read_metadata(&chemin).expect("lecture des métadonnées");
-                let _ = std::fs::remove_file(&chemin);
                 (nom, meta.genres, meta.genre)
             })
             .collect();
@@ -4500,9 +4501,6 @@ mod genres_multivalues_i1821 {
             "deux gravures de la même intention donnent deux classements"
         );
         assert_eq!(a.genre, b.genre);
-
-        let _ = std::fs::remove_file(&separe);
-        let _ = std::fs::remove_file(&unique);
     }
 
     #[test]
@@ -4514,7 +4512,6 @@ mod genres_multivalues_i1821 {
             let meta = super::read_metadata(&chemin).expect("lecture");
             assert_eq!(meta.genres, vec!["Rock".to_string()], "{nom}");
             assert_eq!(meta.genre.as_deref(), Some("Rock"), "{nom}");
-            let _ = std::fs::remove_file(&chemin);
         }
     }
 

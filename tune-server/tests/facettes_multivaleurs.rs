@@ -571,6 +571,18 @@ fn bibliotheque_contrat_facettes() -> axum::Router {
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'release_country', 'FR')",
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'mood', 'Calme')",
         "INSERT INTO track_metadata (track_id, key, value) VALUES (91003, 'source_media', 'Vinyle')",
+        // Dynamic Range (#2144). Le tag décrit l'ALBUM mais vit dans le
+        // magasin ouvert, par PISTE : une seule piste taguée suffit à donner
+        // son DR à tout l'album, et les autres pistes du même album doivent
+        // donc être comptées ET rendues sous cette valeur. C'est précisément
+        // ce que le garde-fou ci-dessous éprouve.
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91001, 'dr_album', '14')",
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91002, 'dr_album', '8')",
+        // Valeur NON numérique sur le même album que « 8 » : elle doit être
+        // écartée des DEUX côtés à l'identique. Écartée d'un seul, le rail
+        // annoncerait une pastille « DR0 » (CAST SQLite) que la liste ne
+        // rendrait pas — ou ferait tomber la requête entière en PostgreSQL.
+        "INSERT INTO track_metadata (track_id, key, value) VALUES (91007, 'dr_album', 'DR12.5')",
         "INSERT OR IGNORE INTO profiles (id, username) VALUES (1, 'contrat-facettes')",
         "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92001, 1, 5)",
         "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES (92002, 1, 4)",
@@ -645,10 +657,10 @@ async fn chaque_effectif_de_facette_est_tenu_par_la_liste_filtree() {
     }
 }
 
-/// Les 17 facettes du rail, avec la clé de filtre qui leur correspond dans la
+/// Les 18 facettes du rail, avec la clé de filtre qui leur correspond dans la
 /// chaîne de requête. `source` est le nom public de la métadonnée
 /// `source_media` ; la clé de filtre reste explicitement `source_media`.
-const FACETTES: [(&str, &str); 17] = [
+const FACETTES: [(&str, &str); 18] = [
     ("genre", "genre"),
     ("label", "label"),
     ("composer", "composer"),
@@ -666,6 +678,11 @@ const FACETTES: [(&str, &str); 17] = [
     ("favorite", "favorite"),
     ("playlist", "playlist"),
     ("untagged", "untagged"),
+    // Dynamic Range (#2144) : la dernière arrivée, et celle dont les deux
+    // prédicats sont les PLUS éloignés l'un de l'autre — table dérivée jointe
+    // pour compter, sous-requête `IN` pour filtrer. Sans ce garde-fou, rien ne
+    // les tiendrait ensemble.
+    ("dr", "dr"),
 ];
 
 /// Somme des effectifs annoncés pour une facette MONOVALUÉE et toujours

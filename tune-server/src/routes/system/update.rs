@@ -1649,7 +1649,6 @@ mod web_swap_tests {
         assert!(target.join("assets/a.js").exists());
         assert!(!tmp.join("web.old").exists(), "backup must be cleaned");
         assert!(!tmp.join("web.new").exists(), "staging must be cleaned");
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -1662,7 +1661,6 @@ mod web_swap_tests {
 
         swap_dir_atomic(&src, &target).unwrap();
         assert!(target.join("index.html").exists());
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }
 

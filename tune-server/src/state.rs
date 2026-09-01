@@ -118,6 +118,16 @@ pub struct AppState {
     /// [`Self::plugin_info`] so the plugin manager can list a dormant plugin
     /// (offering "Install"/"Enable") instead of it vanishing from the API.
     pub plugin_available: Arc<OnceLock<Vec<tune_core::plugin_sdk::AvailablePluginInfo>>>,
+    /// Every compiled-in plugin name, published by [`crate::plugins::init`]
+    /// before `setup_all` runs — so it holds the whole registered set, not the
+    /// part that loaded.
+    ///
+    /// Wider than [`Self::plugin_info`] ∪ [`Self::plugin_available`] on
+    /// purpose: an uncatalogued plugin (DJ, Karaoke — #2090) appears in
+    /// neither, yet installing it by name is still meant to work. This is what
+    /// `POST /plugins/{name}/install` checks a name against, so it can refuse
+    /// one that names nothing this binary carries (#2132).
+    pub plugin_names: Arc<OnceLock<Vec<String>>>,
     /// Loaded WASM plugins (P2 of the plugin ABI). Published once by
     /// [`crate::plugins_host::load_wasm_plugins`] at startup and read by the
     /// `/api/v1/plugins/{id}/…` route mount. Gated behind `plugins-wasm`, so
@@ -382,6 +392,7 @@ impl AppState {
             plugins,
             plugin_info: Arc::new(OnceLock::new()),
             plugin_available: Arc::new(OnceLock::new()),
+            plugin_names: Arc::new(OnceLock::new()),
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]

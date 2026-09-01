@@ -15,6 +15,13 @@ use tune_core::db::track_repo::TrackRepo;
 use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
 
+/// Identifiant de la passe de relecture des métadonnées au registre
+/// `background_tasks` (#2129).
+const TACHE_RESCAN_METADATA: &str = "rescan_metadata";
+
+/// Cadence de publication de l'avancement au registre.
+const JALON_AVANCEMENT_RESCAN: usize = 50;
+
 /// Build a JSON array string for the `genres` column from parsed metadata.
 fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
     if !genres.is_empty() {
@@ -734,7 +741,19 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
     let backend = state.backend.clone();
     let event_bus = state.event_bus.clone();
 
+    // Inscription au registre des tâches de fond (#2129). `rescan_metadata_status`
+    // vaut « running » pendant toute la passe, mais ce réglage ne se lit que
+    // depuis l'écran qui l'a lancée : relire les étiquettes de chaque fichier
+    // d'une bibliothèque dure longtemps, et rien ne le disait ailleurs.
+    let garde_tache = state.background_tasks.begin(
+        TACHE_RESCAN_METADATA,
+        "Relecture des métadonnées des fichiers…",
+        "maintenance",
+    );
+    let taches = state.background_tasks.clone();
+
     tokio::spawn(async move {
+        let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
         let backend_inner = backend.clone();
         let result = tokio::task::spawn_blocking(move || {
             let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend_inner.clone());
@@ -756,8 +775,26 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             let mut updated = 0usize;
             let mut skipped = 0usize;
             let mut errors = 0usize;
+            taches.update_progress(TACHE_RESCAN_METADATA, 0, total as u64, "Métadonnées");
 
             for track in tracks {
+                // Jalon en TÊTE de boucle, pas en queue : trois branches de ce
+                // corps sortent par `continue` (pas de chemin, fichier absent,
+                // étiquettes illisibles). Placé en queue, l'avancement resterait
+                // à 0 sur une bibliothèque dont le disque est démonté — le cas
+                // où l'on a justement besoin de voir que la passe tourne.
+                // Un jalon, pas une publication par piste : le registre émet un
+                // événement WebSocket à chaque changement.
+                let traitees = updated + skipped + errors;
+                if traitees % JALON_AVANCEMENT_RESCAN == 0 {
+                    taches.update_progress(
+                        TACHE_RESCAN_METADATA,
+                        traitees as u64,
+                        total as u64,
+                        "Métadonnées",
+                    );
+                }
+
                 let Some(ref file_path) = track.file_path else {
                     skipped += 1;
                     continue;
@@ -1163,6 +1200,7 @@ mod filtre_actif_tests {
             ("mood", "mood=calme"),
             ("source_media", "source_media=CD"),
             ("original_year", "original_year=1969"),
+            ("dr", "dr=14"),
             ("rating", "rating=4"),
             ("favorite", "favorite=track"),
             ("playlist", "playlist=Ma+liste"),
@@ -1535,5 +1573,56 @@ mod tests_versions_piste {
                 .await
                 .is_none()
         );
+    }
+}
+
+/// Inscription de la relecture des métadonnées au registre des tâches de fond
+/// (#2129).
+///
+/// **Hermétique : aucun accès disque, aucun appel réseau.** La base en mémoire
+/// ne contient aucune piste locale, donc la passe ne lit aucun fichier.
+#[cfg(test)]
+mod tests_tache_de_fond_rescan_metadata {
+    use super::*;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// `rescan_metadata_status` vaut « running » pendant toute la passe, mais
+    /// ce réglage n'est lu que par l'écran qui l'a lancée. Relire les
+    /// étiquettes de chaque fichier d'une bibliothèque de dizaines de milliers
+    /// de pistes prend un temps long, et rien ne le signalait ailleurs.
+    #[tokio::test]
+    async fn la_relecture_des_metadonnees_s_inscrit_au_registre() {
+        let state = etat();
+        let _ = rescan_metadata(State(state.clone())).await;
+
+        let ids: Vec<String> = state
+            .background_tasks
+            .snapshot()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            ids.contains(&TACHE_RESCAN_METADATA.to_string()),
+            "la relecture des métadonnées doit figurer au registre des tâches \
+             de fond, sinon le bandeau global ne peut pas l'afficher (#2129) — \
+             registre observé : {ids:?}"
+        );
+    }
+
+    /// Témoin anti-régression : la route garde son 202 et son message.
+    #[tokio::test]
+    async fn le_contrat_de_la_route_est_inchange() {
+        let state = etat();
+        let reponse = rescan_metadata(State(state.clone())).await.into_response();
+        assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(corps["status"], "rescan_metadata_started");
     }
 }

@@ -265,7 +265,8 @@ pub fn router() -> Router<AppState> {
 /// GET /system/new-releases — new album releases from library artists (digest).
 async fn new_releases_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -273,15 +274,25 @@ async fn new_releases_handler(
         .unwrap_or_default();
 
     match tune_core::cloud::digest::get_new_releases(&state.http_client, &instance_id).await {
-        Ok(releases) => axum::Json(serde_json::json!({"releases": releases})),
-        Err(e) => axum::Json(serde_json::json!({"releases": [], "error": e})),
+        Ok(releases) => {
+            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                "releases": releases
+            })))
+        }
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "releases": [] }),
+        ),
     }
 }
 
 /// GET /system/recommendations — get cached recommendations from cloud.
 async fn recommendations_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> axum::Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -291,8 +302,15 @@ async fn recommendations_handler(
     match tune_core::cloud::recommendations::get_recommendations(&state.http_client, &instance_id)
         .await
     {
-        Ok(recs) => axum::Json(serde_json::json!({"recommendations": recs})),
-        Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+        Ok(recs) => axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+            "recommendations": recs
+        }))),
+        Err(e) => crate::routes::cloud_error::reponse(
+            &e,
+            &headers,
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "recommendations": [] }),
+        ),
     }
 }
 

@@ -1781,7 +1781,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_bytes_reach_the_endpoint_unaltered() {
         let dir = crate::test_scratch::scratch_dir("tune-dsd-proof");
-        std::fs::create_dir_all(&dir).unwrap();
         let dsf_path = dir.join("proof.dsf");
         // 9 blocs/canal ≈ 0,21 s de DSD64 : assez court pour un test,
         // assez long pour plusieurs paquets (73 728 octets ≈ 18 paquets).
@@ -1844,8 +1843,6 @@ mod tests {
             received, expected,
             "les octets DSD reçus diffèrent du fichier — corruption sur le chemin d'envoi"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #1513 — lectures enchaînées (le vrai usage de DEvir : cinq sessions en
@@ -1854,7 +1851,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_dsd_second_play_is_bit_exact_after_aborting_the_first() {
         let dir = crate::test_scratch::scratch_dir("tune-dsd-proof2");
-        std::fs::create_dir_all(&dir).unwrap();
         let path_a = dir.join("a.dsf");
         let path_b = dir.join("b.dsf");
         // A long (2 s) pour être sûr d'être interrompu en plein envoi ;
@@ -1920,8 +1916,6 @@ mod tests {
             received_b, expected_b,
             "le second flux est corrompu après l'annulation du premier (#1481)"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Le contrat de reference des tests de negociation : PCM 24/96 stereo.

@@ -13,6 +13,7 @@ use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
+use crate::routes::playlists::{owned_or_404, owned_or_404_response};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -170,7 +171,15 @@ async fn transfer_playlist(
 
     // Resolve source tracks
     let (source_tracks, source_name) = if body.source_service == "local" {
+        // La source locale se désigne par son id, et les ids de playlists sont
+        // de petits entiers séquentiels : sans ce refus, n'importe quel profil
+        // recopiait la playlist du voisin chez lui, ou la déversait sur son
+        // propre compte de service (#2794, #3073).
         let playlist_id: i64 = body.source_playlist_id.parse().unwrap_or(0);
+        let source = match owned_or_404_response(&playlist_repo, playlist_id, profile.id()) {
+            Ok(pl) => pl,
+            Err(r) => return r,
+        };
         let track_ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
         let tracks = track_repo.get_multiple(&track_ids).unwrap_or_default();
         let source_tracks: Vec<Value> = tracks
@@ -184,13 +193,7 @@ async fn transfer_playlist(
                 })
             })
             .collect();
-        let name = playlist_repo
-            .get(playlist_id)
-            .ok()
-            .flatten()
-            .map(|p| p.name)
-            .unwrap_or_else(|| "Local Playlist".into());
-        (source_tracks, name)
+        (source_tracks, source.name)
     } else {
         // Streaming service source — fetch playlist tracks via the service
         let registry = state.services.lock().await;
@@ -609,8 +612,16 @@ async fn list_links(State(state): State<AppState>) -> Json<Value> {
 
 async fn create_link(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<CreateLinkRequest>,
 ) -> impl IntoResponse {
+    // Le lien désigne une playlist locale par son id, et `sync_link` y écrit.
+    // Refuser dès la création évite d'inscrire dans les réglages un lien qui
+    // pointe sur la playlist d'un autre profil.
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&playlist_repo, body.local_playlist_id, profile.id()) {
+        return r;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
     let id = next_id(&links);
@@ -641,7 +652,11 @@ async fn delete_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl
     Json(json!({"ok": true})).into_response()
 }
 
-async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn sync_link(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
 
@@ -673,6 +688,16 @@ async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl I
         .unwrap_or("pull")
         .to_string();
 
+    // Les liens vivent dans un réglage commun au foyer et sont donc VISIBLES de
+    // tous : sans ce refus, `POST /links/{id}/sync` faisait écrire des pistes
+    // dans la playlist locale d'un autre profil, en énumérant simplement les
+    // ids de liens. Le refus est posé AVANT l'appel au service distant : rien
+    // n'est fetché, rien n'est écrit, et `last_synced_at` reste intact.
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&playlist_repo, local_playlist_id, profile.id()) {
+        return r;
+    }
+
     // Fetch remote playlist tracks
     let registry = state.services.lock().await;
     let svc_arc = match registry.get(&service) {
@@ -694,7 +719,6 @@ async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl I
         .unwrap_or_default();
     drop(svc);
 
-    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let local_track_ids = playlist_repo
         .get_track_ids(local_playlist_id)
@@ -1108,7 +1132,13 @@ async fn merge_playlists(
     for source in &body.playlists {
         let service = source.service.as_deref().unwrap_or("local");
         if service == "local" {
+            // Seule la CRÉATION était cloisonnée : les sources partaient d'un
+            // `WHERE id = ?` nu, et la fusion recopiait donc chez l'appelant le
+            // contenu de n'importe quelle playlist du foyer.
             let playlist_id: i64 = source.playlist_id.parse().unwrap_or(0);
+            if let Err(r) = owned_or_404_response(&playlist_repo, playlist_id, profile.id()) {
+                return r;
+            }
             let ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
             all_track_ids.extend(ids);
         }
@@ -1156,6 +1186,7 @@ struct ExportRequest {
 
 async fn export_playlists(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let format = body.format.as_deref().unwrap_or("json");
@@ -1163,9 +1194,12 @@ async fn export_playlists(
     let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     let (name, tracks) = if body.service == "local" {
+        // Cette route n'avait aucune identité d'appelant : elle rendait en
+        // clair — nom, titres, artistes, albums — la playlist désignée par
+        // l'id, quel que soit son propriétaire. Un export est une lecture
+        // complète : c'est la fuite la plus large des cinq.
         let playlist_id: i64 = body.playlist_id.parse().unwrap_or(0);
-        let pl = playlist_repo.get(playlist_id).ok().flatten();
-        let name = pl.map(|p| p.name).unwrap_or_else(|| "Playlist".into());
+        let name = owned_or_404(&playlist_repo, playlist_id, profile.id())?.name;
         let track_ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
         let tracks = track_repo.get_multiple(&track_ids).unwrap_or_default();
         let tracks_json: Vec<Value> = tracks

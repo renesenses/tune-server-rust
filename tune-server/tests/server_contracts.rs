@@ -17,8 +17,14 @@ mod bios_langue_album;
 mod bios_langue_entete;
 #[path = "bump_natifs_android.rs"]
 mod bump_natifs_android;
+#[path = "cles_developpeur_persistance.rs"]
+mod cles_developpeur_persistance;
+#[path = "collections_couleur_persistee.rs"]
+mod collections_couleur_persistee;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "config_secrets_et_roles.rs"]
+mod config_secrets_et_roles;
 #[path = "contexte_de_session.rs"]
 mod contexte_de_session;
 #[path = "credits_enrichissement_statut.rs"]
@@ -33,6 +39,8 @@ mod etiquettes_types_et_playlists;
 mod explorateur_dossiers;
 #[path = "facettes_multivaleurs.rs"]
 mod facettes_multivaleurs;
+#[path = "favoris_cloisonnement_par_profil.rs"]
+mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
 #[path = "generateur_playlists_sans_ia.rs"]
@@ -49,6 +57,8 @@ mod licence_activation_immediate;
 mod licence_grace_visible;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
+#[path = "nuage_limite_dit_la_limite.rs"]
+mod nuage_limite_dit_la_limite;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_ecriture_fichiers.rs"]
@@ -57,6 +67,10 @@ mod paroles_ecriture_fichiers;
 mod paroles_source_lrclib;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
+#[path = "playlist_manager_cloisonnement_par_profil.rs"]
+mod playlist_manager_cloisonnement_par_profil;
+#[path = "playlists_cloisonnement_par_profil.rs"]
+mod playlists_cloisonnement_par_profil;
 #[path = "playlists_ecritures_partielles.rs"]
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
@@ -69,8 +83,12 @@ mod radios_validation_url;
 mod rbac;
 #[path = "reidentification_album.rs"]
 mod reidentification_album;
+#[path = "reprise_position_au_demarrage.rs"]
+mod reprise_position_au_demarrage;
 #[path = "rustsec_allowlists.rs"]
 mod rustsec_allowlists;
+#[path = "serveur_media_criteres_canoniques.rs"]
+mod serveur_media_criteres_canoniques;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
 #[path = "support_relais_marquer_lu.rs"]
@@ -79,10 +97,14 @@ mod support_relais_marquer_lu;
 mod tests_orphelins;
 #[path = "tranches_dynamic_range.rs"]
 mod tranches_dynamic_range;
+#[path = "tri_aleatoire_albums.rs"]
+mod tri_aleatoire_albums;
 #[path = "uptime_process_scope.rs"]
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]
 mod volume_db_contrat;
+#[path = "volume_db_resolution.rs"]
+mod volume_db_resolution;
 #[path = "web_response_contracts.rs"]
 mod web_response_contracts;
 #[path = "workflows_bornes.rs"]

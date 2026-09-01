@@ -205,6 +205,22 @@ pub async fn auth_middleware(
             // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
             // l'écran Support est consulté par un utilisateur authentifié,
             // jamais de façon anonyme.
+            // /system/peer-info EST public, et il doit l'etre : c'est la
+            // poignee de main entre deux serveurs Tune. Un serveur protege
+            // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
+            // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
+            // il n'a aucun moyen d'en obtenir un.
+            //
+            // Contrairement a /system/profile juste au-dessus, la surface est
+            // etroite et delibere : nom choisi par l'utilisateur, version,
+            // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
+            // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
+            // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
+            //
+            // GET seulement : la route est en lecture, et un POST homonyme
+            // futur ne doit pas heriter de cette ouverture.
+            || (method == axum::http::Method::GET
+                && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
             || path.contains("/cloud/sso/")
             || path == "/ws"
             || is_public_auth_route(&method, path))

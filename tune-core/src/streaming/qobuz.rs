@@ -223,6 +223,12 @@ const TYPE_FAVORI_PLAYLISTS: &str = "playlists";
 /// continue que si la première page était PLEINE et que `total` annonce des
 /// éléments au-delà. Un `total` incohérent (0 alors que la page est pleine)
 /// arrête la pagination, comme avant.
+///
+/// Forme SANS PLAFOND, gardée pour les tests seuls. Depuis #1969 chaque appel
+/// de production porte son plafond et passe donc par
+/// [`remaining_page_offsets_bornees`] : « aller jusqu'au bout du catalogue »
+/// n'est plus une intention qu'on veut pouvoir exprimer par accident.
+#[cfg(test)]
 fn remaining_page_offsets(first_count: usize, total: usize, page_size: usize) -> Vec<usize> {
     remaining_page_offsets_bornees(first_count, total, page_size, usize::MAX)
 }

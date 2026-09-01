@@ -318,3 +318,102 @@ async fn session_cookie_secure_follows_forwarded_proto() {
         .unwrap();
     assert!(!c.contains("Secure"), "http cookie must not be Secure: {c}");
 }
+
+// ── /system/peer-info : la poignée de main entre serveurs ────────────────
+//
+// Un serveur Tune protégé était IMPOSSIBLE à ajouter comme pair : l'autre
+// bout appelle `/system/peer-info` sans jeton (`fetch_peer_info`,
+// routes/system/admin.rs) et n'a aucun moyen d'en obtenir un. La route est
+// donc publique, délibérément — mais sa surface doit le rester.
+
+/// Sans cette ouverture, la découverte entre pairs est morte dès que l'auth
+/// est activée : l'appelant reçoit 401 et conclut « injoignable ».
+#[tokio::test]
+async fn peer_info_reste_joignable_sans_jeton_quand_l_auth_est_activee() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, REMOTE);
+
+    assert_eq!(
+        get_status(&app, "/api/v1/system/peer-info", None).await,
+        StatusCode::OK,
+        "un serveur protégé doit rester ajoutable comme pair"
+    );
+}
+
+/// Le témoin de l'ouverture : ce qui sort ne doit rester QUE la carte de
+/// visite. Si un champ s'ajoute au handler, ce test le dit — l'ouverture a
+/// été accordée sur cette surface-là, pas sur une autre.
+#[tokio::test]
+async fn peer_info_anonyme_ne_publie_que_la_carte_de_visite() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, REMOTE);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/system/peer-info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let obj = v.as_object().expect("peer-info rend un objet");
+
+    let mut champs: Vec<&str> = obj.keys().map(String::as_str).collect();
+    champs.sort_unstable();
+    assert_eq!(
+        champs,
+        vec!["name", "tracks", "version", "zones"],
+        "la surface anonyme de peer-info a changé — l'ouverture ne vaut que \
+         pour la carte de visite (nom, version, pistes, zones)"
+    );
+}
+
+/// L'ouverture est bornée à GET : un POST homonyme futur ne doit pas en
+/// hériter. `contains()` aurait donné cette ouverture aux deux.
+#[tokio::test]
+async fn peer_info_n_ouvre_pas_les_ecritures() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, REMOTE);
+
+    let (st, _) = post_json(&app, "/api/v1/system/peer-info", None, "{}").await;
+    assert_ne!(st, StatusCode::OK, "seul le GET de peer-info est public");
+}
+
+/// Anti-régression du voisinage : `/system/peers` (la liste que CE serveur a
+/// découverte) reste fermée. Les deux noms se ressemblent, un `contains()`
+/// mal écrit ouvrirait les deux.
+#[tokio::test]
+async fn peers_reste_ferme_meme_si_peer_info_est_ouvert() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, REMOTE);
+
+    assert_eq!(
+        get_status(&app, "/api/v1/system/peers", None).await,
+        StatusCode::UNAUTHORIZED,
+        "/system/peers n'est pas /system/peer-info"
+    );
+}
+
+/// Anti-régression de l'arbitrage voisin : `/system/profile` (music_dirs,
+/// IP LAN) doit rester fermé. C'est la limite que l'ouverture ne franchit pas.
+#[tokio::test]
+async fn profile_reste_ferme_meme_si_peer_info_est_ouvert() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, REMOTE);
+
+    assert_eq!(
+        get_status(&app, "/api/v1/system/profile", None).await,
+        StatusCode::UNAUTHORIZED,
+        "/system/profile expose music_dirs : il reste sous jeton"
+    );
+}

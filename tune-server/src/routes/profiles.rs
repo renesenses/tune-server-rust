@@ -1,6 +1,14 @@
+// Resolution ASYMETRIQUE, et non une union : `rc` apportait ici DEUX imports.
+//   - `ActiveProfile` est le fond du correctif #2560 (cloisonnement des
+//     favoris) : il reste, sans quoi on perdrait un correctif de securite ;
+//   - `crate::routes::panne_sql::OuDefautJournalise` est la FORME d'avant :
+//     ce lot a deplace le module dans `tune-http-types`, il n'existe plus
+//     sous `crate::routes`. L'import vit desormais plus bas, sous son nouveau
+//     chemin. Le garder ici casserait `tune-server` lui-meme.
+use crate::routes::active_profile::ActiveProfile;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -301,25 +309,70 @@ async fn delete_profile(State(state): State<AppState>, Path(id): Path<i64>) -> i
     }
 }
 
+/// Le `{id}` du chemin est celui de l'appelant, sinon `404` (#2560).
+///
+/// **Point de refus unique** de la famille `/profiles/{id}/favorites*` : dix
+/// routes qui lisaient et écrivaient sur le profil nommé par le CHEMIN, sans
+/// jamais le confronter à l'identité de l'appelant. Les identifiants de
+/// profils sont de petits entiers séquentiels : les énumérer donnait les
+/// favoris — locaux, streaming et de facette — de tout le foyer, en lecture
+/// comme en écriture.
+///
+/// L'identité vient de [`ActiveProfile`], qui applique déjà la convention du
+/// dépôt (*en-tête = qui agit*) et, auth activée, lie `X-Profile-Id` au
+/// porteur du jeton. Le chemin ne dit plus que *sur quoi*.
+///
+/// `owned_or_404` de `routes::playlists` répond à une AUTRE question — « cette
+/// playlist appartient-elle au profil ? » — et se type sur un `PlaylistRepo`
+/// et une `Playlist` : elle ne peut pas porter celle-ci, où le `{id}` du
+/// chemin *est* le profil. C'est donc bien un mécanisme par intention, et
+/// celui-ci est le seul de la sienne.
+///
+/// **404, jamais 403**, comme la #3073 : un 403 confirmerait l'existence du
+/// profil et rendrait l'énumération exploitable.
+fn profil_du_chemin_ou_404(chemin: i64, appelant: ActiveProfile) -> Result<(), Response> {
+    if chemin == appelant.id() {
+        return Ok(());
+    }
+    tracing::debug!(
+        chemin,
+        appelant = appelant.id(),
+        "favoris_profil_du_chemin_refuse"
+    );
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "profile not found"})),
+    )
+        .into_response())
+}
+
 async fn list_favorites(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Query(q): Query<FavoritesQuery>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
         Some(tri) => repo.list_favorites_sorted(id, q.item_type.as_deref(), tri),
         None => repo.list_favorites(id, q.item_type.as_deref()),
     }
     .unwrap_or_default();
-    Json(json!(items))
+    Json(json!(items)).into_response()
 }
 
 async fn add_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<FavoriteAction>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.add_favorite(id, &body.item_type, body.item_id) {
         // Return a JSON body: web clients call response.json() and an empty
@@ -332,8 +385,12 @@ async fn add_favorite(
 async fn remove_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<FavoriteAction>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.remove_favorite(id, &body.item_type, body.item_id) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
@@ -347,22 +404,30 @@ async fn remove_favorite(
 async fn list_streaming_favorites(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Query(q): Query<FavoritesQuery>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
         Some(tri) => repo.list_sorted(id, q.item_type.as_deref(), tri),
         None => repo.list(id, q.item_type.as_deref()),
     }
     .unwrap_or_default();
-    Json(json!(items))
+    Json(json!(items)).into_response()
 }
 
 async fn add_streaming_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<StreamingFavoriteAdd>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.add(
         id,
@@ -382,8 +447,12 @@ async fn add_streaming_favorite(
 async fn remove_streaming_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<StreamingFavoriteRemove>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.remove(id, &body.item_type, &body.service, &body.service_id) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
@@ -396,22 +465,30 @@ async fn remove_streaming_favorite(
 async fn list_facet_favorites(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Query(q): Query<FacetsQuery>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
     // Site nommé par la #2861 : une panne de base rendait `200 []`, que le
     // client ne distingue pas d'une liste de favoris vide. La réponse reste la
     // même — retirer ses favoris à quelqu'un parce qu'une requête a échoué
     // serait pire —, mais l'échec laisse désormais une trace.
     let items = repo.list(id, q.facet.as_deref()).ou_defaut_journalise();
-    Json(json!(items))
+    Json(json!(items)).into_response()
 }
 
 async fn add_facet_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<FacetFavoriteAction>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
     match repo.add(id, &body.facet, &body.value) {
         Ok(_) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
@@ -427,8 +504,12 @@ async fn add_facet_favorite(
 async fn remove_facet_favorite(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<FacetFavoriteAction>,
 ) -> impl IntoResponse {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = FavoriteFacetsRepo::with_backend(state.backend.clone());
     match repo.remove(id, &body.facet, &body.value) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
@@ -644,8 +725,12 @@ async fn search_profiles(
 async fn check_favorites(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    profil: ActiveProfile,
     Json(body): Json<CheckFavoritesBody>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     let results: Vec<Value> = body
         .item_ids
@@ -657,5 +742,5 @@ async fn check_favorites(
             json!({ "item_id": item_id, "is_favorite": is_fav })
         })
         .collect();
-    Json(json!(results))
+    Json(json!(results)).into_response()
 }

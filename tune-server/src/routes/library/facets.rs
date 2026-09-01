@@ -341,6 +341,20 @@ fn build_facet_conditions(
             }
         }
     }
+    // Dynamic Range (#2144) : JUMEAU strict du prédicat de
+    // `TrackRepo::list_filtered`, tous deux bâtis par `facet_filter` pour que
+    // le rail ne puisse pas compter autrement que la liste qu'il filtre.
+    if exclude != "dr" {
+        if let Some(c) = ph.in_list(
+            tune_core::db::facet_filter::DR_ALBUM_VALUE,
+            sel.dynamic_ranges.len(),
+        ) {
+            conds.push(tune_core::db::facet_filter::dr_album_in(engine, &c));
+            for v in &sel.dynamic_ranges {
+                params.push(SqlValue::Int(*v));
+            }
+        }
+    }
     if exclude != "favorite" {
         // Vocabulaire FERMÉ : une valeur inconnue ne filtre RIEN plutôt que
         // de tout exclure — ou, pire, de tout laisser passer.
@@ -426,6 +440,11 @@ pub(super) fn collection_album_ids(state: &AppState, name: &str) -> Vec<i64> {
 /// aggregation. `country`/`mood`/`source` are read from the open `track_metadata`
 /// key/value store (release_country / mood / source_media), which the client
 /// cannot aggregate without a per-track fetch.
+///
+/// `dr` (Dynamic Range, #2144) s'y lit aussi mais n'est PAS dans le jeu par
+/// défaut : sur une bibliothèque sans tag DR — le cas de très loin le plus
+/// courant — elle est vide, et une facette morte coûterait une requête à
+/// chaque ouverture du rail pour ne rien montrer.
 pub(super) async fn library_facets(
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
@@ -484,6 +503,11 @@ pub(super) async fn library_facets(
             "rating" => rating_facet(&state, limit, &conds, &params),
             "collection" => collection_facet(&state, &q, engine),
             "original_year" => original_year_facet(&state, limit, &conds, &params),
+            // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
+            // bibliothèque non taguée elle est vide, et une facette morte dans
+            // le rail coûte une requête pour ne rien montrer. Un client la
+            // demande explicitement (`fields=…,dr`).
+            "dr" => dr_facet(&state, engine, limit, &conds, &params),
             "favorite" => favorite_facet(&state, &conds, &params),
             "playlist" => playlist_facet(&state, limit, &conds, &params),
             "untagged" => untagged_facet(&state, &conds, &params),
@@ -541,6 +565,65 @@ fn original_year_facet(
             let y = it.next()?.as_i64()?;
             let count = it.next()?.as_i64().unwrap_or(0);
             Some((y.to_string(), count))
+        })
+        .collect()
+}
+
+/// Les Dynamic Range présents, du plus dynamique au plus compressé (#2144).
+///
+/// # Pourquoi une valeur par pastille, et non des tranches nommées
+///
+/// Le ticket demande de « classer et filtrer par tranches », MinimServer cité
+/// en modèle — mais ses bornes exactes n'ont jamais été relevées, et la
+/// couverture réelle des bibliothèques en tags DR n'a jamais été mesurée. Une
+/// tranche gravée ici vivrait dans le contrat HTTP et survivrait à la mesure
+/// qui la contredirait. Le rail rend donc les valeurs RÉELLES avec leurs
+/// effectifs, et la sémantique de facette fait la tranche : cocher DR14, DR15
+/// et DR16, c'est demander « DR14 et au-dessus » — en OU, comme trois formats.
+///
+/// La grille d'albums garde en parallèle sa tranche à bornes libres
+/// (`?dr_min=`/`?dr_max=` sur `/library/albums`) : un intervalle ouvert n'a pas
+/// sa place dans un rail de cases à cocher, et réciproquement.
+///
+/// `JOIN` (et non `LEFT JOIN`) : un album sans tag n'est pas une valeur de
+/// facette. Un effectif nul ne remonte donc jamais, et une bibliothèque
+/// entièrement non taguée rend un tableau vide — l'écran n'affiche alors pas
+/// de facette plutôt qu'une facette morte.
+fn dr_facet(
+    state: &AppState,
+    engine: Engine,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    // Décroissant, comme `year` : l'auditeur qui ouvre cette facette cherche
+    // ses disques les plus dynamiques, pas les plus écrasés.
+    let sql = format!(
+        "SELECT dr.dr, COUNT(*) AS n FROM tracks t \
+         JOIN ({source}) dr ON dr.album_id = t.album_id{where_clause} \
+         GROUP BY dr.dr ORDER BY dr.dr DESC{limit_clause}",
+        source = tune_core::db::facet_filter::dr_album_source(engine)
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let dr = it.next()?.as_i64()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((dr.to_string(), count))
         })
         .collect()
 }

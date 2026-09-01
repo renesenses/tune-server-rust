@@ -406,7 +406,9 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/collections/{id}",
-            get(collections::get_collection).delete(collections::delete_collection),
+            get(collections::get_collection)
+                .put(collections::update_collection)
+                .delete(collections::delete_collection),
         )
         .route(
             "/collections/{id}/albums",

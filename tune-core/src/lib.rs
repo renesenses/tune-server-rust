@@ -55,6 +55,7 @@ pub mod room_correction;
 pub mod scanner;
 pub mod scrobble;
 pub mod secret_envelope;
+pub mod secrets;
 pub mod services_manager;
 pub mod skins;
 pub mod sleep_timer;

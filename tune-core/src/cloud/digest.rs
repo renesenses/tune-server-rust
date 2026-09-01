@@ -1,5 +1,7 @@
 use tracing::info;
 
+use crate::cloud::refusal::CloudError;
+
 const DIGEST_API: &str = "https://mozaiklabs.fr/api/v1/premium";
 
 /// Subscribe this instance to the weekly digest
@@ -7,7 +9,7 @@ pub async fn subscribe(
     http_client: &reqwest::Client,
     instance_id: &str,
     email: &str,
-) -> Result<(), String> {
+) -> Result<(), CloudError> {
     let body = serde_json::json!({
         "instance_id": instance_id,
         "email": email,
@@ -21,7 +23,10 @@ pub async fn subscribe(
         .await
         .map_err(|e| format!("digest subscribe: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("digest subscribe: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(
+            CloudError::from_response(format!("digest subscribe: HTTP {status}"), resp).await,
+        );
     }
     info!("digest_subscribed");
     Ok(())
@@ -31,7 +36,7 @@ pub async fn subscribe(
 pub async fn get_new_releases(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, CloudError> {
     let resp = http_client
         .get(format!("{DIGEST_API}/digest/new-releases"))
         .query(&[("instance_id", instance_id)])
@@ -40,7 +45,8 @@ pub async fn get_new_releases(
         .await
         .map_err(|e| format!("digest: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("digest: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(CloudError::from_response(format!("digest: HTTP {status}"), resp).await);
     }
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
     Ok(data["releases"].as_array().cloned().unwrap_or_default())

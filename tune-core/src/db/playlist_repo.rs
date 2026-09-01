@@ -26,6 +26,19 @@ pub mod sql {
         )
     }
 
+    /// Same projection as [`get_by_id`], but the row must ALSO belong to the
+    /// asking profile. Playlist ids are small sequential integers, so `WHERE id
+    /// = ?` alone lets any caller walk the whole household's playlists (#2794).
+    /// The ownership test belongs in the statement, not in a prior read: a
+    /// check-then-act pair can be raced, and it is one more place to forget.
+    pub fn get_by_id_scoped<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.id = {} AND p.profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn list<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.profile_id = {} ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
@@ -39,11 +52,28 @@ pub mod sql {
         format!("DELETE FROM playlists WHERE id = {}", d.placeholder(1))
     }
 
+    pub fn delete_scoped<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM playlists WHERE id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update_field<D: SqlDialect>(d: &D, field: &str) -> String {
         format!(
             "UPDATE playlists SET {field} = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    pub fn update_field_scoped<D: SqlDialect>(d: &D, field: &str) -> String {
+        format!(
+            "UPDATE playlists SET {field} = {} WHERE id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -146,6 +176,23 @@ impl PlaylistRepo {
             .map(row_to_playlist))
     }
 
+    /// Read a playlist **only if it belongs to `profile_id`**.
+    ///
+    /// [`get`] is kept for the internal paths that legitimately have no caller
+    /// identity (scan-sync of folder playlists, the public share-token route).
+    /// Every HTTP handler that acts on behalf of somebody must use this one:
+    /// `WHERE id = ?` alone is not an access control, since the ids are
+    /// sequential (#2794).
+    pub fn get_for_profile(&self, id: i64, profile_id: i64) -> Result<Option<Playlist>, String> {
+        let sql = self.dialect_sql(sql::get_by_id_scoped, sql::get_by_id_scoped);
+        let params: [&dyn ToSqlValue; 2] = [&id, &profile_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_playlist))
+    }
+
     pub fn list(&self, profile_id: i64, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
         let sql = self.dialect_sql(sql::list, sql::list);
         let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
@@ -183,6 +230,49 @@ impl PlaylistRepo {
             self.db.execute(&sql, &params)?;
         }
         Ok(())
+    }
+
+    /// Delete a playlist **only if it belongs to `profile_id`**. Returns
+    /// whether a row was actually removed, so the caller answers `404` instead
+    /// of a `204` that deleted nothing — the silent no-op is exactly how a
+    /// missing access control stays invisible.
+    pub fn delete_for_profile(&self, id: i64, profile_id: i64) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::delete_scoped, sql::delete_scoped);
+        let params: [&dyn ToSqlValue; 2] = [&id, &profile_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Update a playlist **only if it belongs to `profile_id`**. Returns
+    /// whether the playlist was reachable by that profile at all — a body with
+    /// neither field still answers that question, by reading the row back.
+    pub fn update_for_profile(
+        &self,
+        id: i64,
+        profile_id: i64,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<bool, String> {
+        if name.is_none() && description.is_none() {
+            return Ok(self.get_for_profile(id, profile_id)?.is_some());
+        }
+        let mut touched = false;
+        if let Some(n) = name {
+            let sql = self.dialect_sql(
+                |d| sql::update_field_scoped(d, "name"),
+                |d| sql::update_field_scoped(d, "name"),
+            );
+            let params: [&dyn ToSqlValue; 3] = [&n, &id, &profile_id];
+            touched |= self.db.execute(&sql, &params)? > 0;
+        }
+        if let Some(d) = description {
+            let sql = self.dialect_sql(
+                |dlc| sql::update_field_scoped(dlc, "description"),
+                |dlc| sql::update_field_scoped(dlc, "description"),
+            );
+            let params: [&dyn ToSqlValue; 3] = [&d, &id, &profile_id];
+            touched |= self.db.execute(&sql, &params)? > 0;
+        }
+        Ok(touched)
     }
 
     pub fn add_tracks(
@@ -514,6 +604,51 @@ mod tests {
         assert_eq!(p1[0].name, "P1 only");
         let p2 = repo.list(2, 100, 0).unwrap();
         assert_eq!(p2.len(), 2);
+    }
+
+    /// #2794 — le test ci-dessus ne couvrait que `list` et `count`, c'est-à-dire
+    /// exactement les deux seules opérations qui étaient cloisonnées. Les accès
+    /// **par id**, eux, ignoraient le profil.
+    #[test]
+    fn access_by_id_is_scoped_by_profile() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+        let id = repo.create("Privee du profil 1", None, 1).unwrap();
+
+        // Lecture
+        assert!(repo.get_for_profile(id, 1).unwrap().is_some());
+        assert!(
+            repo.get_for_profile(id, 2).unwrap().is_none(),
+            "le profil 2 a lu la playlist du profil 1"
+        );
+
+        // Modification : refusée ET sans effet en base.
+        assert!(
+            !repo
+                .update_for_profile(id, 2, Some("Detournee"), None)
+                .unwrap()
+        );
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "Privee du profil 1");
+        // Un corps vide répond quand même « cette playlist ne vous est pas
+        // accessible » plutôt que de mentir par un succès.
+        assert!(!repo.update_for_profile(id, 2, None, None).unwrap());
+        assert!(repo.update_for_profile(id, 1, None, None).unwrap());
+
+        // Suppression : refusée ET la ligne est toujours là.
+        assert!(!repo.delete_for_profile(id, 2).unwrap());
+        assert!(repo.get(id).unwrap().is_some());
+
+        // Témoin : le propriétaire, lui, modifie et supprime.
+        assert!(
+            repo.update_for_profile(id, 1, Some("Renommee"), None)
+                .unwrap()
+        );
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "Renommee");
+        assert!(repo.delete_for_profile(id, 1).unwrap());
+        assert!(repo.get(id).unwrap().is_none());
+        // Une seconde suppression n'a plus rien à supprimer : `false`, pas un
+        // succès silencieux.
+        assert!(!repo.delete_for_profile(id, 1).unwrap());
     }
 
     #[test]

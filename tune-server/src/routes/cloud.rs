@@ -421,6 +421,7 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
 async fn marketplace_install(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
@@ -465,7 +466,7 @@ async fn marketplace_install(
         }
         Err(e) => {
             warn!(plugin = %name, error = %e, "marketplace_install_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -478,6 +479,7 @@ struct VoteRequest {
 async fn marketplace_vote(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<VoteRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -486,7 +488,9 @@ async fn marketplace_vote(
 
     match mp.vote(&name, body.up).await {
         Ok(()) => Json(json!({"name": name, "voted": true, "up": body.up})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -502,6 +506,7 @@ struct ArtistImageReport {
 
 async fn report_artist_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<ArtistImageReport>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -515,7 +520,9 @@ async fn report_artist_image(
     .await
     {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
+        }
     }
 }
 
@@ -533,6 +540,7 @@ struct CoverSubmitRequest {
 
 async fn submit_community_cover(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSubmitRequest>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -572,7 +580,7 @@ async fn submit_community_cover(
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => {
             warn!(error = %e, "community_cover_submit_failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+            crate::routes::cloud_error::reponse(&e, &headers, StatusCode::BAD_GATEWAY, json!({}))
         }
     }
 }
@@ -584,6 +592,7 @@ struct CoverSyncRequest {
 
 async fn sync_community_covers(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CoverSyncRequest>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
@@ -601,7 +610,12 @@ async fn sync_community_covers(
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "community_covers_sync_failed");
-                return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+                return crate::routes::cloud_error::reponse(
+                    &e,
+                    &headers,
+                    StatusCode::BAD_GATEWAY,
+                    json!({}),
+                );
             }
         };
 

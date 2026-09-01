@@ -414,10 +414,12 @@ mod tests {
         (code, serde_json::from_slice(&octets).unwrap(), retry)
     }
 
+    /// L'arrondi lui-même vit maintenant dans `routes::cloud_error`, avec sa
+    /// propre contre-épreuve ; on garde ici la règle telle qu'elle est VUE par
+    /// le support : le message parle de minutes, jamais de zéro.
     #[test]
     fn minutes_a_attendre_arrondit_au_superieur_sans_jamais_zero() {
-        // Jamais zéro : « réessaie dans 0 min » renverrait l'utilisateur trop
-        // tôt, donc sur un nouveau 429.
+        use crate::routes::cloud_error::minutes_a_attendre;
         assert_eq!(minutes_a_attendre(1), 1);
         assert_eq!(minutes_a_attendre(59), 1);
         assert_eq!(minutes_a_attendre(60), 1);
@@ -606,16 +608,6 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
         .into_response())
 }
 
-/// Minutes à attendre, déduites des secondes annoncées par mozaiklabs.
-///
-/// L'arrondi se fait vers le HAUT, et jamais à zéro : renvoyer l'utilisateur
-/// « dans 0 min » le ferait revenir trop tôt et reprendre un 429. Le délai
-/// exact en secondes n'est pas perdu pour autant — il reste dans le corps
-/// (`retry_after`) et dans l'en-tête `Retry-After`, pour qui programme.
-fn minutes_a_attendre(secondes: u64) -> u64 {
-    secondes.div_ceil(60).max(1)
-}
-
 /// Remplace le texte d'un 429 par un message localisé et exploitable.
 ///
 /// Le limiteur de Laravel ne sait dire qu'une chose, en anglais et sans
@@ -635,12 +627,15 @@ fn minutes_a_attendre(secondes: u64) -> u64 {
 /// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
 /// contre `rate_limited` gardent leur contrat.
 fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
-    let lang = crate::i18n::lang_from_header(headers);
-    let message = match retry_after {
-        Some(secondes) => crate::i18n::t(&lang, "support.tropDeRequetesDelai")
-            .replace("{minutes}", &minutes_a_attendre(secondes).to_string()),
-        None => crate::i18n::t(&lang, "support.tropDeRequetes"),
-    };
+    // Même fabrique que le reste du nuage (`routes::cloud_error`), avec les
+    // clés propres au support : une seule règle d'arrondi, un seul endroit où
+    // la langue est résolue.
+    let message = crate::routes::cloud_error::message_limite(
+        headers,
+        retry_after,
+        "support.tropDeRequetes",
+        "support.tropDeRequetesDelai",
+    );
 
     // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
     let Some(obj) = value.as_object_mut() else {

@@ -191,6 +191,75 @@ pub fn favorite_condition(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// La règle de lecture du tag **Dynamic Range d'album** (#2144), écrite UNE
+/// fois pour les trois lieux qui s'en servent : la grille d'albums
+/// (`AlbumRepo::dr_album_join`), le rail de facettes (`facets::dr_facet`) et la
+/// liste filtrée (`TrackRepo::list_filtered`). Une facette qui compterait
+/// autrement que la liste qu'elle filtre serait pire qu'une facette absente.
+///
+/// Le DR vit dans le magasin ouvert `track_metadata`, sous la clé `dr_album`,
+/// en **TEXTE** déjà normalisé au scan (« DR12 », « DR 12 » → « 12 », commit
+/// 7cdc93ff). Trois gardes avant le `CAST`, parce qu'un magasin ouvert accepte
+/// n'importe quelle chaîne : non vide, trois caractères au plus, et **rien que
+/// des chiffres**. Sans le troisième, `CAST('abc' AS INTEGER)` vaut `0` en
+/// SQLite (donc « DR0 », une valeur de facette inventée) et **lève** en
+/// PostgreSQL (donc la requête entière échoue) — la 17ᵉ divergence PG/SQLite
+/// qu'on refuse d'ajouter.
+///
+/// L'alias de `track_metadata` est `tm`, celui de `tracks` est `tdr` : jamais
+/// `t`, qui est déjà pris par la requête ENGLOBANTE côté pistes.
+pub fn dr_tag_where(engine: Engine) -> String {
+    let only_digits = match engine {
+        // SQLite n'a pas de `~` ; GLOB est son motif sensible à la casse, et
+        // `[^0-9]` y est une classe de caractères niée.
+        Engine::Sqlite => "tm.value NOT GLOB '*[^0-9]*'",
+        Engine::Postgres => "tm.value ~ '^[0-9]+$'",
+    };
+    format!("tm.key = 'dr_album' AND tm.value <> '' AND LENGTH(tm.value) <= 3 AND {only_digits}")
+}
+
+/// Le DR d'un album à partir de ses pistes : le **maximum**.
+///
+/// Le tag est un tag d'ALBUM recopié sur chaque piste ; en théorie toutes les
+/// pistes portent la même valeur. Quand elles divergent (album ré-tagué à
+/// moitié), le maximum donne une valeur stable et reproductible plutôt qu'une
+/// valeur au hasard du plan d'exécution.
+pub const DR_ALBUM_VALUE: &str = "MAX(CAST(tm.value AS INTEGER))";
+
+/// La table dérivée « un album, son DR » — à joindre sur `album_id`.
+///
+/// Elle ne balaie que les lignes `dr_album` de `track_metadata`, c'est-à-dire
+/// une poignée sur une bibliothèque réelle : c'est ce qui la rend jointe-able
+/// sans coût, là où une sous-requête CORRÉLÉE par piste referait le travail
+/// des centaines de milliers de fois.
+pub fn dr_album_source(engine: Engine) -> String {
+    format!(
+        "SELECT tdr.album_id AS album_id, {DR_ALBUM_VALUE} AS dr \
+           FROM track_metadata tm JOIN tracks tdr ON tdr.id = tm.track_id \
+          WHERE {} GROUP BY tdr.album_id",
+        dr_tag_where(engine)
+    )
+}
+
+/// Prédicat « l'album de CETTE piste porte l'un des DR sélectionnés » — sur
+/// l'alias `t` des requêtes de pistes (#2144).
+///
+/// `having` est le `IN (…)` déjà construit par [`Placeholders::in_list`] sur
+/// [`DR_ALBUM_VALUE`] : l'appelant tient son compteur de marqueurs, ce module
+/// n'en fabrique aucun.
+///
+/// Sous-requête NON corrélée : le moteur l'évalue une fois. Un album sans tag
+/// n'en fait jamais partie — la facette est toujours RESTRICTIVE, comme la
+/// tranche `DrRange` de la grille d'albums.
+pub fn dr_album_in(engine: Engine, having: &str) -> String {
+    format!(
+        "t.album_id IN (SELECT tdr.album_id FROM track_metadata tm \
+           JOIN tracks tdr ON tdr.id = tm.track_id \
+          WHERE {} GROUP BY tdr.album_id HAVING {having})",
+        dr_tag_where(engine)
+    )
+}
+
 /// Prédicat « cet album n'est PAS masqué » (#1391), pour les requêtes
 /// d'ALBUMS — alias `a`, celui de `AlbumRepo::sql::select_album()`.
 ///
@@ -267,6 +336,15 @@ pub struct TrackFilter {
     pub source_medias: Vec<String>,
     pub ratings: Vec<i64>,
     pub original_years: Vec<i64>,
+    /// Dynamic Range de l'ALBUM (#2144), une valeur entière par pastille.
+    ///
+    /// **C'est là que vivent les « tranches » du ticket.** Plusieurs valeurs
+    /// cochées se combinent en OU comme toute facette : cocher 12, 13 et 14
+    /// EST la tranche « DR12 à DR14 ». Le serveur ne grave donc aucune borne
+    /// nommée — l'issue n'en fixe aucune, les bornes de MinimServer citées en
+    /// modèle n'ont jamais été relevées, et un découpage inventé ici
+    /// survivrait dans le contrat HTTP à la mesure qui le contredirait.
+    pub dynamic_ranges: Vec<i64>,
     /// `track` et/ou `album` (profil 1).
     pub favorites: Vec<String>,
     pub playlists: Vec<String>,
@@ -312,6 +390,7 @@ impl TrackFilter {
             || !self.source_medias.is_empty()
             || !self.ratings.is_empty()
             || !self.original_years.is_empty()
+            || !self.dynamic_ranges.is_empty()
             // Vocabulaires FERMÉS : une valeur inconnue ne produit aucun
             // prédicat, donc elle ne doit pas non plus activer le chemin filtré.
             || self.favorites.iter().any(|k| favorite_condition(k).is_some())
@@ -481,6 +560,72 @@ mod tests {
                 "littéral sans marqueur : {cond}"
             );
         }
+    }
+
+    /// Le piège n°2, éprouvé sur la facette la plus jeune (#2144).
+    ///
+    /// En SQLite tous les marqueurs s'écrivent `?` et seul l'ORDRE compte : un
+    /// `IN (…)` qui oublie d'avancer le compteur y passe inaperçu et se
+    /// trompe de valeurs en PostgreSQL. On l'éprouve donc en PostgreSQL, le
+    /// seul moteur où l'indice se VOIT.
+    #[test]
+    fn la_facette_dr_numerote_ses_marqueurs_en_postgresql() {
+        // Le compteur est déjà entamé, comme dans le vrai WHERE où trois
+        // facettes précèdent le DR.
+        let mut ph = Placeholders::resuming_at(Engine::Postgres, 4);
+        let having = ph.in_list(DR_ALBUM_VALUE, 3).expect("liste non vide");
+        let sql = dr_album_in(Engine::Postgres, &having);
+        assert!(
+            sql.contains("HAVING MAX(CAST(tm.value AS INTEGER)) IN ($4, $5, $6)"),
+            "les trois marqueurs se suivent : {sql}"
+        );
+        assert_eq!(
+            ph.next_index(),
+            7,
+            "trois marqueurs consommés, pas un de plus"
+        );
+        // Chaque moteur garde son dialecte de « que des chiffres ».
+        assert!(sql.contains("tm.value ~ '^[0-9]+$'"), "{sql}");
+        let sqlite = dr_album_in(Engine::Sqlite, "1 = 1");
+        assert!(sqlite.contains("NOT GLOB"), "{sqlite}");
+        assert!(!sqlite.contains('~'), "{sqlite}");
+        // L'alias interne n'est JAMAIS `t` : c'est celui de la requête
+        // englobante, et le masquer rendrait le prédicat toujours vrai.
+        assert!(!sql.contains("tracks t "), "{sql}");
+        assert!(sql.contains("tracks tdr"), "{sql}");
+    }
+
+    /// La règle de lecture du tag n'est écrite QU'UNE fois : la table dérivée
+    /// de la grille d'albums et le prédicat des pistes la partagent.
+    #[test]
+    fn la_grille_et_le_rail_lisent_le_dr_de_la_meme_facon() {
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            let regle = dr_tag_where(engine);
+            assert!(dr_album_source(engine).contains(&regle));
+            assert!(dr_album_in(engine, "1 = 1").contains(&regle));
+            // Les trois gardes AVANT le CAST, sur les deux moteurs.
+            assert!(regle.contains("tm.key = 'dr_album'"));
+            assert!(regle.contains("tm.value <> ''"));
+            assert!(regle.contains("LENGTH(tm.value) <= 3"));
+        }
+    }
+
+    /// Une facette DR sans valeur ne produit AUCUN prédicat et n'active pas le
+    /// chemin filtré — le piège n°1, appliqué au dernier arrivé.
+    #[test]
+    fn une_facette_dr_vide_nactive_rien() {
+        let mut ph = Placeholders::new(Engine::Sqlite);
+        assert!(ph.in_list(DR_ALBUM_VALUE, 0).is_none());
+        let vide = TrackFilter {
+            dynamic_ranges: normalize_ints(&[]),
+            ..Default::default()
+        };
+        assert!(!vide.is_active());
+        let actif = TrackFilter {
+            dynamic_ranges: vec![14],
+            ..Default::default()
+        };
+        assert!(actif.is_active());
     }
 
     #[test]

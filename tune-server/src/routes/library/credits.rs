@@ -16,6 +16,20 @@ use super::credits_mb::{LigneCredit, REGLAGE_AVANCEMENT_CREDITS, lignes_credits}
 /// seconde pour rien.
 const JALON_STATUT: i32 = 25;
 
+/// Identifiant de la passe au registre `background_tasks` (#2129).
+///
+/// Le réglage `REGLAGE_AVANCEMENT_CREDITS` et sa route `/enrich-credits/status`
+/// ne se lisent que depuis l'écran qui a lancé la passe. Le registre, lui, est
+/// le PASSE-PARTOUT : `GET /system/background-tasks` et l'événement
+/// `system.background_tasks` alimentent le bandeau global du client, visible
+/// quelle que soit la vue. Sans inscription ici, une passe qui dure des heures
+/// (1 req/s côté MusicBrainz) est indistinguable d'une passe absente dès qu'on
+/// quitte les Réglages — c'est le reproche de Bilou.
+///
+/// Aucun second compteur n'est fabriqué : les chiffres publiés sont EXACTEMENT
+/// ceux que la passe écrivait déjà dans le réglage.
+const TACHE_CREDITS: &str = "credits_enrich";
+
 /// Corps optionnel de `POST /library/enrich-credits` (#2799).
 ///
 /// Sans corps — le contrat historique — `only_missing` vaut `false` et la passe
@@ -193,7 +207,6 @@ pub(super) async fn enrich_album_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    use tune_core::db::backend::ToSqlValue;
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
 
@@ -275,6 +288,18 @@ fn requete_candidats(only_missing: bool) -> &'static str {
     }
 }
 
+/// Pistes déjà traitées — le numérateur du bandeau global.
+///
+/// Les trois compteurs de la passe sont disjoints (une piste est enrichie, OU
+/// sautée, OU en erreur), et leur somme est exactement le dénombrement que le
+/// jalon de statut utilise déjà pour décider quand écrire. Extrait ici pour
+/// être jouable par un test : un numérateur qui ne compterait que `enriched`
+/// ferait stagner la barre sur une bibliothèque où MusicBrainz ne rend aucun
+/// crédit — le « compteur bloqué » déjà mesuré sur les images d'artistes.
+fn traitees(enriched: i32, errors: i32, skipped: i32) -> u64 {
+    (enriched + errors + skipped).max(0) as u64
+}
+
 /// Statut d'avancement sérialisé dans `settings`.
 fn statut_credits(
     status: &str,
@@ -328,7 +353,18 @@ pub(super) async fn enrich_all_credits(
         )
         .ok();
 
+    // Garde RAII pris AVANT le spawn et déplacé dedans : il retire la tâche du
+    // registre quand le futur se termine, y compris en panique. Un drapeau posé
+    // à `running` et jamais remis serait la « tâche perpétuelle fantôme » que ce
+    // registre existe pour éviter.
+    let garde_tache =
+        state
+            .background_tasks
+            .begin(TACHE_CREDITS, "Enrichissement des crédits…", "enrichment");
+    let taches = state.background_tasks.clone();
+
     tokio::spawn(async move {
+        let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
         let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
         let track_ids: Vec<(i64, String)> = backend
             .query_many(requete_candidats(only_missing), &[])
@@ -351,6 +387,10 @@ pub(super) async fn enrich_all_credits(
                 &statut_credits("running", &task_id_clone, 0, 0, 0, total),
             )
             .ok();
+        // Même chiffre, même instant, dans le registre : le bandeau global
+        // n'affiche une fraction qu'une fois le total connu (0/0 se lit comme
+        // un arrêt côté client).
+        taches.update_progress(TACHE_CREDITS, 0, total as u64, "Crédits");
 
         let mut enriched = 0i32;
         let mut errors = 0i32;
@@ -394,6 +434,14 @@ pub(super) async fn enrich_all_credits(
                         ),
                     )
                     .ok();
+                // Le registre suit le MÊME jalon que le réglage : une seule
+                // cadence, donc jamais deux avancements qui se contredisent.
+                taches.update_progress(
+                    TACHE_CREDITS,
+                    traitees(enriched, errors, skipped),
+                    total as u64,
+                    "Crédits",
+                );
             }
 
             // MusicBrainz rate limit: 1 request/sec
@@ -467,5 +515,120 @@ mod tests {
         );
         // Le socle historique reste : on RESTREINT, on ne remplace pas.
         assert!(q.contains("musicbrainz_recording_id IS NOT NULL"), "{q}");
+    }
+}
+
+/// Inscription de la passe des crédits au registre des tâches de fond (#2129).
+///
+/// **Hermétique : aucun appel réseau.** La base en mémoire ne contient aucune
+/// piste portant un `musicbrainz_recording_id`, donc la passe n'a aucun
+/// candidat et ne joint jamais MusicBrainz.
+///
+/// Ce que ces essais observent tient à une propriété du réacteur mono-fil de
+/// `#[tokio::test]` : une tâche déposée par `tokio::spawn` n'est sondée qu'au
+/// premier point de rendez-vous du test. Entre le retour du gestionnaire et
+/// l'assertion, il n'y a aucun `.await` — on lit donc le registre exactement
+/// dans l'état où le trouve un client qui l'interroge pendant que la passe
+/// travaille, sans dépendre d'un ordonnancement.
+#[cfg(test)]
+mod tests_tache_de_fond_credits {
+    use super::*;
+    use crate::state::AppState;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    fn identifiants(state: &AppState) -> Vec<String> {
+        state
+            .background_tasks
+            .snapshot()
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// Le défaut de #2129 : la passe des crédits persistait bien son avancement
+    /// dans `settings` et le rendait sur `/library/enrich-credits/status`, mais
+    /// ne s'inscrivait NULLE PART au registre `background_tasks`. Or c'est ce
+    /// registre — et lui seul — qui alimente `GET /system/background-tasks`,
+    /// l'événement `system.background_tasks` et le bandeau global du client.
+    ///
+    /// Conséquence mesurable : une passe qui tient la cadence MusicBrainz d'une
+    /// requête par seconde, donc des heures sur une grosse bibliothèque, était
+    /// indistinguable d'une passe absente dès qu'on quittait les Réglages.
+    #[tokio::test]
+    async fn la_passe_de_credits_s_inscrit_au_registre() {
+        let state = etat();
+        let _ = enrich_all_credits(State(state.clone()), None).await;
+
+        let ids = identifiants(&state);
+        assert!(
+            ids.contains(&TACHE_CREDITS.to_string()),
+            "la passe des crédits doit figurer au registre des tâches de fond, \
+             sinon le bandeau global du client ne peut pas l'afficher (#2129) — \
+             registre observé : {ids:?}"
+        );
+    }
+
+    /// Le bandeau affiche le libellé du serveur mot pour mot : il ne le traduit
+    /// pas et n'en fabrique pas un. Un libellé vide ferait retomber le client
+    /// sur son texte de secours générique — « un enrichissement est en cours »
+    /// — qui ne dit pas LEQUEL, et c'est justement ce que Bilou reprochait.
+    #[tokio::test]
+    async fn la_tache_porte_un_libelle_non_vide() {
+        let state = etat();
+        let _ = enrich_all_credits(State(state.clone()), None).await;
+
+        let tache = state
+            .background_tasks
+            .snapshot()
+            .into_iter()
+            .find(|t| t.id == TACHE_CREDITS)
+            .expect("la passe doit être inscrite");
+        assert!(
+            !tache.label.trim().is_empty(),
+            "sans libellé, le bandeau retombe sur son texte de secours générique"
+        );
+    }
+
+    /// Témoin anti-régression : la route garde son contrat d'origine. Inscrire
+    /// la passe au registre ne doit changer ni le code de retour, ni le
+    /// `task_id` que le client conserve pour interroger `/status`.
+    #[tokio::test]
+    async fn le_contrat_de_la_route_est_inchange() {
+        use axum::response::IntoResponse;
+
+        let state = etat();
+        let reponse = enrich_all_credits(State(state.clone()), None)
+            .await
+            .into_response();
+        assert_eq!(
+            reponse.status(),
+            StatusCode::ACCEPTED,
+            "la route répond toujours 202"
+        );
+
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(corps["status"], "accepted");
+        assert!(
+            corps["task_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "le task_id reste rendu : c'est la clef de /enrich-credits/status"
+        );
+    }
+
+    /// Le numérateur du bandeau compte les pistes TRAITÉES, pas les seules
+    /// réussites. Sur une bibliothèque où MusicBrainz ne rend aucun crédit
+    /// exploitable, tout part en `skipped` : un numérateur limité à `enriched`
+    /// afficherait « 0/4000 » du début à la fin, soit le compteur bloqué déjà
+    /// mesuré sur les images d'artistes.
+    #[test]
+    fn le_numerateur_compte_les_pistes_sautees_et_en_erreur() {
+        assert_eq!(traitees(0, 0, 37), 37, "37 pistes sautées sont 37 traitées");
+        assert_eq!(traitees(5, 2, 3), 10);
+        assert_eq!(traitees(0, 0, 0), 0);
     }
 }
