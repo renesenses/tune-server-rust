@@ -5270,6 +5270,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-concerts"
+version = "0.9.129"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-core"
 version = "0.9.129"
 dependencies = [
@@ -5438,6 +5451,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tune-bandcamp",
+ "tune-concerts",
  "tune-core",
  "tune-dj",
  "tune-karaoke",

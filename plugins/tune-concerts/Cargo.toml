@@ -1,0 +1,23 @@
+[package]
+name = "tune-concerts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Plugin natif in-tree (#2363). Sorti du cœur toujours-compilé :
+# `tune-core/src/cloud/concert_alerts.rs` (la tâche d'abonnement, démarrée sans
+# condition par `background.rs`) et `GET /system/concerts` (la route de
+# lecture). Même trajet que `tune-bandcamp` avant lui.
+#
+# Aucune dépendance audio : ce plugin ne fait que parler HTTP à notre propre
+# cloud. Il a besoin de la base — pour lire les artistes de la bibliothèque et
+# les réglages — et de rien d'autre.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

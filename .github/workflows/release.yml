@@ -129,7 +129,7 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+            features: oaat,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -139,7 +139,7 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            features: oaat,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+            features: oaat,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -280,7 +280,7 @@ jobs:
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -293,11 +293,11 @@ jobs:
 
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,plugins-wasm,audio-embedding
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
