@@ -502,6 +502,93 @@ fn spawn_paced_levels_forwarder(
     tx
 }
 
+/// Le FREIN du décodage-pour-niveaux, isolé de ce QU'ON décode.
+///
+/// Rend le couple `(puits, relais)` que tout décodage-pour-niveaux de fichier
+/// local branche sur `decode_to_pcm_streaming_with_levels` : le PCM part dans
+/// le puits — personne ne le lit, seul compte le fait de borner la mémoire —
+/// et les fenêtres passent par le relais, qui compte l'avance décodée avant de
+/// les remettre au forwarder.
+///
+/// **Pourquoi un frein.** Un décodage plein pot produit les fenêtres à la
+/// vitesse du DISQUE, pendant que le forwarder ne les publie qu'au TEMPS RÉEL.
+/// Sa file est non bornée par construction et chaque
+/// [`crate::audio::tap::RawWindow`] porte son `pcm: Vec<u8>` : sans frein, elle
+/// retient la piste ENTIÈRE, et la rétention SUIT la durée du morceau au lieu
+/// de plafonner. Le puits ne consomme donc pas au-delà de
+/// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance sur la position rapportée par la
+/// zone, et le décodeur — bloqué sur un canal borné — s'aligne dessus.
+///
+/// Il s'arrête dès que le relais est fermé, donc dès que le forwarder est mort
+/// (piste remplacée, zone stoppée) : le décodeur voit son consommateur
+/// disparaître et rend la main au lieu de convertir la fin d'une piste que
+/// plus personne n'écoute.
+///
+/// **Le frein ne touche PAS aux paramètres de décodage** : chaque appelant
+/// garde les siens. C'est ce qui permet de brider le passthrough — qui décode
+/// aux valeurs TAGUÉES de la piste (`Some(sample_rate)` / `Some(channels)`) —
+/// sans le renvoyer vers [`spawn_local_file_levels_decode`], qui décode au
+/// débit natif du fichier. Sur un fichier bien tagué les deux coïncident ; sur
+/// un fichier mal tagué non, et le passthrough est justement le chemin de
+/// cette population-là (#3145).
+///
+/// C'est une fonction, pas un motif à recopier : #3104 avait reproduit à la
+/// main la forme du décodage-pour-niveaux, puits compris, mais avec un drain
+/// inconditionnel — et a réintroduit la fuite (#3144). Le bloc du passthrough,
+/// lui, ne l'avait jamais eue depuis #1423.
+fn spawn_braked_levels_sink(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) {
+    // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
+    // que le bridage compare à la position rapportée par la zone.
+    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // Relais : le décodeur ne sait pas compter son avance, mais chaque
+    // fenêtre porte sa durée.
+    let (relais_tx, mut relais_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+    {
+        let avance_ms = avance_ms.clone();
+        tokio::spawn(async move {
+            while let Some(raw) = relais_rx.recv().await {
+                avance_ms.fetch_add(
+                    raw.window.as_millis() as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if levels_tx.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // Sonde du même canal : `is_closed()` devient vrai quand le relais a
+    // rendu la main, donc quand le forwarder est mort.
+    let relais = relais_tx.clone();
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move {
+        while sink_rx.recv().await.is_some() {
+            loop {
+                if relais.is_closed() {
+                    return;
+                }
+                let position = playback.get_state(zone_id).await.position_ms;
+                if !levels_decode_doit_freiner(
+                    avance_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    position,
+                ) {
+                    break;
+                }
+                tokio::time::sleep(LEVELS_HOLD).await;
+            }
+        }
+    });
+    (sink_tx, relais_tx)
+}
+
 /// Décode un fichier local EN FLUX, uniquement pour alimenter un forwarder de
 /// niveaux neuf : c'est ce qui rend les aiguilles à la piste devenue courante
 /// après une avance gapless, et ce qui les rend aussi à une piste servie depuis
@@ -524,10 +611,10 @@ fn spawn_paced_levels_forwarder(
 /// (`decode_http_stream_for_levels`) : un décodage plein pot produit les
 /// fenêtres bien plus vite que le forwarder ne les publie, et la file du
 /// forwarder — non bornée par construction — retiendrait alors tout le PCM de
-/// la piste (~600 Mo pour un DSD64 de dix minutes rendu en 176,4 kHz). Le
-/// puits ne consomme donc pas plus vite que
-/// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur, bloqué sur un canal
-/// borné, s'aligne dessus.
+/// la piste (~600 Mo pour un DSD64 de dix minutes rendu en 176,4 kHz). C'est
+/// [`spawn_braked_levels_sink`] qui porte ce frein : le puits ne consomme pas
+/// plus vite que [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur,
+/// bloqué sur un canal borné, s'aligne dessus.
 ///
 /// Ce frein n'est PAS un détail d'implémentation qu'on peut recopier de
 /// mémoire : #3104 a reproduit la forme de cette fonction en ligne dans la
@@ -547,48 +634,7 @@ fn spawn_local_file_levels_decode(
     tokio::spawn(async move {
         let cadence = playback.clone();
         let levels_tx = spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-        // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
-        // que le bridage compare à la position rapportée par la zone.
-        let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        // Relais : le décodeur ne sait pas compter son avance, mais chaque
-        // fenêtre porte sa durée.
-        let (relais_tx, mut relais_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
-        {
-            let avance_ms = avance_ms.clone();
-            tokio::spawn(async move {
-                while let Some(raw) = relais_rx.recv().await {
-                    avance_ms.fetch_add(
-                        raw.window.as_millis() as i64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    if levels_tx.send(raw).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        // Sonde du même canal : `is_closed()` devient vrai quand le relais a
-        // rendu la main, donc quand le forwarder est mort.
-        let relais = relais_tx.clone();
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-        tokio::spawn(async move {
-            while sink_rx.recv().await.is_some() {
-                loop {
-                    if relais.is_closed() {
-                        return;
-                    }
-                    let position = cadence.get_state(zone_id).await.position_ms;
-                    if !levels_decode_doit_freiner(
-                        avance_ms.load(std::sync::atomic::Ordering::Relaxed),
-                        position,
-                    ) {
-                        break;
-                    }
-                    tokio::time::sleep(LEVELS_HOLD).await;
-                }
-            }
-        });
+        let (sink_tx, relais_tx) = spawn_braked_levels_sink(cadence, zone_id, levels_tx);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
             crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -5263,6 +5309,7 @@ impl PlaybackOrchestrator {
                     let play_seq = self.playback.current_play_seq(req.zone_id).await;
                     tokio::spawn(async move {
                         // Passthrough : le décodage pour niveaux part de 0.
+                        let cadence = playback.clone();
                         let levels_tx =
                             spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
                         // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
@@ -5275,8 +5322,30 @@ impl PlaybackOrchestrator {
                         // les niveaux au fil de l'eau ; le PCM produit part
                         // dans un puits, seul l'ordre de grandeur du tampon
                         // reste en mémoire.
-                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                        //
+                        // ... mais un puits qui draine SANS CONDITION ne borne
+                        // rien : il rend simplement au décodeur la vitesse du
+                        // DISQUE, pendant que le forwarder ne publie qu'au
+                        // TEMPS RÉEL. Sa file est non bornée et chaque fenêtre
+                        // porte son PCM, si bien que les ~1,9 Go chassés de la
+                        // porte d'entrée revenaient par la file — la rétention
+                        // SUIVAIT la durée de la piste (mesuré sur un WAV
+                        // 44,1/16 : 10 551 296 octets à 60 s, 21 102 592 à
+                        // 120 s, extrapolé à ~380 Mo en 24/96). C'est le défaut
+                        // d'origine de ce bloc (#1423), celui sur lequel #3104
+                        // s'était modelé ; #3145 le corrige ici.
+                        //
+                        // Le frein passe par `spawn_braked_levels_sink`, et NON
+                        // par `spawn_local_file_levels_decode` : cette
+                        // dernière décode au débit NATIF du fichier, alors que
+                        // le passthrough décode aux valeurs TAGUÉES de la piste
+                        // (`Some(sr)` / `Some(ch)`, lues sur `tracks`). Sur un
+                        // fichier bien tagué c'est identique ; sur un fichier
+                        // mal tagué c'est un écart réel — et le passthrough est
+                        // exactement le chemin de cette population-là. On
+                        // freine donc SANS toucher à ce qui est décodé.
+                        let (sink_tx, relais_tx) =
+                            spawn_braked_levels_sink(cadence, zone_id, levels_tx);
                         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
                         let result = tokio::task::spawn_blocking(move || {
                             crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -5287,7 +5356,7 @@ impl PlaybackOrchestrator {
                                 sink_tx,
                                 LEVELS_DECODE_CHUNK,
                                 ready,
-                                levels_tx,
+                                relais_tx,
                             )
                         })
                         .await;
@@ -13230,6 +13299,315 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // #3145 — les niveaux du PASSTHROUGH : le frein qui manquait depuis
+    // #1423, mesuré sur le même fait de base que #3144.
+    // ------------------------------------------------------------------
+
+    /// Ce que la file du forwarder RETIENT sur le chemin PASSTHROUGH, quand la
+    /// zone n'a pas encore avancé (position 0, l'état d'un début de lecture) :
+    /// fenêtres en attente, octets de PCM, millisecondes d'audio.
+    ///
+    /// Mesuré sur le VRAI décodeur et avec les valeurs TAGUÉES de la piste
+    /// (`Some(sr)` / `Some(ch)`) — celles que la branche emploie, et que le
+    /// correctif ne change pas.
+    ///
+    /// La file est reproduite à l'identique de celle du forwarder —
+    /// `unbounded_channel` de [`crate::audio::tap::RawWindow`], chaque fenêtre
+    /// portant son `pcm: Vec<u8>` — et personne ne la draine : c'est exactement
+    /// un forwarder qui n'a encore rien publié.
+    ///
+    /// Le SEUL écart entre les deux appels est le PUITS :
+    /// - `freine = false` reproduit verbatim le bloc d'origine (#1423) — drain
+    ///   inconditionnel, et le décodeur émet DIRECTEMENT dans la file ;
+    /// - `freine = true` branche la vraie fonction de production,
+    ///   [`super::spawn_braked_levels_sink`] — pas une réplique — sur une zone
+    ///   réelle restée à la position 0.
+    ///
+    /// Aucun `sleep` d'attente : on compte des TOURS jusqu'à ce que le décodage
+    /// rende la main (cas sans frein) ou que la file cesse de grandir (cas
+    /// freiné — le décodeur reste bloqué sur son canal borné tant que la zone
+    /// est à 0). Le cas freiné atteint un PLATEAU : attendre plus longtemps ne
+    /// change pas le chiffre, donc la mesure n'est pas une course.
+    async fn pcm_retenu_passthrough(
+        chemin: &str,
+        sr: u32,
+        ch: u32,
+        freine: bool,
+    ) -> (usize, usize, i64) {
+        let (orch, _bus, zone_id, _rx) = zone_locale_prete_a_enchainer(chemin, "wav").await;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+
+        let (sink_tx, decode_tx) = if freine {
+            super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx)
+        } else {
+            // Forme d'origine : le puits draine sans condition, et le décodeur
+            // écrit DIRECTEMENT dans la file du forwarder.
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+            (sink_tx, levels_tx)
+        };
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let mut decodage = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                Some(sr),
+                Some(ch),
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                decode_tx,
+            )
+        });
+
+        let mut fini = false;
+        let mut precedent = usize::MAX;
+        let mut plateau = 0u32;
+        for _ in 0..2_000 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), &mut decodage)
+                .await
+                .is_ok()
+            {
+                fini = true;
+                break;
+            }
+            let n = levels_rx.len();
+            if n == precedent {
+                plateau += 1;
+                if plateau >= 25 {
+                    break;
+                }
+            } else {
+                plateau = 0;
+                precedent = n;
+            }
+        }
+
+        let mut fenetres = 0usize;
+        let mut octets = 0usize;
+        let mut audio_ms = 0i64;
+        while let Ok(raw) = levels_rx.try_recv() {
+            fenetres += 1;
+            octets += raw.pcm.len();
+            audio_ms += raw.window.as_millis() as i64;
+        }
+
+        // Libérer le décodeur : sans cela il resterait bloqué sur son canal
+        // borné pour toute la vie du binaire de test. On avance la position de
+        // la ZONE — le frein est justement une comparaison à cette position,
+        // donc c'est aussi la démonstration qu'il la relit à chaque tour.
+        orch.playback.update_position(zone_id, 3_600_000).await;
+        if !fini {
+            let _ = decodage.await;
+        }
+        (fenetres, octets, audio_ms)
+    }
+
+    /// Contre-épreuve CHIFFRÉE du frein sur le chemin du PASSTHROUGH (#3145).
+    ///
+    /// Le bloc d'origine (#1423) décodait en flux — le PCM part dans un puits,
+    /// seules les fenêtres ressortent — mais son puits DRAINAIT SANS
+    /// CONDITION. Le décodage courait donc à la vitesse du DISQUE pendant que
+    /// le forwarder ne publie qu'au TEMPS RÉEL, et sa file — non bornée, chaque
+    /// fenêtre portant son PCM — retenait la piste ENTIÈRE. La branche est
+    /// active pour toutes les sorties réseau et navigateur.
+    ///
+    /// Le test mesure les deux formes sur DEUX durées : une seule ne
+    /// distinguerait pas un plateau d'une tendance. Sans frein la rétention
+    /// SUIT la durée de la piste (elle double quand la piste double) ; avec
+    /// frein elle plafonne à ~30 s d'audio, quelle que soit la piste.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn le_passthrough_ne_retient_plus_toute_la_piste() {
+        const SR: u32 = 44_100;
+        const CH: u32 = 2;
+        let court = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let long = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(court.path(), 60_000);
+        ecrire_wav_carre(long.path(), 120_000);
+        let court = court.path().to_str().unwrap().to_string();
+        let long = long.path().to_str().unwrap().to_string();
+
+        // Forme d'origine (#1423) : puits sans frein.
+        let (f60, o60, ms60) = pcm_retenu_passthrough(&court, SR, CH, false).await;
+        let (f120, o120, ms120) = pcm_retenu_passthrough(&long, SR, CH, false).await;
+        // Forme bridée : celle de `spawn_braked_levels_sink`.
+        let (g60, p60, gms60) = pcm_retenu_passthrough(&court, SR, CH, true).await;
+        let (g120, p120, gms120) = pcm_retenu_passthrough(&long, SR, CH, true).await;
+
+        println!(
+            "passthrough sans frein — 60 s : {f60} fenêtres / {o60} octets / {ms60} ms ; \
+             120 s : {f120} fenêtres / {o120} octets / {ms120} ms"
+        );
+        println!(
+            "passthrough avec frein — 60 s : {g60} fenêtres / {p60} octets / {gms60} ms ; \
+             120 s : {g120} fenêtres / {p120} octets / {gms120} ms"
+        );
+
+        assert!(
+            ms60 >= 59_000 && ms120 >= 119_000,
+            "sans frein, la file doit retenir la piste entière — c'est le défaut \
+             qu'on mesure : {ms60} ms sur 60 s, {ms120} ms sur 120 s"
+        );
+        assert!(
+            o120 as f64 > o60 as f64 * 1.9,
+            "sans frein, la rétention doit SUIVRE la durée : {o60} octets sur \
+             60 s contre {o120} sur 120 s — si ce rapport n'est pas ~2, la \
+             mesure ne décrit pas ce qu'elle prétend"
+        );
+
+        assert!(
+            gms60 <= 35_000 && gms120 <= 35_000,
+            "le frein doit plafonner la file à ~30 s d'audio \
+             (PROXY_LEVELS_MAX_AHEAD_MS plus le canal borné du puits) : \
+             {gms60} ms sur 60 s, {gms120} ms sur 120 s"
+        );
+        assert!(
+            gms60 >= 25_000,
+            "le frein ne doit pas ÉTEINDRE les niveaux du passthrough : il en \
+             garde ~30 s d'avance ; reçu {gms60} ms"
+        );
+        assert!(
+            (gms120 - gms60).abs() <= 4_000,
+            "le plafond ne doit pas dépendre de la durée de la piste : {gms60} ms \
+             sur 60 s contre {gms120} ms sur 120 s — un PLATEAU, pas une tendance"
+        );
+        assert!(
+            (p120 as f64) < o120 as f64 / 2.0,
+            "sur 120 s, le frein doit diviser la rétention : {p120} octets contre \
+             {o120} sans frein"
+        );
+    }
+
+    /// Témoin vert : le frein ne supprime pas la FONCTIONNALITÉ.
+    ///
+    /// Même câblage que la branche passthrough — forwarder cadencé, puits
+    /// bridé, décodage aux valeurs TAGUÉES — sur un vrai bus : les
+    /// `playback.audio_levels` montent, et décrivent du SIGNAL, pas du silence.
+    /// Sans ce témoin, « la file ne retient plus rien » serait aussi vrai d'un
+    /// correctif qui aurait simplement débranché les VU-mètres.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_passthrough_bride_fait_toujours_monter_des_niveaux_sur_le_bus() {
+        let fichier = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(fichier.path(), 5_000);
+        let chemin = fichier.path().to_str().unwrap().to_string();
+        let (orch, bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        // Génération épinglée AVANT le spawn, comme dans la branche (#1110).
+        let play_seq = orch.playback.current_play_seq(zone_id).await;
+        let levels_tx =
+            super::spawn_paced_levels_forwarder(bus, orch.playback.clone(), zone_id, play_seq, 0);
+        let (sink_tx, relais_tx) =
+            super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx);
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &chemin,
+                Some(44_100),
+                Some(2),
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+            )
+        });
+
+        let (n, crete) =
+            compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(20), 25).await;
+        assert!(
+            n >= 25,
+            "le passthrough bridé doit toujours animer les VU-mètres : \
+             reçu {n} événements"
+        );
+        assert!(
+            crete > -20.0,
+            "les niveaux doivent décrire le SIGNAL de la piste, pas du \
+             silence : crête {crete:.1} dBFS"
+        );
+    }
+
+    /// Total du PCM effectivement produit par le décodeur pour ces paramètres
+    /// de sortie. Le puits draine, la file de niveaux aussi : on ne mesure ici
+    /// que ce que le décodage FABRIQUE, pas ce qu'il retient.
+    async fn octets_decodes(chemin: &str, sr: Option<u32>, ch: Option<u32>) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let drain = tokio::spawn(async move { while levels_rx.recv().await.is_some() {} });
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let puits = {
+            let total = total.clone();
+            tokio::spawn(async move {
+                while let Some(bloc) = sink_rx.recv().await {
+                    total.fetch_add(bloc.len(), Relaxed);
+                }
+            })
+        };
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                sr,
+                ch,
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                levels_tx,
+            )
+        })
+        .await;
+        let _ = puits.await;
+        let _ = drain.await;
+        total.load(Relaxed)
+    }
+
+    /// L'ARBITRAGE, mesuré : les valeurs taguées ne sont pas le débit natif.
+    ///
+    /// La correction évidente aurait été de renvoyer le passthrough vers
+    /// `spawn_local_file_levels_decode`, la jumelle qui porte déjà le frein —
+    /// c'est ce que #3144 a fait pour le cache de transcodage. Elle décode au
+    /// débit NATIF (`None, None, None`), alors que le passthrough décode aux
+    /// valeurs TAGUÉES de la piste (`tracks.sample_rate` / `tracks.channels`).
+    ///
+    /// Ce test montre que l'écart n'est pas théorique : sur un fichier dont le
+    /// tag ment — ce qu'est, par construction, la population qui arrive en
+    /// passthrough — le décodage suit le TAG et produit deux fois plus de PCM
+    /// que le natif. Si les deux chiffres coïncidaient, l'arbitrage n'existerait
+    /// pas et la jumelle aurait suffi.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn les_valeurs_taguees_ne_sont_pas_le_debit_natif() {
+        let fichier = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(fichier.path(), 3_000); // 44,1 kHz / 16 bits / stéréo
+        let chemin = fichier.path().to_str().unwrap().to_string();
+
+        let natif = octets_decodes(&chemin, None, None).await;
+        let bien_tague = octets_decodes(&chemin, Some(44_100), Some(2)).await;
+        let mal_tague = octets_decodes(&chemin, Some(88_200), Some(2)).await;
+        println!(
+            "octets décodés — natif : {natif} ; tag exact : {bien_tague} ; \
+             tag menteur (88,2 kHz) : {mal_tague}"
+        );
+
+        assert_eq!(
+            natif, bien_tague,
+            "sur un fichier bien tagué, décoder au tag ou au natif doit donner \
+             le MÊME PCM — sinon ce test ne mesure pas ce qu'il prétend"
+        );
+        assert!(
+            mal_tague as f64 > natif as f64 * 1.9,
+            "sur un fichier mal tagué, le décodage suit le TAG : {mal_tague} \
+             octets contre {natif} au natif. C'est cet écart qui interdit de \
+             remplacer le bloc du passthrough par `spawn_local_file_levels_decode`."
+        );
+    }
+
     /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend
     /// `applied_live=false`, mais ce n'est pas une raison pour laisser le
     /// client afficher l'ancien chemin du signal. `zone.updated` lui ordonne
@@ -16185,6 +16563,55 @@ mod annonce_apres_sortie_guard {
             "la branche « cache hit » rebranche un forwarder à la main : c'est \
              la forme qui avait perdu le frein en route. Elle doit passer par \
              `spawn_local_file_levels_decode`, qui porte le bridage."
+        );
+    }
+
+    /// #3145 : le décodage-pour-niveaux du PASSTHROUGH est bridé, ET il décode
+    /// toujours aux valeurs TAGUÉES de la piste.
+    ///
+    /// Deux propriétés que la compilation ne peut pas tenir, sur la même
+    /// tranche, parce qu'elles se contredisent en apparence :
+    ///
+    /// 1. **Le frein.** Le bloc d'origine (#1423) drainait son puits sans
+    ///    condition. Le décodage courait alors à la vitesse du DISQUE pendant
+    ///    que le forwarder ne publie qu'au temps réel, et sa file — non bornée,
+    ///    chaque fenêtre portant son PCM — retenait la piste ENTIÈRE. La mesure
+    ///    qui va avec est `le_passthrough_ne_retient_plus_toute_la_piste`.
+    /// 2. **Les valeurs de décodage.** La façon la plus courte de freiner
+    ///    serait d'appeler `spawn_local_file_levels_decode`, la jumelle bridée
+    ///    — mais elle décode au débit NATIF, pas au tag, et le passthrough est
+    ///    le chemin des fichiers mal tagués. La mesure qui va avec est
+    ///    `les_valeurs_taguees_ne_sont_pas_le_debit_natif`.
+    ///
+    /// Sans la seconde assertion, ce garde serait satisfait par la « correction »
+    /// qui change en silence ce que les VU-mètres décrivent.
+    #[test]
+    fn le_passthrough_est_bride_sans_changer_ce_qu_il_decode() {
+        let debut = position("let skip_passthrough_levels");
+        let fin = position("\"passthrough_levels_decode_failed\"");
+        assert!(
+            debut < fin,
+            "la découpe ne délimite plus le décodage-pour-niveaux du \
+             passthrough : ce garde-fou ne garde plus rien."
+        );
+        let tranche = &code_de_production()[debut..fin];
+        assert!(
+            tranche.contains("spawn_braked_levels_sink("),
+            "le décodage-pour-niveaux du passthrough n'est plus bridé : sa file \
+             de fenêtres retient de nouveau tout le PCM de la piste, et la \
+             rétention suit la DURÉE du morceau (#3145)."
+        );
+        assert!(
+            !tranche.contains("while sink_rx.recv().await.is_some() {}"),
+            "le puits du passthrough draine de nouveau SANS CONDITION : c'est \
+             exactement la forme qui n'a jamais eu de frein depuis #1423."
+        );
+        assert!(
+            tranche.contains("Some(sr),") && tranche.contains("Some(ch),"),
+            "le passthrough ne décode plus aux valeurs TAGUÉES de la piste. \
+             Freiner ne doit pas changer ce qui est MESURÉ : sur un fichier mal \
+             tagué — la population même du passthrough — le débit natif et le \
+             tag divergent (#3145)."
         );
     }
 
