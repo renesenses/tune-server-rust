@@ -25,6 +25,22 @@
 //! refuse le **geste**, avant qu'il ne produise le résidu, et c'est lui qui
 //! empêche le prochain test écrit sur le modèle des précédents.
 //!
+//! # Le second geste : un garde rangé dans un `static`
+//!
+//! Rust **ne détruit pas** les variables statiques à la fin du processus. Un
+//! `TempDir` — ou un `ScratchDir` — placé dans un `static` ne nettoie donc
+//! rien, quand bien même il porte le bon `Drop` : le destructeur n'est jamais
+//! appelé. C'est l'autre fuite de #3030, et le recensement d'origine l'avait
+//! manquée parce qu'il ne comptait que les entrées `tune-*` : le résidu porte
+//! ici le préfixe anonyme de `tempfile`. Mesuré le 01/09/2026 sur la machine
+//! de compilation : **149 dossiers `/tmp/.tmp*`**, tous porteurs des quatre
+//! mêmes fichiers, donc tous nés du même `static`.
+//!
+//! Quand le dossier doit vraiment vivre plus longtemps que toute portée — une
+//! variable d'environnement lue par tous les tests d'un binaire, par exemple —
+//! la seule fin de vie qui reste est celle du processus : `libc::atexit`, et
+//! le marqueur `tmp-autorise` pour que la relecture voie la reprise.
+//!
 //! # La sortie autorisée
 //!
 //! `tune_core::test_scratch` : `scratch_dir` pour un dossier, `scratch_file`
@@ -121,6 +137,44 @@ fn parcourir(dir: &Path, fichiers: &mut Vec<PathBuf>) {
     }
 }
 
+/// Les caisses à inspecter, **découvertes** et non recopiées.
+///
+/// Ce garde a d'abord porté une liste en dur de six noms, et il en couvrait
+/// en réalité **cinq** : `tune-widget` y figurait, mais sa caisse vit sous
+/// `tune-widget/src-tauri`, si bien que `tune-widget/src` n'existe pas et que
+/// le parcours y rendait la main sans un mot.
+///
+/// Le dépôt compte quatorze caisses. Les manquantes — `tune-stream-http`,
+/// `tune-streaming-http`, `tune-plugin-runtime-wasm`, `tune-output-api`,
+/// `plugins/tune-karaoke`, `plugins/tune-bandcamp` — portent **88 tests** à
+/// elles seules. Le geste banni s'y serait écrit sans un mot, et la prochaine
+/// caisse ajoutée au dépôt aurait hérité du même angle mort : personne ne
+/// pense à revenir éditer un garde le jour où il crée une caisse.
+///
+/// Chercher les `Cargo.toml` retire la question : une caisse neuve est gardée
+/// le jour où elle naît. Les dossiers de construction et le code tiers
+/// (`vendor/`) sont écartés — ce garde n'a pas à juger ce qu'il ne peut pas
+/// corriger.
+fn caisses(dir: &Path, trouvees: &mut Vec<PathBuf>) {
+    const IGNORES: [&str; 6] = ["target", ".git", "node_modules", "web", "dist", "vendor"];
+    let nom = dir.file_name().unwrap_or_default().to_string_lossy();
+    if IGNORES.contains(&nom.as_ref()) {
+        return;
+    }
+    if dir.join("Cargo.toml").is_file() && dir.join("src").is_dir() {
+        trouvees.push(dir.to_path_buf());
+    }
+    let Ok(entrees) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entrees.flatten() {
+        let p = e.path();
+        if p.is_dir() && !p.is_symlink() {
+            caisses(&p, trouvees);
+        }
+    }
+}
+
 #[test]
 fn aucun_chemin_temporaire_compose_a_la_main_dans_du_code_de_test() {
     let manifeste = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -128,17 +182,20 @@ fn aucun_chemin_temporaire_compose_a_la_main_dans_du_code_de_test() {
     let motifs = motifs();
     let marqueur = marqueur();
 
+    let mut trouvees = Vec::new();
+    caisses(racine, &mut trouvees);
+    assert!(
+        trouvees.len() >= 14,
+        "seulement {} caisse(s) découverte(s) sous {} : la racine du dépôt a \
+         bougé et ce garde ne garde plus rien",
+        trouvees.len(),
+        racine.display()
+    );
+
     let mut fichiers = Vec::new();
-    for caisse in [
-        "tune-core",
-        "tune-server",
-        "tune-cli",
-        "tune-bridge",
-        "tune-ffi",
-        "tune-widget",
-    ] {
-        parcourir(&racine.join(caisse).join("src"), &mut fichiers);
-        parcourir(&racine.join(caisse).join("tests"), &mut fichiers);
+    for caisse in &trouvees {
+        parcourir(&caisse.join("src"), &mut fichiers);
+        parcourir(&caisse.join("tests"), &mut fichiers);
     }
     assert!(
         fichiers.len() > 200,
@@ -164,6 +221,24 @@ fn aucun_chemin_temporaire_compose_a_la_main_dans_du_code_de_test() {
                 continue;
             }
             if ligne.contains(&marqueur) || (n >= 2 && lignes[n - 2].contains(&marqueur)) {
+                continue;
+            }
+            // Un garde de nettoyage rangé dans un `static` ne s'exécute
+            // JAMAIS : Rust ne détruit pas les variables statiques à la fin
+            // du processus. C'est la seconde fuite de #3030, celle que le
+            // recensement d'origine n'avait pas vue parce qu'il ne comptait
+            // que les entrées `tune-*` : `plugin_contracts.rs` gardait son
+            // `TempDir` dans un `OnceLock` statique et laissait un
+            // `/tmp/.tmpXXXXXX` par exécution — 149 mesurés le 01/09/2026.
+            if ligne.contains("static ")
+                && (ligne.contains("TempDir") || ligne.contains("ScratchDir"))
+            {
+                let relatif = chemin.strip_prefix(racine).unwrap_or(chemin);
+                fautes.push(format!(
+                    "{}:{n} — garde de nettoyage rangé dans un `static` : son `Drop` \
+                     ne sera jamais appelé",
+                    relatif.display()
+                ));
                 continue;
             }
             for (motif, raison) in &motifs {
