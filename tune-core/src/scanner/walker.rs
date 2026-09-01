@@ -60,8 +60,28 @@ const SCAN_IO_CONCURRENCY: usize = 32;
 /// something we cannot benchmark centrally. Empty/invalid/zero → the default;
 /// clamped to 1..=256 so a typo can't spawn a pathological number of OS threads.
 pub fn scan_io_concurrency() -> usize {
-    if let Some(n) = std::env::var("TUNE_SCAN_IO_CONCURRENCY")
-        .ok()
+    concurrence_depuis_reglage(std::env::var("TUNE_SCAN_IO_CONCURRENCY").ok().as_deref())
+}
+
+/// La décision, séparée de la LECTURE du réglage.
+///
+/// Fonction PURE, comme [`concurrence_pour_disque`] juste en dessous, et pour
+/// une raison plus forte qu'un principe : son test l'éprouvait en écrivant
+/// dans l'environnement du processus. Or `set_var` est `unsafe` depuis
+/// l'édition 2024 parce qu'il n'est pas sûr entre fils d'exécution — et il
+/// réécrit le bloc `environ` que TOUS les autres fils lisent au même moment.
+/// Le parcours de bibliothèque en lit un à chaque fichier rencontré
+/// (`is_tune_temp_file` appelle `std::env::temp_dir()`), donc le test faisait
+/// courir la totalité du scanner contre une réécriture d'environnement.
+///
+/// Ce n'était pas théorique : mesuré sur Shrek, l'ajout de deux parcours de
+/// test supplémentaires suffisait à faire tomber **dix** tests de parcours
+/// d'un coup, tous avec « 0 fichier trouvé », dans la suite `--workspace`
+/// seule. Le même test passait en `-p tune-core` isolé, et disparaissait avec
+/// `--skip scan_io_concurrency_env_override`. Prendre le réglage en argument
+/// supprime la course à sa source, sans rien retirer à la couverture.
+fn concurrence_depuis_reglage(reglage: Option<&str>) -> usize {
+    if let Some(n) = reglage
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .map(|n| n.clamp(1, 256))
@@ -464,6 +484,22 @@ pub struct ListAudioResult {
     /// C'est ici que la liste demandée se perdait : le parcours classait le
     /// fichier, incrémentait `skipped_by_ext`, puis jetait le chemin (#2050).
     pub skipped_paths: Vec<String>,
+    /// Les dossiers qui portent au moins une feuille CUE, triés et dédoublés.
+    ///
+    /// Le parcours voit passer chaque `.cue`, le compte comme non lu, et jette
+    /// l'information (#1763). Or une feuille est la seule chose qui explique un
+    /// album entier absent, et savoir CE QU'ELLE DÉCRIT demande de la lire —
+    /// ce qui ne peut pas se faire ici : le parcours doit rester une opération
+    /// de répertoire, sans lecture bloquante par fichier sur un NAS. On retient
+    /// donc les dossiers, et [`super::cue_album::inventorier`] les relit après
+    /// coup, une fois le parcours terminé.
+    ///
+    /// Non plafonné : c'est une liste de DOSSIERS, bornée par l'arborescence
+    /// que le parcours vient de traverser, et bien plus courte que `files`.
+    /// Le plafond est posé plus loin, sur la RELECTURE, qui elle coûte une
+    /// ouverture de fichier par feuille — voir
+    /// [`super::cue_album::PLAFOND_DOSSIERS_INVENTORIES`].
+    pub dossiers_avec_feuille_cue: Vec<PathBuf>,
 }
 
 impl ListAudioResult {
@@ -558,6 +594,9 @@ pub fn list_audio_files_avec_progression(
     let mut skipped_reasons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut skipped_paths: Vec<String> = Vec::new();
+    // `BTreeSet` et non `HashSet` : le rapport de scan doit être reproductible
+    // d'un scan à l'autre, et l'ordre d'un `HashSet` ne l'est pas.
+    let mut dossiers_cue: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -727,6 +766,15 @@ pub fn list_audio_files_avec_progression(
                                 &mut skipped_paths,
                                 format!("{} ({})", path.display(), unsupported.reason),
                             );
+                            // Une feuille CUE n'est pas un fichier ignoré comme
+                            // un autre : c'est la description d'un album. Le
+                            // dossier est retenu ici et relu après le parcours
+                            // (#1763) — voir `dossiers_avec_feuille_cue`.
+                            if unsupported.report_key == "cue" {
+                                if let Some(parent) = path.parent() {
+                                    dossiers_cue.insert(parent.to_path_buf());
+                                }
+                            }
                             skipped_reasons
                                 .entry(unsupported.report_key)
                                 .or_insert_with(|| unsupported.reason.to_string());
@@ -918,6 +966,7 @@ pub fn list_audio_files_avec_progression(
         skipped_by_ext,
         skipped_reasons,
         skipped_paths,
+        dossiers_avec_feuille_cue: dossiers_cue.into_iter().collect(),
     }
 }
 
@@ -1380,37 +1429,42 @@ mod tests {
         assert!((1..=256).contains(&n), "concurrence hors bornes : {n}");
     }
 
+    /// Le réglage manuel est éprouvé SANS toucher à l'environnement.
+    ///
+    /// Ce test écrivait dans `TUNE_SCAN_IO_CONCURRENCY` avec `set_var`, en se
+    /// croyant protégé parce qu'il restaurait la valeur d'origine. Il ne l'était
+    /// pas : `set_var` réécrit le bloc `environ` que tous les autres fils
+    /// lisent, et le parcours de bibliothèque en lit un PAR FICHIER
+    /// (`is_tune_temp_file` → `std::env::temp_dir()`). Sauver et restaurer LA
+    /// variable ne protège de rien — c'est la réécriture elle-même qui est
+    /// dangereuse. Voir [`concurrence_depuis_reglage`].
     #[test]
     fn scan_io_concurrency_env_override() {
-        // Serialize env mutation and always restore, so this can't race or leak
-        // into other tests that read the same variable.
-        let key = "TUNE_SCAN_IO_CONCURRENCY";
-        let saved = std::env::var(key).ok();
-
         // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
         // constante. Comparer à la constante ferait passer ce test par chance
         // sur un runner à SSD, et échouer sur une machine à plateaux.
         let sans_variable = concurrence_pour_disque(disque_rotatif());
-        unsafe { std::env::remove_var(key) };
-        assert_eq!(scan_io_concurrency(), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(None), sans_variable);
 
-        unsafe { std::env::set_var(key, "8") };
-        assert_eq!(scan_io_concurrency(), 8);
+        assert_eq!(concurrence_depuis_reglage(Some("8")), 8);
+        // Les espaces autour du nombre sont tolérés : un réglage recopié dans
+        // un fichier d'unité systemd en traîne souvent.
+        assert_eq!(concurrence_depuis_reglage(Some(" 8 ")), 8);
 
         // Zero, garbage and empty all fall back to the default.
-        unsafe { std::env::set_var(key, "0") };
-        assert_eq!(scan_io_concurrency(), sans_variable);
-        unsafe { std::env::set_var(key, "abc") };
-        assert_eq!(scan_io_concurrency(), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("0")), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("abc")), sans_variable);
+        assert_eq!(concurrence_depuis_reglage(Some("")), sans_variable);
 
         // Over-large is clamped, not honoured verbatim.
-        unsafe { std::env::set_var(key, "100000") };
-        assert_eq!(scan_io_concurrency(), 256);
+        assert_eq!(concurrence_depuis_reglage(Some("100000")), 256);
 
-        match saved {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        // Et la fonction publique branche bien la variable sur cette décision :
+        // une LECTURE de l'environnement, jamais une écriture.
+        assert_eq!(
+            scan_io_concurrency(),
+            concurrence_depuis_reglage(std::env::var("TUNE_SCAN_IO_CONCURRENCY").ok().as_deref())
+        );
     }
 
     #[test]
@@ -1497,6 +1551,141 @@ mod tests {
                 .is_some_and(|reason| reason.contains("aucun décodeur"))
         );
         assert!(!result.skipped_by_ext.contains_key("jpg"));
+    }
+
+    /// #2060 — un format que le decodeur sait lire ne doit jamais sortir du
+    /// parcours SANS TRACE.
+    ///
+    /// Le contrat des deux listes n’etait verrouille que dans un sens : tout
+    /// format catalogue possede un decodeur. Le sens inverse ne l’etait pas,
+    /// et `.oga` — l’extension Ogg que le decodeur, l’ecrivain de tags et la
+    /// decision de transcodage reconnaissent tous — n’etait NI catalogue NI
+    /// declare non lu. Il retombait donc sur `LibraryAudioSupport::NotAudio`,
+    /// c’est-a-dire un `continue` muet : aucune piste, aucun compteur, aucune
+    /// ligne de rapport. C’est la seule facon dont un fichier disparait sans
+    /// laisser de quoi le chercher.
+    ///
+    /// Le temoin `album.ogg` est le jumeau exact du fichier fautif : meme
+    /// conteneur, meme dossier, meme contenu, meme appel. S’il tombait avec
+    /// lui, ce test mesurerait la fixture et non le defaut.
+    #[test]
+    fn un_fichier_oga_entre_en_bibliotheque_comme_son_jumeau_ogg() {
+        // Pas sous temp_dir() : `is_tune_temp_file` y ecarte TOUT.
+        let base = crate::test_scratch::scratch_dir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            "walker-oga-2060",
+        );
+        for name in ["album.ogg", "album.oga"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        // Temoin : vert avant comme apres le correctif.
+        assert!(
+            noms.iter().any(|n| n == "album.ogg"),
+            "temoin album.ogg perdu — la fixture ou le parcours est en cause, pas .oga : {noms:?}"
+        );
+        assert!(
+            noms.iter().any(|n| n == "album.oga"),
+            "album.oga absent du resultat du scan : {noms:?}"
+        );
+        // Et il ne doit pas davantage etre annonce « non lu » : il est lu.
+        assert!(
+            !result.skipped_by_ext.contains_key("oga"),
+            "oga annonce non lu alors qu’il est indexe : {:?}",
+            result.skipped_by_ext
+        );
+    }
+
+    /// Le parcours retient les DOSSIERS porteurs de feuilles CUE (#1763).
+    ///
+    /// Une feuille est la seule chose qui explique un album entier absent, et
+    /// le parcours la comptait comme un fichier non lu de plus avant de jeter
+    /// son chemin. Il ne peut PAS la lire au passage — le parcours doit rester
+    /// une opération de répertoire, sans lecture bloquante par fichier sur un
+    /// NAS — mais il peut retenir où elle est, pour que l'inventaire la relise
+    /// après coup.
+    ///
+    /// Le témoin `temoin.flac` est là exprès : ce test échouerait aussi si la
+    /// reconnaissance des formats DÉJÀ lus régressait en chemin.
+    #[test]
+    fn le_parcours_retient_les_dossiers_porteurs_de_feuilles_cue() {
+        // Chemin suffixé de la clé de tâche : deux agents ont déjà détruit
+        // mutuellement leurs fixtures sous un nom commun.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_dossiers_cue_p2_1763");
+        let _ = std::fs::remove_dir_all(&base);
+        let avec = base.join("Camel - Stationary Traveller");
+        let sans = base.join("Genesis - Trespass");
+        std::fs::create_dir_all(&avec).unwrap();
+        std::fs::create_dir_all(&sans).unwrap();
+        // Deux feuilles dans le MÊME dossier : le dossier ne doit être retenu
+        // qu'une fois, sinon l'inventaire relirait deux fois le même dossier
+        // et compterait ses albums en double.
+        std::fs::write(avec.join("face-a.cue"), b"fixture").unwrap();
+        std::fs::write(avec.join("face-b.cue"), b"fixture").unwrap();
+        std::fs::write(avec.join("image.flac"), b"fixture").unwrap();
+        std::fs::write(sans.join("temoin.flac"), b"fixture").unwrap();
+        std::fs::write(sans.join("album.wma"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.dossiers_avec_feuille_cue.len(),
+            1,
+            "un dossier porteur, et un seul, quel que soit le nombre de feuilles \
+             qu'il contient — obtenu : {:?}",
+            result.dossiers_avec_feuille_cue
+        );
+        assert!(
+            result.dossiers_avec_feuille_cue[0].ends_with("Camel - Stationary Traveller"),
+            "c'est le dossier de la feuille qui est retenu, pas la feuille : {:?}",
+            result.dossiers_avec_feuille_cue
+        );
+        // Témoin anti-régression : le `.cue` reste compté comme non lu — cette
+        // brique AJOUTE une information, elle n'en retire aucune.
+        assert_eq!(result.skipped_by_ext.get("cue"), Some(&2));
+        // Témoin anti-régression : les formats déjà reconnus le restent, et le
+        // `.wma` déjà écarté l'est toujours.
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            noms.contains(&"temoin.flac".to_string()),
+            "obtenu : {noms:?}"
+        );
+        assert!(
+            noms.contains(&"image.flac".to_string()),
+            "obtenu : {noms:?}"
+        );
+        assert_eq!(noms.len(), 2, "obtenu : {noms:?}");
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+    }
+
+    /// Une bibliothèque sans la moindre feuille ne paie rien (#1763).
+    #[test]
+    fn une_bibliotheque_sans_feuille_cue_ne_retient_aucun_dossier() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sans_cue_p2_1763");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("temoin.flac"), b"fixture").unwrap();
+        std::fs::write(base.join("album.mpc"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(result.dossiers_avec_feuille_cue.is_empty());
+        // Le Musepack reste compté et nommé : c'est tout ce que Tune peut en
+        // dire, faute de décodeur (#1763, Rhorn).
+        assert_eq!(result.skipped_by_ext.get("mpc"), Some(&1));
     }
 
     /// Le parcours retient LESQUELS, pas seulement COMBIEN (#2050).

@@ -596,6 +596,28 @@ impl PluginLoader {
     pub async fn plugin_count(&self) -> usize {
         self.plugins.lock().await.len()
     }
+
+    /// Every plugin name this build carries, as registered.
+    ///
+    /// Call **before** [`setup_all`](Self::setup_all): that method retains only
+    /// what loaded, so afterwards this list is the loaded set instead of the
+    /// compiled-in one.
+    ///
+    /// Neither [`loaded_plugins`](Self::loaded_plugins) nor
+    /// [`unloaded_plugins`](Self::unloaded_plugins) can answer "does this
+    /// server carry a plugin by that name?". The first drops the dormant ones,
+    /// and the second drops the uncatalogued ones on top
+    /// ([`TunePlugin::catalogued`]) — DJ and Karaoke are in neither, yet both
+    /// still load when `plugin_{name}_installed` is set (#2090). A caller that
+    /// has to decide whether a name means anything here needs the whole set.
+    pub async fn registered_names(&self) -> Vec<String> {
+        self.plugins
+            .lock()
+            .await
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect()
+    }
 }
 
 #[cfg(test)]

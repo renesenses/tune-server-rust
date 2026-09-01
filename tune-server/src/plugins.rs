@@ -174,6 +174,13 @@ pub async fn init(
         info!(plugin_name = %plugin.name(), "plugin_registered_out_of_tree");
         loader.register(plugin).await;
     }
+    // Publish the registered set BEFORE `setup_all`, which retains only what
+    // loaded — afterwards the loader no longer knows what this binary carries.
+    // Published unconditionally, ahead of the early return: an empty list and
+    // an unpublished one must mean the same thing to a reader, which they do
+    // (`OnceLock::get() -> None` degrades to the empty slice).
+    let _ = state.plugin_names.set(loader.registered_names().await);
+
     if loader.plugin_count().await == 0 {
         return Vec::new();
     }

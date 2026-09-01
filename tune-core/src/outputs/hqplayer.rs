@@ -434,7 +434,7 @@ impl OutputTarget for HqplayerOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, false, false)
+        OutputCapabilities::v1(true, true, true, true, false, false).with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {

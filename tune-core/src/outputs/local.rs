@@ -3717,6 +3717,7 @@ impl OutputTarget for LocalOutput {
             true,
             self.supports_internal_gapless(),
         )
+        .with_linear_volume(1000)
     }
 
     /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop

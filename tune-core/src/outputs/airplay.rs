@@ -518,7 +518,7 @@ impl OutputTarget for AirplayOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, false, true, true, false)
+        OutputCapabilities::v1(true, true, false, true, true, false).with_decibel_volume(100)
     }
 
     fn host(&self) -> Option<&str> {

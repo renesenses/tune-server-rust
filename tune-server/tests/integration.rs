@@ -161,6 +161,162 @@ async fn system_health() {
     assert_eq!(body["status"], "ok");
 }
 
+// ── /system/health : la sonde doit dire ce qu'elle voit (#2796) ───────
+//
+// Elle annonçait `status: "ok"` en HTTP 200 même la base morte. Le témoin
+// anti-régression est juste au-dessus (`system_health`) et ci-dessous
+// (`system_health_base_saine_declare_ses_composants`) : base saine, la route
+// doit RESTER 200/ok — c'est ce que la découverte réseau Flutter, la
+// télécommande macOS et la boucle de redémarrage du client web attendent.
+
+/// Backend qui échoue sur les lectures dont le SQL contient l'un des motifs.
+/// Sans motif, tout échoue : c'est la base indisponible.
+struct BackendEnPanne {
+    motifs: Vec<&'static str>,
+}
+
+impl BackendEnPanne {
+    fn tout() -> Self {
+        Self { motifs: Vec::new() }
+    }
+
+    fn sur(motifs: &[&'static str]) -> Self {
+        Self {
+            motifs: motifs.to_vec(),
+        }
+    }
+
+    fn echoue(&self, sql: &str) -> bool {
+        self.motifs.is_empty() || self.motifs.iter().any(|m| sql.contains(m))
+    }
+}
+
+impl tune_core::db::backend::DbBackend for BackendEnPanne {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        tune_core::db::engine::Engine::Sqlite
+    }
+
+    fn execute(
+        &self,
+        _sql: &str,
+        _params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<usize, String> {
+        Err("base indisponible".to_string())
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        0
+    }
+
+    fn query_one(
+        &self,
+        sql: &str,
+        _params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Option<Vec<tune_core::db::backend::SqlValue>>, String> {
+        if self.echoue(sql) {
+            Err(format!("base indisponible : {sql}"))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn query_many(
+        &self,
+        sql: &str,
+        _params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Vec<Vec<tune_core::db::backend::SqlValue>>, String> {
+        if self.echoue(sql) {
+            Err(format!("base indisponible : {sql}"))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn write_tx(
+        &self,
+        _f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        Err("base indisponible".to_string())
+    }
+
+    fn execute_batch(&self, _sql: &str) -> Result<(), String> {
+        Err("base indisponible".to_string())
+    }
+}
+
+fn app_avec_backend(backend: BackendEnPanne) -> axum::Router {
+    let mut state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    state.backend = std::sync::Arc::new(backend);
+    tune_server::routes::router(state)
+}
+
+#[tokio::test]
+async fn system_health_base_saine_declare_ses_composants() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["db"], "connected");
+    assert_eq!(body["components"]["db_tracks"], json!(true));
+    assert_eq!(body["components"]["db_albums"], json!(true));
+    assert_eq!(body["components"]["db_settings"], json!(true));
+}
+
+#[tokio::test]
+async fn system_health_base_indisponible_rend_503_et_status_error() {
+    let app = app_avec_backend(BackendEnPanne::tout());
+    let (status, body) = get(&app, "/api/v1/system/health").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "base morte, la sonde doit refuser le 200 : {body}"
+    );
+    assert_eq!(body["status"], "error", "corps : {body}");
+    assert_eq!(body["db"], "error", "corps : {body}");
+    assert_eq!(body["components"]["db_tracks"], json!(false));
+    assert_eq!(body["components"]["db_albums"], json!(false));
+    assert_eq!(body["components"]["db_settings"], json!(false));
+}
+
+#[tokio::test]
+async fn system_health_une_sonde_en_echec_degrade_sans_faire_disparaitre_le_serveur() {
+    // Une seule requête échoue (verrou pris pendant un balayage, par
+    // exemple) : la base répond encore. Le serveur doit rester JOIGNABLE —
+    // un 503 ici le rendrait invisible à la découverte réseau — mais ne doit
+    // plus se déclarer « ok ».
+    let app = app_avec_backend(BackendEnPanne::sur(&["FROM tracks"]));
+    let (status, body) = get(&app, "/api/v1/system/health").await;
+    assert_eq!(status, StatusCode::OK, "corps : {body}");
+    assert_ne!(body["status"], "ok", "corps : {body}");
+    assert_eq!(body["status"], "degraded", "corps : {body}");
+    assert_eq!(body["db"], "degraded", "corps : {body}");
+    assert_eq!(body["components"]["db_tracks"], json!(false));
+    assert_eq!(body["components"]["db_albums"], json!(true));
+    assert_eq!(body["components"]["db_settings"], json!(true));
+}
+
+#[tokio::test]
+async fn system_health_sonde_albums_seule_en_echec_degrade_aussi() {
+    // Le chemin nu de l'origine : `albums_result` était converti en zéro sans
+    // rien dégrader du tout. Toute sonde compte, pas seulement `tracks`.
+    let app = app_avec_backend(BackendEnPanne::sur(&["FROM albums"]));
+    let (status, body) = get(&app, "/api/v1/system/health").await;
+    assert_eq!(status, StatusCode::OK, "corps : {body}");
+    assert_eq!(body["status"], "degraded", "corps : {body}");
+    assert_eq!(body["components"]["db_albums"], json!(false));
+}
+
+#[tokio::test]
+async fn system_health_reste_du_json_meme_en_503() {
+    // Le garde « une route d'API ne rend jamais du HTML » vaut aussi pour le
+    // chemin d'erreur : c'est celui que la supervision lit.
+    let app = app_avec_backend(BackendEnPanne::tout());
+    let (status, content_type, body) = get_raw(&app, "/api/v1/system/health").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_json_content_type(&content_type, "/api/v1/system/health");
+    assert_not_html(&body, "/api/v1/system/health");
+}
+
 #[tokio::test]
 async fn system_stats() {
     let app = make_app();
@@ -1772,7 +1928,6 @@ async fn lyrics_track_without_any_source_is_404_no_lyrics() {
 #[tokio::test]
 async fn lyrics_sidecar_lrc_is_synced() {
     let dir = tune_core::test_scratch::scratch_dir("tune_lyrics_it");
-    std::fs::create_dir_all(&dir).unwrap();
     let audio = dir.join("Ma Chanson.flac");
     // Multi-timestamps on one line + metadata tags to ignore.
     std::fs::write(
@@ -1785,7 +1940,6 @@ async fn lyrics_sidecar_lrc_is_synced() {
     let tid = insert_track_with_file(&state, "Ma Chanson", audio.to_str().unwrap());
 
     let (status, body) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
-    std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["synced"], true);

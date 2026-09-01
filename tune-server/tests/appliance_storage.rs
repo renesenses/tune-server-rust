@@ -50,8 +50,6 @@ fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::Pat
 async fn relocation_full_flow() {
     let _environment = crate::lock_environment();
     let tmp = tune_core::test_scratch::scratch_dir("tune-reloc-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
 
     // Source : une vraie petite base SQLite + un cache pochettes.
     let src = tmp.join("source");

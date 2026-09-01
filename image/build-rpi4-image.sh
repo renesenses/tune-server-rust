@@ -140,6 +140,17 @@ EOF
 
 sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' "${ROOTFS}/etc/nsswitch.conf"
 
+# Appliance marker: unlocks /api/v1/appliance (WiFi setup from the web UI,
+# bouton « Éteindre ») and the appliance flag in /system/config.
+#
+# Il manquait ici, et NULLE PART ailleurs : build-nuc-image.sh et
+# build-sunxi-image.sh le posent tous les deux. Sans lui `is_appliance()` est
+# faux, TOUTE la surface /api/v1/appliance/* rend 404, et l'écran — dont la
+# garde est `config.appliance` — n'affiche ni le bouton d'extinction ni la
+# configuration WiFi. Un Pi 4 sous Tune OS était donc la seule image
+# appliance sans moyen propre de s'arrêter (#2135, demande de GgB).
+echo "Tune OS appliance image (Raspberry Pi 4)" > "${ROOTFS}/etc/tune-appliance"
+
 # Password login is kept for headless support, but the account is locked in
 # the image. A first-boot service generates and expires a unique credential
 # before sshd is allowed to start.
@@ -199,8 +210,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=tune
-Group=audio
+# Root sur l'image appliance : le serveur pilote nmcli (config WiFi),
+# mount.cifs (partages SMB) et `systemctl poweroff` (bouton « Éteindre »)
+# directement — cf. /etc/tune-appliance. C'est ce que font déjà
+# build-nuc-image.sh et build-sunxi-image.sh ; ce fichier disait « same as
+# NUC » sans l'être. Sous `User=tune`, poser le seul marqueur aurait montré
+# le bouton et rendu 200 sans rien éteindre : l'ordre part APRÈS la réponse
+# HTTP, l'échec polkit n'aurait fini que dans le journal.
+User=root
 WorkingDirectory=/opt/tune
 ExecStart=/opt/tune/tune-server
 Restart=always

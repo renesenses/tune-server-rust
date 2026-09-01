@@ -140,3 +140,11 @@ required-features = ["plugins-wasm"]
 [[test]]
 name = "panne_sql_journalisee"
 path = "tests/panne_sql_journalisee.rs"
+
+# Même raison, mot pour mot : abonné `tracing` GLOBAL, donc un binaire à lui
+# seul et un seul essai dedans. Celui-ci lit le journal au niveau TRACE pour
+# prouver qu'aucune clef d'API développeur ni chemin d'adresse de webhook n'y
+# apparaît (#2795).
+[[test]]
+name = "cles_developpeur_hors_journal"
+path = "tests/cles_developpeur_hors_journal.rs"

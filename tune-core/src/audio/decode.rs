@@ -754,6 +754,13 @@ static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
 /// plateformes. Un bloc `cfg(linux)` ne serait ni compilé ni testé depuis
 /// macOS — c'est ainsi qu'une fonction morte a déjà été livrée (#2277).
 /// Le point de montage le plus LONG qui préfixe le chemin gagne.
+///
+/// Son unique appelant de production, [`chemin_sur_montage_reseau`], n'existe
+/// que sur Linux et Android : ailleurs (Darwin passe par `statfs`) elle n'a
+/// d'appelant que ses tests, et le compilateur la signale « never used ».
+/// L'`allow` est donc borné à ces plateformes-là — le rendre inconditionnel
+/// masquerait la mort de la fonction le jour où l'appelant Linux disparaîtrait.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn montage_reseau_depuis_mounts(mounts: &str, cible: &str) -> bool {
     const TYPES_RESEAU: &[&str] = &[
         "nfs",
@@ -3648,17 +3655,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // in and the poller replayed the head of the track over and over —
         // #1270 « boucle de 2-3 s en début de piste » (liste Bertrand 13/08).
         let single = std::fs::read(fixture_path("test_vorbis.ogg")).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "{}.ogg",
-            crate::test_scratch::scratch_name("tune_chained_vorbis")
-        ));
+        let path = crate::test_scratch::scratch_file("tune_chained_vorbis", ".ogg");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).
@@ -3713,17 +3715,12 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         // replays the head of the track: the same « boucle de 2-3 s » of
         // #1270 that #1632 fixed for Vorbis, on the libopus path this time.
         let single = std::fs::read(fixture_path("test.opus")).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "{}.opus",
-            crate::test_scratch::scratch_name("tune_chained_opus")
-        ));
+        let path = crate::test_scratch::scratch_file("tune_chained_opus", ".opus");
         let mut chained = single.clone();
         chained.extend_from_slice(&single);
         std::fs::write(&path, &chained).unwrap();
 
-        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
-        let _ = std::fs::remove_file(&path);
-        let result = result.unwrap();
+        let result = decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
 
         // Each link is ~2 s: the chained file must decode BOTH (~4 s), not
         // stop at the first boundary (~2 s).

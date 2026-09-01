@@ -166,7 +166,12 @@ async fn la_tache_periodique_s_arrete_avec_le_greffon() {
         backend: state.backend.clone(),
     });
 
-    let ctx = PluginContext::new("http://127.0.0.1:0", std::env::temp_dir());
+    // Le dossier de données passe par `test_scratch` et non par `temp_dir()`
+    // composé à la main : le garde-fou #3030, arrivé par ce lot, refuse le
+    // second — un dossier compose à la main survit au test, et surtout au test
+    // qui échoue. `dossier` se supprime par `Drop` à la fin de la fonction.
+    let dossier = tune_core::test_scratch::scratch_dir("concerts-teardown");
+    let ctx = PluginContext::new("http://127.0.0.1:0", dossier.path().to_path_buf());
     greffon.setup(&ctx).await.expect("setup");
 
     // Le cœur ne gardait aucune poignée sur cette tâche : `tokio::spawn` et
@@ -315,5 +320,145 @@ fn au_dela_de_200_artistes_le_decoupage_les_emmene_tous() {
     assert_eq!(
         envoyes, 450,
         "la somme des lots doit rendre la bibliotheque entiere"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// L'apport de #2178 (64e8378f), reporté du cœur vers le greffon.
+//
+// Le lot apprend à tout le nuage à rendre un 429 entier : motif nommé, délai
+// de réessai, en-tête `Retry-After`. Il câblait ce contrat sur six modules,
+// dont `cloud::concert_alerts`, et le rendait au client par
+// `routes::cloud_error::reponse` depuis `GET /system/concerts`.
+//
+// La ligne de release a supprimé ce fichier et cette route au profit de ce
+// greffon. La fusion rendait donc un `modify/delete` doublé d'un conflit de
+// contenu, et le réflexe — prendre la suppression — **perdait le traitement du
+// 429 pour les concerts** sans qu'aucun test ne rougisse : le greffon compile
+// parfaitement en rendant 200 sur tous les refus, exactement comme avant.
+//
+// Le greffon ne peut pas appeler `routes::cloud_error` : il dépend de
+// `tune-core`, jamais de `tune-server`. Ce qui est partagé l'est donc au bon
+// niveau — le type `CloudError` et la lecture du délai, tous deux dans
+// `tune-core` — et seul le rendu est refait, sur la forme du greffon : un
+// **code stable** plutôt qu'un message traduit côté serveur.
+//
+// Ces tests portent sur le fait de base — « un 429 du nuage arrive au client
+// en 429, avec son délai » — pas sur une ligne de code. Aucun réseau n'est
+// touché : `reponse_de_refus` est une fonction pure du refus.
+// ---------------------------------------------------------------------------
+
+use axum::http::header;
+use axum::response::Response;
+
+/// Lit une réponse rendue par le greffon : statut, en-tête `Retry-After`, corps.
+async fn lire_reponse(resp: Response) -> (StatusCode, Option<String>, Value) {
+    let statut = resp.status();
+    let retry = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (statut, retry, serde_json::from_slice(&octets).unwrap())
+}
+
+fn limite(retry_after: Option<u64>) -> tune_core::cloud::refusal::CloudError {
+    tune_core::cloud::refusal::CloudError::RateLimited {
+        message: "concerts: HTTP 429 Too Many Requests".into(),
+        retry_after,
+        upstream: "Too Many Attempts.".into(),
+    }
+}
+
+/// Le fait de base du portage : le 429 survit à la fusion.
+///
+/// L'ancienne route rendait **200** sur un refus du nuage — c'est précisément
+/// ce qui empêchait l'écran de reconnaître une limite atteinte. Le statut, le
+/// motif, le délai et l'en-tête doivent tous arriver.
+#[tokio::test]
+async fn un_429_du_nuage_garde_son_statut_son_delai_et_son_entete() {
+    let (statut, retry, corps) =
+        lire_reponse(tune_concerts::reponse_de_refus(&limite(Some(30)))).await;
+
+    assert_eq!(
+        statut,
+        StatusCode::TOO_MANY_REQUESTS,
+        "une limite atteinte doit repartir en 429 : l'ancienne route la rendait \
+         en 200, et l'ecran ne pouvait alors dire que « une erreur est survenue »"
+    );
+    assert_eq!(
+        corps["code"], "concerts.rate_limited",
+        "le motif doit etre nomme par un code stable — la forme du greffon, \
+         qui ne traduit pas cote serveur"
+    );
+    assert_eq!(
+        corps["retry_after"], 30,
+        "le delai annonce par le distant doit arriver au client"
+    );
+    assert_eq!(
+        retry.as_deref(),
+        Some("30"),
+        "l'en-tete Retry-After doit etre reemis, forme standard pour qui programme"
+    );
+    assert_eq!(
+        corps["upstream_message"], "Too Many Attempts.",
+        "le texte du distant est conserve pour le diagnostic"
+    );
+    assert_eq!(
+        corps["concerts"],
+        serde_json::json!([]),
+        "l'enveloppe est conservee, pour l'ecran qui rend la liste avant de \
+         regarder l'erreur"
+    );
+    assert!(
+        corps.get("error").is_none(),
+        "le greffon ne rend pas de champ `error` : son contrat est un `code`"
+    );
+}
+
+/// Le délai n'est **jamais fabriqué**. Quand le distant ne l'annonce pas, le
+/// motif arrive quand même, mais sans chiffre inventé.
+#[tokio::test]
+async fn un_429_sans_entete_ne_fabrique_aucun_delai() {
+    let (statut, retry, corps) = lire_reponse(tune_concerts::reponse_de_refus(&limite(None))).await;
+
+    assert_eq!(statut, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(corps["code"], "concerts.rate_limited");
+    assert!(
+        corps.get("retry_after").is_none(),
+        "aucun delai ne doit etre invente quand le distant n'en annonce pas"
+    );
+    assert!(
+        retry.is_none(),
+        "pas d'en-tete Retry-After sans delai connu"
+    );
+}
+
+/// **Témoin, vert des deux côtés de la contre-épreuve.**
+///
+/// Hors 429, rien ne bouge : statut 200 et `concerts.unavailable`, exactement
+/// comme avant le portage. Ce témoin borne la contre-épreuve au **traitement du
+/// 429** et non au harnais de test : si les deux tests ci-dessus rougissaient
+/// parce que `reponse_de_refus` ne rendait plus rien du tout, celui-ci
+/// rougirait aussi.
+#[tokio::test]
+async fn temoin_un_refus_ordinaire_repart_comme_avant() {
+    let refus = tune_core::cloud::refusal::CloudError::Message("concerts: HTTP 500".into());
+    let (statut, retry, corps) = lire_reponse(tune_concerts::reponse_de_refus(&refus)).await;
+
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "hors 429, le statut de la route ne bouge pas"
+    );
+    assert_eq!(corps["code"], "concerts.unavailable");
+    assert!(retry.is_none());
+    assert_eq!(corps["concerts"], serde_json::json!([]));
+    assert!(
+        corps.get("error").is_none(),
+        "la phrase technique anglaise ne doit pas reapparaitre dans le corps"
     );
 }

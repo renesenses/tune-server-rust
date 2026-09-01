@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::cloud::refusal::CloudError;
+
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
 /// A catalog row as served by `GET /api/v1/plugins` on mozaiklabs.fr (the
@@ -155,7 +157,7 @@ impl PluginMarketplace {
     /// decides whether that is fatal (see the `plugin_signature_required`
     /// setting in the server). A transport failure is an `Err`: "the network
     /// broke" must not be read as "this plugin is unsigned".
-    pub async fn download_signature(&self, name: &str) -> Result<Option<String>, String> {
+    pub async fn download_signature(&self, name: &str) -> Result<Option<String>, CloudError> {
         /// A minisign signature is a couple of short base64 lines.
         const MAX_SIG_BYTES: u64 = 8 * 1024;
 
@@ -176,7 +178,12 @@ impl PluginMarketplace {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(format!("plugin signature fetch: HTTP {}", resp.status()));
+            let status = resp.status();
+            return Err(CloudError::from_response(
+                format!("plugin signature fetch: HTTP {status}"),
+                resp,
+            )
+            .await);
         }
         if resp.content_length().unwrap_or(0) > MAX_SIG_BYTES {
             return Err("plugin signature is implausibly large".into());
@@ -203,7 +210,7 @@ impl PluginMarketplace {
     /// past the signature check before they touch disk — see
     /// `verify_plugin_signature` in the server's marketplace routes (audit
     /// item 8).
-    pub async fn download(&self, name: &str) -> Result<Vec<u8>, String> {
+    pub async fn download(&self, name: &str) -> Result<Vec<u8>, CloudError> {
         /// 50 MiB — generous for a WASM plugin, bounds worst-case memory.
         const MAX_PLUGIN_BYTES: usize = 50 * 1024 * 1024;
 
@@ -221,15 +228,20 @@ impl PluginMarketplace {
             .map_err(|e| format!("plugin download request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("plugin download failed: {}", resp.status()));
+            let status = resp.status();
+            return Err(CloudError::from_response(
+                format!("plugin download failed: {status}"),
+                resp,
+            )
+            .await);
         }
 
         // Reject early if the advertised length already exceeds the cap.
         if let Some(len) = resp.content_length() {
             if len > MAX_PLUGIN_BYTES as u64 {
-                return Err(format!(
+                return Err(CloudError::Message(format!(
                     "plugin too large: {len} bytes (max {MAX_PLUGIN_BYTES})"
-                ));
+                )));
             }
         }
 
@@ -242,9 +254,9 @@ impl PluginMarketplace {
             .map_err(|e| format!("failed to read plugin bytes: {e}"))?
         {
             if bytes.len() + chunk.len() > MAX_PLUGIN_BYTES {
-                return Err(format!(
+                return Err(CloudError::Message(format!(
                     "plugin exceeds maximum size of {MAX_PLUGIN_BYTES} bytes"
-                ));
+                )));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -254,7 +266,7 @@ impl PluginMarketplace {
     }
 
     /// Vote for a plugin (up or down).
-    pub async fn vote(&self, name: &str, up: bool) -> Result<(), String> {
+    pub async fn vote(&self, name: &str, up: bool) -> Result<(), CloudError> {
         let url = format!(
             "{}/api/v1/plugins/{}/vote",
             self.base_url,
@@ -270,7 +282,10 @@ impl PluginMarketplace {
             .map_err(|e| format!("plugin vote request failed: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("plugin vote failed: {}", resp.status()));
+            let status = resp.status();
+            return Err(
+                CloudError::from_response(format!("plugin vote failed: {status}"), resp).await,
+            );
         }
 
         info!(plugin = %name, up, "marketplace_plugin_voted");

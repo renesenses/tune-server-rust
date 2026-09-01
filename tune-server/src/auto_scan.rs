@@ -299,6 +299,23 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
         let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les feuilles CUE, relues après le parcours (#1763) — mêmes clés que
+        // le scan manuel. Les deux scans écrivent le MÊME fichier
+        // `<db>-scan-report.json` : une clé posée d'un seul côté ferait
+        // dépendre la réponse de `/scan/report` de QUEL scan a tourné en
+        // dernier, ce qui est précisément le défaut de #2012 / #2050.
+        let inventaire_cue =
+            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        if inventaire_cue.dossiers > 0 {
+            info!(
+                dossiers = inventaire_cue.dossiers,
+                albums = inventaire_cue.albums,
+                albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
+                pistes = inventaire_cue.pistes,
+                feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
+            );
+        }
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
@@ -942,6 +959,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "failed_paths": stats.failed_paths,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
+            // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que
+            // `ChiffresDeFinDeScan::cue_sheets`.
+            "cue_sheets": {
+                "folders": inventaire_cue.dossiers,
+                "folders_not_inventoried": inventaire_cue.dossiers_non_inventories,
+                "albums": inventaire_cue.albums,
+                "albums_multi_sheet": inventaire_cue.albums_multi_feuilles,
+                "sheets_used": inventaire_cue.feuilles_retenues,
+                "tracks": inventaire_cue.pistes,
+                "sheets_skipped": inventaire_cue.feuilles_ecartees,
+                "sheets_skipped_by_reason": inventaire_cue.ecarts_par_cle,
+            },
         });
 
         // La liste demandée (#2050) — mêmes clés que le scan manuel, sans quoi
@@ -953,11 +982,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         report_fichier["skipped_unsupported_paths"] = serde_json::json!(skipped_unsupported_paths);
         report_fichier["skipped_no_metadata_paths"] = serde_json::json!(skipped_no_metadata_paths);
         report_fichier["skipped_duplicate_paths"] = serde_json::json!(skipped_duplicate_paths);
+        report_fichier["cue_sheets_skipped_paths"] =
+            serde_json::json!(inventaire_cue.chemins_ecartes);
         report_fichier["skipped_paths_truncated"] = serde_json::json!(
             [
                 skipped_unsupported_paths.len(),
                 skipped_no_metadata_paths.len(),
                 skipped_duplicate_paths.len(),
+                inventaire_cue.chemins_ecartes.len(),
             ]
             .iter()
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)

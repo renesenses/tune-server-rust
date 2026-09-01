@@ -370,11 +370,7 @@ mod tests {
         // sous `/private/var`, donc DÉJÀ hors périmètre, et le test passerait
         // pour la mauvaise raison. `/tmp` (`/private/tmp` après résolution)
         // est dans le périmètre sur les deux systèmes.
-        let base = std::path::PathBuf::from("/tmp").join(tune_core::test_scratch::scratch_name(
-            "tune-explorateur-lien-i1275",
-        ));
-        std::fs::remove_dir_all(&base).ok();
-        std::fs::create_dir_all(&base).expect("dossier de test");
+        let base = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-explorateur-lien-i1275");
         let lien = base.join("sys");
         std::os::unix::fs::symlink("/etc", &lien).expect("lien de test");
 
@@ -390,8 +386,6 @@ mod tests {
         let ordinaire = base.join("Musique");
         std::fs::create_dir_all(&ordinaire).expect("dossier de test");
         assert!(la_cible_reste_dans_le_perimetre(&ordinaire));
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Le préfixe « verbatim » de Windows est retiré, sinon aucune règle ne

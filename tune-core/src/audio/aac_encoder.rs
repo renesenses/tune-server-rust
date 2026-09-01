@@ -502,14 +502,12 @@ mod tests {
         // ici aurait visé le même fichier — c'est exactement comme ça que
         // l'ALAC a fini instable.
         let dir = crate::test_scratch::scratch_dir("tune-aac-test");
-        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rt.m4a");
         std::fs::write(&path, &m4a).unwrap();
 
         let decoded =
             crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, f64::MAX)
                 .expect("decode back");
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(decoded.sample_rate, 44100);
         assert_eq!(decoded.channels, 2);

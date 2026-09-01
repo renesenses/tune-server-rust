@@ -786,6 +786,13 @@ pub(crate) struct ChiffresDeFinDeScan<'a> {
     pub(crate) skipped_unsupported_paths: &'a [String],
     pub(crate) skipped_no_metadata_paths: &'a [String],
     pub(crate) skipped_duplicate_paths: &'a [String],
+    /// Ce que les feuilles CUE de la bibliothèque décrivent réellement (#1763).
+    ///
+    /// Sans cela le rapport dit « 2 600 fichiers `.cue` ignorés » et s'arrête
+    /// là — un chiffre qui ne distingue pas la feuille prête à être découpée
+    /// de celle qui a perdu son FLAC, alors que c'est toute la différence
+    /// entre un album récupérable et un album fantôme.
+    pub(crate) cue: &'a tune_core::scanner::cue_album::InventaireCue,
 }
 
 impl ChiffresDeFinDeScan<'_> {
@@ -826,6 +833,30 @@ impl ChiffresDeFinDeScan<'_> {
             "artwork_extracted": self.artwork_extracted,
             "auto_enrichment": self.auto_enrichment,
             "failed_paths": self.scan_stats.failed_paths,
+            // Des COMPTEURS, donc ils partent chez les trois consommateurs —
+            // comme tous les autres. Seule la liste nominative des feuilles
+            // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
+            // même raison que les autres chemins : le bus d'événements est
+            // diffusé à tous les clients connectés.
+            "cue_sheets": self.cue_sheets(),
+        })
+    }
+
+    /// Les compteurs des feuilles CUE, sous une clé unique (#1763).
+    ///
+    /// Un objet plutôt que huit clés à plat : ces chiffres ne se lisent que
+    /// les uns par rapport aux autres — « 14 écartées » ne veut rien dire sans
+    /// « sur 132 vues ».
+    fn cue_sheets(&self) -> Value {
+        json!({
+            "folders": self.cue.dossiers,
+            "folders_not_inventoried": self.cue.dossiers_non_inventories,
+            "albums": self.cue.albums,
+            "albums_multi_sheet": self.cue.albums_multi_feuilles,
+            "sheets_used": self.cue.feuilles_retenues,
+            "tracks": self.cue.pistes,
+            "sheets_skipped": self.cue.feuilles_ecartees,
+            "sheets_skipped_by_reason": self.cue.ecarts_par_cle,
         })
     }
 
@@ -850,6 +881,9 @@ impl ChiffresDeFinDeScan<'_> {
         rapport["skipped_unsupported_paths"] = json!(self.skipped_unsupported_paths);
         rapport["skipped_no_metadata_paths"] = json!(self.skipped_no_metadata_paths);
         rapport["skipped_duplicate_paths"] = json!(self.skipped_duplicate_paths);
+        // LESQUELLES, pas seulement combien (#1763). Même règle que ci-dessus :
+        // ce sont des chemins de l'utilisateur, ils sortent par le fichier.
+        rapport["cue_sheets_skipped_paths"] = json!(self.cue.chemins_ecartes);
         // Dire que la liste est un échantillon, plutôt que de laisser croire
         // qu'elle est complète : une liste muette de 500 entrées face à
         // 40 000 fichiers écartés se lit comme un rapport faux.
@@ -869,6 +903,10 @@ impl ChiffresDeFinDeScan<'_> {
         self.skipped_unsupported_paths.len() >= PLAFOND
             || self.skipped_no_metadata_paths.len() >= PLAFOND
             || self.skipped_duplicate_paths.len() >= PLAFOND
+            // La quatrième liste (#1763) obéit au même plafond et se serait
+            // tronquée en silence : c'est exactement le défaut « un chemin
+            // corrigé, les autres nus » que cette clé existe pour éviter.
+            || self.cue.chemins_ecartes.len() >= PLAFOND
     }
 }
 
@@ -941,6 +979,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // spawn_blocking panique. Le Drop du jeton libère alors la génération.
         let _scan_lease = scan_lease;
         let db_for_panic = db.clone();
+        // Le bus est MOVÉ dans la tâche bloquante ci-dessous : sans cette
+        // copie, la sortie par panique n'a plus rien pour parler.
+        let event_bus_pour_panne = event_bus.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
@@ -1070,6 +1111,25 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
         let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les feuilles CUE, relues APRÈS le parcours (#1763). Le parcours les
+        // a comptées comme des fichiers non lus et n'en a retenu que les
+        // dossiers — les ouvrir pendant le parcours ajouterait une lecture
+        // bloquante par fichier sur un NAS, ce que le parcours s'interdit.
+        // Aucune écriture en base : c'est le rapport qui gagne la vérité, pas
+        // la bibliothèque. Presque toujours instantané, parce que la liste est
+        // vide dans l'immense majorité des bibliothèques.
+        let inventaire_cue =
+            tune_core::scanner::cue_album::inventorier(&list_result.dossiers_avec_feuille_cue);
+        if inventaire_cue.dossiers > 0 {
+            tracing::info!(
+                dossiers = inventaire_cue.dossiers,
+                albums = inventaire_cue.albums,
+                albums_multi_feuilles = inventaire_cue.albums_multi_feuilles,
+                pistes = inventaire_cue.pistes,
+                feuilles_ecartees = inventaire_cue.feuilles_ecartees,
+                "scan_cue_sheets_inventoried — feuilles CUE : ce qu'elles décrivent"
+            );
+        }
         let files = list_result.files;
         let total_discovered = files.len();
 
@@ -1250,8 +1310,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // startup + watcher scans. Owns the cross-batch caches (artist, album,
         // covers, per-folder album-artist pinning), the per-batch compilation
         // decision, and the artwork-extracted counter.
+        // `force` commande aussi la relecture des POCHETTES : sans lui, le
+        // « Scan complet » relit bien les fichiers mais la sonde héritée du
+        // cache (adressée par le chemin) rend l'ancienne image et le `COALESCE`
+        // de `update_cover_path` refuse de la remplacer en base. Remplacer sa
+        // `cover.jpg` n'avait alors aucun chemin vers l'écran (#3028). Même
+        // arbitrage que le genre d'album plus bas : un scan forcé est une
+        // demande explicite de reconstruire depuis les fichiers.
         let mut importer =
-            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone());
+            crate::scan_import::TrackImporter::new(db.clone(), quality_split, cache_dir.clone())
+                .with_force_artwork(force);
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
@@ -2115,6 +2183,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unsupported_paths: &skipped_unsupported_paths,
             skipped_no_metadata_paths: &skipped_no_metadata_paths,
             skipped_duplicate_paths: &skipped_duplicate_paths,
+            cue: &inventaire_cue,
         };
         let rapport_scan = chiffres.rapport();
 
@@ -2171,12 +2240,46 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }).await;
         if let Err(e) = result {
             tracing::error!("scan_task_panicked — {:?}", e);
-            if let Err(e2) = SettingsRepo::with_backend(db_for_panic).set("scan_status", "idle") {
-                tracing::warn!(error = %e2, "scan_status_panic_reset_failed");
-            }
+            cloturer_scan_interrompu(db_for_panic, &event_bus_pour_panne, "panic");
         }
     });
     true
+}
+
+/// Clôt un scan qui s'est arrêté sur une **panique**, et le fait SAVOIR.
+///
+/// La tâche de scan a quatre sorties. Trois annoncent `library.scan.completed` :
+/// la fin normale, l'absence de dossier configuré (#1129) et l'annulation. La
+/// quatrième — la panique de `spawn_blocking` — se contentait de remettre
+/// `scan_status` à `idle` et ne disait rien sur le bus.
+///
+/// Ce n'est pas un cas de figure théorique : les lots sont insérés au fur et à
+/// mesure par `scan_files_batched`, donc une panique SURVENUE APRÈS le premier
+/// lot laisse des albums NEUFS en base et aucun signal pour les annoncer.
+/// L'écran garde son bandeau « scan en cours » et sa liste d'avant, et
+/// l'auditeur ne voit ses nouveautés qu'en rechargeant la page — le symptôme
+/// exact rapporté par Eric (#1393, fil forum, Windows v0.9.61).
+///
+/// `scan_status` retombe bien à `idle`, lui : c'est ce qui rend la panne
+/// silencieuse. Le sondage HTTP dit « plus de scan », le bus ne dit rien, et
+/// les deux surfaces se contredisent sans que personne ne s'en aperçoive.
+///
+/// La charge utile est volontairement DÉGRADÉE, comme celles de l'annulation
+/// (`{"cancelled": true}`) et de l'absence de dossiers (`{"no_dirs": true}`) :
+/// les chiffres d'un scan qui a paniqué ne veulent rien dire, et les habiller
+/// en rapport complet les rendrait indiscernables d'un scan abouti.
+pub(crate) fn cloturer_scan_interrompu(
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+    motif: &str,
+) {
+    if let Err(e) = SettingsRepo::with_backend(backend).set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_panic_reset_failed");
+    }
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "interrupted": true, "reason": motif }),
+    );
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
@@ -3438,6 +3541,22 @@ mod rapport_de_fin_de_scan {
         let doublons: &[String] = Box::leak(Box::new([
             "/Volumes/musique/copie.flac (identique à /Volumes/musique/piste.flac)".to_string(),
         ]));
+        let cue: &tune_core::scanner::cue_album::InventaireCue =
+            Box::leak(Box::new(tune_core::scanner::cue_album::InventaireCue {
+                dossiers: 120,
+                dossiers_non_inventories: 121,
+                albums: 122,
+                albums_multi_feuilles: 123,
+                feuilles_retenues: 124,
+                pistes: 125,
+                feuilles_ecartees: 126,
+                ecarts_par_cle: std::collections::BTreeMap::from([("cue-image-introuvable", 126)]),
+                chemins_ecartes: vec![
+                    "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                     rien à découper)"
+                        .to_string(),
+                ],
+            }));
         ChiffresDeFinDeScan {
             total_discovered: 1_651,
             missing_dirs: missing,
@@ -3466,6 +3585,7 @@ mod rapport_de_fin_de_scan {
             skipped_unsupported_paths: non_lus,
             skipped_no_metadata_paths: sans_metadonnees,
             skipped_duplicate_paths: doublons,
+            cue,
         }
     }
 
@@ -3524,6 +3644,7 @@ mod rapport_de_fin_de_scan {
             // Ordre alphabétique : c'est celui des clés d'un objet
             // `serde_json`, pas celui où on les a écrites.
             vec![
+                "cue_sheets_skipped_paths",
                 "skipped_duplicate_paths",
                 "skipped_no_metadata_paths",
                 "skipped_paths_truncated",
@@ -3590,6 +3711,29 @@ mod rapport_de_fin_de_scan {
         assert_eq!(
             r["skipped_unsupported_reasons"],
             serde_json::json!({"mpc": "format non pris en charge"})
+        );
+        // Ce que les feuilles CUE décrivent (#1763). Huit chiffres tous
+        // distincts : un rapport qui rangerait « albums » sous « pistes »
+        // passerait inaperçu s'ils se ressemblaient.
+        assert_eq!(
+            r["cue_sheets"],
+            serde_json::json!({
+                "folders": 120,
+                "folders_not_inventoried": 121,
+                "albums": 122,
+                "albums_multi_sheet": 123,
+                "sheets_used": 124,
+                "tracks": 125,
+                "sheets_skipped": 126,
+                "sheets_skipped_by_reason": {"cue-image-introuvable": 126},
+            })
+        );
+        assert_eq!(
+            r["cue_sheets_skipped_paths"],
+            serde_json::json!([
+                "/Volumes/musique/orphelin.cue (feuille CUE sans son fichier audio : \
+                 rien à découper)"
+            ])
         );
         // La liste demandée (#2050) : LESQUELS, pas seulement COMBIEN. Trois
         // listes distinctes — un rapport qui rangerait les doublons sous les
@@ -3665,11 +3809,16 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 4] = [
+        const CLES: [&str; 6] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
             "\"skipped_paths_truncated\"",
+            // Les feuilles CUE (#1763) : mêmes deux clés des deux côtés, pour
+            // la même raison. Le compteur part chez les trois consommateurs,
+            // la liste nominative par le seul fichier.
+            "\"cue_sheets\"",
+            "\"cue_sheets_skipped_paths\"",
         ];
 
         for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
@@ -4303,5 +4452,85 @@ mod rapport_de_scan_publie_le_sort_de_lenrichissement {
                 "le motif doit rester lisible par le client (#2507)"
             );
         }
+    }
+}
+
+/// #1393 — la sortie par PANIQUE de la tâche de scan ne disait rien au client.
+///
+/// Les deux tests partagent le même harnais et le même appel ; c'est délibéré.
+/// Le premier est le TÉMOIN : la remise de `scan_status` à `idle` existait
+/// déjà avant le correctif, elle est verte des deux côtés, et elle prouve que
+/// le second n'échoue pas parce que le harnais serait cassé, la base absente
+/// ou l'appel jamais atteint. Le second est le FAIT : sans l'émission,
+/// `rx.recv()` expire, et l'auditeur ne voit ses albums qu'en rechargeant la
+/// page.
+#[cfg(test)]
+mod fin_de_scan_interrompu {
+    use super::cloturer_scan_interrompu;
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire")
+    }
+
+    /// TÉMOIN — vert avant comme après le correctif.
+    #[tokio::test]
+    async fn un_scan_interrompu_repose_le_statut_a_idle() {
+        let etat = etat();
+        SettingsRepo::with_backend(etat.backend.clone())
+            .set("scan_status", "scanning")
+            .expect("le réglage doit être inscriptible");
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let statut = SettingsRepo::with_backend(etat.backend.clone())
+            .get("scan_status")
+            .expect("le réglage doit être lisible");
+        assert_eq!(
+            statut.as_deref(),
+            Some("idle"),
+            "un scan qui a paniqué ne doit pas laisser `scan_status` à `scanning`"
+        );
+    }
+
+    /// LE FAIT — rouge avant le correctif.
+    #[tokio::test]
+    async fn une_panique_de_scan_annonce_quand_meme_la_fin_du_scan() {
+        let etat = etat();
+        let mut rx = etat.event_bus.subscribe();
+
+        cloturer_scan_interrompu(etat.backend.clone(), &etat.event_bus, "panic");
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect(
+                "aucun événement n'est parti : une panique de scan laisse le client \
+                 avec son bandeau et sa liste d'avant, et les albums insérés par les \
+                 lots déjà passés restent invisibles jusqu'au rechargement (#1393)",
+            )
+            .expect("le bus d'événements s'est fermé");
+
+        assert_eq!(
+            ev.event_type,
+            tune_core::event_types::EventType::ScanComplete.as_str(),
+            "c'est le SEUL nom sur lequel le client fait retomber son bandeau de \
+             fin de scan et recharge ses listes"
+        );
+        assert_eq!(
+            ev.data.get("interrupted").and_then(|v| v.as_bool()),
+            Some(true),
+            "le rapport doit se DIRE interrompu : sans ce drapeau il est \
+             indiscernable d'un scan abouti, et le client annoncerait un \
+             succès (charge utile réelle : {})",
+            ev.data
+        );
+        assert_eq!(
+            ev.data.get("reason").and_then(|v| v.as_str()),
+            Some("panic"),
+            "le motif nomme la sortie empruntée (charge utile réelle : {})",
+            ev.data
+        );
     }
 }

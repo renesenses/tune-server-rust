@@ -166,7 +166,7 @@ impl OutputTarget for BluosOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true)
+        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {

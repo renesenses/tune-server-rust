@@ -1,5 +1,5 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,6 +10,8 @@ use tune_core::cloud::plugins::{MarketplacePlugin, PluginMarketplace};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 
+use crate::routes::cloud_error;
+use crate::routes::panne_sql::OuDefautJournalise;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -135,20 +137,56 @@ pub fn router() -> Router<AppState> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// La clef de `settings` où vit la liste des greffons installés.
+const SETTINGS_KEY_INSTALLED: &str = "marketplace_installed";
+
 /// Read installed plugin records from the settings table.
-fn installed_plugins(settings: &SettingsRepo) -> Vec<InstalledRecord> {
-    let raw = settings
-        .get("marketplace_installed")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "[]".to_string());
-    serde_json::from_str::<Vec<InstalledRecord>>(&raw).unwrap_or_default()
+///
+/// Rend `Err` sur panne de base ou JSON illisible — la même primitive que le
+/// Developer API (#2795). La liste vide ne veut plus dire qu'une chose :
+/// aucun greffon installé.
+fn installed_plugins(settings: &SettingsRepo) -> Result<Vec<InstalledRecord>, String> {
+    settings.get_json_list(SETTINGS_KEY_INSTALLED)
 }
 
-fn save_installed(settings: &SettingsRepo, records: &[InstalledRecord]) {
-    if let Ok(json) = serde_json::to_string(records) {
-        settings.set("marketplace_installed", &json).ok();
+/// Une panne de stockage se dit (#2795) : un `installed` annoncé sur une
+/// écriture perdue, c'est le « 200 pour rien » que la #2132 vient de retirer à
+/// `POST /plugins/{nom}/install`.
+fn panne_de_stockage(quoi: &str, erreur: String) -> axum::response::Response {
+    warn!(quoi, erreur = %erreur, "marketplace_stockage_en_echec");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "storage_failure", "detail": erreur })),
+    )
+        .into_response()
+}
+
+/// Refus du magasin de greffons, rendu au client.
+///
+/// Hors limite atteinte, la forme d'origine est conservée mot pour mot :
+/// `{"error": "<code>", "detail": "<texte technique>"}` au statut d'avant.
+/// Sur un 429 le code machine devient `rate_limited` — plus précis que
+/// `install_failed` : ce n'est pas l'installation qui a échoué, c'est le nuage
+/// qui refuse pour l'instant — et le corps porte le délai et un message dans la
+/// langue de l'interface (#2178). `detail` reste présent dans les deux cas.
+fn refus_du_magasin(
+    code: &str,
+    err: &tune_core::cloud::refusal::CloudError,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    if err.is_rate_limited() {
+        return cloud_error::reponse(
+            err,
+            headers,
+            StatusCode::BAD_GATEWAY,
+            json!({ "detail": err.to_string() }),
+        );
     }
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": code, "detail": err.to_string() })),
+    )
+        .into_response()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -184,7 +222,10 @@ async fn list_marketplace_plugins(State(state): State<AppState>) -> Json<Value> 
     let catalog = marketplace.list().await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let installed = installed_plugins(&settings);
+    // Catalogue public : une panne de base ne doit pas effacer la vitrine.
+    // On dégrade le seul champ concerné (`installed`) et on le DIT — ce chemin
+    // n'écrit rien, il ne peut donc pas perdre la liste.
+    let installed = installed_plugins(&settings).ou_defaut_journalise();
 
     let plugins: Vec<MarketplacePlugin> =
         catalog.into_iter().map(|p| enrich(p, &installed)).collect();
@@ -208,7 +249,7 @@ async fn get_plugin_detail(
     match marketplace.detail(&slug).await {
         Some(plugin) => {
             let settings = SettingsRepo::with_backend(state.backend.clone());
-            let installed = installed_plugins(&settings);
+            let installed = installed_plugins(&settings).ou_defaut_journalise();
             let plugin = enrich(plugin, &installed);
             Json(json!(plugin)).into_response()
         }
@@ -228,6 +269,7 @@ async fn get_plugin_detail(
 async fn install_plugin(
     Path(slug): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let marketplace = PluginMarketplace::default();
 
@@ -289,23 +331,46 @@ async fn install_plugin(
 
             // Track installation in settings (`settings` was bound above for
             // the signature check).
-            let mut installed = installed_plugins(&settings);
-            // Remove old entry if upgrading.
-            installed.retain(|r| r.slug != slug);
-            installed.push(InstalledRecord {
+            //
+            // L'ORDRE compte et ne doit pas s'inverser : la liste d'abord, les
+            // drapeaux par greffon ensuite. `load_wasm_plugins` ne charge au
+            // démarrage que ce que `plugin_<id>_installed` autorise — écrire ce
+            // drapeau avant la liste ferait charger, après un échec, un greffon
+            // que l'écran ne montre nulle part.
+            let enregistrement = InstalledRecord {
                 slug: slug.clone(),
                 version: plugin.version.clone(),
                 plugin_id: Some(plugin_id.clone()),
-            });
-            save_installed(&settings, &installed);
+            };
+            let a_remplacer = slug.clone();
+            if let Err(e) = settings.update_json_list::<InstalledRecord, _, _>(
+                SETTINGS_KEY_INSTALLED,
+                move |installed| {
+                    // Remove old entry if upgrading.
+                    installed.retain(|r| r.slug != a_remplacer);
+                    installed.push(enregistrement);
+                    Ok(())
+                },
+            ) {
+                // L'archive est sur le disque mais aucun drapeau ne l'autorise :
+                // elle reste inerte au prochain démarrage. On ne l'efface pas —
+                // sur une mise à jour, `persist_wasm_archive` a écrasé le
+                // répertoire de la version précédente, et le supprimer
+                // désinstallerait un greffon que personne n'a demandé à retirer.
+                return panne_de_stockage("installation", e);
+            }
 
             // Also set the per-plugin installed/enabled keys for compat with
             // the existing /plugins routes. Keyed on the manifest id — that is
             // what `load_wasm_plugins` checks at startup.
             let key = format!("plugin_{plugin_id}_installed");
-            settings.set(&key, "true").ok();
+            if let Err(e) = settings.set(&key, "true") {
+                return panne_de_stockage("drapeau_installe", e);
+            }
             let enabled_key = format!("plugin_{plugin_id}_enabled");
-            settings.set(&enabled_key, "true").ok();
+            if let Err(e) = settings.set(&enabled_key, "true") {
+                return panne_de_stockage("drapeau_actif", e);
+            }
 
             Json(json!({
                 "status": "installed",
@@ -319,11 +384,7 @@ async fn install_plugin(
             }))
             .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "install_failed", "detail": e })),
-        )
-            .into_response(),
+        Err(e) => refus_du_magasin("install_failed", &e, &headers),
     }
 }
 
@@ -336,23 +397,32 @@ async fn uninstall_plugin(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut installed = installed_plugins(&settings);
-    let before = installed.len();
-    let plugin_id = installed
-        .iter()
-        .find(|r| r.slug == slug)
-        .and_then(|r| r.plugin_id.clone());
-    installed.retain(|r| r.slug != slug);
 
-    if installed.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "plugin_not_installed", "slug": slug })),
-        )
-            .into_response();
-    }
-
-    save_installed(&settings, &installed);
+    // Retrait et persistance dans la même transaction : le répertoire n'est
+    // effacé qu'après, et seulement si l'enregistrement a bien disparu.
+    let a_retirer = slug.clone();
+    let plugin_id = match settings.update_json_list::<InstalledRecord, _, _>(
+        SETTINGS_KEY_INSTALLED,
+        move |installed| {
+            let avant = installed.len();
+            let id = installed
+                .iter()
+                .find(|r| r.slug == a_retirer)
+                .and_then(|r| r.plugin_id.clone());
+            installed.retain(|r| r.slug != a_retirer);
+            Ok((installed.len() != avant).then_some(id))
+        },
+    ) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "plugin_not_installed", "slug": slug })),
+            )
+                .into_response();
+        }
+        Err(e) => return panne_de_stockage("desinstallation", e),
+    };
 
     // Remove the on-disk wasm plugin, when this install wrote one. The loaded
     // instance (if any) lives until restart — the registry is a OnceLock.
@@ -392,9 +462,14 @@ async fn uninstall_plugin(
 // GET /marketplace/plugins/installed — List installed plugins with status.
 // ---------------------------------------------------------------------------
 
-async fn list_installed_plugins(State(state): State<AppState>) -> Json<Value> {
+async fn list_installed_plugins(State(state): State<AppState>) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let installed = installed_plugins(&settings);
+    // Ici la liste vide EST la réponse : annoncer « aucun greffon installé »
+    // sur une base illisible enverrait désinstaller puis réinstaller.
+    let installed = match installed_plugins(&settings) {
+        Ok(i) => i,
+        Err(e) => return panne_de_stockage("liste_installes", e),
+    };
 
     let plugins: Vec<Value> = installed
         .iter()
@@ -422,6 +497,7 @@ async fn list_installed_plugins(State(state): State<AppState>) -> Json<Value> {
         "plugins": plugins,
         "count": plugins.len(),
     }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -431,9 +507,15 @@ async fn list_installed_plugins(State(state): State<AppState>) -> Json<Value> {
 async fn update_plugin(
     Path(slug): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let installed = installed_plugins(&settings);
+    // Une base illisible ne doit pas se lire « ce greffon n'est pas installé » :
+    // ce 404-là envoie réinstaller par-dessus une installation saine.
+    let installed = match installed_plugins(&settings) {
+        Ok(i) => i,
+        Err(e) => return panne_de_stockage("lecture_installes", e),
+    };
 
     // Must already be installed.
     let current_version = match installed.iter().find(|r| r.slug == slug) {
@@ -508,6 +590,27 @@ async fn update_plugin(
                 }
             };
 
+            // Update installed record.
+            let enregistrement = InstalledRecord {
+                slug: slug.clone(),
+                version: plugin.version.clone(),
+                plugin_id: Some(plugin_id),
+            };
+            let a_remplacer = slug.clone();
+            if let Err(e) = settings.update_json_list::<InstalledRecord, _, _>(
+                SETTINGS_KEY_INSTALLED,
+                move |installed| {
+                    installed.retain(|r| r.slug != a_remplacer);
+                    installed.push(enregistrement);
+                    Ok(())
+                },
+            ) {
+                return panne_de_stockage("mise_a_jour", e);
+            }
+
+            // Après la persistance, jamais avant : une trace « mis à jour » sur
+            // une écriture perdue fait chercher le défaut à l'endroit où il
+            // n'est pas.
             info!(
                 slug = %slug,
                 from = %current_version,
@@ -515,16 +618,6 @@ async fn update_plugin(
                 bytes = data.len(),
                 "marketplace_plugin_updated"
             );
-
-            // Update installed record.
-            let mut installed = installed_plugins(&settings);
-            installed.retain(|r| r.slug != slug);
-            installed.push(InstalledRecord {
-                slug: slug.clone(),
-                version: plugin.version.clone(),
-                plugin_id: Some(plugin_id),
-            });
-            save_installed(&settings, &installed);
 
             Json(json!({
                 "status": "updated",
@@ -535,11 +628,7 @@ async fn update_plugin(
             }))
             .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "update_failed", "detail": e })),
-        )
-            .into_response(),
+        Err(e) => refus_du_magasin("update_failed", &e, &headers),
     }
 }
 

@@ -31,6 +31,21 @@
 //! (`tune-server/tests/concerts_plugin.rs`) qui portent sur le fait de base :
 //! un artiste sans MBID est abonné comme les autres.
 //!
+//! # Et l'apport de #2178, porté à la fusion de `rc/v0.9.130`
+//!
+//! Même piège, une seconde fois, sur le même fichier. Le lot
+//! `batch/p2-recentes-1` portait `64e8378f` — « un 429 du nuage dit la limite
+//! et le délai, partout » — qui apprenait à `concert_alerts.rs` à rendre un
+//! [`CloudError`] plutôt qu'une `String`, et à `GET /system/concerts` à rendre
+//! ce refus **sans écraser son statut**. Ce fichier et cette route étant
+//! supprimés ici, prendre la suppression aurait perdu le traitement du 429
+//! pour les concerts — en silence, une fois de plus : le greffon compile très
+//! bien en rendant 200 sur tous les refus.
+//!
+//! Le comportement a donc été porté ([`reponse_de_refus`]), et gardé par des
+//! tests qui portent sur le fait de base : un 429 du nuage arrive au client
+//! **en 429, avec son délai**.
+//!
 //! # Ce que ce plugin ne fait PAS, et pourquoi
 //!
 //! **Il n'est pas au catalogue** ([`ConcertsPlugin::catalogued`] rend `false`).
@@ -60,11 +75,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
+use tune_core::cloud::refusal::CloudError;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::TuneEvent;
@@ -182,7 +200,7 @@ pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
 /// **code stable**, traduisible côté client, et le détail part au journal.
 async fn concerts_a_venir(
     axum::extract::State(etat): axum::extract::State<EtatConcerts>,
-) -> Json<Value> {
+) -> Response {
     let instance_id = SettingsRepo::with_backend(etat.backend.clone())
         .get("instance_id")
         .ok()
@@ -190,7 +208,7 @@ async fn concerts_a_venir(
         .unwrap_or_default();
 
     if instance_id.is_empty() {
-        return Json(json!({"concerts": [], "code": "concerts.no_instance_id"}));
+        return Json(json!({"concerts": [], "code": "concerts.no_instance_id"})).into_response();
     }
 
     let client = match tune_core::http::client::builder()
@@ -201,23 +219,94 @@ async fn concerts_a_venir(
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "concerts_client_build_failed");
-            return Json(json!({"concerts": [], "code": "concerts.unavailable"}));
+            return Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response();
         }
     };
 
     match recuperer_concerts(&client, &instance_id).await {
-        Ok(concerts) => Json(json!({"concerts": concerts})),
+        Ok(concerts) => Json(json!({"concerts": concerts})).into_response(),
         Err(e) => {
-            warn!(error = %e, "concerts_fetch_failed");
-            Json(json!({"concerts": [], "code": "concerts.unavailable"}))
+            warn!(error = %e, retry_after = ?e.retry_after(), "concerts_fetch_failed");
+            reponse_de_refus(&e)
         }
     }
 }
 
+/// Rend un refus du nuage **sans en perdre le motif** — la forme greffon de
+/// `routes::cloud_error::reponse` (#2178).
+///
+/// # Pourquoi ce n'est pas un appel à la fabrique commune
+///
+/// `tune-server/src/routes/cloud_error.rs` rend ce contrat pour les quinze
+/// gestionnaires du cœur. Ce greffon **ne peut pas l'appeler** : il dépend de
+/// `tune-core`, jamais de `tune-server` — l'inverse ferait un cycle, puisque
+/// c'est `tune-server` qui monte ce routeur. Ce qui est partagé l'est au bon
+/// niveau : le **type** du refus, [`CloudError`], et la lecture du délai
+/// (`cloud::rate_limit::retry_after_secs`), tous deux dans `tune-core`. Seul le
+/// rendu est refait ici, et il l'est sur la forme propre au greffon.
+///
+/// # Ce qui diffère de la fabrique du cœur, et pourquoi
+///
+/// La fabrique du cœur pose un `message` **déjà traduit** (`crate::i18n::t`,
+/// dix langues). Ce greffon n'en pose pas : `i18n_server.json` vit dans
+/// `tune-server`, hors de portée — mais surtout, ne pas traduire ici est la
+/// règle que ce greffon s'est donnée en sortant du cœur. L'ancienne route
+/// rendait `{"error": "concerts: HTTP 500"}`, une phrase anglaise qu'une
+/// interface traduite en onze langues affichait telle quelle ; le greffon rend
+/// un **code stable** que le client traduit. Le 429 suit cette règle : il se
+/// nomme `concerts.rate_limited`, il ne se raconte pas.
+///
+/// Le reste du contrat est tenu mot pour mot :
+///
+/// * le **statut 429 est préservé** — l'ancienne route rendait 200 sur un
+///   refus, et c'est précisément ce qui empêchait de le reconnaître ;
+/// * `retry_after` en secondes **quand le distant l'annonce**, jamais fabriqué ;
+/// * l'en-tête `Retry-After` réémis, forme standard pour qui programme ;
+/// * le texte amont conservé sous `upstream_message` ;
+/// * l'enveloppe `{"concerts": []}` conservée, pour l'écran qui rend la liste
+///   avant de regarder l'erreur.
+///
+/// Hors 429, **rien ne bouge** : 200 et `concerts.unavailable`, comme avant.
+///
+/// Publique pour être observable depuis `tune-server/tests/concerts_plugin.rs`,
+/// de l'autre côté de la frontière de crate — même raison que
+/// [`artistes_de_la_bibliotheque`].
+pub fn reponse_de_refus(err: &CloudError) -> Response {
+    let CloudError::RateLimited {
+        retry_after,
+        upstream,
+        ..
+    } = err
+    else {
+        return Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response();
+    };
+
+    let mut corps = serde_json::Map::new();
+    corps.insert("concerts".into(), json!([]));
+    corps.insert("code".into(), json!("concerts.rate_limited"));
+    if let Some(secs) = retry_after {
+        corps.insert("retry_after".into(), json!(secs));
+    }
+    if !upstream.is_empty() {
+        corps.insert("upstream_message".into(), json!(upstream));
+    }
+
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(Value::Object(corps))).into_response();
+    if let Some(secs) = retry_after {
+        if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
+    resp
+}
+
 // ---------------------------------------------------------------------------
 // Le cloud — repris de tune-core/src/cloud/concert_alerts.rs, dans son état
-// après #2892 (40f9342c) : la lecture (`recuperer_concerts`) est inchangée,
-// l'abonnement porte désormais sur toute la bibliothèque. Voir l'en-tête.
+// après #2892 (40f9342c) : l'abonnement porte sur toute la bibliothèque.
+// La lecture (`recuperer_concerts`) a depuis reçu l'apport de #2178
+// (64e8378f) à la fusion de rc/v0.9.130 : elle rend un `CloudError`, et un
+// 429 du nuage arrive au client en 429. Voir l'en-tête et
+// [`reponse_de_refus`].
 // ---------------------------------------------------------------------------
 
 /// Les artistes de la bibliothèque, prêts à être abonnés.
@@ -339,7 +428,14 @@ pub async fn synchroniser_abonnements(
         let resp = match resp {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                warn!(statut = %r.status(), "concert_subscribe_lot_refuse");
+                // Le refus de l'abonnement ne remonte à aucun écran : la tâche
+                // est périodique et personne ne l'attend. Le délai annoncé est
+                // tout de même lu et journalisé (#2178) — sans lui, « lot
+                // refusé » ne dit pas si le nuage demande d'attendre une minute
+                // ou une heure, et c'est la seule trace qu'on aura. `None` veut
+                // dire « le distant ne l'a pas dit » : jamais fabriqué.
+                let retry_after = tune_core::cloud::rate_limit::retry_after_secs(r.headers());
+                warn!(statut = %r.status(), ?retry_after, "concert_subscribe_lot_refuse");
                 lots_en_echec += 1;
                 continue;
             }
@@ -384,10 +480,17 @@ pub async fn synchroniser_abonnements(
 
 /// Récupère les concerts à venir pour les artistes auxquels cette instance
 /// s'est abonnée.
+///
+/// Le refus est rendu en [`CloudError`] et non plus en `String` (#2178) : un
+/// 429 y garde son délai (`Retry-After`, à défaut `X-RateLimit-Reset`) et le
+/// texte du distant, que [`reponse_de_refus`] fait ensuite ressortir jusqu'au
+/// client. Les autres erreurs — réseau, analyse — passent inchangées par
+/// `impl From<String>`, et le texte rendu par `Display` reste mot pour mot
+/// celui d'avant : les journaux ne bougent pas.
 pub async fn recuperer_concerts(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, CloudError> {
     let resp = http_client
         .get(format!("{CONCERTS_API}/upcoming"))
         .query(&[("instance_id", instance_id)])
@@ -397,7 +500,8 @@ pub async fn recuperer_concerts(
         .map_err(|e| format!("concerts: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("concerts: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(CloudError::from_response(format!("concerts: HTTP {status}"), resp).await);
     }
 
     let data: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;

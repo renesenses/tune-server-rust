@@ -726,7 +726,6 @@ mod daemon_path_tests {
         // The primary native-install path: the daemon sits in the same directory
         // as the tune-server binary, wherever the archive was extracted.
         let dir = crate::test_scratch::scratch_dir("tune_daemon_test");
-        std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
@@ -737,7 +736,6 @@ mod daemon_path_tests {
         // No exe dir + not in CWD/system dirs → None (caller falls back to PATH).
         std::fs::remove_file(&bin).unwrap();
         assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -746,15 +744,12 @@ mod daemon_path_tests {
         // legacy. An existence-only check would pick it and fail to exec (#700):
         // a zero-length candidate must be treated as "no daemon".
         let dir = crate::test_scratch::scratch_dir("tune_daemon_empty_test");
-        std::fs::create_dir_all(&dir).unwrap();
         let exe_name = daemon_exe_name();
         let bin = dir.join(&exe_name);
         std::fs::write(&bin, b"").unwrap(); // 0 bytes, like `touch`
 
         assert!(!is_usable_daemon(&bin));
         assert_eq!(resolve_daemon_path(Some(&dir), &exe_name), None);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

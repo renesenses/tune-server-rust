@@ -270,6 +270,19 @@ pub struct TrackImporter {
     /// album tags split every group down to one track (JP Borderies).
     folder_comp: HashMap<String, (bool, bool)>,
     artwork_extracted: u64,
+    /// « Scan complet » : relire la pochette depuis les fichiers et **écraser**
+    /// celle de la base.
+    ///
+    /// Faux par défaut — c'est le scan incrémental et le surveillant de
+    /// fichiers, qui gardent la sonde héritée (URL stables, #1444) et
+    /// l'écriture `COALESCE` (une pochette posée une fois ne bouge plus).
+    ///
+    /// Vrai uniquement pour un scan forcé, exactement comme le genre d'album
+    /// (`scan.rs`, « A forced full scan is an explicit "rebuild from the files"
+    /// action ») : sans cela, remplacer `cover.jpg` dans sa bibliothèque
+    /// n'avait AUCUN chemin pour atteindre l'écran, pas même le bouton « Scan
+    /// complet » (#3028).
+    force_artwork: bool,
 }
 
 impl TrackImporter {
@@ -286,7 +299,19 @@ impl TrackImporter {
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
             artwork_extracted: 0,
+            force_artwork: false,
         }
+    }
+
+    /// Active la relecture des pochettes pour un « Scan complet ».
+    ///
+    /// Voir [`TrackImporter::force_artwork`]. Appelé par la route de scan avec
+    /// le même `force` qui commande déjà le contournement du saut de fichiers
+    /// inchangés et la réécriture du genre d'album.
+    #[must_use]
+    pub fn with_force_artwork(mut self, force: bool) -> Self {
+        self.force_artwork = force;
+        self
     }
 
     /// Number of album covers extracted so far (for the scan report).
@@ -598,11 +623,27 @@ impl TrackImporter {
             // Prefer the embedded cover already read while parsing the tags —
             // re-opening the file to extract it failed (os error 3) for some
             // accented Windows paths even though the first read had succeeded.
+            //
+            // Sur un « Scan complet », les variantes `*_refresh` sautent la
+            // sonde héritée : celle-ci est adressée par le CHEMIN de la piste,
+            // qui ne bouge pas quand on remplace `cover.jpg`, et rendait donc
+            // l'ancienne image sans rouvrir le moindre fichier (#3028).
             let cover_hash = match meta.cover_art.as_ref() {
+                Some(cover) if self.force_artwork => {
+                    tune_core::library::artwork::cache_embedded_cover(
+                        std::path::Path::new(&sf.path),
+                        &self.cache_dir,
+                        cover,
+                    )
+                }
                 Some(cover) => tune_core::library::artwork::save_embedded_cover(
                     std::path::Path::new(&sf.path),
                     &self.cache_dir,
                     cover,
+                ),
+                None if self.force_artwork => tune_core::library::artwork::refresh_cover_hash(
+                    std::path::Path::new(&sf.path),
+                    &self.cache_dir,
                 ),
                 None => tune_core::library::artwork::get_or_extract(
                     std::path::Path::new(&sf.path),
@@ -610,7 +651,18 @@ impl TrackImporter {
                 ),
             };
             if let Some(hash) = cover_hash {
-                if let Err(e) = self.album_repo.update_cover_path(aid, &hash) {
+                // `update_cover_path` est un `COALESCE` : il ne remplace jamais
+                // une valeur déjà posée. C'est ce qu'il faut entre deux scans
+                // complets, et c'est exactement ce qui retenait l'ancienne
+                // pochette en base quand l'utilisateur en avait posé une neuve
+                // sur son disque (#3028). Un scan forcé écrase, comme il écrase
+                // déjà le genre d'album.
+                let ecriture = if self.force_artwork {
+                    self.album_repo.force_update_cover_path(aid, &hash)
+                } else {
+                    self.album_repo.update_cover_path(aid, &hash)
+                };
+                if let Err(e) = ecriture {
                     tracing::warn!(album_id = aid, error = %e, "cover_path_update_failed");
                 }
                 self.albums_with_cover.insert(aid);
@@ -672,12 +724,24 @@ impl TrackImporter {
         // Only `meta.cover_art` is used — the bytes were already read while
         // parsing the tags. The `get_or_extract` fallback re-opens the file, and
         // paying that on every track of every mixed folder is not worth it.
+        //
+        // Même règle que la pochette d'album au-dessus : un « Scan complet »
+        // saute la sonde héritée, sans quoi la pochette de PISTE resterait
+        // périmée pendant que celle de l'album se rafraîchit (#3028).
         if use_folder_title && let Some(cover) = meta.cover_art.as_ref() {
-            track.cover_path = tune_core::library::artwork::save_embedded_cover(
-                std::path::Path::new(&sf.path),
-                &self.cache_dir,
-                cover,
-            );
+            track.cover_path = if self.force_artwork {
+                tune_core::library::artwork::cache_embedded_cover(
+                    std::path::Path::new(&sf.path),
+                    &self.cache_dir,
+                    cover,
+                )
+            } else {
+                tune_core::library::artwork::save_embedded_cover(
+                    std::path::Path::new(&sf.path),
+                    &self.cache_dir,
+                    cover,
+                )
+            };
         }
 
         Some((track, album_id))
@@ -746,6 +810,89 @@ mod tests {
             albums.len(),
             4,
             "quatre dossiers, quatre pochettes ⇒ quatre albums (obtenu : {albums:?})"
+        );
+    }
+
+    /// #3028 — remplacer `cover.jpg` dans sa bibliothèque, joué jusqu'à la
+    /// BASE et jusqu'aux OCTETS servis.
+    ///
+    /// Deux passes sur le même dossier, l'image changée entre les deux. Le
+    /// scan ordinaire garde l'ancienne (témoin anti-régression : URL stables,
+    /// #1444) ; le « Scan complet » écrit le condensat de la nouvelle, et le
+    /// fichier de cache sous cette adresse porte bien les octets neufs.
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : `force_artwork` n'existait pas,
+    /// la sonde héritée rendait l'ancien condensat et le `COALESCE` de
+    /// `update_cover_path` refusait de le remplacer.
+    #[test]
+    fn un_scan_complet_remplace_la_pochette_periee_en_base() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+
+        let dossier = tmp.path().join("Bilou").join("Album");
+        std::fs::create_dir_all(&dossier).unwrap();
+        std::fs::write(dossier.join("cover.jpg"), b"ANCIENNE-POCHETTE").unwrap();
+        let chemin = dossier
+            .join("01 - titre.flac")
+            .to_string_lossy()
+            .into_owned();
+        let fichier = || {
+            let mut f = sf(&chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some("titre".into()),
+                artist: Some("Bilou".into()),
+                album: Some("Album".into()),
+                album_artist: Some("Bilou".into()),
+                track_number: Some(1),
+                ..Default::default()
+            });
+            f
+        };
+
+        // Première passe : la bibliothèque est indexée avec l'ancienne image.
+        let mut imp = TrackImporter::new(backend.clone(), true, cache.clone());
+        let (piste, _) = imp.import(&fichier()).expect("import");
+        let aid = piste.album_id.expect("album");
+        let ancien = album_repo.get(aid).unwrap().unwrap().cover_path.unwrap();
+
+        // L'utilisateur remplace l'image sur son disque.
+        std::fs::write(dossier.join("cover.jpg"), b"NOUVELLE-POCHETTE").unwrap();
+
+        // TÉMOIN — scan ordinaire : rien ne bouge, l'URL distribuée tient.
+        let mut ordinaire = TrackImporter::new(backend.clone(), true, cache.clone());
+        ordinaire.import(&fichier()).expect("import");
+        assert_eq!(
+            album_repo.get(aid).unwrap().unwrap().cover_path.as_deref(),
+            Some(ancien.as_str()),
+            "un scan incrémental ne fait pas tourner les URL"
+        );
+
+        // « Scan complet ».
+        let mut complet =
+            TrackImporter::new(backend.clone(), true, cache.clone()).with_force_artwork(true);
+        complet.import(&fichier()).expect("import");
+
+        let nouveau = album_repo.get(aid).unwrap().unwrap().cover_path.unwrap();
+        assert_ne!(nouveau, ancien, "la base annonce une autre adresse");
+        assert_eq!(
+            nouveau,
+            tune_core::library::artwork::content_hash(b"NOUVELLE-POCHETTE"),
+            "l'adresse est le condensat de la NOUVELLE image"
+        );
+        let (fichier_cache, _) = tune_core::library::artwork::find_cached(&cache, &nouveau)
+            .expect("l'entrée de cache existe");
+        assert_eq!(
+            std::fs::read(fichier_cache).unwrap(),
+            b"NOUVELLE-POCHETTE",
+            "les octets servis sont ceux de la nouvelle image"
         );
     }
 

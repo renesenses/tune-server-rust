@@ -29,6 +29,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Identifiant de la passe au registre `background_tasks` (#2129).
+///
+/// Même raison que pour les crédits : `write_tags_status` et sa route ne se
+/// lisent que depuis l'écran qui a lancé la passe. Réécrire les étiquettes de
+/// toute une bibliothèque touche chaque fichier du disque et dure longtemps ;
+/// sans inscription au registre, rien ne le signale ailleurs que là.
+const TACHE_WRITE_TAGS: &str = "write_tags";
+
+/// Cadence de publication de l'avancement au registre, alignée sur le jalon
+/// que la passe utilise DÉJÀ pour écrire son statut. Une publication par piste
+/// ferait un événement WebSocket par fichier.
+const JALON_AVANCEMENT: i32 = 50;
+
 /// POST /library/write-tags
 ///
 /// Writes metadata from the DB back to audio files' tags using lofty.
@@ -49,6 +62,15 @@ pub(crate) async fn write_tags_to_files(
         )
         .ok();
 
+    // Garde RAII pris avant le spawn, déplacé dedans : la tâche disparaît du
+    // registre quand le futur se termine, panique comprise.
+    let garde_tache = state.background_tasks.begin(
+        TACHE_WRITE_TAGS,
+        "Écriture des étiquettes dans les fichiers…",
+        "maintenance",
+    );
+    let taches = state.background_tasks.clone();
+
     let backend2 = backend.clone();
     let task_id_clone = task_id.clone();
     let only_missing = body.only_missing;
@@ -56,6 +78,7 @@ pub(crate) async fn write_tags_to_files(
     let album_id = body.album_id;
 
     tokio::spawn(async move {
+        let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
         // Build the SQL query based on whether specific track IDs were given
         let track_rows = if let Some(ref ids) = track_ids {
             if ids.is_empty() {
@@ -109,7 +132,36 @@ pub(crate) async fn write_tags_to_files(
         let mut skipped = 0i32;
         let mut errors = 0i32;
 
+        // Le total dès qu'il est connu. La sélection SQL précède la boucle :
+        // publier ici évite un bandeau bloqué sur « 0/0 », que le client
+        // n'affiche pas en fraction (il le lirait comme un arrêt).
+        taches.update_progress(TACHE_WRITE_TAGS, 0, total as u64, "Étiquettes");
+
         for row in &track_rows {
+            // Avancement au registre, en TÊTE de boucle — sur le nombre de
+            // pistes RÉELLEMENT traitées, `skipped` compris.
+            //
+            // Deux raisons, et les deux comptent :
+            //
+            // - deux branches de ce corps sortent par `continue` (colonne
+            //   `file_path` nulle, fichier introuvable sur le disque). Un jalon
+            //   placé en queue les manquerait toutes ;
+            // - le jalon du réglage, plus bas, ne compte que `written + errors`.
+            //   Une bibliothèque dont les fichiers sont introuvables — chemins
+            //   NFD, disque démonté — les compte tous en `skipped` : une barre
+            //   indexée sur ce jalon-là resterait figée à 0 du début à la fin,
+            //   c'est-à-dire précisément dans le cas où l'on a besoin de voir
+            //   que la passe tourne.
+            let traitees = written + skipped + errors;
+            if traitees % JALON_AVANCEMENT == 0 {
+                taches.update_progress(
+                    TACHE_WRITE_TAGS,
+                    traitees.max(0) as u64,
+                    total as u64,
+                    "Étiquettes",
+                );
+            }
+
             let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             let file_path = match row.get(1).and_then(|v| v.as_string()) {
                 Some(fp) => fp,
@@ -336,4 +388,72 @@ pub(super) async fn write_tags_status(State(state): State<AppState>) -> Json<Val
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or(json!({"status": "idle"}));
     Json(result)
+}
+
+/// Inscription de la passe d'écriture des étiquettes au registre des tâches de
+/// fond (#2129).
+///
+/// **Hermétique : aucun accès disque, aucun appel réseau.** La base en mémoire
+/// ne contient aucune piste, donc la passe n'ouvre aucun fichier.
+///
+/// Voir l'en-tête des essais de `credits.rs` pour la propriété du réacteur
+/// mono-fil sur laquelle repose l'observation du registre.
+#[cfg(test)]
+mod tests_tache_de_fond_write_tags {
+    use super::*;
+    use crate::state::AppState;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    fn demande() -> WriteTagsRequest {
+        WriteTagsRequest {
+            only_missing: true,
+            track_ids: None,
+            album_id: None,
+        }
+    }
+
+    /// Réécrire les étiquettes de toute une bibliothèque touche chaque fichier
+    /// du disque et dure longtemps. `write_tags_status` le disait, mais ce
+    /// réglage ne se lit que depuis l'écran qui a lancé la passe : ailleurs,
+    /// rien. C'est le défaut de forme que décrit #2129 — « un traitement long
+    /// qui n'est visible que depuis l'écran qui l'a lancé se lit comme un
+    /// traitement absent ».
+    #[tokio::test]
+    async fn la_passe_d_ecriture_des_etiquettes_s_inscrit_au_registre() {
+        let state = etat();
+        let _ = write_tags_to_files(State(state.clone()), Json(demande())).await;
+
+        let ids: Vec<String> = state
+            .background_tasks
+            .snapshot()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            ids.contains(&TACHE_WRITE_TAGS.to_string()),
+            "l'écriture des étiquettes doit figurer au registre des tâches de \
+             fond, sinon le bandeau global ne peut pas l'afficher (#2129) — \
+             registre observé : {ids:?}"
+        );
+    }
+
+    /// Témoin anti-régression : la route garde son 202 et son `task_id`.
+    #[tokio::test]
+    async fn le_contrat_de_la_route_est_inchange() {
+        let state = etat();
+        let reponse = write_tags_to_files(State(state.clone()), Json(demande()))
+            .await
+            .into_response();
+        assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(corps["status"], "accepted");
+        assert!(corps["task_id"].as_str().is_some_and(|s| !s.is_empty()));
+    }
 }
