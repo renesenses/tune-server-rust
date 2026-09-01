@@ -208,6 +208,40 @@ pub fn cache_mime(ext: &str) -> &'static str {
     }
 }
 
+/// Les formats que le cache de pochettes sait ecrire **et** resservir.
+///
+/// C'est exactement l'image de [`canonical_cache_ext`] : tout le reste y
+/// retombe sur `jpg`, donc serait ecrit sous une extension qui ment sur son
+/// contenu et servi `image/jpeg` par [`cache_mime`].
+pub const FORMATS_IMAGE_SERVABLES: &[&str] = &["jpg", "png", "webp", "bmp"];
+
+/// Le format reel d'une image, lu dans ses OCTETS.
+///
+/// Le `content-type` d'un envoi multipart est declare par le client, et le
+/// televersement d'image d'artiste ne s'en servait que pour chercher la
+/// sous-chaine « png » : tout le reste partait dans le cache sous `.jpg`. Une
+/// image WebP recuperee sur Discogs etait donc ecrite `{hash}.jpg` et
+/// resservie `Content-Type: image/jpeg` alors que ses octets disent WebP
+/// (#3102).
+///
+/// `None` = format que la lecture ne saurait pas resservir : a refuser en le
+/// disant, pas a ecrire sous une extension qui ment.
+pub fn sniff_image_ext(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if data.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    None
+}
+
 /// Retrouve le fichier de cache d'un condensat, s'il existe.
 ///
 /// Rend le chemin **et** le type MIME à servir. `None` signifie que le
@@ -1215,8 +1249,14 @@ pub fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> b
     if image_path.starts_with("http") {
         return false;
     }
-    cache_dir.join(format!("{image_path}.jpg")).exists()
-        || cache_dir.join(format!("{image_path}.png")).exists()
+    // Ne pas redresser ici une SECONDE liste d'extensions : `find_cached` est
+    // celle sous laquelle l'ecriture depose ses fichiers, et deux listes
+    // separees etaient deja la cause de #2567. Sondee a `.jpg`/`.png` seuls,
+    // une image posee a la main au format WebP ou BMP passait pour absente :
+    // la passe d'enrichissement automatique remettait l'artiste dans sa file
+    // (`batch_enrich_artist_artwork_inner`, requeue « cache manquant ») et
+    // ecrasait l'image que l'utilisateur venait de deposer (#3102).
+    find_cached(cache_dir, image_path).is_some()
 }
 
 /// Nom de la passe « par nom » (phase 3) dans le réglage
@@ -3463,5 +3503,136 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3102 — le format reel d'une image televersee.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests_format_image_televersee {
+    use super::*;
+
+    /// Aucune image de testeur n'entre dans ce depot : les octets ci-dessous
+    /// sont fabriques ici, en-tetes compris.
+    fn jpeg() -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        v.extend_from_slice(b"minuscule");
+        v
+    }
+    fn png() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(b"minuscule");
+        v
+    }
+    fn webp() -> Vec<u8> {
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&[0x1A, 0, 0, 0]);
+        v.extend_from_slice(b"WEBPVP8 ");
+        v.extend_from_slice(b"minuscule");
+        v
+    }
+    fn bmp() -> Vec<u8> {
+        let mut v = b"BM".to_vec();
+        v.extend_from_slice(b"minuscule");
+        v
+    }
+
+    /// Le format se lit dans les octets, et il tombe sur une extension que
+    /// [`find_cached`] cherche vraiment.
+    #[test]
+    fn chaque_format_reconnu_est_une_extension_servable() {
+        for (nom, octets) in [
+            ("jpeg", jpeg()),
+            ("png", png()),
+            ("webp", webp()),
+            ("bmp", bmp()),
+        ] {
+            let ext =
+                sniff_image_ext(&octets).unwrap_or_else(|| panic!("{nom} devrait etre reconnu"));
+            assert!(
+                CACHE_EXTENSIONS.contains(&ext),
+                "{nom} rendu comme `{ext}`, que la lecture ne cherche pas"
+            );
+            assert_eq!(
+                canonical_cache_ext(ext),
+                ext,
+                "{nom} : extension deja canonique"
+            );
+        }
+        assert_eq!(sniff_image_ext(&webp()), Some("webp"));
+        assert_eq!(sniff_image_ext(&png()), Some("png"));
+    }
+
+    /// Le defaut nu : ce que le testeur recupere sur Discogs peut etre du
+    /// WebP, et l'ancien gestionnaire l'ecrivait `.jpg` parce que le
+    /// `content-type` ne contenait pas « png ».
+    #[test]
+    fn un_webp_n_est_pas_un_jpeg() {
+        assert_ne!(sniff_image_ext(&webp()), Some("jpg"));
+    }
+
+    /// Ce qui n'est pas une image ne recoit aucune extension : l'appelant doit
+    /// le refuser, pas le ranger sous `.jpg`.
+    #[test]
+    fn ce_qui_n_est_pas_une_image_n_est_pas_reconnu() {
+        assert_eq!(sniff_image_ext(b"<html>pas une image</html>"), None);
+        assert_eq!(sniff_image_ext(b""), None);
+        assert_eq!(
+            sniff_image_ext(b"RIFF____WAVEfmt "),
+            None,
+            "un WAV n'est pas une image"
+        );
+        assert_eq!(
+            sniff_image_ext(&[0xFF, 0xD8]),
+            None,
+            "en-tete JPEG tronquee"
+        );
+    }
+
+    /// Le temoin de l'enrichissement automatique : une image posee a la main
+    /// est vue comme PRESENTE dans le cache, quel que soit son format. C'est
+    /// exactement le predicat sur lequel
+    /// `batch_enrich_artist_artwork_inner` decide de remettre un artiste dans
+    /// sa file — donc d'ecraser l'image.
+    #[test]
+    fn une_image_en_cache_est_vue_presente_dans_les_quatre_formats() {
+        let cache = crate::test_scratch::scratch_dir("tune-3102-cache-exists");
+        let mut manques = Vec::new();
+        for (i, (ext, octets)) in [
+            ("jpg", jpeg()),
+            ("png", png()),
+            ("webp", webp()),
+            ("bmp", bmp()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hash = format!("{i:032x}");
+            save_to_cache(&octets, cache.path(), &hash, ext).expect("ecriture cache");
+            if !cached_artwork_exists(cache.path(), &hash) {
+                manques.push(ext);
+            }
+        }
+        assert!(
+            manques.is_empty(),
+            "formats vus comme absents alors que le fichier est la : {manques:?}"
+        );
+    }
+
+    /// Contre-epreuve : un condensat SANS fichier reste absent, et une URL
+    /// distante reste « non mise en cache » — c'est ce qui permet a
+    /// l'enrichissement de la localiser.
+    #[test]
+    fn rien_en_cache_reste_absent() {
+        let cache = crate::test_scratch::scratch_dir("tune-3102-cache-absent");
+        assert!(!cached_artwork_exists(
+            cache.path(),
+            "ffffffffffffffffffffffffffffffff"
+        ));
+        assert!(!cached_artwork_exists(
+            cache.path(),
+            "https://exemple.invalid/artiste.jpg"
+        ));
     }
 }
