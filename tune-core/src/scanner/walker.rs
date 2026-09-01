@@ -543,6 +543,232 @@ pub struct ProgressionParcours<'a> {
 /// reçoive un flux régulier d'un bout à l'autre du scan.
 pub const CADENCE_PROGRESSION_PARCOURS: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Pourquoi une racine configurée n'est pas parcourue pour elle-même.
+///
+/// Ce n'est PAS un rejet : ses fichiers sont bien parcourus, par la racine qui
+/// la couvre. La distinction compte pour le rapport — une racine absorbée ne
+/// doit jamais être confondue avec une racine illisible, qui déclenche, elle,
+/// la protection de purge (#2356).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifAbsorption {
+    /// Deux écritures du MÊME dossier : chaîne différente, dossier identique.
+    Identique,
+    /// Sous-dossier d'une autre racine déjà parcourue.
+    Imbriquee,
+}
+
+impl MotifAbsorption {
+    /// L'étiquette stable posée au journal — lisible dans un export de
+    /// testeur, et cherchable.
+    pub fn etiquette(self) -> &'static str {
+        match self {
+            MotifAbsorption::Identique => "meme_dossier",
+            MotifAbsorption::Imbriquee => "sous_dossier",
+        }
+    }
+}
+
+/// Une racine configurée que le parcours n'ouvrira pas, et celle qui la couvre.
+#[derive(Debug, Clone)]
+pub struct RacineAbsorbee {
+    /// La racine telle que l'utilisateur l'a déclarée.
+    pub racine: String,
+    /// La racine qui la contient, telle qu'elle a été déclarée elle aussi.
+    pub couverte_par: String,
+    pub motif: MotifAbsorption,
+}
+
+/// Le verdict du dédoublonnage : ce qui sera parcouru, et ce qui a été absorbé.
+///
+/// Les deux listes sont rendues ensemble à dessein. Une déduplication ne se
+/// juge pas aux doublons qu'elle évite : elle se juge aussi aux racines
+/// légitimes qu'elle confond. Rendre `absorbees` permet de compter les deux.
+#[derive(Debug, Default)]
+pub struct RacinesDedoublonnees {
+    /// Les racines à parcourir, dans l'ordre où l'utilisateur les a déclarées
+    /// et sous leur écriture d'origine — le parcours les normalise lui-même,
+    /// et le journal doit nommer ce que l'utilisateur a saisi.
+    pub retenues: Vec<String>,
+    pub absorbees: Vec<RacineAbsorbee>,
+}
+
+/// Ce que le dédoublonnage sait d'une racine avant de décider.
+struct RacineSondee {
+    /// Chemin canonique : liens symboliques résolus, `..` réduits, relatif
+    /// rendu absolu. `None` si le chemin n'existe pas ou n'est pas résoluble.
+    canonique: Option<PathBuf>,
+    /// Identité du dossier au sens du système de fichiers. Elle attrape ce que
+    /// la chaîne manque : deux montages du même partage, un `mount --bind`,
+    /// une casse différente sur un volume insensible à la casse. `None` hors
+    /// Unix, où `std` n'expose pas d'identifiant stable.
+    identite: Option<(u64, u64)>,
+    /// Le chemin désigne bien un dossier.
+    est_dossier: bool,
+    /// `read_dir` répond. Seule une racine lisible peut en absorber une autre.
+    lisible: bool,
+}
+
+#[cfg(unix)]
+fn identite_de_dossier(chemin: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(chemin).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identite_de_dossier(_chemin: &std::path::Path) -> Option<(u64, u64)> {
+    // Windows n'expose pas d'identifiant de fichier stable par `std`. La
+    // comparaison retombe sur le chemin canonique, qui couvre déjà les
+    // jonctions et les chemins UNC résolus par `canonicalize`.
+    None
+}
+
+fn sonder_racine(brut: &str) -> RacineSondee {
+    let normalisee = normalize_path(brut);
+    let chemin = std::path::Path::new(&normalisee);
+    RacineSondee {
+        canonique: std::fs::canonicalize(chemin).ok(),
+        identite: identite_de_dossier(chemin),
+        est_dossier: chemin.is_dir(),
+        // Le parcours refera cette sonde quelques lignes plus loin pour en
+        // tirer le MOTIF de l'échec (`obstacle::obstacle_de_lecture`), qui
+        // demande l'`io::Error` lui-même. On ne la partage pas : `read_dir`
+        // n'est qu'un `openat` sur la racine — O(1), aucune entrée lue — et
+        // le coût est sans commune mesure avec le parcours qui suit.
+        lisible: std::fs::read_dir(chemin).is_ok(),
+    }
+}
+
+/// Réduit les racines configurées à celles qu'il faut réellement parcourir.
+///
+/// # Le défaut corrigé (#2889)
+///
+/// La boucle de parcours itérait sur les racines telles quelles. Chez JeromeQ,
+/// `/mnt/eversolo_nvme` et `/mnt/eversolo_nvme/77A6-799D` étaient tous deux
+/// déclarés : le second sous-arbre était donc parcouru DEUX fois — une fois
+/// pour lui-même, une fois à travers le premier. Chaque fichier entrait deux
+/// fois dans `files`, donc deux fois dans la phase de lecture des métadonnées,
+/// la plus longue du scan (48 minutes chez lui pour 30 000 fichiers).
+///
+/// # Ce que la clé couvre
+///
+/// - la même chaîne déclarée deux fois, aux espaces et à la barre finale près
+///   ([`normalize_path`]) ;
+/// - les allers-retours `.` et `..`, et un chemin relatif contre son absolu
+///   (`canonicalize`) ;
+/// - les liens symboliques, dans les deux sens — une racine lien vers une
+///   autre racine, ou une racine sous un parent traversé par lien
+///   (`canonicalize`) ;
+/// - sur Unix : deux montages distincts du même partage, un `mount --bind`,
+///   et une casse différente sur un volume insensible à la casse — ces
+///   trois-là par l'identité `(device, inode)`, que la chaîne ne voit pas.
+///
+/// # Ce qu'elle ne couvre PAS
+///
+/// - **hors Unix**, la casse : `D:\Musique` et `d:\musique` restent deux
+///   racines sous Windows, faute d'identifiant de fichier exposé par `std` ;
+/// - l'**imbrication** à travers une identité plutôt qu'un chemin : si
+///   `/mnt/a` et `/mnt/b` montent le même partage, `/mnt/a` et
+///   `/mnt/b/Jazz` ne sont pas rapprochés — seules les racines *égales* le
+///   sont. Le cas exact de #2889 (parent et enfant sous le même montage) est,
+///   lui, couvert ;
+/// - les **fichiers** atteignables par deux arbres (liens physiques). Le
+///   dédoublonnage porte sur les racines, pas sur les feuilles ; c'est le
+///   hachage audio qui répond de ce cas-là, plus loin dans le scan.
+///
+/// # Ce qui reste intact
+///
+/// Une racine **injoignable** — inexistante, NAS tombé, droits refusés — est
+/// TOUJOURS retenue : elle doit atteindre la sonde du parcours pour être
+/// rapportée dans `missing_dirs` avec son motif, ce qui déclenche
+/// `VerdictPurge::ProtegeIllisible` et empêche la purge de supprimer ses
+/// pistes (#2356). Elle n'absorbe personne non plus : un parent illisible ne
+/// parcourra rien, et avaler son enfant lisible perdrait un sous-arbre sain.
+pub fn dedoublonner_racines(dirs: &[String]) -> RacinesDedoublonnees {
+    let sondees: Vec<RacineSondee> = dirs.iter().map(|d| sonder_racine(d)).collect();
+
+    // Du plus court au plus long chemin canonique, pour qu'un parent soit
+    // toujours examiné avant ses enfants : sans cet ordre, déclarer l'enfant
+    // en premier ferait absorber le PARENT, et tout ce qu'il contient en
+    // dehors de l'enfant disparaîtrait de la bibliothèque. L'indice sert de
+    // départage pour que le résultat ne dépende pas de l'ordre de tri.
+    let mut ordre: Vec<usize> = (0..sondees.len()).collect();
+    ordre.sort_by_key(|&i| {
+        let profondeur = sondees[i]
+            .canonique
+            .as_ref()
+            .map(|c| c.components().count())
+            .unwrap_or(usize::MAX);
+        (profondeur, i)
+    });
+
+    let mut couverture: Vec<Option<(usize, MotifAbsorption)>> = vec![None; sondees.len()];
+    let mut retenues_idx: Vec<usize> = Vec::new();
+
+    for &i in &ordre {
+        let candidate = &sondees[i];
+        let Some(candidate_c) = candidate.canonique.as_ref() else {
+            retenues_idx.push(i);
+            continue;
+        };
+        if !candidate.est_dossier {
+            // Un chemin qui n'est pas un dossier doit atteindre le parcours
+            // pour y être nommé dans `missing_dirs` (#2356).
+            retenues_idx.push(i);
+            continue;
+        }
+
+        let mut couverte = None;
+        for &j in &retenues_idx {
+            let deja = &sondees[j];
+            if !deja.lisible {
+                continue;
+            }
+            let Some(deja_c) = deja.canonique.as_ref() else {
+                continue;
+            };
+            if candidate_c == deja_c
+                || (candidate.identite.is_some() && candidate.identite == deja.identite)
+            {
+                couverte = Some((j, MotifAbsorption::Identique));
+                break;
+            }
+            // `Path::starts_with` compare COMPOSANT par composant, jamais
+            // caractère par caractère : `/nas/Musique-2` ne commence pas par
+            // `/nas/Musique`. C'est ce qui distingue ce test d'un
+            // `str::starts_with`, qui fusionnerait deux bibliothèques
+            // voisines aux noms proches.
+            if candidate_c.starts_with(deja_c) {
+                couverte = Some((j, MotifAbsorption::Imbriquee));
+                break;
+            }
+        }
+        match couverte {
+            Some(c) => couverture[i] = Some(c),
+            None => retenues_idx.push(i),
+        }
+    }
+
+    // Rendues dans l'ordre de DÉCLARATION, pas dans l'ordre de tri : le
+    // journal, le rapport et l'écran doivent refléter ce que l'utilisateur a
+    // saisi.
+    let mut verdict = RacinesDedoublonnees::default();
+    for (i, dir) in dirs.iter().enumerate() {
+        match couverture[i] {
+            None => verdict.retenues.push(dir.clone()),
+            Some((j, motif)) => verdict.absorbees.push(RacineAbsorbee {
+                racine: dir.clone(),
+                couverte_par: dirs[j].clone(),
+                motif,
+            }),
+        }
+    }
+    verdict
+}
+
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
 }
@@ -617,7 +843,22 @@ pub fn list_audio_files_avec_progression(
     let mut derniere_annonce = std::time::Instant::now()
         .checked_sub(cadence)
         .unwrap_or_else(std::time::Instant::now);
-    for dir in dirs {
+
+    // Une racine imbriquée dans une autre était parcourue DEUX fois — une fois
+    // pour elle-même, une fois à travers sa parente (#2889). Le dédoublonnage
+    // se fait ici, au seul goulot par lequel passent les quatre appelants du
+    // parcours : `auto_scan`, `export`, `ingest` et le scan principal.
+    let racines = dedoublonner_racines(dirs);
+    for absorbee in &racines.absorbees {
+        info!(
+            racine = %absorbee.racine,
+            couverte_par = %absorbee.couverte_par,
+            motif = %absorbee.motif.etiquette(),
+            "scan_root_absorbed — racine déjà couverte par une autre, parcourue une seule fois"
+        );
+    }
+
+    for dir in &racines.retenues {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
 
@@ -929,6 +1170,11 @@ pub fn list_audio_files_avec_progression(
     info!(
         count = files.len(),
         dirs = dirs.len(),
+        // Ce que le parcours a réellement ouvert, et ce qu'il a économisé.
+        // Sans ces deux champs, un `count` divisé par deux d'un scan à l'autre
+        // resterait inexplicable dans un journal de testeur (#2889).
+        parcourues = racines.retenues.len(),
+        absorbees = racines.absorbees.len(),
         missing = missing_dirs.len(),
         walk_errors = error_dirs.len(),
         "audio_files_listed"
@@ -2274,5 +2520,323 @@ mod tests {
     fn normalize_path_windows_unc() {
         assert_eq!(normalize_path("\\\\NAS\\Musique"), "\\\\NAS\\Musique");
         assert_eq!(normalize_path("//NAS/Musique"), "\\\\NAS\\Musique");
+    }
+
+    // ————————————————————————————————————————————————————————————————
+    // #2889 — deux racines imbriquées énuméraient deux fois le même fichier
+    // ————————————————————————————————————————————————————————————————
+
+    /// Une racine de bibliothèque de test, **hors du dossier temporaire du
+    /// système**, et supprimée par `Drop` (#3030).
+    ///
+    /// Le « hors de `temp_dir()` » n'est pas un détail de confort : le parcours
+    /// écarte tout fichier situé sous le dossier temporaire du système
+    /// (`scanner::is_tune_temp_file`, dernière ligne — `path.starts_with(temp_dir())`),
+    /// pour qu'une bibliothèque enracinée au-dessus de `%TEMP%` n'indexe pas
+    /// les transcodages de Tune. Une fixture posée dans `temp_dir()` rendrait
+    /// donc un parcours VIDE — mesuré : les six cas de #2889 rendaient `[]`
+    /// avec `tempfile::tempdir()`, un rouge qui ne prouvait rien du défaut
+    /// visé. `target/` est le seul emplacement à la fois inscriptible,
+    /// hors `temp_dir()`, et déjà ignoré par git.
+    fn racine_de_test(etiquette: &str) -> crate::test_scratch::ScratchDir {
+        let sous_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&sous_target).expect("création de target/");
+        crate::test_scratch::scratch_dir_in(sous_target, etiquette)
+    }
+
+    /// Pose un fichier d'extension audio reconnue. Le parcours ne lit AUCUN
+    /// octet — il classe par extension — donc un fichier vide suffit et le test
+    /// reste une opération de répertoire, sans fixture binaire.
+    fn poser_piste(dossier: &std::path::Path, nom: &str) -> PathBuf {
+        std::fs::create_dir_all(dossier).expect("création du dossier de test");
+        let chemin = dossier.join(nom);
+        std::fs::write(&chemin, b"").expect("écriture de la piste de test");
+        chemin
+    }
+
+    /// Le fait de base du ticket : avec une racine imbriquée dans une autre,
+    /// chaque fichier n'est énuméré qu'une fois.
+    ///
+    /// Chez JeromeQ, `/mnt/eversolo_nvme` et `/mnt/eversolo_nvme/77A6-799D`
+    /// étaient tous deux déclarés. La boucle `for dir in dirs` parcourait la
+    /// seconde racine une fois pour elle-même et une fois à travers la
+    /// première : chaque fichier du sous-arbre entrait deux fois dans `files`,
+    /// donc deux fois dans la phase de métadonnées, la plus coûteuse du scan.
+    #[test]
+    fn une_racine_imbriquee_n_enumere_pas_deux_fois_le_meme_fichier() {
+        // `TempDir` nettoie par `Drop` — jamais de chemin temporaire composé à
+        // la main (#3030).
+        let base = racine_de_test("p2a2889-imbriquee");
+        let parent = base.join("bibliotheque");
+        let enfant = parent.join("montage");
+        poser_piste(&parent, "au-dessus.flac");
+        poser_piste(&enfant, "en-dessous.flac");
+
+        let result = list_audio_files(&[
+            parent.to_string_lossy().to_string(),
+            enfant.to_string_lossy().to_string(),
+        ]);
+
+        let en_dessous = result
+            .files
+            .iter()
+            .filter(|f| f.ends_with("en-dessous.flac"))
+            .count();
+        assert_eq!(
+            en_dessous, 1,
+            "le fichier de la racine imbriquée est énuméré {en_dessous} fois : {:?}",
+            result.files
+        );
+        assert_eq!(
+            result.files.len(),
+            2,
+            "l'union des deux racines vaut deux fichiers : {:?}",
+            result.files
+        );
+        // La racine absorbée n'est pas « manquante » : ses fichiers sont bien
+        // là, par la racine parente. La confondre avec une racine illisible
+        // déclencherait la protection de purge sur un sous-arbre sain.
+        assert!(
+            result.missing_dirs.is_empty(),
+            "racine absorbée comptée comme manquante : {:?}",
+            result.missing_dirs
+        );
+    }
+
+    /// Le TÉMOIN, vert des deux côtés du correctif : deux racines réellement
+    /// distinctes restent deux, même quand leurs noms se ressemblent.
+    ///
+    /// C'est le contrôle de collision demandé par le dépôt : une clé de
+    /// déduplication trop large fusionnerait `Musique` et `Musique-2`, ou
+    /// `Jazz` et `Jazz Live`, et ferait disparaître une bibliothèque entière.
+    #[test]
+    fn deux_racines_reellement_distinctes_restent_deux() {
+        let base = racine_de_test("p2a2889-distinctes");
+        // Des noms qui se ressemblent par préfixe de CHAÎNE — c'est
+        // exactement le piège d'un `starts_with` posé sur du texte.
+        let noms = [
+            "Musique",
+            "Musique-2",
+            "Musique 2",
+            "Musiques",
+            "MusiqueBis",
+            "Jazz",
+            "Jazz Live",
+        ];
+        let mut racines = Vec::new();
+        for nom in noms {
+            let dossier = base.join(nom);
+            poser_piste(&dossier, "piste.flac");
+            racines.push(dossier.to_string_lossy().to_string());
+        }
+
+        let result = list_audio_files(&racines);
+
+        assert_eq!(
+            result.files.len(),
+            noms.len(),
+            "{} racines distinctes doivent rendre {} fichiers, obtenu {:?}",
+            noms.len(),
+            noms.len(),
+            result.files
+        );
+        for nom in noms {
+            let attendu = base.join(nom).join("piste.flac");
+            assert!(
+                result.files.iter().any(|f| f == &attendu),
+                "la racine {nom} a été avalée : {:?}",
+                result.files
+            );
+        }
+    }
+
+    /// Le cas symétrique : deux racines qui désignent le MÊME dossier par des
+    /// chemins différents. La chaîne brute ne les rapproche pas ; le chemin
+    /// canonique, si.
+    #[test]
+    fn deux_chemins_pour_le_meme_dossier_ne_font_qu_une_racine() {
+        let base = racine_de_test("p2a2889-meme-dossier");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+
+        // Trois écritures du même dossier : telle quelle, avec un aller-retour
+        // `..`, et avec une barre finale.
+        let detour = base.join("bibliotheque/../bibliotheque");
+        let racines = vec![
+            reel.to_string_lossy().to_string(),
+            detour.to_string_lossy().to_string(),
+            format!("{}/", reel.to_string_lossy()),
+        ];
+
+        let result = list_audio_files(&racines);
+        assert_eq!(
+            result.files.len(),
+            1,
+            "le même dossier écrit de trois façons rend {:?}",
+            result.files
+        );
+    }
+
+    /// Même cas symétrique, par lien symbolique — la forme qu'on rencontre
+    /// réellement sur un serveur : `/music` pointant vers `/mnt/nas/music`.
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_vers_une_racine_ne_la_double_pas() {
+        let base = racine_de_test("p2a2889-symlink");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+        let lien = base.join("raccourci");
+        std::os::unix::fs::symlink(&reel, &lien).expect("lien symbolique");
+
+        let result = list_audio_files(&[
+            reel.to_string_lossy().to_string(),
+            lien.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(
+            result.files.len(),
+            1,
+            "la racine et son lien symbolique rendent {:?}",
+            result.files
+        );
+    }
+
+    /// Une racine injoignable reste retenue : elle DOIT atteindre la sonde
+    /// `read_dir` pour être rapportée dans `missing_dirs` avec son motif — ce
+    /// qui déclenche `VerdictPurge::ProtegeIllisible` et empêche la purge de
+    /// supprimer ses pistes (#2356). Le dédoublonnage ne doit rien y changer.
+    #[test]
+    fn une_racine_injoignable_traverse_le_dedoublonnage() {
+        let base = racine_de_test("p2a2889-injoignable");
+        let reel = base.join("bibliotheque");
+        poser_piste(&reel, "unique.flac");
+        let absente = base.join("montage-tombe");
+
+        let result = list_audio_files(&[
+            reel.to_string_lossy().to_string(),
+            absente.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "la racine injoignable doit être rapportée : {:?}",
+            result.missing_dirs
+        );
+        assert_eq!(result.missing_dir_reasons.len(), 1);
+    }
+
+    /// Une racine parente ILLISIBLE ne doit pas avaler son enfant lisible :
+    /// sans quoi le sous-arbre sain ne serait parcouru par personne.
+    #[cfg(unix)]
+    #[test]
+    fn une_racine_parente_illisible_n_avale_pas_son_enfant_lisible() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = racine_de_test("p2a2889-parent-illisible");
+        let parent = base.join("parent");
+        let enfant = parent.join("enfant");
+        poser_piste(&enfant, "piste.flac");
+        // 0o300 : traversable (`x`) mais non listable (`r`) — `read_dir` échoue,
+        // le chemin de l'enfant reste atteignable.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300))
+            .expect("droits du parent");
+
+        let result = list_audio_files(&[
+            parent.to_string_lossy().to_string(),
+            enfant.to_string_lossy().to_string(),
+        ]);
+        // Remettre les droits AVANT les assertions, sinon le `Drop` du
+        // `TempDir` échoue à nettoyer et le test fuit un dossier (#3030).
+        let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
+
+        assert_eq!(
+            result.files.len(),
+            1,
+            "l'enfant lisible doit rester parcouru : {:?}",
+            result.files
+        );
+        assert_eq!(
+            result.missing_dirs.len(),
+            1,
+            "le parent illisible doit être rapporté : {:?}",
+            result.missing_dirs
+        );
+    }
+
+    /// Le décompte que la revue réclame, mesuré et non estimé : combien de
+    /// racines la nouvelle clé ABSORBE, et combien elle en fait COLLISIONNER.
+    ///
+    /// Une déduplication ne se juge pas aux doublons qu'elle évite : elle se
+    /// juge aussi aux racines légitimes qu'elle confond. Les deux chiffres
+    /// sortent ici du même jeu de racines.
+    #[test]
+    fn le_dedoublonnage_compte_ses_absorptions_et_ses_collisions() {
+        let base = racine_de_test("p2a2889-comptes");
+        let bibliotheque = base.join("Musique");
+        let imbriquee = bibliotheque.join("Jazz");
+        std::fs::create_dir_all(&imbriquee).expect("arborescence");
+        let distinctes = [
+            base.join("Musique-2"),
+            base.join("Musiques"),
+            base.join("Jazz"),
+        ];
+        for d in &distinctes {
+            std::fs::create_dir_all(d).expect("arborescence");
+        }
+
+        let racines: Vec<String> = std::iter::once(bibliotheque.clone())
+            .chain(std::iter::once(imbriquee.clone()))
+            // le même dossier, écrit deux fois
+            .chain(std::iter::once(bibliotheque.clone()))
+            .chain(distinctes.iter().cloned())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let verdict = dedoublonner_racines(&racines);
+
+        // CHIFFRE 1 — doublons évités : la racine imbriquée, plus la
+        // répétition littérale de la racine parente.
+        assert_eq!(
+            verdict.absorbees.len(),
+            2,
+            "absorptions inattendues : {:?}",
+            verdict.absorbees
+        );
+        assert!(
+            verdict
+                .absorbees
+                .iter()
+                .any(|a| a.motif == MotifAbsorption::Imbriquee),
+            "l'imbrication n'a pas été reconnue : {:?}",
+            verdict.absorbees
+        );
+        assert!(
+            verdict
+                .absorbees
+                .iter()
+                .any(|a| a.motif == MotifAbsorption::Identique),
+            "la répétition littérale n'a pas été reconnue : {:?}",
+            verdict.absorbees
+        );
+
+        // CHIFFRE 2 — collisions : aucune racine réellement distincte ne doit
+        // disparaître. C'est le chiffre que la règle du dépôt réclame à côté
+        // du premier, et il doit valoir zéro.
+        let retenues: Vec<&str> = verdict.retenues.iter().map(String::as_str).collect();
+        let mut collisions = 0usize;
+        for d in &distinctes {
+            let attendu = d.to_string_lossy().to_string();
+            if !retenues.contains(&attendu.as_str()) {
+                collisions += 1;
+            }
+        }
+        assert_eq!(
+            collisions, 0,
+            "{collisions} racine(s) distincte(s) avalée(s) : attendu {distinctes:?}, retenues {retenues:?}"
+        );
+        assert_eq!(
+            verdict.retenues.len(),
+            1 + distinctes.len(),
+            "retenues : {retenues:?}"
+        );
     }
 }
