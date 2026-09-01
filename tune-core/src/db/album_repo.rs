@@ -1539,8 +1539,15 @@ impl AlbumRepo {
     /// C'est tout le « bouton de re-tirage » demande au fil 1635 (#3074) :
     /// re-tirer, c'est changer de graine, rien d'autre.
     pub fn graine_aleatoire() -> i64 {
-        use rand_core::RngCore;
-        (rand_core::OsRng.next_u64() % (Self::GRAINE_MODULE as u64)) as i64
+        // `getrandom` et non `rand_core::OsRng` : `rand_core` n'est declare que
+        // sous `[target.'cfg(unix)'.dependencies]`, ou il sert a l'appairage
+        // AirPlay 2. La vue Bibliotheque, elle, est compilee sur les trois
+        // plateformes, et l'import cassait la compilation Windows (E0432).
+        // `getrandom` est une dependance ordinaire de la caisse, meme source
+        // d'entropie, et c'est deja l'idiome de `db_backup::encrypt_backup`.
+        let mut octets = [0u8; 8];
+        getrandom::getrandom(&mut octets).expect("OS RNG unavailable");
+        (u64::from_le_bytes(octets) % (Self::GRAINE_MODULE as u64)) as i64
     }
 
     /// L'expression SQL qui range les albums « au hasard, mais toujours de la
