@@ -116,6 +116,61 @@ impl MockOutput {
         self.play_calls.lock().await.last().map(|c| c.url.clone())
     }
 
+    /// Les titres passes a `set_next_media`, DANS L'ORDRE (#3026).
+    ///
+    /// Le COMPTE d'appels ne dit pas *quelle* piste a ete armee, et l'URL d'un
+    /// flux local est un identifiant de session opaque. Le titre est ce que le
+    /// renderer recoit dans ses metadonnees, donc ce que l'ecran doit nommer :
+    /// c'est la seule grandeur qui permette de comparer « ce qui part au
+    /// renderer » a « ce que la file affiche ».
+    pub async fn set_next_titles(&self) -> Vec<String> {
+        self.set_next_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Les titres passes a `play_media`, DANS L'ORDRE.
+    pub async fn play_titles(&self) -> Vec<String> {
+        self.play_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// L'URI que le renderer joue reellement.
+    pub async fn current_uri(&self) -> Option<String> {
+        self.current_uri.lock().await.clone()
+    }
+
+    /// Le TITRE de ce que le renderer joue reellement, retrouve par l'URI telle
+    /// qu'elle lui a ete donnee. C'est la correspondance qui manque au journal
+    /// de #3026 : l'ecran doit nommer le flux physiquement en cours, pas un
+    /// index de file.
+    pub async fn current_title(&self) -> Option<String> {
+        let uri = self.current_uri.lock().await.clone()?;
+        let joue = self
+            .play_calls
+            .lock()
+            .await
+            .iter()
+            .find(|c| c.url == uri)
+            .and_then(|c| c.title.clone());
+        if joue.is_some() {
+            return joue;
+        }
+        self.set_next_calls
+            .lock()
+            .await
+            .iter()
+            .find(|c| c.url == uri)
+            .and_then(|c| c.title.clone())
+    }
+
     pub async fn last_next_url(&self) -> Option<String> {
         self.set_next_calls
             .lock()
