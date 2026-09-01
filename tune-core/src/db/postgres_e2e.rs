@@ -770,3 +770,24 @@ async fn pg_2860_continuer_lecoute_et_ajouts_recents() {
         "erreur attendue « column \"listened_tracks\" does not exist », obtenue : {err}"
     );
 }
+
+/// Restauration de sauvegarde : le volume fixe ne se rearme jamais, et le
+/// volume d'une zone armee ne se propage pas (#2395, #2477).
+///
+/// La requete `UPDATE` de `import_zones` est BATIE — elle porte ou non la
+/// colonne `volume` selon la sauvegarde. Une requete batie doit rendre le meme
+/// resultat sur les deux moteurs : ces scenarios sont exactement ceux que le
+/// `mod tests` de `config_backup` joue sur SQLite, rejoues ici sur une VRAIE
+/// base PostgreSQL. Sans cette etape, seul le moteur par defaut serait exerce.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_config_backup_zones_volume_fixe() {
+    use crate::config_backup::scenarios_zones;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+
+    scenarios_zones::une_zone_armee_ne_revient_ni_armee_ni_a_100(&db);
+    scenarios_zones::une_zone_armee_absente_prend_le_defaut_du_schema(&db);
+    scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
+    scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
+}
