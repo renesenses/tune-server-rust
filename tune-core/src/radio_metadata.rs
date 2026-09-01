@@ -27,10 +27,10 @@ pub struct IcyMetadata {
 /// endpoints. As a fallback it attempts to read raw ICY metadata from the audio
 /// stream.
 pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Option<IcyMetadata> {
-    fetch_radio_metadata_depuis(RADIOFRANCE_LIVEMETA_BASE, station_name, stream_url).await
+    fetch_radio_metadata_depuis(VoiesRadioFrance::REELLES, station_name, stream_url).await
 }
 
-/// Le même parcours, la racine `livemeta` en paramètre.
+/// Le même parcours, les racines Radio France en paramètre.
 ///
 /// C'est ce que la BBC a déjà fait pour son propre distant (#3139) : la racine
 /// est un paramètre pour que la contre-épreuve puisse dresser un faux service.
@@ -38,7 +38,7 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
 /// flux icecast. Sans ce paramètre, la seule façon d'établir ce que la route
 /// rend pour une station serait de l'interroger pour de vrai.
 async fn fetch_radio_metadata_depuis(
-    livemeta_base: &str,
+    voies: VoiesRadioFrance<'_>,
     station_name: &str,
     stream_url: &str,
 ) -> Option<IcyMetadata> {
@@ -54,7 +54,15 @@ async fn fetch_radio_metadata_depuis(
         // Fall through to the raw ICY reader rather than querying a channel
         // that belongs to a different station.
         if let Some(channel) = radiofrance_channel_id(station_name, stream_url) {
-            return fetch_radiofrance_metadata(livemeta_base, station_name, channel).await;
+            return fetch_radiofrance_metadata(voies.pull, station_name, channel).await;
+        }
+        // `pull` ne les couvre pas, `live` si (#3149) : les trois webradios FIP
+        // dont `pull/78`, `pull/95` et `pull/96` répondent 404 sont servies par
+        // l'autre voie de la MÊME API. Rien d'autre ne passe par ici : le
+        // balayage des identifiants `live` 1 à 300 du 01/09/2026 s'arrête à 100
+        // et n'y trouve aucune webradio France Musique (#3142).
+        if let Some(id) = radiofrance_live_id(station_name, stream_url) {
+            return fetch_radiofrance_live_metadata(voies.live, station_name, id).await;
         }
     }
 
@@ -85,6 +93,45 @@ async fn fetch_radio_metadata_depuis(
 
 /// Racine du service `livemeta` de Radio France — public, sans clef ni compte.
 const RADIOFRANCE_LIVEMETA_BASE: &str = "https://api.radiofrance.fr/livemeta/pull";
+
+/// Racine de l'**autre** voie du même service `livemeta` (#3149).
+///
+/// `livemeta/live/{id}/{preset}` — publique elle aussi, sans clef ni compte :
+/// un `400` sur un préréglage inconnu liste d'ailleurs les préréglages valides.
+const RADIOFRANCE_LIVE_BASE: &str = "https://api.radiofrance.fr/livemeta/live";
+
+/// Le préréglage du lecteur de webradios du site, mesuré le 01/09/2026.
+///
+/// C'est un identifiant **interne au lecteur**, pas un contrat : rien ne
+/// garantit qu'il survive à une refonte du site. Quand il disparaîtra, la route
+/// rendra `400` — `fetch_radiofrance_live_metadata` s'arrête alors sur son test
+/// de statut et les trois stations retournent à l'absence propre d'où elles
+/// viennent. Aucun écran ne montrera de titre faux pour autant.
+const RADIOFRANCE_LIVE_PRESET: &str = "webrf_musique_inter_webradio_player";
+
+/// Les racines des **deux** voies `livemeta` de Radio France.
+///
+/// Elles voyagent ensemble parce qu'elles se relaient sur la même famille :
+/// une station passe par `pull` quand elle y a un canal, par `live` sinon. Les
+/// tenir en un seul paramètre évite qu'une contre-épreuve dresse un faux
+/// service pour l'une et appelle la **vraie** API pour l'autre.
+#[derive(Clone, Copy)]
+struct VoiesRadioFrance<'a> {
+    /// `livemeta/pull/{canal}` : les stations principales et les huit
+    /// webradios FIP qui y ont un canal.
+    pull: &'a str,
+    /// `livemeta/live/{id}/{preset}` : les trois webradios FIP que `pull`
+    /// ignore (404).
+    live: &'a str,
+}
+
+impl VoiesRadioFrance<'static> {
+    /// Les vraies racines — celles qu'emprunte le serveur, jamais un test.
+    const REELLES: Self = Self {
+        pull: RADIOFRANCE_LIVEMETA_BASE,
+        live: RADIOFRANCE_LIVE_BASE,
+    };
+}
 
 /// Le qualificatif de webradio porté par un nom de station ou une URL de flux.
 ///
@@ -322,6 +369,186 @@ async fn fetch_radiofrance_metadata(
         station: Some(station_name.to_string()),
         cover_url,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Radio France — la voie `live` (#3149)
+// ---------------------------------------------------------------------------
+
+/// L'identifiant `livemeta/live` des **trois** webradios FIP que `pull` ignore.
+///
+/// FIP Pop, FIP Hip-Hop et FIP Sacré français n'affichaient aucun morceau :
+/// `pull/78`, `pull/95` et `pull/96` répondent **404**, et leurs flux AAC ne
+/// portent pas d'`icy-metaint`. Elles étaient donc éteintes — à raison, tant
+/// qu'aucune source ne les couvrait : un titre faux est pire qu'une absence.
+///
+/// Mesuré le 01/09/2026 : `livemeta/live/{id}/{preset}` — l'**autre voie de la
+/// même API** — rend le morceau en cours des trois pour ces mêmes numéros.
+///
+/// **Trois, et pas une de plus.** L'espace d'identifiants de `live` a été
+/// balayé de 1 à 300 : il s'arrête à 100, et aucune webradio France Musique n'y
+/// figure. Les neuf de #3142 restent sans source, et restent éteintes. Les huit
+/// webradios FIP qui ont un canal `pull` ne passent pas par ici non plus :
+/// l'appelant a déjà rendu avant d'arriver à cette fonction.
+fn radiofrance_live_id(station_name: &str, stream_url: &str) -> Option<u32> {
+    let hay = format!(
+        "{} {}",
+        station_name.to_lowercase(),
+        stream_url.to_lowercase()
+    );
+    // `None` ici veut dire « ce n'est pas FIP du tout » : `fip` collé derrière
+    // autre chose n'ouvre pas son jeton (#3142). La chaîne vide veut dire « FIP
+    // principale », qui a son canal `pull` et n'a rien à faire ici.
+    let qualificatif = qualificatif_webradio(&hay, "fip")?;
+    // Le nom livré et le radical du flux ne s'écrivent pas pareil : « FIP
+    // Hip-Hop » rend `hip hop`, `fiphiphop-hifi.aac` rend `hiphop` ; « FIP
+    // Sacré français » garde ses accents — `char::is_alphanumeric` est Unicode
+    // — là où `fipsacrefrancais-hifi.aac` rend `sacrefrancais`. Les deux
+    // écritures sont reconnues, et `hiphop` est cherché avant `pop` pour qu'un
+    // ajout de motif ne puisse pas les intervertir.
+    if qualificatif.contains("hiphop") || qualificatif.contains("hip hop") {
+        Some(95)
+    } else if qualificatif.contains("pop") {
+        Some(78)
+    } else if qualificatif.contains("sacre") || qualificatif.contains("sacré") {
+        Some(96)
+    } else {
+        None
+    }
+}
+
+/// La marge autour de la fenêtre du morceau, en secondes.
+///
+/// Elle sépare deux choses mesurées le 01/09/2026, et il y a deux ordres de
+/// grandeur entre elles :
+///
+/// - le **relais normal** : `now` garde le morceau qui vient de finir jusqu'à
+///   ce que le suivant soit annoncé — relevé à **21 s** au plus, en
+///   échantillonnant les trois stations toutes les 20 s ;
+/// - la **réponse périmée** : une même requête a rendu un `now` dont l'`endTime`
+///   était **2 131 s** — trente-cinq minutes — dans le passé, avant de
+///   redevenir fraîche au sondage suivant.
+///
+/// Une minute laisse passer le premier et arrête le second.
+const RADIOFRANCE_LIVE_TOLERANCE_S: i64 = 60;
+
+/// L'instant présent, en secondes depuis 1970.
+fn maintenant_epoch_s() -> Option<i64> {
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64,
+    )
+}
+
+/// Lire le morceau **en cours** dans la réponse de la voie `live`.
+///
+/// ## La forme, mesurée — elle n'a rien à voir avec celle de `pull`
+///
+/// `pull` rend `levels[0].items[position] → steps[uuid]`. `live` rend trois
+/// cases côte à côte, `prev` / `now` / `next`, plus un `delayToRefresh` ; le
+/// morceau est dans `now`, son titre en `firstLine`, son interprète en
+/// `secondLine`, son genre en `thirdLine`.
+///
+/// ## Ce que l'API rend quand rien ne joue
+///
+/// Elle rend quand même un `now` **complet** — le piège exact que la BBC nous a
+/// coûté (#2486). Mais elle le remplit avec la **carte de la station** au lieu
+/// d'un morceau : `firstLine` devient `"Le direct"`, `secondLine` la phrase de
+/// présentation de la webradio, et surtout `songUuid`, `startTime` et `endTime`
+/// passent tous les trois à `null`. Mesuré le 01/09/2026 sur `live/7` (FIP
+/// principale), qui rendait cette carte pendant que les webradios rendaient
+/// leurs morceaux. Sans garde, l'écran aurait affiché « Le direct » de « La
+/// radio la plus éclectique du monde » comme s'il s'agissait d'un titre.
+///
+/// ## Ce que l'API rend quand elle est en retard
+///
+/// La même réponse, complète et plausible, mais périmée : un `now` dont
+/// l'`endTime` était **2 131 s** dans le passé a été servi, puis la requête
+/// suivante est redevenue fraîche. Une charge utile pleine ne prouve donc pas
+/// qu'elle décrit l'instant présent.
+///
+/// ## La garde
+///
+/// Trois conditions, et le morceau n'est rendu que si les trois tiennent :
+/// `songUuid` est une chaîne non vide — c'est ce qui distingue un morceau d'une
+/// carte de station —, `startTime` et `endTime` sont tous deux présents, et
+/// **l'instant présent tombe dans la fenêtre `[startTime, endTime]`**, élargie
+/// de [`RADIOFRANCE_LIVE_TOLERANCE_S`] de chaque côté. `maintenant` est un
+/// paramètre pour que la contre-épreuve puisse placer l'horloge où elle veut.
+fn lire_morceau_en_cours_radiofrance_live(
+    body: &serde_json::Value,
+    station_name: &str,
+    maintenant: i64,
+) -> Option<IcyMetadata> {
+    let now = body.get("now")?;
+
+    // Une carte de station n'a pas d'UUID de morceau : c'est le signe qu'il n'y
+    // a rien à afficher, pas une métadonnée manquante.
+    let uuid = now.get("songUuid").and_then(|v| v.as_str())?;
+    if uuid.trim().is_empty() {
+        return None;
+    }
+
+    let debut = now.get("startTime").and_then(serde_json::Value::as_i64)?;
+    let fin = now.get("endTime").and_then(serde_json::Value::as_i64)?;
+    if maintenant + RADIOFRANCE_LIVE_TOLERANCE_S < debut
+        || maintenant - RADIOFRANCE_LIVE_TOLERANCE_S > fin
+    {
+        debug!(
+            station = %station_name,
+            retard_s = maintenant - fin,
+            "radiofrance_live_hors_fenetre"
+        );
+        return None;
+    }
+
+    let title = now.get("firstLine").and_then(|v| v.as_str())?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let artist = now
+        .get("secondLine")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Some(IcyMetadata {
+        title: title.to_string(),
+        artist,
+        station: Some(station_name.to_string()),
+        // `cover` ne porte pas une adresse : c'est un UUID nu
+        // (`095da3c1-5474-…`), et les racines candidates sondées le 01/09/2026
+        // rendent toutes 401, 403 ou 404. `url_de_pochette` le rejette donc, et
+        // l'écran garde le logo de la station — un logo juste vaut mieux qu'une
+        // image cassée.
+        cover_url: url_de_pochette(now.get("cover").and_then(|v| v.as_str())),
+    })
+}
+
+/// `base` est un paramètre pour que la contre-épreuve puisse dresser un faux
+/// service : aucun test de ce dépôt n'appelle une vraie radio.
+async fn fetch_radiofrance_live_metadata(
+    base: &str,
+    station_name: &str,
+    id: u32,
+) -> Option<IcyMetadata> {
+    let url = format!("{base}/{id}/{RADIOFRANCE_LIVE_PRESET}");
+    let client = crate::http::client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    // C'est ici que se règle la disparition du préréglage : la route rendra
+    // `400`, on s'arrête, et la station retourne à l'absence.
+    if !resp.status().is_success() {
+        debug!(station = %station_name, status = %resp.status(), "radiofrance_live_api_error");
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    lire_morceau_en_cours_radiofrance_live(&body, station_name, maintenant_epoch_s()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1703,97 @@ mod tests {
         format!("{flux}/radiofrance/{radical}-hifi.aac")
     }
 
+    /// Les deux racines Radio France d'un test, toutes les deux locales.
+    ///
+    /// Passer les deux ensemble est ce qui garantit qu'aucun chemin de la
+    /// famille — ni `pull`, ni `live` — ne puisse s'échapper vers la vraie API.
+    fn voies<'a>(pull: &'a str, live: &'a str) -> VoiesRadioFrance<'a> {
+        VoiesRadioFrance { pull, live }
+    }
+
+    /// Faux `livemeta/live`, **à la forme mesurée** le 01/09/2026 :
+    /// `prev` / `now` / `next` côte à côte, le titre en `firstLine`,
+    /// l'interprète en `secondLine`, le genre en `thirdLine`, un `songUuid` et
+    /// une fenêtre `startTime` / `endTime` en secondes epoch.
+    ///
+    /// `decalage_s` déplace cette fenêtre par rapport à l'instant présent : `0`
+    /// pour un morceau qui joue vraiment, une grande valeur négative pour la
+    /// réponse périmée que la vraie API a servie.
+    ///
+    /// Comme la vraie route, il rend `400` sur un préréglage qu'il ne connaît
+    /// pas, et chaque identifiant rend un morceau **qui le nomme** : deux
+    /// stations ne peuvent pas rendre le même titre par accident.
+    async fn faux_live(decalage_s: i64) -> String {
+        faux_live_avec_preregage(decalage_s, RADIOFRANCE_LIVE_PRESET).await
+    }
+
+    /// Le même faux service, mais qui n'accepte que `preregage_accepte`.
+    ///
+    /// Servir un autre préréglage que celui du code, c'est jouer la refonte du
+    /// lecteur du site : l'identifiant interne a changé, la route rend `400`.
+    async fn faux_live_avec_preregage(decalage_s: i64, preregage_accepte: &str) -> String {
+        let attendu = preregage_accepte.to_string();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let attendu = attendu.clone();
+            async move {
+                use axum::response::IntoResponse as _;
+                let chemin = uri.path().trim_start_matches('/').to_string();
+                let mut morceaux = chemin.split('/');
+                let id = morceaux.next().unwrap_or_default().to_string();
+                let preregage = morceaux.next().unwrap_or_default();
+                if preregage != attendu {
+                    // Le corps du vrai 400, à la forme mesurée le 01/09/2026 :
+                    // un objet JSON qui liste les préréglages valides. Il ne
+                    // porte donc **pas** de `now` — l'absence est tenue deux
+                    // fois, par le statut puis par l'analyseur.
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({
+                            "errCode": "e120",
+                            "errMessage": "Expected rule to match 'apprf_bleu_display|…'",
+                        })),
+                    )
+                        .into_response();
+                }
+                let t = maintenant_epoch_s().expect("horloge après 1970");
+                axum::Json(json!({
+                    "prev": [carte_de_station("Webradio")],
+                    "now": {
+                        "firstLine": format!("Morceau de la webradio {id}"),
+                        "firstLineSongUuid": format!("uuid-{id}"),
+                        "secondLine": format!("Interprète de la webradio {id}"),
+                        "secondLineSongUuid": format!("uuid-{id}"),
+                        "thirdLine": "Pop",
+                        "songUuid": format!("uuid-{id}"),
+                        // Un UUID nu, comme le vrai service : pas une adresse.
+                        "cover": "00000000-0000-0000-0000-000000000000",
+                        "startTime": t - 90 + decalage_s,
+                        "endTime": t + 90 + decalage_s,
+                    },
+                    "next": [],
+                    "delayToRefresh": 60000,
+                }))
+                .into_response()
+            }
+        });
+        faux_distant(app).await
+    }
+
+    /// La **carte de la station** — ce que `live` met dans `now` quand aucun
+    /// morceau ne joue. Relevé tel quel sur `live/7` le 01/09/2026 : les trois
+    /// champs qui identifient un morceau sont `null`.
+    fn carte_de_station(genre: &str) -> Value {
+        json!({
+            "firstLine": "Le direct",
+            "secondLine": "La radio la plus éclectique du monde",
+            "thirdLine": genre,
+            "songUuid": Value::Null,
+            "cover": "34e98566-0000-0000-0000-000000000000",
+            "startTime": Value::Null,
+            "endTime": Value::Null,
+        })
+    }
+
     /// **LE FAIT.** Ce que la route rend pour chacune des onze stations.
     ///
     /// Rouge avant le correctif : les onze rendaient `Morceau du canal 4`,
@@ -1484,7 +1802,9 @@ mod tests {
     #[tokio::test]
     async fn aucune_des_onze_stations_ne_rend_le_morceau_d_une_autre() {
         let livemeta = faux_livemeta().await;
+        let live = faux_live(0).await;
         let flux = faux_flux(false).await;
+        let voies = voies(&livemeta, &live);
 
         // Ce que rendent, au même instant, les trois stations mères.
         let mut meres = Vec::new();
@@ -1493,11 +1813,10 @@ mod tests {
             ("Mouv'", "mouv"),
             ("France Inter", "franceinter"),
         ] {
-            let titre =
-                fetch_radio_metadata_depuis(&livemeta, nom, &adresse_locale(&flux, radical))
-                    .await
-                    .unwrap_or_else(|| panic!("« {nom} » doit continuer de rendre son morceau"))
-                    .title;
+            let titre = fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical))
+                .await
+                .unwrap_or_else(|| panic!("« {nom} » doit continuer de rendre son morceau"))
+                .title;
             meres.push(titre);
         }
 
@@ -1506,16 +1825,16 @@ mod tests {
         let mut fautives = Vec::new();
         for &(nom, radical) in ONZE_STATIONS_SANS_SOURCE {
             if let Some(meta) =
-                fetch_radio_metadata_depuis(&livemeta, nom, &adresse_locale(&flux, radical)).await
+                fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical)).await
             {
                 fautives.push(format!("{nom} → « {} »", meta.title));
             }
         }
         assert!(
             fautives.is_empty(),
-            "aucune des onze ne doit RIEN afficher — aucun canal livemeta ne les couvre et leurs \
-             flux ne portent pas d'icy-metaint. {} station(s) affichent pourtant un morceau : \
-             {fautives:?}, quand les stations mères rendent {meres:?} au même instant.",
+            "aucune des onze ne doit RIEN afficher — ni canal `pull`, ni identifiant `live`, et \
+             leurs flux ne portent pas d'icy-metaint. {} station(s) affichent pourtant un \
+             morceau : {fautives:?}, quand les stations mères rendent {meres:?} au même instant.",
             fautives.len()
         );
     }
@@ -1525,9 +1844,10 @@ mod tests {
     #[tokio::test]
     async fn temoin_france_musique_principale_rend_toujours_son_morceau() {
         let livemeta = faux_livemeta().await;
+        let live = faux_live(0).await;
         let flux = faux_flux(false).await;
         let meta = fetch_radio_metadata_depuis(
-            &livemeta,
+            voies(&livemeta, &live),
             "France Musique",
             &adresse_locale(&flux, "francemusique"),
         )
@@ -1543,11 +1863,15 @@ mod tests {
     #[tokio::test]
     async fn temoin_une_station_couverte_par_le_repli_icy_rend_son_titre() {
         let livemeta = faux_livemeta().await;
+        let live = faux_live(0).await;
         let flux = faux_flux(true).await;
-        let meta =
-            fetch_radio_metadata_depuis(&livemeta, "Radio Machin", &format!("{flux}/machin.mp3"))
-                .await
-                .expect("le repli ICY doit lire le bloc du flux");
+        let meta = fetch_radio_metadata_depuis(
+            voies(&livemeta, &live),
+            "Radio Machin",
+            &format!("{flux}/machin.mp3"),
+        )
+        .await
+        .expect("le repli ICY doit lire le bloc du flux");
         assert_eq!(meta.title, "B");
         assert_eq!(meta.artist.as_deref(), Some("A"));
     }
@@ -1574,7 +1898,10 @@ mod tests {
             ("FIP Reggae", "fipreggae", Some(71)),
             ("FIP Electro", "fipelectro", Some(74)),
             ("FIP Metal", "fipmetal", Some(77)),
-            // Les webradios FIP sans canal : déjà éteintes, elles le restent.
+            // Les trois webradios FIP sans canal `pull`. Elles n'en gagnent
+            // toujours pas : #3149 les sert par l'autre voie, `live`, et c'est
+            // justement parce que cette correspondance-ci rend `None` que
+            // l'appelant y arrive.
             ("FIP Pop", "fippop", None),
             ("FIP Hip-Hop", "fiphiphop", None),
             ("FIP Sacré français", "fipsacrefrancais", None),
@@ -1607,5 +1934,326 @@ mod tests {
             fautives.is_empty(),
             "aucune des onze ne doit recevoir de canal, aucun ne les couvre : {fautives:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3149 — trois webradios FIP éteintes, qu'une AUTRE voie de la même API
+    //         couvre
+    // -----------------------------------------------------------------------
+    //
+    // ## Le fait de base
+    //
+    // FIP Pop, FIP Hip-Hop et FIP Sacré français n'affichaient aucun morceau :
+    // `livemeta/pull/78`, `/95` et `/96` répondent **404** et leurs flux AAC ne
+    // portent pas d'`icy-metaint`. Mesuré le 01/09/2026,
+    // `livemeta/live/{id}/{preset}` — publique, sans clef — rend le morceau en
+    // cours des trois pour ces mêmes numéros.
+    //
+    // ## La forme de `live`, qui n'est pas celle de `pull`
+    //
+    // `prev` / `now` / `next` côte à côte plus un `delayToRefresh`, le titre en
+    // `firstLine`, l'interprète en `secondLine`, une fenêtre `startTime` /
+    // `endTime` en secondes epoch, et une `cover` qui n'est **pas** une adresse
+    // mais un UUID nu.
+    //
+    // ## Les deux façons dont elle ne décrit PAS l'instant présent
+    //
+    // 1. **Rien ne joue** : `now` reste complet mais porte la carte de la
+    //    station — `firstLine` = `"Le direct"`, `songUuid`, `startTime` et
+    //    `endTime` tous les trois `null`. Relevé sur `live/7`.
+    // 2. **La réponse est périmée** : `now` est un vrai morceau, mais sa
+    //    fenêtre est passée. Relevé à **2 131 s** — trente-cinq minutes — avant
+    //    que la requête suivante redevienne fraîche.
+    //
+    // C'est le piège de la BBC (#2486), sous deux visages. La garde tient les
+    // deux : un `songUuid`, et l'instant présent dans la fenêtre.
+    //
+    // Aucun test ci-dessous n'appelle une vraie radio, et aucun ne porte de
+    // clef : la voie `live` est publique, et son distant est monté dans le test.
+
+    /// Les trois du ticket : le nom livré, le radical du flux, l'identifiant.
+    const TROIS_WEBRADIOS_FIP_PAR_LIVE: &[(&str, &str, u32)] = &[
+        ("FIP Pop", "fippop", 78),
+        ("FIP Hip-Hop", "fiphiphop", 95),
+        ("FIP Sacré français", "fipsacrefrancais", 96),
+    ];
+
+    /// **LE FAIT.** Le titre et l'interprète rendus pour chacune des trois.
+    ///
+    /// Rouge avant le correctif : les trois ne rendaient **rien** — pas de
+    /// canal `pull`, pas d'`icy-metaint` sur le flux. Vert après : chacune rend
+    /// le morceau de SON identifiant, jamais celui d'une autre.
+    #[tokio::test]
+    async fn les_trois_webradios_fip_rendent_leur_morceau_en_cours() {
+        let livemeta = faux_livemeta().await;
+        let live = faux_live(0).await;
+        let flux = faux_flux(false).await;
+        let voies = voies(&livemeta, &live);
+
+        // Les trois sont interrogées avant de conclure : un `assert` par tour
+        // s'arrêterait à la première et ne dirait rien des deux autres.
+        let mut rendus = Vec::new();
+        for &(nom, radical, id) in TROIS_WEBRADIOS_FIP_PAR_LIVE {
+            let meta = fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical))
+                .await
+                .unwrap_or_else(|| panic!("« {nom} » doit rendre le morceau de la voie `live`"));
+            rendus.push((
+                nom,
+                meta.title.clone(),
+                meta.artist.clone(),
+                meta.cover_url.clone(),
+            ));
+            assert_eq!(
+                meta.title,
+                format!("Morceau de la webradio {id}"),
+                "« {nom} » doit rendre le morceau de l'identifiant {id}, pas d'un autre"
+            );
+            assert_eq!(
+                meta.artist.as_deref(),
+                Some(format!("Interprète de la webradio {id}").as_str()),
+                "« {nom} » doit rendre l'interprète de l'identifiant {id}"
+            );
+            assert_eq!(meta.station.as_deref(), Some(nom));
+            // La `cover` de `live` est un UUID nu, pas une adresse : aucune
+            // pochette ne part à l'écran, et c'est voulu.
+            assert_eq!(meta.cover_url, None, "un UUID nu n'est pas une pochette");
+        }
+
+        // Trois titres distincts : aucune ne montre le morceau d'une autre.
+        let titres: std::collections::BTreeSet<_> =
+            rendus.iter().map(|(_, titre, _, _)| titre).collect();
+        assert_eq!(titres.len(), 3, "les trois doivent différer : {rendus:?}");
+    }
+
+    /// **La garde, visage 1 — rien ne joue.** La carte de station relevée sur
+    /// `live/7` rend une **absence**, pas « Le direct » dans la case du titre.
+    #[test]
+    fn une_reponse_sans_morceau_en_cours_rend_une_absence() {
+        let corps = json!({
+            "prev": [carte_de_station("FIP")],
+            "now": carte_de_station("FIP"),
+            "next": [],
+            "delayToRefresh": 10000,
+        });
+        assert!(
+            lire_morceau_en_cours_radiofrance_live(&corps, "FIP Pop", 1_788_290_585).is_none(),
+            "sans `songUuid`, `now` porte la carte de la station et non un morceau"
+        );
+    }
+
+    /// **`songUuid` n'est pas un ornement.** Sur la carte relevée, les trois
+    /// champs sont `null` à la fois : le test ci-dessus tiendrait encore si
+    /// seule la fenêtre était contrôlée. Celui-ci isole la condition — une
+    /// fenêtre parfaitement valable, mais rien qui nomme un morceau — pour que
+    /// la garde ne repose pas par accident sur une autre.
+    #[test]
+    fn un_now_sans_uuid_de_morceau_ne_rend_rien_meme_avec_une_fenetre_valable() {
+        let t = 1_788_290_585;
+        for sans_morceau in [Value::Null, json!(""), json!("   ")] {
+            let corps = json!({
+                "now": {
+                    "firstLine": "Le direct",
+                    "secondLine": "La radio la plus éclectique du monde",
+                    "songUuid": sans_morceau,
+                    "startTime": t - 90,
+                    "endTime": t + 90,
+                }
+            });
+            assert!(
+                lire_morceau_en_cours_radiofrance_live(&corps, "FIP Pop", t).is_none(),
+                "sans UUID de morceau, il n'y a pas de morceau à afficher : {corps}"
+            );
+        }
+    }
+
+    /// **La garde, visage 2 — la réponse est périmée.** Le même morceau, la
+    /// même charge utile complète : affiché tant que sa fenêtre contient
+    /// l'instant présent, tu dès qu'elle est derrière.
+    ///
+    /// Le retard éprouvé ici est celui **mesuré** le 01/09/2026 : 2 131 s.
+    #[test]
+    fn un_morceau_dont_la_fenetre_est_passee_ne_s_affiche_plus() {
+        let t = 1_788_290_585;
+        let morceau = |debut: i64, fin: i64| {
+            json!({
+                "now": {
+                    "firstLine": "Rubber sky",
+                    "secondLine": "Un interprète",
+                    "songUuid": "55205f47-0000-0000-0000-000000000000",
+                    "startTime": debut,
+                    "endTime": fin,
+                }
+            })
+        };
+
+        // En cours : la fenêtre contient l'instant présent.
+        let en_cours =
+            lire_morceau_en_cours_radiofrance_live(&morceau(t - 90, t + 90), "FIP Pop", t)
+                .expect("un morceau dont la fenêtre contient l'instant présent doit s'afficher");
+        assert_eq!(en_cours.title, "Rubber sky");
+
+        // Le relais normal entre deux morceaux : `now` garde le morceau qui
+        // vient de finir jusqu'à ce que le suivant soit annoncé — relevé à
+        // 21 s au plus. Il doit encore s'afficher.
+        assert!(
+            lire_morceau_en_cours_radiofrance_live(&morceau(t - 300, t - 21), "FIP Pop", t)
+                .is_some(),
+            "un relais de 21 s est le fonctionnement normal, pas une réponse périmée"
+        );
+
+        // La réponse périmée mesurée : 2 131 s de retard.
+        assert!(
+            lire_morceau_en_cours_radiofrance_live(&morceau(t - 2_400, t - 2_131), "FIP Pop", t)
+                .is_none(),
+            "un morceau terminé depuis 35 minutes ne doit plus s'afficher"
+        );
+
+        // Et l'autre bord : un morceau annoncé pour bien plus tard n'est pas
+        // celui qui joue.
+        assert!(
+            lire_morceau_en_cours_radiofrance_live(&morceau(t + 600, t + 900), "FIP Pop", t)
+                .is_none(),
+            "un morceau qui n'a pas commencé ne joue pas"
+        );
+    }
+
+    /// **La garde, bout à bout.** Le faux service rend une charge utile pleine
+    /// et plausible, mais dont la fenêtre est passée de 2 131 s : la route
+    /// entière rend une absence, pas le dernier morceau connu.
+    #[tokio::test]
+    async fn une_reponse_perimee_rend_une_absence_bout_a_bout() {
+        let livemeta = faux_livemeta().await;
+        // `-2_221` place `endTime` à `maintenant - 2_131`.
+        let live = faux_live(-2_221).await;
+        let flux = faux_flux(false).await;
+        let voies = voies(&livemeta, &live);
+
+        let mut fautives = Vec::new();
+        for &(nom, radical, _) in TROIS_WEBRADIOS_FIP_PAR_LIVE {
+            if let Some(meta) =
+                fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical)).await
+            {
+                fautives.push(format!("{nom} → « {} »", meta.title));
+            }
+        }
+        assert!(
+            fautives.is_empty(),
+            "une réponse périmée ne doit rien afficher : {fautives:?}"
+        );
+    }
+
+    /// **Le préréglage n'est pas un contrat.** Quand le lecteur du site change
+    /// son identifiant interne, la route rend `400` : les trois stations
+    /// retournent à l'absence propre d'où elles viennent, sans titre faux ni
+    /// panique.
+    #[tokio::test]
+    async fn un_preregage_devenu_inconnu_rend_une_absence() {
+        let livemeta = faux_livemeta().await;
+        let live = faux_live_avec_preregage(0, "webrf_un_autre_nom_apres_refonte").await;
+        let flux = faux_flux(false).await;
+        let voies = voies(&livemeta, &live);
+
+        let mut fautives = Vec::new();
+        for &(nom, radical, _) in TROIS_WEBRADIOS_FIP_PAR_LIVE {
+            if let Some(meta) =
+                fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical)).await
+            {
+                fautives.push(format!("{nom} → « {} »", meta.title));
+            }
+        }
+        assert!(
+            fautives.is_empty(),
+            "un 400 sur le préréglage doit rendre une absence : {fautives:?}"
+        );
+    }
+
+    /// **Témoin.** Seules les trois ont un identifiant `live` — par le nom seul
+    /// comme par l'URL du flux, car les stations ajoutées à la main ne portent
+    /// pas toujours une URL reconnaissable.
+    #[test]
+    fn temoin_seules_les_trois_webradios_fip_ont_un_identifiant_live() {
+        let url = |s: &str| format!("https://icecast.radiofrance.fr/{s}-hifi.aac");
+
+        for &(nom, radical, id) in TROIS_WEBRADIOS_FIP_PAR_LIVE {
+            assert_eq!(
+                radiofrance_live_id(nom, &url(radical)),
+                Some(id),
+                "« {nom} » doit recevoir l'identifiant {id}"
+            );
+            assert_eq!(
+                radiofrance_live_id(nom, ""),
+                Some(id),
+                "« {nom} » (nom seul) doit recevoir l'identifiant {id}"
+            );
+            assert_eq!(
+                radiofrance_live_id("", &url(radical)),
+                Some(id),
+                "« {radical} » (URL seule) doit recevoir l'identifiant {id}"
+            );
+        }
+
+        // Personne d'autre. Les huit webradios FIP à canal `pull`, FIP
+        // principale, les onze de #3142, et une station qui n'est pas FIP du
+        // tout : aucune ne doit passer par la voie `live`.
+        let mut fautives = Vec::new();
+        let autres = [
+            ("FIP", "fip"),
+            ("FIP Rock", "fiprock"),
+            ("FIP Jazz", "fipjazz"),
+            ("FIP Groove", "fipgroove"),
+            ("FIP Monde", "fipworld"),
+            ("FIP Nouveautés", "fipnouveautes"),
+            ("FIP Reggae", "fipreggae"),
+            ("FIP Electro", "fipelectro"),
+            ("FIP Metal", "fipmetal"),
+            ("France Musique", "francemusique"),
+            ("France Inter", "franceinter"),
+            ("France Culture", "franceculture"),
+            ("Mouv'", "mouv"),
+        ];
+        for (nom, radical) in autres
+            .iter()
+            .copied()
+            .chain(ONZE_STATIONS_SANS_SOURCE.iter().copied())
+        {
+            if let Some(id) = radiofrance_live_id(nom, &url(radical)) {
+                fautives.push(format!("{nom} → live/{id}"));
+            }
+            if let Some(id) = radiofrance_live_id(nom, "") {
+                fautives.push(format!("{nom} (nom seul) → live/{id}"));
+            }
+        }
+        assert!(
+            fautives.is_empty(),
+            "seules les trois webradios du ticket ont un identifiant `live` : {fautives:?}"
+        );
+    }
+
+    /// **Témoin.** FIP principale et les webradios FIP qui ont un canal
+    /// continuent de passer par `pull`, et rendent le morceau de LEUR canal.
+    /// Le faux `live` est monté au même instant : s'il les captait, le titre
+    /// rendu le dirait.
+    #[tokio::test]
+    async fn temoin_les_webradios_fip_a_canal_passent_toujours_par_pull() {
+        let livemeta = faux_livemeta().await;
+        let live = faux_live(0).await;
+        let flux = faux_flux(false).await;
+        let voies = voies(&livemeta, &live);
+
+        for (nom, radical, canal) in [
+            ("FIP", "fip", 7),
+            ("FIP Rock", "fiprock", 64),
+            ("FIP Jazz", "fipjazz", 65),
+            ("FIP Metal", "fipmetal", 77),
+        ] {
+            let meta = fetch_radio_metadata_depuis(voies, nom, &adresse_locale(&flux, radical))
+                .await
+                .unwrap_or_else(|| panic!("« {nom} » doit continuer de rendre son morceau"));
+            assert_eq!(
+                meta.title,
+                format!("Morceau du canal {canal}"),
+                "« {nom} » doit rester sur son canal `pull` {canal}"
+            );
+        }
     }
 }
