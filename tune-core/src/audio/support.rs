@@ -16,9 +16,17 @@ pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
 
 /// Extensions admises par le catalogue. `iso` est l'unique exception au
 /// contrat de décodage direct : le walker l'extrait d'abord en pistes DSF.
+///
+/// `oga` est l'extension normalisée d'un flux audio Ogg (Vorbis, FLAC-in-Ogg
+/// ou Opus). Elle manquait ici seule, alors que tout le reste de la chaîne la
+/// connaît — `AudioFormat::from_extension`, `can_decode_native`,
+/// `tag_writer::TagFormat::Vorbis`, la décision de transcodage de
+/// `network.rs`. Un `.oga` n'était donc ni catalogué ni déclaré non lu : il
+/// retombait sur `NotAudio`, un `continue` muet du parcours, et disparaissait
+/// de la bibliothèque sans un compteur ni une ligne de rapport (#2060).
 pub const LIBRARY_AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "dsf", "dff", "alac", "ape",
-    "iso",
+    "flac", "mp3", "m4a", "ogg", "oga", "opus", "wav", "aiff", "aif", "wv", "dsf", "dff", "alac",
+    "ape", "iso",
 ];
 
 /// Formats audio reconnus mais volontairement exclus du catalogue. Cette liste
@@ -208,6 +216,24 @@ mod tests {
             assert!(
                 NATIVE_DECODE_EXTENSIONS.contains(ext),
                 ".{ext} est catalogué sans décodeur natif"
+            );
+        }
+    }
+
+    /// Le contrat vaut dans les DEUX sens (#2060).
+    ///
+    /// Un format que le decodeur sait lire mais que le catalogue ignore ne
+    /// devient pas « non pris en charge » : il devient `NotAudio`, donc un
+    /// `continue` muet dans le parcours — pas de piste, pas de compteur, pas
+    /// de ligne de rapport. Un ecart doit donc etre DECIDE (`aac`, present
+    /// dans la liste des non lus) et jamais subi.
+    #[test]
+    fn tout_format_decodable_est_catalogue_ou_declare_non_lu() {
+        for ext in NATIVE_DECODE_EXTENSIONS {
+            assert!(
+                LIBRARY_AUDIO_EXTENSIONS.contains(ext)
+                    || KNOWN_UNREAD_AUDIO_EXTENSIONS.contains(ext),
+                ".{ext} est decodable mais ni catalogue ni declare non lu — il disparaitrait du scan sans une ligne de rapport"
             );
         }
     }

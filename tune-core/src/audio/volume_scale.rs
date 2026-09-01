@@ -115,6 +115,45 @@ pub fn inserer_volume(obj: &mut serde_json::Map<String, serde_json::Value>, line
     obj.insert("volume_db".into(), serde_json::json!(linear_to_db(linear)));
 }
 
+/// Motif de refus d'une consigne en dB qu'une sortie ne sait pas tenir (#1274).
+///
+/// `None` = la consigne passe. C'est le cas de toute sortie au réglage continu
+/// ou en dB, et de toute consigne au-dessus du premier pas d'une grille : ce
+/// garde-fou ne mord QUE là où le niveau demandé n'existe pas sur le fil.
+///
+/// Le cas qu'il attrape n'est pas une imprécision, c'est une extinction. Une
+/// sortie DLNA, OpenHome, BluOS, Squeezebox, HQPlayer ou OAAT ne reçoit qu'un
+/// entier 0..100 : `−50 dB` vaut 0,00316 en linéaire, l'entier envoyé est
+/// `round(0,316) = 0`, et le renderer se tait. Le serveur, lui, gardait la
+/// valeur exacte, la persistait, et répondait `200` — la zone était annoncée
+/// à −50 dB et ne faisait aucun bruit, indiscernable d'un mute volontaire.
+/// C'est le même défaut que #2886 avait corrigé dans la colonne `zones.volume`,
+/// resté entier sur le fil.
+///
+/// Le message NOMME la grille et le plancher : sans le chiffre, le client ne
+/// peut ni corriger sa demande ni construire un champ de saisie qui l'évite.
+pub fn refus_de_resolution(
+    resolution: crate::outputs::VolumeResolution,
+    db: f64,
+) -> Option<String> {
+    let linear = db_to_linear(db)?;
+    if resolution.holds(linear) {
+        return None;
+    }
+    // Seule une grille linéaire peut avaler un niveau audible ; `holds` l'a
+    // déjà établi, ce `else` n'existe que pour lire `steps`.
+    let crate::outputs::VolumeResolution::Linear { steps } = resolution else {
+        return None;
+    };
+    let plancher = resolution.floor_db()?;
+    Some(format!(
+        "{db:.1} dB est plus bas que ce que cette sortie sait tenir : elle ne reçoit qu'un \
+         entier sur {steps} pas, et son plus petit niveau audible vaut {plancher:.1} dB. \
+         Au-dessous, la valeur envoyée s'arrondit à zéro — la zone ne baisserait pas, elle \
+         se tairait."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +316,42 @@ mod tests {
             let db = linear_to_db(f64::from(i) / 1000.0).expect("audible");
             assert!(db > precedent, "{i} : {db} <= {precedent}");
             precedent = db;
+        }
+    }
+
+    /// #1274 — le refus nomme la grille ET le plancher, sinon il n'apprend
+    /// rien à qui doit corriger sa demande.
+    #[test]
+    fn le_refus_nomme_la_grille_et_le_plancher() {
+        use crate::outputs::VolumeResolution;
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        let motif = refus_de_resolution(pour_cent, -50.0).expect("−50 dB est hors grille");
+        assert!(motif.contains("-50.0 dB"), "{motif}");
+        assert!(motif.contains("100 pas"), "{motif}");
+        assert!(motif.contains("-40.0 dB"), "{motif}");
+    }
+
+    /// Et il se TAIT partout ailleurs : le garde-fou ne doit pas rendre le
+    /// réglage en dB inutilisable là où le matériel suit.
+    #[test]
+    fn le_refus_se_tait_quand_la_sortie_suit() {
+        use crate::outputs::VolumeResolution;
+        let pour_cent = VolumeResolution::Linear { steps: 100 };
+        // La cible de l'issue, et le plancher lui-même.
+        for db in [-18.0, -20.0, -40.0, -6.0, 0.0] {
+            assert_eq!(refus_de_resolution(pour_cent, db), None, "{db} dB");
+        }
+        // Les grilles fines et le continu n'opposent jamais de refus.
+        for resolution in [
+            VolumeResolution::Continuous,
+            VolumeResolution::Decibels { step_mdb: 100 },
+            VolumeResolution::Linear { steps: 65536 },
+        ] {
+            assert_eq!(
+                refus_de_resolution(resolution, -80.0),
+                None,
+                "{resolution:?}"
+            );
         }
     }
 }

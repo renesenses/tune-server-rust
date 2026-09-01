@@ -75,12 +75,13 @@ struct ReplyBody {
 }
 
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let relay = match relay(&state) {
-        Ok(r) => r,
+    let auth = match auth(&state) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::list_tickets(&state.http_client, &relay).await,
+        support::list_tickets(&state.http_client, &auth, base.as_deref()).await,
         &headers,
     )
 }
@@ -89,8 +90,8 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
 async fn create(State(state): State<AppState>, req: Request) -> Response {
-    let relay = match relay(&state) {
-        Ok(r) => r,
+    let auth = match auth(&state) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
 
@@ -107,16 +108,16 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     let headers = req.headers().clone();
 
     if is_multipart {
-        create_multipart(state, relay, req, headers).await
+        create_multipart(state, auth, req, headers).await
     } else {
-        create_json(state, relay, req, headers).await
+        create_json(state, auth, req, headers).await
     }
 }
 
 /// Chemin JSON historique — ticket sans pièce jointe.
 async fn create_json(
     state: AppState,
-    relay: support::SupportRelay,
+    auth: support::SupportAuth,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -124,10 +125,11 @@ async fn create_json(
         Ok(Json(p)) => p,
         Err(rej) => return rej.into_response(),
     };
+    let base = base_url(&state);
     finish(
         support::create_ticket(
             &state.http_client,
-            &relay,
+            &auth,
             &support::NewTicket {
                 subject: payload.subject,
                 body: payload.body,
@@ -136,6 +138,7 @@ async fn create_json(
                 system: payload.system,
                 logs: payload.logs,
             },
+            base.as_deref(),
         )
         .await,
         &headers,
@@ -147,7 +150,7 @@ async fn create_json(
 /// le multipart tel quel avec la clé de licence / le token premium.
 async fn create_multipart(
     state: AppState,
-    relay: support::SupportRelay,
+    auth: support::SupportAuth,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -233,8 +236,10 @@ async fn create_multipart(
         );
     }
 
+    let base = base_url(&state);
     finish(
-        support::create_ticket_multipart(&state.http_client, &relay, fields, files).await,
+        support::create_ticket_multipart(&state.http_client, &auth, fields, files, base.as_deref())
+            .await,
         &headers,
     )
 }
@@ -414,10 +419,12 @@ mod tests {
         (code, serde_json::from_slice(&octets).unwrap(), retry)
     }
 
+    /// L'arrondi lui-même vit maintenant dans `routes::cloud_error`, avec sa
+    /// propre contre-épreuve ; on garde ici la règle telle qu'elle est VUE par
+    /// le support : le message parle de minutes, jamais de zéro.
     #[test]
     fn minutes_a_attendre_arrondit_au_superieur_sans_jamais_zero() {
-        // Jamais zéro : « réessaie dans 0 min » renverrait l'utilisateur trop
-        // tôt, donc sur un nouveau 429.
+        use crate::routes::cloud_error::minutes_a_attendre;
         assert_eq!(minutes_a_attendre(1), 1);
         assert_eq!(minutes_a_attendre(59), 1);
         assert_eq!(minutes_a_attendre(60), 1);
@@ -526,12 +533,13 @@ async fn detail(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let relay = match relay(&state) {
-        Ok(r) => r,
+    let auth = match auth(&state) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::get_ticket(&state.http_client, &relay, id).await,
+        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
 }
@@ -542,12 +550,20 @@ async fn reply(
     Path(id): Path<i64>,
     Json(payload): Json<ReplyBody>,
 ) -> Response {
-    let relay = match relay(&state) {
-        Ok(r) => r,
+    let auth = match auth(&state) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::reply(&state.http_client, &relay, id, &payload.body).await,
+        support::reply(
+            &state.http_client,
+            &auth,
+            id,
+            &payload.body,
+            base.as_deref(),
+        )
+        .await,
         &headers,
     )
 }
@@ -559,39 +575,42 @@ async fn mark_read(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let relay = match relay(&state) {
-        Ok(r) => r,
+    let auth = match auth(&state) {
+        Ok(a) => a,
         Err(resp) => return resp,
     };
+    let base = base_url(&state);
     finish(
-        support::mark_read(&state.http_client, &relay, id).await,
+        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
         &headers,
     )
 }
 
-/// Résout la cible du relais : l'adresse du nuage ET l'auth vers mozaiklabs —
-/// token OAuth premium (SSO) en priorité, sinon la clé de licence (premium par
-/// clé, sans SSO — la majorité des testeurs). 412 seulement si NI l'un NI
-/// l'autre n'est disponible.
+/// Racine du nuage à interroger, `None` pour la production.
 ///
-/// L'adresse vient du réglage `mozaik_base_url`, comme pour les pochettes
-/// communautaires (`routes/cloud.rs`), les signalements de métadonnées
-/// (`routes/library/reports.rs`) et le magasin de greffons. Le support était la
-/// seule porte du nuage à l'ignorer : il partait toujours vers
-/// `https://mozaiklabs.fr`, et c'est pour cela que le transport du diagnostic et
-/// des pièces jointes — ce que le miroir forum annonce ensuite (#2856) — n'était
-/// vérifié par aucun test.
-fn relay(state: &AppState) -> Result<support::SupportRelay, Response> {
+/// Même réglage que le SSO, le marché de greffons, les couvertures
+/// communautaires et la validation de licence : `mozaik_base_url`. Sans lui, le
+/// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
+/// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
+/// (#2916).
+fn base_url(state: &AppState) -> Option<String> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
+/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
+/// 412 seulement si NI l'un NI l'autre n'est disponible.
+fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let base_url = settings.get("mozaik_base_url").ok().flatten();
 
     // Chemin 1 : token OAuth premium (login SSO dans Tune).
     if let Some(token) = settings.get("mozaik_access_token").ok().flatten() {
         if !token.is_empty() {
-            return Ok(support::SupportRelay::new(
-                base_url.as_deref(),
-                support::SupportAuth::Bearer(token),
-            ));
+            return Ok(support::SupportAuth::Bearer(token));
         }
     }
 
@@ -605,10 +624,7 @@ fn relay(state: &AppState) -> Result<support::SupportRelay, Response> {
                 .flatten()
                 .filter(|f| !f.is_empty())
                 .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
-            return Ok(support::SupportRelay::new(
-                base_url.as_deref(),
-                support::SupportAuth::License { key, fingerprint },
-            ));
+            return Ok(support::SupportAuth::License { key, fingerprint });
         }
     }
 
@@ -620,16 +636,6 @@ fn relay(state: &AppState) -> Result<support::SupportRelay, Response> {
         })),
     )
         .into_response())
-}
-
-/// Minutes à attendre, déduites des secondes annoncées par mozaiklabs.
-///
-/// L'arrondi se fait vers le HAUT, et jamais à zéro : renvoyer l'utilisateur
-/// « dans 0 min » le ferait revenir trop tôt et reprendre un 429. Le délai
-/// exact en secondes n'est pas perdu pour autant — il reste dans le corps
-/// (`retry_after`) et dans l'en-tête `Retry-After`, pour qui programme.
-fn minutes_a_attendre(secondes: u64) -> u64 {
-    secondes.div_ceil(60).max(1)
 }
 
 /// Remplace le texte d'un 429 par un message localisé et exploitable.
@@ -651,12 +657,15 @@ fn minutes_a_attendre(secondes: u64) -> u64 {
 /// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
 /// contre `rate_limited` gardent leur contrat.
 fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
-    let lang = crate::i18n::lang_from_header(headers);
-    let message = match retry_after {
-        Some(secondes) => crate::i18n::t(&lang, "support.tropDeRequetesDelai")
-            .replace("{minutes}", &minutes_a_attendre(secondes).to_string()),
-        None => crate::i18n::t(&lang, "support.tropDeRequetes"),
-    };
+    // Même fabrique que le reste du nuage (`routes::cloud_error`), avec les
+    // clés propres au support : une seule règle d'arrondi, un seul endroit où
+    // la langue est résolue.
+    let message = crate::routes::cloud_error::message_limite(
+        headers,
+        retry_after,
+        "support.tropDeRequetes",
+        "support.tropDeRequetesDelai",
+    );
 
     // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
     let Some(obj) = value.as_object_mut() else {

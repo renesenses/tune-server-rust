@@ -1,5 +1,5 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,6 +10,7 @@ use tune_core::cloud::plugins::{MarketplacePlugin, PluginMarketplace};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 
+use crate::routes::cloud_error;
 use crate::routes::panne_sql::OuDefautJournalise;
 use crate::state::AppState;
 
@@ -160,6 +161,34 @@ fn panne_de_stockage(quoi: &str, erreur: String) -> axum::response::Response {
         .into_response()
 }
 
+/// Refus du magasin de greffons, rendu au client.
+///
+/// Hors limite atteinte, la forme d'origine est conservée mot pour mot :
+/// `{"error": "<code>", "detail": "<texte technique>"}` au statut d'avant.
+/// Sur un 429 le code machine devient `rate_limited` — plus précis que
+/// `install_failed` : ce n'est pas l'installation qui a échoué, c'est le nuage
+/// qui refuse pour l'instant — et le corps porte le délai et un message dans la
+/// langue de l'interface (#2178). `detail` reste présent dans les deux cas.
+fn refus_du_magasin(
+    code: &str,
+    err: &tune_core::cloud::refusal::CloudError,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    if err.is_rate_limited() {
+        return cloud_error::reponse(
+            err,
+            headers,
+            StatusCode::BAD_GATEWAY,
+            json!({ "detail": err.to_string() }),
+        );
+    }
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": code, "detail": err.to_string() })),
+    )
+        .into_response()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InstalledRecord {
     slug: String,
@@ -240,6 +269,7 @@ async fn get_plugin_detail(
 async fn install_plugin(
     Path(slug): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let marketplace = PluginMarketplace::default();
 
@@ -354,11 +384,7 @@ async fn install_plugin(
             }))
             .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "install_failed", "detail": e })),
-        )
-            .into_response(),
+        Err(e) => refus_du_magasin("install_failed", &e, &headers),
     }
 }
 
@@ -481,6 +507,7 @@ async fn list_installed_plugins(State(state): State<AppState>) -> axum::response
 async fn update_plugin(
     Path(slug): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Une base illisible ne doit pas se lire « ce greffon n'est pas installé » :
@@ -601,11 +628,7 @@ async fn update_plugin(
             }))
             .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "update_failed", "detail": e })),
-        )
-            .into_response(),
+        Err(e) => refus_du_magasin("update_failed", &e, &headers),
     }
 }
 

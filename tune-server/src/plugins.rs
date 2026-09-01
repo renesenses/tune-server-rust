@@ -129,6 +129,20 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // Concerts (#2363) : la tâche d'abonnement 24 h et la route de lecture,
+    // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
+    // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
+    // installé le plugin. Sa seule dépendance est la base : lire les artistes
+    // de la bibliothèque, et lire `instance_id` / `community_sync_enabled`.
+    #[cfg(feature = "concerts")]
+    loader
+        .register(Box::new(tune_concerts::ConcertsPlugin::new(
+            tune_concerts::HostServices {
+                backend: state.backend.clone(),
+            },
+        )))
+        .await;
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.

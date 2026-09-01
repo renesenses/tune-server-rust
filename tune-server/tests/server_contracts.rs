@@ -57,6 +57,8 @@ mod licence_activation_immediate;
 mod licence_grace_visible;
 #[path = "notarisation_bornes.rs"]
 mod notarisation_bornes;
+#[path = "nuage_limite_dit_la_limite.rs"]
+mod nuage_limite_dit_la_limite;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_ecriture_fichiers.rs"]
@@ -89,6 +91,8 @@ mod rustsec_allowlists;
 mod serveur_media_criteres_canoniques;
 #[path = "smb_dialect_seam.rs"]
 mod smb_dialect_seam;
+#[path = "support_journaux_joints.rs"]
+mod support_journaux_joints;
 #[path = "support_relais_diagnostic_sortant.rs"]
 mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
@@ -103,6 +107,8 @@ mod tri_aleatoire_albums;
 mod uptime_process_scope;
 #[path = "volume_db_contrat.rs"]
 mod volume_db_contrat;
+#[path = "volume_db_resolution.rs"]
+mod volume_db_resolution;
 #[path = "web_response_contracts.rs"]
 mod web_response_contracts;
 #[path = "workflows_bornes.rs"]

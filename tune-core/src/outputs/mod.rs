@@ -33,5 +33,5 @@ pub mod wasapi_exclusive;
 pub use registry::OutputRegistry;
 pub use traits::{
     OutputCapabilities, OutputCommand, OutputCommandError, OutputCommandResult, OutputStatus,
-    OutputTarget, PlayMedia, TransportState,
+    OutputTarget, PlayMedia, TransportState, VolumeResolution,
 };

@@ -1895,7 +1895,7 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
 /// none — the vast majority — pay the full price every time.
 fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // Vorbis comments live in the file header; a bounded prefix read finds them
@@ -1973,7 +1973,7 @@ fn normalise_dr(raw: &str) -> String {
 
 fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
-    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+    if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
         return None;
     }
     // The Vorbis comment block lives in the file header (FLAC metadata blocks

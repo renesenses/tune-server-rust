@@ -987,6 +987,21 @@ pub(crate) async fn output_capabilities(
     Some(output.lock().await.capabilities())
 }
 
+/// Motif pour lequel la sortie d'une zone ne peut pas tenir une consigne en dB.
+///
+/// `None` = rien à redire : sortie inconnue (zone navigateur, sortie
+/// disparue), réglage continu, ou consigne dans la portée de la grille. Voir
+/// [`tune_core::audio::volume_scale::refus_de_resolution`] pour le cas qui
+/// mord et pourquoi il vaut mieux le dire que le simuler (#1274).
+pub(crate) async fn refus_de_resolution_volume(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    db: f64,
+) -> Option<String> {
+    let capabilities = output_capabilities(state, output_device_id).await?;
+    tune_core::audio::volume_scale::refus_de_resolution(capabilities.volume_resolution, db)
+}
+
 pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) -> &'static str {
     // Le seul fait qu'on ne puisse pas déduire : quelqu'un tire-t-il le flux ?
     // On ne le demande au streamer que pour une zone navigateur en lecture,
@@ -2750,10 +2765,20 @@ async fn patch_zone(
         .output_device_id
         .as_deref()
         .or(zone_before.output_device_id.as_deref());
+    // #1274 — même garde-fou que sur PUT/POST …/volume : ce PATCH est la
+    // troisième porte d'écriture du volume, et la consigne y arrive aussi en
+    // dB. `command_device_id` porte déjà la sortie VISÉE, celle que ce même
+    // PATCH est peut-être en train d'attribuer.
+    if let Some(db) = body.volume_db
+        && let Some(motif) = refus_de_resolution_volume(&state, command_device_id, db).await
+    {
+        return refus_de_valeur(id, "volume_db", &db.to_string(), &motif);
+    }
+
     // #1274 — `volume_demande` porte déjà la valeur linéaire, qu'elle vienne
     // du pour-cent entier ou des dB. L'orchestrateur la reçoit en `f64` et la
-    // garde telle quelle dans l'état de lecture et vers le device ; seule la
-    // persistance en base l'arrondit encore au pour-cent (colonne `INTEGER`).
+    // garde telle quelle dans l'état de lecture, vers le device et en base
+    // (la colonne n'arrondit plus au pour-cent depuis #2886).
     if let Some(volume) = volume_demande
         && let Err(error) = state
             .orchestrator
@@ -3840,6 +3865,20 @@ async fn update_volume(
     };
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    // #1274 — la consigne en dB doit avoir un endroit où arriver. Si la
+    // sortie de la zone ne parle au périphérique qu'en entiers, un dB sous son
+    // premier pas ne baisse pas le son : il l'éteint. On le refuse en le
+    // nommant, plutôt que de répondre 204 sur un silence.
+    if let Some(db) = body.volume_db
+        && let Some(motif) = refus_de_resolution_volume(&state, device_id.as_deref(), db).await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "volume_db_hors_resolution", "message": motif })),
+        )
+            .into_response();
+    }
+
     match state
         .orchestrator
         .set_volume(id, volume_f, device_id.as_deref())

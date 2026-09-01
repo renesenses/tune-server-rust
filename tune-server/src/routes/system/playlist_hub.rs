@@ -1,12 +1,13 @@
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::json;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::routes::cloud_error;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -17,6 +18,7 @@ pub struct BackupRequest {
 /// POST /system/playlist-hub/backup — backup a local playlist to cloud
 pub(super) async fn backup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<BackupRequest>,
 ) -> impl IntoResponse {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
@@ -46,12 +48,15 @@ pub(super) async fn backup(
             "playlist_id": body.playlist_id,
         }))
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => cloud_error::reponse(&e, &headers, StatusCode::INTERNAL_SERVER_ERROR, json!({})),
     }
 }
 
 /// GET /system/playlist-hub — list cloud playlists for this instance
-pub(super) async fn list_playlists(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn list_playlists(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
         .get("instance_id")
         .ok()
@@ -70,11 +75,12 @@ pub(super) async fn list_playlists(State(state): State<AppState>) -> impl IntoRe
         .await
     {
         Ok(playlists) => Json(json!({"playlists": playlists})).into_response(),
-        Err(e) => (
+        Err(e) => cloud_error::reponse(
+            &e,
+            &headers,
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"playlists": [], "error": e})),
-        )
-            .into_response(),
+            json!({ "playlists": [] }),
+        ),
     }
 }
 
@@ -82,10 +88,11 @@ pub(super) async fn list_playlists(State(state): State<AppState>) -> impl IntoRe
 pub(super) async fn get_playlist(
     State(state): State<AppState>,
     Path(hub_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     match tune_core::cloud::playlist_hub::get_cloud_playlist(&state.http_client, &hub_id).await {
         Ok(data) => Json(data).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => cloud_error::reponse(&e, &headers, StatusCode::INTERNAL_SERVER_ERROR, json!({})),
     }
 }
 
@@ -93,10 +100,11 @@ pub(super) async fn get_playlist(
 pub(super) async fn delete_playlist(
     State(state): State<AppState>,
     Path(hub_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     match tune_core::cloud::playlist_hub::delete_cloud_playlist(&state.http_client, &hub_id).await {
         Ok(()) => Json(json!({"deleted": true})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => cloud_error::reponse(&e, &headers, StatusCode::INTERNAL_SERVER_ERROR, json!({})),
     }
 }
 
@@ -109,6 +117,7 @@ pub struct TransferRequest {
 pub(super) async fn transfer(
     State(state): State<AppState>,
     Path(hub_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<TransferRequest>,
 ) -> impl IntoResponse {
     let instance_id = SettingsRepo::with_backend(state.backend.clone())
@@ -143,6 +152,6 @@ pub(super) async fn transfer(
     .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => cloud_error::reponse(&e, &headers, StatusCode::INTERNAL_SERVER_ERROR, json!({})),
     }
 }

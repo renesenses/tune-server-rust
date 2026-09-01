@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::cloud::refusal::CloudError;
+
 const RECO_API: &str = "https://mozaiklabs.fr/api/v1/premium/recommendations";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +172,7 @@ pub async fn generate_recommendations(
 pub async fn get_recommendations(
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, CloudError> {
     let resp = http_client
         .get(RECO_API)
         .query(&[("instance_id", instance_id)])
@@ -179,7 +181,8 @@ pub async fn get_recommendations(
         .await
         .map_err(|e| format!("reco: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("reco: HTTP {}", resp.status()));
+        let status = resp.status();
+        return Err(CloudError::from_response(format!("reco: HTTP {status}"), resp).await);
     }
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
     Ok(data["recommendations"]

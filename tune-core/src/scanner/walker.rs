@@ -1553,6 +1553,54 @@ mod tests {
         assert!(!result.skipped_by_ext.contains_key("jpg"));
     }
 
+    /// #2060 — un format que le decodeur sait lire ne doit jamais sortir du
+    /// parcours SANS TRACE.
+    ///
+    /// Le contrat des deux listes n’etait verrouille que dans un sens : tout
+    /// format catalogue possede un decodeur. Le sens inverse ne l’etait pas,
+    /// et `.oga` — l’extension Ogg que le decodeur, l’ecrivain de tags et la
+    /// decision de transcodage reconnaissent tous — n’etait NI catalogue NI
+    /// declare non lu. Il retombait donc sur `LibraryAudioSupport::NotAudio`,
+    /// c’est-a-dire un `continue` muet : aucune piste, aucun compteur, aucune
+    /// ligne de rapport. C’est la seule facon dont un fichier disparait sans
+    /// laisser de quoi le chercher.
+    ///
+    /// Le temoin `album.ogg` est le jumeau exact du fichier fautif : meme
+    /// conteneur, meme dossier, meme contenu, meme appel. S’il tombait avec
+    /// lui, ce test mesurerait la fixture et non le defaut.
+    #[test]
+    fn un_fichier_oga_entre_en_bibliotheque_comme_son_jumeau_ogg() {
+        // Pas sous temp_dir() : `is_tune_temp_file` y ecarte TOUT.
+        let base = crate::test_scratch::scratch_dir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            "walker-oga-2060",
+        );
+        for name in ["album.ogg", "album.oga"] {
+            std::fs::write(base.join(name), b"fixture").unwrap();
+        }
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let noms: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        // Temoin : vert avant comme apres le correctif.
+        assert!(
+            noms.iter().any(|n| n == "album.ogg"),
+            "temoin album.ogg perdu — la fixture ou le parcours est en cause, pas .oga : {noms:?}"
+        );
+        assert!(
+            noms.iter().any(|n| n == "album.oga"),
+            "album.oga absent du resultat du scan : {noms:?}"
+        );
+        // Et il ne doit pas davantage etre annonce « non lu » : il est lu.
+        assert!(
+            !result.skipped_by_ext.contains_key("oga"),
+            "oga annonce non lu alors qu’il est indexe : {:?}",
+            result.skipped_by_ext
+        );
+    }
+
     /// Le parcours retient les DOSSIERS porteurs de feuilles CUE (#1763).
     ///
     /// Une feuille est la seule chose qui explique un album entier absent, et
