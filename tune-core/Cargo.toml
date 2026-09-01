@@ -151,6 +151,12 @@ path = "tests/journal_insertion_par_lot.rs"
 name = "journal_sondage_repos"
 path = "tests/journal_sondage_repos.rs"
 
+# Meme famille, meme raison (#2566), site frere : la zone EN LECTURE. Abonne
+# `tracing` GLOBAL, donc un binaire a lui seul et un seul essai dedans.
+[[test]]
+name = "journal_sondage_lecture"
+path = "tests/journal_sondage_lecture.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false

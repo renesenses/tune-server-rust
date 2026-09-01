@@ -2186,7 +2186,7 @@ struct IdlePollBackoff {
     consecutive_errors: u8,
     remaining: u8,
     /// Comptabilité du journal — distincte du recul, qui lui n'est pas en cause.
-    journal: JournalSondageRepos,
+    journal: JournalSondage,
 }
 
 /// Combien d'échecs consécutifs sont **détaillés** avant de passer au
@@ -2210,7 +2210,24 @@ pub enum TraceEchecSondage {
     Muet,
 }
 
-/// Comptabilité du journal d'un sondage de zone au repos qui échoue (#2566).
+/// Comptabilité du journal d'un sondage qui échoue, tour après tour (#2566).
+///
+/// ## Les trois sites, et pourquoi un seul compteur
+///
+/// | site | fichier | ce qu'un appareil muet coûtait |
+/// |---|---|---|
+/// | zone au repos | `poller.rs`, branche « repos » | 1 ligne / 33 s — les 79 de Dimitri |
+/// | zone **en lecture** | `poller.rs`, branche « lecture » | 1 ligne / 17 s, soit ~212 / h |
+/// | HQPlayer | `tune-server/src/background.rs` | 1 ligne / 60 s, **sans aucun recul** |
+///
+/// Le premier a été borné en v0.9.129 ; le commit qui l'a fait nommait les deux
+/// autres comme non traités, et ce sont eux que ce passage-ci rejoint. Le
+/// compteur est le même pour les trois — c'est la même panne vue de trois
+/// boucles —, mais **l'émission reste locale à chaque site** : `tracing` fige
+/// la cible du module au point d'appel, et l'export de diagnostic compte par
+/// module (`QUOTA_PAR_MODULE`, #1974). Émettre le bruit d'HQPlayer depuis
+/// `tune_core::poller` l'aurait imputé au poller, c'est-à-dire au module qu'on
+/// lit précisément quand une lecture ne démarre pas.
 ///
 /// ## Le défaut mesuré
 ///
@@ -2255,16 +2272,20 @@ pub enum TraceEchecSondage {
 /// isolé reste dit en entier, et un sondage qui réussit sans échec préalable
 /// n'émet toujours rien.
 #[derive(Debug, Default, Clone)]
-pub struct JournalSondageRepos {
+pub struct JournalSondage {
     /// Échecs consécutifs, en `u32` : `IdlePollBackoff::consecutive_errors`
     /// est un `u8` qui sature à 255, ce qui rendrait le total faux et les
     /// paliers erratiques au-delà de deux heures de panne.
     echecs: u32,
 }
 
-impl JournalSondageRepos {
+impl JournalSondage {
     /// Un échec de plus. Rend ce qu'il faut en dire.
-    fn compter_echec(&mut self) -> TraceEchecSondage {
+    ///
+    /// Publique parce que c'est la **décision** partagée par les trois sites :
+    /// chacun l'interroge, puis émet sa propre ligne, avec ses propres champs
+    /// et sous sa propre cible de module.
+    pub fn compter_echec(&mut self) -> TraceEchecSondage {
         self.echecs = self.echecs.saturating_add(1);
         if self.echecs <= ECHECS_SONDAGE_DETAILLES {
             TraceEchecSondage::Detaille
@@ -2318,13 +2339,79 @@ impl JournalSondageRepos {
     /// clore, et rien du tout sinon — un sondage qui a toujours réussi ne doit
     /// pas changer d'un iota.
     pub fn succes(&mut self, zone_id: i64, device: &str) {
-        let echecs = std::mem::take(&mut self.echecs);
-        if echecs > ECHECS_SONDAGE_DETAILLES {
+        if let Some(echecs) = self.cloturer() {
             debug!(
                 zone_id,
                 device = %device,
                 echecs,
                 "idle_poll_recovered"
+            );
+        }
+    }
+
+    /// Le sondage repasse : remet le compteur à zéro et rend le total à
+    /// annoncer, ou `None` s'il n'y a **rien à clore**.
+    ///
+    /// Rien à clore, c'est le cas de l'écrasante majorité des tours : un
+    /// sondage qui a toujours réussi, et un échec isolé déjà dit en entier. La
+    /// clôture n'existe que pour la panne qu'on a cessé de détailler — sans
+    /// elle, plafonner masquerait l'ampleur, et un plafond deviendrait une
+    /// censure.
+    pub fn cloturer(&mut self) -> Option<u32> {
+        let echecs = std::mem::take(&mut self.echecs);
+        (echecs > ECHECS_SONDAGE_DETAILLES).then_some(echecs)
+    }
+
+    /// Un échec de plus sur une zone **en lecture**, et la trace qui convient
+    /// est émise.
+    ///
+    /// Jumelle de [`Self::echec`], et volontairement pas une paramétrisation de
+    /// celle-ci : le nom d'un évènement `tracing` est figé au point d'appel,
+    /// avec sa cible et son niveau. Le rendre variable ferait de
+    /// `poll_failed_backing_off` et `idle_poll_failed_backing_off` un seul et
+    /// même point d'appel, indiscernables dans un filtre par cible — pour
+    /// n'économiser que l'invocation d'une macro.
+    ///
+    /// Les champs de la ligne détaillée sont **inchangés** (`zone_id`,
+    /// `device`, `error`, `backoff`) : c'est le texte que les journaux déjà
+    /// versés portent, et qu'on relit en cherchant une panne.
+    pub fn echec_lecture(
+        &mut self,
+        zone_id: i64,
+        device: &str,
+        error: &dyn std::fmt::Display,
+        backoff: u8,
+    ) {
+        match self.compter_echec() {
+            TraceEchecSondage::Detaille => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                backoff,
+                "poll_failed_backing_off"
+            ),
+            TraceEchecSondage::Recapitulatif => debug!(
+                zone_id,
+                device = %device,
+                error = %error,
+                echecs = self.echecs,
+                detaillees = ECHECS_SONDAGE_DETAILLES,
+                backoff,
+                "poll_still_failing"
+            ),
+            TraceEchecSondage::Muet => {}
+        }
+    }
+
+    /// Le sondage d'une zone en lecture repasse. Muet s'il n'avait pas cessé
+    /// de parler.
+    pub fn succes_lecture(&mut self, zone_id: i64, device: &str) {
+        if let Some(echecs) = self.cloturer() {
+            debug!(
+                zone_id,
+                device = %device,
+                echecs,
+                "poll_recovered"
             );
         }
     }
@@ -2393,6 +2480,11 @@ struct ZonePollState {
     /// After N failures, skip 2^min(N,4) ticks before retrying.
     consecutive_errors: u8,
     backoff_remaining: u8,
+    /// Comptabilité du journal (#2566), sans effet sur les deux champs
+    /// ci-dessus : le recul et le compte d'erreurs sont tenus par le site
+    /// d'appel, avant elle, et ce sont eux que lisent `poll_failed_past_end`
+    /// et l'arrêt de zone. Voir [`JournalSondage`].
+    journal: JournalSondage,
     total_polls: u64,
     total_errors: u64,
     last_latency_ms: u32,
@@ -2529,6 +2621,7 @@ impl ZonePollState {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -3479,6 +3572,9 @@ impl PositionPoller {
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
                     Ok((s, signal_path, dsp_metrics)) => {
                         ps.consecutive_errors = 0;
+                        // Clôture de panne (#2566) : muette si le sondage
+                        // n'avait jamais cessé de répondre.
+                        ps.journal.succes_lecture(zone_id, &device_id);
                         let latency = poll_start.elapsed().as_millis() as u32;
                         ps.last_latency_ms = latency;
                         if latency > ps.max_latency_ms {
@@ -3500,13 +3596,17 @@ impl PositionPoller {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
                         ps.total_errors += 1;
                         ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
-                        debug!(
-                            zone_id,
-                            device = %device_id,
-                            error = %e,
-                            backoff = ps.backoff_remaining,
-                            "poll_failed_backing_off"
-                        );
+                        // Les trois compteurs ci-dessus sont tenus AVANT, et le
+                        // journal n'en touche aucun : une panne qui cesse
+                        // d'être dite continue d'être comptée, donc le repli de
+                        // fin de piste (`poll_failed_past_end`) et l'arrêt de
+                        // zone décident sur exactement les mêmes chiffres
+                        // qu'avant (#2566). Seul le volume du journal change :
+                        // 1 ligne toutes les 17 s pour un appareil muet, sans
+                        // fin, devient 5 lignes détaillées puis un récapitulatif
+                        // aux paliers de doublement.
+                        let backoff = ps.backoff_remaining;
+                        ps.journal.echec_lecture(zone_id, &device_id, &e, backoff);
 
                         // Poll-fail end-of-track fallback for a DLNA renderer
                         // whose status poll errors outright (LMS UPnP bridge:
@@ -6270,6 +6370,7 @@ mod tests {
             gapless_cooldown: 4,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -6329,6 +6430,7 @@ mod tests {
             gapless_cooldown: 3,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -6633,6 +6735,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -7432,6 +7535,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
@@ -7758,6 +7862,7 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            journal: JournalSondage::default(),
             total_polls: 0,
             total_errors: 0,
             last_latency_ms: 0,
