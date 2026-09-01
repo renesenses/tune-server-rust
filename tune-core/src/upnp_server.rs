@@ -516,7 +516,15 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
 /// titre : la regle reste celle de #2312 — n'annoncer QUE ce qu'on evalue,
 /// jamais l'inverse. Le test `les_capacites_annoncees_sont_toutes_evaluees`
 /// tient l'invariant dans les deux sens.
-const SEARCH_CAPS: &str = "upnp:class,dc:title";
+///
+/// `@refID` s'y ajoute pour #1390. Ce n'est pas un champ de recherche de plus :
+/// c'est le suffixe que la specification ContentDirectory:1 donne en EXEMPLE
+/// (`… and @refID exists false`, « exclure les objets de reference ») et que
+/// les points de controle collent derriere CHAQUE critere de classe. Ne pas
+/// l'evaluer le faisait tomber dans le bras « autre champ » d'`evaluer_criteres`
+/// — donc un SOAP 708, donc un dossier vide chez Foobar2000 et WiiM la ou
+/// Emby et Serviio remplissaient (Roro62, fil forum, #1390).
+const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
 
 /// L'action `Search` de ContentDirectory.
 ///
@@ -824,11 +832,13 @@ pub(crate) struct CriteresRecherche {
 /// Portee, volontairement etroite et alignee sur `SEARCH_CAPS` :
 /// - `*`, le raccourci d'indexation historique ;
 /// - des predicats sur `upnp:class` et `dc:title` ;
+/// - `@refID exists true|false`, la clause d'existence des exemples de la
+///   specification (#1390) ;
 /// - leur conjonction par `and`.
 ///
-/// Tout le reste — `or`, parentheses, autre champ, `exists` — rend `Err`, donc
-/// un SOAP 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que
-/// rendre la bibliotheque entiere en faisant croire qu'on a cherche.
+/// Tout le reste — `or`, parentheses, autre champ — rend `Err`, donc un SOAP
+/// 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que rendre
+/// la bibliotheque entiere en faisant croire qu'on a cherche.
 pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> {
     let c = criteria.trim();
     if c == "*" {
@@ -862,6 +872,23 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
                 _ => return Err(()),
             };
             titres.push(PredicatTitre { op, valeur });
+        } else if champ.eq_ignore_ascii_case("@refID") {
+            // `@refID exists false` = « pas les objets de reference ». Tune
+            // n'en publie AUCUN — aucun `<item>` ni `<container>` sorti d'ici
+            // ne porte de `refID` —, donc tout ce que nous publions satisfait
+            // deja ce predicat : il ne restreint rien.
+            //
+            // Sa forme inverse, `@refID exists true`, ne peut rendre que la
+            // liste vide, pour la meme raison. Vide, pas en faute : c'est la
+            // regle deja tenue par `une_classe_inconnue_ou_ambigue_rend_une_liste_vide`.
+            if !op.eq_ignore_ascii_case("exists") {
+                return Err(());
+            }
+            match valeur.to_ascii_lowercase().as_str() {
+                "false" => {}
+                "true" => cibles.clear(),
+                _ => return Err(()),
+            }
         } else {
             return Err(());
         }
@@ -926,11 +953,21 @@ fn decouper_predicat(p: &str) -> Result<(String, String, String), ()> {
     let champ = it.next().ok_or(())?.to_string();
     let op = it.next().ok_or(())?.to_string();
     let brut = it.next().ok_or(())?.trim().to_string();
-    let valeur = brut
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .ok_or(())?
-        .to_string();
+    let valeur = match brut.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        Some(v) => v.to_string(),
+        // `exists` prend un booleen NU — `@refID exists false`, sans
+        // guillemets, comme dans les exemples de la specification. Exiger des
+        // guillemets partout faisait echouer le decoupage AVANT meme qu'on
+        // regarde le champ, et le critere entier partait en 708 (#1390).
+        // La tolerance s'arrete la : elle n'est ouverte que pour `exists`, et
+        // seulement pour `true`/`false`.
+        None if op.eq_ignore_ascii_case("exists")
+            && (brut.eq_ignore_ascii_case("true") || brut.eq_ignore_ascii_case("false")) =>
+        {
+            brut
+        }
+        None => return Err(()),
+    };
     Ok((champ, op, valeur))
 }
 
@@ -4482,6 +4519,10 @@ mod ssdp_msearch_tests {
         for champ in SEARCH_CAPS.split(',') {
             let critere = if champ == "upnp:class" {
                 format!("{champ} = \"object.item.audioItem.musicTrack\"")
+            } else if champ.starts_with('@') {
+                // Un attribut ne se compare pas, il EXISTE ou non : c'est la
+                // seule forme que la specification lui donne.
+                format!("{champ} exists false")
             } else {
                 format!("{champ} contains \"x\"")
             };
