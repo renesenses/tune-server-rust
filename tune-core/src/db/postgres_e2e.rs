@@ -791,3 +791,200 @@ async fn pg_config_backup_zones_volume_fixe() {
     scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
     scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
 }
+
+/// #2441 — « Continuer l'ecoute » sur une VRAIE base PostgreSQL : les
+/// contextes, leur ordre, et l'avancement que le client dessine.
+///
+/// # Pourquoi ce test manquait
+///
+/// Le correctif de #2441 (PR #2479 puis #2936) a mis « Continuer l'ecoute » a
+/// partir de `listen_history` et de son contexte de lecture. Les DEUX requetes
+/// qui le portent — la derniere ecoute de chaque contexte, et la resolution
+/// des albums locaux avec leur avancement — etaient redigees dans
+/// `tune-server/src/routes/home.rs`. Or ce job lance `cargo test -p tune-core`
+/// et ne compile PAS `tune-server` : elles n'avaient donc jamais ete jouees
+/// sur PostgreSQL, exactement comme les requetes de #2860 avant elles, et pour
+/// la meme raison. Leurs erreurs seraient avalees par le
+/// `unwrap_or_default()` de l'appelant : pas un message, juste une section
+/// vide.
+///
+/// Elles sont descendues dans `db/home_queries.rs`, et ce test les EXECUTE.
+///
+/// # Ce qu'il etablit
+///
+/// 1. Les deux requetes s'executent sur PostgreSQL.
+/// 2. Un historique couvrant TROIS albums en rend trois, du plus recent au
+///    plus ancien, sans doublon — le fait de base du ticket.
+/// 3. `progression_pourcent` rend 60 / 40 / 20 — **les memes nombres** que le
+///    test SQLite `plusieurs_albums_entames_rendent_chacun_leur_avancement`
+///    (tune-server/src/routes/home.rs). C'est la comparaison des deux moteurs.
+/// 4. TEMOIN : le cas a un seul album rend exactement cet album.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2441_continuer_lecoute_contextes_et_progression() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{
+        continue_listening_albums_du_contexte, continue_listening_contextes, progression_pourcent,
+    };
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+
+    // ── Trois disques de cinq pistes, entames de 1, 2 et 3 pistes ──
+    let mut albums = Vec::new();
+    for (rang, nom) in ["Un", "Deux", "Trois"].iter().enumerate() {
+        let artiste = id_de(&format!(
+            "INSERT INTO artists (name) VALUES ('Artiste {nom}') RETURNING id"
+        ));
+        let album = id_de(&format!(
+            "INSERT INTO albums (title, artist_id, track_count) \
+             VALUES ('Disque {nom}', {artiste}, 5) RETURNING id"
+        ));
+        // Le plus ANCIEN est le moins ecoute : l'ordre attendu est celui de
+        // l'ecoute, pas celui de l'avancement.
+        for piste in 0..=rang {
+            db.execute(
+                &format!(
+                    "INSERT INTO listen_history \
+                     (title, artist_name, album_title, album_id, source, \
+                      context_type, context_id, listened_at) \
+                     VALUES ('{nom}{piste}', 'Artiste {nom}', 'Disque {nom}', \
+                             {album}, 'local', 'album', '{album}', \
+                             '2026-08-2{rang}T10:0{piste}:00Z')"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        albums.push(album);
+    }
+    let (un, deux, trois) = (albums[0], albums[1], albums[2]);
+
+    // ── 1. La requete des contextes s'execute, et rend les TROIS ──
+    let marge: i64 = 40;
+    let sql_ctx = continue_listening_contextes(Engine::Postgres, "");
+    let lignes = db
+        .query_many(&sql_ctx, &[&marge as &dyn ToSqlValue])
+        .expect("`continue_listening_contextes` doit s'executer sur PostgreSQL");
+
+    let contextes: Vec<(String, String)> = lignes
+        .iter()
+        .filter_map(|c| {
+            Some((
+                c.first().and_then(|v| v.as_string())?,
+                c.get(1).and_then(|v| v.as_string())?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        contextes.len(),
+        3,
+        "les trois contextes album etaient attendus, obtenu : {contextes:?}"
+    );
+
+    // 2. Le bon ordre — du plus recent au plus ancien — et sans doublon.
+    let ids: Vec<String> = contextes.iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![trois.to_string(), deux.to_string(), un.to_string()],
+        "l'ordre doit etre celui de la derniere ecoute"
+    );
+    let uniques: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(ids.len(), uniques.len(), "un contexte remonte deux fois");
+    assert!(
+        contextes.iter().all(|(nature, _)| nature == "album"),
+        "toutes les entrees sont de nature album : {contextes:?}"
+    );
+
+    // ── 3. L'avancement : les memes nombres que sur SQLite ──
+    let sql_alb = continue_listening_albums_du_contexte(&[un, deux, trois]);
+    let resolus = db
+        .query_many(&sql_alb, &[])
+        .expect("`continue_listening_albums_du_contexte` doit s'executer sur PostgreSQL");
+
+    let mut pourcents = std::collections::HashMap::new();
+    for cols in &resolus {
+        let id = cols.first().and_then(|v| v.as_i64()).unwrap();
+        let ecoutees = cols.get(6).and_then(|v| v.as_i64());
+        let total = cols.get(7).and_then(|v| v.as_i64());
+        pourcents.insert(id, progression_pourcent(ecoutees, total));
+    }
+    assert_eq!(
+        (
+            pourcents.get(&trois).copied().flatten(),
+            pourcents.get(&deux).copied().flatten(),
+            pourcents.get(&un).copied().flatten()
+        ),
+        (Some(60), Some(40), Some(20)),
+        "PostgreSQL doit rendre le MEME avancement que SQLite (3/5, 2/5, 1/5), \
+         obtenu : {pourcents:?}"
+    );
+
+    // ── 4. TEMOIN — un seul album rend exactement cet album ──
+    reset_schema(&db);
+    let artiste = id_de("INSERT INTO artists (name) VALUES ('Pulp') RETURNING id");
+    let seul = id_de(&format!(
+        "INSERT INTO albums (title, artist_id, track_count) \
+         VALUES ('Live', {artiste}, 5) RETURNING id"
+    ));
+    for piste in ["Common People", "Disco 2000"] {
+        db.execute(
+            &format!(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, source, \
+                  context_type, context_id, listened_at) \
+                 VALUES ('{piste}', 'Pulp', 'Live', {seul}, 'local', \
+                         'album', '{seul}', '2026-08-28T22:45:00Z')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+
+    let lignes = db
+        .query_many(&sql_ctx, &[&marge as &dyn ToSqlValue])
+        .expect("la requete des contextes doit s'executer");
+
+    // Les deux pistes portent la MEME `listened_at` — a la seconde pres, ce
+    // qu'un enchainement produit — et la jointure sur le MAX les rend donc
+    // TOUTES LES DEUX. Mesure du 01/09 sur PostgreSQL 15 : la requete rend
+    // bien deux lignes ici. Le dedoublonnage est en Rust, chez l'appelant
+    // (`contextes_recents`, tune-server/src/routes/home.rs) qui garde la
+    // premiere, l'ordre etant deja decroissant. On rejoue cette regle pour
+    // verifier le contrat REEL de la requete, pas un contrat imagine.
+    let mut vues = std::collections::HashSet::new();
+    let distincts: Vec<String> = lignes
+        .iter()
+        .filter_map(|c| {
+            let nature = c.first().and_then(|v| v.as_string())?;
+            let id = c.get(1).and_then(|v| v.as_string())?;
+            vues.insert((nature, id.clone())).then_some(id)
+        })
+        .collect();
+    assert_eq!(
+        distincts,
+        vec![seul.to_string()],
+        "le temoin doit rendre exactement l'album ecoute : {lignes:?}"
+    );
+
+    let resolus = db
+        .query_many(&continue_listening_albums_du_contexte(&[seul]), &[])
+        .expect("la resolution d'album doit s'executer");
+    assert_eq!(resolus.len(), 1);
+    assert_eq!(
+        progression_pourcent(
+            resolus[0].get(6).and_then(|v| v.as_i64()),
+            resolus[0].get(7).and_then(|v| v.as_i64())
+        ),
+        Some(40),
+        "2 pistes sur 5, comme sur SQLite : {resolus:?}"
+    );
+}

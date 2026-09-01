@@ -116,6 +116,19 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
 
+      # #2441 — le CONTEXTE de lecture, sur une vraie base. Meme angle mort que
+      # ci-dessus, une release plus tard : les deux requetes qui portent
+      # « Continuer l'ecoute » depuis listen_history (la derniere ecoute de
+      # chaque contexte, et la resolution des albums avec leur avancement)
+      # etaient elles aussi redigees dans tune-server, que ce job ne compile
+      # pas. Descendues dans tune-core (db/home_queries.rs), elles sont
+      # desormais EXECUTEES ici. Le test exige les memes nombres que le test
+      # SQLite jumeau : 3/5, 2/5, 1/5 de disque ecoute.
+      - name: Contexte de lecture sur PostgreSQL (#2441)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
