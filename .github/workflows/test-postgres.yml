@@ -81,7 +81,7 @@ jobs:
       # retire de ci.yml. On ne compile donc plus deux fois le crate pour deux
       # filtres qui etaient deja inclus dans cette execution.
       - name: Tests tune-core avec PostgreSQL
-        run: cargo test -p tune-core --no-default-features --features postgres,oaat
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres,oaat
 
       # Real-schema regression for #1706: the self-healing DDL in
       # `ensure_schema` and migration 026 can only be proven against an actual
@@ -102,7 +102,7 @@ jobs:
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
 
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
@@ -114,7 +114,7 @@ jobs:
       - name: « Continuer l'écoute » sur PostgreSQL (#2860)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
 
       # #2441 — le CONTEXTE de lecture, sur une vraie base. Meme angle mort que
       # ci-dessus, une release plus tard : les deux requetes qui portent
@@ -127,7 +127,7 @@ jobs:
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
 
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
@@ -145,9 +145,9 @@ jobs:
       - name: Volume fixe et restauration de sauvegarde (#2395)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_config_backup -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_config_backup -- --nocapture
 
       - name: Parité du schéma PG (#2111)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture

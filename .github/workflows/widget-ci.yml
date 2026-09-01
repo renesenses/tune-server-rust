@@ -34,5 +34,5 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo check --release
         working-directory: tune-widget/src-tauri
-      - run: cargo test
+      - run: cargo test --no-fail-fast
         working-directory: tune-widget/src-tauri

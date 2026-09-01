@@ -622,7 +622,7 @@ fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
             .lines()
             .filter(|ligne| {
                 ligne.trim()
-                    == "run: cargo test -p tune-core --no-default-features --features postgres,oaat"
+                    == "run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres,oaat"
             })
             .count(),
         1,
@@ -635,6 +635,62 @@ fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
     assert!(widget.contains("      - \"tune-widget/**\""));
     assert!(widget.contains("cargo check --release"));
     assert!(widget.contains("cargo test"));
+}
+
+/// Contre-epreuve de #3098 : toute porte `cargo test` va jusqu'au bout.
+///
+/// Sans `--no-fail-fast`, le PREMIER binaire de test qui echoue arrete la
+/// commande : tous les binaires suivants ne sont jamais executes, et la porte
+/// n'affiche qu'un echec la ou il y en a peut-etre dix. Mesure sur Shrek le
+/// 01/09/2026, jeu de fonctionnalites exact du job `test` (`oaat,cloud-relay`,
+/// cinq paquets), avec l'echec IPv6 de `dual_stack_socket_accepts_both_families`
+/// au 9e binaire : SANS le drapeau, 9 binaires sur 18 sont executes et les NEUF
+/// suivants ne tournent jamais ; AVEC, les 18 tournent, plus quatre lots de
+/// doc-tests. Ce qui n'est pas execute ne peut pas etre rouge.
+///
+/// Le compte minimal en fin de test est delibere : un detecteur qui ne repere
+/// plus aucune ligne passerait a vide, exactement le defaut qu'il garde.
+#[test]
+fn toute_porte_cargo_test_va_jusqu_au_bout() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+    let mut fichiers: Vec<_> = fs::read_dir(&racine)
+        .expect("dossier des workflows illisible")
+        .filter_map(|entree| entree.ok().map(|entree| entree.path()))
+        .filter(|chemin| chemin.extension().and_then(|ext| ext.to_str()) == Some("yml"))
+        .collect();
+    fichiers.sort();
+
+    let mut vues = 0usize;
+    for chemin in fichiers {
+        let source = fs::read_to_string(&chemin)
+            .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+        for (numero, ligne) in source.lines().enumerate() {
+            let nue = ligne.trim();
+            let Some(commande) = nue
+                .strip_prefix("- run: ")
+                .or_else(|| nue.strip_prefix("run: "))
+            else {
+                continue;
+            };
+            if commande != "cargo test" && !commande.starts_with("cargo test ") {
+                continue;
+            }
+            vues += 1;
+            assert!(
+                commande.contains("--no-fail-fast"),
+                "{}:{} lance cargo test sans --no-fail-fast : le premier binaire \
+                 en echec emporterait tous les suivants en silence\n  {nue}",
+                chemin.display(),
+                numero + 1
+            );
+        }
+    }
+
+    assert!(
+        vues >= 10,
+        "seulement {vues} portes `cargo test` reperees : le detecteur ne voit \
+         plus les lignes qu'il doit garder"
+    );
 }
 
 /// Le plafond de l'etape apt doit laisser passer ses TROIS essais.
