@@ -24,11 +24,66 @@ struct HomeParams {
     zone_id: Option<i64>,
 }
 
+/// Les parametres d'« Ajoutes recemment » (#3039).
+///
+/// `days` est la nouveaute : la fenetre etait ecrite en dur a 7 jours dans une
+/// fonction SANS argument, si bien que le testeur qui demande « les quinze
+/// derniers jours » ou « le dernier mois » n'avait aucun moyen de l'obtenir.
+#[derive(Deserialize)]
+struct RecentlyAddedParams {
+    limit: Option<i64>,
+    /// Largeur de la fenetre en jours. Absent ⇒ [`FENETRE_JOURS_DEFAUT`].
+    days: Option<i64>,
+}
+
+/// La fenetre servie quand le client n'en demande aucune.
+///
+/// TEMOIN DE NON-REGRESSION : c'est exactement ce que la route rendait avant
+/// #3039. Un client deja deploye qui appelle `/home/recently-added` sans rien
+/// doit voir la meme chose qu'hier ; la valeur ne se change pas sans changer
+/// ce que voient tous les ecrans d'accueil du parc.
+pub(crate) const FENETRE_JOURS_DEFAUT: i64 = 7;
+
+/// Le plafond de la fenetre, en jours : deux ans.
+///
+/// Une fenetre non bornee est une invitation a `?days=100000`, c'est-a-dire a
+/// un balayage de la bibliotheque entiere — et il n'y a AUCUN index sur
+/// `tracks.file_mtime` ni sur `file_first_seen.first_seen_at` (verifie sur les
+/// deux moteurs le 02/09/2026) : le filtre est deja une passe complete sur
+/// `tracks`, que seul le petit nombre de lignes retenues rend supportable.
+/// Au-dela, la vue « ajouts recents » ne veut de toute facon plus rien dire :
+/// c'est la bibliotheque, et la grille des albums triee par date d'ajout la
+/// sert deja avec sa pagination.
+///
+/// Au-dessus, une erreur qui DIT la borne — pas un silence, pas un ecretage
+/// muet qui ferait croire au client que sa demande a ete honoree.
+pub(crate) const FENETRE_JOURS_MAX: i64 = 730;
+
+/// Traduit une largeur de fenetre en borne basse (secondes epoch), ou refuse.
+///
+/// Refuser plutot qu'ecreter : un client qui demande 5 000 jours et recoit
+/// 730 jours de resultats croit avoir tout. Il vaut mieux qu'il l'apprenne.
+fn borne_basse_de_fenetre(days: Option<i64>) -> Result<f64, AppError> {
+    let jours = days.unwrap_or(FENETRE_JOURS_DEFAUT);
+    if !(1..=FENETRE_JOURS_MAX).contains(&jours) {
+        return Err(AppError::bad_request(format!(
+            "days={jours} hors bornes : la fenetre des ajouts recents va de 1 a \
+             {FENETRE_JOURS_MAX} jours (defaut {FENETRE_JOURS_DEFAUT})"
+        )));
+    }
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    Ok(maintenant - (jours as f64) * 24.0 * 3600.0)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(home_page))
         .route("/continue-listening", get(continue_listening))
         .route("/recently-added", get(recently_added))
+        .route("/recently-added/summary", get(recently_added_summary))
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
@@ -76,7 +131,9 @@ fn sql_top_genres() -> String {
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // No zone filter for the aggregated home page — show all zones.
     let continue_items = fetch_continue_listening(&state, 10, None)?;
-    let recent_items = fetch_recently_added(&state, 20)?;
+    // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
+    // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
+    let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
     let top_tracks = fetch_top_tracks(&state, 20);
     let radios = fetch_radio_picks(&state)?;
     let discover = fetch_recommendations(&state, 20)?;
@@ -156,10 +213,6 @@ async fn continue_listening(
 fn marge_de_contextes(limit: i64) -> i64 {
     limit.saturating_mul(4).clamp(1, 80)
 }
-
-/// Les cinq natures que `contexte_de_lecture` (tune-server/src/routes/
-/// playback.rs) sait ecrire, telles que FabienM les a enumerees.
-const CONTEXTES_AFFICHES: [&str; 5] = ["album", "playlist", "artist", "label", "track"];
 
 /// « Continuer l'ecoute » : ce que l'auditeur a demande en dernier, et OU il
 /// en etait — pas « les albums qu'il n'a pas finis ».
@@ -267,6 +320,8 @@ fn fetch_continue_listening(
         }
         let titre = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let dernier = cols.get(8).and_then(|v| v.as_string()).unwrap_or_default();
+        let ecoutees = cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0);
+        let total = cols.get(7).and_then(|v| v.as_i64());
         items.push((
             dernier,
             json!({
@@ -285,8 +340,12 @@ fn fetch_continue_listening(
                 "year": cols.get(3).and_then(|v| v.as_i64()),
                 "cover_path": cols.get(4).and_then(|v| v.as_string()),
                 "genre": cols.get(5).and_then(|v| v.as_string()),
-                "listened_tracks": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
-                "track_count": cols.get(7).and_then(|v| v.as_i64()),
+                "listened_tracks": ecoutees,
+                "track_count": total,
+                // Ces lignes-la, elles, ont TOUJOURS leur avancement : le
+                // `HAVING listened_tracks < a.track_count` de la requete
+                // garantit un `track_count` non nul et strictement positif.
+                "progress_percent": home_queries::progression_pourcent(Some(ecoutees), total),
                 "source": "local",
             }),
         ));
@@ -294,7 +353,22 @@ fn fetch_continue_listening(
 
     // Le plus recent d'abord, toutes natures confondues : l'auditeur relit son
     // geste le plus recent, pas « les albums puis les playlists ».
-    items.sort_by(|a, b| b.0.cmp(&a.0));
+    //
+    // Le departage par nature puis identifiant rend l'ordre TOTAL. Sans lui,
+    // deux entrees de la meme seconde — `listened_at` est au format seconde,
+    // et les deux rangs sont fusionnes ici — se classaient selon leur ordre
+    // d'insertion, c'est-a-dire selon l'ordre qu'un moteur avait rendu. Le
+    // `truncate` juste apres decidait alors, en silence, laquelle des deux
+    // disparaissait de la section.
+    items.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| {
+                a.1["context_type"]
+                    .as_str()
+                    .cmp(&b.1["context_type"].as_str())
+            })
+            .then_with(|| a.1["context_id"].as_str().cmp(&b.1["context_id"].as_str()))
+    });
     items.truncate(limit.max(0) as usize);
     Ok(items.into_iter().map(|(_, item)| item).collect())
 }
@@ -306,37 +380,10 @@ fn fetch_continue_listening(
 fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(String, Value)> {
     let engine = state.backend.engine();
     let marge = marge_de_contextes(limit);
-    let natures = CONTEXTES_AFFICHES
-        .iter()
-        .map(|n| format!("'{n}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // La ligne la PLUS RECENTE de chaque contexte : c'est elle qui porte le
-    // rang atteint, et les champs d'affichage de repli. La jointure sur le
-    // MAX plutot qu'une fonction de fenetrage — les deux moteurs la
-    // comprennent, `ROW_NUMBER() OVER` n'existe pas sur toutes les versions de
-    // SQLite embarquees.
-    let p1 = ph(engine, 1);
-    let sql = format!(
-        "SELECT lh.context_type, lh.context_id, lh.listened_at, \
-                lh.context_position, lh.title, lh.artist_name, lh.album_title, \
-                lh.cover_url, lh.album_id, lh.source \
-         FROM listen_history lh \
-         JOIN (SELECT context_type, context_id, MAX(listened_at) as dernier \
-               FROM listen_history lh \
-               WHERE lh.context_type IN ({natures}) \
-                 AND lh.context_id IS NOT NULL \
-                 {zone_filter}\
-               GROUP BY context_type, context_id) d \
-           ON d.context_type = lh.context_type \
-          AND d.context_id = lh.context_id \
-          AND d.dernier = lh.listened_at \
-         WHERE lh.context_type IN ({natures}) \
-         {zone_filter}\
-         ORDER BY lh.listened_at DESC \
-         LIMIT {p1}"
-    );
+    // La requete vit dans `tune-core` : c'est le SEUL crate que le job
+    // « Test (PostgreSQL) » compile. Redigee ici, elle n'etait jouee que sur
+    // SQLite — le trou par lequel #2860 etait passe (cf. home_queries.rs).
+    let sql = home_queries::continue_listening_contextes(engine, zone_filter);
     let params: [&dyn ToSqlValue; 1] = [&marge];
     let rows = state
         .backend
@@ -393,6 +440,10 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                 "genre": Value::Null,
                 "listened_tracks": Value::Null,
                 "track_count": Value::Null,
+                // Aucune des quatre autres natures n'a de notion de completude :
+                // la barre reste absente plutot que de mentir a 0 %. Seule la
+                // branche `album` ci-dessous la renseigne.
+                "progress_percent": Value::Null,
                 "title": titre_piste,
             });
             let o = item.as_object_mut()?;
@@ -419,6 +470,17 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                         o.insert("genre".into(), json!(a.genre));
                         o.insert("listened_tracks".into(), json!(a.listened_tracks));
                         o.insert("track_count".into(), json!(a.track_count));
+                        // La barre que `HomeView.svelte` dessine sous la
+                        // vignette. Calculee en Rust : en SQL, un album a
+                        // `track_count` = 0 ferait LEVER PostgreSQL sur une
+                        // division par zero et emporterait toute la section.
+                        o.insert(
+                            "progress_percent".into(),
+                            json!(home_queries::progression_pourcent(
+                                a.listened_tracks,
+                                a.track_count
+                            )),
+                        );
                     } else {
                         // Album de STREAMING (`context_id` non numerique) ou
                         // disque disparu de la bibliotheque : la ligne
@@ -499,24 +561,12 @@ fn resoudre_albums(
     if ids.is_empty() {
         return std::collections::HashMap::new();
     }
-    let liste = ids
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
     // GROUP BY exhaustif, et non `GROUP BY a.id` : la dependance fonctionnelle
     // de PostgreSQL ne couvre que les colonnes de la table dont on groupe la
     // cle primaire — `ar.name` vient d'une AUTRE table et ferait echouer la
-    // requete sur ce moteur.
-    let sql = format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
-                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
-         FROM albums a \
-         LEFT JOIN artists ar ON a.artist_id = ar.id \
-         LEFT JOIN listen_history lh ON {HISTORIQUE_VERS_ALBUM} \
-         WHERE a.id IN ({liste}) \
-         GROUP BY a.id, a.title, ar.name, a.year, a.cover_path, a.genre, a.track_count"
-    );
+    // requete sur ce moteur. La requete vit dans `tune-core` pour que le job
+    // « Test (PostgreSQL) » l'execute vraiment (#2441).
+    let sql = home_queries::continue_listening_albums_du_contexte(&ids);
     state
         .backend
         .query_many(&sql, &[])
@@ -1345,14 +1395,55 @@ mod tests_contextes {
     }
 }
 
-/// Albums added in the last 7 days (by file mtime of tracks).
+/// Les albums entres dans la bibliotheque au cours des `days` derniers jours.
+///
+/// `days` va de 1 a [`FENETRE_JOURS_MAX`], defaut [`FENETRE_JOURS_DEFAUT`] ;
+/// hors bornes, 400 et le message dit la borne (#3039).
+///
+/// La forme de la reponse — un TABLEAU d'albums — ne change pas : les clients
+/// deployes la lisent telle quelle. Les nombres du sous-titre vivent a cote,
+/// dans [`recently_added_summary`].
 async fn recently_added(
     State(state): State<AppState>,
-    Query(p): Query<HomeParams>,
+    Query(p): Query<RecentlyAddedParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
-    let items = fetch_recently_added(&state, limit)?;
+    let depuis = borne_basse_de_fenetre(p.days)?;
+    let items = fetch_recently_added(&state, limit, depuis)?;
     Ok(Json(json!(items)))
+}
+
+/// Le sous-titre de l'onglet : combien d'albums, combien de pistes, combien de
+/// temps, sur la MEME fenetre que [`recently_added`] (#3039).
+///
+/// Route separee, et non un champ de plus dans la reponse ci-dessus : passer
+/// le tableau en objet casserait tout client deja deploye. `limit` n'est pas
+/// lu ici — on compte la fenetre, pas la page.
+async fn recently_added_summary(
+    State(state): State<AppState>,
+    Query(p): Query<RecentlyAddedParams>,
+) -> Result<Json<Value>, AppError> {
+    let depuis = borne_basse_de_fenetre(p.days)?;
+    let engine = state.backend.engine();
+    let sql = home_queries::recently_added_totaux(engine);
+    let params: [&dyn ToSqlValue; 1] = [&depuis];
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
+    let cols = rows.first();
+    let nombre = |i: usize| cols.and_then(|c: &Vec<_>| c.get(i)?.as_i64()).unwrap_or(0);
+    let duree_ms = nombre(2);
+    Ok(Json(json!({
+        "days": p.days.unwrap_or(FENETRE_JOURS_DEFAUT),
+        "album_count": nombre(0),
+        "track_count": nombre(1),
+        "duration_ms": duree_ms,
+        // Les secondes en plus des millisecondes : c'est la seule des trois
+        // valeurs que l'ecran affiche telle quelle (« 5 h 55 min »), et la
+        // division n'a pas a etre refaite par chaque client.
+        "duration_seconds": duree_ms / 1000,
+    })))
 }
 
 /// « Ajoutes recemment ».
@@ -1363,11 +1454,14 @@ async fn recently_added(
 /// `column "ar.name" must appear in the GROUP BY clause or be used in an
 /// aggregate function`, avalee par le `unwrap_or_default()` plus bas. Cette
 /// section-la etait donc vide, elle aussi, sur toute installation PostgreSQL.
-fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+///
+/// `depuis` est la borne basse de la fenetre, en secondes epoch : elle vient
+/// de [`borne_basse_de_fenetre`], qui l'a deja bornee. Elle etait auparavant
+/// recalculee ici a 7 jours en dur, hors d'atteinte de tout appelant (#3039).
+fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    let seven_days_ago = chrono_epoch_seven_days_ago();
     let sql = home_queries::recently_added(engine);
-    let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
+    let params: [&dyn ToSqlValue; 2] = [&depuis, &limit];
     let rows = state
         .backend
         .query_many(&sql, &params)
@@ -1386,19 +1480,15 @@ fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppE
                 "sample_rate": cols.get(7).and_then(|v| v.as_i64()),
                 "bit_depth": cols.get(8).and_then(|v| v.as_i64()),
                 "track_count": cols.get(9).and_then(|v| v.as_i64()),
+                // `added_at`, et non plus `added_mtime` : la valeur n'est plus
+                // un `mtime` de fichier mais la premiere vue par le scan quand
+                // elle existe (#3039). L'ancien nom est conserve a cote le
+                // temps que les clients migrent — il porte la meme valeur.
+                "added_at": cols.get(10).and_then(|v| v.as_f64()),
                 "added_mtime": cols.get(10).and_then(|v| v.as_f64()),
             })
         })
         .collect())
-}
-
-/// Returns epoch seconds for 7 days ago.
-fn chrono_epoch_seven_days_ago() -> f64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    now - (7.0 * 24.0 * 3600.0)
 }
 
 /// Recommendations based on listening history: find most-played genres/artists,
@@ -1976,4 +2066,326 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
+}
+
+/// #2441 — l'avancement que le client dessine et que le serveur n'emettait
+/// nulle part.
+///
+/// `HomeView.svelte` (tune-web-client, `origin/main`) porte, sous la vignette
+/// de « Continuer l'ecoute » :
+///
+/// ```svelte
+/// {#if item.progress_percent != null}
+///   <div class="continue-progress">
+///     <div class="continue-progress-bar" style="width: {item.progress_percent}%"></div>
+/// ```
+///
+/// `progress_percent` ne figurait dans AUCUN fichier de ce depot — compte fait
+/// le 01/09/2026 : zero occurrence, toutes extensions confondues. La condition
+/// n'a donc jamais pu etre vraie et la barre n'est apparue chez personne. C'est
+/// le dernier point de l'arbitrage rendu par Bertrand le 01/09 : « corriger au
+/// passage le champ de progression que le client lit et que le serveur n'emet
+/// nulle part ».
+///
+/// Ces tests portent aussi le FAIT DE BASE de ce ticket, sur lequel toute la
+/// section repose : un historique couvrant PLUSIEURS albums doit en rendre
+/// plusieurs, dans le bon ordre, sans doublon.
+#[cfg(test)]
+mod tests_2441_progression {
+    use super::*;
+
+    fn poser_album(state: &AppState, artiste: &str, titre: &str, pistes: i64) -> i64 {
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (name) VALUES (?1)",
+            &[&artiste as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let artiste_id = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES (?1, ?2, ?3)",
+            &[
+                &titre as &dyn ToSqlValue,
+                &artiste_id as &dyn ToSqlValue,
+                &pistes as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        b.last_insert_rowid()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ecoute(
+        state: &AppState,
+        titre: &str,
+        album: Option<&str>,
+        album_id: Option<i64>,
+        nature: &str,
+        contexte_id: &str,
+        quand: &str,
+    ) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, album_id, source, \
+                  context_type, context_id, listened_at) \
+                 VALUES (?1, 'Interprete', ?2, ?3, 'local', ?4, ?5, ?6)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &nature as &dyn ToSqlValue,
+                    &contexte_id as &dyn ToSqlValue,
+                    &quand as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// LE FAIT DE BASE de #2441, et l'avancement de chacun.
+    ///
+    /// Trois disques de cinq pistes, entames respectivement d'une, deux et
+    /// trois pistes. La section doit rendre LES TROIS — c'est ce que le titre
+    /// du ticket reclame — du plus recent au plus ancien, sans qu'aucun
+    /// n'apparaisse deux fois, et chacun avec sa propre barre.
+    #[test]
+    fn plusieurs_albums_entames_rendent_chacun_leur_avancement() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let un = poser_album(&state, "Artiste Un", "Disque Un", 5);
+        let deux = poser_album(&state, "Artiste Deux", "Disque Deux", 5);
+        let trois = poser_album(&state, "Artiste Trois", "Disque Trois", 5);
+
+        // Le plus ANCIEN est celui qu'on a le plus ecoute : l'ordre attendu
+        // est celui de l'ecoute, pas celui de l'avancement.
+        for (i, t) in ["A1"].iter().enumerate() {
+            ecoute(
+                &state,
+                t,
+                Some("Disque Un"),
+                Some(un),
+                "album",
+                &un.to_string(),
+                &format!("2026-08-28T22:4{i}:00Z"),
+            );
+        }
+        for (i, t) in ["B1", "B2"].iter().enumerate() {
+            ecoute(
+                &state,
+                t,
+                Some("Disque Deux"),
+                Some(deux),
+                "album",
+                &deux.to_string(),
+                &format!("2026-08-28T23:1{i}:00Z"),
+            );
+        }
+        for (i, t) in ["C1", "C2", "C3"].iter().enumerate() {
+            ecoute(
+                &state,
+                t,
+                Some("Disque Trois"),
+                Some(trois),
+                "album",
+                &trois.to_string(),
+                &format!("2026-08-29T08:0{i}:00Z"),
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        // 1. PLUSIEURS albums, pas un seul.
+        assert_eq!(
+            items.len(),
+            3,
+            "« Continuer l'ecoute » doit rendre les TROIS disques entames, \
+             obtenu : {items:?}"
+        );
+
+        // 2. Aucun doublon.
+        let ids: Vec<i64> = items
+            .iter()
+            .filter_map(|i| i["album_id"].as_i64())
+            .collect();
+        let uniques: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            uniques.len(),
+            "un album remonte deux fois : {ids:?}"
+        );
+
+        // 3. Le bon ordre : du plus recemment ecoute au plus ancien.
+        assert_eq!(
+            ids,
+            vec![trois, deux, un],
+            "l'ordre doit etre celui de la derniere ecoute"
+        );
+
+        // 4. CHACUN avec son avancement — le champ que le client lit.
+        let pourcents: Vec<Option<i64>> = items
+            .iter()
+            .map(|i| i["progress_percent"].as_i64())
+            .collect();
+        assert_eq!(
+            pourcents,
+            vec![Some(60), Some(40), Some(20)],
+            "3/5, 2/5 et 1/5 de disque ecoute : {items:?}"
+        );
+    }
+
+    /// TEMOIN — le cas a un seul album continue de rendre exactement cet
+    /// album, avec sa barre. La correction ne doit rien changer ici.
+    #[test]
+    fn l_album_unique_rend_toujours_exactement_cet_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let seul = poser_album(&state, "Pulp", "Live", 5);
+        for (i, t) in ["Common People", "Disco 2000"].iter().enumerate() {
+            ecoute(
+                &state,
+                t,
+                Some("Live"),
+                Some(seul),
+                "album",
+                &seul.to_string(),
+                &format!("2026-08-28T22:4{i}:00Z"),
+            );
+        }
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 1, "un seul album attendu : {items:?}");
+        assert_eq!(items[0]["album_id"].as_i64(), Some(seul));
+        assert_eq!(items[0]["context_type"], "album");
+        assert_eq!(items[0]["listened_tracks"].as_i64(), Some(2));
+        assert_eq!(
+            items[0]["progress_percent"].as_i64(),
+            Some(40),
+            "2 pistes sur 5 : {items:?}"
+        );
+    }
+
+    /// Une playlist n'a AUCUNE notion de completude : elle doit remonter, mais
+    /// sans barre. Une barre a 0 % ferait croire a une ecoute jamais
+    /// commencee — le client, lui, teste `!= null` et n'affiche alors rien.
+    #[test]
+    fn une_playlist_remonte_sans_barre_plutot_qu_a_zero_pour_cent() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist = state.backend.last_insert_rowid();
+        ecoute(
+            &state,
+            "So What",
+            Some("Kind of Blue"),
+            None,
+            "playlist",
+            &playlist.to_string(),
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 1, "la playlist doit remonter : {items:?}");
+        assert_eq!(items[0]["context_type"], "playlist");
+        assert!(
+            items[0]["progress_percent"].is_null(),
+            "une playlist n'a pas d'avancement d'album : {items:?}"
+        );
+        assert!(
+            items[0]
+                .as_object()
+                .unwrap()
+                .contains_key("progress_percent"),
+            "le champ doit EXISTER meme nul — les clients deployes le lisent"
+        );
+    }
+
+    /// Un album de STREAMING n'a pas de ligne dans `albums` : on ignore son
+    /// nombre de pistes. Pas de barre inventee.
+    #[test]
+    fn un_album_de_streaming_n_annonce_pas_d_avancement() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute(
+            &state,
+            "Piste Qobuz",
+            Some("Album Qobuz"),
+            None,
+            "album",
+            "qobuz:12345",
+            "2026-08-28T22:45:00Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 1, "l'album de flux doit remonter : {items:?}");
+        assert!(
+            items[0]["progress_percent"].is_null(),
+            "nombre de pistes inconnu : aucune barre. {items:?}"
+        );
+    }
+
+    /// GARDE — deux gestes de la MEME seconde ne doivent pas se classer au
+    /// hasard. `listened_at` est au format seconde : deux clics rapproches y
+    /// tombent, et le `truncate` decidait alors en silence lequel disparait.
+    ///
+    /// La divergence n'a PAS ete observee entre les deux moteurs sur ce jeu
+    /// (mesure du 01/09) : ce test fige un ordre total, il ne repare pas un
+    /// defaut constate.
+    #[test]
+    fn deux_contextes_de_la_meme_seconde_gardent_un_ordre_total() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = poser_album(&state, "Pulp", "Live", 5);
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist = state.backend.last_insert_rowid();
+
+        let meme_seconde = "2026-08-28T22:45:00Z";
+        ecoute(
+            &state,
+            "Common People",
+            Some("Live"),
+            Some(album),
+            "album",
+            &album.to_string(),
+            meme_seconde,
+        );
+        ecoute(
+            &state,
+            "So What",
+            Some("Kind of Blue"),
+            None,
+            "playlist",
+            &playlist.to_string(),
+            meme_seconde,
+        );
+
+        let lire = || {
+            let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+                panic!("la requete doit repondre")
+            };
+            items
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}:{}",
+                        i["context_type"].as_str().unwrap_or_default(),
+                        i["context_id"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let attendu = vec![format!("album:{album}"), format!("playlist:{playlist}")];
+        assert_eq!(lire(), attendu, "l'ordre doit etre celui du departage");
+        assert_eq!(lire(), attendu, "et il doit etre le meme a chaque appel");
+    }
 }

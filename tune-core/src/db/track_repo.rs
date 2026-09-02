@@ -35,34 +35,83 @@ pub fn folder_like_pattern(prefix: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
     let sep = std::path::MAIN_SEPARATOR;
     let base: String = prefix.trim_end_matches(['/', '\\']).nfc().collect();
-    format!("{base}{sep}%")
+    // Le chemin est du TEXTE, pas un motif : seul le `%` final est un joker.
+    // Le séparateur est échappé comme le reste, parce que sous Windows c'est
+    // l'antislash — c'est-à-dire le caractère d'échappement lui-même.
+    format!(
+        "{}{}%",
+        echapper_jokers_like(&base),
+        echapper_jokers_like(&sep.to_string())
+    )
+}
+
+/// Neutralise dans `texte` les trois caractères que `LIKE` interprète : `%`
+/// (n'importe quelle suite), `_` (n'importe quel caractère) et l'antislash,
+/// qui sert ici de caractère d'échappement et doit donc se doubler.
+///
+/// **C'est la moitié « valeur » d'un contrat en deux moitiés** : tout motif
+/// construit ici DOIT être suivi de [`like_escape_clause`], et réciproquement.
+/// Séparées, chacune casse l'autre — un motif échappé lu sans clause `ESCAPE`
+/// sur SQLite rendrait les antislashs littéraux et ne trouverait plus rien.
+///
+/// Pourquoi il le fallait : un nom de dossier peut légalement contenir `%` ou
+/// `_`, et ces deux-là sont exactement les jokers de `LIKE`. Sans échappement,
+/// « `100% Live` » produisait le motif `…/100% Live/%`, dont le premier `%`
+/// avale n'importe quelle suite : sélectionner ce répertoire rendait aussi le
+/// contenu de `…/1000 Autres/`. Un filtre qui ne filtre pas rend PLUS que
+/// demandé, et le testeur voit « toute la bibliothèque » là où il attendait un
+/// dossier (#3101). Le `_` a le même défaut, d'un caractère : `Disc_1` ramenait
+/// `DiscX1`. Sur des bibliothèques de dizaines de milliers de fichiers, ces
+/// deux caractères sont partout dans les noms de dossiers d'albums.
+///
+/// Les surcoûts sont bornés : au pire un antislash par caractère.
+pub fn echapper_jokers_like(texte: &str) -> String {
+    let mut sortie = String::with_capacity(texte.len());
+    for c in texte.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            sortie.push('\\');
+        }
+        sortie.push(c);
+    }
+    sortie
 }
 
 /// SQL suffix that must follow every `LIKE` whose pattern is a **file path**.
 ///
-/// Postgres treats a backslash inside a `LIKE` pattern as the default escape
-/// character; SQLite has no default escape character at all. Folder patterns
-/// are built from absolute paths, so on a Windows host the pattern reads
-/// `G:\Blues 2\%` — Postgres consumes the trailing `\%` as a *literal* percent
-/// sign, the pattern degrades to the literal string `G:Blues 2%`, and it
-/// matches no row. Every folder then reports "0 pistes" while the library is
-/// perfectly scanned (JF, Windows + Postgres: all four roots empty in
-/// Répertoires, and the data-derived fallback root fell to zero too because it
-/// reuses the same pattern).
+/// **Moitié « clause » du contrat ouvert par [`echapper_jokers_like`]** : la
+/// valeur liée a été échappée à l'antislash, et cette clause dit aux DEUX
+/// moteurs de le lire ainsi. Les deux moitiés voyagent ensemble ou pas du tout.
 ///
-/// `ESCAPE ''` selects *no* escape character, which is exactly SQLite's
-/// behaviour — so both engines now read the backslash literally. SQLite rejects
-/// an empty ESCAPE string, hence the bare `LIKE` there: its semantics are
-/// already the target ones, so this is a no-op on SQLite by construction.
+/// # Ce qu'elle règle, et qu'il ne faut pas ré-ouvrir
 ///
-/// Known and unchanged on both engines: `%` and `_` inside a real folder name
-/// still act as wildcards (over-match, never under-match). Escaping them would
-/// require an escape character, which is what we are deliberately giving up.
-pub fn like_escape_clause(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => " ESCAPE ''",
-        Engine::Sqlite => "",
-    }
+/// 1. **`%` et `_` dans un nom de dossier** (#3101). Ce sont les jokers de
+///    `LIKE`. Ils sont désormais neutralisés dans la valeur, ce que seule une
+///    clause `ESCAPE` explicite rend possible : sélectionner `100% Live` ne
+///    ramène plus le contenu de `1000 Autres`.
+/// 2. **L'antislash de Windows** (#1752). Postgres traite l'antislash comme son
+///    caractère d'échappement par défaut ; SQLite n'en a aucun. Un motif brut
+///    `G:\Blues 2\%` se dégradait donc, côté Postgres, en la chaîne littérale
+///    `G:Blues 2%` qui ne correspond à rien : tous les répertoires annoncés
+///    « 0 piste » alors que la bibliothèque était parfaitement scannée (JF,
+///    Windows + Postgres). La réponse d'alors était `ESCAPE ''` — *aucun*
+///    caractère d'échappement — ce qui rendait l'antislash littéral mais
+///    interdisait du même coup de neutraliser `%` et `_`. Ici l'antislash est
+///    DOUBLÉ dans la valeur, donc littéral lui aussi, et les jokers redeviennent
+///    échappables. Les deux moteurs lisent la même chose.
+///
+/// # Pourquoi la même chaîne pour les deux moteurs
+///
+/// `ESCAPE '\'` est déjà le comportement par défaut de Postgres et une clause
+/// que SQLite accepte : le suffixe est identique de part et d'autre, ce qui
+/// supprime la divergence de dialecte qui avait produit #1752. Le paramètre
+/// `engine` a donc disparu — un appelant ne peut plus se tromper de moteur.
+///
+/// ⚠️ Sur SQLite, une clause `ESCAPE` désactive l'optimisation d'index de
+/// `LIKE`. Elle était déjà inapplicable ici (elle exige un index en
+/// `COLLATE NOCASE`, or `idx_tracks_file_path` est en collation binaire) : le
+/// plan est un parcours complet avant comme après, mesuré, pas supposé.
+pub fn like_escape_clause() -> &'static str {
+    " ESCAPE '\\'"
 }
 
 /// The longest common directory prefix of all `tracks.file_path` — the real
@@ -129,28 +178,33 @@ mod common_root_tests {
 
 #[cfg(test)]
 mod like_escape_tests {
-    use super::{Engine, like_escape_clause};
+    use super::{echapper_jokers_like, like_escape_clause};
 
-    /// Regression guard for the Windows + Postgres "Dossier vide" bug: a folder
-    /// pattern built from `G:\Blues 2` ends in `\%`, which Postgres reads as an
-    /// escaped — hence literal — percent sign unless the escape mechanism is
-    /// switched off. Verified against PostgreSQL 15: without the clause the
-    /// count is 0, with it the count is right. Deleting this suffix silently
-    /// empties the Répertoires view and the Oxygen folder drill-down for every
-    /// Windows user on Postgres — and only for them, which is why it went
-    /// unnoticed.
+    /// Les deux moitiés du contrat sont indissociables : la clause dit
+    /// « l'antislash échappe », la valeur doit donc doubler les siens.
     #[test]
-    fn postgres_disables_the_backslash_escape() {
-        assert_eq!(like_escape_clause(Engine::Postgres), " ESCAPE ''");
+    fn la_clause_est_la_meme_pour_les_deux_moteurs() {
+        assert_eq!(like_escape_clause(), " ESCAPE '\\'");
     }
 
-    /// SQLite has no default escape character, so a bare LIKE already reads the
-    /// backslash literally — and it *rejects* an empty ESCAPE string
-    /// ("ESCAPE expression must be a single character"). The clause must stay
-    /// empty here: this is a correctness constraint, not a style choice.
+    /// #3101 — les deux jokers de `LIKE` sont neutralisés dans la valeur.
     #[test]
-    fn sqlite_keeps_the_bare_like() {
-        assert_eq!(like_escape_clause(Engine::Sqlite), "");
+    fn les_jokers_sont_neutralises() {
+        assert_eq!(echapper_jokers_like("100% Live"), "100\\% Live");
+        assert_eq!(echapper_jokers_like("Disc_1"), "Disc\\_1");
+        assert_eq!(echapper_jokers_like("sans joker"), "sans joker");
+    }
+
+    /// #1752 — l'antislash de Windows est DOUBLÉ, donc littéral sur les deux
+    /// moteurs. C'est ce que `ESCAPE ''` obtenait autrefois en renonçant à tout
+    /// échappement ; on l'obtient maintenant sans renoncer aux jokers.
+    #[test]
+    fn l_antislash_de_windows_reste_litteral() {
+        assert_eq!(
+            echapper_jokers_like("G:\\Blues 2"),
+            "G:\\\\Blues 2",
+            "un antislash de chemin doit sortir doublé, jamais nu"
+        );
     }
 }
 
@@ -897,7 +951,7 @@ impl TrackRepo {
             conditions.push(format!(
                 "t.file_path LIKE {}{}",
                 ph.take(),
-                like_escape_clause(engine)
+                like_escape_clause()
             ));
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
         }
@@ -1211,10 +1265,12 @@ impl TrackRepo {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
-        let esc = like_escape_clause(self.db.engine());
+        let esc = like_escape_clause();
         let sql =
             format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
-        let like = format!("{dir_prefix}%");
+        // Même contrat que `folder_like_pattern` : le préfixe est du texte, le
+        // `%` final est le seul joker.
+        let like = format!("{}%", echapper_jokers_like(dir_prefix));
         let params: [&dyn ToSqlValue; 1] = [&like];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
@@ -1344,7 +1400,7 @@ impl TrackRepo {
         conditions.push(format!(
             "t.file_path LIKE {}{}",
             ph.take(),
-            like_escape_clause(engine)
+            like_escape_clause()
         ));
         owned_params.push(SqlValue::Text(folder_like_pattern(folder)));
 

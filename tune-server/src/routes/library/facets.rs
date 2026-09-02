@@ -271,7 +271,7 @@ fn build_facet_conditions(
             conds.push(format!(
                 "t.file_path LIKE {}{}",
                 ph.take(),
-                tune_core::db::track_repo::like_escape_clause(engine)
+                tune_core::db::track_repo::like_escape_clause()
             ));
             params.push(SqlValue::Text(
                 tune_core::db::track_repo::folder_like_pattern(fld),

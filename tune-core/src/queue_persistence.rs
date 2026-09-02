@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -75,17 +76,63 @@ fn queue_file_path(db_path: &str, zone_id: i64) -> PathBuf {
 }
 
 /// Save the current queue state for a zone to a JSON file.
+///
+/// 🔴 #2569 / #2775 — **une lecture qui ÉCHOUE ne dit pas « la file est
+/// vide » : elle ne dit rien.**
+///
+/// Les trois lectures ci-dessous portaient un `unwrap_or_default()`, qui
+/// confond exactement ces deux réponses. La base répond `Err` (« database is
+/// locked »), l'instantané se construit sur une file vide, et il ÉCRASE sur le
+/// disque l'instantané d'une file de quarante titres. Ce n'est pas une
+/// hypothèse : #1997 a établi ici même qu'un lot de scan tient la connexion
+/// SQLite partagée pendant que l'utilisateur agit sur sa file — le chemin
+/// d'ÉCRITURE s'est vu ajouter des reprises pour ça (`set_queue_retrying`), la
+/// LECTURE n'en a jamais eu.
+///
+/// Le critère n'est donc pas « la file est-elle vide ? » mais **`Err` contre
+/// `Ok(vide)`** :
+///
+/// * `Err` — la base est illisible. On ne sait rien, on n'écrit rien, et
+///   l'instantané précédent survit.
+/// * `Ok(vec![])` — la file est réellement vide, parce que l'utilisateur l'a
+///   vidée. Elle DOIT s'écrire : refuser d'écrire une file vide ferait
+///   réapparaître au redémarrage une file que l'utilisateur a effacée, le
+///   défaut symétrique et le plus insidieux des deux.
 pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_state: &ZoneState) {
+    let repo = PlayQueueRepo::with_backend(db.clone());
+
+    // Les trois lectures d'abord, AVANT de toucher au disque : un instantané ne
+    // s'écrit que s'il repose sur une base qui a répondu.
+    let local_items = match repo.get_queue(zone_id) {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+    let streaming_items = match repo.get_streaming_queue(zone_id) {
+        Ok(items) => items,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+    // La liste unifiée ordonnée : celle que la restauration préfère, donc celle
+    // dont la perte coûte la file entière.
+    let entries = match repo.get_ordered(zone_id) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_persist_read_failed_snapshot_kept");
+            return;
+        }
+    };
+
     let dir = queue_dir(db_path);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(zone_id, error = %e, "queue_persist_mkdir_failed");
         return;
     }
 
-    let repo = PlayQueueRepo::with_backend(db.clone());
-
-    // Gather local queue track IDs
-    let local_items = repo.get_queue(zone_id).unwrap_or_default();
     let local_track_ids: Vec<i64> = local_items.iter().map(|i| i.track_id).collect();
     let current_position = local_items
         .iter()
@@ -94,7 +141,6 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         .unwrap_or(zone_state.queue_position);
 
     // Gather streaming queue
-    let streaming_items = repo.get_streaming_queue(zone_id).unwrap_or_default();
     let streaming_tracks: Vec<StreamingQueueEntry> = streaming_items
         .iter()
         .map(|item| StreamingQueueEntry {
@@ -109,8 +155,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         .collect();
 
     // The authoritative ordered unified list (local + streaming interleaved by
-    // position). Preferred on restore.
-    let entries = repo.get_ordered(zone_id).unwrap_or_default();
+    // position). Preferred on restore. Lue plus haut, avec son erreur.
     let items: Vec<QueueSnapshotItem> = entries
         .iter()
         .map(|e| QueueSnapshotItem {
@@ -151,12 +196,55 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
     let path = queue_file_path(db_path, zone_id);
     match serde_json::to_string_pretty(&snapshot) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = ecrire_atomiquement(&path, &json) {
                 warn!(zone_id, error = %e, "queue_persist_write_failed");
             }
         }
         Err(e) => {
             warn!(zone_id, error = %e, "queue_persist_serialize_failed");
+        }
+    }
+}
+
+/// Écrit `contenu` dans `path` **d'un seul coup**, par un fichier temporaire
+/// suivi d'un renommage.
+///
+/// 🔴 #2569 / #2775 — `persist_queue_async` fait `tokio::spawn` puis
+/// `spawn_blocking` : deux persistances lancées coup sur coup n'ont AUCUN ordre
+/// garanti, et leurs deux tâches bloquantes écrivaient LE MÊME fichier en même
+/// temps. `std::fs::write` tronque puis écrit : deux écritures concurrentes de
+/// longueurs différentes laissent un JSON DÉCHIRÉ.
+///
+/// Ce n'est pas une crainte de principe, c'est mesuré : trois fils persistant
+/// une file dont la taille varie ont produit **19 fichiers illisibles sur 901
+/// lectures** (2,1 %). Au redémarrage suivant, `restore_all_queues` échoue sur
+/// `queue_restore_parse_failed` et passe la zone SANS BRUIT — l'instantané est
+/// perdu, et l'utilisateur retrouve la file que la base contient, c'est-à-dire
+/// le seul titre en cours.
+///
+/// Le renommage rend l'écriture indivisible : le fichier de destination est
+/// toujours un instantané COMPLET, celui d'avant ou celui d'après, jamais un
+/// mélange des deux. Le nom du temporaire porte l'identifiant du fil, sans quoi
+/// deux persistances se battraient pour le même temporaire et on n'aurait fait
+/// que déplacer la course.
+fn ecrire_atomiquement(path: &Path, contenu: &str) -> std::io::Result<()> {
+    // Un temporaire par écrivain : le renommage est indivisible, l'écriture du
+    // temporaire ne l'est pas. Le suffixe `.tmp` le tient hors de la
+    // restauration, qui ne lit que les `.json`.
+    static ECRIVAIN: AtomicU64 = AtomicU64::new(0);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        ECRIVAIN.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contenu)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
         }
     }
 }

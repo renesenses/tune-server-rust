@@ -333,6 +333,236 @@ async fn les_cartes_album_voient_la_meme_selection() {
     );
 }
 
+/// Une bibliothèque à ALBUMS, pour raisonner sur l'ensemble rendu plutôt que
+/// sur un compteur de pistes.
+///
+/// | album | genres des pistes | format | pistes |
+/// |-------|-------------------|--------|--------|
+/// | Bleu  | Jazz ×2, Rock ×1  | aiff   | 3      |
+/// | Rouge | Jazz ×3           | aiff   | 3      |
+/// | Vert  | Rock ×2           | flac   | 2      |
+/// | Gris  | Blues ×2          | wav    | 2      |
+///
+/// **« Bleu » porte les DEUX genres** : c'est lui qui rend le test « sans
+/// doublon » réel. `genre=Jazz` rend {Bleu, Rouge}, `genre=Rock` rend
+/// {Bleu, Vert} ; leur union est {Bleu, Rouge, Vert} — Bleu UNE fois.
+fn bibliotheque_albums() -> axum::Router {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let mut n = 0;
+    for (titre, pistes) in [
+        (
+            "Bleu",
+            &[("Jazz", "aiff"), ("Jazz", "aiff"), ("Rock", "aiff")][..],
+        ),
+        (
+            "Rouge",
+            &[("Jazz", "aiff"), ("Jazz", "aiff"), ("Jazz", "aiff")][..],
+        ),
+        ("Vert", &[("Rock", "flac"), ("Rock", "flac")][..]),
+        ("Gris", &[("Blues", "wav"), ("Blues", "wav")][..]),
+    ] {
+        state
+            .backend
+            .execute(
+                &format!("INSERT INTO albums (title, artist_id) VALUES ('{titre}', NULL)"),
+                &[],
+            )
+            .expect("insertion d'album");
+        let album_id = state.backend.last_insert_rowid();
+        for (genre, format) in pistes {
+            n += 1;
+            state
+                .backend
+                .execute(
+                    &format!(
+                        "INSERT INTO tracks (title, album_id, artist_id, file_path, duration_ms, \
+                         format, genre, sample_rate) \
+                         VALUES ('Piste {n}', {album_id}, NULL, '/music/p{n}.{format}', 200000, \
+                         '{format}', '{genre}', 44100)"
+                    ),
+                    &[],
+                )
+                .expect("insertion de piste");
+        }
+    }
+    tune_server::routes::router(state)
+}
+
+/// Les titres d'albums rendus par `/library/albums-detailed`, triés.
+fn albums_rendus(body: &Value) -> Vec<String> {
+    let mut v: Vec<String> = body
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("la liste d'albums doit être rendue")
+        .iter()
+        .map(|a| {
+            a.get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Bourrage : `n` valeurs distinctes qu'aucune piste ne porte.
+fn bourrage(cle: &str, n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        s.push_str(&format!("&{cle}=z{i}"));
+    }
+    s
+}
+
+/// ⚠️ **La facette « contient » à mille valeurs rendait une liste VIDE sur
+/// SQLite et la bonne liste sur PostgreSQL.**
+///
+/// `genre` teste la colonne `t.genre` (un `IN`) OU le tableau `t.genres` (une
+/// chaîne de `LIKE` en OU). Au-delà de 1 000 termes, cette chaîne dépasse la
+/// profondeur d'arbre maximale de SQLite — `Expression tree is too large
+/// (maximum depth 1000)` — la requête échoue à la préparation, l'échec est
+/// avalé par `ou_defaut_journalise` (#2861), et la route sert un `200 OK` dont
+/// la liste d'albums est VIDE. PostgreSQL, lui, avale la même chaîne (mesuré à
+/// 12 000 termes) et rend la bonne liste. Même URL, deux réponses.
+///
+/// L'épreuve porte donc sur un FAIT DE BASE — l'ensemble des albums rendus —
+/// et jamais sur un code HTTP, qui valait déjà 200 avant la correction.
+#[tokio::test]
+async fn une_facette_a_mille_valeurs_rend_encore_lunion() {
+    let app = bibliotheque_albums();
+
+    // Le témoin de référence : deux valeurs, l'union, sans doublon.
+    let (st, deux) = get(
+        &app,
+        "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&deux),
+        vec!["Bleu", "Rouge", "Vert"],
+        "Jazz {{Bleu, Rouge}} ∪ Rock {{Bleu, Vert}} — et Bleu UNE seule fois"
+    );
+
+    // La même sélection, noyée dans 1 500 valeurs qui ne désignent rien. Le
+    // résultat doit être RIGOUREUSEMENT le même : ni plus, ni moins, ni doublon.
+    let url = format!(
+        "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock{}",
+        bourrage("genre", 1500)
+    );
+    let (st, mille) = get(&app, &url).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&mille),
+        albums_rendus(&deux),
+        "1 500 valeurs de plus qui ne désignent rien ne changent pas l'ensemble rendu"
+    );
+
+    // Et la liste de pistes, qui passe par l'AUTRE constructeur de prédicats,
+    // doit tenir le même ensemble : 8 pistes Jazz ou Rock sur 10.
+    let (_, pistes) = get(
+        &app,
+        &format!(
+            "/api/v1/library/tracks?limit=100&genre=Jazz&genre=Rock{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(total(&pistes), 8, "3 Jazz + 3 Jazz + 2 Rock");
+}
+
+/// Les trois témoins, tous verts AVANT comme APRÈS : la correction ne touche
+/// que le cas au-delà de mille termes.
+#[tokio::test]
+async fn les_temoins_de_la_facette_profonde_restent_verts() {
+    let app = bibliotheque_albums();
+
+    // 1. UNE seule valeur rend exactement ce qu'elle rendait.
+    for (url, attendu) in [
+        (
+            "/api/v1/library/albums-detailed?genre=Jazz",
+            vec!["Bleu", "Rouge"],
+        ),
+        (
+            "/api/v1/library/albums-detailed?genre=Rock",
+            vec!["Bleu", "Vert"],
+        ),
+        ("/api/v1/library/albums-detailed?genre=Blues", vec!["Gris"]),
+    ] {
+        let (st, r) = get(&app, url).await;
+        assert_eq!(st, StatusCode::OK, "{url}");
+        assert_eq!(albums_rendus(&r), attendu, "{url}");
+    }
+
+    // 2. Deux facettes DIFFÉRENTES se combinent en ET, jamais en OU — y compris
+    //    quand la facette profonde est bourrée. (Jazz OU Rock) ET flac ne laisse
+    //    que Vert ; une union en aurait rendu trois.
+    let (st, croise) = get(
+        &app,
+        &format!(
+            "/api/v1/library/albums-detailed?genre=Jazz&genre=Rock&format=flac{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        albums_rendus(&croise),
+        vec!["Vert"],
+        "le OU de la facette a débordé sur le ET"
+    );
+
+    // 3. ZÉRO valeur ne filtre rien : une facette vide n'est pas un filtre, et
+    //    surtout pas un filtre qui ne rend rien.
+    let (_, nue) = get(&app, "/api/v1/library/albums-detailed").await;
+    let (_, vide) = get(&app, "/api/v1/library/albums-detailed?genre=&genre=").await;
+    assert_eq!(
+        albums_rendus(&vide),
+        albums_rendus(&nue),
+        "une facette sans valeur doit se comporter comme l'absence de facette"
+    );
+    assert_eq!(albums_rendus(&nue), vec!["Bleu", "Gris", "Rouge", "Vert"]);
+}
+
+/// Les deux autres facettes « contient » — `label` et `composer` — passent par
+/// le même assembleur et se cassaient donc de la même façon.
+#[tokio::test]
+async fn les_facettes_label_et_compositeur_tiennent_aussi_le_millier() {
+    let app = bibliotheque_albums();
+
+    for cle in ["label", "composer"] {
+        // Aucune piste ne porte ces valeurs : l'ensemble attendu est VIDE.
+        // Ce qui est prouvé ici, c'est qu'il est vide PARCE QUE rien ne
+        // correspond, et non parce que la requête a échoué — le témoin juste
+        // au-dessous, qui trouve bien son album, le distingue.
+        let (st, r) = get(
+            &app,
+            &format!(
+                "/api/v1/library/albums-detailed?{}",
+                &bourrage(cle, 1500)[1..]
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{cle}");
+        assert!(albums_rendus(&r).is_empty(), "{cle}");
+    }
+
+    // Le témoin qui distingue « vide » de « en panne » : une valeur qui existe,
+    // noyée dans le même bourrage, doit être TROUVÉE.
+    let app2 = bibliotheque_albums();
+    let (st, r) = get(
+        &app2,
+        &format!(
+            "/api/v1/library/albums-detailed?genre=Blues{}",
+            bourrage("genre", 1500)
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(albums_rendus(&r), vec!["Gris"]);
+}
+
 /// **Rétrocompatibilité.** Une URL ou un état enregistré d'avant #2168 ne porte
 /// qu'une valeur par facette : il doit continuer de rendre exactement la même
 /// chose.

@@ -94,9 +94,11 @@ struct PatchZone {
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
-    /// Accord ponctuel de l'utilisateur pour une activation qui peut envoyer
-    /// immédiatement 100 % à une sortie réseau. Ce jeton appartient à la
-    /// requête et n'est jamais persisté avec la zone (#2395).
+    /// Accord ponctuel de l'utilisateur pour une activation qui porte
+    /// immédiatement la zone à 100 %. Exigé sur **toute** sortie, sans
+    /// exception de type (#2395) : c'est le niveau qui sort des haut-parleurs
+    /// qui est en jeu, pas l'identité de ce qu'on commande. Ce jeton appartient
+    /// à la requête et n'est jamais persisté avec la zone.
     #[serde(default)]
     confirm_full_volume: bool,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
@@ -198,21 +200,23 @@ struct PatchZone {
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
-/// un simple réglage. Le serveur l'impose à tous les clients réseau, y compris
-/// aux anciennes interfaces et aux appels directs qui contournent le Web.
+/// un simple réglage. Le serveur l'impose à tous les clients, y compris aux
+/// anciennes interfaces et aux appels directs qui contournent le Web.
 ///
-/// Le type envoyé dans le PATCH prime sur celui qui est déjà stocké : changer
-/// une zone locale en DLNA et armer le volume fixe dans la même requête doit
-/// rester protégé. Un type absent ou inconnu est traité comme distant jusqu'à
-/// preuve du contraire (fail-closed).
+/// **Aucun type de sortie n'est dispensé** (#2395). La garde protège le niveau
+/// qui sort des haut-parleurs, pas l'identité de ce qu'on commande : qui
+/// écoutait à 20 % a compensé au gain de son ampli, et passer à pleine échelle
+/// lui rend une quinzaine de décibels d'un coup — que l'atténuation vive dans
+/// un renderer DLNA, dans la chaîne locale, ou dans le client web d'une zone
+/// `browser`, souvent un casque sur un portable.
+///
+/// La garde ne lit donc plus le type de sortie du tout, et devient
+/// trivialement fail-closed : il n'y a plus de branche à oublier, plus de type
+/// inconnu à classer, et plus d'écart possible entre les deux gardes sœurs
+/// (`full_volume_confirmation_required` pour le mode PURE, et celle du réglage
+/// global dans `system/config.rs`), qui n'ont jamais rien dispensé.
 fn fixed_volume_confirmation_required(zone: &Zone, body: &PatchZone) -> bool {
-    let effective_output_type = body.output_type.as_deref().or(zone.output_type.as_deref());
-    let local_or_browser = matches!(effective_output_type, Some("local" | "browser"));
-
-    body.fixed_volume == Some(true)
-        && !zone.fixed_volume
-        && !local_or_browser
-        && !body.confirm_full_volume
+    body.fixed_volume == Some(true) && !zone.fixed_volume && !body.confirm_full_volume
 }
 
 /// Injecte l'identité appareil d'une zone dans son JSON de sortie :
@@ -518,12 +522,18 @@ fn read_crossfeed_config(settings: &tune_core::db::settings_repo::SettingsRepo, 
 async fn set_zone_dsp(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    // Premium gate: DSP & EQ mutations require Premium. Le refus parle la
+    // langue de l'application (#2419) — c'est le même écran « Égaliseur » que
+    // `POST /zones/{id}/eq`, et il tire ses deux moitiés d'ici et de là.
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return resp;
     }
@@ -900,12 +910,93 @@ pub(crate) fn inject_metadata_anchor(obj: &mut serde_json::Map<String, Value>, p
 /// trois surfaces qui portent `current_track` restaient muettes ; ce
 /// fabricant les aligne, à l'identique de `inject_metadata_anchor`, et aux
 /// mêmes trois points d'appel, pour qu'elles ne puissent plus diverger.
+///
+/// `session_context_source` complète la paire, et sans lui elle ne suffisait
+/// pas à ROUVRIR ce qui joue. L'identifiant est une chaîne nue tirée de deux
+/// espaces de noms : un `i64` de la table `albums`, ou l'identifiant
+/// d'édition d'un service. Le chemin LOCAL s'en tirait tout seul — la
+/// bibliothèque est l'espace de noms implicite, `"42"` s'ouvre par
+/// `GET /albums/42`. Le chemin QOBUZ, celui du ticket, restait nu :
+/// `("album", "0060254735822")` ne dit pas chez qui l'ouvrir, quand
+/// `GET /streaming/{service}/albums/{id}` réclame ce `{service}`. Le client
+/// n'avait plus qu'à supposer que le service affiché à l'écran est celui qui
+/// joue — faux dès qu'on regarde Tidal en écoutant Qobuz, et la devinette
+/// même que #1284 a condamnée.
 pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, ps: &ZoneState) {
     obj.insert(
         "session_context_type".into(),
         json!(ps.session_context_type),
     );
     obj.insert("session_context_id".into(), json!(ps.session_context_id));
+    obj.insert(
+        "session_context_source".into(),
+        json!(ps.session_context_source),
+    );
+}
+
+/// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.
+///
+/// `/stream/{id}` n'admet qu'UN consommateur (`streamer.rs`, un canal mpsc) :
+/// une seconde connexion sur la même session fait `break` sur la première. La
+/// coupure est propre — un `EOF`, et la sortie journalise
+/// `local_audio_stream_eof` — mais elle ARRÊTE la lecture en cours.
+///
+/// Publier cette adresse à une zone dont la sortie n'est PAS l'onglet, c'est
+/// donc donner à cet onglet de quoi voler le flux au renderer (DLNA /
+/// Chromecast / AirPlay / SlimProto / local). C'est le défaut d'eric (#954) :
+/// « je ferme l'onglet et le son revient ».
+///
+/// Une zone `browser` la reçoit : là, l'onglet EST la sortie, et le client web
+/// branche son `<audio>` dessus (`stores/zones.ts`, `handleBrowserPlayback`).
+///
+/// #3164 — cette règle était ÉCRITE cinq fois et POSÉE une seule
+/// (`build_zone_json`). `GET /zones`, `GET /zones/{id}`,
+/// `GET /zones/{id}/status`, les vingt routes de lecture qui passent par
+/// `build_zone_json_with_result` et `POST /radios/{id}/play/{zone_id}`
+/// publiaient l'adresse à tout le monde. Elle vit désormais ici, et
+/// [`inject_stream_url`] est le seul chemin qui la pose.
+pub fn zone_recoit_l_adresse_du_flux(output_type: Option<&str>) -> bool {
+    output_type == Some("browser")
+}
+
+/// Pose `stream_url` (et `stream_url_remote`, quand le pont est actif) sur la
+/// charge utile d'une zone — ou ne pose RIEN quand
+/// [`zone_recoit_l_adresse_du_flux`] le refuse.
+///
+/// Rend `true` quand l'adresse a été publiée, pour que l'appelant puisse le
+/// dire sans relire la charge utile.
+pub(crate) fn inject_stream_url(
+    obj: &mut serde_json::Map<String, Value>,
+    state: &AppState,
+    output_type: Option<&str>,
+    stream_id: Option<&str>,
+) -> bool {
+    if !zone_recoit_l_adresse_du_flux(output_type) {
+        return false;
+    }
+    let Some(stream_id) = stream_id else {
+        return false;
+    };
+    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+        tune_core::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into())
+    });
+    const EXT: &str = "flac";
+    obj.insert(
+        "stream_url".into(),
+        json!(format!(
+            "http://{}:{}/stream/{}.{}",
+            server_ip, state.port, stream_id, EXT
+        )),
+    );
+    // Adresse joignable de l'exterieur, quand le pont est actif.
+    if let Some(distant) =
+        crate::routes::stream_handler::stream_url_distant(state.backend.clone(), stream_id, EXT)
+    {
+        obj.insert("stream_url_remote".into(), json!(distant));
+    }
+    true
 }
 
 /// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
@@ -2367,29 +2458,17 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "output_capabilities".into(),
                 json!(output_capabilities(&state, z.output_device_id.as_deref()).await),
             );
-            // Include stream_url for browser playback zones so the web client
-            // can feed it to an HTML5 <audio> element.
-            if let Some(ref np) = ps.now_playing {
-                if let Some(ref stream_id) = np.stream_id {
-                    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                        tune_core::discovery::ssdp::get_local_ip()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_else(|| "127.0.0.1".into())
-                    });
-                    let stream_url = format!(
-                        "http://{}:{}/stream/{}.flac",
-                        server_ip, state.port, stream_id
-                    );
-                    obj.insert("stream_url".into(), json!(stream_url));
-                    if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                        state.backend.clone(),
-                        stream_id,
-                        "flac",
-                    ) {
-                        obj.insert("stream_url_remote".into(), json!(distant));
-                    }
-                }
-            }
+            // #3164 — l'adresse du flux ne se publie QUE pour une zone
+            // navigateur. Ce site-ci la rendait à toutes : un onglet ouvert sur
+            // la liste des zones tenait de quoi couper la lecture d'un renderer.
+            inject_stream_url(
+                obj,
+                &state,
+                z.output_type.as_deref(),
+                ps.now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref()),
+            );
         }
         result.push(v);
     }
@@ -2537,29 +2616,16 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "output_capabilities".into(),
                     json!(output_capabilities(&state, zone.output_device_id.as_deref()).await),
                 );
-                // Include stream_url for browser playback zones so the web client
-                // can feed it to an HTML5 <audio> element.
-                if let Some(ref np) = ps.now_playing {
-                    if let Some(ref stream_id) = np.stream_id {
-                        let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                            tune_core::discovery::ssdp::get_local_ip()
-                                .map(|ip| ip.to_string())
-                                .unwrap_or_else(|| "127.0.0.1".into())
-                        });
-                        let stream_url = format!(
-                            "http://{}:{}/stream/{}.flac",
-                            server_ip, state.port, stream_id
-                        );
-                        obj.insert("stream_url".into(), json!(stream_url));
-                        if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                            state.backend.clone(),
-                            stream_id,
-                            "flac",
-                        ) {
-                            obj.insert("stream_url_remote".into(), json!(distant));
-                        }
-                    }
-                }
+                // #3164 — même règle que la liste, et le même trou : la fiche
+                // d'une zone DLNA rendait l'adresse de son flux au client web.
+                inject_stream_url(
+                    obj,
+                    &state,
+                    zone.output_type.as_deref(),
+                    ps.now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref()),
+                );
             }
             Json(v).into_response()
         }
@@ -2751,7 +2817,7 @@ async fn patch_zone(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "full_volume_confirmation_required",
-                "message": "Enabling fixed volume on a network output sets the device volume to 100%. Explicit confirmation is required.",
+                "message": "Enabling fixed volume raises this zone to full scale (100%). Confirm with `confirm_full_volume` to proceed.",
             })),
         )
             .into_response();
@@ -2842,11 +2908,57 @@ async fn patch_zone(
         );
     }
     if let Some(fixed) = body.fixed_volume {
+        // #2395 — le mode bit-perfect fait UN saut, annoncé et réversible.
+        //
+        // Seules les TRANSITIONS agissent : un PATCH qui réaffirme l'état
+        // courant ne commande rien. C'est ce qui rend le saut unique — sans
+        // cette garde, chaque `{"fixed_volume": true}` d'un client bavard
+        // renverrait 100 % à l'appareil, et on aurait remplacé la réassertion
+        // à la lecture par une réassertion au PATCH.
+        let etait_fixe = zone_before.fixed_volume;
         ecrire!("fixed_volume", fixed, repo.update_fixed_volume(id, fixed));
-        // When enabling fixed_volume, pin volume to 100% in DB and in-memory
-        if fixed {
-            repo.update_volume(id, 100.0).ok();
-            state.playback.set_volume(id, 1.0).await;
+        if fixed && !etait_fixe {
+            // Mémoriser AVANT de commander : une fois le 100 % appliqué, la
+            // valeur d'origine n'est plus lisible nulle part. L'échec de la
+            // mémorisation coûte la restauration, pas le mode — il est dit au
+            // journal, il n'interrompt pas l'armement.
+            if let Err(error) =
+                tune_core::audio::fixed_volume::remember(&state.backend, id, zone_before.volume)
+            {
+                warn!(zone_id = id, %error, "fixed_volume_memoire_non_ecrite");
+            }
+            // `arm_fixed_volume` et non `set_volume` : ce dernier sort au plus
+            // tôt sur une zone désormais `fixed_volume` et ne parlerait pas au
+            // device. C'est ici, et nulle part ailleurs, que le 100 % part.
+            if let Err(error) = state
+                .orchestrator
+                .arm_fixed_volume(id, command_device_id)
+                .await
+            {
+                return crate::routes::playback::output_command_error_response(error);
+            }
+        } else if !fixed && etait_fixe {
+            // Sortie du mode : rendre le volume d'avant. `update_fixed_volume`
+            // est déjà écrit ci-dessus, donc `set_volume` ne sort plus au plus
+            // tôt et commande réellement l'appareil.
+            //
+            // Sans mémoire (zone armée par une version antérieure à ce
+            // correctif, ou écriture perdue), on ne devine pas : la zone reste
+            // à 100 % et l'utilisateur garde la main. Commander une valeur
+            // inventée serait le défaut qu'on corrige, à l'envers.
+            match tune_core::audio::fixed_volume::take(&state.backend, id) {
+                Some(pourcent) => {
+                    if let Err(error) = state
+                        .orchestrator
+                        .set_volume(id, pourcent / 100.0, command_device_id)
+                        .await
+                    {
+                        return crate::routes::playback::output_command_error_response(error);
+                    }
+                    info!(zone_id = id, volume = pourcent, "fixed_volume_restaure");
+                }
+                None => info!(zone_id = id, "fixed_volume_sans_memoire_rien_a_restaurer"),
+            }
         }
     }
     // #2271 — les deux champs visent la MEME colonne. `autoplay_mode` est le
@@ -6255,47 +6367,118 @@ mod patch_zone_deserialize_tests {
         assert_eq!(p.max_sample_rate, Some(Some(705_600)));
     }
 
+    /// #2395 — AUCUN type de sortie n'est dispensé de l'accord.
+    ///
+    /// `local` et `browser` l'étaient jusqu'ici. La garde protège le niveau qui
+    /// sort des haut-parleurs, pas l'identité de ce qu'on commande : une zone
+    /// locale à 20 % monte bien à pleine échelle (`LocalOutput::set_volume` est
+    /// un vrai gain), et une zone `browser` — souvent un casque sur un portable
+    /// — voit son niveau appliqué par le client web à partir du volume de zone,
+    /// celui que l'armement met à 100.
+    ///
+    /// Le `None` et le type inconnu sont dans la liste pour ce qu'ils prouvent :
+    /// la garde ne classe plus rien, donc elle ne peut plus se tromper de
+    /// classement.
     #[test]
-    fn sortie_reseau_refuse_l_armement_sans_accord() {
+    fn aucune_sortie_ne_s_arme_sans_accord() {
         let p: PatchZone = serde_json::from_str(r#"{"fixed_volume": true}"#).unwrap();
-        assert!(
-            fixed_volume_confirmation_required(&zone(Some("dlna"), false), &p),
-            "avant le correctif, ce chemin envoyait immédiatement 100 % sans accord"
-        );
+        for stored_type in [
+            Some("dlna"),
+            Some("airplay"),
+            Some("chromecast"),
+            Some("local"),
+            Some("browser"),
+            Some("un-type-que-personne-ne-connait"),
+            None,
+        ] {
+            assert!(
+                fixed_volume_confirmation_required(&zone(stored_type, false), &p),
+                "{stored_type:?} : armer le volume fixe monte la zone a pleine echelle, \
+                 l'accord explicite est du quel que soit le type de sortie"
+            );
+        }
     }
 
+    /// L'accord donné, l'armement passe — sur n'importe quelle sortie.
+    ///
+    /// L'autre bord du test précédent : la garde exige un accord, elle ne
+    /// bloque pas le mode. Sans ce cas, un `return true` inconditionnel
+    /// passerait pour un correctif.
     #[test]
-    fn accord_explicite_autorise_l_armement_reseau() {
+    fn l_accord_explicite_autorise_l_armement_sur_toute_sortie() {
         let p: PatchZone =
             serde_json::from_str(r#"{"fixed_volume": true, "confirm_full_volume": true}"#).unwrap();
-        assert!(!fixed_volume_confirmation_required(
-            &zone(Some("dlna"), false),
-            &p
-        ));
+        for stored_type in [
+            Some("dlna"),
+            Some("airplay"),
+            Some("local"),
+            Some("browser"),
+            None,
+        ] {
+            assert!(
+                !fixed_volume_confirmation_required(&zone(stored_type, false), &p),
+                "{stored_type:?} : l'accord donne, l'armement doit passer"
+            );
+        }
     }
 
+    /// Changer de type de sortie dans le PATCH qui arme ne change rien.
+    ///
+    /// Ce cas gardait autrefois la précédence du type envoyé sur le type
+    /// stocké — une zone locale basculée en AirPlay ne devait pas profiter de
+    /// l'exemption. Il n'y a plus d'exemption ni de lecture du type, donc plus
+    /// de précédence à tenir ; le cas reste, comme garde de non-régression :
+    /// aucune combinaison de types, dans un sens ou dans l'autre, ne doit
+    /// rouvrir un chemin d'armement sans accord.
     #[test]
-    fn passage_local_vers_reseau_dans_le_meme_patch_reste_protege() {
-        let p: PatchZone =
-            serde_json::from_str(r#"{"output_type": "airplay", "fixed_volume": true}"#).unwrap();
-        assert!(fixed_volume_confirmation_required(
-            &zone(Some("local"), false),
-            &p
-        ));
+    fn un_changement_de_type_dans_le_meme_patch_reste_protege() {
+        for (stocke, demande) in [
+            (Some("local"), "airplay"),
+            (Some("dlna"), "local"),
+            (Some("browser"), "dlna"),
+            (Some("airplay"), "browser"),
+        ] {
+            let p: PatchZone = serde_json::from_str(&format!(
+                r#"{{"output_type": "{demande}", "fixed_volume": true}}"#
+            ))
+            .unwrap();
+            assert!(
+                fixed_volume_confirmation_required(&zone(stocke, false), &p),
+                "{stocke:?} -> {demande} : toujours un accord"
+            );
+        }
     }
 
+    /// Ce qui ne monte PAS le volume passe sans rien demander.
+    ///
+    /// Le contre-poids des deux premiers : la garde ne se déclenche que sur la
+    /// transition qui monte réellement à pleine échelle. Une zone déjà armée
+    /// qu'on réaffirme ne monte rien — le saut a eu lieu — et un désarmement
+    /// fait redescendre. Sans ces cas, exiger l'accord partout se confondrait
+    /// avec l'exiger tout le temps.
+    ///
+    /// La liste ne contient plus `local` ni `browser` : ces deux chemins
+    /// montent bel et bien la zone à 100 %, et ils sont désormais éprouvés dans
+    /// `aucune_sortie_ne_s_arme_sans_accord`. L'ancien nom de cet essai
+    /// affirmait qu'ils « ne montent pas le volume » ; c'était faux.
     #[test]
-    fn chemins_sans_montee_de_volume_restent_immediats() {
+    fn ce_qui_ne_monte_pas_le_volume_passe_sans_accord() {
         for (stored_type, stored_fixed, payload) in [
-            (Some("local"), false, r#"{"fixed_volume": true}"#),
-            (Some("browser"), false, r#"{"fixed_volume": true}"#),
+            // Déjà armée : le PATCH réaffirme, il ne monte rien.
             (Some("dlna"), true, r#"{"fixed_volume": true}"#),
+            (Some("local"), true, r#"{"fixed_volume": true}"#),
+            (Some("browser"), true, r#"{"fixed_volume": true}"#),
+            // Désarmement : on redescend.
             (Some("dlna"), true, r#"{"fixed_volume": false}"#),
+            (Some("local"), true, r#"{"fixed_volume": false}"#),
+            // Le PATCH ne parle pas de volume fixe du tout.
+            (Some("dlna"), false, r#"{"name": "Salon"}"#),
         ] {
             let p: PatchZone = serde_json::from_str(payload).unwrap();
             assert!(
                 !fixed_volume_confirmation_required(&zone(stored_type, stored_fixed), &p),
-                "le chemin {stored_type:?}/{stored_fixed}/{payload} ne monte pas une sortie réseau nouvellement armée à 100 %"
+                "le chemin {stored_type:?}/{stored_fixed}/{payload} ne monte aucune zone \
+                 a pleine echelle : rien a confirmer"
             );
         }
     }
@@ -6962,6 +7145,12 @@ mod backend_local_annonce_tests {
             "fell_back",
             "fallback_reason",
             "fallback_detail",
+            // #2207 — le PÉRIPHÉRIQUE réellement ouvert, face au demandé. Le
+            // champ fait partie du contrat même quand rien n'a encore joué :
+            // il vaut alors `null`, ce qui est la réponse honnête. C'est son
+            // ABSENCE de la charge utile qui serait la régression — le client
+            // n'aurait de nouveau que le journal pour savoir où sort le son.
+            "device",
         ] {
             assert!(v.get(champ).is_some(), "champ « {champ} » absent de {v}");
         }

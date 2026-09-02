@@ -277,6 +277,32 @@ pub struct ZoneState {
     pub session_context_type: Option<String>,
     #[serde(default)]
     pub session_context_id: Option<String>,
+    /// Le SERVICE auquel `session_context_id` appartient — `"qobuz"`,
+    /// `"tidal"`, … — ou `"local"` quand le geste portait sur la
+    /// bibliothèque.
+    ///
+    /// L'identifiant seul ne suffit pas à ROUVRIR ce qui joue. C'est une
+    /// chaîne nue, et les gestes que `contexte_de_lecture` reconnaît la
+    /// remplissent depuis deux espaces de noms distincts : un `i64` de la
+    /// table `albums`, ou l'identifiant d'édition d'un service. Le chemin
+    /// local s'en sortait — la bibliothèque est l'espace de noms implicite,
+    /// `"42"` s'ouvre par `GET /albums/42`. Le chemin de service, non :
+    /// `("album", "0060254735822")` ne dit pas chez QUI cet identifiant a un
+    /// sens, alors que `GET /streaming/{service}/albums/{id}` réclame ce
+    /// `{service}`.
+    ///
+    /// Le client web ne pouvait combler le trou qu'en supposant que le
+    /// service ouvert à l'écran est celui qui joue — faux dès qu'on regarde
+    /// Tidal en écoutant Qobuz, et la même classe de devinette que #1284 a
+    /// condamnée pour l'album (« Entreat (2010) » ouvrait la page de The
+    /// Cure). Cyrille Moutia réclame le retour à l'album en cours depuis le
+    /// 30/06/2026 (#1361).
+    ///
+    /// `None` quand la nature du geste est elle-même inconnue : nommer un
+    /// service là où le serveur ne sait rien armerait le raccourci sur du
+    /// vide. `#[serde(default)]` comme ses deux voisins.
+    #[serde(default)]
+    pub session_context_source: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -384,6 +410,7 @@ impl Default for ZoneState {
             session_profile_id: None,
             session_context_type: None,
             session_context_id: None,
+            session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
         }
@@ -939,6 +966,11 @@ impl PlaybackManager {
     /// remplace le precedent. Sans cela, jouer une piste isolee apres une
     /// playlist laisserait la piste marquee « playlist ».
     ///
+    /// `context_source` va avec `context_id` et jamais sans lui : c'est
+    /// l'espace de noms qui rend l'identifiant ROUVRABLE (#1361). Il s'ecrase
+    /// avec les deux autres, pour la meme raison — un geste laisse derriere
+    /// lui un contexte entier, ou aucun.
+    ///
     /// Aucun evenement emis — c'est de l'attribution interne, pas de l'etat
     /// d'interface.
     pub async fn set_session_context(
@@ -946,6 +978,7 @@ impl PlaybackManager {
         zone_id: i64,
         context_type: Option<String>,
         context_id: Option<String>,
+        context_source: Option<String>,
     ) {
         let mut zones = self.zones.lock().await;
         let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -954,6 +987,7 @@ impl PlaybackManager {
         });
         z.session_context_type = context_type;
         z.session_context_id = context_id;
+        z.session_context_source = context_source;
     }
 
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
@@ -1132,6 +1166,7 @@ mod tests {
             session_profile_id: None,
             session_context_type: None,
             session_context_id: None,
+            session_context_source: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
         };

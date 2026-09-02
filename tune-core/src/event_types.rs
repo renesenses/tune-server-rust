@@ -139,6 +139,15 @@ declarer_evenements! {
     GroupUpdated => "group.updated", Emis;
     GroupDeleted => "group.deleted", Emis;
 
+    // ── Sous-systemes ──────────────────────────────────────────────────────
+    /// Le serveur SlimProto n'a pas pu prendre son port TCP (3483 par defaut) :
+    /// aucune platine Squeezebox ne pourra se connecter de toute la session.
+    /// Cinq testeurs, deux systemes, et rien hors du journal ne le disait
+    /// (#2938). Le bind ayant lieu au DEMARRAGE, cet evenement ne trouve
+    /// generalement aucun abonne : le porteur qui survit est
+    /// `slimproto::etat_ecoute()`, servi par `/system/diagnostics/network`.
+    SlimprotoListenFailed => "slimproto.listen_failed", Emis;
+
     // ── Reserves ───────────────────────────────────────────────────────────
     /// RESERVE : le changement de profil se fait par requete, sans diffusion.
     ProfileSwitched => "profile.switched", Reserve;
@@ -346,7 +355,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            36,
+            37,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );

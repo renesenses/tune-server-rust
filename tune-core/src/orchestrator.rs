@@ -95,6 +95,266 @@ fn transcode_budget_for(path: &str) -> std::time::Duration {
     std::time::Duration::from_secs((FLOOR_S + extra).min(CEILING_S))
 }
 
+/// Plafond absolu du budget de transcodage : 30 minutes.
+///
+/// C'est la même valeur que le plafond de `transcode_budget_for`, reprise ici
+/// parce qu'elle borne AUSSI le budget adaptatif : un hôte trop lent doit
+/// finir par rendre la main, et un budget infini n'est pas une réponse. À ce
+/// plafond, une piste de durée `D` n'aboutit que si l'hôte décode au moins à
+/// `D / 1800` fois le temps réel — soit `× 1,0` pour une piste de 30 minutes.
+/// En dessous, la piste est refusée VITE et pour une raison NOMMÉE, ce qui vaut
+/// mieux qu'un silence.
+const PLAFOND_BUDGET_TRANSCODAGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Marge appliquée au temps de décodage restant estimé.
+///
+/// Le facteur temps réel est mesuré sur la boucle de décodage seule. Deux
+/// choses lui échappent, et elles ont été MESURÉES sur Shrek (DSD256 stéréo de
+/// 60 s, profil release) :
+///
+/// | poste | mesuré |
+/// |---|---|
+/// | décodage (ce que la balise voit) | 26,12 s |
+/// | `pcm_bytes` + 24→16 bits + WAV + écriture | **0,59 s, soit +2,3 %** |
+/// | dispersion du facteur d'un bout à l'autre du fichier | **±1,5 %** |
+///
+/// Quatre pour cent suffiraient donc au poste mesuré. Les vingt retenus
+/// laissent seize points de réserve pour ce que ce banc ne pouvait PAS
+/// mesurer : la CONCURRENCE sur l'hôte — une autre zone qui joue, une passe de
+/// scan, un enrichissement — qui ne change pas le travail à faire mais partage
+/// les cœurs qui le font. Ces seize points ne sont pas mesurés ; ils sont
+/// assumés, et ils ne coûtent qu'à un transcodage qui allait de toute façon
+/// échouer.
+const MARGE_BUDGET_TRANSCODAGE: f64 = 1.20;
+
+/// Pas de sondage de la balise d'avancement.
+///
+/// Il fixe aussi la granularité du dépassement : le budget peut être franchi
+/// d'au plus un pas. Sur un budget qui vaut au minimum 120 s, un quart de
+/// seconde ne se voit pas.
+const PAS_SONDAGE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Nombre de sondages consécutifs montrant de l'avancement avant de croire la
+/// mesure.
+///
+/// **Combien de fenêtres faut-il ? La question a été mesurée, pas supposée.**
+/// Décodage DSD256 réel sur Shrek, balise échantillonnée toutes les 10 ms,
+/// facteur estimé après *k* secondes d'audio, comparé au facteur final :
+///
+/// | audio décodé | horloge | facteur | écart au final |
+/// |---|---|---|---|
+/// | 0,25 s | 0,111 s | × 2,26 | **+0,3 %** |
+/// | 1,0 s | 0,445 s | × 2,29 | +1,4 % |
+/// | 5,0 s | 2,20 s | × 2,27 | +0,7 % |
+/// | 30 s | 13,1 s | × 2,28 | +1,2 % |
+/// | *final (60 s)* | 26,6 s | **× 2,26** | — |
+///
+/// L'estimation est donc stable à ±1,5 % **dès la PREMIÈRE fenêtre** : sur un
+/// fichier local, le coût fixe du démarrage (ouverture, conception du filtre
+/// FIR de décimation) est déjà amorti au bout de 110 ms.
+///
+/// Huit sondages — deux secondes d'horloge, soit ~4,5 s d'audio DSD256 sur
+/// Shrek — sont donc largement au-delà de ce que la stabilité exige. Cette
+/// marge n'est pas pour le fichier local mesuré ici : elle est pour le fichier
+/// SUR UN NAS, dont les premières fenêtres sont bornées par la recopie locale
+/// (`stage_locally_for_decode`) et non par le processeur. Deux secondes ne
+/// coûtent rien sur un budget qui vaut au minimum 120 s.
+///
+/// Et ce cas-là se trompe dans le SENS SÛR : un début lent sous-estime le
+/// facteur, donc surestime le besoin, donc élargit le budget.
+const SONDAGES_AVANT_MESURE: usize = 8;
+
+/// La politique de budget de #3140 : le temps accordé suit le DÉBIT DE DÉCODAGE
+/// mesuré sur l'hôte, plus seulement la taille du fichier.
+///
+/// ## Le défaut corrigé
+///
+/// `transcode_budget_for` accorde `120 + 120·G` secondes pour `G` gibioctets.
+/// En DSD256 stéréo cela vaut `120 + 0,3154·D` pour `D` secondes d'audio, ce
+/// qui n'est tenable que si l'hôte décode à `× 3,17` temps réel. Shrek mesure
+/// `× 2,2` : toute piste DSD256 de plus de ~14,4 min y expirait, donc silence.
+/// Et Tune livre un binaire ARM64, un `.deb` arm64 et une image Docker arm64 —
+/// les hôtes plus lents encore sont une population livrée.
+///
+/// ## La règle
+///
+/// Le budget effectif ne fait que **s'ÉTENDRE**, jamais se resserrer :
+///
+/// ```text
+/// budget = min(plafond, max(budget_taille, écoulé + restant/R × marge))
+/// ```
+///
+/// C'est ce qui rend le correctif invisible pour tout le monde sauf ceux qui
+/// rencontraient le silence. Quiconque aboutissait sous l'ancienne règle avait
+/// `budget_taille ≥ besoin` ; le nouveau budget est `≥ budget_taille` : son
+/// transcodage se déroule EXACTEMENT comme avant, à la même seconde près, et
+/// aucune ligne de journal supplémentaire n'est émise puisque le budget n'a pas
+/// bougé. Resserrer aurait demandé de faire confiance à une mesure faite sur
+/// les premières fenêtres d'un fichier — et un cache froid, une recopie NAS ou
+/// un cœur momentanément pris sous-estiment ce débit-là.
+#[derive(Debug, Clone, Copy)]
+struct BudgetAdaptatif {
+    /// Durée de la piste, en secondes. `0` quand la base ne la connaît pas —
+    /// on ne peut alors rien extrapoler et le budget historique s'applique.
+    piste_s: f64,
+    /// Le budget historique, indexé sur la taille. Plancher indéplaçable.
+    budget_taille: std::time::Duration,
+    plafond: std::time::Duration,
+}
+
+/// Ce que la politique conclut d'une observation de la balise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VerdictBudget {
+    /// Rien de mesurable : durée de piste inconnue, décodeur qui ne publie pas,
+    /// ou pas encore assez de fenêtres. Le budget historique reste seul en jeu.
+    PasEncore,
+    /// Débit mesuré sur l'hôte, et budget total qui en découle.
+    Mesure {
+        facteur: f64,
+        budget: std::time::Duration,
+    },
+}
+
+impl BudgetAdaptatif {
+    fn new(piste_s: f64, budget_taille: std::time::Duration) -> Self {
+        Self {
+            piste_s,
+            budget_taille,
+            plafond: PLAFOND_BUDGET_TRANSCODAGE,
+        }
+    }
+
+    /// `ecoule` : temps depuis le début du transcodage. `decode` : audio déjà
+    /// sorti du décodeur. `sondages` : combien de sondages consécutifs ont vu
+    /// de l'avancement.
+    fn observer(
+        &self,
+        ecoule: std::time::Duration,
+        decode: std::time::Duration,
+        sondages: usize,
+    ) -> VerdictBudget {
+        let ecoule_s = ecoule.as_secs_f64();
+        let decode_s = decode.as_secs_f64();
+        if self.piste_s <= 0.0
+            || sondages < SONDAGES_AVANT_MESURE
+            || decode_s <= 0.0
+            || ecoule_s <= 0.0
+        {
+            return VerdictBudget::PasEncore;
+        }
+        let facteur = decode_s / ecoule_s;
+        if !facteur.is_finite() || facteur <= 0.0 {
+            return VerdictBudget::PasEncore;
+        }
+        let restant_s = (self.piste_s - decode_s).max(0.0);
+        let besoin_s = ecoule_s + restant_s / facteur * MARGE_BUDGET_TRANSCODAGE;
+        // `besoin_s` peut déborder si le facteur est infime ; le plafond le
+        // rattrape, mais `from_secs_f64` panique sur un flottant hors bornes.
+        let besoin = if besoin_s.is_finite() && besoin_s < self.plafond.as_secs_f64() {
+            std::time::Duration::from_secs_f64(besoin_s)
+        } else {
+            self.plafond
+        };
+        VerdictBudget::Mesure {
+            facteur,
+            budget: besoin.max(self.budget_taille).min(self.plafond),
+        }
+    }
+}
+
+/// Ce qu'on sait au moment où le budget est épuisé — de quoi NOMMER la cause.
+///
+/// Avant #3140 le journal n'annonçait qu'un délai dépassé et la taille du
+/// fichier, ce qui envoyait chercher du côté du disque ou du réseau alors que
+/// la cause était la vitesse du processeur.
+#[derive(Debug, Clone, Copy)]
+struct DepassementBudget {
+    budget: std::time::Duration,
+    ecoule: std::time::Duration,
+    decode: std::time::Duration,
+    /// Facteur temps réel mesuré sur cet hôte, si la balise a parlé.
+    facteur: Option<f64>,
+    piste_s: f64,
+}
+
+impl DepassementBudget {
+    /// Le facteur temps réel qu'il aurait fallu pour tenir dans ce budget.
+    fn facteur_requis(&self) -> Option<f64> {
+        let budget_s = self.budget.as_secs_f64();
+        (self.piste_s > 0.0 && budget_s > 0.0).then(|| self.piste_s / budget_s)
+    }
+}
+
+/// Surveille `travail` sous un budget qui s'étend selon le débit mesuré.
+///
+/// Remplace le `tokio::time::timeout` fixe. L'horloge est celle de tokio
+/// (`tokio::time::Instant`), pas `std::time::Instant` : c'est ce qui rend la
+/// contre-épreuve possible sans AUCUN `sleep` réel — un test sous
+/// `#[tokio::test(start_paused = true)]` avance cette horloge virtuellement.
+async fn transcoder_sous_budget<F, T>(
+    travail: F,
+    progres: std::sync::Arc<crate::audio::decode_progress::DecodeProgress>,
+    politique: BudgetAdaptatif,
+    pas: std::time::Duration,
+    journal: Option<&str>,
+) -> Result<T, DepassementBudget>
+where
+    F: std::future::Future<Output = T>,
+{
+    let debut = tokio::time::Instant::now();
+    let mut budget = politique.budget_taille;
+    let mut facteur: Option<f64> = None;
+    let mut sondages = 0usize;
+    let mut annonce = false;
+    tokio::pin!(travail);
+    loop {
+        tokio::select! {
+            resultat = &mut travail => return Ok(resultat),
+            _ = tokio::time::sleep(pas) => {}
+        }
+        let ecoule = debut.elapsed();
+        let decode = std::time::Duration::from_millis(progres.decoded_ms());
+        if decode > std::time::Duration::ZERO {
+            sondages += 1;
+        }
+        if let VerdictBudget::Mesure {
+            facteur: f,
+            budget: b,
+        } = politique.observer(ecoule, decode, sondages)
+        {
+            facteur = Some(f);
+            if b > budget {
+                // Une seule ligne, à la première extension : la suivre à chaque
+                // sondage remplirait le journal d'un tour par quart de seconde.
+                if !annonce {
+                    if let Some(file) = journal {
+                        info!(
+                            file,
+                            budget_s_initial = politique.budget_taille.as_secs(),
+                            budget_s = b.as_secs(),
+                            host_realtime_factor = f,
+                            track_s = politique.piste_s,
+                            "transcode_budget_extended_slow_host"
+                        );
+                    }
+                    annonce = true;
+                }
+                budget = b;
+            }
+        }
+        if ecoule >= budget {
+            return Err(DepassementBudget {
+                budget,
+                ecoule,
+                decode,
+                facteur,
+                piste_s: politique.piste_s,
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn transcode_source_to_file(
     source: String,
     out_sr: u32,
@@ -105,9 +365,14 @@ async fn transcode_source_to_file(
     convolver: Option<crate::audio::convolver::Convolver>,
     replaygain: Option<f64>,
     dest: String,
+    progres: Option<std::sync::Arc<crate::audio::decode_progress::DecodeProgress>>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // 1. Decode source to PCM (blocking I/O).
     let decoded = tokio::task::spawn_blocking(move || {
+        // La balise se pose SUR CE THREAD : c'est lui qui décode (#3140).
+        // Sans balise (`None`, tous les appelants hors chemin de lecture), le
+        // décodage est strictement celui d'avant.
+        let _balise = progres.map(crate::audio::decode_progress::installer);
         crate::audio::decode::decode_to_pcm(&source, Some(out_sr), Some(channels as u32), 0.0, 0.0)
     })
     .await
@@ -502,9 +767,98 @@ fn spawn_paced_levels_forwarder(
     tx
 }
 
+/// Le FREIN du décodage-pour-niveaux, isolé de ce QU'ON décode.
+///
+/// Rend le couple `(puits, relais)` que tout décodage-pour-niveaux de fichier
+/// local branche sur `decode_to_pcm_streaming_with_levels` : le PCM part dans
+/// le puits — personne ne le lit, seul compte le fait de borner la mémoire —
+/// et les fenêtres passent par le relais, qui compte l'avance décodée avant de
+/// les remettre au forwarder.
+///
+/// **Pourquoi un frein.** Un décodage plein pot produit les fenêtres à la
+/// vitesse du DISQUE, pendant que le forwarder ne les publie qu'au TEMPS RÉEL.
+/// Sa file est non bornée par construction et chaque
+/// [`crate::audio::tap::RawWindow`] porte son `pcm: Vec<u8>` : sans frein, elle
+/// retient la piste ENTIÈRE, et la rétention SUIT la durée du morceau au lieu
+/// de plafonner. Le puits ne consomme donc pas au-delà de
+/// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance sur la position rapportée par la
+/// zone, et le décodeur — bloqué sur un canal borné — s'aligne dessus.
+///
+/// Il s'arrête dès que le relais est fermé, donc dès que le forwarder est mort
+/// (piste remplacée, zone stoppée) : le décodeur voit son consommateur
+/// disparaître et rend la main au lieu de convertir la fin d'une piste que
+/// plus personne n'écoute.
+///
+/// **Le frein ne touche PAS aux paramètres de décodage** : chaque appelant
+/// garde les siens. C'est ce qui permet de brider le passthrough — qui décode
+/// aux valeurs TAGUÉES de la piste (`Some(sample_rate)` / `Some(channels)`) —
+/// sans le renvoyer vers [`spawn_local_file_levels_decode`], qui décode au
+/// débit natif du fichier. Sur un fichier bien tagué les deux coïncident ; sur
+/// un fichier mal tagué non, et le passthrough est justement le chemin de
+/// cette population-là (#3145).
+///
+/// C'est une fonction, pas un motif à recopier : #3104 avait reproduit à la
+/// main la forme du décodage-pour-niveaux, puits compris, mais avec un drain
+/// inconditionnel — et a réintroduit la fuite (#3144). Le bloc du passthrough,
+/// lui, ne l'avait jamais eue depuis #1423.
+fn spawn_braked_levels_sink(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) {
+    // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
+    // que le bridage compare à la position rapportée par la zone.
+    let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // Relais : le décodeur ne sait pas compter son avance, mais chaque
+    // fenêtre porte sa durée.
+    let (relais_tx, mut relais_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+    {
+        let avance_ms = avance_ms.clone();
+        tokio::spawn(async move {
+            while let Some(raw) = relais_rx.recv().await {
+                avance_ms.fetch_add(
+                    raw.window.as_millis() as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if levels_tx.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // Sonde du même canal : `is_closed()` devient vrai quand le relais a
+    // rendu la main, donc quand le forwarder est mort.
+    let relais = relais_tx.clone();
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    tokio::spawn(async move {
+        while sink_rx.recv().await.is_some() {
+            loop {
+                if relais.is_closed() {
+                    return;
+                }
+                let position = playback.get_state(zone_id).await.position_ms;
+                if !levels_decode_doit_freiner(
+                    avance_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    position,
+                ) {
+                    break;
+                }
+                tokio::time::sleep(LEVELS_HOLD).await;
+            }
+        }
+    });
+    (sink_tx, relais_tx)
+}
+
 /// Décode un fichier local EN FLUX, uniquement pour alimenter un forwarder de
 /// niveaux neuf : c'est ce qui rend les aiguilles à la piste devenue courante
-/// après une avance gapless.
+/// après une avance gapless, et ce qui les rend aussi à une piste servie depuis
+/// le cache de transcodage (`transcode_cache_hit`, #3104) — là le « fichier
+/// local » est la RENDITION en cache, celle qui part au renderer.
 ///
 /// Le PCM produit part dans un puits — seules comptent les fenêtres de niveaux
 /// et le fait de borner la mémoire. `decode_to_pcm` matérialisait ici la piste
@@ -522,10 +876,19 @@ fn spawn_paced_levels_forwarder(
 /// (`decode_http_stream_for_levels`) : un décodage plein pot produit les
 /// fenêtres bien plus vite que le forwarder ne les publie, et la file du
 /// forwarder — non bornée par construction — retiendrait alors tout le PCM de
-/// la piste (~600 Mo pour un DSD64 de dix minutes rendu en 176,4 kHz). Le
-/// puits ne consomme donc pas plus vite que
-/// [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur, bloqué sur un canal
-/// borné, s'aligne dessus.
+/// la piste (~600 Mo pour un DSD64 de dix minutes rendu en 176,4 kHz). C'est
+/// [`spawn_braked_levels_sink`] qui porte ce frein : le puits ne consomme pas
+/// plus vite que [`PROXY_LEVELS_MAX_AHEAD_MS`] d'avance, et le décodeur,
+/// bloqué sur un canal borné, s'aligne dessus.
+///
+/// Ce frein n'est PAS un détail d'implémentation qu'on peut recopier de
+/// mémoire : #3104 a reproduit la forme de cette fonction en ligne dans la
+/// branche du cache hit, puits compris, mais avec un drain inconditionnel.
+/// Mesuré sur un WAV 44,1/16 stéréo
+/// (`la_rendition_en_cache_ne_retient_plus_toute_la_piste`) : sans frein la
+/// file retient 10 551 296 octets pour 60 s de piste et 21 102 592 pour 120 s —
+/// elle SUIT la durée ; avec frein elle plafonne à 5 636 096 octets (31,9 s
+/// d'audio) dans les deux cas. Tout nouvel appelant passe par ici.
 fn spawn_local_file_levels_decode(
     bus: Arc<EventBus>,
     playback: Arc<PlaybackManager>,
@@ -536,48 +899,7 @@ fn spawn_local_file_levels_decode(
     tokio::spawn(async move {
         let cadence = playback.clone();
         let levels_tx = spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-        // Position DÉCODÉE, alimentée par le relais ci-dessous : c'est elle
-        // que le bridage compare à la position rapportée par la zone.
-        let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        // Relais : le décodeur ne sait pas compter son avance, mais chaque
-        // fenêtre porte sa durée.
-        let (relais_tx, mut relais_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
-        {
-            let avance_ms = avance_ms.clone();
-            tokio::spawn(async move {
-                while let Some(raw) = relais_rx.recv().await {
-                    avance_ms.fetch_add(
-                        raw.window.as_millis() as i64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    if levels_tx.send(raw).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        // Sonde du même canal : `is_closed()` devient vrai quand le relais a
-        // rendu la main, donc quand le forwarder est mort.
-        let relais = relais_tx.clone();
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-        tokio::spawn(async move {
-            while sink_rx.recv().await.is_some() {
-                loop {
-                    if relais.is_closed() {
-                        return;
-                    }
-                    let position = cadence.get_state(zone_id).await.position_ms;
-                    if !levels_decode_doit_freiner(
-                        avance_ms.load(std::sync::atomic::Ordering::Relaxed),
-                        position,
-                    ) {
-                        break;
-                    }
-                    tokio::time::sleep(LEVELS_HOLD).await;
-                }
-            }
-        });
+        let (sink_tx, relais_tx) = spawn_braked_levels_sink(cadence, zone_id, levels_tx);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
             crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -1285,6 +1607,132 @@ fn replay_needs_output_seek(
     position_ms: u64,
 ) -> bool {
     is_network_output && session_is_range_seekable && position_ms > 0
+}
+/// Ce qu'une reprise doit faire de la SESSION DE FLUX d'une zone.
+///
+/// Reprendre « sur place » suppose que la session qui alimentait la sortie a
+/// survécu à la pause. Il y a deux façons de ne pas y survivre, et surtout DEUX
+/// REMÈDES qui n'ont rien à voir l'un avec l'autre. C'est tout l'objet de ce
+/// type : le premier existait déjà, le second manquait, et les confondre aurait
+/// été un défaut de plus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepriseDeSession {
+    /// La session vit : `checked_resume` sur la sortie suffit, et c'est ce qui
+    /// marche aujourd'hui.
+    SurPlace,
+    /// RADIO seulement (#1629). Un flux radio est un DIRECT : on ré-amorce la
+    /// station, position JETÉE. On reprend le direct, pas un différé de dix-neuf
+    /// minutes.
+    RejouerLeDirect,
+    /// PISTE (#2512). Rétablir la MÊME écoute au MÊME point. Rejouer une piste
+    /// « depuis le direct » n'aurait aucun sens : l'auditeur veut retrouver son
+    /// morceau là où il l'a laissé.
+    RetablirALaPosition,
+    /// La session est morte et rien ne permet de la rétablir. Il reste à le
+    /// DIRE : un silence sans message est un défaut à lui seul.
+    Expliquer,
+}
+/// La matrice de décision de [`PlaybackOrchestrator::resume`].
+///
+/// Fonction PURE, et c'est ce qui permet de l'éprouver : `paused_at` est un
+/// `std::time::Instant` que `tokio::time::pause()` n'atteint pas, donc une pause
+/// de vingt minutes ne se joue pas dans un test — mais un booléen, si.
+///
+/// La branche RADIO est la table de vérité de #1629, inchangée : rejouer dès que
+/// la pause dépasse le seuil OU que le producteur de décodage est mort, jamais
+/// sans URL de station. Elle a été écrite contre un cas mesuré et elle
+/// fonctionne ; elle n'est ni généralisée, ni dupliquée, ni contournée.
+///
+/// La branche PISTE ne regarde PAS `pause_longue`. C'est délibéré et c'est le
+/// cœur du correctif : une piste dont la session vit encore reprend sur place,
+/// qu'on l'ait laissée trente secondes ou trois heures. Seule la mort de la
+/// session — le ramasse-miettes est passé — justifie de rétablir quoi que ce
+/// soit, et alors on rétablit à la position, pas au début.
+pub(crate) fn reprise_de_session(
+    est_radio: bool,
+    rejouable: bool,
+    pause_longue: bool,
+    session_morte: bool,
+) -> RepriseDeSession {
+    if est_radio {
+        if rejouable && (pause_longue || session_morte) {
+            RepriseDeSession::RejouerLeDirect
+        } else {
+            RepriseDeSession::SurPlace
+        }
+    } else if !session_morte {
+        RepriseDeSession::SurPlace
+    } else if rejouable {
+        RepriseDeSession::RetablirALaPosition
+    } else {
+        RepriseDeSession::Expliquer
+    }
+}
+/// La demande de lecture qui RÉTABLIT la session d'une piste au point exact où
+/// la pause l'a laissée.
+///
+/// C'est ce qui sépare ce correctif d'une transposition du comportement radio.
+/// Le re-play d'une station jette la position — il le doit. Ici la position est
+/// le cœur de la demande : `seek_ms` porte le `position_ms` que l'état de zone a
+/// conservé à travers la pause. Tout le reste désigne la même écoute, d'où
+/// `play_without_history` chez l'appelant : pas de seconde ligne d'historique,
+/// même règle que le re-play radio.
+///
+/// Les champs de résolution restent `None` : `play_inner` re-résout la piste
+/// depuis `track_id`/`source_id` comme au premier lancement, et une valeur
+/// recopiée ici ne pourrait que le contredire.
+///
+/// Fonction PURE : le contrat « la MÊME piste, au MÊME point » se prouve sans
+/// orchestrateur, sans sortie et sans fichier.
+pub(crate) fn requete_de_retablissement(
+    zone_id: i64,
+    output_device_id: String,
+    np: &NowPlaying,
+    position_ms: u64,
+) -> PlayRequest {
+    PlayRequest {
+        zone_id,
+        output_device_id: Some(output_device_id),
+        track_id: np.track_id,
+        source: Some(np.source.clone()),
+        source_id: np.source_id.clone(),
+        title: Some(np.title.clone()),
+        artist_name: np.artist_name.clone(),
+        album_title: np.album_title.clone(),
+        cover_url: np.cover_path.clone(),
+        duration_ms: (np.duration_ms > 0).then_some(np.duration_ms),
+        seek_ms: Some(position_ms),
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+    }
+}
+/// La phrase que la zone rend quand sa session n'a pas survécu à la pause et
+/// n'a pas pu être rétablie.
+///
+/// Elle existe parce que l'absence de message EST le défaut : « aucun son,
+/// volume dans le vide » et pas une ligne pour dire pourquoi. Elle nomme donc
+/// les trois choses que l'auditeur ne peut pas deviner — quelle piste, à quelle
+/// position, et pourquoi la session n'est plus là.
+///
+/// Fonction PURE, éprouvée sans orchestrateur.
+pub(crate) fn message_session_perdue(titre: &str, position_ms: u64, cause: Option<&str>) -> String {
+    let secondes = position_ms / 1000;
+    let mut phrase = format!(
+        "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
+         flux n'a pas survécu à la pause (le serveur la libère après {} minutes \
+         sans lecture). Relancez la piste.",
+        secondes / 60,
+        secondes % 60,
+        crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60,
+    );
+    if let Some(cause) = cause {
+        phrase.push_str(&format!(" Cause : {cause}"));
+    }
+    phrase
 }
 
 /// Temporisation avant le `Seek` qui suit une recréation de flux réseau.
@@ -2575,43 +3023,36 @@ impl PlaybackOrchestrator {
                 "playback_timing"
             );
 
-            // After play_media succeeds, send the zone's stored volume to the
-            // renderer — but ONLY if the user has explicitly set a volume
-            // (not the default 50). This prevents blasting speakers at an
-            // unexpected level after a server restart.
-            if result.0 {
-                let zone_db = ZoneRepo::with_backend(self.db.clone())
-                    .get(req.zone_id)
-                    .ok()
-                    .flatten();
-                let is_fixed = zone_db.as_ref().is_some_and(|z| z.fixed_volume);
-                // Only (re)assert the volume on play for fixed-volume (bit-perfect)
-                // zones, which must sit at 100%. For a normal zone, leave the
-                // device's current volume untouched: Tune previously pushed the
-                // stored zone volume on EVERY play, overriding a level the user
-                // had set directly on the device — the stored value drifts from
-                // the device (no external-change sync) so a low device jumped to
-                // the stored 50% on play (Fabien, "Salon"). Trade-off: this drops
-                // the old "re-apply saved volume after a restart to avoid a blast"
-                // behaviour for normal zones; the device keeps whatever level it
-                // is physically at.
-                if is_fixed {
-                    let did = device_id.clone();
-                    let outputs = self.outputs.clone();
-                    let zone_id = req.zone_id;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let arc = { outputs.lock().await.get(&did) };
-                        if let Some(output) = arc {
-                            if let Err(e) = output.lock().await.checked_set_volume(1.0).await {
-                                warn!(zone_id, volume = 1.0, error = %e, "play_initial_volume_failed");
-                            } else {
-                                info!(zone_id, volume = 1.0, "play_initial_volume_sent");
-                            }
-                        }
-                    });
-                }
-            }
+            // #2395 — AUCUNE commande de volume n'est envoyée ici, pour aucune
+            // zone.
+            //
+            // Deux comportements sont morts à cet endroit, et pour deux
+            // raisons distinctes :
+            //
+            // 1. Zone ordinaire : Tune poussait le volume stocké à CHAQUE
+            //    lecture, écrasant le niveau réglé directement sur l'appareil
+            //    — la valeur stockée dérive (rien ne resynchronise depuis le
+            //    device), et un appareil laissé bas remontait aux 50 % stockés
+            //    (Fabien, « Salon »). Retiré avant #2395 ; la zone garde le
+            //    niveau où elle est physiquement.
+            //
+            // 2. Zone `fixed_volume` : le plein volume était RÉASSERTÉ 500 ms
+            //    après chaque piste (`play_initial_volume_sent`). C'est la
+            //    part du mode que l'utilisateur n'a jamais consentie : il a
+            //    accepté UN saut à l'armement, pas une commande à 100 %
+            //    renvoyée à chaque morceau. Sur un renderer qui porte son
+            //    propre ampli — Denon RC12, Marco Polo, fil 1546 — chacune de
+            //    ces commandes est une puissance acoustique réelle.
+            //
+            // Le mode bit-perfect reste entier : le 100 % est commandé UNE
+            // fois, à l'armement, derrière la confirmation explicite
+            // (`fixed_volume_confirmation_required`, routes/zones.rs), et il
+            // est rendu au désarmement (`audio::fixed_volume`).
+            //
+            // Contrepartie assumée : une commande extérieure qui rebaisse le
+            // renderer EN COURS de session casse le bit-perfect sans que rien
+            // ne le dise. C'est le prix du choix — un saut annoncé et
+            // réversible — et non un défaut à rattraper par une réassertion.
 
             result
         } else {
@@ -2792,6 +3233,47 @@ impl PlaybackOrchestrator {
                 error = output_error.as_deref().unwrap_or(""),
                 "output_send_failed_stopping_zone_immediately"
             );
+            // …et le DIRE, pas seulement l'écrire dans le journal du serveur.
+            //
+            // Ce bloc CONNAÎT la cause — le renderer vient de la donner — puis il
+            // la range dans `PlayResult.error` et rend `Ok`. Or `Ok` est ce que
+            // presque tous les appelants lisent comme un succès : le corps de la
+            // réponse n'est relu que par les branches HTTP qui ATTENDENT `play()`
+            // (`POST /zones/:id/play` et ses voisines, via
+            // `build_zone_json_with_result`).
+            //
+            // Partout ailleurs la cause mourait ici : `next` et `previous`
+            // répondent `{"status":"playing"}` depuis un `tokio::spawn` avant même
+            // que l'envoi soit tenté (routes/playback.rs) ; `resume` et `seek`
+            // rendent `Ok(())` ; l'avance automatique, l'autoplay et la relance
+            // de démarrage mort du sondeur écrivent `Ok(_) =>` et poursuivent
+            // comme si la piste avait démarré ; idem pour les alarmes, la reprise
+            // au démarrage, le transfert de zone et l'émulation de renderer UPnP.
+            // Vu de l'auditeur : la zone dit « en lecture », rien ne part, et rien
+            // ne dit pourquoi.
+            //
+            // `zone.playback_error` existe déjà pour six autres échecs de lecture
+            // (périphérique disparu, décodage, volume, radio…) et le serveur le
+            // pousse verbatim à tous les clients (`routes/ws.rs`). Le REFUS D'UNE
+            // SORTIE était le seul échec de lecture à ne pas s'en servir.
+            //
+            // `fatal` pour la même raison qu'en #2630 : la zone s'arrête quinze
+            // lignes plus bas, et sans ce drapeau la fenêtre de grâce
+            // d'après-lecture du client avalerait le message — l'utilisateur
+            // n'aurait, une fois de plus, que le silence.
+            //
+            // Coût nul sur une lecture qui démarre : on n'entre dans ce bloc que
+            // lorsqu'une sortie a EXPLICITEMENT refusé le flux.
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "zone.playback_error",
+                    serde_json::json!({
+                        "zone_id": req.zone_id,
+                        "error": output_error.as_deref().unwrap_or_default(),
+                        "fatal": true,
+                    }),
+                );
+            }
             // La session de flux ne se détruit que si la commande n'a
             // certainement PAS été exécutée. Sur un timeout, elle a pu atteindre
             // un renderer lent : détruire le flux garantit alors qu'il tombe sur
@@ -3245,9 +3727,22 @@ impl PlaybackOrchestrator {
     ///
     /// Returns `Some(stream_url)` only when `url` is a playlist that
     /// dereferenced to a different http(s) URL; `None` for a direct media URL
-    /// (no network hit — cheap extension gate first), for HLS `.m3u8` (that
-    /// manifest IS the stream, consumed directly by the player), or on any
-    /// fetch/parse failure — so the caller keeps the original URL.
+    /// (no network hit — cheap extension gate first), for an HLS `.m3u8`
+    /// manifest, or on any fetch/parse failure — so the caller keeps the
+    /// original URL.
+    ///
+    /// `.m3u8` est écarté du déréférencement, et ce n'est PAS parce que « le
+    /// manifeste EST le flux, consommé directement par le lecteur » — ce que
+    /// cette phrase affirmait jusqu'à #2307, en annonçant une capacité qui
+    /// n'a jamais existé. Tune n'a aucun chargeur de segments HLS : le seul
+    /// lecteur de flux radio est `decode_radio_stream_to_pcm`, un GET unique
+    /// poussé dans symphonia. Et déréférencer ne servirait à rien non plus :
+    /// une playlist HLS ne porte que des chemins de segments RELATIFS, donc
+    /// le filtre `http(s)` ci-dessous n'y trouverait rien à rendre (constat
+    /// déjà écrit noir sur blanc dans la migration 86, qui a retiré BBC
+    /// Radio 3 pour cette raison). La garde reste donc telle quelle ; c'est
+    /// la LECTURE qui refuse HLS, en le NOMMANT — voir
+    /// [`RADIO_HLS_UNSUPPORTED`].
     async fn resolve_playlist_url(&self, url: &str) -> Option<String> {
         let path = url
             .split(['?', '#'])
@@ -4756,51 +5251,46 @@ impl PlaybackOrchestrator {
                     // un ReplayGain est en jeu, donc une rendition en cache est
                     // toujours du signal non traité.
                     //
-                    // Même forme que les niveaux du passthrough : décodage EN
-                    // FLUX, le PCM part dans un puits, seules les fenêtres
-                    // ressortent. Matérialiser la piste coûterait ~1,9 Go sur un
-                    // 24/192 de dix minutes, uniquement pour animer des aiguilles.
+                    // Décodage EN FLUX, le PCM part dans un puits, seules les
+                    // fenêtres ressortent : matérialiser la piste coûterait
+                    // ~1,9 Go sur un 24/192 de dix minutes, uniquement pour
+                    // animer des aiguilles.
+                    //
+                    // Par `spawn_local_file_levels_decode`, et pas en recopiant
+                    // la forme à la main. La première version de ce bloc s'était
+                    // modelée sur le décodage-pour-niveaux du PASSTHROUGH, qui
+                    // n'a jamais eu de frein (#1423) : elle en a hérité la forme
+                    // (flux, PCM au puits) mais pas le bridage que porte la
+                    // fonction ci-dessus — son puits drainait sans condition. Le
+                    // décodage courait alors à la vitesse du DISQUE pendant que
+                    // le forwarder ne publie qu'au temps réel, et la file du
+                    // forwarder — non bornée, chaque fenêtre portant son PCM —
+                    // retenait la piste ENTIÈRE. Le comble : le commentaire
+                    // ci-dessus invoquait les ~1,9 Go qu'il laissait revenir par
+                    // la file. Et le cache hit est le cas COURANT, pas le rare.
+                    //
+                    // On décode la rendition à son débit NATIF : la clef du
+                    // cache (`transcode_cache::cache_path`) couvre `out_sr`,
+                    // `out_bd` et `channels`, donc le fichier en cache est déjà
+                    // dans ce format — rééchantillonner vers lui ne changeait
+                    // rien.
                     if let Some(bus) = ev_bus
                         .clone()
                         .filter(|_| self.levels_attach_allowed(zone_id))
                     {
-                        let playback = playback.clone();
-                        let sr = out_sr;
-                        let ch = channels as u32;
-                        let rendition = cp.clone();
                         // Génération épinglée au moment de la décision (#1110) :
                         // ce décodage dure toute la piste, il ne doit pas pouvoir
                         // se raccrocher à la suivante.
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        tokio::spawn(async move {
-                            // Cache hit : la rendition est servie depuis son
-                            // début (un seek passe par Range HTTP).
-                            let levels_tx =
-                                spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
-                            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
-                            let ready = std::sync::Arc::new(tokio::sync::Notify::new());
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::audio::decode::decode_to_pcm_streaming_with_levels(
-                                    &rendition,
-                                    Some(sr),
-                                    Some(ch),
-                                    None,
-                                    sink_tx,
-                                    LEVELS_DECODE_CHUNK,
-                                    ready,
-                                    levels_tx,
-                                )
-                            })
-                            .await;
-                            match result {
-                                Err(e) => debug!(error = %e, "cache_hit_levels_task_panic"),
-                                Ok(Err(e)) => {
-                                    debug!(error = %e, "cache_hit_levels_decode_failed")
-                                }
-                                Ok(Ok(_)) => {}
-                            }
-                        });
+                        // Cache hit : la rendition est servie depuis son début
+                        // (un seek passe par Range HTTP).
+                        spawn_local_file_levels_decode(
+                            bus,
+                            playback.clone(),
+                            zone_id,
+                            play_seq,
+                            cp.clone(),
+                        );
                     }
                     (
                         session_id,
@@ -4844,12 +5334,21 @@ impl PlaybackOrchestrator {
                         budget_s = transcode_budget.as_secs(),
                         "transcode_budget_selected"
                     );
+                    // …mais la taille seule ne suffit pas : elle ignore la
+                    // VITESSE de la machine (#3140). `120 + 0,3154·D` en DSD256
+                    // n'est tenable qu'à partir de `× 3,17` temps réel ; Shrek
+                    // décode à `× 2,2`, et Tune livre de l'ARM64. La balise
+                    // publie l'audio déjà décodé, le chien de garde en tire le
+                    // facteur réel de CET hôte et n'ÉTEND le budget que si
+                    // celui de la taille ne suffit pas.
+                    let progres = crate::audio::decode_progress::DecodeProgress::new();
+                    let politique =
+                        BudgetAdaptatif::new(track.duration_ms as f64 / 1000.0, transcode_budget);
                     // Même raison que le pré-transcode DASH plus bas : la ligne
                     // de fin doit porter sa propre durée, pour rester lisible
                     // seule dans un export de journal tronqué par la rotation.
                     let file_transcode_start = std::time::Instant::now();
-                    let transcode_result = tokio::time::timeout(
-                        transcode_budget,
+                    let transcode_result = transcoder_sous_budget(
                         transcode_source_to_file(
                             fp.clone(),
                             out_sr,
@@ -4860,7 +5359,12 @@ impl PlaybackOrchestrator {
                             convolver,
                             replaygain_factor,
                             tmp_path.clone(),
+                            Some(progres.clone()),
                         ),
+                        progres,
+                        politique,
+                        PAS_SONDAGE_BUDGET,
+                        Some(file_path.as_str()),
                     )
                     .await;
 
@@ -4977,25 +5481,61 @@ impl PlaybackOrchestrator {
                             let _ = std::fs::remove_file(&tmp_path);
                             return Err(format!("transcode failed: {e}"));
                         }
-                        Err(_) => {
-                            let budget_s = transcode_budget.as_secs();
+                        Err(depassement) => {
+                            let budget_s = depassement.budget.as_secs();
                             let size_mb = std::fs::metadata(&fp)
                                 .map(|m| m.len() / (1024 * 1024))
                                 .unwrap_or(0);
-                            // Message explicite : l'ancien annoncait « 120s »
-                            // meme quand le budget etait tout autre, et ne
-                            // disait pas la taille en cause.
-                            warn!(
-                                file = %file_path,
-                                budget_s,
-                                size_mb,
-                                "transcode_timeout"
-                            );
                             let _ = std::fs::remove_file(&tmp_path);
-                            return Err(format!(
-                                "transcode timeout after {budget_s}s for a {size_mb} MB source \u{2014} \
-                                 disk or network too slow, or the file is unusually large"
-                            ));
+                            // La moitié utile de #3140 : DIRE que c'est l'hôte.
+                            //
+                            // L'ancienne ligne n'annonçait qu'un délai dépassé
+                            // et une taille, et envoyait chercher du côté du
+                            // disque ou du réseau — alors que la cause est la
+                            // vitesse du processeur, et qu'elle est désormais
+                            // MESURÉE. On la nomme, avec son facteur et celui
+                            // qu'il aurait fallu.
+                            match (depassement.facteur, depassement.facteur_requis()) {
+                                (Some(mesure), Some(requis)) => {
+                                    warn!(
+                                        file = %file_path,
+                                        budget_s,
+                                        size_mb,
+                                        track_s = depassement.piste_s,
+                                        decoded_s = depassement.decode.as_secs_f64(),
+                                        elapsed_s = depassement.ecoule.as_secs_f64(),
+                                        host_realtime_factor = mesure,
+                                        required_realtime_factor = requis,
+                                        "transcode_timeout_host_too_slow"
+                                    );
+                                    return Err(format!(
+                                        "transcode timeout after {budget_s}s: this HOST decodes \
+                                         this file at \u{d7}{mesure:.2} real time and would need \
+                                         \u{d7}{requis:.2} to finish a {track_min:.1} min track \
+                                         \u{2014} the machine is too slow for this format, not the \
+                                         disk and not the file ({size_mb} MB, \
+                                         {decoded:.0}s of audio decoded)",
+                                        track_min = depassement.piste_s / 60.0,
+                                        decoded = depassement.decode.as_secs_f64(),
+                                    ));
+                                }
+                                // Rien n'a été mesuré (décodeur qui ne publie
+                                // pas, durée de piste inconnue, blocage avant
+                                // la première fenêtre) : le message d'avant,
+                                // mot pour mot.
+                                _ => {
+                                    warn!(
+                                        file = %file_path,
+                                        budget_s,
+                                        size_mb,
+                                        "transcode_timeout"
+                                    );
+                                    return Err(format!(
+                                        "transcode timeout after {budget_s}s for a {size_mb} MB source \u{2014} \
+                                         disk or network too slow, or the file is unusually large"
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -5264,6 +5804,7 @@ impl PlaybackOrchestrator {
                     let play_seq = self.playback.current_play_seq(req.zone_id).await;
                     tokio::spawn(async move {
                         // Passthrough : le décodage pour niveaux part de 0.
+                        let cadence = playback.clone();
                         let levels_tx =
                             spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
                         // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
@@ -5276,8 +5817,30 @@ impl PlaybackOrchestrator {
                         // les niveaux au fil de l'eau ; le PCM produit part
                         // dans un puits, seul l'ordre de grandeur du tampon
                         // reste en mémoire.
-                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
-                        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+                        //
+                        // ... mais un puits qui draine SANS CONDITION ne borne
+                        // rien : il rend simplement au décodeur la vitesse du
+                        // DISQUE, pendant que le forwarder ne publie qu'au
+                        // TEMPS RÉEL. Sa file est non bornée et chaque fenêtre
+                        // porte son PCM, si bien que les ~1,9 Go chassés de la
+                        // porte d'entrée revenaient par la file — la rétention
+                        // SUIVAIT la durée de la piste (mesuré sur un WAV
+                        // 44,1/16 : 10 551 296 octets à 60 s, 21 102 592 à
+                        // 120 s, extrapolé à ~380 Mo en 24/96). C'est le défaut
+                        // d'origine de ce bloc (#1423), celui sur lequel #3104
+                        // s'était modelé ; #3145 le corrige ici.
+                        //
+                        // Le frein passe par `spawn_braked_levels_sink`, et NON
+                        // par `spawn_local_file_levels_decode` : cette
+                        // dernière décode au débit NATIF du fichier, alors que
+                        // le passthrough décode aux valeurs TAGUÉES de la piste
+                        // (`Some(sr)` / `Some(ch)`, lues sur `tracks`). Sur un
+                        // fichier bien tagué c'est identique ; sur un fichier
+                        // mal tagué c'est un écart réel — et le passthrough est
+                        // exactement le chemin de cette population-là. On
+                        // freine donc SANS toucher à ce qui est décodé.
+                        let (sink_tx, relais_tx) =
+                            spawn_braked_levels_sink(cadence, zone_id, levels_tx);
                         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
                         let result = tokio::task::spawn_blocking(move || {
                             crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -5288,7 +5851,7 @@ impl PlaybackOrchestrator {
                                 sink_tx,
                                 LEVELS_DECODE_CHUNK,
                                 ready,
-                                levels_tx,
+                                relais_tx,
                             )
                         })
                         .await;
@@ -7665,6 +8228,9 @@ impl PlaybackOrchestrator {
                 None,
                 None,
                 tmp.clone(),
+                // Pré-chauffage en fond, sans budget ni auditeur qui attend :
+                // rien à mesurer, rien à étendre (#3140).
+                None,
             )
             .await
             {
@@ -9136,46 +9702,113 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Dire à l'auditeur que la session n'a pas survécu à la pause — sur les
+    /// DEUX canaux, parce qu'aucun des deux ne suffit seul.
+    ///
+    /// L'`OutputCommandError` remonte à l'appelant HTTP : `POST
+    /// /zones/{id}/resume` la rend en 502 avec son `message`
+    /// (`output_command_error_response`). Mais seul le client qui a appuyé sur
+    /// lecture la voit, et seulement s'il attend la réponse.
+    /// `zone.playback_error` — le canal que six autres échecs de lecture
+    /// utilisent déjà, poussé verbatim à TOUS les clients par `routes/ws.rs` —
+    /// porte la même phrase aux autres télécommandes. La deuxième moitié de
+    /// #1998 nommait déjà `resume` parmi les chemins où la cause « mourait ici ».
+    ///
+    /// `fatal: true` pour la raison écrite en #1960 et #2630 : sans lui, la
+    /// fenêtre de grâce d'après-lecture du client web avale le message, et
+    /// l'auditeur n'a — une fois de plus — que le silence.
+    fn dire_session_perdue(
+        &self,
+        zone_id: i64,
+        titre: &str,
+        position_ms: u64,
+        cause: Option<&str>,
+    ) -> OutputCommandError {
+        let message = message_session_perdue(titre, position_ms, cause);
+        warn!(zone_id, position_ms, %message, "resume_stream_session_lost");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message.clone(),
+                    "fatal": true,
+                }),
+            );
+        }
+        OutputCommandError::failed(OutputCommand::Resume, message)
+    }
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
         let position_ms = state.position_ms.max(0) as u64;
 
-        // WEBRADIO : une reprise après une pause longue — ou après la mort du
-        // producteur de décodage — est traitée comme un RE-PLAY de la station
-        // (#1629). Un flux radio est un DIRECT : pendant la pause le pipeline
-        // continue de se périmer (la connexion icecast peut mourir par un
-        // chemin qui ne logge qu'en debug!, la sortie accumule un retard sans
-        // borne, les horodatages OAAT prennent toute la durée de la pause de
-        // retard) et la reprise « sur place » rend du silence sans la moindre
-        // erreur (.42 : pause 15:48 → reprise 16:07, aucun son, volume dans le
-        // vide). Rejouer dans CE chemin commun couvre les trois familles de
-        // sorties (locale, OAAT, réseau) — et c'est de toute façon le
-        // comportement attendu d'un direct : on reprend le direct, pas un
-        // différé de 19 minutes.
+        // Une reprise « sur place » suppose que la SESSION DE FLUX qui alimentait
+        // la sortie a survécu à la pause. Deux façons d'y échouer, deux remèdes.
+        //
+        // WEBRADIO (#1629) : le flux est un DIRECT. Pendant la pause le pipeline
+        // continue de se périmer — la connexion icecast peut mourir par un chemin
+        // qui ne logge qu'en debug!, la sortie accumule un retard sans borne, les
+        // horodatages OAAT prennent toute la durée de la pause de retard — et la
+        // reprise « sur place » rend du silence sans la moindre erreur (.42 :
+        // pause 15:48 → reprise 16:07, aucun son, volume dans le vide). Le remède
+        // est un RE-PLAY de la station : on reprend le direct, pas un différé de
+        // dix-neuf minutes. Rien de tout cela ne change ici.
+        //
+        // PISTE (#2512) : le MÊME silence, par une autre porte, et il n'était pas
+        // gardé. Le ramasse-miettes retire toute session NON RADIO restée
+        // `SESSION_IDLE_TIMEOUT` (trente minutes) sans servir un octet — la radio
+        // y est explicitement exemptée, la piste non — et une lecture en pause ne
+        // tire plus rien, ce que le commentaire de la borne dit mot pour mot :
+        // « elle survit une demi-heure aujourd'hui ». Passé ce délai la session
+        // n'existe plus, `/stream/{id}` répond 404, et toutes les familles de
+        // sorties reprennent sur du vide — la locale comprise, qui va chercher
+        // son PCM en HTTP.
+        //
+        // Le remède n'est PAS celui de la radio : on rétablit la même écoute à la
+        // MÊME position. Et quand plus rien ne le permet, on le dit.
         if let Some(np) = state.now_playing.as_ref() {
+            let est_radio = np.source == "radio";
             let has_url = np.source_id.as_deref().is_some_and(|s| !s.is_empty());
-            if np.source == "radio" && has_url {
-                let paused_long = state
-                    .paused_at
-                    .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
-                // Producteur mort même sous le seuil : plus rien n'alimente la
-                // session WAV, reprendre sur place serait silencieux aussi.
-                let producer_dead = match np.stream_id.as_deref() {
-                    Some(sid) => self.streamer.radio_producer_done(sid).await,
-                    None => false,
-                };
-                if paused_long || producer_dead {
-                    let did = device_id.map(str::to_string).or_else(|| {
-                        ZoneRepo::with_backend(self.db.clone())
-                            .get(zone_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|z| z.output_device_id)
-                    });
-                    if let Some(did) = did {
-                        info!(zone_id, paused_long, producer_dead, "radio_resume_replay");
+            // De quoi re-demander la MÊME écoute : une URL de station pour une
+            // radio, une piste identifiable pour tout le reste.
+            let rejouable = if est_radio {
+                has_url
+            } else {
+                np.track_id.is_some() || has_url
+            };
+            let pause_longue = state
+                .paused_at
+                .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
+            // Ce qui tue une session n'est pas le même selon la famille. Radio :
+            // le producteur de décodage s'est terminé — plus rien n'alimente la
+            // session WAV, reprendre sur place serait silencieux aussi. Piste :
+            // `producer_done` n'est jamais armé (seul `decode_radio_stream_to_pcm`
+            // le fait), la seule question qui vaille est « la session existe-t-elle
+            // encore ».
+            let session_morte = match np.stream_id.as_deref() {
+                Some(sid) if est_radio => self.streamer.radio_producer_done(sid).await,
+                Some(sid) => !self.streamer.session_alive(sid).await,
+                None => false,
+            };
+            let decision = reprise_de_session(est_radio, rejouable, pause_longue, session_morte);
+            if decision != RepriseDeSession::SurPlace {
+                let did = device_id.map(str::to_string).or_else(|| {
+                    ZoneRepo::with_backend(self.db.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id)
+                });
+                match (decision, did) {
+                    (RepriseDeSession::RejouerLeDirect, Some(did)) => {
+                        info!(
+                            zone_id,
+                            paused_long = pause_longue,
+                            producer_dead = session_morte,
+                            "radio_resume_replay"
+                        );
                         let req = PlayRequest {
                             zone_id,
                             output_device_id: Some(did),
@@ -9206,10 +9839,41 @@ impl PlaybackOrchestrator {
                             ),
                         }
                     }
+                    (RepriseDeSession::RetablirALaPosition, Some(did)) => {
+                        info!(zone_id, position_ms, "resume_stream_session_restore");
+                        let req = requete_de_retablissement(zone_id, did, np, position_ms);
+                        // Même piste, même écoute : pas de seconde ligne
+                        // d'historique, exactement comme le re-play radio.
+                        match self.play_without_history(req).await {
+                            Ok(_) => return Ok(()),
+                            // Pas de repli silencieux : la sortie n'a plus rien à
+                            // jouer, la reprendre ne ferait que rejouer le défaut.
+                            Err(e) => {
+                                return Err(self.dire_session_perdue(
+                                    zone_id,
+                                    &np.title,
+                                    position_ms,
+                                    Some(&e),
+                                ));
+                            }
+                        }
+                    }
+                    (RepriseDeSession::Expliquer, _)
+                    | (RepriseDeSession::RetablirALaPosition, None) => {
+                        return Err(self.dire_session_perdue(
+                            zone_id,
+                            &np.title,
+                            position_ms,
+                            None,
+                        ));
+                    }
+                    // Radio dont on ne connaît aucune sortie : repli inchangé sur
+                    // la reprise ordinaire, exactement comme avant #2512.
+                    (RepriseDeSession::RejouerLeDirect, None) | (RepriseDeSession::SurPlace, _) => {
+                    }
                 }
             }
         }
-
         let output_type = if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -9718,6 +10382,53 @@ impl PlaybackOrchestrator {
             // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
             // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
             .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+            .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        Ok(())
+    }
+
+    /// Arme le volume fixe : commande le plein volume au périphérique, **une
+    /// seule fois** (#2395).
+    ///
+    /// C'est le seul chemin autorisé à commander une zone `fixed_volume` :
+    /// [`Self::set_volume`] sort au plus tôt pour ces zones et ne parle jamais
+    /// au device. L'appelant est la route qui écrit `fixed_volume` (PATCH
+    /// `/zones/{id}`), APRÈS que la confirmation explicite a été obtenue —
+    /// jamais la lecture, qui ne commande plus rien.
+    ///
+    /// Le trim de gain par renderer n'est délibérément pas composé ici : le
+    /// mode promet du bit-perfect, et `1.0` doit rester `1.0`.
+    ///
+    /// L'ordre suit celui de `set_volume` : le device d'abord, la base et
+    /// l'état interne seulement s'il a accepté. Une zone sans sortie
+    /// enregistrée n'est pas une erreur — le 100 % est alors seulement
+    /// persisté, et la sortie le recevra à son enregistrement.
+    pub async fn arm_fixed_volume(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
+        if let Some(did) = device_id {
+            let output = { self.outputs.lock().await.get(did) };
+            match output {
+                Some(output) => {
+                    info!(zone_id, device_id = did, "fixed_volume_arm_sending");
+                    if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
+                        warn!(zone_id, error = %error, "fixed_volume_arm_failed");
+                        return Err(error);
+                    }
+                }
+                // Sortie déclarée mais pas encore enregistrée : rien à
+                // commander, et surtout rien à refuser — la zone reste armée.
+                None => info!(zone_id, device_id = did, "fixed_volume_arm_no_output"),
+            }
+        } else {
+            info!(zone_id, "fixed_volume_arm_no_device_id");
+        }
+
+        self.playback.set_volume(zone_id, 1.0).await;
+        self.playback.mark_volume_changed(zone_id).await;
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(zone_id, 100.0)
             .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
         Ok(())
     }
@@ -10559,6 +11270,15 @@ fn emit_radio_playback_error(
         format!(
             "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
         )
+    } else if error.starts_with(RADIO_HLS_UNSUPPORTED) {
+        // Nommer HLS, et dire quoi faire. Avant #2307 l'auditeur recevait au
+        // mieux le « radio probe failed: … » de symphonia — le nom d'un
+        // sous-système qu'il n'a aucune raison de connaître, sur un défaut
+        // qu'il ne peut pas corriger. Ici il apprend que sa station est bien
+        // vivante, que c'est Tune qui ne sait pas la lire, et quoi demander.
+        format!(
+            "« {station} » est diffusée en HLS (manifeste .m3u8) : Tune ne sait pas encore lire ce format de flux. Demandez à la station son adresse de flux directe (MP3 ou AAC), ou choisissez une autre station."
+        )
     } else {
         format!("Impossible de lire la station « {station} » : {error}")
     };
@@ -10627,6 +11347,62 @@ pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
         .then_some(ct)
 }
 
+/// Préfixe des erreurs « cette station est diffusée en HLS » (#2307).
+///
+/// Distinct de [`RADIO_NOT_AUDIO`] parce que le remède n'est pas le même : une
+/// station en `text/html` est morte ou a changé d'adresse, une station en HLS
+/// est bien vivante et c'est Tune qui ne sait pas la lire. Confondre les deux
+/// enverrait l'auditeur chercher une adresse de remplacement qui n'existe pas.
+pub(crate) const RADIO_HLS_UNSUPPORTED: &str = "radio_hls_unsupported";
+
+/// Cette station est-elle publiée en HLS ?
+///
+/// HLS n'est pas un format de conteneur qu'il suffirait d'ajouter au décodeur :
+/// c'est un PROTOCOLE. Un `.m3u8` est un manifeste qui liste des segments à
+/// télécharger l'un après l'autre, et qu'il faut re-télécharger périodiquement
+/// tant que le direct dure. `decode_radio_stream_to_pcm` fait un GET, un seul,
+/// et pousse le corps dans symphonia. Tune ne sait donc pas lire HLS ; dire
+/// lequel, et le dire à l'auditeur, est tout ce que ce contrôle sert à faire.
+///
+/// Deux signaux, tous deux SANS AMBIGUÏTÉ — c'est délibérément étroit, parce
+/// qu'un faux positif rendrait muette une station qui marche aujourd'hui :
+///
+///   * l'extension `.m3u8` du chemin, paramètres et ancre retirés ;
+///   * le type MIME `application/vnd.apple.mpegurl`, le type ENREGISTRÉ de HLS
+///     (RFC 8216) — le seul cas où une URL sans extension se dénonce.
+///
+/// Volontairement ABSENTS : `audio/x-mpegurl`, `audio/mpegurl` et
+/// `application/x-mpegurl`, que les serveurs servent aussi pour une simple
+/// playlist `.m3u`. Une `.m3u` est déréférencée en amont par
+/// `resolve_playlist_url` ; quand ce déréférencement échoue (réseau), le
+/// décodeur la reçoit telle quelle — et l'annoncer « HLS » serait un
+/// diagnostic FAUX sur le chemin le plus fréquenté. Mieux vaut se taire sur
+/// ces types-là que mentir.
+///
+/// Ce contrôle vit à part de [`non_audio_content_type`] et ne le modifie pas :
+/// cette liste noire répond à une autre question (« le serveur a-t-il rendu une
+/// page web ? ») et son témoin exige justement que les types `mpegurl` la
+/// traversent. Les deux gardes sont indépendantes.
+///
+/// `content_type` peut être vide : c'est le mode « avant le réseau », où seule
+/// l'extension parle.
+pub(crate) fn is_hls_manifest(url: &str, content_type: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".m3u8") {
+        return true;
+    }
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/vnd.apple.mpegurl")
+}
+
 /// Applique l'EQ au PCM radio déjà décodé, avant sa quantification en i16.
 /// `None` est une identité stricte : les chemins sans EQ conservent exactement
 /// les mêmes échantillons et ne paient aucun traitement supplémentaire.
@@ -10659,6 +11435,19 @@ fn decode_radio_stream_to_pcm(
     use symphonia::core::meta::MetadataOptions;
     use tracing::{debug, info, warn};
 
+    // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
+    // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
+    // rafraîchissement de playlist, rien de ce qu'un direct HLS exige. Sans
+    // cette porte le manifeste partait quand même dans symphonia avec
+    // l'indice « mp3 » (le repli du `hint` plus bas, `.m3u8` ne correspondant
+    // à aucune branche), et l'auditeur récoltait au mieux un « radio probe
+    // failed: ... » illisible, au pire du silence si le probe accrochait une
+    // fausse synchro dans le texte du manifeste. On refuse, et on le DIT.
+    if is_hls_manifest(&url, "") {
+        return Err(format!(
+            "{RADIO_HLS_UNSUPPORTED}: {url} est un manifeste HLS, pas un flux audio décodable"
+        ));
+    }
     let rt =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime for radio decode")?;
 
@@ -10725,6 +11514,13 @@ fn decode_radio_stream_to_pcm(
             if let Some(bad) = non_audio_content_type(&content_type) {
                 return Err(format!(
                     "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
+                ));
+            }
+            // Un manifeste HLS servi depuis une URL sans extension : seul le
+            // type MIME le dénonce. Même refus nommé que la porte d'entrée.
+            if is_hls_manifest(&url, &content_type) {
+                return Err(format!(
+                    "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
                 ));
             }
             info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
@@ -10800,7 +11596,9 @@ fn decode_radio_stream_to_pcm(
                 // flux audio en réessayant trente fois : on remonte l'erreur
                 // tout de suite pour qu'elle soit DITE, au lieu de quinze
                 // secondes de silence suivies d'un abandon muet.
-                if e.starts_with(RADIO_NOT_AUDIO) {
+                // Ni un manifeste HLS, que trente reconnexions ne
+                // transformeront pas davantage en flux Icecast (#2307).
+                if e.starts_with(RADIO_NOT_AUDIO) || e.starts_with(RADIO_HLS_UNSUPPORTED) {
                     return Err(e);
                 }
                 reconnects += 1;
@@ -11122,6 +11920,344 @@ mod transcode_budget_tests {
     }
 }
 
+/// #3140 — le budget suit le DÉBIT DE DÉCODAGE de l'hôte, plus la seule taille.
+///
+/// ## Le fait de base mesuré ici
+///
+/// À débit de décodage donné et durée de piste donnée, **le transcodage
+/// aboutit au lieu d'expirer**. Pas un code HTTP, pas un compte d'événements :
+/// la valeur rendue par le chien de garde, `Ok` ou `Err`.
+///
+/// ## Aucun `sleep` réel
+///
+/// Tout tourne sous `#[tokio::test(start_paused = true)]` : l'horloge de tokio
+/// est virtuelle, `tokio::time::Instant` la suit, et le décodeur feint publie
+/// sur la même balise que le vrai. Un test de budget qui dort serait
+/// intermittent ; celui-ci s'exécute en quelques millisecondes et rend TOUJOURS
+/// le même verdict.
+#[cfg(test)]
+mod budget_adaptatif_tests {
+    use super::{
+        BudgetAdaptatif, MARGE_BUDGET_TRANSCODAGE, PAS_SONDAGE_BUDGET, PLAFOND_BUDGET_TRANSCODAGE,
+        SONDAGES_AVANT_MESURE, VerdictBudget, transcoder_sous_budget,
+    };
+    use crate::audio::decode_progress::DecodeProgress;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Le budget historique, tel qu'il était calculé — reproduit ici sur la
+    /// taille SANS toucher au disque, pour que la contre-épreuve puisse dire
+    /// « rouge avant » sur le même nombre que la production.
+    fn budget_historique_pour(octets: u64) -> Duration {
+        let gib = octets as f64 / (1024.0 * 1024.0 * 1024.0);
+        Duration::from_secs((120 + (gib * 120.0).round() as u64).min(30 * 60))
+    }
+
+    /// Octets d'un DSD256 stéréo de `piste_s` secondes : 11 289 600 bits/s par
+    /// canal, deux canaux. C'est le format du ticket.
+    fn octets_dsd256(piste_s: f64) -> u64 {
+        (piste_s * 11_289_600.0 / 8.0 * 2.0) as u64
+    }
+
+    /// Un transcodage FEINT : il consomme `piste_s / facteur` secondes
+    /// d'horloge tokio et publie son avancement sur la balise exactement comme
+    /// la boucle de décodage réelle (valeur cumulée, en millisecondes d'audio).
+    ///
+    /// Le pas est de 250 ms d'audio, du même ordre qu'un paquet FLAC ; le vrai
+    /// DSF publie plus fin encore (un super-bloc ≈ 3 ms en DSD256), ce qui ne
+    /// peut que rendre l'estimation plus rapide, jamais plus lente.
+    async fn transcodage_feint(
+        progres: Arc<DecodeProgress>,
+        piste_s: f64,
+        facteur: f64,
+    ) -> Result<&'static str, String> {
+        let total_ms = (piste_s * 1000.0) as u64;
+        let mut decode_ms = 0u64;
+        while decode_ms < total_ms {
+            let tranche_ms = 250u64.min(total_ms - decode_ms);
+            tokio::time::sleep(Duration::from_secs_f64(
+                tranche_ms as f64 / 1000.0 / facteur,
+            ))
+            .await;
+            decode_ms += tranche_ms;
+            progres.publier(decode_ms);
+        }
+        Ok("transcodé")
+    }
+
+    async fn jouer(
+        piste_s: f64,
+        facteur: f64,
+        budget_taille: Duration,
+    ) -> (
+        Result<Result<&'static str, String>, super::DepassementBudget>,
+        Duration,
+    ) {
+        let debut = tokio::time::Instant::now();
+        let progres = DecodeProgress::new();
+        let politique = BudgetAdaptatif::new(piste_s, budget_taille);
+        let r = transcoder_sous_budget(
+            transcodage_feint(progres.clone(), piste_s, facteur),
+            progres,
+            politique,
+            PAS_SONDAGE_BUDGET,
+            None,
+        )
+        .await;
+        (r, debut.elapsed())
+    }
+
+    // ------------------------------------------------------------------
+    // Couple 1 — le silence du ticket : DSD256 de 20 min sur un hôte à × 2,2
+    // (le facteur MESURÉ de Shrek, banc `dsd_to_pcm`).
+    // ------------------------------------------------------------------
+
+    /// ROUGE AVANT — et pas sur un calcul : sur l'ANCIEN code, exécuté.
+    ///
+    /// `tokio::time::timeout(budget_de_taille, …)` est mot pour mot ce que
+    /// faisait `resolve_local_track` avant #3140. Le même décodeur feint, le
+    /// même couple, et il EXPIRE. Sans cette moitié-là, le test vert d'à côté
+    /// ne prouverait rien.
+    #[tokio::test(start_paused = true)]
+    async fn couple_1_rouge_avant_le_budget_de_taille_ne_tient_pas() {
+        let piste_s = 20.0 * 60.0;
+        let facteur = 2.2;
+        let budget = budget_historique_pour(octets_dsd256(piste_s));
+        let besoin_s = piste_s / facteur;
+        assert!(
+            besoin_s > budget.as_secs_f64(),
+            "ce couple doit ÊTRE rouge avant : besoin {besoin_s:.0} s, \
+             budget de taille {} s",
+            budget.as_secs()
+        );
+        let progres = DecodeProgress::new();
+        let avant =
+            tokio::time::timeout(budget, transcodage_feint(progres, piste_s, facteur)).await;
+        assert!(
+            avant.is_err(),
+            "l'ANCIEN budget devait EXPIRER sur ce couple, il a rendu {avant:?}"
+        );
+    }
+
+    /// VERT APRÈS : le même couple aboutit, et il aboutit AU MOMENT où le
+    /// décodage finit — le budget ne l'a pas retenu.
+    #[tokio::test(start_paused = true)]
+    async fn couple_1_vert_apres_un_dsd256_de_20_min_a_x2_2_aboutit() {
+        let piste_s = 20.0 * 60.0;
+        let facteur = 2.2;
+        let budget = budget_historique_pour(octets_dsd256(piste_s));
+        let (r, ecoule) = jouer(piste_s, facteur, budget).await;
+        assert!(
+            matches!(r, Ok(Ok("transcodé"))),
+            "le transcodage devait ABOUTIR, il a rendu {r:?}"
+        );
+        let attendu = piste_s / facteur;
+        assert!(
+            (ecoule.as_secs_f64() - attendu).abs() < 5.0,
+            "il devait finir vers {attendu:.0} s, il a mis {:.0} s",
+            ecoule.as_secs_f64()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Couple 2 — celui qui doit CONTINUER d'échouer : un budget infini n'est
+    // pas la réponse. Hôte à × 0,5 (deux fois plus lent que le temps réel),
+    // piste de 40 min : 4 800 s de décodage, contre un plafond de 1 800 s.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn couple_2_un_hote_deux_fois_plus_lent_que_le_temps_reel_echoue_toujours() {
+        let piste_s = 40.0 * 60.0;
+        let facteur = 0.5;
+        let budget = budget_historique_pour(octets_dsd256(piste_s));
+        let (r, ecoule) = jouer(piste_s, facteur, budget).await;
+        let Err(d) = r else {
+            panic!("un hôte à × 0,5 ne peut PAS transcoder 40 min : {r:?}");
+        };
+        assert_eq!(
+            d.budget, PLAFOND_BUDGET_TRANSCODAGE,
+            "l'échec doit survenir AU PLAFOND, pas plus tard"
+        );
+        assert!(
+            ecoule < PLAFOND_BUDGET_TRANSCODAGE + PAS_SONDAGE_BUDGET * 2,
+            "il doit rendre la main au plafond, il a mis {ecoule:?}"
+        );
+        // Et il doit NOMMER l'hôte : facteur mesuré, facteur qu'il aurait fallu.
+        let mesure = d.facteur.expect("le facteur de l'hôte doit être mesuré");
+        assert!(
+            (mesure - facteur).abs() < 0.1,
+            "facteur mesuré {mesure:.2}, attendu ~{facteur:.2}"
+        );
+        let requis = d.facteur_requis().expect("le facteur requis doit être dit");
+        assert!(
+            (requis - piste_s / PLAFOND_BUDGET_TRANSCODAGE.as_secs_f64()).abs() < 0.01,
+            "facteur requis {requis:.2}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Témoins verts des deux côtés.
+    // ------------------------------------------------------------------
+
+    /// Une piste courte sur une machine rapide ne change NI de budget NI de
+    /// comportement : c'est la garantie que ce correctif est invisible pour
+    /// tous ceux qui ne rencontraient pas le silence.
+    #[tokio::test(start_paused = true)]
+    async fn temoin_piste_courte_machine_rapide_ne_change_rien() {
+        let piste_s = 4.0 * 60.0;
+        let facteur = 6.0; // le DSD64 de Shrek
+        let budget = budget_historique_pour(octets_dsd256(piste_s));
+        let (r, ecoule) = jouer(piste_s, facteur, budget).await;
+        assert!(matches!(r, Ok(Ok("transcodé"))), "{r:?}");
+        // Le budget de taille suffisait déjà : la politique ne l'étend pas.
+        let politique = BudgetAdaptatif::new(piste_s, budget);
+        let besoin = Duration::from_secs_f64(piste_s / facteur);
+        let v = politique.observer(besoin, Duration::from_secs_f64(piste_s), 99);
+        match v {
+            VerdictBudget::Mesure { budget: b, .. } => assert_eq!(
+                b, budget,
+                "le budget d'une machine rapide ne doit PAS bouger"
+            ),
+            autre => panic!("verdict inattendu : {autre:?}"),
+        }
+        assert!((ecoule.as_secs_f64() - piste_s / facteur).abs() < 2.0);
+    }
+
+    /// Un fichier réellement illisible échoue TOUJOURS, et VITE : l'erreur du
+    /// décodeur remonte telle quelle, sans consommer une seconde de budget.
+    #[tokio::test(start_paused = true)]
+    async fn temoin_un_fichier_illisible_echoue_toujours_et_vite() {
+        let debut = tokio::time::Instant::now();
+        let progres = DecodeProgress::new();
+        let politique = BudgetAdaptatif::new(1200.0, Duration::from_secs(500));
+        let r: Result<Result<&str, String>, _> = transcoder_sous_budget(
+            async { Err::<&str, String>("decode failed: corrupt".to_string()) },
+            progres,
+            politique,
+            PAS_SONDAGE_BUDGET,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&r, Ok(Err(e)) if e.contains("corrupt")),
+            "l'échec du décodeur doit remonter tel quel : {r:?}"
+        );
+        assert!(
+            debut.elapsed() < Duration::from_secs(1),
+            "il doit échouer VITE, il a mis {:?}",
+            debut.elapsed()
+        );
+    }
+
+    /// Un décodeur qui ne publie RIEN (AIFF, WavPack, APE, Opus : ils n'ont pas
+    /// de balise) garde le budget historique, au quart de seconde près, et son
+    /// échec porte l'ancien message — `facteur` reste `None`.
+    ///
+    /// C'est la propriété qui empêche une absence de mesure de RACCOURCIR un
+    /// budget.
+    #[tokio::test(start_paused = true)]
+    async fn temoin_un_decodeur_muet_garde_le_budget_historique() {
+        let budget = Duration::from_secs(200);
+        let progres = DecodeProgress::new();
+        let politique = BudgetAdaptatif::new(1200.0, budget);
+        let debut = tokio::time::Instant::now();
+        let r: Result<Result<&str, String>, _> = transcoder_sous_budget(
+            async {
+                // Ne publie jamais, et ne finit jamais dans le budget.
+                tokio::time::sleep(Duration::from_secs(10_000)).await;
+                Ok("jamais")
+            },
+            progres,
+            politique,
+            PAS_SONDAGE_BUDGET,
+            None,
+        )
+        .await;
+        let Err(d) = r else {
+            panic!("il devait expirer : {r:?}")
+        };
+        assert_eq!(d.budget, budget, "le budget ne doit pas avoir bougé");
+        assert!(d.facteur.is_none(), "rien n'a été mesuré, rien à annoncer");
+        assert!(d.facteur_requis().is_some(), "la durée de piste est connue");
+        let ecoule = debut.elapsed();
+        assert!(
+            ecoule >= budget && ecoule < budget + PAS_SONDAGE_BUDGET * 2,
+            "il devait rendre la main à {budget:?}, il a mis {ecoule:?}"
+        );
+    }
+
+    /// Durée de piste inconnue (`duration_ms` à zéro) : rien à extrapoler, le
+    /// budget historique s'applique inchangé.
+    #[test]
+    fn sans_duree_de_piste_aucune_extension() {
+        let politique = BudgetAdaptatif::new(0.0, Duration::from_secs(120));
+        assert_eq!(
+            politique.observer(Duration::from_secs(10), Duration::from_secs(5), 99),
+            VerdictBudget::PasEncore
+        );
+    }
+
+    /// Avant `SONDAGES_AVANT_MESURE` fenêtres, on ne conclut RIEN : les
+    /// premières portent encore le coût fixe du démarrage (ouverture, recopie
+    /// locale, conception du filtre FIR) et sous-estiment le débit.
+    #[test]
+    fn pas_de_verdict_avant_assez_de_fenetres() {
+        let politique = BudgetAdaptatif::new(1200.0, Duration::from_secs(120));
+        assert_eq!(
+            politique.observer(
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                SONDAGES_AVANT_MESURE - 1
+            ),
+            VerdictBudget::PasEncore
+        );
+        assert!(matches!(
+            politique.observer(
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                SONDAGES_AVANT_MESURE
+            ),
+            VerdictBudget::Mesure { .. }
+        ));
+    }
+
+    /// Le budget ne se RESSERRE jamais : quel que soit le débit mesuré, il
+    /// reste au moins celui de la taille. Sans cette borne, un débit
+    /// sous-estimé sur un cache froid ferait échouer une lecture qui marchait.
+    #[test]
+    fn le_budget_ne_se_resserre_jamais() {
+        let budget = Duration::from_secs(600);
+        let politique = BudgetAdaptatif::new(60.0, budget);
+        // Hôte foudroyant : le besoin réel est de 2 s.
+        let VerdictBudget::Mesure { budget: b, facteur } =
+            politique.observer(Duration::from_secs(2), Duration::from_secs(60), 99)
+        else {
+            panic!("verdict attendu")
+        };
+        assert!(facteur > 20.0);
+        assert_eq!(b, budget, "le budget de taille est un PLANCHER");
+    }
+
+    /// La marge est appliquée au temps restant, pas au temps déjà écoulé —
+    /// sinon un transcodage long verrait son budget enfler à chaque sondage.
+    #[test]
+    fn la_marge_porte_sur_le_restant() {
+        let politique = BudgetAdaptatif::new(1200.0, Duration::from_secs(1));
+        // À mi-course : 600 s d'audio décodées en 300 s → × 2,0.
+        let VerdictBudget::Mesure { budget: b, facteur } =
+            politique.observer(Duration::from_secs(300), Duration::from_secs(600), 99)
+        else {
+            panic!("verdict attendu")
+        };
+        assert!((facteur - 2.0).abs() < 1e-9);
+        let attendu = 300.0 + 600.0 / 2.0 * MARGE_BUDGET_TRANSCODAGE;
+        assert!(
+            (b.as_secs_f64() - attendu).abs() < 0.5,
+            "budget {b:?}, attendu {attendu:.1} s"
+        );
+    }
+}
+
 /// La regle de decision du passthrough DSD (#2122).
 ///
 /// Les douze combinaisons : quatre modes croises avec les trois reponses
@@ -11418,7 +12554,8 @@ mod wav_override_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, arm_local_stream_consumer_watch,
+        decode_radio_stream_to_pcm, emit_radio_playback_error, is_hls_manifest,
         non_audio_content_type,
     };
     use crate::event_bus::EventBus;
@@ -11599,6 +12736,202 @@ mod tests {
     #[test]
     fn no_event_bus_is_not_a_panic() {
         emit_radio_playback_error(&None, 1, "Station", "boom");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2307 — les flux HLS ne sont jamais lus. Ils doivent au moins le DIRE.
+    // -----------------------------------------------------------------------
+
+    /// Les deux signaux retenus, et eux seuls, dénoncent un manifeste HLS.
+    #[test]
+    fn un_manifeste_hls_est_reconnu_par_son_extension_ou_son_type() {
+        for url in [
+            "https://example.net/hls/master.m3u8",
+            "https://example.net/live/index.M3U8",
+            // Paramètres de session : très fréquent chez les CDN HLS.
+            "https://example.net/live/playlist.m3u8?token=abc&sid=42",
+            "https://example.net/live/playlist.m3u8#debut",
+            "http://as-hls.example.co.uk/pool/x/live/bbc_6music-audio=96000.m3u8",
+        ] {
+            assert!(
+                is_hls_manifest(url, ""),
+                "{url} aurait dû être reconnue comme HLS : sans la garde d'extension, elle repart en silence dans symphonia"
+            );
+        }
+        // URL sans extension : seul le type enregistré de HLS la dénonce.
+        assert!(is_hls_manifest(
+            "https://example.net/live/stream",
+            "application/vnd.apple.mpegurl"
+        ));
+        assert!(is_hls_manifest(
+            "https://example.net/live/stream",
+            "Application/VND.Apple.MpegURL; charset=utf-8"
+        ));
+    }
+
+    /// LE TÉMOIN. Rien de ce qui joue aujourd'hui ne doit être pris pour du
+    /// HLS : ni les playlists `.m3u`/`.pls` — le chemin fréquenté, déréférencé
+    /// en amont par `resolve_playlist_url` — ni aucune des formes d'adresse que
+    /// `radios_validation_url` déclare légitimes, ni aucun des types MIME que
+    /// `real_radio_content_types_pass_through` exige de laisser passer.
+    ///
+    /// Les types `audio/x-mpegurl` et `application/x-mpegurl` sont ici
+    /// VOLONTAIREMENT du côté « pas HLS » : ils servent aussi pour une simple
+    /// `.m3u`, et un diagnostic « HLS » sur une `.m3u` dont le déréférencement
+    /// a échoué serait un mensonge sur le chemin le plus emprunté.
+    #[test]
+    fn le_temoin_m3u_pls_et_les_stations_livrees_ne_sont_jamais_pris_pour_du_hls() {
+        for url in [
+            "http://example.net/live.m3u",
+            "http://example.net/live.pls",
+            "https://radioswissjazz.ch/live/mp3.m3u",
+            "http://icecast.example.net:8000/stream.mp3",
+            "https://ais-sa8.cdnstream1.com/3630_128.mp3",
+            "https://radio.jamminvibezonline.ca/listen/reggae/stream.aac",
+            "https://example.net/live/flac",
+            "https://example.net/autodj",
+            "http://192.168.1.42:8000/",
+            "http://[2001:db8::1]:8000/stream",
+            "https://s.eu/live/aac?bitrate=320&session=abc",
+            "HTTP://EXAMPLE.NET/Stream.MP3",
+            "http://example.net/stream#anchor",
+        ] {
+            assert!(
+                !is_hls_manifest(url, ""),
+                "{url} prise pour du HLS à tort — une station qui joue deviendrait muette"
+            );
+        }
+        for ct in [
+            "audio/aac",
+            "audio/mpeg",
+            "audio/aacp",
+            "audio/ogg",
+            "audio/flac",
+            "audio/x-flac",
+            "application/ogg",
+            "application/octet-stream",
+            "audio/x-mpegurl",
+            "audio/mpegurl",
+            "application/x-mpegurl",
+            "video/mp2t",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !is_hls_manifest("http://example.net/live.m3u", ct),
+                "type « {ct} » pris pour du HLS à tort"
+            );
+        }
+    }
+
+    /// Ce contrôle est INDÉPENDANT de `non_audio_content_type` : ajouter les
+    /// types HLS à cette liste noire aurait cassé son propre témoin, qui exige
+    /// qu'ils la traversent. Les deux répondent à deux questions différentes.
+    #[test]
+    fn le_controle_hls_ne_touche_pas_la_liste_noire_page_web() {
+        assert_eq!(
+            non_audio_content_type("application/vnd.apple.mpegurl"),
+            None
+        );
+        assert_eq!(non_audio_content_type("audio/x-mpegurl"), None);
+        assert!(!is_hls_manifest("http://example.net/live", "text/html"));
+    }
+
+    /// L'ÉPREUVE : la fonction de production qui lit réellement les radios,
+    /// appelée telle quelle, refuse un manifeste HLS — et le refuse AVANT le
+    /// réseau.
+    ///
+    /// L'adresse pointe sur `127.0.0.1:9` (discard), qui refuse la connexion
+    /// instantanément. Si la garde disparaissait, le décodeur ouvrirait le
+    /// réseau et rendrait `radio HTTP fetch failed: …` : l'assertion tombe.
+    /// Le test ne peut donc pas passer pour une mauvaise raison.
+    #[tokio::test]
+    async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+        let (_session_id, tx, data_ready, session) = streamer.create_radio_session(info, 4).await;
+        // Appelée EXACTEMENT comme la production l'appelle : ses trois sites
+        // (sortie locale, OAAT, DLNA proxifiée) l'enveloppent dans
+        // `spawn_blocking`, parce que symphonia et `reqwest::blocking` sont
+        // synchrones. Le test emprunte donc le même chemin, et un sabotage de
+        // la garde y produit la vraie erreur réseau plutôt qu'une panique de
+        // runtime qui masquerait ce qui s'est passé.
+        let erreur = tokio::task::spawn_blocking(move || {
+            decode_radio_stream_to_pcm(
+                "http://127.0.0.1:9/live/master.m3u8?token=abc".to_string(),
+                tx,
+                data_ready,
+                session,
+                None,
+                None,
+            )
+        })
+        .await
+        .expect("la tâche de décodage ne doit pas paniquer")
+        .expect_err("un manifeste HLS ne doit jamais être accepté comme flux");
+        assert!(
+            erreur.starts_with(RADIO_HLS_UNSUPPORTED),
+            "le décodeur doit refuser en NOMMANT HLS, pas en laissant symphonia \
+             échouer sur un message obscur : {erreur}"
+        );
+    }
+
+    /// Et l'auditeur, lui, voit quoi ? Un `zone.playback_error` `fatal: true`
+    /// — le canal que le client web écoute déjà pour sept autres échecs de
+    /// lecture, et que le websocket sert à tout client abonné (motif `*` par
+    /// défaut, `tune-server/src/routes/ws.rs`). Le message doit NOMMER HLS :
+    /// c'est toute la différence entre « Tune est cassé » et « cette station
+    /// utilise un format que Tune ne lit pas encore ».
+    #[tokio::test]
+    async fn une_station_hls_est_annoncee_a_l_auditeur_en_nommant_hls() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        emit_radio_playback_error(
+            &Some(bus.clone()),
+            9,
+            "Radio Segments",
+            &format!(
+                "{RADIO_HLS_UNSUPPORTED}: https://example.net/master.m3u8 est un \
+                 manifeste HLS, pas un flux audio décodable"
+            ),
+        );
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event_type, "zone.playback_error");
+        assert_eq!(ev.data["zone_id"], 9);
+        assert_eq!(
+            ev.data["fatal"], true,
+            "sans fatal:true le client étouffe le message dans sa fenêtre de grâce"
+        );
+        let msg = ev.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("Radio Segments"),
+            "le message doit nommer la station : {msg}"
+        );
+        assert!(
+            msg.contains("HLS"),
+            "le message doit NOMMER le protocole en cause : {msg}"
+        );
+        assert!(
+            msg.contains(".m3u8"),
+            "le message doit donner le mot que l'auditeur verra chez son opérateur : {msg}"
+        );
+        // Surtout pas le diagnostic de la station morte : la station HLS est
+        // vivante, lui dire de chercher une nouvelle adresse serait faux.
+        assert!(
+            !msg.contains("page web"),
+            "HLS ne doit pas être confondu avec une station morte : {msg}"
+        );
+    }
+
+    /// Aucun bus (démarrage partiel, tests) : on se tait, on ne panique pas.
+    #[test]
+    fn un_refus_hls_sans_bus_ne_panique_pas() {
+        emit_radio_playback_error(&None, 1, "Station", RADIO_HLS_UNSUPPORTED);
     }
 
     /// Le garde-fou ne doit RIEN casser : les types réellement servis par les
@@ -11945,9 +13278,10 @@ mod tests {
     use crate::streaming::registry::ServiceRegistry;
 
     use super::{
-        PlayRequest, PlaybackOrchestrator, StreamingDsp, is_network_output_type,
-        is_push_uri_output_type, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
-        replay_needs_output_seek, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
+        PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
+        is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
+        pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
+        requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
         streaming_pretranscode_format, use_file_transcode_for,
     };
 
@@ -12902,6 +14236,597 @@ mod tests {
         assert!(super::levels_decode_doit_freiner(90_001, 60_000));
     }
 
+    // ------------------------------------------------------------------
+    // #3104 — les niveaux d'un CACHE HIT : mesurés, pas seulement écrits.
+    // ------------------------------------------------------------------
+
+    /// Écrit un WAV PCM 44,1 kHz / 16 bits / stéréo de `duree_ms`, rempli d'un
+    /// carré à ~43 Hz et -2,7 dBFS. C'est la forme exacte d'une rendition mise
+    /// en cache pour un renderer DLNA en LPCM. Le signal est FRANC : un test
+    /// peut exiger des niveaux au-dessus du silence, et pas seulement
+    /// l'existence d'événements.
+    fn ecrire_wav_carre(path: &std::path::Path, duree_ms: u64) {
+        const SR: u32 = 44_100;
+        const CANAUX: u16 = 2;
+        const BITS: u16 = 16;
+        let trames = (SR as u64 * duree_ms / 1000) as usize;
+        let mut buf = Vec::with_capacity(44 + trames * 4);
+        buf.extend_from_slice(&crate::audio::wav::build_wav_header_with_duration(
+            CANAUX,
+            SR,
+            BITS,
+            Some(duree_ms),
+        ));
+        let demi_periode = (SR / 86).max(1) as usize;
+        for t in 0..trames {
+            let v: i16 = if (t / demi_periode) % 2 == 0 {
+                24_000
+            } else {
+                -24_000
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// Ce que la file du forwarder RETIENT quand la zone n'a pas encore avancé
+    /// (position rapportée à 0, l'état d'un début de lecture) : fenêtres en
+    /// attente, octets de PCM, et millisecondes d'audio.
+    ///
+    /// La file est reproduite à l'identique du forwarder — `unbounded_channel`
+    /// de [`crate::audio::tap::RawWindow`], chaque fenêtre portant son
+    /// `pcm: Vec<u8>` — et personne ne la draine : c'est exactement un
+    /// forwarder qui n'a encore rien publié. Le SEUL écart entre les deux
+    /// appels est le puits : `freine = false` reproduit verbatim le drain
+    /// inconditionnel du bloc en ligne livré par #3104
+    /// (`while sink_rx.recv().await.is_some() {}`), `freine = true` celui de
+    /// `spawn_local_file_levels_decode`.
+    ///
+    /// Aucun délai dans la mesure : on compte des tours jusqu'à ce que le
+    /// décodage rende la main (cas sans frein) ou que l'avance décodée cesse de
+    /// croître (cas freiné — le décodeur reste bloqué sur son canal borné tant
+    /// que la zone est à 0). Le cas freiné atteint un PLATEAU : attendre plus
+    /// longtemps ne change pas le chiffre, donc la mesure n'est pas une course.
+    async fn pcm_retenu(chemin: &str, freine: bool) -> (usize, usize, i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let avance_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let relache = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Relais compteur d'avance, identique à celui de la fonction bridée.
+        let (relais_tx, mut relais_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let relais = {
+            let avance_ms = avance_ms.clone();
+            tokio::spawn(async move {
+                while let Some(raw) = relais_rx.recv().await {
+                    avance_ms.fetch_add(raw.window.as_millis() as i64, Relaxed);
+                    if levels_tx.send(raw).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        {
+            let avance_ms = avance_ms.clone();
+            let relache = relache.clone();
+            tokio::spawn(async move {
+                while sink_rx.recv().await.is_some() {
+                    while freine
+                        && !relache.load(Relaxed)
+                        && super::levels_decode_doit_freiner(avance_ms.load(Relaxed), 0)
+                    {
+                        tokio::time::sleep(super::LEVELS_HOLD).await;
+                    }
+                }
+            });
+        }
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let mut decodage = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                None,
+                None,
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+            )
+        });
+
+        let mut fini = false;
+        let mut precedent = -1i64;
+        let mut plateau = 0u32;
+        for _ in 0..2_000 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), &mut decodage)
+                .await
+                .is_ok()
+            {
+                fini = true;
+                break;
+            }
+            let a = avance_ms.load(Relaxed);
+            if a == precedent {
+                plateau += 1;
+                if plateau >= 25 {
+                    break;
+                }
+            } else {
+                plateau = 0;
+                precedent = a;
+            }
+        }
+        // Décodage terminé : le relais se ferme de lui-même (son émetteur est
+        // tombé avec la tâche de décodage). On l'attend pour que la file soit
+        // complète au moment du comptage. En plateau, l'avance stable prouve
+        // déjà que le relais est au repos.
+        if fini {
+            let _ = relais.await;
+        }
+
+        let mut fenetres = 0usize;
+        let mut octets = 0usize;
+        let mut audio_ms = 0i64;
+        while let Ok(raw) = levels_rx.try_recv() {
+            fenetres += 1;
+            octets += raw.pcm.len();
+            audio_ms += raw.window.as_millis() as i64;
+        }
+
+        // Libérer le décodeur : sans cela il resterait bloqué sur son canal
+        // borné pour toute la vie du binaire de test.
+        relache.store(true, Relaxed);
+        if !fini {
+            let _ = decodage.await;
+        }
+        (fenetres, octets, audio_ms)
+    }
+
+    /// Contre-épreuve CHIFFRÉE du frein sur le chemin du cache hit.
+    ///
+    /// #3104 a recopié la forme du décodage-pour-niveaux — flux, PCM au puits —
+    /// mais pas son frein : son puits drainait sans condition. Le décodage
+    /// courait alors à la vitesse du DISQUE pendant que le forwarder ne publie
+    /// qu'au temps réel, et la file du forwarder — non bornée, chaque fenêtre
+    /// portant son PCM — retenait la piste ENTIÈRE. Le cache hit étant le cas
+    /// courant, la fuite l'était aussi.
+    ///
+    /// Le test mesure les deux formes sur deux durées : sans frein la rétention
+    /// SUIT la durée de la piste (elle double quand la piste double) ; avec
+    /// frein elle plafonne à ~30 s d'audio, quelle que soit la piste.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn la_rendition_en_cache_ne_retient_plus_toute_la_piste() {
+        let court = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let long = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(court.path(), 60_000);
+        ecrire_wav_carre(long.path(), 120_000);
+        let court = court.path().to_str().unwrap().to_string();
+        let long = long.path().to_str().unwrap().to_string();
+
+        // Forme livrée par #3104 : puits sans frein.
+        let (f60, o60, ms60) = pcm_retenu(&court, false).await;
+        let (f120, o120, ms120) = pcm_retenu(&long, false).await;
+        // Forme bridée : celle de `spawn_local_file_levels_decode`.
+        let (g60, p60, gms60) = pcm_retenu(&court, true).await;
+        let (g120, p120, gms120) = pcm_retenu(&long, true).await;
+
+        println!(
+            "sans frein — 60 s : {f60} fenêtres / {o60} octets / {ms60} ms ; \
+             120 s : {f120} fenêtres / {o120} octets / {ms120} ms"
+        );
+        println!(
+            "avec frein — 60 s : {g60} fenêtres / {p60} octets / {gms60} ms ; \
+             120 s : {g120} fenêtres / {p120} octets / {gms120} ms"
+        );
+
+        assert!(
+            ms60 >= 59_000 && ms120 >= 119_000,
+            "sans frein, la file doit retenir la piste entière — c'est le défaut \
+             qu'on mesure : {ms60} ms sur 60 s, {ms120} ms sur 120 s"
+        );
+        assert!(
+            o120 as f64 > o60 as f64 * 1.9,
+            "sans frein, la rétention doit SUIVRE la durée : {o60} octets sur \
+             60 s contre {o120} sur 120 s — si ce rapport n'est pas ~2, la \
+             mesure ne décrit pas ce qu'elle prétend"
+        );
+
+        assert!(
+            gms60 <= 35_000 && gms120 <= 35_000,
+            "le frein doit plafonner la file à ~30 s d'audio (PROXY_LEVELS_MAX_AHEAD_MS \
+             plus le canal borné du puits) : {gms60} ms sur 60 s, {gms120} ms sur 120 s"
+        );
+        assert!(
+            gms60 >= 25_000,
+            "le frein ne doit pas ÉTEINDRE les niveaux : il en garde ~30 s \
+             d'avance ; reçu {gms60} ms"
+        );
+        assert!(
+            (gms120 - gms60).abs() <= 4_000,
+            "le plafond ne doit pas dépendre de la durée de la piste : {gms60} ms \
+             sur 60 s contre {gms120} ms sur 120 s"
+        );
+        assert!(
+            (p120 as f64) < o120 as f64 / 2.0,
+            "sur 120 s, le frein doit diviser la rétention : {p120} octets contre \
+             {o120} sans frein"
+        );
+    }
+
+    /// #3104 a livré son correctif avec un garde sur le TEXTE source : il
+    /// vérifiait qu'un forwarder était bien câblé dans la tranche du cache hit,
+    /// sans jamais faire passer UNE SEULE fenêtre. Voici la mesure qui manquait.
+    ///
+    /// On appelle ce que la branche « cache hit » appelle, avec la même
+    /// génération épinglée, sur une RENDITION (pas sur la source) : les
+    /// `playback.audio_levels` doivent monter sur le bus, et décrire du SIGNAL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_cache_hit_fait_bien_monter_des_niveaux_sur_le_bus() {
+        let rendition = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(rendition.path(), 5_000);
+        let chemin = rendition.path().to_str().unwrap().to_string();
+        let (orch, bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        let play_seq = orch.playback.current_play_seq(zone_id).await;
+        super::spawn_local_file_levels_decode(
+            bus,
+            orch.playback.clone(),
+            zone_id,
+            play_seq,
+            chemin,
+        );
+
+        let (n, crete) =
+            compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(20), 25).await;
+        assert!(
+            n >= 25,
+            "une piste servie depuis le cache de transcodage doit animer les VU : \
+             reçu {n} événements"
+        );
+        assert!(
+            crete > -20.0,
+            "les niveaux doivent décrire le SIGNAL de la rendition, pas du \
+             silence : crête {crete:.1} dBFS"
+        );
+    }
+
+    /// Contre-épreuve PERMANENTE du test ci-dessus : la décision d'AVANT #3104
+    /// — un cache hit sert le fichier et n'attache rien — sur le même harnais.
+    /// Si des `audio_levels` arrivaient ici par un autre chemin, le test
+    /// principal deviendrait insensible au défaut ; celui-ci tomberait d'abord.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contre_epreuve_un_cache_hit_sans_niveaux_laisse_les_vu_morts() {
+        let rendition = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(rendition.path(), 5_000);
+        let chemin = rendition.path().to_str().unwrap().to_string();
+        let (_orch, _bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        // Comportement historique : la branche de cache créait la session de
+        // streaming et s'arrêtait là. Rien n'est attaché, volontairement.
+        let (n, _) = compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(3), 0).await;
+        assert_eq!(
+            n, 0,
+            "sous le défaut, ce harnais doit voir ZÉRO niveau — sinon le test \
+             principal ne prouve rien"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #3145 — les niveaux du PASSTHROUGH : le frein qui manquait depuis
+    // #1423, mesuré sur le même fait de base que #3144.
+    // ------------------------------------------------------------------
+
+    /// Ce que la file du forwarder RETIENT sur le chemin PASSTHROUGH, quand la
+    /// zone n'a pas encore avancé (position 0, l'état d'un début de lecture) :
+    /// fenêtres en attente, octets de PCM, millisecondes d'audio.
+    ///
+    /// Mesuré sur le VRAI décodeur et avec les valeurs TAGUÉES de la piste
+    /// (`Some(sr)` / `Some(ch)`) — celles que la branche emploie, et que le
+    /// correctif ne change pas.
+    ///
+    /// La file est reproduite à l'identique de celle du forwarder —
+    /// `unbounded_channel` de [`crate::audio::tap::RawWindow`], chaque fenêtre
+    /// portant son `pcm: Vec<u8>` — et personne ne la draine : c'est exactement
+    /// un forwarder qui n'a encore rien publié.
+    ///
+    /// Le SEUL écart entre les deux appels est le PUITS :
+    /// - `freine = false` reproduit verbatim le bloc d'origine (#1423) — drain
+    ///   inconditionnel, et le décodeur émet DIRECTEMENT dans la file ;
+    /// - `freine = true` branche la vraie fonction de production,
+    ///   [`super::spawn_braked_levels_sink`] — pas une réplique — sur une zone
+    ///   réelle restée à la position 0.
+    ///
+    /// Aucun `sleep` d'attente : on compte des TOURS jusqu'à ce que le décodage
+    /// rende la main (cas sans frein) ou que la file cesse de grandir (cas
+    /// freiné — le décodeur reste bloqué sur son canal borné tant que la zone
+    /// est à 0). Le cas freiné atteint un PLATEAU : attendre plus longtemps ne
+    /// change pas le chiffre, donc la mesure n'est pas une course.
+    async fn pcm_retenu_passthrough(
+        chemin: &str,
+        sr: u32,
+        ch: u32,
+        freine: bool,
+    ) -> (usize, usize, i64) {
+        let (orch, _bus, zone_id, _rx) = zone_locale_prete_a_enchainer(chemin, "wav").await;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+
+        let (sink_tx, decode_tx) = if freine {
+            super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx)
+        } else {
+            // Forme d'origine : le puits draine sans condition, et le décodeur
+            // écrit DIRECTEMENT dans la file du forwarder.
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+            (sink_tx, levels_tx)
+        };
+
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let mut decodage = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                Some(sr),
+                Some(ch),
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                decode_tx,
+            )
+        });
+
+        let mut fini = false;
+        let mut precedent = usize::MAX;
+        let mut plateau = 0u32;
+        for _ in 0..2_000 {
+            if tokio::time::timeout(std::time::Duration::from_millis(20), &mut decodage)
+                .await
+                .is_ok()
+            {
+                fini = true;
+                break;
+            }
+            let n = levels_rx.len();
+            if n == precedent {
+                plateau += 1;
+                if plateau >= 25 {
+                    break;
+                }
+            } else {
+                plateau = 0;
+                precedent = n;
+            }
+        }
+
+        let mut fenetres = 0usize;
+        let mut octets = 0usize;
+        let mut audio_ms = 0i64;
+        while let Ok(raw) = levels_rx.try_recv() {
+            fenetres += 1;
+            octets += raw.pcm.len();
+            audio_ms += raw.window.as_millis() as i64;
+        }
+
+        // Libérer le décodeur : sans cela il resterait bloqué sur son canal
+        // borné pour toute la vie du binaire de test. On avance la position de
+        // la ZONE — le frein est justement une comparaison à cette position,
+        // donc c'est aussi la démonstration qu'il la relit à chaque tour.
+        orch.playback.update_position(zone_id, 3_600_000).await;
+        if !fini {
+            let _ = decodage.await;
+        }
+        (fenetres, octets, audio_ms)
+    }
+
+    /// Contre-épreuve CHIFFRÉE du frein sur le chemin du PASSTHROUGH (#3145).
+    ///
+    /// Le bloc d'origine (#1423) décodait en flux — le PCM part dans un puits,
+    /// seules les fenêtres ressortent — mais son puits DRAINAIT SANS
+    /// CONDITION. Le décodage courait donc à la vitesse du DISQUE pendant que
+    /// le forwarder ne publie qu'au TEMPS RÉEL, et sa file — non bornée, chaque
+    /// fenêtre portant son PCM — retenait la piste ENTIÈRE. La branche est
+    /// active pour toutes les sorties réseau et navigateur.
+    ///
+    /// Le test mesure les deux formes sur DEUX durées : une seule ne
+    /// distinguerait pas un plateau d'une tendance. Sans frein la rétention
+    /// SUIT la durée de la piste (elle double quand la piste double) ; avec
+    /// frein elle plafonne à ~30 s d'audio, quelle que soit la piste.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn le_passthrough_ne_retient_plus_toute_la_piste() {
+        const SR: u32 = 44_100;
+        const CH: u32 = 2;
+        let court = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let long = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(court.path(), 60_000);
+        ecrire_wav_carre(long.path(), 120_000);
+        let court = court.path().to_str().unwrap().to_string();
+        let long = long.path().to_str().unwrap().to_string();
+
+        // Forme d'origine (#1423) : puits sans frein.
+        let (f60, o60, ms60) = pcm_retenu_passthrough(&court, SR, CH, false).await;
+        let (f120, o120, ms120) = pcm_retenu_passthrough(&long, SR, CH, false).await;
+        // Forme bridée : celle de `spawn_braked_levels_sink`.
+        let (g60, p60, gms60) = pcm_retenu_passthrough(&court, SR, CH, true).await;
+        let (g120, p120, gms120) = pcm_retenu_passthrough(&long, SR, CH, true).await;
+
+        println!(
+            "passthrough sans frein — 60 s : {f60} fenêtres / {o60} octets / {ms60} ms ; \
+             120 s : {f120} fenêtres / {o120} octets / {ms120} ms"
+        );
+        println!(
+            "passthrough avec frein — 60 s : {g60} fenêtres / {p60} octets / {gms60} ms ; \
+             120 s : {g120} fenêtres / {p120} octets / {gms120} ms"
+        );
+
+        assert!(
+            ms60 >= 59_000 && ms120 >= 119_000,
+            "sans frein, la file doit retenir la piste entière — c'est le défaut \
+             qu'on mesure : {ms60} ms sur 60 s, {ms120} ms sur 120 s"
+        );
+        assert!(
+            o120 as f64 > o60 as f64 * 1.9,
+            "sans frein, la rétention doit SUIVRE la durée : {o60} octets sur \
+             60 s contre {o120} sur 120 s — si ce rapport n'est pas ~2, la \
+             mesure ne décrit pas ce qu'elle prétend"
+        );
+
+        assert!(
+            gms60 <= 35_000 && gms120 <= 35_000,
+            "le frein doit plafonner la file à ~30 s d'audio \
+             (PROXY_LEVELS_MAX_AHEAD_MS plus le canal borné du puits) : \
+             {gms60} ms sur 60 s, {gms120} ms sur 120 s"
+        );
+        assert!(
+            gms60 >= 25_000,
+            "le frein ne doit pas ÉTEINDRE les niveaux du passthrough : il en \
+             garde ~30 s d'avance ; reçu {gms60} ms"
+        );
+        assert!(
+            (gms120 - gms60).abs() <= 4_000,
+            "le plafond ne doit pas dépendre de la durée de la piste : {gms60} ms \
+             sur 60 s contre {gms120} ms sur 120 s — un PLATEAU, pas une tendance"
+        );
+        assert!(
+            (p120 as f64) < o120 as f64 / 2.0,
+            "sur 120 s, le frein doit diviser la rétention : {p120} octets contre \
+             {o120} sans frein"
+        );
+    }
+
+    /// Témoin vert : le frein ne supprime pas la FONCTIONNALITÉ.
+    ///
+    /// Même câblage que la branche passthrough — forwarder cadencé, puits
+    /// bridé, décodage aux valeurs TAGUÉES — sur un vrai bus : les
+    /// `playback.audio_levels` montent, et décrivent du SIGNAL, pas du silence.
+    /// Sans ce témoin, « la file ne retient plus rien » serait aussi vrai d'un
+    /// correctif qui aurait simplement débranché les VU-mètres.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_passthrough_bride_fait_toujours_monter_des_niveaux_sur_le_bus() {
+        let fichier = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(fichier.path(), 5_000);
+        let chemin = fichier.path().to_str().unwrap().to_string();
+        let (orch, bus, zone_id, mut rx) = zone_locale_prete_a_enchainer(&chemin, "wav").await;
+
+        // Génération épinglée AVANT le spawn, comme dans la branche (#1110).
+        let play_seq = orch.playback.current_play_seq(zone_id).await;
+        let levels_tx =
+            super::spawn_paced_levels_forwarder(bus, orch.playback.clone(), zone_id, play_seq, 0);
+        let (sink_tx, relais_tx) =
+            super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx);
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &chemin,
+                Some(44_100),
+                Some(2),
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+            )
+        });
+
+        let (n, crete) =
+            compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(20), 25).await;
+        assert!(
+            n >= 25,
+            "le passthrough bridé doit toujours animer les VU-mètres : \
+             reçu {n} événements"
+        );
+        assert!(
+            crete > -20.0,
+            "les niveaux doivent décrire le SIGNAL de la piste, pas du \
+             silence : crête {crete:.1} dBFS"
+        );
+    }
+
+    /// Total du PCM effectivement produit par le décodeur pour ces paramètres
+    /// de sortie. Le puits draine, la file de niveaux aussi : on ne mesure ici
+    /// que ce que le décodage FABRIQUE, pas ce qu'il retient.
+    async fn octets_decodes(chemin: &str, sr: Option<u32>, ch: Option<u32>) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (levels_tx, mut levels_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+        let drain = tokio::spawn(async move { while levels_rx.recv().await.is_some() {} });
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let puits = {
+            let total = total.clone();
+            tokio::spawn(async move {
+                while let Some(bloc) = sink_rx.recv().await {
+                    total.fetch_add(bloc.len(), Relaxed);
+                }
+            })
+        };
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fichier = chemin.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                &fichier,
+                sr,
+                ch,
+                None,
+                sink_tx,
+                super::LEVELS_DECODE_CHUNK,
+                ready,
+                levels_tx,
+            )
+        })
+        .await;
+        let _ = puits.await;
+        let _ = drain.await;
+        total.load(Relaxed)
+    }
+
+    /// L'ARBITRAGE, mesuré : les valeurs taguées ne sont pas le débit natif.
+    ///
+    /// La correction évidente aurait été de renvoyer le passthrough vers
+    /// `spawn_local_file_levels_decode`, la jumelle qui porte déjà le frein —
+    /// c'est ce que #3144 a fait pour le cache de transcodage. Elle décode au
+    /// débit NATIF (`None, None, None`), alors que le passthrough décode aux
+    /// valeurs TAGUÉES de la piste (`tracks.sample_rate` / `tracks.channels`).
+    ///
+    /// Ce test montre que l'écart n'est pas théorique : sur un fichier dont le
+    /// tag ment — ce qu'est, par construction, la population qui arrive en
+    /// passthrough — le décodage suit le TAG et produit deux fois plus de PCM
+    /// que le natif. Si les deux chiffres coïncidaient, l'arbitrage n'existerait
+    /// pas et la jumelle aurait suffi.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn les_valeurs_taguees_ne_sont_pas_le_debit_natif() {
+        let fichier = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        ecrire_wav_carre(fichier.path(), 3_000); // 44,1 kHz / 16 bits / stéréo
+        let chemin = fichier.path().to_str().unwrap().to_string();
+
+        let natif = octets_decodes(&chemin, None, None).await;
+        let bien_tague = octets_decodes(&chemin, Some(44_100), Some(2)).await;
+        let mal_tague = octets_decodes(&chemin, Some(88_200), Some(2)).await;
+        println!(
+            "octets décodés — natif : {natif} ; tag exact : {bien_tague} ; \
+             tag menteur (88,2 kHz) : {mal_tague}"
+        );
+
+        assert_eq!(
+            natif, bien_tague,
+            "sur un fichier bien tagué, décoder au tag ou au natif doit donner \
+             le MÊME PCM — sinon ce test ne mesure pas ce qu'il prétend"
+        );
+        assert!(
+            mal_tague as f64 > natif as f64 * 1.9,
+            "sur un fichier mal tagué, le décodage suit le TAG : {mal_tague} \
+             octets contre {natif} au natif. C'est cet écart qui interdit de \
+             remplacer le bloc du passthrough par `spawn_local_file_levels_decode`."
+        );
+    }
+
     /// #1985 : persister un nouvel égaliseur sans sortie locale vivante rend
     /// `applied_live=false`, mais ce n'est pas une raison pour laisser le
     /// client afficher l'ancien chemin du signal. `zone.updated` lui ordonne
@@ -13264,6 +15189,284 @@ mod tests {
             orch.playback.get_state(zone_id).await.state,
             PlayState::Playing,
             "la zone doit être repassée en lecture"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #2512 — Reprise après une pause longue, côté PISTE.
+    // ------------------------------------------------------------------
+
+    /// TÉMOIN #1629 : la décision RADIO, ligne par ligne, telle qu'elle était.
+    ///
+    /// Les deux épreuves de bout en bout ci-dessus couvrent « producteur mort »
+    /// et « pause courte, producteur vivant ». La ligne PAUSE LONGUE, elle, ne
+    /// pouvait pas être jouée : `paused_at` est un `std::time::Instant` que
+    /// l'horloge virtuelle de tokio n'atteint pas. Rendue pure, elle se prouve.
+    #[test]
+    fn le_temoin_radio_1629_ne_bouge_pas() {
+        for (pause_longue, session_morte, attendu) in [
+            (false, false, RepriseDeSession::SurPlace),
+            (true, false, RepriseDeSession::RejouerLeDirect),
+            (false, true, RepriseDeSession::RejouerLeDirect),
+            (true, true, RepriseDeSession::RejouerLeDirect),
+        ] {
+            assert_eq!(
+                reprise_de_session(true, true, pause_longue, session_morte),
+                attendu,
+                "radio (pause_longue={pause_longue}, session_morte={session_morte})"
+            );
+        }
+        // Sans URL de station la radio n'a jamais rien rejoué — et ne s'explique
+        // pas non plus : ce chemin reste EXACTEMENT celui d'avant #2512.
+        for (pause_longue, session_morte) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                reprise_de_session(true, false, pause_longue, session_morte),
+                RepriseDeSession::SurPlace,
+                "radio sans URL (pause_longue={pause_longue}, session_morte={session_morte})"
+            );
+        }
+    }
+
+    /// LE point qui sépare ce correctif d'une transposition du comportement
+    /// radio : la DURÉE de la pause ne décide de rien pour une piste.
+    ///
+    /// Vingt minutes de pause, session encore vivante ⇒ reprise sur place. Pas
+    /// au début, pas « en direct ». Si un jour quelqu'un branche
+    /// `RADIO_RESUME_REPLAY_AFTER` sur la branche piste, c'est ici que ça tombe.
+    #[test]
+    fn la_duree_d_une_pause_ne_relance_jamais_une_piste() {
+        assert_eq!(
+            reprise_de_session(false, true, true, false),
+            RepriseDeSession::SurPlace,
+            "session vivante : une pause longue ne justifie AUCUN redémarrage"
+        );
+        assert_eq!(
+            reprise_de_session(false, false, true, false),
+            RepriseDeSession::SurPlace
+        );
+    }
+
+    /// Le vrai défaut : session ramassée pendant la pause ⇒ on RÉTABLIT, et à la
+    /// position — quelle que soit la durée de la pause.
+    #[test]
+    fn une_piste_dont_la_session_est_morte_est_retablie_a_sa_position() {
+        assert_eq!(
+            reprise_de_session(false, true, false, true),
+            RepriseDeSession::RetablirALaPosition
+        );
+        assert_eq!(
+            reprise_de_session(false, true, true, true),
+            RepriseDeSession::RetablirALaPosition
+        );
+    }
+
+    /// Session morte et rien à rejouer : il reste à le DIRE. Un silence sans
+    /// message est un défaut à lui seul.
+    #[test]
+    fn une_piste_irrejouable_ne_se_tait_pas() {
+        assert_eq!(
+            reprise_de_session(false, false, false, true),
+            RepriseDeSession::Expliquer
+        );
+    }
+
+    /// La demande de rétablissement repart AU POINT, sur la MÊME piste.
+    #[test]
+    fn le_retablissement_repart_a_la_position_et_pas_du_debut() {
+        let np = NowPlaying {
+            track_id: Some(77),
+            title: "Sur la piste".into(),
+            source: "local".into(),
+            source_id: Some("77".into()),
+            duration_ms: 300_000,
+            ..Default::default()
+        };
+        let req = requete_de_retablissement(9, "local:DAC".into(), &np, 137_000);
+        assert_eq!(
+            req.seek_ms,
+            Some(137_000),
+            "rejouer une piste depuis le début serait la régression que ce \
+             correctif doit éviter"
+        );
+        assert_eq!(req.track_id, Some(77));
+        assert_eq!(req.source.as_deref(), Some("local"));
+        assert_eq!(req.source_id.as_deref(), Some("77"));
+        assert_eq!(req.zone_id, 9);
+        assert_eq!(req.output_device_id.as_deref(), Some("local:DAC"));
+        assert_eq!(req.duration_ms, Some(300_000));
+    }
+
+    /// Le message nomme la piste, la position et la cause. C'est ce qui manquait
+    /// : « aucun son, volume dans le vide », et pas une ligne pour l'expliquer.
+    #[test]
+    fn le_message_de_session_perdue_nomme_la_piste_et_la_position() {
+        let seche = message_session_perdue("Sur la piste", 137_000, None);
+        assert!(seche.contains("Sur la piste"), "{seche}");
+        assert!(seche.contains("2:17"), "la position doit y être : {seche}");
+        assert!(seche.contains("30 minutes"), "{seche}");
+        let detaille = message_session_perdue("X", 0, Some("piste introuvable"));
+        assert!(detaille.contains("piste introuvable"), "{detaille}");
+    }
+
+    /// Prépare une zone qui JOUE une piste locale via une session de flux, puis
+    /// la met en pause à `position_ms`. Rend `(orchestrateur, zone, stream_id)`.
+    async fn zone_en_pause_sur_une_piste(
+        track_id: Option<i64>,
+        position_ms: i64,
+    ) -> (PlaybackOrchestrator, i64, String) {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some("mock"), Some("mock-salon"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        // Une session de PISTE — `create_session`, pas `create_radio_session` :
+        // c'est celle que le ramasse-miettes a le droit de prendre.
+        let (sid, _tx, _ready) = orch
+            .streamer
+            .create_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44_100,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                false,
+                4,
+            )
+            .await;
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id,
+                    title: "Sur la piste".into(),
+                    source: "local".into(),
+                    stream_id: Some(sid.clone()),
+                    duration_ms: 300_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, position_ms).await;
+        orch.playback.pause(zone_id).await;
+        (orch, zone_id, sid)
+    }
+
+    /// Fait passer le ramasse-miettes comme il passe toutes les minutes en
+    /// production, avec des bornes réduites : une session en pause ne sert plus
+    /// un octet, elle est donc « muette » au sens de `cleanup_stale_sessions`.
+    async fn le_ramasse_miettes_passe(orch: &PlaybackOrchestrator, sid: &str) {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        orch.streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+        assert!(
+            !orch.streamer.session_alive(sid).await,
+            "le balayage doit avoir ramassé la session de la piste en pause — \
+             sans ça l'épreuve ne mesure rien"
+        );
+    }
+
+    /// #2512, bout en bout sur la VRAIE `resume` : une piste dont la session a
+    /// été ramassée pendant la pause ne répond plus « en lecture » en silence.
+    ///
+    /// Avant : `Ok(())`, la route rend 200 et un `now_playing` qui joue, la
+    /// sortie ne reçoit rien, et rien ne dit pourquoi.
+    #[tokio::test]
+    async fn une_piste_dont_la_session_est_morte_ne_reprend_plus_en_silence() {
+        // Ni `track_id` ni `source_id` : rien ne permet de rétablir quoi que ce
+        // soit. Il reste à le dire — c'est tout l'objet de cette épreuve.
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(None, 137_000).await;
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, Some("mock-salon"))
+            .await
+            .expect_err("une reprise qui ne peut pas aboutir ne doit plus dire « en lecture »");
+        let OutputCommandError::Failed { command, message } = erreur else {
+            panic!("la reprise doit échouer en Failed, pas en Unsupported");
+        };
+        assert_eq!(command, OutputCommand::Resume);
+        assert!(
+            message.contains("Sur la piste") && message.contains("2:17"),
+            "le message doit nommer la piste et la position : {message}"
+        );
+        // Et la zone ne doit pas prétendre jouer.
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Paused,
+            "une zone qui n'a pas repris ne doit pas s'annoncer en lecture"
+        );
+    }
+
+    /// Même chemin, mais la piste est identifiable : `resume` doit TENTER de
+    /// rétablir la session — et quand la tentative échoue (ici la piste n'est pas
+    /// en base), l'échec REMONTE au lieu de retomber en silence sur la sortie.
+    ///
+    /// La position voyage dans le message : c'est la preuve que la reprise
+    /// visait le point de la pause, et non le début du morceau.
+    #[tokio::test]
+    async fn un_retablissement_impossible_remonte_au_lieu_de_se_taire() {
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(Some(4242), 137_000).await;
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, Some("mock-salon"))
+            .await
+            .expect_err("le rétablissement a échoué : la reprise doit le dire");
+        assert!(
+            erreur.to_string().contains("2:17"),
+            "la reprise visait la position de la pause : {erreur}"
+        );
+        let outputs = orch.outputs.lock().await;
+        let guard = outputs.get("mock-salon").unwrap();
+        let guard = guard.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "rien n'a pu être rétabli : aucune lecture ne doit être annoncée à la sortie"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE : session VIVANTE ⇒ la reprise reste exactement ce qu'elle
+    /// est aujourd'hui. Aucune relecture, aucune erreur, la zone repart.
+    ///
+    /// Sans elle, le correctif pourrait « marcher » en relançant toutes les
+    /// reprises — et personne ne le verrait.
+    #[tokio::test]
+    async fn une_piste_dont_la_session_vit_reprend_sur_place() {
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(Some(4242), 137_000).await;
+        assert!(orch.streamer.session_alive(&sid).await);
+        orch.resume(zone_id, Some("mock-salon"))
+            .await
+            .expect("session vivante : la reprise ordinaire doit aboutir");
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Playing
+        );
+        let outputs = orch.outputs.lock().await;
+        let guard = outputs.get("mock-salon").unwrap();
+        let guard = guard.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "session vivante ⇒ reprise sur place, aucune relecture"
         );
     }
 
@@ -13804,6 +16007,230 @@ mod tests {
             .await;
 
         (orch, zone_id, dir)
+    }
+
+    // ------------------------------------------------------------------
+    // #2395 — le volume que l'APPAREIL reçoit pendant la lecture.
+    // ------------------------------------------------------------------
+
+    /// Zone réseau garnie de trois pistes, prête à enchaîner (#2395).
+    ///
+    /// Trois pistes DISTINCTES, et non trois fois la même : les deux gardes
+    /// anti-doublon de `play` (retap dans `RETAP_DEDUP_WINDOW`, puis
+    /// `last_net_play` dans `DUPLICATE_NET_PLAY_WINDOW`) coalescent une
+    /// relecture du même `track_id`. Trois lectures du même morceau ne
+    /// mesureraient donc qu'un seul passage par `send_to_output` : le test
+    /// serait vert sans rien prouver.
+    ///
+    /// Trois FICHIERS distincts, et pas trois lignes vers le même : la colonne
+    /// `tracks.file_path` porte une contrainte d'unicité. Ce sont de vraies
+    /// copies du FLAC du dépôt — le chemin réseau lit leur taille sur le
+    /// disque, un chemin fantôme échouerait en `file_not_found`.
+    ///
+    /// Le répertoire est rendu à l'appelant et doit vivre aussi longtemps que
+    /// le test : il se nettoie tout seul, par `Drop`.
+    async fn zone_reseau_trois_pistes(
+        device_id: &str,
+        fixed_volume: bool,
+    ) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
+        let orch = test_orchestrator();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pistes = Vec::new();
+        for id in 1..=3i64 {
+            let chemin = dir.path().join(format!("piste-{id}.flac"));
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+                &chemin,
+            )
+            .unwrap();
+            pistes.push(chemin.to_string_lossy().into_owned());
+        }
+
+        orch.db
+            .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+                &[],
+            )
+            .unwrap();
+        for id in 1..=3i64 {
+            orch.db
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                     duration_ms, sample_rate, bit_depth, channels) \
+                     VALUES (?, ?, 1, 1, ?, 'flac', 300000, 44100, 16, 2)",
+                    &[
+                        &id as &dyn crate::db::backend::ToSqlValue,
+                        &format!("Piste {id}") as &dyn crate::db::backend::ToSqlValue,
+                        &pistes[(id - 1) as usize] as &dyn crate::db::backend::ToSqlValue,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zone_repo
+            .create("Denon RC12", Some("dlna"), Some(device_id))
+            .unwrap();
+        zone_repo.update_dlna_native_flac(zone_id, true).unwrap();
+        // 30 % : un niveau d'écoute ordinaire, franchement distinct du plein
+        // volume. Une commande à 1.0 se verrait donc, si elle partait.
+        zone_repo.update_volume(zone_id, 30.0).unwrap();
+        if fixed_volume {
+            zone_repo.update_fixed_volume(zone_id, true).unwrap();
+        }
+
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new(device_id, "Denon RC12").with_type("dlna"),
+        ));
+
+        (orch, zone_id, dir)
+    }
+
+    /// Les commandes de volume que l'APPAREIL a reçues, dans l'ordre (#2395).
+    ///
+    /// On interroge la sortie, pas l'état du serveur : la question est « qu'a
+    /// reçu le Denon ? », et seul le mock peut y répondre.
+    async fn volumes_recus_par_l_appareil(
+        orch: &PlaybackOrchestrator,
+        device_id: &str,
+    ) -> Vec<f64> {
+        let outputs = orch.outputs.lock().await;
+        let out = outputs.get(device_id).expect("sortie enregistree");
+        let guard = out.lock().await;
+        guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("la sortie factice")
+            .volume_calls()
+            .await
+    }
+
+    /// Enchaîne les trois pistes, en laissant à une éventuelle réassertion
+    /// différée tout le temps de partir.
+    ///
+    /// L'ancien code postait la commande dans un `tokio::spawn` qui dormait
+    /// 500 ms. Mesurer juste après le `play` ne prouverait donc rien : on
+    /// attend franchement plus que ce délai après chaque piste, sinon le test
+    /// serait vert même avec le défaut en place.
+    async fn enchainer_trois_pistes(orch: &PlaybackOrchestrator, zone_id: i64) {
+        for track_id in 1..=3i64 {
+            orch.play(PlayRequest {
+                zone_id,
+                track_id: Some(track_id),
+                source: Some("local".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("la lecture doit aboutir");
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        }
+    }
+
+    /// #2395 — LE défaut, mesuré sur l'appareil : en mode bit-perfect, le plein
+    /// volume repartait vers le renderer 500 ms après CHAQUE piste.
+    ///
+    /// Marco Polo (fil 1546) écoute sur un Denon RC12, à la fois renderer DLNA
+    /// et amplificateur : chacune de ces commandes est une puissance
+    /// acoustique réelle, et il n'en a jamais consenti qu'une — celle de
+    /// l'armement.
+    ///
+    /// Le compte est fait sur des COMMANDES REÇUES, pas sur un code HTTP ni
+    /// sur le volume courant : trois consignes à 100 % sur un appareil déjà à
+    /// 100 % ne changent aucun état lisible, et se liraient comme une seule.
+    ///
+    /// Avant le correctif : trois commandes (une par piste). Après : zéro.
+    #[tokio::test]
+    async fn en_bit_perfect_trois_lectures_ne_commandent_plus_le_volume() {
+        let device_id = "dlna-denon-rc12";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, true).await;
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            Vec::<f64>::new(),
+            "la lecture ne doit commander AUCUN volume : le 100 % du mode \
+             bit-perfect s'obtient a l'armement, une fois, et pas a chaque piste"
+        );
+    }
+
+    /// #2395 — le mode entier, vu de l'appareil : UNE seule commande.
+    ///
+    /// C'est la promesse tenue à l'utilisateur — un saut, annoncé — vérifiée
+    /// bout à bout : l'armement commande le plein volume, les trois lectures
+    /// qui suivent ne commandent rien.
+    #[tokio::test]
+    async fn armement_puis_trois_lectures_ne_font_qu_une_commande() {
+        let device_id = "dlna-denon-rc12";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        // L'armement, seul chemin autorisé à monter la zone à 100 %.
+        orch.arm_fixed_volume(zone_id, Some(device_id))
+            .await
+            .expect("l'armement doit aboutir");
+        ZoneRepo::with_backend(orch.db.clone())
+            .update_fixed_volume(zone_id, true)
+            .unwrap();
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            vec![1.0],
+            "apres trois lectures successives, l'appareil ne doit avoir recu \
+             qu'UNE seule commande de volume : celle de l'armement"
+        );
+    }
+
+    /// #2395 — TÉMOIN : hors du mode, ce chemin ne commande jamais le volume.
+    ///
+    /// Vert avant comme après le correctif. Il tient la mesure honnête : sans
+    /// lui, un test qui compte zéro commande pourrait se contenter d'une
+    /// lecture qui n'a rien joué du tout. Ici la même zone, les mêmes trois
+    /// pistes et le même compteur donnent déjà zéro sans le mode — la
+    /// différence mesurée plus haut vient donc bien de `fixed_volume`, et pas
+    /// d'un banc qui ne mesure rien.
+    #[tokio::test]
+    async fn temoin_hors_bit_perfect_la_lecture_ne_commande_aucun_volume() {
+        let device_id = "dlna-zone-ordinaire";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        enchainer_trois_pistes(&orch, zone_id).await;
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            Vec::<f64>::new(),
+            "une zone ordinaire garde le niveau ou l'appareil est \
+             physiquement : la lecture ne lui commande rien"
+        );
+    }
+
+    /// #2395 — le banc mesure vraiment quelque chose.
+    ///
+    /// Contre-épreuve du compteur lui-même : si `volume_calls` restait vide
+    /// quoi qu'il arrive, les trois tests ci-dessus seraient verts pour rien.
+    /// Une commande envoyée à la main doit s'y voir, et le compteur doit
+    /// distinguer deux consignes identiques d'une seule.
+    #[tokio::test]
+    async fn le_compteur_de_commandes_voit_ce_qui_part() {
+        let device_id = "dlna-temoin-compteur";
+        let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+        orch.set_volume(zone_id, 0.3, Some(device_id))
+            .await
+            .unwrap();
+        orch.set_volume(zone_id, 0.3, Some(device_id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            volumes_recus_par_l_appareil(&orch, device_id).await,
+            vec![0.3, 0.3],
+            "deux consignes identiques restent DEUX commandes recues"
+        );
     }
 
     /// Position rapportée par la sortie factice après la relecture.
@@ -15602,8 +18029,15 @@ mod annonce_apres_sortie_guard {
     ///
     /// Le garde tient sur la TRANCHE de la branche de cache — de son propre
     /// journal jusqu'à celui du transcodage frais. Chercher
-    /// `spawn_paced_levels_forwarder` dans tout le fichier serait satisfait par
-    /// la douzaine d'autres chemins qui l'appellent déjà.
+    /// `spawn_local_file_levels_decode` dans tout le fichier serait satisfait
+    /// par les autres chemins qui l'appellent déjà.
+    ///
+    /// Ce garde-fou exige la fonction BRIDÉE, pas un forwarder nu. Sa première
+    /// version demandait `spawn_paced_levels_forwarder` : elle était satisfaite
+    /// par le bloc en ligne qui recopiait la forme du décodage sans son frein,
+    /// et laissait donc passer la régression que ce garde prétendait couvrir.
+    /// La mesure qui va avec est
+    /// `la_rendition_en_cache_ne_retient_plus_toute_la_piste`.
     #[test]
     fn un_cache_hit_attache_aussi_les_niveaux() {
         let debut = position("\"transcode_cache_hit\"");
@@ -15613,12 +18047,68 @@ mod annonce_apres_sortie_guard {
             "les deux branches ont été réordonnées : la découpe ne délimite \
              plus la branche de cache, ce garde-fou ne garde plus rien."
         );
+        let tranche = &code_de_production()[debut..fin];
         assert!(
-            code_de_production()[debut..fin].contains("spawn_paced_levels_forwarder"),
-            "la branche « cache hit » n'attache plus de forwarder de niveaux : \
-             toute piste servie depuis le cache de transcodage joue avec des \
-             VU-mètres morts et un spectrogramme plat, alors que sa toute \
-             première écoute — la seule à transcoder — les animait."
+            tranche.contains("spawn_local_file_levels_decode("),
+            "la branche « cache hit » n'attache plus de niveaux par la fonction \
+             bridée : soit les VU-mètres retombent morts dès la deuxième écoute, \
+             soit — si le décodage a été réécrit en ligne — il repart sans frein \
+             et la file du forwarder retient tout le PCM de la piste."
+        );
+        assert!(
+            !tranche.contains("spawn_paced_levels_forwarder"),
+            "la branche « cache hit » rebranche un forwarder à la main : c'est \
+             la forme qui avait perdu le frein en route. Elle doit passer par \
+             `spawn_local_file_levels_decode`, qui porte le bridage."
+        );
+    }
+
+    /// #3145 : le décodage-pour-niveaux du PASSTHROUGH est bridé, ET il décode
+    /// toujours aux valeurs TAGUÉES de la piste.
+    ///
+    /// Deux propriétés que la compilation ne peut pas tenir, sur la même
+    /// tranche, parce qu'elles se contredisent en apparence :
+    ///
+    /// 1. **Le frein.** Le bloc d'origine (#1423) drainait son puits sans
+    ///    condition. Le décodage courait alors à la vitesse du DISQUE pendant
+    ///    que le forwarder ne publie qu'au temps réel, et sa file — non bornée,
+    ///    chaque fenêtre portant son PCM — retenait la piste ENTIÈRE. La mesure
+    ///    qui va avec est `le_passthrough_ne_retient_plus_toute_la_piste`.
+    /// 2. **Les valeurs de décodage.** La façon la plus courte de freiner
+    ///    serait d'appeler `spawn_local_file_levels_decode`, la jumelle bridée
+    ///    — mais elle décode au débit NATIF, pas au tag, et le passthrough est
+    ///    le chemin des fichiers mal tagués. La mesure qui va avec est
+    ///    `les_valeurs_taguees_ne_sont_pas_le_debit_natif`.
+    ///
+    /// Sans la seconde assertion, ce garde serait satisfait par la « correction »
+    /// qui change en silence ce que les VU-mètres décrivent.
+    #[test]
+    fn le_passthrough_est_bride_sans_changer_ce_qu_il_decode() {
+        let debut = position("let skip_passthrough_levels");
+        let fin = position("\"passthrough_levels_decode_failed\"");
+        assert!(
+            debut < fin,
+            "la découpe ne délimite plus le décodage-pour-niveaux du \
+             passthrough : ce garde-fou ne garde plus rien."
+        );
+        let tranche = &code_de_production()[debut..fin];
+        assert!(
+            tranche.contains("spawn_braked_levels_sink("),
+            "le décodage-pour-niveaux du passthrough n'est plus bridé : sa file \
+             de fenêtres retient de nouveau tout le PCM de la piste, et la \
+             rétention suit la DURÉE du morceau (#3145)."
+        );
+        assert!(
+            !tranche.contains("while sink_rx.recv().await.is_some() {}"),
+            "le puits du passthrough draine de nouveau SANS CONDITION : c'est \
+             exactement la forme qui n'a jamais eu de frein depuis #1423."
+        );
+        assert!(
+            tranche.contains("Some(sr),") && tranche.contains("Some(ch),"),
+            "le passthrough ne décode plus aux valeurs TAGUÉES de la piste. \
+             Freiner ne doit pas changer ce qui est MESURÉ : sur un fichier mal \
+             tagué — la population même du passthrough — le débit natif et le \
+             tag divergent (#3145)."
         );
     }
 
@@ -15888,6 +18378,7 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
                 None,
                 None,
                 dest_s.clone(),
+                None,
             )
             .await
             {
@@ -15947,6 +18438,7 @@ mod profondeur_annoncee_egale_profondeur_ecrite {
                 None,
                 None,
                 dest_s.clone(),
+                None,
             )
             .await
             .expect("transcodage WAV 16 bits");

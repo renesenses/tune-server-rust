@@ -56,7 +56,7 @@ pub(super) async fn serve_artwork(
 /// [`tune_core::library::artwork::CACHE_EXTENSIONS`], la même que celle sous
 /// laquelle l'écriture dépose ses fichiers. Deux listes séparées, c'était la
 /// porte ouverte à un condensat annoncé en base et introuvable ici (#2567).
-async fn serve_artwork_from(
+pub(super) async fn serve_artwork_from(
     cache_dir: &std::path::Path,
     hash: &str,
     size: Option<u32>,

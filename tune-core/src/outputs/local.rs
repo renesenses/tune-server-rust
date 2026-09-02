@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransportState,
+    OutputCapabilities, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus,
+    OutputStatus, OutputTarget, RingStarvation, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -231,6 +231,71 @@ struct ObservedBackend {
     fallback_reason: Option<LocalBackendFallback>,
 }
 
+/// Le PÉRIPHÉRIQUE réellement ouvert par la dernière lecture locale, face à
+/// celui que la zone demandait.
+///
+/// Frère jumeau d'[`OBSERVED_BACKEND`], et pour la même raison : le serveur
+/// SAVAIT déjà ce qu'il avait ouvert — `WasapiExclusiveOutput::opened_device_name`
+/// existe depuis #2207 — mais sa seule lecture était une ligne de journal
+/// (`wasapi_exclusive_playing`). Aucun client n'a jamais pu voir l'écart.
+///
+/// Or l'écart existe : sur Windows, le chemin exclusif WASAPI appelle
+/// `GetDefaultAudioEndpoint` quand la résolution par nom échoue, et le chemin
+/// cpal partagé retombe explicitement sur le périphérique système
+/// (`audio_device_not_found_falling_back_to_default`). Une zone réglée sur un
+/// DAC peut donc jouer sur les haut-parleurs, sans que rien ne le dise.
+///
+/// ⚠️ Ce verrou porte la DERNIÈRE ouverture observée et n'est pas effacé à
+/// l'arrêt — exactement comme `OBSERVED_BACKEND`. C'est pour cela que le nom
+/// demandé est mémorisé **au même instant** que le nom ouvert : la paire reste
+/// cohérente entre elle même si le réglage de la zone change ensuite.
+static OBSERVED_DEVICE: std::sync::RwLock<Option<ObservedDevice>> = std::sync::RwLock::new(None);
+
+/// Ce que la dernière ouverture de périphérique a demandé, et ce qu'elle a eu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedDevice {
+    backend: &'static str,
+    requested: String,
+    opened: String,
+    opened_id: Option<String>,
+}
+
+/// Nom du backend tel que `select_host` l'a observé, ou `"local"` faute d'avoir
+/// encore ouvert quoi que ce soit. Sert à étiqueter l'ouverture d'un
+/// périphérique par le chemin cpal, qui ne connaît que la variante cpal.
+fn observed_backend_name() -> &'static str {
+    OBSERVED_BACKEND
+        .read()
+        .ok()
+        .and_then(|g| *g)
+        .map(|o| o.name)
+        .unwrap_or("local")
+}
+
+/// Enregistre le périphérique réellement ouvert. **Appelé par chaque chemin
+/// d'ouverture** : cpal partagé, WASAPI exclusif, ASIO exclusif, CoreAudio
+/// exclusif.
+///
+/// `opened_id` vaut `None` quand le backend n'expose aucun identifiant stable
+/// (ASIO et CoreAudio exclusif : l'`AudioDeviceID` de CoreAudio est un entier
+/// réattribué au redémarrage, ce n'est pas une identité). Un champ absent est
+/// honnête ; un champ inventé ne l'est pas.
+fn note_opened_device(
+    backend: &'static str,
+    requested: &str,
+    opened: &str,
+    opened_id: Option<&str>,
+) {
+    if let Ok(mut slot) = OBSERVED_DEVICE.write() {
+        *slot = Some(ObservedDevice {
+            backend,
+            requested: requested.to_string(),
+            opened: opened.to_string(),
+            opened_id: opened_id.filter(|id| !id.is_empty()).map(str::to_string),
+        });
+    }
+}
+
 /// Pourquoi la sortie locale ne tourne pas sur le backend demandé.
 ///
 /// #1395 — le nom du backend actif ne suffit pas. Bilou règle sa zone « Ce PC /
@@ -311,6 +376,60 @@ pub struct LocalBackendStatus {
     pub fallback_reason: Option<LocalBackendFallback>,
     /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
     pub fallback_detail: Option<&'static str>,
+    /// Le PÉRIPHÉRIQUE réellement ouvert, face à celui qui était demandé.
+    ///
+    /// `None` = aucune ouverture observée depuis le démarrage (rien n'a encore
+    /// joué en local), ou backend incapable de dire ce qu'il a ouvert. Absent
+    /// plutôt que faux : c'est la seule réponse honnête.
+    ///
+    /// ⚠️ **À ne pas confondre avec `fell_back`**, qui parle du BACKEND
+    /// (ASIO → WASAPI). Les deux replis sont indépendants : une zone peut
+    /// tourner sur le backend demandé et sur un autre périphérique.
+    pub device: Option<LocalDeviceStatus>,
+}
+
+/// Ce que la sortie locale a réellement OUVERT, face à ce que la zone
+/// demandait — la moitié manquante de [`LocalBackendStatus`].
+///
+/// #2207 : le chemin exclusif WASAPI appelle `GetDefaultAudioEndpoint` dès que
+/// la résolution par nom échoue, et le chemin cpal partagé retombe sur le
+/// périphérique système. Une zone réglée sur un DAC peut donc jouer sur les
+/// haut-parleurs. Le serveur le savait — deux accesseurs, une ligne de journal
+/// — mais aucun écran ne pouvait le dire. **La zone doit dire la vérité, pas la
+/// consigne.**
+///
+/// Ce type ne CORRIGE pas la résolution : il la rend visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalDeviceStatus {
+    /// Le backend qui a ouvert ce périphérique (`"WASAPI"`, `"ASIO"`,
+    /// `"CoreAudio"`, `"ALSA"`).
+    pub backend: &'static str,
+    /// Le nom demandé au moment de l'ouverture. `"default"` = périphérique
+    /// système, demandé explicitement — ce n'est pas un repli.
+    pub requested: String,
+    /// Le nom réellement ouvert, tel que le pilote le rend.
+    pub opened: String,
+    /// Identifiant d'endpoint quand le backend en expose un de stable (WASAPI,
+    /// cpal). `None` pour ASIO et CoreAudio exclusif : ils n'en ont pas.
+    pub opened_id: Option<String>,
+    /// `true` dès que les deux noms diffèrent — c'est LE fait à montrer.
+    pub differs: bool,
+}
+
+impl LocalDeviceStatus {
+    /// Un `"default"` demandé n'est jamais un écart : l'utilisateur a demandé
+    /// « le périphérique système », il l'a eu. Partout ailleurs, deux noms
+    /// différents sont un écart, même sans motif connu.
+    fn from_observed(observed: ObservedDevice) -> Self {
+        let differs = observed.requested != "default" && observed.requested != observed.opened;
+        Self {
+            backend: observed.backend,
+            requested: observed.requested,
+            opened: observed.opened,
+            opened_id: observed.opened_id,
+            differs,
+        }
+    }
 }
 
 /// Enregistre le backend réellement ouvert, et le motif du repli s'il y en a un.
@@ -398,7 +517,11 @@ pub fn active_backend_name(backend: &str) -> &'static str {
 /// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
 /// serveur a basculé — ni pourquoi.
 pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
-    backend_status(OBSERVED_BACKEND.read().ok().and_then(|g| *g), requested)
+    backend_status(
+        OBSERVED_BACKEND.read().ok().and_then(|g| *g),
+        OBSERVED_DEVICE.read().ok().and_then(|g| g.clone()),
+        requested,
+    )
 }
 
 /// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
@@ -423,7 +546,11 @@ fn backend_display_name(observed: Option<&'static str>, backend: &str) -> &'stat
 
 /// Même isolement pour le statut complet : aucune lecture de l'état global,
 /// aucun périphérique ouvert, donc jouable sur n'importe quelle plateforme.
-fn backend_status(observed: Option<ObservedBackend>, requested: &str) -> LocalBackendStatus {
+fn backend_status(
+    observed: Option<ObservedBackend>,
+    observed_device: Option<ObservedDevice>,
+    requested: &str,
+) -> LocalBackendStatus {
     let requested_lower = requested.to_lowercase();
     let active = backend_display_name(observed.map(|o| o.name), requested);
 
@@ -455,6 +582,7 @@ fn backend_status(observed: Option<ObservedBackend>, requested: &str) -> LocalBa
         fell_back,
         fallback_reason,
         fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
+        device: observed_device.map(LocalDeviceStatus::from_observed),
     }
 }
 
@@ -954,12 +1082,14 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     };
 
                 let is_default = raw_name == default_name;
-                // caps_reliable was only read by the removed (name, caps) collapse
-                // (Linux collapses by name; Windows/macOS now keep every device).
-                let _ = caps_reliable;
                 // Ce que vaut la liste qu'on s'apprête à publier. Sur WASAPI
-                // elle n'a jamais été confrontée au matériel (#2862).
-                let rates_evidence = sample_rate_evidence(&host_name);
+                // elle n'a jamais été confrontée au matériel (#2862) ; sur ALSA
+                // elle ne vaut que si le PCM interrogé EST le matériel, et pas
+                // un `dmix:`/`plughw:` qui accepte tout (#1655). Et une liste
+                // SUPPOSÉE (`caps_reliable = false`) n'a jamais rien mesuré —
+                // ce drapeau était calculé puis jeté.
+                let rates_evidence =
+                    sample_rate_evidence_for_device(&host_name, &endpoint_id, caps_reliable);
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
                 // output repeatedly with varying caps, so collapse by NAME and
@@ -1354,6 +1484,14 @@ pub struct LocalOutput {
     /// `play_url()` — a failure belongs to the track that provoked it, and
     /// must never travel to the next one.
     open_failure: Arc<std::sync::Mutex<Option<String>>>,
+    /// Combien de fois le rappel audio a manqué de données depuis le début du
+    /// flux, et combien d'échantillons sont partis en zéros (#3205).
+    ///
+    /// Le même `Arc` est confié à l'anneau de CHAQUE backend au moment où il
+    /// est créé, quelle que soit la branche empruntée ; il survit donc aux
+    /// replis (rate de repli, cascade entière) parce qu'il appartient à la
+    /// sortie, pas au flux.
+    starvation: Arc<RingStarvation>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -1504,6 +1642,7 @@ impl LocalOutput {
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
+            starvation: Arc::new(RingStarvation::new()),
         }
     }
 
@@ -1831,6 +1970,16 @@ pub struct RingBuf {
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
+    /// Compteur de famine (#3205), partagé avec la sortie qui possède cet
+    /// anneau.
+    ///
+    /// Il est porté par l'ANNEAU et non par chaque rappel parce que l'anneau
+    /// est le seul objet que TOUS les backends partagent : cpal partagé,
+    /// repli entier, chemin compressé, CoreAudio exclusif, ASIO et WASAPI
+    /// exclusif reçoivent tous ce même `Arc`. Compter dans le drain couvre
+    /// donc les six d'un seul geste, sans toucher à la signature d'un seul
+    /// backend, et rend impossible l'oubli d'un site futur.
+    starvation: Arc<RingStarvation>,
 }
 
 /// Integer SPSC ring used by Windows exclusive backends when the source must
@@ -1845,6 +1994,9 @@ pub(crate) struct NativePcmRing {
     buf: Box<[UnsafeCell<i32>]>,
     write: AtomicU64,
     read: AtomicU64,
+    /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
+    /// Windows drainent cet anneau-ci.
+    starvation: Arc<RingStarvation>,
 }
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
@@ -1858,6 +2010,11 @@ unsafe impl Sync for NativePcmRing {}
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl NativePcmRing {
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Jumeau de `RingBuf::new_metered` (#3205).
+    pub(crate) fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0i32))
@@ -1865,6 +2022,7 @@ impl NativePcmRing {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -1923,6 +2081,7 @@ impl NativePcmRing {
             *target = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        self.starvation.record(out.len(), n);
         n
     }
 
@@ -1948,6 +2107,9 @@ impl NativePcmRing {
             out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
         }
         self.read.store(r + count as u64, Ordering::Release);
+        // Compté en ÉCHANTILLONS comme partout ailleurs, pas en octets : le
+        // chiffre doit se comparer d'un backend à l'autre (#3205).
+        self.starvation.record(out.len() / bytes_per_sample, count);
         count * bytes_per_sample
     }
 }
@@ -2064,6 +2226,13 @@ unsafe impl Sync for RingBuf {}
 
 impl RingBuf {
     pub fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Anneau dont la famine est comptée dans un compteur PARTAGÉ avec la
+    /// sortie, seul moyen pour `/api/v1/system/diagnostics` de lire ce que le
+    /// rappel a vécu.
+    pub fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0.0f32))
@@ -2071,6 +2240,7 @@ impl RingBuf {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -2139,6 +2309,10 @@ impl RingBuf {
             out[i] = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        // #3205 : `n < out.len()` ICI, c'est exactement le `read < data.len()`
+        // que les rappels comblent avec des zéros. Trois atomiques `Relaxed`,
+        // rien d'autre — voir le contrat sur `RingStarvation`.
+        self.starvation.record(out.len(), n);
         n
     }
 }
@@ -2917,6 +3091,44 @@ fn record_exclusive_open_failure(
     if let Ok(mut slot) = failure_slot.lock() {
         *slot = Some(format!(
             "Sortie « {requested_device} » : l'ouverture {backend} exclusive a échoué ({error}). Aucun repli vers un autre endpoint ou vers le mode partagé n'a été effectué"
+        ));
+    }
+}
+
+/// Le périphérique s'est OUVERT puis a cessé de tirer l'audio : dire lequel,
+/// et où la lecture s'est arrêtée.
+///
+/// Distinct de [`record_exclusive_open_failure`] parce que la cause l'est :
+/// là-bas rien n'a jamais été envoyé, ici le rappel de rendu a accepté
+/// l'ouverture puis s'est tu. Vu de l'utilisateur les deux se ressemblent —
+/// « ça ne joue pas » — mais le geste diffère (rebrancher/rallumer contre
+/// choisir une autre sortie), et c'est ce que dit le message.
+///
+/// `frozen_position_ms` n'est pas décoratif : c'est la position à laquelle
+/// l'écran est resté figé, donc le seul chiffre qui relie ce que le testeur
+/// voit à ce que le journal dit. Sur un anneau exclusif dimensionné à deux
+/// secondes d'audio, il vaut 2000 — le « figée à 2 s » du constat.
+///
+/// Passe par `failure_slot`, c'est-à-dire par `take_output_failure()` : le
+/// canal que le poller draine déjà à chaque tick pour émettre
+/// `zone.playback_error` avec `fatal: true`. Aucun second canal n'est ouvert.
+fn record_feed_stall_failure(
+    backend: &str,
+    device: &str,
+    frozen_position_ms: u64,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        frozen_position_ms,
+        stall_timeout_secs = FEED_STALL_TIMEOUT.as_secs(),
+        "output_feed_stall_consumer_dead"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "Sortie « {device} » : le périphérique a accepté l'ouverture {backend} puis a cessé de recevoir l'audio ; la lecture est restée figée à {frozen_position_ms} ms. {}",
+            OpenFailure::DeviceGone.user_message()
         ));
     }
 }
@@ -3891,6 +4103,9 @@ impl OutputTarget for LocalOutput {
         let playing = self.playing.clone();
         let paused = self.paused.clone();
         let volume = self.volume.clone();
+        // #3205 : le compteur de famine suit le flux dans le fil de lecture et
+        // sera confié à l'anneau de la branche effectivement retenue.
+        let starvation = self.starvation.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -4103,7 +4318,8 @@ impl OutputTarget for LocalOutput {
                 let output_ch = output_config.channels;
 
                 let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(output_sr, output_ch);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback can read
                 let ring_cb = ring.clone();
                 let vol_cb = volume.clone();
@@ -4331,11 +4547,8 @@ impl OutputTarget for LocalOutput {
                 // ring stays full and this loop used to spin until restart.
                 // Deadline = queued audio duration + 5s margin, mirroring the
                 // asio_drain_timeout guard of the exclusive path.
-                let drain_deadline = std::time::Duration::from_millis(
-                    (ring.available() as u64 * 1000)
-                        / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                        + 5000,
-                );
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
                 let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -4413,7 +4626,8 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback reads
 
                 let exclusive = match ExclusiveOutput::new(
@@ -4439,6 +4653,17 @@ impl OutputTarget for LocalOutput {
                 };
 
                 info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
+                // CoreAudio exclusif : `resolve_output_device` retombe sur le
+                // périphérique système quand le nom stocké n'existe plus (DAC
+                // débranché, renommé, routage macOS changé). `opened_id` reste
+                // `None` : l'`AudioDeviceID` est un entier réattribué au
+                // redémarrage, ce n'est pas une identité qu'on peut afficher.
+                note_opened_device(
+                    "CoreAudio",
+                    &device_name,
+                    &exclusive.format_info().device_name,
+                    None,
+                );
 
                 // Feed audio data (no resampling needed -- hardware is set to source rate)
                 let pcm_data = if data_offset < header_buf.len() {
@@ -4466,6 +4691,13 @@ impl OutputTarget for LocalOutput {
                 };
 
                 // Process leftover from header read
+                // #3108 — le verdict de blocage était JETÉ aux trois sites de
+                // ce chemin, seul de tous les chemins de lecture. Conséquence
+                // exacte du constat : l'anneau exclusif tient deux secondes
+                // d'audio (`ring_cap` ci-dessus), il se remplit une fois, le
+                // rappel de rendu ne tire rien, et la position reste sur 2 000
+                // ms pour toujours — sans un mot.
+                let mut feed_stalled = false;
                 if let Some(processed) = pcm_processor.process_pcm_chunk(
                     &mut leftover,
                     frame_bytes,
@@ -4473,18 +4705,20 @@ impl OutputTarget for LocalOutput {
                     channels,
                     &mut pcm_kind,
                 ) {
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                    }
                     total_frames_fed += processed.source_frames;
                 }
 
                 let mut http_eof_excl = false;
-                loop {
+                while !feed_stalled {
                     if stop_rx.try_recv().is_ok() {
                         break;
                     }
@@ -4530,19 +4764,35 @@ impl OutputTarget for LocalOutput {
                         continue;
                     };
 
-                    feed_ring_abortable(
+                    if !feed_ring_abortable(
                         &ring,
                         &processed.samples,
                         &stop_rx,
                         &paused,
                         Some(&force_silent),
-                    );
+                    ) {
+                        feed_stalled = true;
+                        break;
+                    }
 
                     total_frames_fed += processed.source_frames;
 
                     let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
                         + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                if feed_stalled {
+                    // La piste n'a PAS fini : `http_eof_excl` reste faux, donc
+                    // aucune fin naturelle n'est signalée et la file n'avance
+                    // pas vers un morceau qui heurterait le même périphérique
+                    // mort. Le seul mot dit à l'utilisateur part d'ici.
+                    record_feed_stall_failure(
+                        "CoreAudio",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
+                    );
                 }
 
                 if http_eof_excl {
@@ -4561,7 +4811,7 @@ impl OutputTarget for LocalOutput {
                     channels,
                     dop_active.load(Ordering::Relaxed),
                 );
-                if !queue.is_empty() {
+                if !queue.is_empty() && !feed_stalled {
                     feed_ring_abortable(&ring, &queue, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (queue.len() / channels.max(1) as usize) as u64;
                 }
@@ -4575,7 +4825,15 @@ impl OutputTarget for LocalOutput {
                     TRACK_END_NOTIFY.notify_one();
                 }
 
-                // Wait for ring buffer to drain
+                // Wait for ring buffer to drain — JAMAIS sans fin (#3108).
+                // Les chemins ASIO, WASAPI et partagé bornaient déjà leur
+                // vidage ; celui-ci, seul, tournait tant que l'anneau n'était
+                // pas vide. Face à un rappel de rendu mort il ne se vide
+                // jamais : le fil restait vivant, la zone « en lecture », et le
+                // réexamen des branchements gelé avec elle.
+                let drain_deadline =
+                    drain_deadline_for(ring.available(), sample_rate as u64, channels as u64);
+                let drain_started = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -4584,6 +4842,14 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        break;
+                    }
+                    if drain_started.elapsed() >= drain_deadline {
+                        warn!(
+                            device = %device_name,
+                            remaining_samples = ring.available(),
+                            "local_audio_exclusive_drain_timeout"
+                        );
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4617,8 +4883,10 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let float_ring = Arc::new(RingBuf::new(ring_cap));
-                let native_ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let float_ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+                let native_ring =
+                    Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 float_ring.clear();
                 native_ring.clear();
 
@@ -4661,6 +4929,10 @@ impl OutputTarget for LocalOutput {
                 }
 
                 info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
+                // ASIO exclusif : résolution par sous-chaîne, et `"default"`
+                // prend le premier pilote listé. `opened_id` reste `None` :
+                // ASIO n'expose aucun identifiant d'endpoint.
+                note_opened_device("ASIO", &device_name, exclusive.opened_device_name(), None);
 
                 // Feed audio data (no resampling needed -- hardware is set to source rate)
                 let pcm_data = if data_offset < header_buf.len() {
@@ -5181,7 +5453,8 @@ impl OutputTarget for LocalOutput {
                 );
 
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 ring.clear();
 
                 match WasapiExclusiveOutput::new(
@@ -5210,6 +5483,15 @@ impl OutputTarget for LocalOutput {
                                 endpoint_id = %wasapi.opened_device_id(),
                                 info = %wasapi.format_info(),
                                 "wasapi_exclusive_playing"
+                            );
+                            // Ces deux accesseurs existaient depuis #2207 et
+                            // n'avaient que cette ligne de journal pour
+                            // lecteur. La zone les porte désormais.
+                            note_opened_device(
+                                "WASAPI",
+                                &device_name,
+                                wasapi.opened_device_name(),
+                                Some(wasapi.opened_device_id()),
                             );
 
                             let pcm_data = if data_offset < header_buf.len() {
@@ -5577,11 +5859,20 @@ impl OutputTarget for LocalOutput {
                     // (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Sur ALSA / ASIO /
                     // CoreAudio la plage vient d'une interrogation du pilote et
                     // la branche dit bien ce qu'elle prétend.
-                    let rate_evidence = sample_rate_evidence(host_id_name);
+                    // Sur ALSA, `endpoint_id` est le nom de PCM (`hw:CARD=…`,
+                    // `dmix:CARD=…`) : c'est LUI qui dit si le « oui » vient du
+                    // pilote ou d'un rééchantillonneur (#1655). Le journaliser
+                    // ici est la ligne qui manquait pour trancher un relevé de
+                    // terrain sans y retourner.
+                    let opened_endpoint_id =
+                        device.id().map(|id| id.to_string()).unwrap_or_default();
+                    let rate_evidence =
+                        sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
                     info!(
                         source_sr = sample_rate,
                         device_default_sr = ?default_sr,
                         backend = %host_id_name,
+                        endpoint_id = %opened_endpoint_id,
                         rate_support_measured = rate_evidence.is_measured(),
                         "local_audio_open_at_source_rate_reported_supported"
                     );
@@ -5771,7 +6062,8 @@ impl OutputTarget for LocalOutput {
 
             let ring_cap =
                 (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-            let ring_buf = Arc::new(RingBuf::new(ring_cap));
+            starvation.begin_stream(output_config.sample_rate, output_config.channels);
+            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
             ring_buf.clear(); // Defensive: zero-fill before callback can read
             // Minimum buffer: ~200ms of audio before the callback starts reading.
             // sr * ch / 5 = 200ms of interleaved samples.
@@ -5801,7 +6093,8 @@ impl OutputTarget for LocalOutput {
                     };
                     let ring_cap_fb =
                         (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
-                    let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                    starvation.begin_stream(source_cfg.sample_rate, source_cfg.channels);
+                    let ring_fb = Arc::new(RingBuf::new_metered(ring_cap_fb, starvation.clone()));
                     ring_fb.clear();
                     data_started_shared.store(false, Ordering::SeqCst);
                     let min_buffer_fb =
@@ -5847,7 +6140,8 @@ impl OutputTarget for LocalOutput {
                                 let min_buf =
                                     (cand.sample_rate as usize) * (cand.channels as usize) / 5;
                                 for is_i32 in [true, false] {
-                                    let r = Arc::new(RingBuf::new(cap));
+                                    starvation.begin_stream(cand.sample_rate, cand.channels);
+                                    let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
                                     r.clear();
                                     data_started_shared.store(false, Ordering::SeqCst);
                                     let res = if is_i32 {
@@ -6271,6 +6565,16 @@ impl OutputTarget for LocalOutput {
                         device = %device_name,
                         total_bytes_read,
                         "local_audio_stopped_feed_stall"
+                    );
+                    // …et sans celle-ci, il s'arrêtait SANS RIEN DIRE (#3108).
+                    // `device_gone` ne comble pas le trou : sur macOS le rappel
+                    // d'erreur cpal ne se déclenche jamais à l'arrachage, donc
+                    // le seul témoin est le blocage qu'on vient de constater.
+                    record_feed_stall_failure(
+                        "CPAL",
+                        &device_name,
+                        position_ms.load(Ordering::Relaxed),
+                        &open_failure,
                     );
                     break;
                 }
@@ -6729,6 +7033,15 @@ impl OutputTarget for LocalOutput {
                                     total_bytes_read,
                                     "local_audio_gapless_stopped_feed_stall"
                                 );
+                                // Même canal que la boucle principale (#3108) :
+                                // une piste enchaînée qui meurt en silence est
+                                // aussi muette qu'une première piste.
+                                record_feed_stall_failure(
+                                    "CPAL",
+                                    &device_name,
+                                    position_ms.load(Ordering::Relaxed),
+                                    &open_failure,
+                                );
                                 http_eof = false;
                                 break;
                             }
@@ -6875,11 +7188,8 @@ impl OutputTarget for LocalOutput {
             // the zone "Playing" and freezing the hotplug rescan. Deadline =
             // queued audio duration + 5s margin (same guard as the ASIO
             // exclusive path's asio_drain_timeout).
-            let drain_deadline = std::time::Duration::from_millis(
-                (ring.available() as u64 * 1000)
-                    / ((output_sr as u64).max(1) * (output_ch as u64).max(1))
-                    + 5000,
-            );
+            let drain_deadline =
+                drain_deadline_for(ring.available(), output_sr as u64, output_ch as u64);
             let drain_started = std::time::Instant::now();
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -6932,10 +7242,15 @@ impl OutputTarget for LocalOutput {
             // the zone shows a clear message instead of silently stopping.
             if device_gone.load(Ordering::Relaxed) {
                 if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "Sortie « {device_name} » : {}.",
-                        OpenFailure::DeviceGone.user_message()
-                    ));
+                    // Ne pas écraser un constat déjà posé : le blocage de
+                    // l'anneau (#3108) dit la même panne AVEC la position où
+                    // l'écran s'est figé, et il est arrivé le premier.
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "Sortie « {device_name} » : {}.",
+                            OpenFailure::DeviceGone.user_message()
+                        ));
+                    }
                 }
             }
 
@@ -7175,6 +7490,9 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())
     }
 
+    fn ring_starvation(&self) -> Option<OutputRingStarvation> {
+        Some(self.starvation.snapshot())
+    }
     fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
         self.eq.lock().ok().and_then(|eq| {
             eq.as_ref().map(|processor| {
@@ -7253,6 +7571,12 @@ fn make_stream_error_cb(
     }
 }
 
+/// Seuil du détecteur de blocage : au-delà, le consommateur de l'anneau est
+/// tenu pour mort. Très au-dessus de toute contre-pression normale (le rappel
+/// de rendu vide un anneau plein en quelques périodes de tampon), donc jamais
+/// atteint par une lecture saine.
+const FEED_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
 /// Checks the stop signal, abort flag, and pause state periodically.
 /// Returns immediately when abort is signaled or stop is received.
@@ -7267,6 +7591,30 @@ fn feed_ring_abortable(
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
     abort: Option<&AtomicBool>,
+) -> bool {
+    feed_ring_abortable_with_stall_timeout(
+        ring,
+        samples,
+        stop_rx,
+        paused,
+        abort,
+        FEED_STALL_TIMEOUT,
+    )
+}
+
+/// Le corps réel de [`feed_ring_abortable`], avec son seuil de blocage en
+/// paramètre.
+///
+/// Le seuil est injecté pour UNE raison : le vérifier sans dormir cinq
+/// secondes. Un test qui passe `Duration::ZERO` traverse exactement le même
+/// code que la production — c'est la boucle de production, pas une réplique.
+fn feed_ring_abortable_with_stall_timeout(
+    ring: &RingBuf,
+    samples: &[f32],
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+    paused: &AtomicBool,
+    abort: Option<&AtomicBool>,
+    stall_timeout: std::time::Duration,
 ) -> bool {
     let mut offset = 0;
     // Wedge detector: if the render callback stops consuming, the ring stays
@@ -7299,7 +7647,7 @@ fn feed_ring_abortable(
         let written = ring.push(&samples[offset..]);
         offset += written;
         if written == 0 {
-            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
+            if last_progress_at.elapsed() >= stall_timeout {
                 warn!(
                     remaining_samples = samples.len() - offset,
                     "asio_feed_ring_stall_timeout"
@@ -7313,6 +7661,23 @@ fn feed_ring_abortable(
         }
     }
     true
+}
+
+/// Combien de temps accorder au vidage d'un anneau qui contient encore
+/// `queued_samples` échantillons entrelacés.
+///
+/// Durée de l'audio en attente + 5 s de marge. Extrait des deux chemins
+/// partagés qui la calculaient déjà en ligne (#1626) pour que le chemin
+/// CoreAudio exclusif — le seul qui n'en avait AUCUNE — s'y raccroche sans
+/// recopier l'arithmétique.
+fn drain_deadline_for(
+    queued_samples: usize,
+    sample_rate: u64,
+    channels: u64,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        (queued_samples as u64 * 1000) / (sample_rate.max(1) * channels.max(1)) + 5000,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -7517,7 +7882,20 @@ fn find_device_with_fallback(
     endpoint_id: Option<&str>,
 ) -> Option<(cpal::Device, bool)> {
     if device_name == "default" {
-        return host.default_output_device().map(|d| (d, false));
+        return host.default_output_device().map(|d| {
+            // Demander « default » et obtenir le périphérique système n'est pas
+            // un écart — mais l'écran doit quand même pouvoir NOMMER ce qui a
+            // été ouvert : « default » ne dit rien à personne.
+            note_opened_device(
+                observed_backend_name(),
+                device_name,
+                &d.description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "unknown".into()),
+                d.id().ok().map(|id| id.to_string()).as_deref(),
+            );
+            (d, false)
+        });
     }
 
     // La même liste que la découverte, puits nuls écartés compris : c'est la
@@ -7550,6 +7928,16 @@ fn find_device_with_fallback(
             matched_by = ?matched,
             "audio_device_resolved"
         );
+        // Le nom RÉSOLU, pas le nom demandé : la résolution accepte les
+        // correspondances approchées (endpoint id, rang `(n)`, casse), donc les
+        // deux peuvent légitimement différer — et c'est précisément ce que
+        // l'utilisateur doit voir plutôt que de le déduire d'un `debug!`.
+        note_opened_device(
+            observed_backend_name(),
+            device_name,
+            &identities[index].raw_name,
+            Some(identities[index].endpoint_id.as_str()),
+        );
         // `nth` plutôt qu'un clone : `cpal::Device` n'est pas clonable sur tous
         // les hôtes, et on n'a plus besoin des autres.
         return devices.into_iter().nth(index).map(|device| (device, false));
@@ -7575,6 +7963,14 @@ fn find_device_with_fallback(
              the configured device is unavailable (unplugged, renamed, or \
              macOS audio routing changed); using the system default output \
              device instead"
+        );
+        // LE cas de #2207, rendu visible : la zone demandait un DAC, la lecture
+        // part sur le périphérique système. `differs` vaudra `true`.
+        note_opened_device(
+            observed_backend_name(),
+            device_name,
+            &default_name,
+            default_device.id().ok().map(|id| id.to_string()).as_deref(),
         );
         Some((default_device, true))
     } else {
@@ -7691,6 +8087,76 @@ pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
         // backend dont on ignore ce qu'il fait.
         _ => SampleRateEvidence::Unverified,
     }
+}
+
+/// Le nom de PCM ALSA porté par un `endpoint_id`, sans le préfixe d'hôte.
+///
+/// cpal rend `DeviceId` sous la forme `«hôte»:«pcm»` (`Display`, `cpal-0.17.3`
+/// `src/lib.rs:255`), et le `pcm` d'ALSA est lui-même préfixé par son greffon
+/// (`hw:CARD=…`, `dmix:CARD=…`). On ne retire donc QUE le préfixe d'hôte, et
+/// seulement s'il est présent : certains enregistrements ne portent que le PCM.
+fn alsa_pcm_name(endpoint_id: &str) -> &str {
+    let Some((tete, reste)) = endpoint_id.split_once(':') else {
+        return endpoint_id;
+    };
+    if tete.eq_ignore_ascii_case("alsa") {
+        reste
+    } else {
+        endpoint_id
+    }
+}
+
+/// Ce PCM ALSA parle-t-il au MATÉRIEL, ou à un convertisseur logiciel ?
+///
+/// `snd_device_name_hint` expose la même carte sous une dizaine de noms qui
+/// partagent tous la même première ligne de description — c'est pourquoi le
+/// dédoublonnage Linux les regroupe. Un seul de ces noms atteint le pilote sans
+/// conversion : `hw:`. Tous les autres (`default`, `sysdefault:`, `plughw:`,
+/// `dmix:`, `plug:`, `front:`, `iec958:`, `pipewire`, `pulse`, `jack`) passent
+/// par un greffon qui ACCEPTE tout et rééchantillonne.
+///
+/// La distinction n'est pas cosmétique : `dmix` fixe la cadence de son esclave
+/// (`defaults.pcm.dmix.rate 48000` dans `alsa.conf`). Interroger un tel PCM
+/// cadence par cadence rend « oui » pour 44,1 → 384 kHz, mais c'est le
+/// convertisseur qui répond, pas le DAC.
+pub fn alsa_pcm_is_direct_hardware(endpoint_id: &str) -> bool {
+    alsa_pcm_name(endpoint_id)
+        .split(':')
+        .next()
+        .is_some_and(|greffon| greffon.eq_ignore_ascii_case("hw"))
+}
+
+/// Ce que vaut la liste de cadences d'UN périphérique — pas seulement de son hôte.
+///
+/// [`sample_rate_evidence`] répond pour l'hôte ; elle ne peut pas voir deux
+/// faits qui, eux, sont propres au périphérique :
+///
+/// 1. **Le PCM interrogé n'est pas forcément le matériel.** Sur ALSA, cpal
+///    interroge bien le pilote (`hw_params.test_rate`) — mais le « pilote »
+///    d'un `dmix:` ou d'un `plughw:` est un rééchantillonneur logiciel. GgB
+///    (#1655, Eversolo DAC-Z8) : l'écran annonce 44,1 → 384 kHz « mesurées »,
+///    `local_audio_stream_config` note `output_sr=192000`, et
+///    `/proc/asound/card0/stream0` montre l'endpoint USB à 48 kHz nominal.
+///    C'est le greffon qui a dit oui.
+/// 2. **La liste peut être une SUPPOSITION.** Quand l'énumération échoue,
+///    [`probe_device_fallback_caps`] invente `(2, [44100, 48000])` et le
+///    signale par `caps_reliable = false` — un drapeau que l'énumération
+///    calculait puis jetait (`let _ = caps_reliable`).
+///
+/// Aucune de ces deux réserves ne change ce qui est JOUÉ : elles changent ce
+/// que l'écran a le droit d'affirmer.
+pub fn sample_rate_evidence_for_device(
+    backend: &str,
+    endpoint_id: &str,
+    enumeration_answered: bool,
+) -> SampleRateEvidence {
+    if !enumeration_answered {
+        return SampleRateEvidence::Unverified;
+    }
+    if backend.eq_ignore_ascii_case("alsa") && !alsa_pcm_is_direct_hardware(endpoint_id) {
+        return SampleRateEvidence::Unverified;
+    }
+    sample_rate_evidence(backend)
 }
 
 /// Quels chemins de sortie **exclusive** sont réellement COMPILÉS pour une
@@ -8863,6 +9329,94 @@ mod tests {
         assert!(sample_rate_evidence("alsa").is_measured());
     }
 
+    // -----------------------------------------------------------------------
+    // #1655 — sur ALSA, « le pilote a répondu » ne veut pas dire « le DAC a
+    // répondu ».
+    //
+    // Relevé de GgB du 30/08/2026, sur 0.9.127, pendant la lecture d'un
+    // fichier 192 kHz / 24 bits (`/proc/asound/card0/stream0`) :
+    //
+    //     Momentary freq = 48001 Hz (0x6.0008)
+    //     Packet Size = 72
+    //     Rates: 44100, 48000, …, 705600, 768000
+    //
+    // `Momentary freq` n'est pas une cadence nominale : c'est `freqm`, le
+    // compteur de rétroaction de l'endpoint USB, en 16.16 échantillon par
+    // micro-trame (noyau Linux, `sound/usb/proc.c`, `proc_dump_ep_status` →
+    // `get_high_speed_hz(x) = (x * 125 + (1 << 9)) >> 10`). 0x6.0008 vaut
+    // 6,000122 échantillon par micro-trame de 125 µs, soit 48 000 Hz nominal
+    // dérivant de +0,002 % — la dérive NORMALE d'un endpoint asynchrone
+    // (`ASYNC`, `Feedback Format = 16.16`) asservi à l'horloge du DAC. Le
+    // 48001 n'est donc pas le défaut. Le défaut est le 48 000 nominal qu'il
+    // révèle : un flux 192 kHz demanderait ≈24 échantillons par micro-trame
+    // (0x18.xxxx), et ne tiendrait pas dans un paquet de 72 octets
+    // (24 × 2 canaux × 4 octets = 192 octets minimum).
+    //
+    // Côté Tune, le journal du même appareil dit `output_sr=192000` et
+    // `max_channels=32` — or ce DAC est stéréo. 32 est le PLAFOND que cpal
+    // impose (`cpal-0.17.3` `src/host/alsa/mod.rs:556`) : seul un greffon
+    // logiciel annonce autant de canaux. Et le journal porte
+    // `ALSA lib pcm_direct.c … snd1_pcm_direct_slave_recover`, c'est-à-dire
+    // `dmix` — dont `alsa.conf` fixe l'esclave à `defaults.pcm.dmix.rate
+    // 48000`. L'écran affiche donc, comme MESURÉES, les cadences qu'un
+    // rééchantillonneur a bien voulu accepter.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn un_pcm_alsa_convertisseur_ne_peut_pas_annoncer_une_cadence_mesuree() {
+        for pcm in [
+            "ALSA:default",
+            "ALSA:sysdefault:CARD=DACZ8",
+            "ALSA:plughw:CARD=DACZ8,DEV=0",
+            "ALSA:dmix:CARD=DACZ8,DEV=0",
+            "ALSA:front:CARD=DACZ8,DEV=0",
+            "ALSA:iec958:CARD=DACZ8,DEV=0",
+            "ALSA:pipewire",
+            "ALSA:pulse",
+        ] {
+            assert!(
+                !sample_rate_evidence_for_device("Alsa", pcm, true).is_measured(),
+                "« {pcm} » n'est pas le DAC : c'est un greffon qui accepte tout \
+                 et rééchantillonne. Présenter ses cadences comme mesurées, \
+                 c'est faire dire au matériel ce que le convertisseur a \
+                 répondu — l'écran de GgB annonce 44,1 → 384 kHz pendant que \
+                 l'endpoint USB tourne à 48 kHz (#1655)"
+            );
+        }
+    }
+
+    #[test]
+    fn le_pcm_materiel_direct_reste_une_mesure_et_la_supposition_jamais() {
+        // Témoin : `hw:` atteint le pilote sans conversion. Le rétrograder
+        // ferait perdre à Linux une information qu'il avait bel et bien.
+        assert!(
+            sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", true).is_measured()
+        );
+        // Le préfixe d'hôte est facultatif : le PCM reste lisible sans lui.
+        assert!(sample_rate_evidence_for_device("Alsa", "hw:CARD=DACZ8,DEV=0", true).is_measured());
+        assert!(alsa_pcm_is_direct_hardware("hw:CARD=DACZ8,DEV=0"));
+        assert!(!alsa_pcm_is_direct_hardware("dmix:CARD=DACZ8,DEV=0"));
+
+        // Une liste SUPPOSÉE n'a mesuré personne — quel que soit l'hôte ou le
+        // PCM. C'est le drapeau que `probe_device_fallback_caps` calculait et
+        // que l'énumération jetait (`let _ = caps_reliable`) : les 40
+        // `local_audio_device_fallback_to_assumed_stereo_44100_48000` du
+        // journal de GgB étaient publiés comme des mesures.
+        assert!(
+            !sample_rate_evidence_for_device("Alsa", "ALSA:hw:CARD=DACZ8,DEV=0", false)
+                .is_measured()
+        );
+        assert!(
+            !sample_rate_evidence_for_device("CoreAudio", "CoreAudio:Engine", false).is_measured()
+        );
+
+        // Les hôtes non-ALSA ne dépendent pas d'un nom de PCM : leur verdict
+        // reste celui de `sample_rate_evidence`, inchangé.
+        assert!(sample_rate_evidence_for_device("CoreAudio", "", true).is_measured());
+        assert!(sample_rate_evidence_for_device("Asio", "", true).is_measured());
+        assert!(!sample_rate_evidence_for_device("Wasapi", "", true).is_measured());
+    }
+
     /// La table est indexée sur `cpal::HostId::name()`, qui rend le nom de la
     /// VARIANTE (`stringify!`) et non un libellé d'affichage. Si cpal renomme
     /// une variante, la table devient muette et l'hôte retombe silencieusement
@@ -8969,7 +9523,7 @@ mod tests {
         // Decoupe en CARACTERES : ce fichier est accentue, une coupe a
         // l octet pres tomberait au milieu d un caractere et paniquerait.
         let branche: String = apres.chars().take(4_000).collect();
-        let appel_indice = ["sample_rate_evidence(", "host_id_name)"].concat();
+        let appel_indice = ["sample_rate_evidence_for_device(", "host_id_name,"].concat();
         assert!(
             branche.contains(&appel_indice),
             "cette branche ouvre à la cadence source parce que le périphérique \
@@ -8977,7 +9531,15 @@ mod tests {
              find_matching_config recopie la cadence demandée — donc la branche \
              est toujours prise, needs_resample reste faux et rubato ne tourne \
              jamais. Elle doit au moins journaliser d'où vient cette \
-             supposition (#2862)"
+             supposition (#2862), et sur ALSA QUEL PCM a dit oui : le « oui » \
+             d'un `dmix:` n'est pas celui du DAC (#1655)"
+        );
+        let pcm_journalise = ["endpoint_id = %", "opened_endpoint_id,"].concat();
+        assert!(
+            branche.contains(&pcm_journalise),
+            "sans le nom du PCM ALSA dans le journal, un relevé de terrain ne \
+             peut pas dire si Tune a ouvert le matériel ou un \
+             rééchantillonneur — c'est la ligne qui manquait à #1655"
         );
     }
 
@@ -10559,6 +11121,145 @@ mod open_failure_tests {
     }
 }
 
+/// #3108 — « la zone reste figée à 2 s, sans message ».
+///
+/// Le refus d'OUVERTURE avait déjà son canal (`record_exclusive_open_failure`).
+/// Ce qui n'en avait aucun, c'est la panne d'APRÈS l'ouverture : le
+/// périphérique accepte, puis son rappel de rendu se tait. L'anneau se remplit
+/// une fois — deux secondes d'audio, par construction — et plus rien ne bouge.
+///
+/// Les trois fonctions éprouvées ici sont celles de la production, compilées
+/// sur toutes les cibles. Aucune ne dort : le seuil de blocage est injecté.
+#[cfg(test)]
+mod feed_stall_tests {
+    use super::{
+        FEED_STALL_TIMEOUT, OpenFailure, RingBuf, drain_deadline_for,
+        feed_ring_abortable_with_stall_timeout, record_feed_stall_failure,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// La boucle de production, avec son seuil ramené à zéro : un anneau plein
+    /// que personne ne vide rend le verdict « consommateur mort » — tout de
+    /// suite, sans dormir cinq secondes.
+    #[test]
+    fn un_anneau_que_personne_ne_vide_rend_le_verdict_de_blocage() {
+        let ring = RingBuf::new(4);
+        ring.push(&[0.0; 4]); // plein, et personne ne tirera jamais
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        let debut = std::time::Instant::now();
+        assert!(
+            !feed_ring_abortable_with_stall_timeout(
+                &ring,
+                &[0.5f32; 8],
+                &rx,
+                &paused,
+                None,
+                std::time::Duration::ZERO,
+            ),
+            "un anneau plein et jamais vidé doit être déclaré bloqué"
+        );
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(1),
+            "le seuil injecté doit rendre le verdict sans attendre"
+        );
+    }
+
+    /// TÉMOIN VERT : le même appel, sur un anneau qui a de la place, ne
+    /// déclare rien. Le détecteur ne doit pas devenir un couperet.
+    #[test]
+    fn un_anneau_qui_accepte_tout_ne_declare_aucun_blocage() {
+        let ring = RingBuf::new(16);
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let paused = AtomicBool::new(false);
+        assert!(feed_ring_abortable_with_stall_timeout(
+            &ring,
+            &[0.5f32; 8],
+            &rx,
+            &paused,
+            None,
+            std::time::Duration::ZERO,
+        ));
+        assert_eq!(ring.available(), 8);
+    }
+
+    /// Le seuil réel n'est pas nul : un test qui l'injecterait à zéro partout
+    /// masquerait une production devenue instantanément couperet.
+    #[test]
+    fn le_seuil_de_production_laisse_le_temps_a_la_contre_pression() {
+        assert_eq!(FEED_STALL_TIMEOUT, std::time::Duration::from_secs(5));
+    }
+
+    /// Le message doit nommer la sortie, la position où l'écran s'est figé, et
+    /// le geste à faire. « Une erreur est survenue » ne répare rien.
+    #[test]
+    fn le_blocage_dit_la_sortie_la_position_et_le_geste() {
+        let slot = std::sync::Mutex::new(None);
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &slot);
+        let message = slot.lock().unwrap().clone().expect("le canal doit porter");
+        assert!(message.contains("DAC USB"), "sortie absente : {message}");
+        assert!(
+            message.contains("CoreAudio"),
+            "transport absent : {message}"
+        );
+        assert!(
+            message.contains("2000 ms"),
+            "la position figée est le chiffre qui relie l'écran au journal : {message}"
+        );
+        assert!(
+            message.contains(OpenFailure::DeviceGone.user_message()),
+            "le geste à faire est absent : {message}"
+        );
+    }
+
+    /// Le canal est celui du poller : `take_output_failure()` le draine, une
+    /// fois, et le tick suivant ne re-stoppe pas la zone.
+    #[test]
+    fn le_blocage_passe_par_le_canal_que_le_poller_draine() {
+        use super::super::traits::OutputTarget;
+        let sortie = super::LocalOutput::new("DAC USB".into());
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "TÉMOIN VERT : une sortie saine ne remonte rien"
+        );
+
+        record_feed_stall_failure("CoreAudio", "DAC USB", 2000, &sortie.open_failure);
+        let remonte = sortie
+            .take_output_failure()
+            .expect("le blocage doit remonter par le canal du poller");
+        assert!(remonte.contains("2000 ms"), "got: {remonte}");
+        assert!(
+            sortie.take_output_failure().is_none(),
+            "un échec ne doit jamais être remonté deux fois"
+        );
+    }
+
+    /// Le vidage borné : durée de l'audio en attente + 5 s de marge.
+    #[test]
+    fn le_delai_de_vidage_couvre_l_audio_en_attente_plus_la_marge() {
+        // Deux secondes de stéréo à 44,1 kHz = 176 400 échantillons entrelacés.
+        assert_eq!(
+            drain_deadline_for(44_100 * 2 * 2, 44_100, 2),
+            std::time::Duration::from_millis(7000)
+        );
+        // Anneau vide : la marge seule.
+        assert_eq!(
+            drain_deadline_for(0, 44_100, 2),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    /// Une cadence ou un nombre de canaux nuls ne doivent pas diviser par zéro
+    /// — ce serait tuer le fil de lecture au lieu de borner son vidage.
+    #[test]
+    fn une_cadence_nulle_ne_divise_pas_par_zero() {
+        assert_eq!(
+            drain_deadline_for(0, 0, 0),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+}
+
 #[cfg(test)]
 mod backend_display_tests {
     use super::backend_display_name;
@@ -10601,8 +11302,8 @@ mod backend_display_tests {
 #[cfg(test)]
 mod backend_fallback_tests {
     use super::{
-        LocalBackendFallback, ObservedBackend, asio_available, asio_outcome, backend_status,
-        platform_default_backend_name, unsupported_outcome,
+        LocalBackendFallback, ObservedBackend, ObservedDevice, asio_available, asio_outcome,
+        backend_status, platform_default_backend_name, unsupported_outcome,
     };
 
     fn observed(
@@ -10612,6 +11313,22 @@ mod backend_fallback_tests {
         Some(ObservedBackend {
             name,
             fallback_reason: reason,
+        })
+    }
+
+    /// Une ouverture de périphérique observée : ce qui était demandé, ce qui a
+    /// été ouvert. `opened_id` optionnel — ASIO et CoreAudio n'en ont pas.
+    fn ouvert(
+        backend: &'static str,
+        requested: &str,
+        opened: &str,
+        opened_id: Option<&str>,
+    ) -> Option<ObservedDevice> {
+        Some(ObservedDevice {
+            backend,
+            requested: requested.to_string(),
+            opened: opened.to_string(),
+            opened_id: opened_id.map(str::to_string),
         })
     }
 
@@ -10767,6 +11484,7 @@ mod backend_fallback_tests {
     fn le_statut_porte_lactif_le_demande_et_la_cause() {
         let s = backend_status(
             observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            None,
             "ASIO",
         );
         assert_eq!(s.active, "WASAPI");
@@ -10783,7 +11501,7 @@ mod backend_fallback_tests {
     /// motif. Le garde-fou doit savoir se taire.
     #[test]
     fn asio_honore_ne_declare_ni_repli_ni_motif() {
-        let s = backend_status(observed("ASIO", None), "asio");
+        let s = backend_status(observed("ASIO", None), None, "asio");
         assert_eq!(s.active, "ASIO");
         assert!(!s.fell_back, "repli annoncé alors qu'ASIO joue");
         assert_eq!(s.fallback_reason, None);
@@ -10797,7 +11515,7 @@ mod backend_fallback_tests {
         let natif = platform_default_backend_name();
         let natif_minuscules = natif.to_lowercase();
         for requested in ["auto", "", natif, natif_minuscules.as_str()] {
-            let s = backend_status(observed(natif, None), requested);
+            let s = backend_status(observed(natif, None), None, requested);
             assert!(
                 !s.fell_back,
                 "demande « {requested} » sur {natif} : repli annoncé à tort"
@@ -10811,7 +11529,7 @@ mod backend_fallback_tests {
     /// une cible avec ASIO il ne doit surtout pas être inventé.
     #[test]
     fn sans_observation_seul_le_motif_de_compilation_est_affirme() {
-        let s = backend_status(None, "asio");
+        let s = backend_status(None, None, "asio");
         if asio_available() {
             assert_eq!(
                 s.fallback_reason, None,
@@ -10830,9 +11548,195 @@ mod backend_fallback_tests {
     /// jour ASIO s'ouvre, plus aucun motif ne doit traîner.
     #[test]
     fn lobservation_prime_sur_la_deduction() {
-        let s = backend_status(observed("ASIO", None), "asio");
+        let s = backend_status(observed("ASIO", None), None, "asio");
         assert_eq!(s.fallback_reason, None);
         assert_eq!(s.active, "ASIO");
+    }
+
+    // ------------------------------------------------------------------
+    // Le PÉRIPHÉRIQUE — l'autre moitié de la vérité (#2207).
+    // ------------------------------------------------------------------
+
+    /// **Le fait de base.** Quand le backend ouvre un autre périphérique que
+    /// celui demandé, le statut porte LES DEUX noms et le dit.
+    ///
+    /// C'est exactement la situation de #2207 : le chemin exclusif WASAPI
+    /// appelle `GetDefaultAudioEndpoint` quand la résolution par nom échoue,
+    /// donc une zone réglée sur un DAC joue sur les haut-parleurs. Le serveur
+    /// le savait déjà (`opened_device_name`), personne ne pouvait le lire.
+    #[test]
+    fn un_peripherique_different_du_demande_porte_les_deux_noms() {
+        let s = backend_status(
+            observed("WASAPI", None),
+            ouvert(
+                "WASAPI",
+                "Topping D90 SE",
+                "Haut-parleurs (Realtek Audio)",
+                Some("{0.0.0.00000000}.{aaaa}"),
+            ),
+            "wasapi",
+        );
+        let d = s
+            .device
+            .expect("le statut doit porter le périphérique observé");
+        assert_eq!(d.requested, "Topping D90 SE");
+        assert_eq!(d.opened, "Haut-parleurs (Realtek Audio)");
+        assert_eq!(d.backend, "WASAPI");
+        assert_eq!(d.opened_id.as_deref(), Some("{0.0.0.00000000}.{aaaa}"));
+        assert!(d.differs, "l'écart doit être signalé, c'est tout l'intérêt");
+    }
+
+    /// **Le témoin.** Le périphérique demandé est bien celui ouvert : aucun
+    /// écart ne doit être annoncé. Un garde-fou qui crie toujours ne sert à
+    /// rien — c'est la faute qu'ont déjà coûtée #2053 et #1315.
+    #[test]
+    fn un_peripherique_honore_nannonce_aucun_ecart() {
+        let s = backend_status(
+            observed("ALSA", None),
+            ouvert(
+                "ALSA",
+                "Topping D90 SE",
+                "Topping D90 SE",
+                Some("hw:CARD=D90"),
+            ),
+            "auto",
+        );
+        let d = s.device.expect("périphérique observé");
+        assert!(!d.differs, "écart annoncé alors que le DAC demandé joue");
+    }
+
+    /// Demander « default », c'est demander le périphérique système : le
+    /// recevoir n'est PAS un écart. Mais l'écran doit quand même pouvoir le
+    /// NOMMER — « default » ne dit rien à personne.
+    #[test]
+    fn default_demande_nest_pas_un_ecart_mais_reste_nomme() {
+        let s = backend_status(
+            observed("CoreAudio", None),
+            ouvert("CoreAudio", "default", "MacBook Pro Speakers", None),
+            "auto",
+        );
+        let d = s.device.expect("périphérique observé");
+        assert!(!d.differs, "« default » honoré n'est pas un repli");
+        assert_eq!(d.opened, "MacBook Pro Speakers");
+        assert_eq!(
+            d.opened_id, None,
+            "CoreAudio n'expose aucun identifiant stable : le champ doit rester absent, pas inventé"
+        );
+    }
+
+    /// **L'honnêteté de l'absence.** Rien n'a encore été ouvert : le champ est
+    /// absent, pas rempli d'une valeur plausible.
+    #[test]
+    fn sans_ouverture_observee_le_peripherique_est_absent() {
+        let s = backend_status(observed("ALSA", None), None, "auto");
+        assert!(
+            s.device.is_none(),
+            "un périphérique annoncé sans qu'aucun n'ait été ouvert est une invention"
+        );
+    }
+
+    /// **Le faux ami.** `fell_back` parle du BACKEND (ASIO → WASAPI), `differs`
+    /// parle du PÉRIPHÉRIQUE. Les deux replis sont indépendants : le backend
+    /// demandé peut jouer et le DAC demandé être introuvable, et
+    /// réciproquement. Confondre les deux, c'est ré-annoncer #1395 à la place
+    /// de #2207.
+    #[test]
+    fn le_repli_de_backend_et_celui_de_peripherique_sont_independants() {
+        // Backend honoré, périphérique dévié.
+        let a = backend_status(
+            observed("WASAPI", None),
+            ouvert("WASAPI", "DAC USB", "Haut-parleurs", None),
+            "wasapi",
+        );
+        assert!(!a.fell_back, "aucun repli de BACKEND ici");
+        assert!(a.device.expect("périphérique").differs);
+
+        // Backend dévié, périphérique honoré.
+        let b = backend_status(
+            observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices)),
+            ouvert("WASAPI", "DAC USB", "DAC USB", None),
+            "asio",
+        );
+        assert!(b.fell_back, "repli de BACKEND attendu");
+        assert!(!b.device.expect("périphérique").differs);
+    }
+
+    /// La charge utile JSON — ce que l'écran reçoit réellement — porte bien les
+    /// deux noms sous `device`. Un `assert` sur la structure Rust ne prouverait
+    /// rien du champ sérialisé.
+    #[test]
+    fn la_charge_utile_json_porte_les_deux_noms() {
+        let s = backend_status(
+            observed("WASAPI", None),
+            ouvert("WASAPI", "Topping D90 SE", "Haut-parleurs", None),
+            "wasapi",
+        );
+        let v = serde_json::to_value(&s).expect("statut sérialisable");
+        assert_eq!(v["device"]["requested"], "Topping D90 SE");
+        assert_eq!(v["device"]["opened"], "Haut-parleurs");
+        assert_eq!(v["device"]["differs"], true);
+        assert_eq!(v["device"]["backend"], "WASAPI");
+        // Les champs de #1395 restent en place : cet ajout est additif.
+        assert_eq!(v["active"], "WASAPI");
+        assert_eq!(v["requested"], "wasapi");
+    }
+
+    /// **Le VERROU de branchement**, pour les chemins que Linux ne compile
+    /// pas : WASAPI exclusif, ASIO exclusif et CoreAudio exclusif vivent tous
+    /// trois sous un `#[cfg]` inatteignable depuis la machine de compilation.
+    /// Sans ce garde, on pourrait retirer un `note_opened_device` et tout
+    /// resterait vert — c'est LITTÉRALEMENT le défaut qu'on corrige : deux
+    /// accesseurs justes, un seul lecteur, une ligne de journal.
+    ///
+    /// Même procédé que `chaque_sortie_de_select_host_enregistre_le_backend_ouvert`.
+    #[test]
+    fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
+        let src = std::fs::read_to_string(std::path::Path::new("src/outputs/local.rs"))
+            .expect("local.rs doit être lisible depuis la racine du crate");
+
+        // 1. Les trois chemins EXCLUSIFS : chacun annonce sa lecture par une
+        //    ligne `…_playing`, chacun doit enregistrer juste après.
+        for (marqueur, backend) in [
+            ("\"wasapi_exclusive_playing\"", "WASAPI"),
+            ("\"local_audio_asio_exclusive_playing\"", "ASIO"),
+            ("\"local_audio_exclusive_playing\"", "CoreAudio"),
+        ] {
+            let debut = src
+                .find(marqueur)
+                .unwrap_or_else(|| panic!("marqueur {marqueur} introuvable dans local.rs"));
+            let fenetre = &src[debut..src.len().min(debut + 900)];
+            assert!(
+                fenetre.contains("note_opened_device(")
+                    && fenetre.contains(&format!("\"{backend}\"")),
+                "le chemin {marqueur} joue sans dire QUEL périphérique il a ouvert \
+                 (attendu : un note_opened_device(\"{backend}\", …) juste après) : \
+                 la zone continuerait d'afficher la consigne au lieu de la vérité (#2207)"
+            );
+        }
+
+        // 2. Le chemin cpal PARTAGÉ (ALSA, CoreAudio partagé, WASAPI partagé) :
+        //    `find_device_with_fallback` a trois sorties qui rendent un
+        //    périphérique — « default » demandé, nom résolu, repli sur le
+        //    périphérique système. Les trois doivent enregistrer, et la
+        //    troisième est justement celle de #2207.
+        let debut = src
+            .find("fn find_device_with_fallback(")
+            .expect("find_device_with_fallback introuvable");
+        let fin = src[debut..]
+            .find("\n/// Probe a device's capabilities")
+            .map(|i| debut + i)
+            .expect("le corps de find_device_with_fallback doit précéder `Probe a device`");
+        let corps = &src[debut..fin];
+        let enregistrements = corps.matches("note_opened_device(").count();
+        assert_eq!(
+            enregistrements, 3,
+            "find_device_with_fallback rend un périphérique par trois chemins mais n'en \
+             enregistre que {enregistrements} : une sortie repart sans dire ce qu'elle a ouvert"
+        );
+        assert!(
+            corps.contains("audio_device_not_found_falling_back_to_default"),
+            "le repli sur le périphérique système a disparu — le cas à rendre visible n'existe plus"
+        );
     }
 
     /// Le VERROU de branchement, pour la seule branche que PERSONNE ne peut

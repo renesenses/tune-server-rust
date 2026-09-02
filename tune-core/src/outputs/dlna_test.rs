@@ -36,6 +36,11 @@ mod tests {
         /// SetAVTransportURI accepté, sauf si `media_info_fige` est vrai.
         current_uri: Arc<Mutex<String>>,
         media_info_fige: Arc<Mutex<bool>>,
+        /// #2749 — l'ampli HEOS en VEILLE reseau : sa pile UPnP repond deja
+        /// (SetAVTransportURI et Play sont acquittes) mais il ne tient AUCUN
+        /// media tant qu'il n'est pas sorti de veille. Les `n` premieres
+        /// lectures de `GetMediaInfo` rendent donc une `CurrentURI` VIDE.
+        media_info_vide_restants: Arc<AtomicU32>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
         /// « Salon » (#2581) : ce renderer refuse `Play` avec le code UPnP 701
@@ -113,6 +118,7 @@ mod tests {
                 stop_exige_pause: Arc::new(Mutex::new(false)),
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
+                media_info_vide_restants: Arc::new(AtomicU32::new(0)),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
                 salon_701_sans_media: Arc::new(Mutex::new(false)),
                 refus_701_restants: Arc::new(Mutex::new(0)),
@@ -417,7 +423,17 @@ mod tests {
                 .into_response()
             }
             "GetMediaInfo" => {
-                let uri = state.current_uri.lock().await.clone();
+                // #2749 — les `n` premieres lectures rendent le VIDE : l'ampli
+                // n'est pas encore sorti de veille.
+                let encore_en_veille = state
+                    .media_info_vide_restants
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+                let uri = if encore_en_veille {
+                    String::new()
+                } else {
+                    state.current_uri.lock().await.clone()
+                };
                 soap_ok(
                     "GetMediaInfo",
                     &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
@@ -811,6 +827,45 @@ mod tests {
             dernier.contains("<CurrentURI></CurrentURI>"),
             "le média mort (notre hôte) devait être vidé, dernier envoi : {}",
             &dernier[..dernier.len().min(200)]
+        );
+        handle.abort();
+    }
+
+    /// #2749 — L'AMPLI SORT DE VEILLE, ET LA ZONE JOUE.
+    ///
+    /// Le renderer acquitte `SetAVTransportURI` puis `Play` — sa pile UPnP est
+    /// bien vivante — mais rend une `CurrentURI` VIDE tant qu'il n'a pas fini
+    /// de sortir de veille et de basculer sur son entree reseau. Tune y lisait
+    /// « il joue une autre source » et coupait la zone en 13,5 s.
+    ///
+    /// Ce test passe par `play_media` : c'est LUI qui prouve que la fenetre de
+    /// reveil est BRANCHEE, et pas seulement ecrite. Les six premieres
+    /// lectures — tout le bareme de #2390 — ne voient que du vide ; c'est la
+    /// septieme, celle de la fenetre de reveil, qui trouve l'URI.
+    #[tokio::test]
+    async fn un_ampli_qui_sort_de_veille_finit_par_jouer() {
+        let state = MockState::default();
+        state.media_info_vide_restants.store(6, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+        let url = "http://192.168.1.18:8888/stream/fip-reveil.flac";
+        output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("FIP"),
+                ..Default::default()
+            })
+            .await
+            .expect("l'ampli a fini de se reveiller : la lecture doit aboutir");
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "le renderer doit finir sur NOTRE flux"
+        );
+        assert!(
+            state.set_uri_corps.lock().await.len() >= 2,
+            "l'URI devait etre REPOSEE pendant l'attente, pas seulement posee une fois"
         );
         handle.abort();
     }
@@ -1778,5 +1833,316 @@ mod tests {
             "durée inconnue vaut mieux que la durée d'une autre piste"
         );
         handle.abort();
+    }
+
+    /// #3107 — « rien ne part » : ce qu'une sortie REFUSE doit être DIT.
+    ///
+    /// Le constat de terrain (Bertrand, 01/09/2026, zone DLNA vers l'Eversolo
+    /// DMP-A8) est « cela ne démarre même pas ». Le même album en local vers la
+    /// zone navigateur démarre. Ce banc ne prétend pas rejouer l'appareil : il
+    /// mesure le SEUL fait qui manquait au dossier — ce que Tune ENVOIE
+    /// réellement à un renderer, et ce qu'il DIT quand ce renderer acquitte
+    /// tout et ne joue rien.
+    ///
+    /// Le défaut mesuré ici n'est pas dans la couche DLNA, qui rend bien une
+    /// erreur : il est juste au-dessus. `play_inner` range cette erreur dans
+    /// `PlayResult.error` et rend `Ok`. Seules les branches HTTP qui ATTENDENT
+    /// `play()` relisent ce corps ; `next`, `previous`, `resume`, `seek`,
+    /// l'avance automatique et l'autoplay du sondeur, les alarmes, la reprise
+    /// au démarrage, le transfert de zone et l'émulation de renderer UPnP
+    /// écrivent tous `Ok(_) =>` et poursuivent comme si la piste avait démarré.
+    /// La cause n'existait alors que dans le journal du serveur.
+    mod ce_que_la_sortie_refuse_est_annonce {
+        use super::*;
+        use crate::db::migrations::run_migrations;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::zone_repo::ZoneRepo;
+        use crate::event_bus::{EventBus, TuneEvent};
+        use crate::http::streamer::AudioStreamer;
+        use crate::orchestrator::{PlayRequest, PlaybackOrchestrator};
+        use crate::outputs::registry::OutputRegistry;
+        use crate::playback::PlaybackManager;
+        use crate::streaming::ServiceRegistry;
+        use tokio::sync::broadcast::Receiver;
+        use tokio::sync::broadcast::error::RecvError;
+
+        /// Le renderer factice porte déjà cet identifiant dans `make_dlna`.
+        const DEVICE_ID: &str = "mock-dlna-001";
+
+        /// L'URI qu'un renderer zombie tient et ne lâche pas : un flux Tune
+        /// périmé, servi par une AUTRE machine.
+        ///
+        /// Le `/stream/` est ce qui rend le verdict concluant — c'est la règle
+        /// de `verdict_uri_appliquee` : une URI étrangère qu'on ne sait pas
+        /// interpréter ne conclut RIEN, par choix, pour ne pas accuser à tort
+        /// les renderers qui réécrivent l'URI. L'origine, elle, reste étrangère
+        /// à notre serveur : ce média n'est donc pas vidé (cf.
+        /// `un_flux_etranger_n_est_pas_vide`).
+        const URI_ETRANGERE: &str = "http://192.168.1.42:9000/stream/vieux-flux.flac";
+
+        /// Un banc COMPLET : base, orchestrateur, bus d'évènements, une piste
+        /// locale réelle, et une zone DLNA dont la sortie est le renderer
+        /// factice.
+        ///
+        /// La chaîne entière est celle de production — `orch.play()` traverse
+        /// `play_inner`, `send_to_output` et le vrai `DlnaOutput`. Un banc qui
+        /// appellerait `send_to_output` à la main resterait vert alors que le
+        /// code de production se dégrade : c'est exactement ce que fait déjà
+        /// `output_send_error_fails_fast_to_stopped`, qui simule lui-même
+        /// l'arrêt de la zone.
+        async fn banc(
+            base: &str,
+        ) -> (
+            PlaybackOrchestrator,
+            i64,
+            Receiver<TuneEvent>,
+            tempfile::TempDir,
+        ) {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            run_migrations(&db).unwrap();
+            let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+            let mut orch = PlaybackOrchestrator::new(
+                db.clone(),
+                Arc::new(PlaybackManager::new()),
+                Arc::new(AudioStreamer::new(0)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                Arc::new(Mutex::new(OutputRegistry::new())),
+                None,
+            );
+            let bus = Arc::new(EventBus::new());
+            let recu = bus.subscribe();
+            orch.event_bus = Some(bus);
+
+            // Un vrai fichier : le chemin passthrough réseau lit sa taille sur
+            // le disque, un chemin fantôme échouerait en `file_not_found` et le
+            // test mesurerait une tout autre panne. Cadence et profondeur
+            // suivent le fichier de test, pas l'album du ticket : ce qui est
+            // mesuré ici est la remontée de la cause, et un écart avec l'en-tête
+            // réel ferait décider un transcodage sans rapport.
+            let dir = tempfile::tempdir().unwrap();
+            let piste = dir.path().join("03 - On the Run.flac");
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+                &piste,
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO artists (id, name) VALUES (1, 'Pink Floyd')",
+                &[],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO albums (id, title, artist_id) \
+                 VALUES (1, 'The Dark Side of the Moon', 1)",
+                &[],
+            )
+            .unwrap();
+            let chemin = piste.to_string_lossy().into_owned();
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+                 duration_ms, sample_rate, bit_depth, channels) \
+                 VALUES (1, 'On the Run', 1, 1, ?, 'flac', 216000, 44100, 16, 2)",
+                &[&chemin as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+
+            let zones = ZoneRepo::with_backend(db.clone());
+            let zone_id = zones
+                .create("Eversolo DMP-A8", Some("dlna"), Some(DEVICE_ID))
+                .unwrap();
+            zones.update_dlna_native_flac(zone_id, true).unwrap();
+            orch.outputs
+                .lock()
+                .await
+                .register(Box::new(make_dlna(base)));
+            (orch, zone_id, recu, dir)
+        }
+
+        /// Collecte EN CONTINU les erreurs de lecture poussées aux clients.
+        ///
+        /// Vider le canal à la fin ne suffirait pas : la diffusion est bornée à
+        /// 256 messages, un décodage-pour-niveaux en publie pendant toute la
+        /// piste, et l'évènement cherché pourrait être écarté avant d'être lu —
+        /// un test vert au mauvais motif, puis rouge par intermittence.
+        fn collecter(mut recu: Receiver<TuneEvent>) -> Arc<Mutex<Vec<serde_json::Value>>> {
+            let vu = Arc::new(Mutex::new(Vec::new()));
+            let sortie = vu.clone();
+            tokio::spawn(async move {
+                loop {
+                    match recu.recv().await {
+                        Ok(ev) if ev.event_type == "zone.playback_error" => {
+                            sortie.lock().await.push(ev.data);
+                        }
+                        Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+            vu
+        }
+
+        /// Ce que le collecteur a vu, en laissant à l'annonce le temps de
+        /// partir — au plus `delai`.
+        ///
+        /// L'émission est synchrone dans `play_inner`, mais le collecteur est
+        /// une tâche : lire juste après le retour de `play()` mesurerait
+        /// l'ordonnanceur, pas le code. On attend un fait, pas une durée — dès
+        /// que l'erreur est là, on rend la main.
+        async fn erreurs_apres(
+            vu: &Arc<Mutex<Vec<serde_json::Value>>>,
+            delai: std::time::Duration,
+        ) -> Vec<serde_json::Value> {
+            let fin = std::time::Instant::now() + delai;
+            loop {
+                let courant = vu.lock().await.clone();
+                if !courant.is_empty() || std::time::Instant::now() >= fin {
+                    return courant;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Les `CurrentURI` que le renderer factice a REÇUS, dans l'ordre.
+        ///
+        /// C'est le fait de base du ticket : pas un code HTTP — le symptôme est
+        /// précisément qu'il ment — mais la requête SOAP elle-même.
+        async fn uris_recues(state: &MockState) -> Vec<String> {
+            state
+                .set_uri_corps
+                .lock()
+                .await
+                .iter()
+                .map(|corps| extract_tag(corps, "CurrentURI"))
+                .collect()
+        }
+
+        /// Une lecture demandée à un renderer d'où RIEN ne part.
+        ///
+        /// Le renderer tient déjà un flux étranger et n'en changera pas : il
+        /// acquitte `SetAVTransportURI`, acquitte `Play`, et continue son
+        /// morceau. C'est le zombie constaté par SOAP direct sur le DMP-A8, et
+        /// c'est « rien ne part » dans sa forme la plus trompeuse — chaque code
+        /// de retour dit oui.
+        ///
+        /// Avant ce correctif : `play()` rendait `Ok`, la zone passait à
+        /// l'arrêt, et la cause — que le renderer avait pourtant donnée —
+        /// n'existait que dans une ligne `warn!` du journal du serveur.
+        #[tokio::test]
+        async fn un_renderer_qui_acquitte_sans_rien_jouer_fait_remonter_la_cause() {
+            let state = MockState::default();
+            *state.current_uri.lock().await = URI_ETRANGERE.into();
+            *state.media_info_fige.lock().await = true;
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) = banc(&base).await;
+            let erreurs = collecter(recu);
+
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok — c'est justement le piège de ce ticket");
+
+            // 1. LE FAIT DE BASE — ce que Tune a réellement envoyé au renderer.
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusée doit quand même nommer son URL de flux");
+            let uris = uris_recues(&state).await;
+            assert!(
+                uris.iter().any(|u| *u == url),
+                "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer n'a ACQUITTÉ aucun Play : ce n'est pas le cas mesuré ici"
+            );
+
+            // 2. …et pourtant rien n'est parti : il tient toujours l'autre URI.
+            assert_eq!(
+                *state.current_uri.lock().await,
+                URI_ETRANGERE,
+                "le renderer devait rester sur son flux étranger"
+            );
+            assert!(
+                !resultat.output_sent,
+                "la sortie n'a rien accepté : output_sent doit valoir faux"
+            );
+
+            // 3. CE QUI ÉTAIT AVALÉ — la cause doit être POUSSÉE aux clients.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                erreurs.len(),
+                1,
+                "une et une seule erreur de lecture doit être annoncée : {erreurs:?}"
+            );
+            let erreur = &erreurs[0];
+            assert_eq!(erreur["zone_id"], zone_id, "l'erreur doit nommer la zone");
+            assert_eq!(
+                erreur["fatal"], true,
+                "sans `fatal`, la fenêtre de grâce d'après-lecture du client avale \
+                 le message — la zone s'arrête à la ligne suivante (#2630)"
+            );
+            let texte = erreur["error"].as_str().unwrap_or_default();
+            assert!(
+                texte.contains("acquitté Play"),
+                "le message doit NOMMER ce que le renderer a fait, pas dire \
+                 « erreur » : {texte:?}"
+            );
+            assert!(
+                texte.contains(URI_ETRANGERE),
+                "le message doit dire l'URI que le renderer tient encore : {texte:?}"
+            );
+
+            handle.abort();
+        }
+
+        /// Témoin vert — une lecture qui démarre n'annonce RIEN.
+        ///
+        /// Le même banc, le même appareil, le renderer nominal. Sans ce témoin,
+        /// une remontée d'erreur trop large passerait pour un correctif tout en
+        /// couvrant l'écran de messages sur des lectures parfaitement saines.
+        #[tokio::test]
+        async fn une_lecture_qui_demarre_n_annonce_aucune_erreur() {
+            let state = MockState::default();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, recu, _dir) = banc(&base).await;
+            let erreurs = collecter(recu);
+
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("la lecture doit aboutir");
+
+            let url = resultat.stream_url.clone().expect("une URL de flux");
+            assert!(resultat.output_sent, "la sortie a accepté le titre");
+            assert_eq!(
+                *state.current_uri.lock().await,
+                url,
+                "le renderer doit tenir NOTRE flux"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le renderer doit avoir reçu un Play"
+            );
+            // Le délai est ATTENDU en entier : c'est ce qui donne son poids au
+            // témoin — une annonce en retard serait vue, pas manquée.
+            let erreurs = erreurs_apres(&erreurs, std::time::Duration::from_millis(500)).await;
+            assert!(
+                erreurs.is_empty(),
+                "une lecture qui démarre ne doit annoncer AUCUNE erreur : {erreurs:?}"
+            );
+
+            handle.abort();
+        }
     }
 }

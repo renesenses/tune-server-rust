@@ -3,12 +3,16 @@
 //! Ces modules utilisent des bases et routeurs isolés ; ils peuvent donc
 //! partager un binaire de tests sans partager leurs données.
 
+#[path = "adresse_du_flux_reservee_au_navigateur.rs"]
+mod adresse_du_flux_reservee_au_navigateur;
 #[path = "albums_pas_des_doublons.rs"]
 mod albums_pas_des_doublons;
 #[path = "annonce_forum_bornes.rs"]
 mod annonce_forum_bornes;
 #[path = "auth_security.rs"]
 mod auth_security;
+#[path = "autoeq_import_route.rs"]
+mod autoeq_import_route;
 #[path = "bios_bilan_visible.rs"]
 mod bios_bilan_visible;
 #[path = "bios_langue_album.rs"]
@@ -23,6 +27,8 @@ mod cles_developpeur_persistance;
 mod collections_couleur_persistee;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "compilation_dans_les_reponses_album.rs"]
+mod compilation_dans_les_reponses_album;
 #[path = "config_secrets_et_roles.rs"]
 mod config_secrets_et_roles;
 #[path = "contexte_de_session.rs"]
@@ -33,6 +39,8 @@ mod credits_enrichissement_statut;
 mod enrich_artiste_langue_entete;
 #[path = "enrichissement_repertoire.rs"]
 mod enrichissement_repertoire;
+#[path = "eq_refus_premium_localise.rs"]
+mod eq_refus_premium_localise;
 #[path = "etiquettes_types_et_playlists.rs"]
 mod etiquettes_types_et_playlists;
 #[path = "explorateur_dossiers.rs"]
@@ -43,6 +51,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "fonds_communautaire_par_mbid.rs"]
+mod fonds_communautaire_par_mbid;
 #[path = "generateur_playlists_sans_ia.rs"]
 mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
@@ -59,6 +69,8 @@ mod licence_grace_visible;
 mod notarisation_bornes;
 #[path = "nuage_limite_dit_la_limite.rs"]
 mod nuage_limite_dit_la_limite;
+#[path = "openhome_pins_atteignent_le_renderer.rs"]
+mod openhome_pins_atteignent_le_renderer;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_ecriture_fichiers.rs"]
@@ -75,6 +87,8 @@ mod playlists_cloisonnement_par_profil;
 mod playlists_ecritures_partielles;
 #[path = "podcasts_radiofrance_cle.rs"]
 mod podcasts_radiofrance_cle;
+#[path = "portee_repertoire_jokers.rs"]
+mod portee_repertoire_jokers;
 #[path = "radios_recherche_distinction.rs"]
 mod radios_recherche_distinction;
 #[path = "radios_validation_url.rs"]
@@ -111,6 +125,8 @@ mod uptime_process_scope;
 mod volume_db_contrat;
 #[path = "volume_db_resolution.rs"]
 mod volume_db_resolution;
+#[path = "volume_fixe_2395.rs"]
+mod volume_fixe_2395;
 #[path = "web_response_contracts.rs"]
 mod web_response_contracts;
 #[path = "workflows_bornes.rs"]

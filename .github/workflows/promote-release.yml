@@ -290,4 +290,28 @@ jobs:
             echo "- Homebrew mis a jour"
             echo "- site notifie"
             echo "- Android inchange : absent du manifeste a quatre composants"
+            echo "- paquet .deb : job \`deb\` de ce meme run"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Le paquet Debian, dans le MEME run que la promotion.
+  #
+  # `deb.yml` ecoute `release: [published]` depuis toujours, et ce declencheur
+  # n'a jamais tire une seule fois : GitHub ne declenche aucun workflow depuis
+  # un evenement produit avec le `GITHUB_TOKEN` par defaut, et c'est ce jeton
+  # qui publie la release ci-dessus. Le `.deb` partait donc a la main, apres
+  # coup, quand quelqu'un y pensait.
+  #
+  # Un `uses:` ne passe par aucun evenement : c'est le meme run qui continue,
+  # l'anti-recursion ne s'y applique pas. C'est exactement ce que release.yml
+  # fait deja pour `docker.yml` et `trigger-os-images.yml`.
+  #
+  # En aval de tout : si l'empaquetage tombe, la release reste promue et le
+  # paquet se rejoue seul par `workflow_dispatch`, comme avant.
+  deb:
+    name: Paquet Debian
+    needs: promote
+    if: ${{ !inputs.dry_run }}
+    uses: ./.github/workflows/deb.yml
+    with:
+      tag: v${{ inputs.version }}
+      publish: true

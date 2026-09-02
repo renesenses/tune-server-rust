@@ -119,6 +119,9 @@ fn tout_job_de_release_a_un_plafond() {
         "docker.yml",
         "trigger-os-images.yml",
         "promote-release.yml",
+        // Le paquet Debian est desormais appele par la promotion : ses jobs
+        // occupent un runner DANS le train, et aucun ne portait de plafond.
+        "deb.yml",
     ] {
         verifier(fichier);
     }
@@ -375,17 +378,14 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
             "job {nom} : les crates HTTP extraites ne sont plus testees explicitement"
         );
     }
-    for nom in [
-        "test-shipped-features",
-        "audio-embedding",
-        "windows-pr",
-        "macos-pr",
-    ] {
+    for nom in ["test-shipped-features", "audio-embedding"] {
         assert!(
             corps(nom).contains("needs.impact.outputs.full == 'true'"),
             "suite complete {nom} encore lancee sur chaque correctif du lot"
         );
     }
+    // `windows-pr` et `macos-pr` ont QUITTE cette liste (#3123) : voir
+    // `les_deux_plateformes_compilent_sur_toute_pr_rust`, qui exige l'inverse.
 
     let livraison = corps("build");
     assert!(livraison.contains("if: github.event_name != 'pull_request'"));
@@ -622,7 +622,7 @@ fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
             .lines()
             .filter(|ligne| {
                 ligne.trim()
-                    == "run: cargo test -p tune-core --no-default-features --features postgres,oaat"
+                    == "run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat"
             })
             .count(),
         1,
@@ -635,6 +635,231 @@ fn postgres_et_widget_ne_sont_plus_doubles_dans_la_ci_generale() {
     assert!(widget.contains("      - \"tune-widget/**\""));
     assert!(widget.contains("cargo check --release"));
     assert!(widget.contains("cargo test"));
+}
+
+/// Contre-epreuve de #3098 : toute porte `cargo test` va jusqu'au bout.
+///
+/// Sans `--no-fail-fast`, le PREMIER binaire de test qui echoue arrete la
+/// commande : tous les binaires suivants ne sont jamais executes, et la porte
+/// n'affiche qu'un echec la ou il y en a peut-etre dix. Mesure sur Shrek le
+/// 01/09/2026, jeu de fonctionnalites exact du job `test` (`oaat,cloud-relay`,
+/// cinq paquets), avec l'echec IPv6 de `dual_stack_socket_accepts_both_families`
+/// au 9e binaire : SANS le drapeau, 9 binaires sur 18 sont executes et les NEUF
+/// suivants ne tournent jamais ; AVEC, les 18 tournent, plus quatre lots de
+/// doc-tests. Ce qui n'est pas execute ne peut pas etre rouge.
+///
+/// Le compte minimal en fin de test est delibere : un detecteur qui ne repere
+/// plus aucune ligne passerait a vide, exactement le defaut qu'il garde.
+#[test]
+fn toute_porte_cargo_test_va_jusqu_au_bout() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+    let mut fichiers: Vec<_> = fs::read_dir(&racine)
+        .expect("dossier des workflows illisible")
+        .filter_map(|entree| entree.ok().map(|entree| entree.path()))
+        .filter(|chemin| chemin.extension().and_then(|ext| ext.to_str()) == Some("yml"))
+        .collect();
+    fichiers.sort();
+
+    let mut vues = 0usize;
+    for chemin in fichiers {
+        let source = fs::read_to_string(&chemin)
+            .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+        for (numero, ligne) in source.lines().enumerate() {
+            let nue = ligne.trim();
+            let Some(commande) = nue
+                .strip_prefix("- run: ")
+                .or_else(|| nue.strip_prefix("run: "))
+            else {
+                continue;
+            };
+            if commande != "cargo test" && !commande.starts_with("cargo test ") {
+                continue;
+            }
+            vues += 1;
+            assert!(
+                commande.contains("--no-fail-fast"),
+                "{}:{} lance cargo test sans --no-fail-fast : le premier binaire \
+                 en echec emporterait tous les suivants en silence\n  {nue}",
+                chemin.display(),
+                numero + 1
+            );
+        }
+    }
+
+    assert!(
+        vues >= 10,
+        "seulement {vues} portes `cargo test` reperees : le detecteur ne voit \
+         plus les lignes qu'il doit garder"
+    );
+}
+
+/// Contre-epreuve de #3123, porte 1 : Windows et macOS compilent sur TOUTE PR
+/// qui touche du Rust.
+///
+/// Ce que la condition `full` a coute, mesure : `rand_core::OsRng` appele depuis
+/// `tune-core/src/db/album_repo.rs` (93186f81, #3074) alors que la caisse n'est
+/// declaree que sous `[target.'cfg(unix)'.dependencies]`. Une PR vers `batch/*`
+/// ne porte pas `full` : le defaut a traverse sa propre PR, le lot ET la RC sans
+/// une seule compilation Windows, et n'a rougi qu'a la promotion vers main, ou
+/// il a arrete le train de la 0.9.130.
+///
+/// Le compte minimal est delibere, comme dans le garde de #3098 : un detecteur
+/// qui ne repere plus aucun job passerait a vide.
+#[test]
+fn les_deux_plateformes_compilent_sur_toute_pr_rust() {
+    let source = workflow("ci.yml");
+    let jobs = jobs(&source);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de ci.yml"))
+    };
+
+    let mut vus = 0usize;
+    for nom in ["windows-pr", "macos-pr"] {
+        let job = corps(nom);
+        vus += 1;
+        assert!(
+            job.contains("needs.impact.outputs.rust == 'true'"),
+            "{nom} ne suit plus le verdict d impact"
+        );
+        assert!(
+            !job.contains("needs.impact.outputs.full"),
+            "{nom} est de nouveau reserve aux PR `full` : une PR de lot ne \
+             serait plus compilee sur cette plateforme, et c'est exactement \
+             comment #3074 a traverse le lot et la RC"
+        );
+    }
+    assert_eq!(
+        vus, 2,
+        "le detecteur ne voit plus les deux jobs de plateforme qu'il garde"
+    );
+
+    // Rien n'est RETIRE : les deux jobs gardent leurs configurations, et
+    // `release-gate` continue de les exiger verts pour promouvoir vers main.
+    let windows = corps("windows-pr");
+    assert!(windows.contains("--features oaat,postgres,dj,karaoke,bandcamp,plugins-wasm"));
+    assert!(
+        windows
+            .contains("--features oaat,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm")
+    );
+    assert!(corps("macos-pr").contains("cargo check --package tune-server"));
+    let porte = corps("release-gate");
+    for nom in ["windows-pr", "macos-pr"] {
+        assert!(
+            porte.contains(&format!("- {nom}")),
+            "release-gate n'exige plus {nom}"
+        );
+    }
+}
+
+/// Contre-epreuve de #3123, porte 2 : PostgreSQL execute aussi `tune-server`,
+/// et ne saute plus les PR de lot qui touchent du Rust.
+///
+/// Ce que le trou a coute, mesure : les deux requetes de « Continuer l'ecoute »
+/// (#2441) vivaient dans `tune-server`, que ce workflow ne compilait pas. Elles
+/// n'avaient donc jamais tourne sur PostgreSQL. L'une calculait un pourcentage
+/// en SQL : `total = 0` rend `NULL` sur SQLite et leve `division by zero` sur
+/// PostgreSQL. C'est l'angle mort de #2860, rejoue une release plus tard.
+///
+/// Compte du 01/09/2026 sur les 100 dernieres executions du workflow : sur 98
+/// declenchements de PR, **73 sautes**, 23 reussis, 2 annules.
+#[test]
+fn postgresql_execute_les_requetes_de_tune_server() {
+    let postgres = workflow("test-postgres.yml");
+
+    // a) Les trois clauses de #2808 sont INTACTES — la promotion `rc/* -> main`
+    //    sans une ligne de Rust reste couverte — et une quatrieme s'y ajoute.
+    assert!(postgres.contains("github.event_name != 'pull_request'"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'batch/')"));
+    assert!(postgres.contains("!startsWith(github.base_ref, 'rc/')"));
+    assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
+    assert!(
+        postgres.contains("|| needs.impact.outputs.rust == 'true'"),
+        "une PR de correctif vers batch/* ou rc/* saute encore PostgreSQL en \
+         entier, alors que c'est la que le SQL des P2 s'ecrit"
+    );
+    // Le temoin vert de l'autre cote : la PR qui ne touche aucun Rust ne doit
+    // rien declencher de lourd, donc le classifieur reste en place et garde sa
+    // propre contre-epreuve.
+    assert!(postgres.contains("bash scripts/detecter-impact-ci.sh --autotest"));
+
+    // b) Les paquets reellement exerces sur PostgreSQL, comptes dans le
+    //    fichier. Avant #3123 : `tune-core` seul, sur les six etapes.
+    let mut lignes = 0usize;
+    let mut paquets: Vec<&str> = Vec::new();
+    for ligne in postgres.lines() {
+        let nue = ligne.trim();
+        let Some(commande) = nue.strip_prefix("run: ") else {
+            continue;
+        };
+        if !commande.starts_with("cargo test ") {
+            continue;
+        }
+        lignes += 1;
+        let mots: Vec<&str> = commande.split_whitespace().collect();
+        for (index, mot) in mots.iter().enumerate() {
+            if *mot == "-p" {
+                if let Some(paquet) = mots.get(index + 1) {
+                    if !paquets.contains(paquet) {
+                        paquets.push(paquet);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        lignes >= 7,
+        "seulement {lignes} etapes `cargo test` reperees dans test-postgres.yml : \
+         le detecteur ne voit plus ce qu'il doit compter"
+    );
+    paquets.sort_unstable();
+    assert_eq!(
+        paquets,
+        ["tune-core", "tune-server"],
+        "l'inventaire des paquets joues sur PostgreSQL a change : on n'en retire \
+         jamais, et `tune-server` doit y rester — c'est la que vivent les \
+         requetes des routes"
+    );
+
+    // c) L'etape qui EXECUTE ces requetes, avec une base vivante.
+    assert!(
+        postgres.contains("--test pg_routes_serveur"),
+        "l'epreuve des routes de tune-server sur PostgreSQL a disparu"
+    );
+    let etape = postgres
+        .split("--test pg_routes_serveur")
+        .nth(1)
+        .expect("etape pg_routes_serveur");
+    assert!(
+        etape.contains("--test-threads=1"),
+        "les TRUNCATE CASCADE de l'epreuve s'interbloquent en parallele"
+    );
+    assert!(
+        postgres.matches("TUNE_TEST_PG_URL: postgresql://").count() >= 6,
+        "une etape PostgreSQL a perdu sa base vivante : `pg_or_skip!` la sauterait \
+         en silence"
+    );
+
+    // Le test lui-meme doit exister et etre DECLARE : `tune-server` porte
+    // `autotests = false`, donc un fichier non inscrit ne se compile jamais.
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        racine.join("tests/pg_routes_serveur.rs").is_file(),
+        "tune-server/tests/pg_routes_serveur.rs absent"
+    );
+    let manifeste =
+        fs::read_to_string(racine.join("Cargo.toml")).expect("tune-server/Cargo.toml lisible");
+    assert!(
+        manifeste.contains("name = \"pg_routes_serveur\""),
+        "cible de test pg_routes_serveur non declaree : avec autotests = false, \
+         le fichier ne serait JAMAIS compile"
+    );
+    assert!(
+        manifeste.contains("required-features = [\"postgres\"]"),
+        "pg_routes_serveur doit exiger la feature postgres"
+    );
 }
 
 /// Le plafond de l'etape apt doit laisser passer ses TROIS essais.
@@ -866,5 +1091,175 @@ fn toute_feature_declaree_est_activee_par_une_porte_clippy() {
         perimees.is_empty(),
         "HORS_PORTE justifie des features qui n'existent plus : {perimees:?} — \
          retirer l'entree plutot que la laisser rassurer"
+    );
+}
+
+/// Lance le `--autotest` d'un script d'outillage et exige un nombre minimum de
+/// garanties.
+///
+/// ⭐ Un garde qui ne trouve rien doit ECHOUER, pas reussir. Un autotest vide
+/// de son contenu sortirait en 0 et passerait ici pour vert : on compte donc
+/// les lignes `ok: ` qu'il imprime, comme le fait deja la porte des features.
+fn autotest(script: &str, minimum: usize) {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let chemin = racine.join("../scripts").join(script);
+    let sortie = std::process::Command::new("bash")
+        .arg(&chemin)
+        .arg("--autotest")
+        .output()
+        .unwrap_or_else(|e| panic!("scripts/{script} --autotest injouable : {e}"));
+    let flux = String::from_utf8_lossy(&sortie.stdout);
+    assert!(
+        sortie.status.success(),
+        "scripts/{script} --autotest en echec\nstdout:\n{}\nstderr:\n{}",
+        flux,
+        String::from_utf8_lossy(&sortie.stderr)
+    );
+    let garanties = flux.lines().filter(|l| l.starts_with("ok: ")).count();
+    assert!(
+        garanties >= minimum,
+        "scripts/{script} --autotest n'a verifie que {garanties} garantie(s) au lieu de \
+         {minimum} : l'autotest s'est vide, il ne garde plus rien.\nstdout:\n{flux}"
+    );
+}
+
+/// La relecture d'un tag juste cree ne distinguait pas « absent » de « pas
+/// encore visible ».
+///
+/// Run 33522674458, publication de la v0.9.130 : le tag venait d'etre cree sur
+/// `tune-web-client`, la relecture immediate a rendu « neant », et le
+/// controleur s'est arrete AVANT `universal`, `os` et `server`. Le tag
+/// existait — relu trente secondes plus tard, sur le bon SHA. Un tag orphelin
+/// dans un depot, trois depots sans tag, un train a reprendre a la main.
+///
+/// L'intention de la garde est juste et ne doit pas etre affaiblie : ce test
+/// exige la reprise ET le refus immediat d'un tag divergent.
+#[test]
+fn le_controleur_relit_le_tag_avec_reprise_sans_desarmer_la_garde() {
+    autotest("relire-tag-avec-reprise.sh", 8);
+
+    let controleur = workflow("release-controller.yml");
+    assert!(
+        controleur.contains("source scripts/relire-tag-avec-reprise.sh"),
+        "le controleur ne charge plus la reprise de relecture"
+    );
+    assert!(
+        controleur.contains(r#"relu="$(relire_tag_avec_reprise "$sha" cible_tag "$repo" "$tag")""#),
+        "la relecture d'apres-creation ne passe plus par la reprise"
+    );
+    assert!(
+        !controleur.contains(r#"relu="$(cible_tag "$repo" "$tag")""#),
+        "la relecture immediate SANS reprise est de retour — c'est elle qui a \
+         coupe le train de la v0.9.130 (run 33522674458)"
+    );
+
+    // L'echec reste DUR des deux cotes : introuvable au bout des tentatives,
+    // et tag divergent.
+    assert!(
+        controleur.contains("n'est pas verifiable apres creation"),
+        "l'echec dur apres relecture a disparu"
+    );
+    assert!(
+        controleur.contains("pointe sur $existant au lieu de $sha"),
+        "le refus d'un tag deja pose ailleurs a disparu"
+    );
+
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(racine.join("../scripts/relire-tag-avec-reprise.sh"))
+        .expect("scripts/relire-tag-avec-reprise.sh lisible");
+    // Un plafond, et une attente qui reste de l'ordre de la seconde : l'echec
+    // doit rester rapide. Sans plafond, un tag reellement absent ferait tourner
+    // le controleur jusqu'a la borne du job.
+    assert!(script.contains("RELIRE_TAG_ESSAIS:-5"));
+    assert!(script.contains("RELIRE_TAG_PAUSE:-1"));
+    assert!(
+        script.contains("return 3"),
+        "le verdict immediat sur un tag divergent a disparu du script"
+    );
+}
+
+/// L'envoi des `.deb` echouait systematiquement, APRES avoir reussi.
+///
+/// `gh release upload "$TAG" dist/*.deb dist/SHA256SUMS.deb --clobber` nommait
+/// le meme actif deux fois — `dist/*.deb` couvre deja `dist/SHA256SUMS.deb` —
+/// et l'ordre alphabetique du glob l'envoyait EN PREMIER, avant les paquets
+/// qu'il annonce. D'ou le `HTTP 404` du run 33536592140, et surtout l'etat
+/// qu'il laissait : au premier passage de la v0.9.130, `amd64` manquait alors
+/// que SHA256SUMS.deb, publie, le listait.
+#[test]
+fn les_deb_partent_un_par_un_les_empreintes_en_dernier_et_l_inventaire_tranche() {
+    autotest("attacher-deb-release.sh", 10);
+
+    let deb = workflow("deb.yml");
+    assert!(
+        !deb.contains(r#"gh release upload "$TAG" dist/*.deb dist/SHA256SUMS.deb"#),
+        "l'envoi en lot est de retour : `dist/*.deb` couvre deja \
+         `dist/SHA256SUMS.deb`, le meme actif est nomme deux fois et `--clobber` \
+         rend HTTP 404 (run 33536592140)"
+    );
+
+    let jobs = jobs(&deb);
+    let corps = |nom: &str| {
+        jobs.iter()
+            .find(|(candidat, _)| candidat == nom)
+            .map(|(_, corps)| corps.as_str())
+            .unwrap_or_else(|| panic!("job {nom} absent de deb.yml"))
+    };
+    let publication = corps("publish");
+    assert!(
+        publication.contains(r#"bash scripts/attacher-deb-release.sh "$TAG" dist"#),
+        "le job d'envoi n'appelle plus le script qui pose les actifs un par un"
+    );
+    assert!(
+        publication.contains("uses: actions/checkout@v4"),
+        "sans checkout, scripts/attacher-deb-release.sh n'existe pas dans ce job"
+    );
+    // La seule chose que la condition gardait — ne rien publier depuis une PR —
+    // reste gardee.
+    assert!(
+        publication.contains("github.event_name != 'pull_request' && inputs.publish"),
+        "la condition d'envoi ne protege plus les PR, ou ne couvre plus l'appel \
+         par la promotion"
+    );
+}
+
+/// Le `.deb` n'est jamais parti tout seul : `deb.yml` ecoute
+/// `release: [published]`, et GitHub ne declenche aucun workflow depuis un
+/// evenement produit avec le `GITHUB_TOKEN` par defaut (anti-recursion). Or
+/// c'est ce jeton qui publie la release dans `promote-release.yml`. Mesure :
+/// aucun run `release` dans tout l'historique de deb.yml, jamais.
+///
+/// Un `uses:` ne passe par aucun evenement — c'est le meme run qui continue.
+#[test]
+fn la_promotion_emporte_le_paquet_debian_dans_son_propre_run() {
+    let deb = workflow("deb.yml");
+    assert!(
+        deb.contains("  workflow_call:"),
+        "deb.yml n'est pas appelable : la promotion ne peut pas emporter le paquet"
+    );
+    // Le declencheur mort est CONSERVE : il tire encore si un humain publie la
+    // release depuis l'interface web. On ne retire pas une porte, on en ajoute.
+    assert!(
+        deb.contains("  release:\n    types: [published]"),
+        "le declencheur `release` a ete retire au lieu d'etre double"
+    );
+
+    let promotion = workflow("promote-release.yml");
+    let jobs = jobs(&promotion);
+    let paquet = jobs
+        .iter()
+        .find(|(nom, _)| nom == "deb")
+        .map(|(_, corps)| corps.as_str())
+        .expect("promote-release.yml ne lance plus le paquet Debian");
+    assert!(paquet.contains("uses: ./.github/workflows/deb.yml"));
+    assert!(
+        paquet.contains("needs: promote"),
+        "le paquet serait construit avant que la release ne soit publique"
+    );
+    assert!(paquet.contains("tag: v${{ inputs.version }}"));
+    assert!(paquet.contains("publish: true"));
+    assert!(
+        paquet.contains("if: ${{ !inputs.dry_run }}"),
+        "un dry-run de promotion attacherait un paquet pour de vrai"
     );
 }
