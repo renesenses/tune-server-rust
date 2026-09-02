@@ -3727,9 +3727,22 @@ impl PlaybackOrchestrator {
     ///
     /// Returns `Some(stream_url)` only when `url` is a playlist that
     /// dereferenced to a different http(s) URL; `None` for a direct media URL
-    /// (no network hit — cheap extension gate first), for HLS `.m3u8` (that
-    /// manifest IS the stream, consumed directly by the player), or on any
-    /// fetch/parse failure — so the caller keeps the original URL.
+    /// (no network hit — cheap extension gate first), for an HLS `.m3u8`
+    /// manifest, or on any fetch/parse failure — so the caller keeps the
+    /// original URL.
+    ///
+    /// `.m3u8` est écarté du déréférencement, et ce n'est PAS parce que « le
+    /// manifeste EST le flux, consommé directement par le lecteur » — ce que
+    /// cette phrase affirmait jusqu'à #2307, en annonçant une capacité qui
+    /// n'a jamais existé. Tune n'a aucun chargeur de segments HLS : le seul
+    /// lecteur de flux radio est `decode_radio_stream_to_pcm`, un GET unique
+    /// poussé dans symphonia. Et déréférencer ne servirait à rien non plus :
+    /// une playlist HLS ne porte que des chemins de segments RELATIFS, donc
+    /// le filtre `http(s)` ci-dessous n'y trouverait rien à rendre (constat
+    /// déjà écrit noir sur blanc dans la migration 86, qui a retiré BBC
+    /// Radio 3 pour cette raison). La garde reste donc telle quelle ; c'est
+    /// la LECTURE qui refuse HLS, en le NOMMANT — voir
+    /// [`RADIO_HLS_UNSUPPORTED`].
     async fn resolve_playlist_url(&self, url: &str) -> Option<String> {
         let path = url
             .split(['?', '#'])
@@ -11257,6 +11270,15 @@ fn emit_radio_playback_error(
         format!(
             "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
         )
+    } else if error.starts_with(RADIO_HLS_UNSUPPORTED) {
+        // Nommer HLS, et dire quoi faire. Avant #2307 l'auditeur recevait au
+        // mieux le « radio probe failed: … » de symphonia — le nom d'un
+        // sous-système qu'il n'a aucune raison de connaître, sur un défaut
+        // qu'il ne peut pas corriger. Ici il apprend que sa station est bien
+        // vivante, que c'est Tune qui ne sait pas la lire, et quoi demander.
+        format!(
+            "« {station} » est diffusée en HLS (manifeste .m3u8) : Tune ne sait pas encore lire ce format de flux. Demandez à la station son adresse de flux directe (MP3 ou AAC), ou choisissez une autre station."
+        )
     } else {
         format!("Impossible de lire la station « {station} » : {error}")
     };
@@ -11325,6 +11347,62 @@ pub(crate) fn non_audio_content_type(content_type: &str) -> Option<String> {
         .then_some(ct)
 }
 
+/// Préfixe des erreurs « cette station est diffusée en HLS » (#2307).
+///
+/// Distinct de [`RADIO_NOT_AUDIO`] parce que le remède n'est pas le même : une
+/// station en `text/html` est morte ou a changé d'adresse, une station en HLS
+/// est bien vivante et c'est Tune qui ne sait pas la lire. Confondre les deux
+/// enverrait l'auditeur chercher une adresse de remplacement qui n'existe pas.
+pub(crate) const RADIO_HLS_UNSUPPORTED: &str = "radio_hls_unsupported";
+
+/// Cette station est-elle publiée en HLS ?
+///
+/// HLS n'est pas un format de conteneur qu'il suffirait d'ajouter au décodeur :
+/// c'est un PROTOCOLE. Un `.m3u8` est un manifeste qui liste des segments à
+/// télécharger l'un après l'autre, et qu'il faut re-télécharger périodiquement
+/// tant que le direct dure. `decode_radio_stream_to_pcm` fait un GET, un seul,
+/// et pousse le corps dans symphonia. Tune ne sait donc pas lire HLS ; dire
+/// lequel, et le dire à l'auditeur, est tout ce que ce contrôle sert à faire.
+///
+/// Deux signaux, tous deux SANS AMBIGUÏTÉ — c'est délibérément étroit, parce
+/// qu'un faux positif rendrait muette une station qui marche aujourd'hui :
+///
+///   * l'extension `.m3u8` du chemin, paramètres et ancre retirés ;
+///   * le type MIME `application/vnd.apple.mpegurl`, le type ENREGISTRÉ de HLS
+///     (RFC 8216) — le seul cas où une URL sans extension se dénonce.
+///
+/// Volontairement ABSENTS : `audio/x-mpegurl`, `audio/mpegurl` et
+/// `application/x-mpegurl`, que les serveurs servent aussi pour une simple
+/// playlist `.m3u`. Une `.m3u` est déréférencée en amont par
+/// `resolve_playlist_url` ; quand ce déréférencement échoue (réseau), le
+/// décodeur la reçoit telle quelle — et l'annoncer « HLS » serait un
+/// diagnostic FAUX sur le chemin le plus fréquenté. Mieux vaut se taire sur
+/// ces types-là que mentir.
+///
+/// Ce contrôle vit à part de [`non_audio_content_type`] et ne le modifie pas :
+/// cette liste noire répond à une autre question (« le serveur a-t-il rendu une
+/// page web ? ») et son témoin exige justement que les types `mpegurl` la
+/// traversent. Les deux gardes sont indépendantes.
+///
+/// `content_type` peut être vide : c'est le mode « avant le réseau », où seule
+/// l'extension parle.
+pub(crate) fn is_hls_manifest(url: &str, content_type: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".m3u8") {
+        return true;
+    }
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/vnd.apple.mpegurl")
+}
+
 /// Applique l'EQ au PCM radio déjà décodé, avant sa quantification en i16.
 /// `None` est une identité stricte : les chemins sans EQ conservent exactement
 /// les mêmes échantillons et ne paient aucun traitement supplémentaire.
@@ -11357,6 +11435,19 @@ fn decode_radio_stream_to_pcm(
     use symphonia::core::meta::MetadataOptions;
     use tracing::{debug, info, warn};
 
+    // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
+    // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
+    // rafraîchissement de playlist, rien de ce qu'un direct HLS exige. Sans
+    // cette porte le manifeste partait quand même dans symphonia avec
+    // l'indice « mp3 » (le repli du `hint` plus bas, `.m3u8` ne correspondant
+    // à aucune branche), et l'auditeur récoltait au mieux un « radio probe
+    // failed: ... » illisible, au pire du silence si le probe accrochait une
+    // fausse synchro dans le texte du manifeste. On refuse, et on le DIT.
+    if is_hls_manifest(&url, "") {
+        return Err(format!(
+            "{RADIO_HLS_UNSUPPORTED}: {url} est un manifeste HLS, pas un flux audio décodable"
+        ));
+    }
     let rt =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime for radio decode")?;
 
@@ -11423,6 +11514,13 @@ fn decode_radio_stream_to_pcm(
             if let Some(bad) = non_audio_content_type(&content_type) {
                 return Err(format!(
                     "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
+                ));
+            }
+            // Un manifeste HLS servi depuis une URL sans extension : seul le
+            // type MIME le dénonce. Même refus nommé que la porte d'entrée.
+            if is_hls_manifest(&url, &content_type) {
+                return Err(format!(
+                    "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
                 ));
             }
             info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
@@ -11498,7 +11596,9 @@ fn decode_radio_stream_to_pcm(
                 // flux audio en réessayant trente fois : on remonte l'erreur
                 // tout de suite pour qu'elle soit DITE, au lieu de quinze
                 // secondes de silence suivies d'un abandon muet.
-                if e.starts_with(RADIO_NOT_AUDIO) {
+                // Ni un manifeste HLS, que trente reconnexions ne
+                // transformeront pas davantage en flux Icecast (#2307).
+                if e.starts_with(RADIO_NOT_AUDIO) || e.starts_with(RADIO_HLS_UNSUPPORTED) {
                     return Err(e);
                 }
                 reconnects += 1;
@@ -12454,7 +12554,8 @@ mod wav_override_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RADIO_NOT_AUDIO, arm_local_stream_consumer_watch, emit_radio_playback_error,
+        RADIO_HLS_UNSUPPORTED, RADIO_NOT_AUDIO, arm_local_stream_consumer_watch,
+        decode_radio_stream_to_pcm, emit_radio_playback_error, is_hls_manifest,
         non_audio_content_type,
     };
     use crate::event_bus::EventBus;
@@ -12635,6 +12736,202 @@ mod tests {
     #[test]
     fn no_event_bus_is_not_a_panic() {
         emit_radio_playback_error(&None, 1, "Station", "boom");
+    }
+
+    // -----------------------------------------------------------------------
+    // #2307 — les flux HLS ne sont jamais lus. Ils doivent au moins le DIRE.
+    // -----------------------------------------------------------------------
+
+    /// Les deux signaux retenus, et eux seuls, dénoncent un manifeste HLS.
+    #[test]
+    fn un_manifeste_hls_est_reconnu_par_son_extension_ou_son_type() {
+        for url in [
+            "https://example.net/hls/master.m3u8",
+            "https://example.net/live/index.M3U8",
+            // Paramètres de session : très fréquent chez les CDN HLS.
+            "https://example.net/live/playlist.m3u8?token=abc&sid=42",
+            "https://example.net/live/playlist.m3u8#debut",
+            "http://as-hls.example.co.uk/pool/x/live/bbc_6music-audio=96000.m3u8",
+        ] {
+            assert!(
+                is_hls_manifest(url, ""),
+                "{url} aurait dû être reconnue comme HLS : sans la garde d'extension, elle repart en silence dans symphonia"
+            );
+        }
+        // URL sans extension : seul le type enregistré de HLS la dénonce.
+        assert!(is_hls_manifest(
+            "https://example.net/live/stream",
+            "application/vnd.apple.mpegurl"
+        ));
+        assert!(is_hls_manifest(
+            "https://example.net/live/stream",
+            "Application/VND.Apple.MpegURL; charset=utf-8"
+        ));
+    }
+
+    /// LE TÉMOIN. Rien de ce qui joue aujourd'hui ne doit être pris pour du
+    /// HLS : ni les playlists `.m3u`/`.pls` — le chemin fréquenté, déréférencé
+    /// en amont par `resolve_playlist_url` — ni aucune des formes d'adresse que
+    /// `radios_validation_url` déclare légitimes, ni aucun des types MIME que
+    /// `real_radio_content_types_pass_through` exige de laisser passer.
+    ///
+    /// Les types `audio/x-mpegurl` et `application/x-mpegurl` sont ici
+    /// VOLONTAIREMENT du côté « pas HLS » : ils servent aussi pour une simple
+    /// `.m3u`, et un diagnostic « HLS » sur une `.m3u` dont le déréférencement
+    /// a échoué serait un mensonge sur le chemin le plus emprunté.
+    #[test]
+    fn le_temoin_m3u_pls_et_les_stations_livrees_ne_sont_jamais_pris_pour_du_hls() {
+        for url in [
+            "http://example.net/live.m3u",
+            "http://example.net/live.pls",
+            "https://radioswissjazz.ch/live/mp3.m3u",
+            "http://icecast.example.net:8000/stream.mp3",
+            "https://ais-sa8.cdnstream1.com/3630_128.mp3",
+            "https://radio.jamminvibezonline.ca/listen/reggae/stream.aac",
+            "https://example.net/live/flac",
+            "https://example.net/autodj",
+            "http://192.168.1.42:8000/",
+            "http://[2001:db8::1]:8000/stream",
+            "https://s.eu/live/aac?bitrate=320&session=abc",
+            "HTTP://EXAMPLE.NET/Stream.MP3",
+            "http://example.net/stream#anchor",
+        ] {
+            assert!(
+                !is_hls_manifest(url, ""),
+                "{url} prise pour du HLS à tort — une station qui joue deviendrait muette"
+            );
+        }
+        for ct in [
+            "audio/aac",
+            "audio/mpeg",
+            "audio/aacp",
+            "audio/ogg",
+            "audio/flac",
+            "audio/x-flac",
+            "application/ogg",
+            "application/octet-stream",
+            "audio/x-mpegurl",
+            "audio/mpegurl",
+            "application/x-mpegurl",
+            "video/mp2t",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !is_hls_manifest("http://example.net/live.m3u", ct),
+                "type « {ct} » pris pour du HLS à tort"
+            );
+        }
+    }
+
+    /// Ce contrôle est INDÉPENDANT de `non_audio_content_type` : ajouter les
+    /// types HLS à cette liste noire aurait cassé son propre témoin, qui exige
+    /// qu'ils la traversent. Les deux répondent à deux questions différentes.
+    #[test]
+    fn le_controle_hls_ne_touche_pas_la_liste_noire_page_web() {
+        assert_eq!(
+            non_audio_content_type("application/vnd.apple.mpegurl"),
+            None
+        );
+        assert_eq!(non_audio_content_type("audio/x-mpegurl"), None);
+        assert!(!is_hls_manifest("http://example.net/live", "text/html"));
+    }
+
+    /// L'ÉPREUVE : la fonction de production qui lit réellement les radios,
+    /// appelée telle quelle, refuse un manifeste HLS — et le refuse AVANT le
+    /// réseau.
+    ///
+    /// L'adresse pointe sur `127.0.0.1:9` (discard), qui refuse la connexion
+    /// instantanément. Si la garde disparaissait, le décodeur ouvrirait le
+    /// réseau et rendrait `radio HTTP fetch failed: …` : l'assertion tombe.
+    /// Le test ne peut donc pas passer pour une mauvaise raison.
+    #[tokio::test]
+    async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
+        use crate::http::streamer::{AudioStreamer, StreamInfo};
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let info = StreamInfo {
+            format: "wav".to_string(),
+            mime_type: "audio/wav".to_string(),
+            ..StreamInfo::default()
+        };
+        let (_session_id, tx, data_ready, session) = streamer.create_radio_session(info, 4).await;
+        // Appelée EXACTEMENT comme la production l'appelle : ses trois sites
+        // (sortie locale, OAAT, DLNA proxifiée) l'enveloppent dans
+        // `spawn_blocking`, parce que symphonia et `reqwest::blocking` sont
+        // synchrones. Le test emprunte donc le même chemin, et un sabotage de
+        // la garde y produit la vraie erreur réseau plutôt qu'une panique de
+        // runtime qui masquerait ce qui s'est passé.
+        let erreur = tokio::task::spawn_blocking(move || {
+            decode_radio_stream_to_pcm(
+                "http://127.0.0.1:9/live/master.m3u8?token=abc".to_string(),
+                tx,
+                data_ready,
+                session,
+                None,
+                None,
+            )
+        })
+        .await
+        .expect("la tâche de décodage ne doit pas paniquer")
+        .expect_err("un manifeste HLS ne doit jamais être accepté comme flux");
+        assert!(
+            erreur.starts_with(RADIO_HLS_UNSUPPORTED),
+            "le décodeur doit refuser en NOMMANT HLS, pas en laissant symphonia \
+             échouer sur un message obscur : {erreur}"
+        );
+    }
+
+    /// Et l'auditeur, lui, voit quoi ? Un `zone.playback_error` `fatal: true`
+    /// — le canal que le client web écoute déjà pour sept autres échecs de
+    /// lecture, et que le websocket sert à tout client abonné (motif `*` par
+    /// défaut, `tune-server/src/routes/ws.rs`). Le message doit NOMMER HLS :
+    /// c'est toute la différence entre « Tune est cassé » et « cette station
+    /// utilise un format que Tune ne lit pas encore ».
+    #[tokio::test]
+    async fn une_station_hls_est_annoncee_a_l_auditeur_en_nommant_hls() {
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        emit_radio_playback_error(
+            &Some(bus.clone()),
+            9,
+            "Radio Segments",
+            &format!(
+                "{RADIO_HLS_UNSUPPORTED}: https://example.net/master.m3u8 est un \
+                 manifeste HLS, pas un flux audio décodable"
+            ),
+        );
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event_type, "zone.playback_error");
+        assert_eq!(ev.data["zone_id"], 9);
+        assert_eq!(
+            ev.data["fatal"], true,
+            "sans fatal:true le client étouffe le message dans sa fenêtre de grâce"
+        );
+        let msg = ev.data["error"].as_str().unwrap();
+        assert!(
+            msg.contains("Radio Segments"),
+            "le message doit nommer la station : {msg}"
+        );
+        assert!(
+            msg.contains("HLS"),
+            "le message doit NOMMER le protocole en cause : {msg}"
+        );
+        assert!(
+            msg.contains(".m3u8"),
+            "le message doit donner le mot que l'auditeur verra chez son opérateur : {msg}"
+        );
+        // Surtout pas le diagnostic de la station morte : la station HLS est
+        // vivante, lui dire de chercher une nouvelle adresse serait faux.
+        assert!(
+            !msg.contains("page web"),
+            "HLS ne doit pas être confondu avec une station morte : {msg}"
+        );
+    }
+
+    /// Aucun bus (démarrage partiel, tests) : on se tait, on ne panique pas.
+    #[test]
+    fn un_refus_hls_sans_bus_ne_panique_pas() {
+        emit_radio_playback_error(&None, 1, "Station", RADIO_HLS_UNSUPPORTED);
     }
 
     /// Le garde-fou ne doit RIEN casser : les types réellement servis par les
