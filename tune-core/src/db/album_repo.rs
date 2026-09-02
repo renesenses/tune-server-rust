@@ -2270,6 +2270,30 @@ fn jetons_de_genre(genre: Option<&str>, genres_json: Option<&str>) -> Vec<String
     jetons
 }
 
+/// Décode le drapeau « compilation » (#1957) tel qu'une requête SQL le rend,
+/// sur les deux moteurs et sur toutes les bases.
+///
+/// UN SEUL décodeur, pour que toutes les routes qui servent un album rendent
+/// la même chose : [`row_to_album`] s'en sert pour le modèle, et les routes
+/// qui construisent leur JSON à la main s'en servent pour leur colonne.
+///
+/// - `as_i64` tolère l'entier de SQLite (`INTEGER`), le `SMALLINT` de
+///   PostgreSQL, un booléen natif, ET le texte d'une base issue de
+///   `tune db migrate-to-postgres` que la migration PG 028 n'a pas encore
+///   soignée — donc jamais de faux « non » par simple désaccord de type.
+/// - **NUL ⇒ `false`, jamais `null`.** [`Album::is_compilation`] est un `bool`
+///   sans troisième état, `COALESCE(is_compilation, 0)` gouverne déjà la
+///   lecture (filtre) et l'écriture (`marquer_compilation`), et la migration
+///   PG 028 finit par `UPDATE albums SET is_compilation = 0 WHERE … IS NULL`.
+///   Rendre `null` obligerait chaque client à gérer un état que ni le modèle
+///   ni le schéma ne portent, pour une valeur qui vaut « non » partout
+///   ailleurs dans le serveur.
+pub fn drapeau_compilation(col: Option<&SqlValue>) -> bool {
+    col.and_then(|v| v.as_i64())
+        .map(|n| n != 0)
+        .unwrap_or(false)
+}
+
 fn row_to_album(cols: &Vec<SqlValue>) -> Album {
     Album {
         id: cols.first().and_then(|v| v.as_i64()),
@@ -2281,15 +2305,9 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         genre: cols.get(6).and_then(|v| v.as_string()),
         // Index 23 (after the 23-col select): a.genres
         genres: cols.get(23).and_then(|v| v.as_string()),
-        // Index 24: a.is_compilation (#1957). `as_i64` tolère l'entier des deux
-        // moteurs ET le texte d'une base issue de `migrate-to-postgres` pas
-        // encore soignée par la migration PG 028 — donc jamais de faux « non »
-        // par simple désaccord de type. Absent/NUL = non.
-        is_compilation: cols
-            .get(24)
-            .and_then(|v| v.as_i64())
-            .map(|n| n != 0)
-            .unwrap_or(false),
+        // Index 24: a.is_compilation (#1957). Voir [`drapeau_compilation`] :
+        // même décodeur que les routes qui bâtissent leur JSON à la main.
+        is_compilation: drapeau_compilation(cols.get(24)),
         // Index 25: added_at — absent de la plupart des requêtes (None) ;
         // le listing trié par date d'ajout le renseigne après coup, depuis
         // sa première passe (#1269).

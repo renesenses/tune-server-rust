@@ -86,7 +86,8 @@ pub(super) async fn albums_detailed(
                 COUNT(*), \
                 MAX(t.format), \
                 MAX(t.sample_rate), \
-                MAX(t.bit_depth) \
+                MAX(t.bit_depth), \
+                MAX(al.is_compilation) \
          FROM tracks t \
          LEFT JOIN albums al ON al.id = t.album_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id{where_clause} \
@@ -114,6 +115,13 @@ pub(super) async fn albums_detailed(
             let format = it.next().and_then(|v| v.as_string());
             let sample_rate = it.next().and_then(|v| v.as_i64());
             let bit_depth = it.next().and_then(|v| v.as_i64());
+            // Le drapeau « compilation » (#1957). Un `MAX()` comme les autres
+            // colonnes d'album : constante au sein du groupe, et PostgreSQL
+            // exigerait sinon la colonne dans le GROUP BY. Décodé par le
+            // décodeur unique de `tune-core` — jamais de `null` : une ligne
+            // sans album, ou une base migrée qui porte encore NULL, vaut
+            // « non », exactement comme dans le modèle `Album`.
+            let is_compilation = tune_core::db::album_repo::drapeau_compilation(it.next().as_ref());
             Some(json!({
                 "album_id": album_id,
                 "title": title,
@@ -127,6 +135,7 @@ pub(super) async fn albums_detailed(
                 "format": format,
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
+                "is_compilation": is_compilation,
             }))
         })
         .collect();

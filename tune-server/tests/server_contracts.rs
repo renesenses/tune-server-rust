@@ -27,6 +27,8 @@ mod cles_developpeur_persistance;
 mod collections_couleur_persistee;
 #[path = "collections_ordre_albums.rs"]
 mod collections_ordre_albums;
+#[path = "compilation_dans_les_reponses_album.rs"]
+mod compilation_dans_les_reponses_album;
 #[path = "config_secrets_et_roles.rs"]
 mod config_secrets_et_roles;
 #[path = "contexte_de_session.rs"]

@@ -540,7 +540,10 @@ fn execute_smart_track_query(
         order.to_string()
     };
     let sql = format!(
-        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path \
+        // `al.is_compilation` en 10 (#1957) : la ligne porte déjà quatre
+        // colonnes d'album (`al.title`, `al.id`, `al.cover_path`, l'année),
+        // et c'est d'elles que `smart_collection_albums` bâtit ses albums.
+        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path, al.is_compilation \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
@@ -566,6 +569,10 @@ fn execute_smart_track_query(
                 "year": cols.get(7).and_then(|v| v.as_i64()).map(|y| y as i32),
                 "album_id": cols.get(8).and_then(|v| v.as_i64()),
                 "cover_path": cols.get(9).and_then(|v| v.as_string()),
+                // Drapeau de l'ALBUM de la piste (#1957), aux côtés des
+                // autres champs d'album déjà portés ici. Ajout : aucune clé
+                // existante ne bouge.
+                "is_compilation": tune_core::db::album_repo::drapeau_compilation(cols.get(10)),
             })
         })
         .collect())
@@ -665,6 +672,13 @@ async fn smart_collection_albums(
                     "artist_name": track.get("artist_name"),
                     "cover_path": track.get("cover_path"),
                     "year": track.get("year"),
+                    // #1957 — l'album que cette vue sert porte son drapeau,
+                    // comme partout ailleurs. Toujours un booléen : la ligne
+                    // vient du même décodeur, qui ne rend jamais `null`.
+                    "is_compilation": track
+                        .get("is_compilation")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 }));
             }
         }
