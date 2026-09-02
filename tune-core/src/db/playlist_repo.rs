@@ -75,20 +75,41 @@ pub mod sql {
     /// aucun changement visible là-bas. Le repli protège les bibliothèques
     /// moins régulières, pas celle qui a servi à écrire ceci.
     ///
-    /// Le `GROUP BY` dédoublonne côté base : un album de douze titres ne fait
-    /// pas douze lignes. Le découpage à quatre reste à l'appelant — la base
-    /// n'a pas à connaître la forme de la vignette.
+    /// Le `GROUP BY` porte sur l'ALBUM — artiste et titre, insensibles à la
+    /// casse — et non sur le chemin de la pochette.
+    ///
+    /// Grouper sur le chemin ne suffisait pas : un coffret est stocké comme
+    /// PLUSIEURS albums, chacun avec son propre fichier de pochette en cache.
+    /// Quatre chemins différents, une seule image. Vécu sur la collection
+    /// « Classique » de Bertrand : les quatre disques du coffret Górecki
+    /// « A Nonesuch Retrospective » remplissaient la mosaïque à eux seuls,
+    /// quatre fois la même pochette (02/09/2026).
+    ///
+    /// Le couple artiste + titre les réunit, là où le titre seul confondrait
+    /// deux albums homonymes d'artistes différents.
+    ///
+    /// Deux groupes peuvent malgré tout partager un chemin : le découpage à
+    /// quatre, côté appelant, dédoublonne donc AUSSI sur le chemin. La base ne
+    /// connaît pas la forme de la vignette.
+    ///
+    /// 🔴 Sans album, la clé retombe sur le CHEMIN de la pochette. Une piste
+    /// hors album n'a ni artiste ni titre d'album : toutes se seraient
+    /// regroupées sous la clé vide, et une playlist de titres épars n'aurait
+    /// montré qu'une seule pochette. Deux tests existants l'ont attrapé dès la
+    /// première version de ce groupement.
     pub fn covers_for_page<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT pt.playlist_id, COALESCE(t.cover_path, al.cover_path) AS cover, \
+            "SELECT pt.playlist_id, MIN(COALESCE(t.cover_path, al.cover_path)) AS cover, \
              MIN(pt.position) AS pos \
              FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id \
              LEFT JOIN albums al ON al.id = t.album_id \
+             LEFT JOIN artists ar ON ar.id = al.artist_id \
              WHERE COALESCE(t.cover_path, al.cover_path) IS NOT NULL \
              AND COALESCE(t.cover_path, al.cover_path) <> '' \
              AND pt.playlist_id IN (SELECT p.id FROM playlists p WHERE p.profile_id = {} \
              ORDER BY LOWER(p.name) LIMIT {} OFFSET {}) \
-             GROUP BY pt.playlist_id, COALESCE(t.cover_path, al.cover_path) \
+             GROUP BY pt.playlist_id, LOWER(COALESCE(ar.name, '')), \
+             LOWER(COALESCE(al.title, t.cover_path, '')) \
              ORDER BY pt.playlist_id, pos",
             d.placeholder(1),
             d.placeholder(2),
@@ -272,8 +293,11 @@ impl PlaylistRepo {
                 continue;
             };
             let e = out.entry(pid).or_default();
-            // Le tri de la requête garantit l'ordre ; on coupe simplement.
-            if e.len() < max {
+            // Le tri de la requête garantit l'ordre. Second dédoublonnage, sur
+            // le CHEMIN : deux albums distincts peuvent partager une pochette
+            // (une compilation et sa réédition, par exemple), et la mosaïque
+            // montrerait alors deux fois la même image.
+            if e.len() < max && !e.iter().any(|c| c == &cover) {
                 e.push(cover);
             }
         }
@@ -645,6 +669,106 @@ mod tests {
                 .unwrap_or_default(),
             vec!["ALB", "PISTE"],
             "la piste nue doit apporter la pochette de son album, en premiere position"
+        );
+    }
+
+    /// Les albums SANS pochette ne consomment pas de case.
+    ///
+    /// Regle de Bertrand : quatre pochettes DISTINCTES « si possible »
+    /// (02/09/2026). Un fichier nu ne doit donc pas voler une place a une
+    /// pochette qui existe plus loin — sinon la mosaique en montrerait trois la
+    /// ou la playlist en a quatre, et rien ne le signalerait : elle cyclerait,
+    /// ce qui reste credible a l'oeil.
+    #[test]
+    fn les_pistes_sans_pochette_ne_volent_pas_de_case() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        // Trois pistes nues intercalees entre les pochettes : elles ne doivent
+        // ni apparaitre, ni empecher D d'etre atteinte.
+        let ids: Vec<i64> = [
+            ("n1", None),
+            ("p1", Some("A")),
+            ("n2", None),
+            ("p2", Some("B")),
+            ("n3", None),
+            ("p3", Some("C")),
+            ("p4", Some("D")),
+        ]
+        .iter()
+        .map(|(n, c)| piste(&track_repo, n, *c))
+        .collect();
+
+        let pl = repo.create("Troue", None, 1).unwrap();
+        repo.add_tracks(pl, &ids, None).unwrap();
+
+        assert_eq!(
+            repo.covers_for_page(1, 50, 0, 4)
+                .unwrap()
+                .get(&pl)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["A", "B", "C", "D"],
+            "quatre pochettes distinctes malgre trois pistes nues intercalees"
+        );
+    }
+
+    /// Un COFFRET ne remplit pas la mosaique a lui seul.
+    ///
+    /// Un coffret est stocke comme PLUSIEURS albums, chacun avec son propre
+    /// fichier de pochette en cache : quatre chemins differents, une seule
+    /// image. Groupe sur le chemin, les quatre disques prenaient les quatre
+    /// cases. Vecu sur la collection « Classique » de Bertrand — le coffret
+    /// Gorecki « A Nonesuch Retrospective » (02/09/2026).
+    ///
+    /// Le groupe porte donc sur l'ALBUM : artiste + titre, insensibles a la
+    /// casse.
+    #[test]
+    fn un_coffret_ne_prend_qu_une_case() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db.clone());
+
+        // Quatre disques du MEME coffret : meme artiste, meme titre, quatre
+        // pochettes en cache differentes. Puis deux vrais autres albums.
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1,'Gorecki'),(2,'Autre'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (1,'A Nonesuch Retrospective',1,'C1'), \
+               (2,'A Nonesuch Retrospective',1,'C2'), \
+               (3,'a nonesuch retrospective',1,'C3'), \
+               (4,'A Nonesuch Retrospective',1,'C4'), \
+               (5,'Vrai Deux',2,'D'), \
+               (6,'Vrai Trois',2,'E');",
+        )
+        .unwrap();
+
+        let mut ids = Vec::new();
+        for (i, album) in [1i64, 2, 3, 4, 5, 6].iter().enumerate() {
+            let mut t = TrackModel::new(format!("t{i}"));
+            t.file_path = Some(format!("/t{i}.flac"));
+            t.album_id = Some(*album);
+            t.cover_path = None; // la pochette vient de l'album
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        let pl = repo.create("Coffret", None, 1).unwrap();
+        repo.add_tracks(pl, &ids, None).unwrap();
+
+        let obtenu = repo
+            .covers_for_page(1, 50, 0, 4)
+            .unwrap()
+            .get(&pl)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            obtenu.len(),
+            3,
+            "le coffret ne doit compter que pour UNE case : {obtenu:?}"
+        );
+        assert!(
+            obtenu.contains(&"D".to_string()) && obtenu.contains(&"E".to_string()),
+            "les deux autres albums doivent y figurer : {obtenu:?}"
         );
     }
 

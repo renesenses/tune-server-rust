@@ -186,23 +186,41 @@ async fn list_collections(
             // propre de la collection — une vignette de quatre cases n'est pas
             // un aperçu du classement, et rejouer le tri complet ici coûterait
             // une jointure de plus pour un gain invisible.
+            // Groupe sur l'ALBUM — artiste + titre, insensibles a la casse — et
+            // non sur le chemin de la pochette.
+            //
+            // Un coffret est stocke comme PLUSIEURS albums, chacun avec son
+            // propre fichier de pochette en cache : quatre chemins differents,
+            // une seule image. Groupe sur le chemin, les quatre disques
+            // remplissaient la mosaique a eux seuls — vecu sur la collection
+            // « Classique » de Bertrand, coffret Gorecki « A Nonesuch
+            // Retrospective » (02/09/2026).
+            //
+            // On demande DOUZE groupes pour n'en garder que quatre : deux
+            // albums distincts peuvent partager un chemin (une compilation et
+            // sa reedition), et sans marge la mosaique tomberait a trois.
             let covers_sql = format!(
-                "SELECT al.cover_path FROM albums al \
+                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
                  LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
-                 GROUP BY al.cover_path \
-                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> '' \
-                 ORDER BY MIN(al.title) LIMIT 4"
+                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                 ORDER BY t LIMIT 12"
             );
-            let covers: Vec<String> = state
-                .backend
-                .query_many(&covers_sql, &[])
-                .map(|rs| {
-                    rs.iter()
-                        .filter_map(|r| r.first().and_then(|v| v.as_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut covers: Vec<String> = Vec::new();
+            if let Ok(rs) = state.backend.query_many(&covers_sql, &[]) {
+                for r in &rs {
+                    let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                        continue;
+                    };
+                    if covers.len() == 4 {
+                        break;
+                    }
+                    if !covers.iter().any(|x| x == &c) {
+                        covers.push(c);
+                    }
+                }
+            }
             col["covers"] = json!(covers);
 
             col
@@ -1062,26 +1080,38 @@ mod tests {
         // Six albums, dont DEUX partageant la pochette « A » : elle ne doit
         // occuper qu'une seule case.
         db.execute_batch(
-            "INSERT INTO albums (id, title, cover_path) VALUES \
-               (1,'a1','A'),(2,'a2','A'),(3,'b','B'),(4,'c','C'),(5,'d','D'),(6,'e','E'); \
-             INSERT INTO albums (id, title, cover_path) VALUES (7,'a0_sans_pochette',NULL);",
+            "INSERT INTO artists (id, name) VALUES (1,'Un'),(2,'Deux'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (1,'a1',1,'A'),(2,'a2',2,'A'),(3,'b',1,'B'),(4,'c',1,'C'), \
+               (5,'d',1,'D'),(6,'e',1,'E'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (7,'a0_sans_pochette',1,NULL);",
         )
         .unwrap();
 
         let requete = |where_clause: &str| -> Vec<String> {
+            // La requete de production, mot pour mot.
             let sql = format!(
-                "SELECT al.cover_path FROM albums al \
+                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
                  LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
-                 GROUP BY al.cover_path \
-                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> '' \
-                 ORDER BY MIN(al.title) LIMIT 4"
+                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                 ORDER BY t LIMIT 12"
             );
-            db.query_many(&sql, &[])
-                .unwrap()
-                .iter()
-                .filter_map(|r| r.first().and_then(|v| v.as_string()))
-                .collect()
+            let mut out: Vec<String> = Vec::new();
+            for r in &db.query_many(&sql, &[]).unwrap() {
+                let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                    continue;
+                };
+                if out.len() == 4 {
+                    break;
+                }
+                if !out.iter().any(|x| x == &c) {
+                    out.push(c);
+                }
+            }
+            out
         };
 
         // Clause VIDE — une collection sans regle. C'est le cas qui casserait
@@ -1109,6 +1139,59 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(sans_plafond, 5, "cinq pochettes distinctes en base");
+    }
+
+    /// Un COFFRET ne remplit pas la mosaique a lui seul.
+    ///
+    /// Quatre disques du meme coffret = quatre ALBUMS, chacun avec son propre
+    /// fichier de pochette en cache. Quatre chemins differents, une seule
+    /// image. Groupe sur le chemin, ils prenaient les quatre cases — vecu sur
+    /// la collection « Classique » de Bertrand (02/09/2026).
+    #[test]
+    fn un_coffret_ne_prend_qu_une_case_dans_une_collection() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1,'Gorecki'),(2,'Autre'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (1,'A Nonesuch Retrospective',1,'C1'), \
+               (2,'A Nonesuch Retrospective',1,'C2'), \
+               (3,'a nonesuch retrospective',1,'C3'), \
+               (4,'A Nonesuch Retrospective',1,'C4'), \
+               (5,'Zeta',2,'D'),(6,'Zeta Deux',2,'E');",
+        )
+        .unwrap();
+
+        let sql = "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
+                   LEFT JOIN artists ar ON al.artist_id = ar.id \
+                   LEFT JOIN tracks t ON t.album_id = al.id \
+                   GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                   HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                   ORDER BY t LIMIT 12";
+        let mut out: Vec<String> = Vec::new();
+        for r in &db.query_many(sql, &[]).unwrap() {
+            let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            if out.len() == 4 {
+                break;
+            }
+            if !out.iter().any(|x| x == &c) {
+                out.push(c);
+            }
+        }
+        assert_eq!(
+            out.len(),
+            3,
+            "le coffret ne doit compter que pour UNE case : {out:?}"
+        );
+        assert!(
+            out.contains(&"D".to_string()) && out.contains(&"E".to_string()),
+            "les deux autres albums doivent y figurer : {out:?}"
+        );
     }
 
     #[test]
