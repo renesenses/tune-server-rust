@@ -36,6 +36,11 @@ mod tests {
         /// SetAVTransportURI accepté, sauf si `media_info_fige` est vrai.
         current_uri: Arc<Mutex<String>>,
         media_info_fige: Arc<Mutex<bool>>,
+        /// #2749 — l'ampli HEOS en VEILLE reseau : sa pile UPnP repond deja
+        /// (SetAVTransportURI et Play sont acquittes) mais il ne tient AUCUN
+        /// media tant qu'il n'est pas sorti de veille. Les `n` premieres
+        /// lectures de `GetMediaInfo` rendent donc une `CurrentURI` VIDE.
+        media_info_vide_restants: Arc<AtomicU32>,
         /// Corps des SetAVTransportURI reçus, dans l'ordre.
         set_uri_corps: Arc<Mutex<Vec<String>>>,
         /// « Salon » (#2581) : ce renderer refuse `Play` avec le code UPnP 701
@@ -113,6 +118,7 @@ mod tests {
                 stop_exige_pause: Arc::new(Mutex::new(false)),
                 current_uri: Arc::new(Mutex::new(String::new())),
                 media_info_fige: Arc::new(Mutex::new(false)),
+                media_info_vide_restants: Arc::new(AtomicU32::new(0)),
                 set_uri_corps: Arc::new(Mutex::new(Vec::new())),
                 salon_701_sans_media: Arc::new(Mutex::new(false)),
                 refus_701_restants: Arc::new(Mutex::new(0)),
@@ -417,7 +423,17 @@ mod tests {
                 .into_response()
             }
             "GetMediaInfo" => {
-                let uri = state.current_uri.lock().await.clone();
+                // #2749 — les `n` premieres lectures rendent le VIDE : l'ampli
+                // n'est pas encore sorti de veille.
+                let encore_en_veille = state
+                    .media_info_vide_restants
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok();
+                let uri = if encore_en_veille {
+                    String::new()
+                } else {
+                    state.current_uri.lock().await.clone()
+                };
                 soap_ok(
                     "GetMediaInfo",
                     &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
@@ -811,6 +827,45 @@ mod tests {
             dernier.contains("<CurrentURI></CurrentURI>"),
             "le média mort (notre hôte) devait être vidé, dernier envoi : {}",
             &dernier[..dernier.len().min(200)]
+        );
+        handle.abort();
+    }
+
+    /// #2749 — L'AMPLI SORT DE VEILLE, ET LA ZONE JOUE.
+    ///
+    /// Le renderer acquitte `SetAVTransportURI` puis `Play` — sa pile UPnP est
+    /// bien vivante — mais rend une `CurrentURI` VIDE tant qu'il n'a pas fini
+    /// de sortir de veille et de basculer sur son entree reseau. Tune y lisait
+    /// « il joue une autre source » et coupait la zone en 13,5 s.
+    ///
+    /// Ce test passe par `play_media` : c'est LUI qui prouve que la fenetre de
+    /// reveil est BRANCHEE, et pas seulement ecrite. Les six premieres
+    /// lectures — tout le bareme de #2390 — ne voient que du vide ; c'est la
+    /// septieme, celle de la fenetre de reveil, qui trouve l'URI.
+    #[tokio::test]
+    async fn un_ampli_qui_sort_de_veille_finit_par_jouer() {
+        let state = MockState::default();
+        state.media_info_vide_restants.store(6, Ordering::Relaxed);
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+        let url = "http://192.168.1.18:8888/stream/fip-reveil.flac";
+        output
+            .play_media(&PlayMedia {
+                url,
+                mime_type: "audio/flac",
+                title: Some("FIP"),
+                ..Default::default()
+            })
+            .await
+            .expect("l'ampli a fini de se reveiller : la lecture doit aboutir");
+        assert_eq!(
+            *state.current_uri.lock().await,
+            url,
+            "le renderer doit finir sur NOTRE flux"
+        );
+        assert!(
+            state.set_uri_corps.lock().await.len() >= 2,
+            "l'URI devait etre REPOSEE pendant l'attente, pas seulement posee une fois"
         );
         handle.abort();
     }
