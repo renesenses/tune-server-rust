@@ -578,17 +578,6 @@ pub(crate) fn dual_stack_listen_socket(
 /// Le dossier de donnees de Tune sous macOS, relatif a `$HOME`.
 pub const MACOS_DATA_SUBDIR: &str = "Library/Application Support/Tune";
 
-/// Les fichiers annexes d'une base SQLite.
-///
-/// Une base n'est pas UN fichier : le `-wal` porte les transactions pas
-/// encore repliees, le `-shm` l'index de ce journal. Copier la base seule
-/// et laisser son `-wal` derriere rend une base amputee des dernieres
-/// ecritures ; l'inverse — poser un `-wal` etranger a cote d'une base —
-/// fait rejouer un journal qui n'est pas le sien. Le patron est celui de
-/// `tune_core::db_backup`, qui traite deja les deux suffixes ensemble dans
-/// `create_backup`, `replace_database` et `prune_backups`.
-const ANNEXES_SQLITE: [&str; 2] = ["-wal", "-shm"];
-
 /// Ce que le demarrage doit faire de la base, une fois la regle appliquee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionBaseMacos {
@@ -693,95 +682,21 @@ pub fn plan_base_macos(
 }
 
 /// Recopie une base SQLite **et ses annexes** vers `cible`, sans jamais
-/// effacer la source.
+/// effacer la source — reexportee depuis [`tune_core::db_backup`].
 ///
-/// Deux garanties, parce qu'il s'agit de la donnee d'un utilisateur :
+/// #3227 l'avait ecrite ici pour la migration macOS ; la migration Windows
+/// vers `%LOCALAPPDATA%\TuneServer` avait besoin du meme geste, au mot pres.
+/// Plutot que d'en tenir deux exemplaires, la mise en oeuvre vit desormais
+/// dans `tune_core::db_backup` — la caisse qui portait deja la connaissance
+/// « le `-wal` et le `-shm` voyagent avec la base », dans `create_backup`,
+/// `replace_database` et `prune_backups`, et que les DEUX chemins de
+/// migration atteignent. Un seul geste, un seul endroit a corriger la
+/// prochaine fois.
 ///
-/// * **rien n'est detruit** — on copie, on ne deplace pas. Si quoi que ce
-///   soit tourne mal ensuite, la base d'origine est encore la ou elle etait ;
-///   au demarrage suivant la regle la verra comme [`ActionBaseMacos::DeuxBases`]
-///   et la laissera intacte ;
-/// * **aucun etat a mi-chemin** — les trois fichiers sont d'abord ecrits a
-///   cote de la cible sous un nom temporaire, puis mis en place par des
-///   renommages faits dans le meme dossier. Un echec avant la fin retire les
-///   temporaires ET les fichiers deja poses, et rend l'erreur : la cible est
-///   alors exactement dans l'etat ou elle etait.
-///
-/// Sans `cfg` : la migration est ainsi eprouvee sur toutes les plateformes.
-pub fn copier_base_sqlite(source: &Path, cible: &Path) -> Result<u64, String> {
-    /// Defait ce qui a ete pose, retire les temporaires, et rend l'erreur.
-    fn renoncer(
-        a_poser: &[(PathBuf, PathBuf)],
-        poses: &[PathBuf],
-        erreur: String,
-    ) -> Result<u64, String> {
-        for chemin in poses {
-            let _ = std::fs::remove_file(chemin);
-        }
-        for (temporaire, _) in a_poser {
-            let _ = std::fs::remove_file(temporaire);
-        }
-        Err(erreur)
-    }
-
-    let nom_source = source
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("chemin de base invalide : {}", source.display()))?;
-    let nom_cible = cible
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("chemin de base invalide : {}", cible.display()))?;
-    let marque = format!("{nom_cible}.migration-{}", std::process::id());
-
-    // (temporaire, nom definitif)
-    let mut a_poser: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut poses: Vec<PathBuf> = Vec::new();
-
-    let temporaire = cible.with_file_name(&marque);
-    if let Err(e) = std::fs::copy(source, &temporaire) {
-        // Rien n'a encore ete pose : il n'y a que ce temporaire a retirer, et
-        // il peut n'avoir jamais ete cree.
-        let _ = std::fs::remove_file(&temporaire);
-        return Err(format!("copie de {} : {e}", source.display()));
-    }
-    a_poser.push((temporaire, cible.to_path_buf()));
-
-    for suffixe in ANNEXES_SQLITE {
-        let annexe = source.with_file_name(format!("{nom_source}{suffixe}"));
-        if !annexe.exists() {
-            continue;
-        }
-        let temporaire = cible.with_file_name(format!("{marque}{suffixe}"));
-        if let Err(e) = std::fs::copy(&annexe, &temporaire) {
-            let _ = std::fs::remove_file(&temporaire);
-            return renoncer(
-                &a_poser,
-                &poses,
-                format!("copie de {} : {e}", annexe.display()),
-            );
-        }
-        a_poser.push((
-            temporaire,
-            cible.with_file_name(format!("{nom_cible}{suffixe}")),
-        ));
-    }
-
-    for (temporaire, definitif) in &a_poser {
-        if let Err(e) = std::fs::rename(temporaire, definitif) {
-            return renoncer(
-                &a_poser,
-                &poses,
-                format!("mise en place de {} : {e}", definitif.display()),
-            );
-        }
-        poses.push(definitif.clone());
-    }
-
-    std::fs::metadata(cible)
-        .map(|m| m.len())
-        .map_err(|e| format!("base migree illisible a {} : {e}", cible.display()))
-}
+/// Les deux versions ont ete comparees ligne a ligne avant la fusion : elles
+/// etaient **identiques** — meme ordre, memes messages d'erreur, meme
+/// renoncement. Aucun comportement n'a ete arbitre au passage.
+pub use tune_core::db_backup::copier_base_sqlite;
 
 /// Applique le plan de [`plan_base_macos`] : cree le dossier de donnees,
 /// migre s'il le faut, puis pose les chemins definitifs dans la configuration.
