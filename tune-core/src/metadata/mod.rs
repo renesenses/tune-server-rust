@@ -561,17 +561,18 @@ struct DsfHeaderInfo {
 
 /// Parse a DSF file header to extract sample rate, channel count, duration,
 /// and the metadata (ID3v2) offset.
-fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
+fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, &'static str> {
     use std::io::Read;
 
-    let mut f =
-        std::fs::File::open(&*crate::library::artwork::extended_path(path)).map_err(|_| ())?;
+    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path))
+        .map_err(|_| "ouverture_impossible")?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
-    f.read_exact(&mut header).map_err(|_| ())?;
+    f.read_exact(&mut header)
+        .map_err(|_| "entete_dsd_trop_court")?;
 
     // Verify "DSD " magic
     if &header[0..4] != b"DSD " {
-        return Err(());
+        return Err("magie_dsd_absente");
     }
 
     // DSD chunk: bytes 4-11 = chunk size (u64 LE, should be 28)
@@ -584,7 +585,7 @@ fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
 
     // fmt chunk should start at offset 28
     if &header[28..32] != b"fmt " {
-        return Err(());
+        return Err("magie_fmt_absente");
     }
 
     // fmt chunk layout (all little-endian):
@@ -1117,55 +1118,403 @@ fn decode_utf16(data: &[u8], little_endian: bool) -> String {
     String::from_utf16_lossy(&code_units)
 }
 
+/// Nombre d'octets que le lecteur de tag DSF tient en mémoire d'un seul bloc.
+///
+/// Ce n'est PLUS un plafond de REFUS. Un tag plus gros n'est plus jeté en
+/// bloc : il est relu trame par trame par [`read_id3v2_selected_frames`], qui
+/// ne copie que les trames utiles et SAUTE les autres d'un `seek` — elles ne
+/// sont jamais allouées.
+///
+/// Le chiffre ne bouge pas, parce que c'est lui qui borne la pointe mémoire du
+/// scan : [`try_read_metadata`] est appelé par le pool de `scanner/walker.rs`,
+/// à `SCAN_IO_CONCURRENCY = 32` lectures simultanées, soit 32 Mio de pointe.
+/// C'est la contrainte mesurée sur ce scanner (JeromeQ : 261 fichiers, 6,1 Gio
+/// de RSS sur une machine de 8 Gio, tué par l'OOM killer), la même que citent
+/// [`MAX_RETAINED_COVER_BYTES`] et les deux passes lofty de ce fichier.
+const DSF_TAG_READ_BUDGET: usize = 1_048_576;
+
+/// Origine de l'appel au lecteur de tag ID3v2 brut. Décide si un rejet PARLE.
+///
+/// Les rejets de ce lecteur étaient tous MUETS : un fichier dont le tag entier
+/// était écarté ne laissait aucune trace, et c'est ce qui a rendu #3180
+/// invisible deux mois (Benjithom fil 1100 : titre = nom de fichier ;
+/// Pierre M fil 920 : tags ignorés en bloc et albums DSD sans pochette).
+///
+/// Mais le même lecteur sert aussi une sonde spéculative en tête de MP3/WAV, où
+/// ne rien trouver est le cas NORMAL. Y journaliser un rejet noierait un scan
+/// de dizaines de milliers de fichiers. C'est donc le SITE D'APPEL qui tranche,
+/// pas le lecteur : un `warn!` par fichier réellement écarté, zéro ligne sur un
+/// fichier ordinaire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Id3ReadSite {
+    /// Tag d'un `.dsf`, à l'offset annoncé par son en-tête DSD.
+    ///
+    /// lofty 0.24 ne connaît pas le format DSF — pas de variante `FileType`, le
+    /// mot n'apparaît nulle part dans ses sources —, donc `Probe::read()` échoue
+    /// sur tout `.dsf` et ce lecteur est la SEULE source de titre, d'artiste,
+    /// d'album et de pochette du format. Il n'y a aucun filet derrière : tout
+    /// rejet est une perte sèche et doit laisser une trace.
+    DsfTag,
+    /// Sonde spéculative à l'offset 0 d'un fichier NON-DSF dont lofty a rendu un
+    /// titre vide. N'y trouver aucun tag est le cas normal et fréquent — un
+    /// FLAC sans titre le traverse à chaque scan. Muette, donc.
+    LeadingProbe,
+}
+
+/// Trames qu'un tag hors budget vaut la peine d'être relu pour.
+///
+/// Exactement ce que [`parse_id3v2_tag`] consomme : les trames de texte
+/// (`T…`, `TXXX` compris) et `UFID`/`UFI`, où Picard écrit l'identifiant
+/// MusicBrainz. Plus `APIC`/`PIC` quand c'est la pochette qu'on est venu
+/// chercher.
+///
+/// Le critère est SÉMANTIQUE, pas une taille : on ne devine pas ce qui est
+/// « gros », on sait ce qui est utile. La trame qui fait déborder le budget est
+/// toujours l'image, et elle n'est copiée que sur le chemin qui la demande.
+fn id3v2_frame_worth_reading(frame_id: &[u8], want_picture: bool) -> bool {
+    if want_picture && (frame_id == b"APIC".as_slice() || frame_id == b"PIC".as_slice()) {
+        return true;
+    }
+    frame_id.first() == Some(&b'T')
+        || frame_id == b"UFID".as_slice()
+        || frame_id == b"UFI".as_slice()
+}
+
+/// Plafond du seul chemin POCHETTE ([`extract_dsf_cover`]).
+///
+/// Plus haut que [`DSF_TAG_READ_BUDGET`] pour une raison de site d'appel, pas de
+/// goût : la pochette n'est extraite qu'UNE fois par album, par la boucle
+/// d'import séquentielle de `scan_import.rs` (garde `albums_with_cover`), alors
+/// que le tag est lu pour CHAQUE fichier sur un pool de 32 lectures
+/// simultanées. Une seule allocation à la fois, donc.
+///
+/// Le chiffre n'est pas choisi : c'est [`MAX_RETAINED_COVER_BYTES`], la seule
+/// borne MESURÉE du dépôt pour une pochette intégrée. Au-delà, Tune refuse déjà
+/// de tenir une pochette en mémoire quel que soit le conteneur ; le DSF suit la
+/// même règle et l'album retombe sur la pochette de son dossier.
+const DSF_COVER_FRAME_BUDGET: usize = MAX_RETAINED_COVER_BYTES;
+
 /// Read the raw ID3v2 tag bytes from a DSF file's metadata chunk.
 ///
 /// DSF files store an ID3v2 tag at the byte offset specified in the DSD
 /// chunk header (bytes 20-27). Returns the tag as a contiguous buffer
 /// (ID3v2 header + body), or `None` if there is no tag or it looks invalid.
-fn read_dsf_id3v2_raw(path: &Path, metadata_offset: Option<u64>) -> Option<Vec<u8>> {
+///
+/// # #3180 — la pochette n'emporte plus le texte
+///
+/// Ce lecteur refusait EN BLOC tout tag de plus d'un mégaoctet. Dans un `.dsf`,
+/// le tag ID3v2 contient la pochette (`APIC`) : sur un rip SACD elle dépasse
+/// couramment le mégaoctet à elle seule. Le refus rendait donc `None` pour la
+/// TOTALITÉ du tag — plus de titre, plus d'artiste, plus d'album, plus de
+/// pochette — et `dsf_dff_fallback` retombait sur `path.file_stem()`. Une seule
+/// ligne expliquait les deux plaintes du ticket.
+///
+/// Le plafond n'est pas relevé : il borne une pointe mémoire réelle. Ce qui
+/// change, c'est qu'il ne décide plus du sort du TEXTE. Au-dessus du budget, le
+/// tag est reparcouru trame par trame et seules les trames utiles sont copiées.
+fn read_dsf_id3v2_raw(
+    path: &Path,
+    metadata_offset: Option<u64>,
+    site: Id3ReadSite,
+    want_picture: bool,
+) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
-
-    let offset = metadata_offset?;
-
-    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
-    let file_len = f.metadata().ok()?.len();
-
-    // Sanity check: offset must be within the file, with room for at least
-    // the 10-byte ID3v2 header.
-    if offset + 10 > file_len {
+    // Un rejet ne parle que depuis le tag d'un `.dsf` — voir [`Id3ReadSite`].
+    let rejet = |motif: &str, detail: String| {
+        if site == Id3ReadSite::DsfTag {
+            tracing::warn!(
+                path = %path.display(),
+                motif = motif,
+                detail = %detail,
+                "dsf_id3v2_tag_ecarte"
+            );
+        }
+    };
+    let Some(offset) = metadata_offset else {
+        // Pas un rejet : l'en-tête DSD annonce 0 quand le fichier n'a aucun tag.
+        // `debug!`, sinon chaque `.dsf` nu d'une bibliothèque écrirait un `warn!`.
+        if site == Id3ReadSite::DsfTag {
+            tracing::debug!(path = %path.display(), "dsf_id3v2_aucun_chunk_metadata");
+        }
+        return None;
+    };
+    let mut f = match std::fs::File::open(&*crate::library::artwork::extended_path(path)) {
+        Ok(f) => f,
+        Err(e) => {
+            rejet("ouverture_impossible", e.to_string());
+            return None;
+        }
+    };
+    let file_len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            rejet("taille_illisible", e.to_string());
+            return None;
+        }
+    };
+    // `offset + 10` débordait en silence sur un offset corrompu proche de
+    // `u64::MAX` : en release le calcul boucle, rend un petit nombre, et la
+    // garde PASSE au lieu d'arrêter. `checked_add` la ferme.
+    match offset.checked_add(10) {
+        Some(fin) if fin <= file_len => {}
+        _ => {
+            rejet(
+                "offset_hors_fichier",
+                format!("offset={offset} taille={file_len}"),
+            );
+            return None;
+        }
+    }
+    if let Err(e) = f.seek(SeekFrom::Start(offset)) {
+        rejet("positionnement_impossible", e.to_string());
         return None;
     }
-
-    f.seek(SeekFrom::Start(offset)).ok()?;
-
     // Read the ID3v2 header to get the tag size
     let mut header = [0u8; 10];
-    f.read_exact(&mut header).ok()?;
-
-    if &header[0..3] != b"ID3" {
+    if let Err(e) = f.read_exact(&mut header) {
+        rejet("entete_id3v2_illisible", e.to_string());
         return None;
     }
-
+    if &header[0..3] != b"ID3" {
+        rejet(
+            "pas_un_tag_id3v2",
+            format!("offset={offset} magie={:02x?}", &header[0..3]),
+        );
+        return None;
+    }
     let tag_size = syncsafe_to_u32(&header[6..10]) as usize;
     let total_tag_bytes = 10 + tag_size;
 
-    // Cap read at 1 MB to avoid OOM on corrupt files
-    if total_tag_bytes > 1_048_576 {
-        return None;
+    // Cas courant : le tag tient dans le budget, il est lu d'un bloc — pochette
+    // comprise, donc `extract_dsf_cover` ne change pas d'un octet ici.
+    if total_tag_bytes <= DSF_TAG_READ_BUDGET {
+        let mut tag_data = Vec::with_capacity(total_tag_bytes);
+        tag_data.extend_from_slice(&header);
+        if let Err(e) = f.by_ref().take(tag_size as u64).read_to_end(&mut tag_data) {
+            rejet("corps_du_tag_illisible", e.to_string());
+            return None;
+        }
+        if tag_data.len() < total_tag_bytes {
+            // Lecture COURTE — le troisième `return None` muet. Le tag annonce
+            // plus d'octets que le fichier n'en porte, mais les trames
+            // COMPLÈTES avant la coupure restent valables et `parse_id3v2_tag`
+            // borne son parcours à `data.len()`. On rend ce qui a été lu au lieu
+            // de jeter un titre parfaitement lisible parce que l'image derrière
+            // est tronquée.
+            tracing::warn!(
+                path = %path.display(),
+                annonce = total_tag_bytes,
+                lu = tag_data.len(),
+                "dsf_id3v2_tag_tronque"
+            );
+        }
+        return Some(tag_data);
     }
 
-    // Read the full tag into memory
-    let mut tag_data = vec![0u8; total_tag_bytes];
-    tag_data[..10].copy_from_slice(&header);
-    f.read_exact(&mut tag_data[10..]).ok()?;
+    // Tag AU-DESSUS du budget : c'est ici que #3180 rendait `None`.
+    match read_id3v2_selected_frames(&mut f, &header, offset, file_len, want_picture) {
+        Some(recompose) => {
+            tracing::debug!(
+                path = %path.display(),
+                taille_tag = total_tag_bytes,
+                budget = DSF_TAG_READ_BUDGET,
+                retenu = recompose.len(),
+                "dsf_id3v2_tag_hors_budget_relu_par_trames"
+            );
+            Some(recompose)
+        }
+        None => {
+            // Le parcours par trames n'est pas sûr ici (voir
+            // `read_id3v2_selected_frames`), ou n'a rien retenu. Reste le
+            // préfixe : on lit le budget et on rend ce qu'il contient, que
+            // `parse_id3v2_tag` sait parcourir jusqu'à la coupure. Moins bon que
+            // le parcours, infiniment mieux que l'ancien `None`.
+            if f.seek(SeekFrom::Start(offset)).is_err() {
+                rejet(
+                    "hors_budget_repositionnement_impossible",
+                    format!("taille={total_tag_bytes} budget={DSF_TAG_READ_BUDGET}"),
+                );
+                return None;
+            }
+            let mut prefixe = Vec::with_capacity(DSF_TAG_READ_BUDGET);
+            if f.by_ref()
+                .take(DSF_TAG_READ_BUDGET as u64)
+                .read_to_end(&mut prefixe)
+                .is_err()
+                || prefixe.len() <= 10
+            {
+                rejet(
+                    "hors_budget_prefixe_illisible",
+                    format!("taille={total_tag_bytes} budget={DSF_TAG_READ_BUDGET}"),
+                );
+                return None;
+            }
+            tracing::warn!(
+                path = %path.display(),
+                taille_tag = total_tag_bytes,
+                budget = DSF_TAG_READ_BUDGET,
+                motif = "trames_non_parcourables",
+                "dsf_id3v2_tag_hors_budget_lu_en_prefixe"
+            );
+            Some(prefixe)
+        }
+    }
+}
 
-    Some(tag_data)
+/// Relit un tag ID3v2 trop gros pour le budget en ne copiant QUE les trames
+/// utiles, les autres étant sautées d'un `seek` — jamais allouées.
+///
+/// Rend un tag ID3v2 **recomposé** (en-tête + trames retenues, taille corrigée)
+/// que [`parse_id3v2_tag`] lit sans savoir qu'il a été rebâti. C'est ce qui
+/// évite de redire ici sa logique de décodage : un seul décodeur, un seul
+/// endroit où le corriger.
+///
+/// Rend `None` quand le parcours ne serait pas fiable — l'appelant retombe alors
+/// sur un préfixe plutôt que sur rien.
+fn read_id3v2_selected_frames(
+    f: &mut std::fs::File,
+    header: &[u8; 10],
+    tag_offset: u64,
+    file_len: u64,
+    want_picture: bool,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let major = header[3];
+    if !(2..=4).contains(&major) {
+        return None;
+    }
+    let flags = header[5];
+    let tag_size = syncsafe_to_u32(&header[6..10]) as u64;
+    // Désynchronisation GLOBALE (fanion 0x80) en v2.2/v2.3 : le bourrage
+    // 0xFF 0x00 est réparti sur TOUT le bloc de trames et les tailles annoncées
+    // ne valent qu'une fois ce bourrage retiré. Sauter de trame en trame sur le
+    // flux stocké désaligne tout dès la première. En v2.4 la désynchronisation
+    // est PAR TRAME et la taille compte les octets STOCKÉS : le parcours reste
+    // juste, `parse_id3v2_tag` défaisant le bourrage trame par trame.
+    if major <= 3 && flags & 0x80 != 0 {
+        return None;
+    }
+    // Fin du tag, bornée par le fichier : une taille annoncée plus grande que ce
+    // que le fichier porte ne doit pas nous faire lire au-delà.
+    let tag_end = tag_offset
+        .saturating_add(10)
+        .saturating_add(tag_size)
+        .min(file_len);
+    let mut cursor = tag_offset.saturating_add(10);
+    // En-tête étendu (v2.3/v2.4) : sauté, il n'est pas recopié.
+    if major >= 3 && flags & 0x40 != 0 {
+        let mut ext = [0u8; 4];
+        f.seek(SeekFrom::Start(cursor)).ok()?;
+        f.read_exact(&mut ext).ok()?;
+        let ext_size = if major == 4 {
+            syncsafe_to_u32(&ext) as u64
+        } else {
+            u32::from_be_bytes(ext) as u64
+        };
+        cursor = cursor.saturating_add(ext_size.max(4));
+    }
+    let (id_len, frame_header_len) = if major == 2 {
+        (3usize, 6u64)
+    } else {
+        (4usize, 10u64)
+    };
+    // Ce que le parcours s'autorise à copier EN TOUT. Le chemin pochette ajoute
+    // de quoi tenir une image PAR-DESSUS le texte — il tourne seul, une fois par
+    // album. Le chemin métadonnées garde le budget du scan, à 32 lectures
+    // simultanées.
+    let allocation_max = if want_picture {
+        (DSF_COVER_FRAME_BUDGET + DSF_TAG_READ_BUDGET) as u64
+    } else {
+        DSF_TAG_READ_BUDGET as u64
+    };
+    let mut kept: Vec<u8> = Vec::new();
+    f.seek(SeekFrom::Start(cursor)).ok()?;
+    while cursor.saturating_add(frame_header_len) <= tag_end {
+        let mut entete = [0u8; 10];
+        let n = frame_header_len as usize;
+        if f.read_exact(&mut entete[..n]).is_err() {
+            break;
+        }
+        cursor += frame_header_len;
+        // Bourrage de fin de tag : des octets nuls, plus aucune trame derrière.
+        if entete[0] == 0 {
+            break;
+        }
+        let frame_size = match major {
+            4 => syncsafe_to_u32(&entete[4..8]) as u64,
+            3 => u32::from_be_bytes([entete[4], entete[5], entete[6], entete[7]]) as u64,
+            // v2.2 : taille sur 3 octets, gros-boutiste.
+            _ => ((entete[3] as u64) << 16) | ((entete[4] as u64) << 8) | (entete[5] as u64),
+        };
+        if frame_size == 0 || cursor.saturating_add(frame_size) > tag_end {
+            break;
+        }
+        // Deux plafonds, un par nature de trame : l'image a le sien
+        // (`DSF_COVER_FRAME_BUDGET`), le texte celui du scan. Une image
+        // au-dessus du sien est SAUTÉE — l'album retombe sur la pochette de son
+        // dossier, comme n'importe quel autre conteneur — sans que le texte
+        // autour d'elle en souffre.
+        let id = &entete[..id_len];
+        let est_image = id == b"APIC".as_slice() || id == b"PIC".as_slice();
+        let plafond_trame = if est_image {
+            DSF_COVER_FRAME_BUDGET as u64
+        } else {
+            DSF_TAG_READ_BUDGET as u64
+        };
+        let garder = id3v2_frame_worth_reading(id, want_picture)
+            && frame_size <= plafond_trame
+            && kept.len() as u64 + frame_header_len + frame_size <= allocation_max;
+        if garder {
+            let mut corps = vec![0u8; frame_size as usize];
+            if f.read_exact(&mut corps).is_err() {
+                break;
+            }
+            kept.extend_from_slice(&entete[..n]);
+            kept.extend_from_slice(&corps);
+        } else {
+            // La trame écartée n'est jamais lue : on passe par-dessus.
+            if f.seek(SeekFrom::Current(frame_size as i64)).is_err() {
+                break;
+            }
+        }
+        cursor += frame_size;
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    // Tag recomposé : le même en-tête, sans le fanion d'en-tête étendu (0x40,
+    // non recopié) ni celui de pied de page (0x10, laissé derrière), et la
+    // taille syncsafe des seules trames retenues.
+    let mut out = Vec::with_capacity(10 + kept.len());
+    out.extend_from_slice(header);
+    out[5] &= !(0x40u8 | 0x10u8);
+    let taille = kept.len();
+    out[6] = ((taille >> 21) & 0x7F) as u8;
+    out[7] = ((taille >> 14) & 0x7F) as u8;
+    out[8] = ((taille >> 7) & 0x7F) as u8;
+    out[9] = (taille & 0x7F) as u8;
+    out.extend_from_slice(&kept);
+    Some(out)
 }
 
 /// Read and parse the ID3v2 metadata chunk from a DSF file.
 fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v2Tags> {
-    let tag_data = read_dsf_id3v2_raw(path, metadata_offset)?;
-    parse_id3v2_tag(&tag_data)
+    let tag_data = read_dsf_id3v2_raw(path, metadata_offset, Id3ReadSite::DsfTag, false)?;
+    match parse_id3v2_tag(&tag_data) {
+        Some(tags) => Some(tags),
+        None => {
+            // Le tag a été LU mais pas compris : version hors 2.2–2.4, en-tête
+            // étendu incohérent… Muet jusqu'ici, alors que c'est le dernier
+            // point avant le repli sur le nom de fichier.
+            tracing::warn!(
+                path = %path.display(),
+                octets = tag_data.len(),
+                motif = "tag_illisible",
+                "dsf_id3v2_tag_ecarte"
+            );
+            None
+        }
+    }
 }
 
 /// Decode the image bytes and MIME type from an ID3v2 picture frame body.
@@ -1258,10 +1607,28 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
         return None;
     }
 
-    let info = parse_dsf_header_full(path).ok()?;
-    let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset)?;
-
-    let (mime, data) = parse_id3v2_tag(&tag_data)?.picture?;
+    let info = match parse_dsf_header_full(path) {
+        Ok(info) => info,
+        Err(motif) => {
+            // `debug!` et pas `warn!` : la passe de métadonnées a déjà parlé au
+            // niveau WARN pour ce même fichier (`dsf_entete_illisible`), et le
+            // redire ici doublerait chaque ligne d'un scan de DSF abîmés.
+            tracing::debug!(path = %path.display(), motif, "dsf_pochette_entete_illisible");
+            return None;
+        }
+    };
+    // `want_picture` : sur un tag hors budget, c'est le seul chemin qui copie la
+    // trame APIC. La passe de métadonnées, elle, la saute — d'où deux plafonds.
+    let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset, Id3ReadSite::DsfTag, true)?;
+    let (mime, data) = match parse_id3v2_tag(&tag_data).and_then(|t| t.picture) {
+        Some(p) => p,
+        None => {
+            // Cas NORMAL et fréquent : un DSF tagué sans pochette intégrée.
+            // `debug!` — un `warn!` ici parlerait pour un album sur deux.
+            tracing::debug!(path = %path.display(), "dsf_aucune_pochette_integree");
+            return None;
+        }
+    };
     Some((data, mime))
 }
 
@@ -1292,7 +1659,14 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
                 info.duration_ms,
                 info.metadata_offset,
             ),
-            Err(_) => (None, None, None, None),
+            Err(motif) => {
+                // Muet jusqu'ici : un `.dsf` dont l'en-tête DSD ne se lit pas
+                // perdait d'un coup fréquence, canaux, durée ET tag, sans une
+                // ligne. lofty ne connaissant pas le format, il n'y a aucun
+                // second lecteur derrière pour rattraper.
+                tracing::warn!(path = %path.display(), motif, "dsf_entete_illisible");
+                (None, None, None, None)
+            }
         }
     } else {
         // DFF (DSDIFF) has no fmt/ID3 chunk like DSF. Previously this arm
@@ -2236,7 +2610,11 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let mut artist = tag.artist().map(|s| s.to_string());
     let mut album = tag.album().map(|s| s.to_string());
     if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
-        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0)) {
+        // `LeadingProbe` : sonde spéculative, ne rien trouver est le cas
+        // normal — elle ne journalise donc aucun rejet. Sans cette
+        // distinction, chaque fichier sans titre d'une bibliothèque
+        // produirait une ligne de journal par scan.
+        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false) {
             if let Some(id3) = parse_id3v2_tag(&raw) {
                 let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
                     if cur.as_deref().map_or(true, |x| x.trim().is_empty()) {
