@@ -348,7 +348,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // with an empty map every file on disk looks new, so a transient DB
         // hiccup would re-insert the whole library as duplicates. (The
         // ScanStatusGuard resets scan_status on this early return.)
-        let existing_tracks = match track_repo.get_all_local_file_info() {
+        let existing_tracks = match track_repo.get_all_file_info_by_path() {
             Ok(map) => map,
             Err(e) => {
                 tracing::error!(error = %e, "auto_scan_aborted_existing_tracks_read_failed");
@@ -462,6 +462,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 }
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
+                // Lignes posées par un importateur que ce lot reprend (#2939).
+                let mut a_adopter: Vec<i64> = Vec::new();
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
@@ -503,29 +505,38 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
-                    // Without this, build_track_from_metadata can create a ghost album
-                    // (with cover but no tracks) for files that are ultimately skipped.
-                    if let Some(&(_existing_id, existing_mtime, existing_size)) =
-                        existing_tracks.get(&sf.path)
-                    {
-                        let file_changed = existing_mtime
-                            .is_none_or(|m| (m - sf.mtime as f64).abs() > 0.5)
-                            || (existing_size != Some(sf.file_size as i64));
-                        if !file_changed {
-                            skipped += 1;
-                            skipped_unchanged += 1;
-                            continue;
-                        }
+                    // Insertion, mise à jour ou rien : la MÊME règle que le scan
+                    // manuel, appelée et non recopiée (#2939). Prise avant
+                    // `importer.import`, sans quoi un album fantôme (pochette,
+                    // zéro piste) naît pour un fichier qu'on va écarter.
+                    // `force` est faux ici : le scan automatique ne re-résout
+                    // jamais les album_id d'un fichier inchangé.
+                    let verdict = crate::routes::system::scan::verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_tracks,
+                    );
+                    if verdict == crate::routes::system::scan::VerdictEcriture::Inchange {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
                     }
 
                     let Some((mut track, _album_id)) = importer.import(sf) else {
                         continue;
                     };
 
-                    // File already exists and has changed — collect for batch update
-                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
-                        track.id = Some(existing_id);
+                    if let crate::routes::system::scan::VerdictEcriture::MettreAJour {
+                        id,
+                        adopter,
+                    } = verdict
+                    {
+                        track.id = Some(id);
+                        if adopter {
+                            a_adopter.push(id);
+                        }
                         to_update.push(track);
                         continue;
                     }
@@ -577,6 +588,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // Reprise des lignes d'importation relues sur le disque — sœur
+                // exacte du scan manuel (#2939).
+                match track_repo.adopter_en_local(&a_adopter) {
+                    Ok(0) => {}
+                    Ok(adoptees) => tracing::info!(
+                        adoptees,
+                        "auto_scan_lignes_importees_adoptees — ces pistes existaient sous une \
+                         source d'importation au même chemin : le scan les a mises à jour et \
+                         reprises."
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "auto_scan_adoption_locale_failed"),
+                }
                 if batch_inserted == to_insert.len() as u64 {
                     for track in &to_insert {
                         if let (Some(hash), Some(album_id), Some(path)) =
@@ -716,7 +739,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // du service, précisément au moment où un montage SMB peut ne pas
             // encore être là. Le point de montage existe, il est lisible, il
             // est vide — et la bibliothèque partait avec (#1652).
-            let existing_refs: Vec<&str> = existing_tracks.keys().map(|s| s.as_str()).collect();
+            // Comme dans le scan manuel : la carte couvre toute la table (la
+            // portée de `file_path TEXT UNIQUE`), mais la purge ne retire que
+            // ce que le scan a posé. Le filtre est explicite, et la purge se
+            // comporte exactement comme avant #2939.
+            let pistes_locales: std::collections::HashMap<&str, i64> = existing_tracks
+                .iter()
+                .filter(|(_, info)| info.est_locale())
+                .map(|(chemin, info)| (chemin.as_str(), info.id))
+                .collect();
+            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
             racines_videes = crate::routes::system::scan::roots_gone_empty(
                 &music_dirs,
                 &existing_refs,
@@ -754,9 +786,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             let mut protected = 0i64;
             let mut hors_perimetre = 0i64;
             let mut a_supprimer: Vec<i64> = Vec::new();
-            let examinees = existing_tracks.len();
-            for (db_path, &(track_id, _, _)) in &existing_tracks {
-                if !discovered_paths.contains(db_path.as_str()) {
+            let examinees = pistes_locales.len();
+            for (&db_path, &track_id) in &pistes_locales {
+                if !discovered_paths.contains(db_path) {
                     match verdict_purge(
                         db_path,
                         &music_dirs,
