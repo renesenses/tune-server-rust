@@ -179,6 +179,71 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
+/// Ce que la route « lire un titre de service » doit faire de la file deja en
+/// base.
+///
+/// 🔴 #2569 (Pierre M, Windows 11) — « la file d'attente se limite au titre en
+/// cours ». Une garde protegeait deja ce cas, et elle a EXISTE sans tenir :
+/// elle lisait `queue_repo.get_ordered(zone_id).unwrap_or_default()`. Ce
+/// `unwrap_or_default()` confond deux reponses opposees :
+///
+/// * `Ok(vec![])` — la base a repondu, la file est reellement vide ;
+/// * `Err(_)` — la base n'a PAS repondu (« database is locked »).
+///
+/// Les deux devenaient une liste vide, `find(...)` rendait `None`, et la
+/// branche restante appelle `queue_repo.clear(zone_id)` : la file de
+/// l'utilisateur etait EFFACEE en base, puis remplacee par le seul titre en
+/// cours. Le symptome exact du signalement, et il vient de l'ECRITURE, pas de
+/// la relecture au demarrage.
+///
+/// La condition n'est pas theorique : #1997 a etabli ici meme qu'un lot de
+/// scan tient la connexion SQLite partagee pendant que l'utilisateur agit sur
+/// sa file. Le chemin d'ECRITURE s'est vu ajouter des reprises pour ca
+/// (`set_queue_retrying`, 12 essais) ; la LECTURE, elle, n'en a jamais eu.
+///
+/// La decision a donc TROIS branches, pas deux. Le doute ne doit pas couter la
+/// file de l'utilisateur.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileDejaChargee {
+    /// Le titre demande est deja dans la file : la garder ENTIERE et poser la
+    /// position courante dessus.
+    Garder { position: i64, longueur: i64 },
+    /// La base a repondu et la file ne contient pas ce titre : elle devient ce
+    /// seul titre. C'est le comportement VOULU — lire un titre depuis une
+    /// recherche remplace bien la file, et cette branche doit rester atteignable
+    /// sur une file vraiment vide, sans quoi on remplacerait un defaut par son
+    /// symetrique.
+    RemplacerParCeTitre,
+    /// La base n'a pas repondu. Ne rien effacer, ne rien persister.
+    NePasToucher,
+}
+
+/// La decision de #2569, seule partie separable du handler HTTP.
+///
+/// `lecture` est le resultat BRUT de `PlayQueueRepo::get_ordered` : c'est son
+/// `Err` — jete jusqu'ici — qui porte toute l'information qui manquait.
+pub(crate) fn file_deja_chargee(
+    lecture: Result<&[tune_core::db::play_queue_repo::QueueEntry], &str>,
+    source: Option<&str>,
+    source_id: &str,
+) -> FileDejaChargee {
+    let entries = match lecture {
+        Ok(entries) => entries,
+        Err(_) => return FileDejaChargee::NePasToucher,
+    };
+    let existante = entries.iter().find(|e| {
+        e.source_id.as_deref() == Some(source_id)
+            && (source.is_none() || e.source.as_deref() == source)
+    });
+    match existante {
+        Some(e) => FileDejaChargee::Garder {
+            position: e.position,
+            longueur: entries.len() as i64,
+        },
+        None => FileDejaChargee::RemplacerParCeTitre,
+    }
+}
+
 /// Whether the server would accept the manual "next" action as an actual
 /// advance instead of stopping the zone at the end of the queue.
 ///
@@ -1364,41 +1429,62 @@ async fn play(
                 // single-track queue would truncate the album down to the current
                 // title (Pierre M: "Si STOP et relance, la file d'attente se
                 // limite au titre en cours").
-                let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
-                let existing = entries.iter().find(|e| {
-                    e.source_id.as_deref() == Some(source_id_val.as_str())
-                        && (source_for_q.is_none()
-                            || e.source.as_deref() == source_for_q.as_deref())
-                });
-                if let Some(e) = existing {
-                    // Keep the full queue, just move the current position onto it
-                    // (its unified position, valid whether the queue is mixed).
-                    state
-                        .playback
-                        .update_queue_info(zone_id, e.position, entries.len() as i64)
-                        .await;
-                } else {
-                    // Not queued yet — make this single streaming track the queue.
-                    queue_repo.clear(zone_id).ok();
-                    if let Err(e) = queue_repo.append(
-                        zone_id,
-                        &[QueueInput::Streaming {
-                            source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
-                            source_id: source_id_val,
-                            title: title_val,
-                            artist: artist_val,
-                            album: album_val,
-                            cover_url: cover_val,
-                            duration_ms: duration_val,
-                            track_number: meta.track_number,
-                            disc_number: meta.disc_number,
-                        }],
-                    ) {
-                        warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
+                //
+                // 🔴 #2569 — cette garde EXISTAIT et ne tenait pas : elle lisait
+                // `get_ordered(...)` puis `.unwrap_or_default()`. Une base
+                // momentanement ILLISIBLE rendait donc une file VIDE, la garde
+                // concluait « ce titre n'est pas dans la file », et prenait la
+                // branche qui EFFACE (`clear`). Voir `file_deja_chargee`.
+                let lecture = queue_repo.get_ordered(zone_id);
+                match file_deja_chargee(
+                    lecture.as_deref().map_err(String::as_str),
+                    source_for_q.as_deref(),
+                    source_id_val.as_str(),
+                ) {
+                    FileDejaChargee::Garder { position, longueur } => {
+                        // Keep the full queue, just move the current position onto it
+                        // (its unified position, valid whether the queue is mixed).
+                        state
+                            .playback
+                            .update_queue_info(zone_id, position, longueur)
+                            .await;
+                        persist_queue_async(&state, zone_id);
                     }
-                    state.playback.update_queue_info(zone_id, 0, 1).await;
+                    FileDejaChargee::RemplacerParCeTitre => {
+                        // Not queued yet — make this single streaming track the queue.
+                        queue_repo.clear(zone_id).ok();
+                        if let Err(e) = queue_repo.append(
+                            zone_id,
+                            &[QueueInput::Streaming {
+                                source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                                source_id: source_id_val,
+                                title: title_val,
+                                artist: artist_val,
+                                album: album_val,
+                                cover_url: cover_val,
+                                duration_ms: duration_val,
+                                track_number: meta.track_number,
+                                disc_number: meta.disc_number,
+                            }],
+                        ) {
+                            warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
+                        }
+                        state.playback.update_queue_info(zone_id, 0, 1).await;
+                        persist_queue_async(&state, zone_id);
+                    }
+                    FileDejaChargee::NePasToucher => {
+                        // La base n'a pas repondu. On ne sait pas ce que la file
+                        // contient : on ne l'efface pas, et on ne persiste pas un
+                        // instantane bati sur ce silence. Le titre demande joue
+                        // quand meme — c'est la file qui est preservee, pas la
+                        // lecture qui est refusee.
+                        warn!(
+                            zone_id,
+                            error = %lecture.as_ref().err().map(String::as_str).unwrap_or_default(),
+                            "file_illisible_file_conservee_2569"
+                        );
+                    }
                 }
-                persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => play_error_response(e).into_response(),
@@ -4719,6 +4805,122 @@ mod save_queue_decision {
     #[test]
     fn une_file_vide_ne_compte_rien() {
         assert_eq!(distantes_de(0, 0), 0);
+    }
+}
+
+/// #2569 — la garde qui protege la file d'attente contre sa propre troncature.
+///
+/// Ces tests portent sur la DECISION, seule partie separable du handler HTTP :
+/// que faire de la file selon ce que la base a REPONDU — y compris quand elle
+/// n'a rien repondu du tout.
+#[cfg(test)]
+mod file_deja_chargee_2569 {
+    use super::{FileDejaChargee, file_deja_chargee};
+    use tune_core::db::play_queue_repo::QueueEntry;
+
+    /// Une ligne de file de service, reduite aux champs dont la garde se sert.
+    fn ligne(position: i64, source: &str, source_id: &str) -> QueueEntry {
+        QueueEntry {
+            id: position + 1,
+            zone_id: 1,
+            track_id: None,
+            position,
+            is_current: false,
+            source: Some(source.into()),
+            source_id: Some(source_id.into()),
+            title: Some(format!("Titre {position}")),
+            artist_name: Some("Artiste".into()),
+            album_title: Some("Album".into()),
+            duration_ms: Some(200_000),
+            file_path: None,
+            cover_path: None,
+            format: None,
+            sample_rate: None,
+            bit_depth: None,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    fn album_qobuz() -> Vec<QueueEntry> {
+        (0..12)
+            .map(|i| ligne(i, "qobuz", &format!("q{i}")))
+            .collect()
+    }
+
+    /// 🔴 LE cas de Pierre M. La base ne repond pas — un lot de scan tient la
+    /// connexion (#1997). L'ancienne garde traduisait ce silence en file vide et
+    /// prenait la branche qui EFFACE. Un album de douze titres tombait a un.
+    ///
+    /// Le silence doit rester un silence : on ne touche a rien.
+    #[test]
+    fn une_base_illisible_ne_doit_rien_effacer() {
+        let decision = file_deja_chargee(Err("query: database is locked"), Some("qobuz"), "q3");
+        assert_eq!(
+            decision,
+            FileDejaChargee::NePasToucher,
+            "une lecture en echec ne dit pas « la file est vide » : elle ne dit rien"
+        );
+    }
+
+    /// La contre-epreuve du meme instant : si la base avait REPONDU, la garde
+    /// aurait vu les douze titres et garde la file. C'est bien le `Err`, et lui
+    /// seul, qui faisait basculer la decision.
+    #[test]
+    fn la_meme_file_lue_correctement_est_conservee_entiere() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("qobuz"), "q3");
+        assert_eq!(
+            decision,
+            FileDejaChargee::Garder {
+                position: 3,
+                longueur: 12
+            }
+        );
+    }
+
+    /// 🔴 LE TEMOIN. Le defaut symetrique serait de ne plus JAMAIS remplacer la
+    /// file. Une file vraiment vide — la base a repondu `Ok(vec![])` — doit
+    /// toujours accepter de devenir le titre demande, sinon « lire ce titre »
+    /// depuis une recherche ne ferait plus rien.
+    #[test]
+    fn une_file_vraiment_vide_accepte_toujours_le_titre_demande() {
+        let decision = file_deja_chargee(Ok(&[]), Some("qobuz"), "q3");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Une file pleine qui ne contient PAS le titre demande se fait bien
+    /// remplacer : la garde ne protege pas la file contre l'utilisateur.
+    #[test]
+    fn une_file_etrangere_au_titre_demande_est_bien_remplacee() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("qobuz"), "autre-chose");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Meme identifiant, autre service : ce n'est pas le meme titre. La garde
+    /// doit comparer la source aussi, sans quoi un `q3` Tidal ferait passer pour
+    /// « deja en file » un `q3` Qobuz.
+    #[test]
+    fn un_meme_identifiant_sur_un_autre_service_ne_compte_pas() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("tidal"), "q3");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Sans source precisee, l'identifiant seul suffit — c'est ce que fait la
+    /// route quand le client n'envoie que `source_id`.
+    #[test]
+    fn sans_source_precisee_l_identifiant_seul_suffit() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), None, "q7");
+        assert_eq!(
+            decision,
+            FileDejaChargee::Garder {
+                position: 7,
+                longueur: 12
+            }
+        );
     }
 }
 

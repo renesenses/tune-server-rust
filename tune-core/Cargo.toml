@@ -192,6 +192,13 @@ path = "tests/ape_pic_memoire_i2505.rs"
 name = "scan_refus_insertion_comptes_2939"
 path = "tests/scan_refus_insertion_comptes_2939.rs"
 
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# #2569 / #2775 — l'instantane de file d'attente ne doit pas etre ecrase par une
+# base momentanement illisible, et DOIT l'etre quand l'utilisateur vide sa file.
+[[test]]
+name = "instantane_de_file_i2569_f4c821"
+path = "tests/instantane_de_file_i2569_f4c821.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
