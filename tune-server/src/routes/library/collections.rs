@@ -97,6 +97,43 @@ const POCHETTES_IDS_MAX: usize = 600;
 /// entière.
 const POCHETTES_FENETRE: usize = POCHETTES_MAX * 16;
 
+/// Les quatre pochettes d'une collection, dans SON ordre à elle.
+///
+/// `par_album` associe un identifiant d'album à son chemin de pochette et à sa
+/// clé de mosaïque. Extraite du corps de la route pour être testable : cette
+/// route n'avait aucun test, et c'est ici qu'une mosaïque se remplit d'une
+/// seule image.
+fn quatre_pochettes(
+    ids: &[i64],
+    par_album: &std::collections::HashMap<i64, (String, String)>,
+) -> Vec<String> {
+    let mut vues: Vec<String> = Vec::new();
+    let mut cles: Vec<String> = Vec::new();
+    for id in ids {
+        let Some((cover, cle)) = par_album.get(id) else {
+            continue;
+        };
+        // Dédoublonnage sur le DISQUE d'abord : un même disque est stocké comme
+        // plusieurs lignes d'albums, une par artiste crédité, chacune avec son
+        // propre fichier de pochette en cache — autant de chemins, une seule
+        // image (« Les indispensables du piano », treize pianistes, 02/09/2026).
+        if cles.iter().any(|k| k == cle) {
+            continue;
+        }
+        // Puis sur le CHEMIN : deux disques distincts peuvent malgré tout
+        // partager une pochette.
+        if vues.iter().any(|v| v == cover) {
+            continue;
+        }
+        cles.push(cle.clone());
+        vues.push(cover.clone());
+        if vues.len() == POCHETTES_MAX {
+            break;
+        }
+    }
+    vues
+}
+
 pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut data = settings
@@ -138,7 +175,7 @@ pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Valu
         }
     }
 
-    // id -> (chemin de pochette, cle d'ALBUM : artiste + titre)
+    // id -> (chemin de pochette, cle de mosaique)
     let mut par_album: std::collections::HashMap<i64, (String, String)> =
         std::collections::HashMap::new();
     if !voulus.is_empty() {
@@ -151,59 +188,35 @@ pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Valu
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            // Artiste et titre en DEUX colonnes : la clé se compose côté Rust.
-            // Les concaténer en SQL demanderait un séparateur, donc un caractère
-            // de contrôle échappé — et `\u{{…}}` est lu au lexage, avant
-            // `format!`, ce qui ne compile pas.
-            "SELECT al.id, al.cover_path, LOWER(COALESCE(ar.name, '')) AS artiste, \
-             LOWER(COALESCE(al.title, '')) AS titre \
-             FROM albums al LEFT JOIN artists ar ON ar.id = al.artist_id \
+            // Pas de jointure sur `artists` : la clé de mosaïque ne retient que
+            // le TITRE. L'artiste est justement ce qui varie entre les lignes
+            // d'un même disque.
+            "SELECT al.id, al.cover_path, al.title \
+             FROM albums al \
              WHERE al.id IN ({liste}) \
              AND al.cover_path IS NOT NULL AND al.cover_path <> ''"
         );
         if let Ok(rows) = state.backend.query_many(&sql, &[]) {
             for r in &rows {
-                if let (Some(id), Some(c), Some(a), Some(t)) = (
+                if let (Some(id), Some(c)) = (
                     r.first().and_then(|v| v.as_i64()),
                     r.get(1).and_then(|v| v.as_string()),
-                    r.get(2).and_then(|v| v.as_string()),
-                    r.get(3).and_then(|v| v.as_string()),
                 ) {
-                    // Séparateur non imprimable : aucun nom ne le contient, donc
-                    // « A » + « BC » ne peut pas se confondre avec « AB » + « C ».
-                    par_album.insert(id, (c, format!("{a}\u{1f}{t}")));
+                    let titre = r.get(2).and_then(|v| v.as_string());
+                    let cle = tune_core::library::mosaique::cle_pochette(titre.as_deref(), &c);
+                    par_album.insert(id, (c, cle));
                 }
             }
         }
     }
 
     for c in &mut data {
-        let mut vues: Vec<String> = Vec::new();
-        let mut cles: Vec<String> = Vec::new();
-        if let Some(ids) = c.get("album_ids").and_then(|v| v.as_array()) {
-            for id in ids.iter().filter_map(|v| v.as_i64()) {
-                let Some((cover, cle)) = par_album.get(&id) else {
-                    continue;
-                };
-                // Dédoublonnage sur l'ALBUM d'abord : un coffret est stocké
-                // comme plusieurs albums, chacun avec son propre fichier de
-                // pochette en cache — quatre chemins, une seule image (coffret
-                // Górecki, collection « Classique », 02/09/2026).
-                if cles.iter().any(|k| k == cle) {
-                    continue;
-                }
-                // Puis sur le CHEMIN : deux albums distincts peuvent malgré
-                // tout partager une pochette.
-                if vues.iter().any(|v| v == cover) {
-                    continue;
-                }
-                cles.push(cle.clone());
-                vues.push(cover.clone());
-                if vues.len() == POCHETTES_MAX {
-                    break;
-                }
-            }
-        }
+        let ids: Vec<i64> = c
+            .get("album_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let vues = quatre_pochettes(&ids, &par_album);
         if let Some(obj) = c.as_object_mut() {
             obj.insert("covers".to_string(), json!(vues));
         }
@@ -445,4 +458,111 @@ pub(super) async fn remove_album_from_collection(
     Ok(Json(
         json!({"removed": true, "collection_id": path.id, "album_id": path.album_id}),
     ))
+}
+
+#[cfg(test)]
+mod tests_pochettes {
+    use super::*;
+    use tune_core::library::mosaique::cle_pochette;
+
+    /// Construit la table `id -> (chemin, clé)` comme le fait la route.
+    fn table(albums: &[(i64, &str, &str)]) -> std::collections::HashMap<i64, (String, String)> {
+        albums
+            .iter()
+            .map(|(id, titre, chemin)| {
+                (
+                    *id,
+                    ((*chemin).to_string(), cle_pochette(Some(titre), chemin)),
+                )
+            })
+            .collect()
+    }
+
+    /// Un même disque ne remplit pas la mosaïque à lui seul.
+    ///
+    /// Données RELEVÉES sur le serveur de Bertrand le 02/09/2026 : le coffret
+    /// Górecki existe en quatre lignes d'album, une par artiste crédité, plus
+    /// sa réédition 24 bits — cinq chemins de pochette, une seule image.
+    ///
+    /// ⚠️ Les artistes DIFFÈRENT, et c'est tout le point : une clé
+    /// « artiste + titre » — la première version — laissait passer les cinq.
+    #[test]
+    fn un_meme_disque_ne_prend_qu_une_case() {
+        let t = table(&[
+            (1, "A Nonesuch Retrospective", "C1"),
+            (2, "A Nonesuch Retrospective", "C2"),
+            (3, "a nonesuch retrospective", "C3"),
+            (4, "A Nonesuch Retrospective", "C4"),
+            (5, "A Nonesuch Retrospective (24bit)", "C5"),
+            (6, "Vrai Deux", "D"),
+            (7, "Vrai Trois", "E"),
+        ]);
+        let out = quatre_pochettes(&[1, 2, 3, 4, 5, 6, 7], &t);
+        assert_eq!(out, vec!["C1", "D", "E"], "obtenu {out:?}");
+    }
+
+    /// Treize pianistes, un seul disque — le plus gros cas mesuré sur
+    /// « Classique ». Les albums qui suivent doivent atteindre la mosaïque.
+    #[test]
+    fn treize_lignes_laissent_la_place_aux_suivants() {
+        let mut albums: Vec<(i64, String, String)> = (1..=13)
+            .map(|i| {
+                (
+                    i,
+                    "Les indispensables du piano (96kHz/24bit)".to_string(),
+                    format!("P{i}"),
+                )
+            })
+            .collect();
+        for (i, titre) in [(20i64, "Alpha"), (21, "Beta"), (22, "Gamma")] {
+            albums.push((i, titre.to_string(), format!("X{i}")));
+        }
+        let refs: Vec<(i64, &str, &str)> = albums
+            .iter()
+            .map(|(i, t, c)| (*i, t.as_str(), c.as_str()))
+            .collect();
+        let ids: Vec<i64> = refs.iter().map(|(i, _, _)| *i).collect();
+        let out = quatre_pochettes(&ids, &table(&refs));
+        assert_eq!(out, vec!["P1", "X20", "X21", "X22"], "obtenu {out:?}");
+    }
+
+    /// La contre-épreuve : la clé doit encore SÉPARER ce qui est différent.
+    /// Sans elle, « ne rendre qu'une pochette » passerait aussi le test
+    /// ci-dessus.
+    #[test]
+    fn des_disques_differents_remplissent_les_quatre_cases() {
+        let t = table(&[
+            (1, "Way Out West", "A"),
+            (2, "Come Away With Me (5.1 Remix)", "B"),
+            (3, "Standards, Vol. 2", "C"),
+            (4, "The Koln Concert (Live)", "D"),
+            (5, "Somethin' Else", "E"),
+        ]);
+        let out = quatre_pochettes(&[1, 2, 3, 4, 5], &t);
+        assert_eq!(
+            out,
+            vec!["A", "B", "C", "D"],
+            "plafonne a quatre, dans l'ordre"
+        );
+    }
+
+    /// Deux disques distincts partageant un chemin : une seule case, sinon la
+    /// mosaïque montrerait deux fois la même image.
+    #[test]
+    fn un_chemin_partage_ne_compte_qu_une_fois() {
+        let t = table(&[
+            (1, "Compilation", "A"),
+            (2, "Reedition", "A"),
+            (3, "Autre", "B"),
+        ]);
+        assert_eq!(quatre_pochettes(&[1, 2, 3], &t), vec!["A", "B"]);
+    }
+
+    /// Un identifiant absent de la table — album sans pochette, ou supprimé —
+    /// est sauté sans faire perdre de case.
+    #[test]
+    fn un_album_inconnu_ne_mange_pas_de_case() {
+        let t = table(&[(1, "Un", "A"), (3, "Trois", "B")]);
+        assert_eq!(quatre_pochettes(&[1, 2, 3], &t), vec!["A", "B"]);
+    }
 }

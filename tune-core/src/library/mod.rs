@@ -12,6 +12,7 @@ pub mod ingest;
 pub mod local_path;
 pub mod lyrics_pass;
 pub mod m3u_parser;
+pub mod mosaique;
 pub mod playlist_scan;
 pub mod smart_collections;
 pub mod track_matcher;

@@ -75,41 +75,43 @@ pub mod sql {
     /// aucun changement visible là-bas. Le repli protège les bibliothèques
     /// moins régulières, pas celle qui a servi à écrire ceci.
     ///
-    /// Le `GROUP BY` porte sur l'ALBUM — artiste et titre, insensibles à la
-    /// casse — et non sur le chemin de la pochette.
+    /// Le `GROUP BY` porte sur le TITRE de l'album, insensible à la casse, et
+    /// non sur le chemin de la pochette.
     ///
-    /// Grouper sur le chemin ne suffisait pas : un coffret est stocké comme
-    /// PLUSIEURS albums, chacun avec son propre fichier de pochette en cache.
-    /// Quatre chemins différents, une seule image. Vécu sur la collection
-    /// « Classique » de Bertrand : les quatre disques du coffret Górecki
-    /// « A Nonesuch Retrospective » remplissaient la mosaïque à eux seuls,
-    /// quatre fois la même pochette (02/09/2026).
+    /// Grouper sur le chemin ne suffisait pas : un même disque est stocké comme
+    /// PLUSIEURS lignes d'`albums`, une par artiste crédité, chacune avec son
+    /// propre fichier de pochette en cache. Autant de chemins, une seule image.
     ///
-    /// Le couple artiste + titre les réunit, là où le titre seul confondrait
-    /// deux albums homonymes d'artistes différents.
+    /// Sur la bibliothèque de Bertrand (02/09/2026) : « Les indispensables du
+    /// piano » compte treize lignes — treize pianistes —, « I Give It A Year »
+    /// quatorze, le coffret Górecki « A Nonesuch Retrospective » quatre.
     ///
-    /// Deux groupes peuvent malgré tout partager un chemin : le découpage à
-    /// quatre, côté appelant, dédoublonne donc AUSSI sur le chemin. La base ne
-    /// connaît pas la forme de la vignette.
+    /// 🔴 Le titre SEUL, sans l'artiste. Une première version groupait sur
+    /// artiste + titre : c'était viser à côté, puisque l'artiste est justement
+    /// ce qui varie d'une ligne à l'autre.
     ///
-    /// 🔴 Sans album, la clé retombe sur le CHEMIN de la pochette. Une piste
-    /// hors album n'a ni artiste ni titre d'album : toutes se seraient
-    /// regroupées sous la clé vide, et une playlist de titres épars n'aurait
-    /// montré qu'une seule pochette. Deux tests existants l'ont attrapé dès la
-    /// première version de ce groupement.
+    /// Le titre du disque ne réunit pas tout : « … (24bit) » et sa version sans
+    /// suffixe restent deux groupes. C'est
+    /// [`tune_core::library::mosaique::cle_pochette`], côté appelant, qui les
+    /// rapproche — un nettoyage que ni SQLite ni Postgres ne savent faire de la
+    /// même façon.
+    ///
+    /// 🔴 Sans titre d'album, la clé retombe sur le CHEMIN. Les pistes hors
+    /// album se seraient sinon regroupées sous la clé vide, et une playlist de
+    /// titres épars n'aurait montré qu'une seule pochette. Deux tests
+    /// existants l'ont attrapé dès la première version de ce groupement.
     pub fn covers_for_page<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT pt.playlist_id, MIN(COALESCE(t.cover_path, al.cover_path)) AS cover, \
-             MIN(pt.position) AS pos \
+             MIN(COALESCE(al.title, '')) AS titre, MIN(pt.position) AS pos \
              FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id \
              LEFT JOIN albums al ON al.id = t.album_id \
-             LEFT JOIN artists ar ON ar.id = al.artist_id \
              WHERE COALESCE(t.cover_path, al.cover_path) IS NOT NULL \
              AND COALESCE(t.cover_path, al.cover_path) <> '' \
              AND pt.playlist_id IN (SELECT p.id FROM playlists p WHERE p.profile_id = {} \
              ORDER BY LOWER(p.name) LIMIT {} OFFSET {}) \
-             GROUP BY pt.playlist_id, LOWER(COALESCE(ar.name, '')), \
-             LOWER(COALESCE(al.title, t.cover_path, '')) \
+             GROUP BY pt.playlist_id, \
+             LOWER(COALESCE(al.title, t.cover_path, al.cover_path, '')) \
              ORDER BY pt.playlist_id, pos",
             d.placeholder(1),
             d.placeholder(2),
@@ -284,7 +286,10 @@ impl PlaylistRepo {
         let sql = self.dialect_sql(sql::covers_for_page, sql::covers_for_page);
         let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        let mut out: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        // (clé de mosaïque, chemin) le temps du parcours ; la clé est jetée à la
+        // sortie, l'appelant ne veut que les chemins.
+        let mut out: std::collections::HashMap<i64, Vec<(String, String)>> =
+            std::collections::HashMap::new();
         for cols in &rows {
             let Some(pid) = cols.first().and_then(|v| v.as_i64()) else {
                 continue;
@@ -292,16 +297,30 @@ impl PlaylistRepo {
             let Some(cover) = cols.get(1).and_then(|v| v.as_string()) else {
                 continue;
             };
+            let titre = cols.get(2).and_then(|v| v.as_string());
+            // Le tri de la requête garantit l'ordre.
+            //
+            // Second dédoublonnage, côté Rust, parce que le `GROUP BY` s'arrête
+            // au titre BRUT : « A Nonesuch Retrospective » et « A Nonesuch
+            // Retrospective (24bit) » en sortent séparés, alors que c'est la
+            // même pochette. `cle_pochette` retire le suffixe.
+            let cle = crate::library::mosaique::cle_pochette(titre.as_deref(), &cover);
             let e = out.entry(pid).or_default();
-            // Le tri de la requête garantit l'ordre. Second dédoublonnage, sur
-            // le CHEMIN : deux albums distincts peuvent partager une pochette
-            // (une compilation et sa réédition, par exemple), et la mosaïque
-            // montrerait alors deux fois la même image.
-            if e.len() < max && !e.iter().any(|c| c == &cover) {
-                e.push(cover);
+            if e.len() >= max {
+                continue;
             }
+            // Et sur le CHEMIN : deux albums réellement distincts peuvent
+            // partager une pochette (une compilation et sa réédition), et la
+            // mosaïque montrerait alors deux fois la même image.
+            if e.iter().any(|(_, c)| c == &cover) || e.iter().any(|(k, _)| k == &cle) {
+                continue;
+            }
+            e.push((cle, cover));
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|(pid, v)| (pid, v.into_iter().map(|(_, c)| c).collect()))
+            .collect())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -725,27 +744,37 @@ mod tests {
     /// Le groupe porte donc sur l'ALBUM : artiste + titre, insensibles a la
     /// casse.
     #[test]
-    fn un_coffret_ne_prend_qu_une_case() {
+    fn un_meme_disque_ne_prend_qu_une_case() {
         let db = test_db();
         let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
         let repo = PlaylistRepo::new(db.clone());
 
-        // Quatre disques du MEME coffret : meme artiste, meme titre, quatre
-        // pochettes en cache differentes. Puis deux vrais autres albums.
+        // Un meme disque eclate en QUATRE lignes d'album, une par artiste
+        // credite, chacune avec sa propre pochette en cache. Plus sa reedition
+        // 24 bits, que le titre brut ne rejoint pas. Puis deux vrais autres
+        // albums.
+        //
+        // Les artistes DIFFERENT, comme en base : c'est le point. Ma premiere
+        // version donnait le meme artiste aux quatre lignes, si bien qu'une cle
+        // « artiste + titre » — celle qui a laisse passer le defaut chez
+        // Bertrand — rendait ce test vert.
         db.execute_batch(
-            "INSERT INTO artists (id, name) VALUES (1,'Gorecki'),(2,'Autre'); \
+            "INSERT INTO artists (id, name) VALUES \
+               (1,'Henryk Gorecki'),(2,'Dawn Upshaw'),(3,'Kronos Quartet'), \
+               (4,'London Philharmonic Orchestra'),(9,'Autre'); \
              INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
                (1,'A Nonesuch Retrospective',1,'C1'), \
-               (2,'A Nonesuch Retrospective',1,'C2'), \
-               (3,'a nonesuch retrospective',1,'C3'), \
-               (4,'A Nonesuch Retrospective',1,'C4'), \
-               (5,'Vrai Deux',2,'D'), \
-               (6,'Vrai Trois',2,'E');",
+               (2,'A Nonesuch Retrospective',2,'C2'), \
+               (3,'a nonesuch retrospective',3,'C3'), \
+               (4,'A Nonesuch Retrospective',4,'C4'), \
+               (5,'A Nonesuch Retrospective (24bit)',2,'C5'), \
+               (6,'Vrai Deux',9,'D'), \
+               (7,'Vrai Trois',9,'E');",
         )
         .unwrap();
 
         let mut ids = Vec::new();
-        for (i, album) in [1i64, 2, 3, 4, 5, 6].iter().enumerate() {
+        for (i, album) in [1i64, 2, 3, 4, 5, 6, 7].iter().enumerate() {
             let mut t = TrackModel::new(format!("t{i}"));
             t.file_path = Some(format!("/t{i}.flac"));
             t.album_id = Some(*album);
@@ -764,7 +793,8 @@ mod tests {
         assert_eq!(
             obtenu.len(),
             3,
-            "le coffret ne doit compter que pour UNE case : {obtenu:?}"
+            "le disque, ses quatre artistes et sa reedition 24 bits ne doivent \
+             compter que pour UNE case : {obtenu:?}"
         );
         assert!(
             obtenu.contains(&"D".to_string()) && obtenu.contains(&"E".to_string()),
