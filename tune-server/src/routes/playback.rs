@@ -179,6 +179,71 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
+/// Ce que la route « lire un titre de service » doit faire de la file deja en
+/// base.
+///
+/// 🔴 #2569 (Pierre M, Windows 11) — « la file d'attente se limite au titre en
+/// cours ». Une garde protegeait deja ce cas, et elle a EXISTE sans tenir :
+/// elle lisait `queue_repo.get_ordered(zone_id).unwrap_or_default()`. Ce
+/// `unwrap_or_default()` confond deux reponses opposees :
+///
+/// * `Ok(vec![])` — la base a repondu, la file est reellement vide ;
+/// * `Err(_)` — la base n'a PAS repondu (« database is locked »).
+///
+/// Les deux devenaient une liste vide, `find(...)` rendait `None`, et la
+/// branche restante appelle `queue_repo.clear(zone_id)` : la file de
+/// l'utilisateur etait EFFACEE en base, puis remplacee par le seul titre en
+/// cours. Le symptome exact du signalement, et il vient de l'ECRITURE, pas de
+/// la relecture au demarrage.
+///
+/// La condition n'est pas theorique : #1997 a etabli ici meme qu'un lot de
+/// scan tient la connexion SQLite partagee pendant que l'utilisateur agit sur
+/// sa file. Le chemin d'ECRITURE s'est vu ajouter des reprises pour ca
+/// (`set_queue_retrying`, 12 essais) ; la LECTURE, elle, n'en a jamais eu.
+///
+/// La decision a donc TROIS branches, pas deux. Le doute ne doit pas couter la
+/// file de l'utilisateur.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileDejaChargee {
+    /// Le titre demande est deja dans la file : la garder ENTIERE et poser la
+    /// position courante dessus.
+    Garder { position: i64, longueur: i64 },
+    /// La base a repondu et la file ne contient pas ce titre : elle devient ce
+    /// seul titre. C'est le comportement VOULU — lire un titre depuis une
+    /// recherche remplace bien la file, et cette branche doit rester atteignable
+    /// sur une file vraiment vide, sans quoi on remplacerait un defaut par son
+    /// symetrique.
+    RemplacerParCeTitre,
+    /// La base n'a pas repondu. Ne rien effacer, ne rien persister.
+    NePasToucher,
+}
+
+/// La decision de #2569, seule partie separable du handler HTTP.
+///
+/// `lecture` est le resultat BRUT de `PlayQueueRepo::get_ordered` : c'est son
+/// `Err` — jete jusqu'ici — qui porte toute l'information qui manquait.
+pub(crate) fn file_deja_chargee(
+    lecture: Result<&[tune_core::db::play_queue_repo::QueueEntry], &str>,
+    source: Option<&str>,
+    source_id: &str,
+) -> FileDejaChargee {
+    let entries = match lecture {
+        Ok(entries) => entries,
+        Err(_) => return FileDejaChargee::NePasToucher,
+    };
+    let existante = entries.iter().find(|e| {
+        e.source_id.as_deref() == Some(source_id)
+            && (source.is_none() || e.source.as_deref() == source)
+    });
+    match existante {
+        Some(e) => FileDejaChargee::Garder {
+            position: e.position,
+            longueur: entries.len() as i64,
+        },
+        None => FileDejaChargee::RemplacerParCeTitre,
+    }
+}
+
 /// Whether the server would accept the manual "next" action as an actual
 /// advance instead of stopping the zone at the end of the queue.
 ///
@@ -258,15 +323,6 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
         crate::routes::zones::inject_session_context(obj, &zone_state);
     }
-    // Include stream_url ONLY for browser playback zones, so the web client can
-    // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
-    // / AirPlay / SlimProto / local), an open web-client tab that fetched this URL
-    // would consume the SAME single-consumer stream (streamer.rs mpsc) as the
-    // renderer and starve it — playback stalled or skipped after a few tracks
-    // until the tab was closed (forum: eric, #954; matches "close the tab and the
-    // sound comes back").
-    let is_browser_zone =
-        zone_db.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
     // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
     if let Some(ref zone) = zone_db {
         v.as_object_mut().unwrap().insert(
@@ -287,34 +343,20 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             ),
         );
     }
-    if is_browser_zone {
-        if let Some(ref np) = zone_state.now_playing {
-            if let Some(ref stream_id) = np.stream_id {
-                let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                    tune_core::discovery::ssdp::get_local_ip()
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "127.0.0.1".into())
-                });
-                let ext = "flac";
-                let stream_url = format!(
-                    "http://{}:{}/stream/{}.{}",
-                    server_ip, state.port, stream_id, ext
-                );
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("stream_url".into(), json!(stream_url));
-                // Adresse joignable de l'exterieur, quand le pont est actif.
-                if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                    state.backend.clone(),
-                    stream_id,
-                    ext,
-                ) {
-                    v.as_object_mut()
-                        .unwrap()
-                        .insert("stream_url_remote".into(), json!(distant));
-                }
-            }
-        }
+    // #3164 — la règle vit maintenant dans
+    // `zones::zone_recoit_l_adresse_du_flux`, et `inject_stream_url` est le
+    // seul chemin qui pose l'adresse. Elle n'était appliquée QU'ICI ; les
+    // quatre autres surfaces la recopiaient en commentaire sans la poser.
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_stream_url(
+            obj,
+            state,
+            zone_db.as_ref().and_then(|z| z.output_type.as_deref()),
+            zone_state
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref()),
+        );
     }
     // Include signal_path (the bit-perfect indicator) so the play / next /
     // previous / resume responses carry it, matching GET /zones/{id}. Without
@@ -381,8 +423,20 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     zone.as_object_mut()
         .unwrap()
         .insert("output_sent".into(), json!(result.output_sent));
-    // Expose stream_url for browser playback zones
-    if let Some(ref url) = result.stream_url {
+    // #3164 — `PlayResult::stream_url` vaut `Some(resolved.url)` pour TOUTES
+    // les zones : c'est l'adresse que le renderer va consommer. Sans le filtre,
+    // cet `insert` ÉCRASAIT la décision de `build_zone_json` juste au-dessus et
+    // rendait l'adresse aux vingt routes de lecture qui passent par ici
+    // (`play`, `next`, `previous`, `resume`, `queue/jump`, `pins/{i}/invoke`…)
+    // — c'est-à-dire au chemin le plus fréquenté du client web.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    if crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref())
+        && let Some(ref url) = result.stream_url
+    {
         zone.as_object_mut()
             .unwrap()
             .insert("stream_url".into(), json!(url));
@@ -452,11 +506,24 @@ const CONTEXTES_CONNUS: [&str; 5] = ["track", "album", "playlist", "artist", "la
 /// la piste : un `POST` qui porte a la fois `album_id` et `track_id` met tout
 /// l'album en file, donc c'est bien l'album qui a ete demande.
 ///
-/// `(None, None)` quand rien ne permet de trancher — notamment une liste de
-/// `track_ids` nue, qui peut aussi bien venir d'une page artiste que d'une
-/// selection manuelle. On ecrit alors NULL : une intention devinee est pire
-/// qu'une intention absente.
-fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
+/// `(None, None, None)` quand rien ne permet de trancher — notamment une
+/// liste de `track_ids` nue, qui peut aussi bien venir d'une page artiste que
+/// d'une selection manuelle. On ecrit alors NULL : une intention devinee est
+/// pire qu'une intention absente.
+///
+/// Le TROISIEME membre est le service auquel l'identifiant appartient, sans
+/// lequel il ne s'ouvre pas (#1361). Il ne se lit pas dans le corps entier
+/// mais dans la BRANCHE prise : `album_id`, `playlist_id` et `track_id` sont
+/// des `i64` de bibliotheque, donc `"local"` quel que soit le `source`
+/// annonce — c'est bien la bibliotheque que le gestionnaire interroge sous ces
+/// champs, et `"7"` n'aurait aucun sens chez Qobuz. Les branches de streaming,
+/// elles, portent le service nomme par l'appelant.
+fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, Option<String>) {
+    /// L'espace de noms d'un identifiant de BIBLIOTHEQUE. Le mot est celui que
+    /// `NowPlaying.source` emploie deja pour une piste locale : le client lit
+    /// le meme vocabulaire des deux cotes.
+    const LOCAL: &str = "local";
+
     // 1. L'appelant l'a dit explicitement : sa parole prime sur toute
     //    deduction. C'est la seule voie pour `artist` et `label`.
     if let Some(t) = body
@@ -465,33 +532,61 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>) {
         .map(str::trim)
         .filter(|t| CONTEXTES_CONNUS.contains(t))
     {
-        return (Some(t.to_string()), body.context_id.clone());
+        // L'appelant qui ENONCE son contexte enonce aussi le service dans
+        // `source`, comme pour toute lecture de service. Son absence dit la
+        // bibliotheque : c'est la seule autre provenance possible.
+        let service = body.source.clone().unwrap_or_else(|| LOCAL.to_string());
+        return (Some(t.to_string()), body.context_id.clone(), Some(service));
     }
 
     // 2. Sinon, ce que le corps trahit deja de lui-meme. Les deux premiers cas
     //    exigent `source` comme le gestionnaire lui-meme : sans service
     //    nomme, il ne prend pas la branche streaming, et le contexte doit
     //    decrire ce qui joue vraiment.
-    if let (Some(_), Some(id)) = (&body.source, &body.streaming_album_id) {
-        return ("album".to_string().into(), Some(id.clone()));
+    if let (Some(service), Some(id)) = (&body.source, &body.streaming_album_id) {
+        return (
+            "album".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
-    if let (Some(_), Some(id)) = (&body.source, &body.streaming_playlist_id) {
-        return ("playlist".to_string().into(), Some(id.clone()));
+    if let (Some(service), Some(id)) = (&body.source, &body.streaming_playlist_id) {
+        return (
+            "playlist".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
     if let Some(id) = body.album_id {
-        return ("album".to_string().into(), Some(id.to_string()));
+        return (
+            "album".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     if let Some(id) = body.playlist_id {
-        return ("playlist".to_string().into(), Some(id.to_string()));
+        return (
+            "playlist".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     if let Some(id) = body.track_id {
-        return ("track".to_string().into(), Some(id.to_string()));
+        return (
+            "track".to_string().into(),
+            Some(id.to_string()),
+            Some(LOCAL.to_string()),
+        );
     }
     // Piste unique en streaming : `source` + `source_id`, sans track_id.
-    if body.source.is_some() && body.source_id.is_some() && body.track_ids.is_none() {
-        return ("track".to_string().into(), body.source_id.clone());
+    if let (Some(service), Some(id), None) = (&body.source, &body.source_id, &body.track_ids) {
+        return (
+            "track".to_string().into(),
+            Some(id.clone()),
+            Some(service.clone()),
+        );
     }
-    (None, None)
+    (None, None, None)
 }
 
 #[derive(Deserialize)]
@@ -672,32 +767,23 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             }
         }
     }
-    // Expose stream_url for browser playback zones
-    if let Some(ref np) = zone_state.now_playing {
-        if let Some(ref stream_id) = np.stream_id {
-            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                tune_core::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into())
-            });
-            let ext = "flac"; // default extension
-            let stream_url = format!(
-                "http://{}:{}/stream/{}.{}",
-                server_ip, state.port, stream_id, ext
-            );
-            v.as_object_mut()
-                .unwrap()
-                .insert("stream_url".into(), json!(stream_url));
-            if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                state.backend.clone(),
-                stream_id,
-                ext,
-            ) {
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("stream_url_remote".into(), json!(distant));
-            }
-        }
+    // #3164 — « la surface que les clients interrogent en boucle » (#1274)
+    // publiait l'adresse du flux sans regarder le type de sortie.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_stream_url(
+            obj,
+            &state,
+            output_type.as_deref(),
+            zone_state
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref()),
+        );
     }
     // #1274 — cette charge utile est la sérialisation brute de
     // `PlaybackState`, qui ne porte que le volume linéaire ; le dB s'ajoute
@@ -1063,10 +1149,10 @@ async fn play(
     //
     // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
     // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
-    let (contexte_type, contexte_id) = contexte_de_lecture(&body);
+    let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
     state
         .playback
-        .set_session_context(zone_id, contexte_type, contexte_id)
+        .set_session_context(zone_id, contexte_type, contexte_id, contexte_service)
         .await;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
@@ -1343,41 +1429,62 @@ async fn play(
                 // single-track queue would truncate the album down to the current
                 // title (Pierre M: "Si STOP et relance, la file d'attente se
                 // limite au titre en cours").
-                let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
-                let existing = entries.iter().find(|e| {
-                    e.source_id.as_deref() == Some(source_id_val.as_str())
-                        && (source_for_q.is_none()
-                            || e.source.as_deref() == source_for_q.as_deref())
-                });
-                if let Some(e) = existing {
-                    // Keep the full queue, just move the current position onto it
-                    // (its unified position, valid whether the queue is mixed).
-                    state
-                        .playback
-                        .update_queue_info(zone_id, e.position, entries.len() as i64)
-                        .await;
-                } else {
-                    // Not queued yet — make this single streaming track the queue.
-                    queue_repo.clear(zone_id).ok();
-                    if let Err(e) = queue_repo.append(
-                        zone_id,
-                        &[QueueInput::Streaming {
-                            source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
-                            source_id: source_id_val,
-                            title: title_val,
-                            artist: artist_val,
-                            album: album_val,
-                            cover_url: cover_val,
-                            duration_ms: duration_val,
-                            track_number: meta.track_number,
-                            disc_number: meta.disc_number,
-                        }],
-                    ) {
-                        warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
+                //
+                // 🔴 #2569 — cette garde EXISTAIT et ne tenait pas : elle lisait
+                // `get_ordered(...)` puis `.unwrap_or_default()`. Une base
+                // momentanement ILLISIBLE rendait donc une file VIDE, la garde
+                // concluait « ce titre n'est pas dans la file », et prenait la
+                // branche qui EFFACE (`clear`). Voir `file_deja_chargee`.
+                let lecture = queue_repo.get_ordered(zone_id);
+                match file_deja_chargee(
+                    lecture.as_deref().map_err(String::as_str),
+                    source_for_q.as_deref(),
+                    source_id_val.as_str(),
+                ) {
+                    FileDejaChargee::Garder { position, longueur } => {
+                        // Keep the full queue, just move the current position onto it
+                        // (its unified position, valid whether the queue is mixed).
+                        state
+                            .playback
+                            .update_queue_info(zone_id, position, longueur)
+                            .await;
+                        persist_queue_async(&state, zone_id);
                     }
-                    state.playback.update_queue_info(zone_id, 0, 1).await;
+                    FileDejaChargee::RemplacerParCeTitre => {
+                        // Not queued yet — make this single streaming track the queue.
+                        queue_repo.clear(zone_id).ok();
+                        if let Err(e) = queue_repo.append(
+                            zone_id,
+                            &[QueueInput::Streaming {
+                                source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                                source_id: source_id_val,
+                                title: title_val,
+                                artist: artist_val,
+                                album: album_val,
+                                cover_url: cover_val,
+                                duration_ms: duration_val,
+                                track_number: meta.track_number,
+                                disc_number: meta.disc_number,
+                            }],
+                        ) {
+                            warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
+                        }
+                        state.playback.update_queue_info(zone_id, 0, 1).await;
+                        persist_queue_async(&state, zone_id);
+                    }
+                    FileDejaChargee::NePasToucher => {
+                        // La base n'a pas repondu. On ne sait pas ce que la file
+                        // contient : on ne l'efface pas, et on ne persiste pas un
+                        // instantane bati sur ce silence. Le titre demande joue
+                        // quand meme — c'est la file qui est preservee, pas la
+                        // lecture qui est refusee.
+                        warn!(
+                            zone_id,
+                            error = %lecture.as_ref().err().map(String::as_str).unwrap_or_default(),
+                            "file_illisible_file_conservee_2569"
+                        );
+                    }
                 }
-                persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => play_error_response(e).into_response(),
@@ -2771,6 +2878,20 @@ fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
 /// POSTed here, the server echoed the body back and persisted NOTHING — the
 /// UI showed the EQ as applied with zero audible effect (found by measuring
 /// the stream served by .18: EQ on/off captures were md5-identical).
+///
+/// **Cette lecture est GRATUITE, et c'est délibéré (#2419).** La tentation est
+/// de la garder comme l'écriture puisqu'elles se suivent — ce serait une
+/// régression. `EqualizerView.svelte` appelle `api.getEq(zoneId)` dans son
+/// `onMount`, **sans condition de licence**, pour dessiner la courbe réelle
+/// derrière le bandeau `premium-gate` qu'il affiche juste au-dessus quand
+/// `!$isPremium`. Un 402 ici viderait cet écran de son contenu ET déclencherait
+/// la fenêtre premium de `fetchJSON` à la simple OUVERTURE de l'égaliseur,
+/// avant tout geste de l'utilisateur.
+///
+/// C'est aussi la règle uniforme du domaine : `get_zone_dsp`, `eq_status`,
+/// `list_presets`, `get_preset`, `get_bands` et `get_expert_settings` lisent
+/// sans droit ; seules les écritures passent `require_premium`. Voir
+/// [`set_eq`], juste en dessous, pour l'autre moitié.
 async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let profile: tune_core::audio::eq::EqProfile = settings
@@ -2791,14 +2912,22 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
 /// Persist the zone's expert-mode EQ bands into the SAME per-zone profile the
 /// orchestrator reads (`zone_{id}_eq_profile`), preserving the profiler tilt
 /// fields. Same premium gate as the /dsp path.
+///
+/// `headers` sert au seul refus : sa phrase suit la langue choisie dans
+/// l'application (#2419). L'ordre des extracteurs compte — `Json` consomme le
+/// corps, il reste donc dernier.
 async fn set_eq(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<EqSettings>,
 ) -> axum::response::Response {
-    if let Err(resp) =
-        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
-            .await
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
     {
         return resp;
     }
@@ -3262,8 +3391,29 @@ fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Zone Pins
 // ---------------------------------------------------------------------------
+//
+// #2722 — deux défauts vivaient ici, dont un seul se voyait.
+//
+// 1. `GET /zones/{id}/pins` rendait `Json(json!(pins))`, un TABLEAU NU, alors
+//    que le contrat web (`docs/contrat-web.json`) exige l'enveloppe
+//    `{ supported, pins, max_slots }`. `supported` valait `undefined` et
+//    l'écran concluait que les Pins n'étaient pas pris en charge.
+//
+// 2. Le défaut profond : ces routes STOCKAIENT des objets dans `settings` et
+//    n'appelaient JAMAIS le service `av.openhome.org:Pins:1` du renderer.
+//    Corriger la seule enveloppe aurait affiché une capacité que l'appareil
+//    n'a jamais annoncée — « inventer `max_slots` côté Tune rendrait seulement
+//    le test vert ».
+//
+// Depuis #2722, quand le renderer de la zone publie `Pins:1`, ce sont SES
+// actions qui sont appelées (`GetDeviceMax`, `GetIdArray`, `ReadList`,
+// `SetDevice`, `InvokeIndex`, `Clear`) et `max_slots` est ce qu'IL annonce.
+// Sinon `supported` vaut `false` sans un octet de réseau, et le stockage
+// historique dans `settings` reste tel quel pour ne rien casser.
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::outputs::openhome::OpenHomeOutput;
+use tune_core::outputs::openhome_pins::{PinWrite, PinsService};
 
 #[derive(Deserialize, serde::Serialize, Clone)]
 struct ZonePin {
@@ -3272,6 +3422,57 @@ struct ZonePin {
     uri: String,
     #[serde(rename = "type")]
     pin_type: String,
+    /// Champs du contrat OpenHome `SetDevice`. Optionnels : le corps que le
+    /// client web envoie aujourd'hui (`index`, `title`, `uri`, `type`) se
+    /// désérialise inchangé.
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    artwork_uri: String,
+    #[serde(default)]
+    shuffle: bool,
+}
+
+impl ZonePin {
+    fn to_device_write(&self) -> PinWrite {
+        PinWrite {
+            index: self.index,
+            mode: self.mode.clone(),
+            pin_type: self.pin_type.clone(),
+            uri: self.uri.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            artwork_uri: self.artwork_uri.clone(),
+            shuffle: self.shuffle,
+        }
+    }
+}
+
+/// Le service `Pins:1` du renderer branché à cette zone, s'il existe.
+///
+/// Aucun aller-retour réseau ici : la présence du service se lit dans le
+/// descriptif déjà collecté à la découverte, recopié dans l'`OpenHomeOutput`
+/// enregistré. Une zone navigateur, une sortie locale, un renderer DLNA ou un
+/// OpenHome sans `Pins:1` rendent `None` immédiatement — c'est le chemin le
+/// plus fréquenté, et la fiche de zone n'y attend rien.
+async fn zone_pins_service(state: &AppState, zone_id: i64) -> Option<PinsService> {
+    let device_id = get_zone_device_id(state, zone_id)?;
+    let output = { state.outputs.lock().await.get(&device_id) }?;
+    // Le verrou de la sortie ne tient QUE la lecture de l'URL : le client rendu
+    // est autonome, les allers-retours SOAP se font hors verrou.
+    let guard = output.lock().await;
+    guard
+        .as_any()
+        .downcast_ref::<OpenHomeOutput>()?
+        .pins_service()
+}
+
+/// Réponse d'un appareil injoignable ou qui refuse l'action.
+fn pins_erreur_renderer(zone_id: i64, erreur: String) -> axum::response::Response {
+    warn!(zone_id, error = %erreur, "zone_pins_service_renderer_en_echec");
+    (StatusCode::BAD_GATEWAY, Json(json!({ "error": erreur }))).into_response()
 }
 
 fn pins_key(zone_id: i64) -> String {
@@ -3298,9 +3499,40 @@ fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
         .ok();
 }
 
+/// `GET /zones/{id}/pins` → `{ supported, pins, max_slots }`.
+///
+/// `max_slots` est ce que l'appareil ANNONCE par `GetDeviceMax`. Il n'existe
+/// aucun littéral côté Tune : sans service `Pins:1` la capacité vaut 0 et
+/// `supported` vaut `false`. Les pins historiques rangés dans `settings` sont
+/// tout de même rendus dans ce cas — les taire ferait disparaître du contenu
+/// déjà enregistré —, mais ils ne prétendent à AUCUNE capacité d'appareil.
 async fn get_zone_pins(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let pins = load_pins(&state, zone_id);
-    Json(json!(pins))
+    let Some(service) = zone_pins_service(&state, zone_id).await else {
+        return Json(json!({
+            "supported": false,
+            "pins": load_pins(&state, zone_id),
+            "max_slots": 0,
+        }));
+    };
+    match service.snapshot().await {
+        Ok(snapshot) => Json(json!({
+            "supported": true,
+            "pins": snapshot.pins,
+            "max_slots": snapshot.device_max,
+        })),
+        Err(erreur) => {
+            // L'appareil publie bien `Pins:1` mais ne répond pas : on ne
+            // devine NI sa capacité NI sa liste. `supported: false` est ici la
+            // seule réponse honnête, et `error` dit pourquoi.
+            warn!(zone_id, error = %erreur, "zone_pins_lecture_renderer_echouee");
+            Json(json!({
+                "supported": false,
+                "pins": [],
+                "max_slots": 0,
+                "error": erreur,
+            }))
+        }
+    }
 }
 
 async fn set_zone_pin(
@@ -3308,6 +3540,14 @@ async fn set_zone_pin(
     Path(zone_id): Path<i64>,
     Json(body): Json<ZonePin>,
 ) -> impl IntoResponse {
+    // Renderer porteur de `Pins:1` : c'est `SetDevice` qui pose le pin, pas
+    // `settings`.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        return match service.set_device(&body.to_device_write()).await {
+            Ok(()) => (StatusCode::CREATED, Json(json!(body))).into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let mut pins = load_pins(&state, zone_id);
     // Replace at index or append
     if let Some(existing) = pins.iter_mut().find(|p| p.index == body.index) {
@@ -3323,16 +3563,45 @@ async fn clear_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
+    // `Clear` du contrat OpenHome prend un IDENTIFIANT, pas un rang : on lit
+    // d'abord `GetIdArray` pour traduire le rang que porte l'URL. Un
+    // emplacement vide (identifiant 0) n'est pas une erreur d'appareil, c'est
+    // un 404.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        let ids = match service.id_array().await {
+            Ok(ids) => ids,
+            Err(erreur) => return pins_erreur_renderer(zone_id, erreur),
+        };
+        let Some(id) = ids.get(index).copied().filter(|id| *id != 0) else {
+            return (StatusCode::NOT_FOUND, "pin not found").into_response();
+        };
+        return match service.clear(id).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let mut pins = load_pins(&state, zone_id);
     pins.retain(|p| p.index != index);
     save_pins(&state, zone_id, &pins);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
 ) -> impl IntoResponse {
+    // `InvokeIndex` : l'appareil déclenche lui-même sa source. Tune n'a rien à
+    // orchestrer, et surtout rien à acquitter à sa place.
+    if let Some(service) = zone_pins_service(&state, zone_id).await {
+        return match service.invoke_index(index).await {
+            Ok(()) => (
+                StatusCode::ACCEPTED,
+                Json(json!({ "invoked": index, "by": "openhome_pins" })),
+            )
+                .into_response(),
+            Err(erreur) => pins_erreur_renderer(zone_id, erreur),
+        };
+    }
     let pins = load_pins(&state, zone_id);
     let Some(pin) = pins.iter().find(|p| p.index == index) else {
         return (StatusCode::NOT_FOUND, "pin not found").into_response();
@@ -3372,6 +3641,20 @@ async fn save_queue_as_pin(
     Path(zone_id): Path<i64>,
     Json(body): Json<ZonePin>,
 ) -> impl IntoResponse {
+    // Épingler la file Tune dans un emplacement de l'APPAREIL demanderait une
+    // adresse que l'appareil sache ouvrir ; `queue:zone:{id}` n'en est pas
+    // une. Plutôt que d'écrire dans `settings` un pin que `GET` n'affichera
+    // jamais pour cette zone, on le dit (#2722, reste à porter).
+    if zone_pins_service(&state, zone_id).await.is_some() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "openhome_pins_from_queue_non_supporte",
+                "message": "Cette zone porte le service OpenHome Pins : un emplacement de l'appareil demande une adresse qu'il sache ouvrir, ce que la file Tune ne fournit pas encore.",
+            })),
+        )
+            .into_response();
+    }
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if items.is_empty() {
@@ -3383,6 +3666,10 @@ async fn save_queue_as_pin(
         title: body.title,
         uri: format!("queue:zone:{zone_id}"),
         pin_type: "queue".into(),
+        mode: body.mode,
+        description: body.description,
+        artwork_uri: body.artwork_uri,
+        shuffle: body.shuffle,
     };
     if let Some(existing) = pins.iter_mut().find(|p| p.index == pin.index) {
         *existing = pin.clone();
@@ -4521,6 +4808,122 @@ mod save_queue_decision {
     }
 }
 
+/// #2569 — la garde qui protege la file d'attente contre sa propre troncature.
+///
+/// Ces tests portent sur la DECISION, seule partie separable du handler HTTP :
+/// que faire de la file selon ce que la base a REPONDU — y compris quand elle
+/// n'a rien repondu du tout.
+#[cfg(test)]
+mod file_deja_chargee_2569 {
+    use super::{FileDejaChargee, file_deja_chargee};
+    use tune_core::db::play_queue_repo::QueueEntry;
+
+    /// Une ligne de file de service, reduite aux champs dont la garde se sert.
+    fn ligne(position: i64, source: &str, source_id: &str) -> QueueEntry {
+        QueueEntry {
+            id: position + 1,
+            zone_id: 1,
+            track_id: None,
+            position,
+            is_current: false,
+            source: Some(source.into()),
+            source_id: Some(source_id.into()),
+            title: Some(format!("Titre {position}")),
+            artist_name: Some("Artiste".into()),
+            album_title: Some("Album".into()),
+            duration_ms: Some(200_000),
+            file_path: None,
+            cover_path: None,
+            format: None,
+            sample_rate: None,
+            bit_depth: None,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    fn album_qobuz() -> Vec<QueueEntry> {
+        (0..12)
+            .map(|i| ligne(i, "qobuz", &format!("q{i}")))
+            .collect()
+    }
+
+    /// 🔴 LE cas de Pierre M. La base ne repond pas — un lot de scan tient la
+    /// connexion (#1997). L'ancienne garde traduisait ce silence en file vide et
+    /// prenait la branche qui EFFACE. Un album de douze titres tombait a un.
+    ///
+    /// Le silence doit rester un silence : on ne touche a rien.
+    #[test]
+    fn une_base_illisible_ne_doit_rien_effacer() {
+        let decision = file_deja_chargee(Err("query: database is locked"), Some("qobuz"), "q3");
+        assert_eq!(
+            decision,
+            FileDejaChargee::NePasToucher,
+            "une lecture en echec ne dit pas « la file est vide » : elle ne dit rien"
+        );
+    }
+
+    /// La contre-epreuve du meme instant : si la base avait REPONDU, la garde
+    /// aurait vu les douze titres et garde la file. C'est bien le `Err`, et lui
+    /// seul, qui faisait basculer la decision.
+    #[test]
+    fn la_meme_file_lue_correctement_est_conservee_entiere() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("qobuz"), "q3");
+        assert_eq!(
+            decision,
+            FileDejaChargee::Garder {
+                position: 3,
+                longueur: 12
+            }
+        );
+    }
+
+    /// 🔴 LE TEMOIN. Le defaut symetrique serait de ne plus JAMAIS remplacer la
+    /// file. Une file vraiment vide — la base a repondu `Ok(vec![])` — doit
+    /// toujours accepter de devenir le titre demande, sinon « lire ce titre »
+    /// depuis une recherche ne ferait plus rien.
+    #[test]
+    fn une_file_vraiment_vide_accepte_toujours_le_titre_demande() {
+        let decision = file_deja_chargee(Ok(&[]), Some("qobuz"), "q3");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Une file pleine qui ne contient PAS le titre demande se fait bien
+    /// remplacer : la garde ne protege pas la file contre l'utilisateur.
+    #[test]
+    fn une_file_etrangere_au_titre_demande_est_bien_remplacee() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("qobuz"), "autre-chose");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Meme identifiant, autre service : ce n'est pas le meme titre. La garde
+    /// doit comparer la source aussi, sans quoi un `q3` Tidal ferait passer pour
+    /// « deja en file » un `q3` Qobuz.
+    #[test]
+    fn un_meme_identifiant_sur_un_autre_service_ne_compte_pas() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), Some("tidal"), "q3");
+        assert_eq!(decision, FileDejaChargee::RemplacerParCeTitre);
+    }
+
+    /// Sans source precisee, l'identifiant seul suffit — c'est ce que fait la
+    /// route quand le client n'envoie que `source_id`.
+    #[test]
+    fn sans_source_precisee_l_identifiant_seul_suffit() {
+        let entrees = album_qobuz();
+        let decision = file_deja_chargee(Ok(&entrees), None, "q7");
+        assert_eq!(
+            decision,
+            FileDejaChargee::Garder {
+                position: 7,
+                longueur: 12
+            }
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests_prereglage {
     use super::prereglage_a_appliquer;
@@ -4572,7 +4975,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("playlist".into()), Some("12".into())),
+            (
+                Some("playlist".into()),
+                Some("12".into()),
+                Some("local".into())
+            ),
             "le corps portait `playlist_id` et l'intention s'est perdue (#2441)"
         );
     }
@@ -4590,7 +4997,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("7".into()))
+            (Some("album".into()), Some("7".into()), Some("local".into()))
         );
     }
 
@@ -4603,7 +5010,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("track".into()), Some("99".into()))
+            (
+                Some("track".into()),
+                Some("99".into()),
+                Some("local".into())
+            )
         );
     }
 
@@ -4618,7 +5029,52 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("0060254735822".into()))
+            (
+                Some("album".into()),
+                Some("0060254735822".into()),
+                // #1361 — sans ce troisieme membre, l'identifiant nomme
+                // l'album sans dire par quelle route le rouvrir.
+                Some("qobuz".into())
+            )
+        );
+    }
+
+    /// L'identifiant d'un album de BIBLIOTHEQUE reste local meme si le corps
+    /// annonce un service : c'est bien la table `albums` que le gestionnaire
+    /// interroge sous `album_id`, et `"7"` n'a aucun sens chez Qobuz.
+    ///
+    /// Lire `body.source` sans regarder la branche aurait envoye le raccourci
+    /// sur `GET /streaming/qobuz/albums/7` — un 404, ou pire, un album
+    /// etranger.
+    #[test]
+    fn un_album_de_bibliotheque_reste_local_sous_un_service_annonce() {
+        let body = PlayRequest {
+            source: Some("qobuz".into()),
+            album_id: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (Some("album".into()), Some("7".into()), Some("local".into()))
+        );
+    }
+
+    /// Une piste unique de streaming garde son service, comme l'album : c'est
+    /// le meme geste vu de plus pres.
+    #[test]
+    fn une_piste_de_streaming_garde_son_service() {
+        let body = PlayRequest {
+            source: Some("tidal".into()),
+            source_id: Some("77390017".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            contexte_de_lecture(&body),
+            (
+                Some("track".into()),
+                Some("77390017".into()),
+                Some("tidal".into())
+            )
         );
     }
 
@@ -4634,7 +5090,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (None, None),
+            (None, None, None),
             "une intention devinee est pire qu'une intention absente"
         );
     }
@@ -4652,7 +5108,11 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("artist".into()), Some("451".into()))
+            (
+                Some("artist".into()),
+                Some("451".into()),
+                Some("local".into())
+            )
         );
     }
 
@@ -4668,7 +5128,7 @@ mod tests_contexte_de_lecture {
         };
         assert_eq!(
             contexte_de_lecture(&body),
-            (Some("album".into()), Some("7".into()))
+            (Some("album".into()), Some("7".into()), Some("local".into()))
         );
     }
 }

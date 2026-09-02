@@ -653,6 +653,18 @@ fn merge_into_vault(
     Ok(count)
 }
 
+/// Une restauration ne rearme JAMAIS le volume fixe.
+///
+/// Meme raisonnement que `autoplay_enabled` plus bas (#1132), applique au
+/// reglage le plus bruyant du bloc. Armer le volume fixe n'est pas un reglage
+/// mais une COMMANDE a 100 % : la route `PATCH /zones/{id}` la refuse tant que
+/// le client n'a pas confirme (`fixed_volume_confirmation_required`,
+/// `tune-server/src/routes/zones.rs`). Une restauration ecrit la colonne en SQL
+/// direct et ne rencontre donc jamais cette confirmation : une zone revenait
+/// armee sans que personne ne l'ait demande (#2395, #2477). L'utilisateur
+/// re-arme consciemment par la route, ou pas du tout.
+const FIXED_VOLUME_JAMAIS_REARME: i64 = 0;
+
 fn import_zones(
     backend: &Arc<dyn DbBackend>,
     zones: &[Value],
@@ -661,59 +673,106 @@ fn import_zones(
     let mut count = 0;
     for z in zones {
         let name = z["name"].as_str().unwrap_or("Unnamed Zone");
+        let name = name.to_string();
 
         let existing = backend.query_one(
             "SELECT id FROM zones WHERE name = ?",
-            &[&name.to_string() as &dyn ToSqlValue],
+            &[&name as &dyn ToSqlValue],
         )?;
 
+        let output_type = z["output_type"].as_str().map(|s| s.to_string());
+        let output_device_id = z["output_device_id"].as_str().map(|s| s.to_string());
+        // #2886 — `as_i64()` rendait None des que le volume
+        // sauvegarde portait une virgule, et la restauration
+        // reposait alors 50 % en travers du reglage de l'utilisateur.
+        //
+        // Le `unwrap_or(50.0)` reste un niveau INVENTE quand le champ manque :
+        // une sauvegarde sans `volume` repose 50 % en travers du reglage, tout
+        // comme la virgule le faisait. Signale, pas corrige ici — le sujet de
+        // ce correctif est le volume fixe, et changer ce defaut demande de
+        // decider ce que vaut une sauvegarde muette sur le volume.
+        let volume = z["volume"].as_f64().unwrap_or(50.0);
+        let muted = z["muted"].as_i64().unwrap_or(0);
+        let gapless_enabled = z["gapless_enabled"].as_i64().unwrap_or(1);
+        let max_sample_rate = z["max_sample_rate"].as_i64();
+        let fixed_volume = FIXED_VOLUME_JAMAIS_REARME;
+        // autoplay defaults OFF: the schema default is 0 and
+        // migration 46 (autoplay_default_off) forces it off. A
+        // backup that predates the autoplay field must NOT silently
+        // re-enable endless auto-DJ, which appends random tracks
+        // when a launched playlist ends (#1132).
+        let autoplay_enabled = z["autoplay_enabled"].as_i64().unwrap_or(0);
+
+        // Le `volume` d'une sauvegarde prise zone ARMEE est l'artefact de
+        // l'armement, pas une preference : le contrat « volume fixe » impose
+        // 100 %, c'est lui qui a ecrit ce 100, pas l'utilisateur. Le reposer
+        // sur une zone qui revient desarmee ferait afficher 100 a la facade —
+        // et la prochaine commande de volume l'enverrait a l'appareil. On ne
+        // devine aucun niveau de remplacement : sans memoire, on laisse en
+        // place ce qui existe (UPDATE) ou le defaut du schema (INSERT).
+        let restaurer_le_volume = z["fixed_volume"].as_i64().unwrap_or(0) == 0;
+
         if existing.is_some() {
-            backend.execute(
-                "UPDATE zones SET output_type = ?, output_device_id = ?, volume = ?, \
-                 muted = ?, gapless_enabled = ?, max_sample_rate = ?, \
-                 fixed_volume = ?, autoplay_enabled = ? \
-                 WHERE name = ?",
-                &[
-                    &z["output_type"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    &z["output_device_id"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    // #2886 — `as_i64()` rendait None des que le volume
-                    // sauvegarde portait une virgule, et la restauration
-                    // reposait alors 50 % en travers du reglage de l'utilisateur.
-                    &z["volume"].as_f64().unwrap_or(50.0) as &dyn ToSqlValue,
-                    &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
-                    &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
-                    &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    // autoplay defaults OFF: the schema default is 0 and
-                    // migration 46 (autoplay_default_off) forces it off. A
-                    // backup that predates the autoplay field must NOT silently
-                    // re-enable endless auto-DJ, which appends random tracks
-                    // when a launched playlist ends (#1132).
-                    &z["autoplay_enabled"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    &name.to_string() as &dyn ToSqlValue,
-                ],
-            )?;
+            let mut affectations: Vec<&str> = Vec::with_capacity(8);
+            let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(9);
+
+            affectations.push("output_type = ?");
+            params.push(&output_type);
+            affectations.push("output_device_id = ?");
+            params.push(&output_device_id);
+            if restaurer_le_volume {
+                affectations.push("volume = ?");
+                params.push(&volume);
+            }
+            affectations.push("muted = ?");
+            params.push(&muted);
+            affectations.push("gapless_enabled = ?");
+            params.push(&gapless_enabled);
+            affectations.push("max_sample_rate = ?");
+            params.push(&max_sample_rate);
+            affectations.push("fixed_volume = ?");
+            params.push(&fixed_volume);
+            affectations.push("autoplay_enabled = ?");
+            params.push(&autoplay_enabled);
+            params.push(&name);
+
+            let sql = format!(
+                "UPDATE zones SET {} WHERE name = ?",
+                affectations.join(", ")
+            );
+            backend.execute(&sql, &params)?;
         } else {
-            backend.execute(
-                "INSERT INTO zones (name, output_type, output_device_id, volume, \
-                 muted, gapless_enabled, max_sample_rate, fixed_volume, autoplay_enabled) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    &name.to_string() as &dyn ToSqlValue,
-                    &z["output_type"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    &z["output_device_id"].as_str().map(|s| s.to_string()) as &dyn ToSqlValue,
-                    // #2886 — `as_i64()` rendait None des que le volume
-                    // sauvegarde portait une virgule, et la restauration
-                    // reposait alors 50 % en travers du reglage de l'utilisateur.
-                    &z["volume"].as_f64().unwrap_or(50.0) as &dyn ToSqlValue,
-                    &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
-                    &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
-                    &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                    // autoplay defaults OFF (see UPDATE branch above, #1132).
-                    &z["autoplay_enabled"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
-                ],
-            )?;
+            let mut colonnes: Vec<&str> = Vec::with_capacity(9);
+            let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(9);
+
+            colonnes.push("name");
+            params.push(&name);
+            colonnes.push("output_type");
+            params.push(&output_type);
+            colonnes.push("output_device_id");
+            params.push(&output_device_id);
+            if restaurer_le_volume {
+                colonnes.push("volume");
+                params.push(&volume);
+            }
+            colonnes.push("muted");
+            params.push(&muted);
+            colonnes.push("gapless_enabled");
+            params.push(&gapless_enabled);
+            colonnes.push("max_sample_rate");
+            params.push(&max_sample_rate);
+            colonnes.push("fixed_volume");
+            params.push(&fixed_volume);
+            colonnes.push("autoplay_enabled");
+            params.push(&autoplay_enabled);
+
+            let marqueurs = vec!["?"; colonnes.len()].join(", ");
+            let sql = format!(
+                "INSERT INTO zones ({}) VALUES ({})",
+                colonnes.join(", "),
+                marqueurs
+            );
+            backend.execute(&sql, &params)?;
         }
         count += 1;
     }
@@ -1342,5 +1401,263 @@ mod tests {
             "the user should be nudged to re-export: {:?}",
             report.warnings
         );
+    }
+
+    fn backend_sqlite() -> Arc<dyn DbBackend> {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    #[test]
+    fn zone_armee_restauree_sur_une_zone_existante() {
+        scenarios_zones::une_zone_armee_ne_revient_ni_armee_ni_a_100(&backend_sqlite());
+    }
+
+    #[test]
+    fn zone_armee_restauree_sur_une_zone_absente() {
+        scenarios_zones::une_zone_armee_absente_prend_le_defaut_du_schema(&backend_sqlite());
+    }
+
+    #[test]
+    fn temoin_une_sauvegarde_desarmee_repose_bien_son_volume() {
+        scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&backend_sqlite());
+    }
+
+    #[test]
+    fn temoin_le_reste_du_bloc_ne_change_pas() {
+        scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&backend_sqlite());
+    }
+}
+
+/// Contre-epreuves de `import_zones`, ecrites contre un `DbBackend` quelconque.
+///
+/// La requete `UPDATE` est desormais BATIE : elle porte ou non la colonne
+/// `volume` selon la sauvegarde. Une requete batie doit rendre le meme resultat
+/// sur les deux moteurs — ces scenarios sont donc joues deux fois, sur SQLite
+/// par le `mod tests` ci-dessus et sur une VRAIE base PostgreSQL par
+/// `db::postgres_e2e::pg_config_backup_zones` (etape dediee de
+/// `.github/workflows/test-postgres.yml`).
+///
+/// Chaque scenario nettoie ses propres lignes a l'entree : la base PostgreSQL
+/// de la CI est partagee par toute la suite.
+#[cfg(test)]
+pub(crate) mod scenarios_zones {
+    use super::*;
+
+    /// Lit une colonne numerique sans presumer de son type de stockage :
+    /// `zones.fixed_volume` est un INTEGER sur les deux moteurs, mais
+    /// `PG_FULL_SCHEMA` la declare TEXT (cf. `db/pg_sqlite_type_parity.rs`).
+    fn nombre(v: Option<&SqlValue>) -> Option<f64> {
+        let v = v?;
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|n| n as f64))
+            .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
+            .or_else(|| v.as_string().and_then(|s| s.trim().parse::<f64>().ok()))
+    }
+
+    fn effacer(backend: &Arc<dyn DbBackend>, nom: &str) {
+        backend
+            .execute(
+                "DELETE FROM zones WHERE name = ?",
+                &[&nom.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    fn ligne(backend: &Arc<dyn DbBackend>, nom: &str) -> Vec<SqlValue> {
+        backend
+            .query_one(
+                "SELECT volume, fixed_volume, muted, gapless_enabled, \
+                 max_sample_rate, autoplay_enabled, output_type \
+                 FROM zones WHERE name = ?",
+                &[&nom.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("la zone « {nom} » devrait exister apres restauration"))
+    }
+
+    fn volume(backend: &Arc<dyn DbBackend>, nom: &str) -> f64 {
+        nombre(ligne(backend, nom).first()).expect("volume illisible")
+    }
+
+    fn fixed_volume(backend: &Arc<dyn DbBackend>, nom: &str) -> f64 {
+        nombre(ligne(backend, nom).get(1)).expect("fixed_volume illisible")
+    }
+
+    fn sauvegarde(nom: &str, fixed: i64, vol: f64) -> Value {
+        serde_json::json!({
+            "name": nom,
+            "output_type": "dlna",
+            "output_device_id": "dev-p2c",
+            "volume": vol,
+            "muted": 0,
+            "gapless_enabled": 1,
+            "max_sample_rate": 192_000,
+            "fixed_volume": fixed,
+            "autoplay_enabled": 0,
+        })
+    }
+
+    fn restaurer(backend: &Arc<dyn DbBackend>, zone: Value) {
+        let mut avertissements = Vec::new();
+        assert_eq!(
+            import_zones(backend, std::slice::from_ref(&zone), &mut avertissements).unwrap(),
+            1
+        );
+    }
+
+    /// 🔴 avant / 🟢 apres, sur la BRANCHE `UPDATE` : une sauvegarde prise zone
+    /// armee (`fixed_volume = 1`, donc `volume = 100` ecrit par l'armement)
+    /// restauree sur une zone reglee a 20 % laisse `fixed_volume = 0` ET
+    /// `volume = 20`.
+    pub(crate) fn une_zone_armee_ne_revient_ni_armee_ni_a_100(backend: &Arc<dyn DbBackend>) {
+        const NOM: &str = "P2C Salon";
+        effacer(backend, NOM);
+        backend
+            .execute(
+                "INSERT INTO zones (name, volume, fixed_volume) VALUES (?, ?, ?)",
+                &[
+                    &NOM.to_string() as &dyn ToSqlValue,
+                    &20.0f64 as &dyn ToSqlValue,
+                    &0i64 as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+
+        restaurer(backend, sauvegarde(NOM, 1, 100.0));
+
+        assert_eq!(
+            fixed_volume(backend, NOM),
+            0.0,
+            "une restauration ne doit JAMAIS rearmer le volume fixe : \
+             la confirmation de la route n'a pas ete rencontree (#2395, #2477)"
+        );
+        assert_eq!(
+            volume(backend, NOM),
+            20.0,
+            "le 100 d'une sauvegarde armee est l'artefact de l'armement, \
+             pas une preference : le reglage en place reste en place"
+        );
+
+        effacer(backend, NOM);
+    }
+
+    /// Meme regle sur la branche `INSERT` : la zone est absente, la colonne
+    /// `volume` n'est pas ecrite du tout, donc la ligne prend le defaut du
+    /// schema — aucun niveau invente (ni 50, ni 20).
+    pub(crate) fn une_zone_armee_absente_prend_le_defaut_du_schema(backend: &Arc<dyn DbBackend>) {
+        const NOM: &str = "P2C Cuisine";
+        const TEMOIN: &str = "P2C Temoin defaut";
+        effacer(backend, NOM);
+        effacer(backend, TEMOIN);
+
+        // Le defaut du schema, mesure et non presume : une ligne nue.
+        backend
+            .execute(
+                "INSERT INTO zones (name) VALUES (?)",
+                &[&TEMOIN.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let defaut = volume(backend, TEMOIN);
+
+        restaurer(backend, sauvegarde(NOM, 1, 100.0));
+
+        assert_eq!(fixed_volume(backend, NOM), 0.0);
+        assert_eq!(
+            volume(backend, NOM),
+            defaut,
+            "sans zone existante il n'y a rien a preserver : le schema decide, \
+             pas la sauvegarde d'une zone armee"
+        );
+        assert_ne!(volume(backend, NOM), 100.0);
+
+        effacer(backend, NOM);
+        effacer(backend, TEMOIN);
+    }
+
+    /// Temoin vert des deux cotes : une sauvegarde DESARMEE restaure son volume
+    /// exactement comme avant, en `UPDATE` comme en `INSERT`.
+    pub(crate) fn temoin_une_sauvegarde_desarmee_repose_son_volume(backend: &Arc<dyn DbBackend>) {
+        const EXISTANTE: &str = "P2C Bureau";
+        const ABSENTE: &str = "P2C Chambre";
+        effacer(backend, EXISTANTE);
+        effacer(backend, ABSENTE);
+
+        backend
+            .execute(
+                "INSERT INTO zones (name, volume) VALUES (?, ?)",
+                &[
+                    &EXISTANTE.to_string() as &dyn ToSqlValue,
+                    &20.0f64 as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+
+        restaurer(backend, sauvegarde(EXISTANTE, 0, 35.0));
+        restaurer(backend, sauvegarde(ABSENTE, 0, 35.0));
+
+        assert_eq!(volume(backend, EXISTANTE), 35.0);
+        assert_eq!(volume(backend, ABSENTE), 35.0);
+        assert_eq!(fixed_volume(backend, EXISTANTE), 0.0);
+        assert_eq!(fixed_volume(backend, ABSENTE), 0.0);
+
+        effacer(backend, EXISTANTE);
+        effacer(backend, ABSENTE);
+    }
+
+    /// Temoin vert : le reste du bloc garde son comportement, que la
+    /// sauvegarde soit armee ou non — seule la colonne `volume` sort de la
+    /// requete, et seulement quand la sauvegarde est armee.
+    pub(crate) fn temoin_les_autres_champs_du_bloc_ne_bougent_pas(backend: &Arc<dyn DbBackend>) {
+        const NOM: &str = "P2C Terrasse";
+
+        for armee in [0i64, 1i64] {
+            effacer(backend, NOM);
+            backend
+                .execute(
+                    "INSERT INTO zones (name, volume) VALUES (?, ?)",
+                    &[
+                        &NOM.to_string() as &dyn ToSqlValue,
+                        &20.0f64 as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+
+            let mut zone = sauvegarde(NOM, armee, 100.0);
+            zone["muted"] = serde_json::json!(1);
+            zone["gapless_enabled"] = serde_json::json!(0);
+            zone["autoplay_enabled"] = serde_json::json!(1);
+            restaurer(backend, zone);
+
+            let r = ligne(backend, NOM);
+            assert_eq!(nombre(r.get(2)), Some(1.0), "muted, armee={armee}");
+            assert_eq!(
+                nombre(r.get(3)),
+                Some(0.0),
+                "gapless_enabled, armee={armee}"
+            );
+            assert_eq!(
+                nombre(r.get(4)),
+                Some(192_000.0),
+                "max_sample_rate, armee={armee}"
+            );
+            assert_eq!(
+                nombre(r.get(5)),
+                Some(1.0),
+                "autoplay_enabled, armee={armee}"
+            );
+            assert_eq!(
+                r.get(6).and_then(|v| v.as_string()).as_deref(),
+                Some("dlna"),
+                "output_type, armee={armee}"
+            );
+        }
+
+        effacer(backend, NOM);
     }
 }

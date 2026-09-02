@@ -521,6 +521,7 @@ pub(crate) async fn edit_track(
             year: body.year,
             composer: body.composer.clone(),
             label: body.label.clone(),
+            musicbrainz_recording_id: None,
         };
 
         if let Err(e) = write_metadata(std::path::Path::new(file_path), &update) {

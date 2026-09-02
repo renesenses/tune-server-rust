@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -6,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChecker};
+use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker};
 
 use crate::state::AppState;
 
@@ -22,6 +24,11 @@ const SCAN_GUARD_STALE_SECS: u64 = 12 * 3600;
 /// update restart that would otherwise kill a long scan mid-import (the batches
 /// never persist, so the library stays empty and the scan looks "stuck" — the
 /// user re-triggers it and the next auto-update kills it again).
+///
+/// L'horodatage est EXIGÉ. Sans lui la fenêtre d'ancienneté n'a rien à
+/// mesurer, et le report que ce garde-fou pose n'a plus aucune sortie — il
+/// n'existe même pas de `force` pour le contourner ici, contrairement au
+/// garde-fou de la lecture (#2976).
 fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> bool {
     let settings = SettingsRepo::with_backend(backend.clone());
     let scanning = settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
@@ -39,9 +46,22 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
         .unwrap_or(0);
     match started {
         Some(t) => now.saturating_sub(t) < SCAN_GUARD_STALE_SECS,
-        // No/invalid start time recorded: treat as fresh so we err on the side
-        // of protecting the scan rather than killing it.
-        None => true,
+        // Aucun horodatage lisible : ce n'est PAS un scan que ce binaire a
+        // annoncé. Les deux seuls chemins de production qui posent
+        // `scan_status = "scanning"` — le manuel/planifié et celui du
+        // démarrage — passent désormais par `scan::marquer_scan_en_cours`,
+        // qui écrit la date AVANT le statut. Un scan vivant est donc toujours
+        // daté ; « scanning » sans date ne peut plus venir que d'une base
+        // laissée par une version antérieure, c'est-à-dire du cas même que la
+        // fenêtre d'ancienneté existe pour dénouer : un scan mort.
+        //
+        // Le traiter comme frais, ce qu'on faisait, rendait le report
+        // ÉTERNEL : `POST /system/update/install` rendait 409
+        // `scan_in_progress` à chaque tentative, en promettant une reprise
+        // « une fois le scan terminé » que rien ne pouvait déclencher. Une
+        // mise à jour reportée se rattrape à la tentative suivante ; un scan
+        // coupé se relance. L'asymétrie tranche dans ce sens (#2976).
+        None => false,
     }
 }
 
@@ -79,6 +99,100 @@ async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -
         .await
         .iter()
         .any(|z| z.state == tune_core::playback::PlayState::Playing)
+}
+
+/// Les zones qui jouent, par identifiant. Sert uniquement à nommer dans le
+/// journal ce qui retient la relance : le 30 août, `update_restarting` est
+/// tombé 24 s après le début d'un morceau et rien, dans le journal, ne disait
+/// ce que le chemin de mise à jour avait regardé (#2954).
+async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Vec<i64> {
+    playback
+        .all_states()
+        .await
+        .iter()
+        .filter(|z| z.state == tune_core::playback::PlayState::Playing)
+        .map(|z| z.zone_id)
+        .collect()
+}
+
+/// Plafond du report de la relance. Passé ce délai on relance MALGRÉ une zone
+/// annoncée en lecture.
+///
+/// Il faut une sortie, sans quoi une zone oubliée bloque les mises à jour pour
+/// toujours — et #3155 a établi qu'aucun détecteur ne rattrape une zone locale
+/// figée : une zone peut rester `Playing` en mémoire indéfiniment sans qu'un
+/// seul échantillon sorte. Deux heures couvrent un album ou une œuvre longue
+/// d'un bout à l'autre ; au-delà, une zone qui « joue » encore est plus
+/// probablement une zone figée sans auditeur qu'une session réelle, et la mise
+/// à jour reprend la main.
+const RESTART_DEFERRAL_MAX: Duration = Duration::from_secs(2 * 3600);
+
+/// Cadence de relecture de l'état de lecture pendant le report. Une lecture de
+/// l'état en mémoire (un verrou, une `HashMap`) toutes les 5 s : le coût est
+/// nul pour la lecture en cours, et la relance suit la fin du morceau à 5 s
+/// près.
+const RESTART_DEFERRAL_POLL: Duration = Duration::from_secs(5);
+
+/// Comment le report de la relance s'est terminé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRelease {
+    /// Rien ne jouait : la relance part sans attendre.
+    Idle,
+    /// Une lecture était en cours et s'est arrêtée d'elle-même.
+    PlaybackEnded(Duration),
+    /// Le plafond a expiré, la zone annonce toujours une lecture, on relance.
+    WindowExpired(Duration),
+}
+
+/// Retient la relance tant qu'une zone joue — bornée par
+/// [`RESTART_DEFERRAL_MAX`].
+///
+/// **C'est ici que se joue le défaut de #2954, pas au garde-fou d'entrée.** Le
+/// garde-fou de `update_install` consulte l'état de lecture UNE fois, à la
+/// réception de la requête, avant un téléchargement de 38 Mo — et un appelant
+/// qui passe `?force=true` le saute entièrement. Or ce que la requête autorise,
+/// c'est de télécharger et d'installer : deux actes inaudibles. Ce qui coupe le
+/// son, c'est l'échange d'image (`execv`), plusieurs secondes ou plusieurs
+/// minutes plus tard, et il ne consultait rien du tout. Le 30 août la lecture a
+/// démarré à 15:42:00 et `update_reexec` est tombé à 15:42:24 sans qu'une seule
+/// ligne dise ce qui avait été regardé.
+///
+/// Le report est donc posé au dernier instant utile, et il ne dépend PAS de
+/// `force` : l'utilisateur averti que « la musique va s'arrêter » a été averti
+/// d'un état de lecture qui datait de sa requête, pas de celui de la relance.
+/// Le binaire est déjà remplacé sur le disque quand on arrive ici — la mise à
+/// jour est acquise, même si le processus meurt pendant l'attente, la prochaine
+/// ouverture démarre la nouvelle version. Seul l'échange d'image attend.
+///
+/// Une zone en PAUSE ne retient rien : `playback_in_progress` ne compte que
+/// `PlayState::Playing`, exactement comme le frein de repos du poller depuis
+/// #3120. Les deux chemins disent la même chose de « actif ».
+async fn defer_restart_until_quiet(
+    playback: &tune_core::playback::PlaybackManager,
+    max: Duration,
+    poll: Duration,
+) -> RestartRelease {
+    if !playback_in_progress(playback).await {
+        return RestartRelease::Idle;
+    }
+    let zones = playing_zone_ids(playback).await;
+    warn!(
+        zones = ?zones,
+        max_secs = max.as_secs(),
+        "update_restart_deferred_playback"
+    );
+    let started = tokio::time::Instant::now();
+    loop {
+        let waited = started.elapsed();
+        if waited >= max {
+            return RestartRelease::WindowExpired(waited);
+        }
+        // Le dernier pas est rogné pour atterrir exactement sur le plafond.
+        tokio::time::sleep(poll.min(max - waited)).await;
+        if !playback_in_progress(playback).await {
+            return RestartRelease::PlaybackEnded(started.elapsed());
+        }
+    }
 }
 
 /// Can we actually create a file in `dir`? Permission *bits* are not the
@@ -391,6 +505,67 @@ const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB
 /// au fil forum a envoyé Jean Valjean vérifier SON réseau. Il n'y était pour
 /// rien. Un message qui ne nomme pas la cause fait chercher au mauvais endroit
 /// — et le seul qui puisse trancher, c'est le code qui a vu la réponse HTTP.
+/// Le dernier maillon du canal (#2266) : le réglage relu dans la base ARME
+/// bien le vérificateur que les deux routes utilisent.
+///
+/// Ce test ne passe pas par le réseau — il n'interroge pas l'API des releases,
+/// il vérifie que `checker_for` porte le canal enregistré. C'est exactement le
+/// maillon qu'un « écrit mais pas branché » casserait sans qu'aucun test de
+/// filtrage ne bronche : `select_release` pourrait être parfait pendant que les
+/// routes construiraient encore un vérificateur en `Auto`.
+#[cfg(test)]
+mod canal_branche_sur_le_verificateur {
+    use super::{checker_for, update_channel};
+    use tune_core::updater::UpdateChannel;
+
+    fn etat() -> crate::state::AppState {
+        crate::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// LE TÉMOIN, côté serveur : base neuve, réglage jamais écrit → `Auto`,
+    /// c'est-à-dire le vérificateur d'avant #2266.
+    #[test]
+    fn sans_reglage_le_verificateur_reste_en_auto() {
+        let state = etat();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+        assert_eq!(checker_for(&state.backend).channel(), UpdateChannel::Auto);
+    }
+
+    #[test]
+    fn le_reglage_enregistre_arme_le_verificateur() {
+        let state = etat();
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        for canal in [
+            UpdateChannel::Stable,
+            UpdateChannel::Beta,
+            UpdateChannel::Auto,
+        ] {
+            settings
+                .set(UpdateChannel::SETTING_KEY, canal.as_str())
+                .unwrap();
+            assert_eq!(update_channel(&state.backend), canal);
+            assert_eq!(
+                checker_for(&state.backend).channel(),
+                canal,
+                "le vérificateur des routes doit porter le canal {}",
+                canal.as_str()
+            );
+        }
+    }
+
+    /// Une valeur illisible ne doit jamais OUVRIR le canal bêta : le repli est
+    /// le comportement historique.
+    #[test]
+    fn valeur_illisible_retombe_sur_auto() {
+        let state = etat();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(UpdateChannel::SETTING_KEY, "nightly")
+            .unwrap();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateBlame {
     /// Rien n'a répondu : réseau, DNS, proxy, coupure. Chez l'utilisateur.
@@ -686,19 +861,133 @@ kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV
     }
 }
 
+/// Le canal de mise à jour effectivement en vigueur, relu dans la base.
+///
+/// **C'est le seul lecteur du réglage**, et les DEUX routes qui interrogent
+/// l'API des releases passent par lui — `update_check` et `update_install`.
+/// Un canal que seule la route de lecture consulterait laisserait
+/// `POST /update/install` installer la préversion que `GET /update/check`
+/// venait de refuser d'annoncer : le réglage serait décoratif.
+///
+/// Une valeur illisible (base écrite par une version postérieure, réglage
+/// bricolé à la main) retombe sur [`UpdateChannel::Auto`] : le comportement
+/// historique est le repli sûr, jamais une ouverture du canal bêta.
+fn update_channel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> UpdateChannel {
+    SettingsRepo::with_backend(backend.clone())
+        .get(UpdateChannel::SETTING_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| UpdateChannel::parse(&raw))
+        .unwrap_or_default()
+}
+
+/// Le vérificateur de releases ARMÉ du canal enregistré.
+///
+/// Les deux routes qui interrogent l'API des releases passent par ici : c'est
+/// le point unique où le réglage rejoint le cœur, et donc le seul endroit à
+/// éprouver pour savoir que le réglage est BRANCHÉ.
+fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> UpdateChecker {
+    UpdateChecker::with_channel(update_channel(backend))
+}
+
+/// Les deux champs que toute réponse de `/update/check` porte désormais :
+/// le réglage tel qu'il est enregistré, et le canal EFFECTIF une fois `auto`
+/// résolu contre le binaire en cours. Sans le second, un écran affichant
+/// « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+fn channel_fields(channel: UpdateChannel, current: &str) -> (&'static str, &'static str) {
+    (channel.as_str(), channel.effective(current))
+}
+
+/// GET /system/update/channel — le réglage, et ce qu'il donne concrètement.
+pub(super) async fn update_channel_get(State(state): State<AppState>) -> Json<Value> {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    Json(json!({
+        "channel": setting,
+        "effective_channel": effective,
+        "current": current,
+        "choices": ["auto", "stable", "beta"],
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct UpdateChannelBody {
+    channel: String,
+}
+
+/// PUT /system/update/channel — choisir stable, bêta, ou revenir à `auto`.
+///
+/// Réservé à l'administrateur, comme `update_install` : ce réglage décide de ce
+/// que la machine acceptera d'installer.
+///
+/// Une valeur inconnue est REFUSÉE (400) plutôt qu'ignorée. Un `200` pour rien
+/// laisserait l'écran croire que « nightly » a été retenu alors que le serveur
+/// serait resté sur `auto`.
+pub(super) async fn update_channel_set(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<UpdateChannelBody>,
+) -> impl IntoResponse {
+    let Some(channel) = UpdateChannel::parse(&body.channel) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unknown_channel",
+                "message": format!("Unknown update channel '{}'", body.channel),
+                "choices": ["auto", "stable", "beta"],
+            })),
+        )
+            .into_response();
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.set(UpdateChannel::SETTING_KEY, channel.as_str()) {
+        error!(error = %e, "update_channel_write_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "settings_write_failed", "message": e})),
+        )
+            .into_response();
+    }
+
+    let current = tune_core::version();
+    let (setting, effective) = channel_fields(channel, current);
+    info!(channel = setting, effective, "update_channel_set");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "channel": setting,
+            "effective_channel": effective,
+            "current": current,
+            "choices": ["auto", "stable", "beta"],
+        })),
+    )
+        .into_response()
+}
+
 /// GET /system/update/check
 ///
 /// Fetches the latest release from GitHub, compares versions, and returns update info.
-pub(super) async fn update_check() -> Json<Value> {
-    let checker = UpdateChecker::new();
+pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
     let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    let checker = checker_for(&state.backend);
     let homebrew = current_homebrew_installation();
     let installation_version_mismatch = homebrew
         .as_ref()
         .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
+        Ok(Some(release)) => {
+            let mut payload = update_release_payload(current, &release, homebrew.as_ref());
+            payload["channel"] = json!(setting);
+            payload["effective_channel"] = json!(effective);
+            Json(payload)
+        }
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
@@ -711,6 +1000,8 @@ pub(super) async fn update_check() -> Json<Value> {
             "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
             "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
             "installation_version_mismatch": installation_version_mismatch,
+            "channel": setting,
+            "effective_channel": effective,
         })),
         Err(e) => {
             warn!(error = %e, "update_check_failed");
@@ -719,6 +1010,8 @@ pub(super) async fn update_check() -> Json<Value> {
                 "latest": null,
                 "update_available": false,
                 "error": e,
+                "channel": setting,
+                "effective_channel": effective,
             }))
         }
     }
@@ -730,15 +1023,38 @@ pub(super) async fn update_check() -> Json<Value> {
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
 ///
-/// `?force=true` overrides the deferral guards that exist to protect work in
-/// progress (currently: playback). The UI sets it on the install button, which
-/// sits directly under the warning that playback will stop.
+/// `?force=true` overrides the *request-time* deferral guard that protects work
+/// in progress (currently: playback). The UI sets it on the install button,
+/// which sits directly under the warning that playback will stop. It does NOT
+/// override the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
 ) -> impl IntoResponse {
     let force = params.force.unwrap_or(false);
+
+    // Journaliser l'entrée AVANT tout garde-fou. Sur l'incident du 30 août
+    // (#2954), le journal montrait `update_download_starting` puis
+    // `update_restarting` 4 s plus tard, et rien ne permettait de départager
+    // « le garde-fou a été court-circuité par `force` » de « le garde-fou a
+    // regardé un état de lecture qui disait autre chose ». Les deux pistes
+    // étaient strictement indiscernables sur le journal du testeur. Ces trois
+    // champs — l'intention de l'appelant, son identité, et ce que le serveur
+    // voyait de la lecture au même instant — rendent le prochain signalement
+    // imputable sans témoin.
+    let origin = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let playing = playing_zone_ids(&state.playback).await;
+    info!(
+        force,
+        origin = %origin,
+        playing_zones = ?playing,
+        "update_install_requested"
+    );
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
@@ -859,12 +1175,19 @@ pub(super) async fn update_install(
             .into_response();
     }
 
-    // Guard: don't restart while music is playing. The restart re-execs the
-    // process, which kills every output mid-stream — and says so nowhere, so
-    // the listener just hears the music cut out (#1462). An update that lands
-    // after the album is worth more than one that interrupts it.
-    if !force && playback_in_progress(&state.playback).await {
-        warn!("update_deferred_playback_in_progress");
+    // Guard: don't even DOWNLOAD while music is playing. The restart re-execs
+    // the process, which kills every output mid-stream — and says so nowhere,
+    // so the listener just hears the music cut out (#1462). An update that
+    // lands after the album is worth more than one that interrupts it.
+    //
+    // Ce garde-fou-ci ne protège plus le son à lui seul : il consulte l'état de
+    // lecture à la RÉCEPTION de la requête, et `force` le saute. C'est
+    // `defer_restart_until_quiet` qui tient l'échange d'image (#2954). Ce qu'il
+    // évite encore, et qui vaut d'être gardé : 38 Mo tirés du réseau pendant
+    // qu'une zone joue — la contention est exactement le terrain des coupures
+    // signalées dans le même fil (#2952).
+    if !force && !playing.is_empty() {
+        warn!(zones = ?playing, "update_deferred_playback_in_progress");
         return (
             StatusCode::CONFLICT,
             Json(json!({
@@ -882,7 +1205,12 @@ pub(super) async fn update_install(
     }
 
     // 1. Check for update (fast — just a GitHub API call)
-    let checker = UpdateChecker::new();
+    //
+    // MÊME canal que `/update/check`. C'est ici que le réglage cesse d'être
+    // décoratif : sans lui, l'installation retomberait sur le canal déduit du
+    // binaire et poserait la préversion que la vérification venait de refuser
+    // d'annoncer (#2266).
+    let checker = checker_for(&state.backend);
     let release = match checker.check().await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -916,6 +1244,8 @@ pub(super) async fn update_install(
         version = %release.version,
         asset = %asset.name,
         size = asset.size,
+        force,
+        playing_zones = ?playing,
         "update_download_starting"
     );
 
@@ -1155,6 +1485,41 @@ pub(super) async fn update_install(
         );
 
         // --- Restart ---
+        //
+        // Le nouveau binaire est en place sur le disque : la mise à jour est
+        // acquise. Il ne reste que l'échange d'image, et c'est LUI, et lui
+        // seul, qui coupe le son. On ne le fait pas au milieu d'un morceau
+        // (#2954) — pas même quand la requête portait `force`, qui décrivait
+        // l'état de lecture d'il y a un téléchargement. Borné par
+        // `RESTART_DEFERRAL_MAX` pour qu'une zone oubliée en lecture ne bloque
+        // pas les mises à jour à vie.
+        if playback_in_progress(&state.playback).await {
+            set_phase("restart_pending_playback");
+        }
+        match defer_restart_until_quiet(
+            &state.playback,
+            RESTART_DEFERRAL_MAX,
+            RESTART_DEFERRAL_POLL,
+        )
+        .await
+        {
+            RestartRelease::Idle => {}
+            RestartRelease::PlaybackEnded(waited) => {
+                info!(
+                    waited_secs = waited.as_secs(),
+                    "update_restart_window_clear"
+                );
+            }
+            RestartRelease::WindowExpired(waited) => {
+                let zones = playing_zone_ids(&state.playback).await;
+                warn!(
+                    waited_secs = waited.as_secs(),
+                    zones = ?zones,
+                    "update_restart_deferral_expired"
+                );
+            }
+        }
+
         set_phase("restarting");
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2279,14 +2644,78 @@ mod scan_guard_tests {
         assert!(scan_in_progress(&b));
     }
 
+    /// Remplace `scanning_without_start_time_blocks_update`, qui épinglait
+    /// l'inverse (« pas de date ⇒ on protège le scan »). La règle a changé,
+    /// délibérément : tant que le scan de démarrage n'horodatait pas, cette
+    /// branche était le SEUL comportement possible pour lui, donc un report
+    /// perpétuel déguisé en prudence. Maintenant que les deux chemins de
+    /// production datent leur annonce (`scan::marquer_scan_en_cours`), un scan
+    /// vivant ne passe plus jamais par ici : ne reste que la base héritée
+    /// d'une version antérieure tuée en plein scan — exactement ce que la
+    /// fenêtre d'ancienneté doit dénouer (#2976).
     #[test]
-    fn scanning_without_start_time_blocks_update() {
-        // Err on the side of protecting the scan when no start time is recorded.
+    fn scanning_without_start_time_no_longer_blocks_update() {
         let b = backend();
         SettingsRepo::with_backend(b.clone())
             .set("scan_status", "scanning")
             .unwrap();
-        assert!(scan_in_progress(&b));
+        assert!(
+            !scan_in_progress(&b),
+            "« scanning » sans horodatage ne peut venir que d'un scan mort : \
+             le bloquer indéfiniment n'a aucune sortie"
+        );
+    }
+
+    /// Même chose pour un horodatage illisible : `parse::<u64>()` échoue, et
+    /// le garde-fou ne doit pas retomber sur un blocage sans issue.
+    #[test]
+    fn scanning_with_unparsable_start_time_does_not_block_update() {
+        let b = backend();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("scan_status", "scanning").unwrap();
+        s.set("scan_started_at", "2026-08-30T15:42:00Z").unwrap();
+        assert!(!scan_in_progress(&b));
+    }
+
+    /// TÉMOIN. Un scan RÉELLEMENT en cours doit continuer de différer la mise
+    /// à jour. L'annonce est faite par la FONCTION DE PRODUCTION que les deux
+    /// scans appellent, jamais par une transcription : si elle cesse
+    /// d'horodater, ce test tombe.
+    #[test]
+    fn scan_annonce_par_la_production_bloque_la_mise_a_jour() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        assert!(
+            scan_in_progress(&b),
+            "un scan vivant, annoncé par le chemin de production, doit différer la mise à jour"
+        );
+    }
+
+    /// L'autre sens, sur la MÊME annonce de production : passé la fenêtre
+    /// d'ancienneté, le scan ne bloque plus. Avant #2976 le scan de démarrage
+    /// n'était pas daté et ne pouvait donc JAMAIS franchir cette fenêtre.
+    #[test]
+    fn scan_annonce_par_la_production_puis_perime_laisse_passer() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        let s = SettingsRepo::with_backend(b.clone());
+        let pose: u64 = s
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le chemin de production doit horodater son annonce")
+            .trim()
+            .parse()
+            .expect("l'horodatage doit être un epoch en secondes");
+        assert!(
+            now_secs().saturating_sub(pose) < 60,
+            "l'horodatage posé doit être celui de maintenant"
+        );
+        s.set(
+            "scan_started_at",
+            &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+        )
+        .unwrap();
+        assert!(!scan_in_progress(&b));
     }
 
     #[test]
@@ -2299,6 +2728,102 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+/// Le scan de DÉMARRAGE, éprouvé de bout en bout — c'est lui, et lui seul,
+/// que #2976 laissait indatable.
+///
+/// Le vrai `spawn_auto_scan` est exécuté sur un dossier de musique temporaire.
+/// `ScanStatusGuard` remet `scan_status` à `idle` en fin de tâche, mais il
+/// n'efface PAS `scan_started_at` : la trace que le scan de démarrage a bien
+/// daté son annonce survit à sa terminaison, et se lit donc sans course.
+#[cfg(test)]
+mod scan_de_demarrage_tests {
+    use super::scan_in_progress;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+
+    #[tokio::test]
+    async fn le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable() {
+        // Le dossier doit exister pendant TOUT le scan : le handle est gardé
+        // en vie jusqu'à la fin du test, et il n'est pas dans /tmp partagé.
+        let dossier = tempfile::tempdir().unwrap();
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[dossier.path().to_string_lossy()]).unwrap(),
+            )
+            .unwrap();
+
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let fini = crate::auto_scan::spawn_auto_scan(backend.clone(), bus);
+        for _ in 0..600 {
+            if fini.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            fini.load(Ordering::Acquire),
+            "le scan de démarrage n'a pas terminé"
+        );
+
+        // 1. Le scan de démarrage a DATÉ son annonce. C'est l'écriture qui
+        //    manquait : sans elle tout ce qui suit est indécidable.
+        let pose: u64 = settings
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le scan de démarrage doit poser `scan_started_at` (#2976)")
+            .trim()
+            .parse()
+            .expect("`scan_started_at` doit être un epoch en secondes parseable");
+        let maintenant = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            maintenant.saturating_sub(pose) < 300,
+            "l'horodatage doit être celui de ce scan-ci"
+        );
+
+        // 2. Le processus meurt pendant le scan : `ScanStatusGuard` ne
+        //    s'exécute pas, la base garde « scanning ». C'est l'état exact que
+        //    laisse une coupure de courant ou un `kill -9`.
+        settings.set("scan_status", "scanning").unwrap();
+
+        // TÉMOIN : tant que la fenêtre n'est pas franchie, la mise à jour
+        //    reste différée — la correction ne tue pas un scan vivant.
+        assert!(
+            scan_in_progress(&backend),
+            "un scan de démarrage récent doit continuer de différer la mise à jour"
+        );
+
+        // 3. Treize heures plus tard, le garde-fou le déclare périmé et la
+        //    mise à jour passe. C'est ce que le scan de démarrage ne pouvait
+        //    PAS faire avant #2976, faute de date.
+        settings
+            .set(
+                "scan_started_at",
+                &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+            )
+            .unwrap();
+        assert!(
+            !scan_in_progress(&backend),
+            "passé la fenêtre d'ancienneté, un scan de démarrage mort ne doit plus rien bloquer"
+        );
+
+        drop(dossier);
     }
 }
 
@@ -2350,6 +2875,241 @@ mod playback_guard_tests {
         pm.pause(8).await;
         pm.play(12, NowPlaying::default()).await;
         assert!(playback_in_progress(&pm).await);
+    }
+}
+
+/// Le report de la relance — la moitié qui manquait à #2954.
+///
+/// L'horloge est celle de tokio, mise en pause : `start_paused = true` fait
+/// avancer le temps VIRTUEL dès que toutes les tâches dorment. Ces tests
+/// traversent deux heures de plafond sans qu'une seule seconde réelle passe.
+/// Aucun `sleep` réel : un test qui attendrait vraiment 24 s finirait désarmé.
+///
+/// Ils portent sur `defer_restart_until_quiet` — la fonction que la tâche
+/// d'installation appelle juste avant `set_phase("restarting")`, pas une
+/// réplique de son mécanisme. Dégrader son corps fait tomber ces tests.
+#[cfg(test)]
+mod restart_deferral_tests {
+    use super::{RestartRelease, defer_restart_until_quiet};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    const MAX: Duration = Duration::from_secs(2 * 3600);
+    const POLL: Duration = Duration::from_secs(5);
+
+    /// Les valeurs de PRODUCTION, pas celles du test.
+    ///
+    /// Les cas ci-dessous passent leurs propres bornes pour rester lisibles ;
+    /// ce test-ci est le seul qui tienne les constantes réelles. Sans lui, un
+    /// plafond porté à l'infini — la façon la plus simple de rétablir le défaut
+    /// « une zone oubliée bloque les mises à jour à vie » — passerait au vert.
+    #[test]
+    fn the_production_ceiling_is_finite_and_the_poll_is_short() {
+        assert_eq!(
+            super::RESTART_DEFERRAL_MAX,
+            MAX,
+            "le plafond du report doit rester borné : sans sortie, une zone \
+             laissée en lecture — ou figée, ce qu'aucun détecteur ne rattrape \
+             (#3155) — bloque les mises à jour pour toujours"
+        );
+        assert_eq!(
+            super::RESTART_DEFERRAL_POLL,
+            POLL,
+            "la relance doit suivre la fin du morceau de près, sinon le report \
+             devient une attente en soi"
+        );
+        assert!(super::RESTART_DEFERRAL_POLL < super::RESTART_DEFERRAL_MAX);
+    }
+
+    /// LA moitié qui décrit l'incident : la lecture démarre, la relance se
+    /// présente 24 s plus tard, et elle N'A PAS LIEU. Le journal du 30 août
+    /// montre `local_audio_playing_after_prefill` à 15:42:00 et
+    /// `update_reexec` à 15:42:24.
+    #[tokio::test(start_paused = true)]
+    async fn restart_waits_while_a_zone_plays() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        // 24 s de plafond : la fenêtre exacte de l'incident. Rien ne s'arrête,
+        // donc la seule sortie est le plafond — et on doit l'avoir ATTENDU.
+        let short = Duration::from_secs(24);
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, short, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(short));
+        assert_eq!(
+            started.elapsed(),
+            short,
+            "la relance est partie avant la fin de la fenêtre"
+        );
+    }
+
+    /// L'autre moitié, qui compte autant : quand plus rien ne joue, la relance
+    /// part — et sans rien attendre du tout.
+    #[tokio::test(start_paused = true)]
+    async fn restart_goes_ahead_when_nothing_plays() {
+        let pm = PlaybackManager::new();
+        let started = tokio::time::Instant::now();
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "une mise à jour hors lecture ne doit rien payer"
+        );
+    }
+
+    /// Une zone arrêtée entre-temps libère la relance au tour de scrutation
+    /// suivant : c'est le cas nominal — la mise à jour prend la fin du morceau,
+    /// pas son milieu.
+    #[tokio::test(start_paused = true)]
+    async fn restart_fires_as_soon_as_playback_stops() {
+        let pm = Arc::new(PlaybackManager::new());
+        pm.play(20, NowPlaying::default()).await;
+
+        let stopper = Arc::clone(&pm);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            stopper.stop(20).await;
+        });
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        match release {
+            RestartRelease::PlaybackEnded(waited) => {
+                assert!(
+                    waited >= Duration::from_secs(90) && waited <= Duration::from_secs(90) + POLL,
+                    "libérée à {waited:?}, attendu entre 90 s et 95 s"
+                );
+            }
+            other => panic!("attendu PlaybackEnded, obtenu {other:?}"),
+        }
+    }
+
+    /// Le piège symétrique : une zone oubliée EN LECTURE ne bloque pas les
+    /// mises à jour à vie. #3155 a établi qu'aucun détecteur ne rattrape une
+    /// zone locale figée — elle peut rester `Playing` indéfiniment sans qu'un
+    /// échantillon sorte. Le plafond est la sortie, et il est atteint.
+    #[tokio::test(start_paused = true)]
+    async fn a_zone_left_playing_forever_does_not_block_updates_forever() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(MAX));
+    }
+
+    /// Une zone en PAUSE ne retient rien. Sans quoi une zone laissée en pause
+    /// des jours durant bloquerait toutes les mises à jour jusqu'au plafond,
+    /// pour un son que personne n'écoute. C'est aussi ce que dit le frein de
+    /// repos du poller depuis #3120 : la pause n'est pas une lecture.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_zone_never_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+        pm.pause(20).await;
+
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Le corps du handler `update_install`, isolé du fichier source.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module de test compris — où le
+    /// nom de la fonction surveillée apparaît en toutes lettres, et où le
+    /// fichier compte huit modules `#[cfg(test)]` intercalés dans la
+    /// production. Sans cette découpe, le garde-fou ci-dessous se prouverait
+    /// lui-même et resterait vert quel que soit le code d'installation.
+    fn corps_de_update_install(source: &str) -> &str {
+        let debut = source
+            .find("pub(super) async fn update_install(")
+            .expect("handler `update_install` introuvable dans le source");
+        let reste = &source[debut..];
+        // Jusqu'au prochain handler de premier niveau, ou au prochain module de
+        // test — le premier des deux.
+        let fin = reste[1..]
+            .find("\npub(super) async fn ")
+            .into_iter()
+            .chain(reste[1..].find("\n#[cfg(test)]"))
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(reste.len());
+        &reste[..fin]
+    }
+
+    /// Le report est-il POSÉ SUR LE CHEMIN DE LA RELANCE ?
+    ///
+    /// Les tests ci-dessus éprouvent le mécanisme ; celui-ci éprouve son
+    /// branchement. C'est exactement la faille de #2954 : le garde-fou de
+    /// lecture existait, il était juste consulté au mauvais endroit. Un
+    /// correctif juste qui n'est appelé nulle part ne coupe rien.
+    #[test]
+    fn the_install_task_defers_the_restart_before_re_execing() {
+        let corps = corps_de_update_install(include_str!("update.rs"));
+        let defer = corps
+            .find("defer_restart_until_quiet(")
+            .expect("la tâche d'installation n'appelle plus le report de relance (#2954)");
+        let restart = corps
+            .find("set_phase(\"restarting\")")
+            .expect("phase `restarting` introuvable dans `update_install`");
+        assert!(
+            defer < restart,
+            "le report doit être consulté AVANT la phase `restarting` : \
+             c'est l'échange d'image qui coupe le son, pas le téléchargement"
+        );
+    }
+
+    /// Contre-épreuve du garde-fou statique : sur un source d'où l'appel a
+    /// disparu, il doit tomber. Un détecteur qui trouve son motif partout ne
+    /// détecte rien.
+    #[test]
+    fn the_call_site_guard_falls_on_a_source_without_the_call() {
+        // Un handler nu : rien à trouver.
+        let nu = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n";
+        assert!(
+            !corps_de_update_install(nu).contains("defer_restart_until_quiet("),
+            "le détecteur trouve l'appel dans un handler qui ne l'a pas"
+        );
+        // Le report posé dans un AUTRE handler ne compte pas : la découpe doit
+        // s'arrêter au handler suivant.
+        let ailleurs = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \npub(super) async fn update_status(s: S) {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(ailleurs).contains("defer_restart_until_quiet("),
+            "la découpe déborde sur le handler suivant"
+        );
+        // Ni un module de test intercalé.
+        let en_test = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \n#[cfg(test)]\nmod t {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(en_test).contains("defer_restart_until_quiet("),
+            "la coupe à `#[cfg(test)]` ne tient pas"
+        );
+    }
+
+    /// Treize zones sur .18 : le report regarde toutes les zones, pas la
+    /// première venue. Une seule qui joue suffit à retenir.
+    #[tokio::test(start_paused = true)]
+    async fn one_playing_zone_among_idle_ones_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(4, NowPlaying::default()).await;
+        pm.stop(4).await;
+        pm.play(8, NowPlaying::default()).await;
+        pm.pause(8).await;
+        pm.play(20, NowPlaying::default()).await;
+
+        let short = Duration::from_secs(60);
+        assert_eq!(
+            defer_restart_until_quiet(&pm, short, POLL).await,
+            RestartRelease::WindowExpired(short)
+        );
     }
 }
 

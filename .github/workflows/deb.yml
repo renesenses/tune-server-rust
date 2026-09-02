@@ -13,10 +13,33 @@ name: Paquet Debian (.deb)
 # avant que ce workflow existe). Il porte son propre SHA256SUMS.deb.
 
 on:
-  # Une release vient d'être publiée (release.yml bascule le brouillon en
-  # public tout à la fin) → on attache les .deb.
+  # ⚠️ CE DÉCLENCHEUR N'A JAMAIS TIRÉ, ET NE TIRERA PAS DEPUIS LE TRAIN.
+  # GitHub ne déclenche aucun workflow depuis un événement produit avec le
+  # `GITHUB_TOKEN` par défaut (anti-récursion) — or c'est bien ce jeton qui
+  # publie la release, dans `promote-release.yml`. Mesuré : aucun run `release`
+  # dans tout l'historique de deb.yml, jamais. Le paquet partait donc à la main
+  # après chaque promotion, quand quelqu'un y pensait.
+  #
+  # On le GARDE quand même : il tire si un humain publie la release depuis
+  # l'interface web. Ce qui rend le paquet automatique, c'est `workflow_call`
+  # ci-dessous — la promotion appelle ce workflow dans SON PROPRE run, où
+  # aucune règle d'anti-récursion ne s'applique.
   release:
     types: [published]
+
+  # Appelé par `promote-release.yml`, juste après le basculement de la release
+  # en public. C'est le chemin qui remplace le déclencheur mort ci-dessus.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag de release (ex. v0.9.126)"
+        required: true
+        type: string
+      publish:
+        description: "Attacher les .deb à la release"
+        required: false
+        default: true
+        type: boolean
 
   # Rejeu manuel sur n'importe quel tag déjà publié.
   workflow_dispatch:
@@ -37,6 +60,7 @@ on:
     paths:
       - "packaging/deb/**"
       - "scripts/build-deb.sh"
+      - "scripts/attacher-deb-release.sh"
       - ".github/workflows/deb.yml"
 
 permissions:
@@ -49,6 +73,11 @@ jobs:
     # base que les binaires qu'il contient, sinon les hypothèses de
     # compatibilité (glibc 2.35) ne sont plus vérifiables ici.
     runs-on: ubuntu-22.04
+    # Un job sans plafond tourne SIX HEURES avant que GitHub ne le tue. Ce
+    # workflow fait maintenant partie du train (appelé par la promotion) : un
+    # `apt-get` qui pend y bloquerait la publication du paquet toute une
+    # après-midi. Cf. tune-server/tests/workflows_bornes.rs.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -66,16 +95,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # ⚠️ Appelé par `uses:` depuis promote-release.yml, `github.event_name`
+          # est celui du workflow APPELANT (`workflow_dispatch` de la
+          # promotion), jamais `workflow_call`. On ne s'y fie donc que pour
+          # distinguer les deux cas qui n'ont pas d'entrée `tag` : la release
+          # publiée à la main, et la PR. Partout ailleurs, le tag est une
+          # ENTRÉE explicite — dispatch manuel comme appel par la promotion.
           case "${{ github.event_name }}" in
-            release)           TAG="${{ github.event.release.tag_name }}" ;;
-            workflow_dispatch) TAG="${{ inputs.tag }}" ;;
-            *)
+            release)      TAG="${{ github.event.release.tag_name }}" ;;
+            pull_request)
               # Sur une PR il n'y a pas de tag associé : on prend la dernière
               # release publiée. On ne teste alors pas « ce commit », on teste
               # la RECETTE — c'est bien ce que la PR modifie.
               TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
               ;;
+            *)            TAG="${{ inputs.tag }}" ;;
           esac
+          [ -n "$TAG" ] || { echo "::error::aucun tag source : entrée 'tag' vide"; exit 1; }
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "--- source : ${TAG} ---"
@@ -139,6 +175,7 @@ jobs:
     # réellement chargée, démarrée, et le serveur répond. Une simple extraction
     # `dpkg-deb -x` ne prouverait rien de tout ça.
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -217,11 +254,20 @@ jobs:
   publish:
     name: Attacher les .deb à la release
     needs: [build, verify-install]
+    # Jamais depuis une PR — c'est la seule chose que cette condition garde.
+    # `inputs.publish` couvre le rejeu manuel COMME l'appel par la promotion :
+    # sous `workflow_call`, `github.event_name` reste celui de l'appelant, on
+    # ne peut donc pas le nommer ici.
     if: >-
       github.event_name == 'release' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
+      (github.event_name != 'pull_request' && inputs.publish)
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
+      # L'envoi passe par `scripts/attacher-deb-release.sh` : sans checkout, le
+      # script n'existe pas dans ce job.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: deb-*
@@ -232,6 +278,10 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          # ⚠️ `./*.deb` est développé AVANT que la redirection ne crée
+          # SHA256SUMS.deb : le fichier ne se liste donc pas lui-même. Le
+          # `-not -name` explicite dirait la même chose ; ce commentaire évite
+          # qu'on « corrige » un jour ce qui marche.
           sha256sum ./*.deb > SHA256SUMS.deb
           cat SHA256SUMS.deb
 
@@ -241,7 +291,14 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.event.release.tag_name || inputs.tag }}"
-          gh release upload "$TAG" dist/*.deb dist/SHA256SUMS.deb \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name'
+          # Un fichier à la fois, les empreintes en dernier, et le verdict rendu
+          # par l'inventaire de la release — pas par le code de sortie de `gh`.
+          #
+          # L'envoi unique d'avant nommait SHA256SUMS.deb DEUX FOIS (le glob
+          # `dist/*.deb` le couvre déjà), d'où le `HTTP 404` du run 33536592140,
+          # et il l'envoyait EN PREMIER, avant les paquets qu'il annonce. Au
+          # premier passage de la v0.9.130, `amd64` manquait alors que
+          # SHA256SUMS.deb, publié, le listait.
+          #
+          # Le détail et les contre-épreuves sont dans le script (`--autotest`).
+          bash scripts/attacher-deb-release.sh "$TAG" dist

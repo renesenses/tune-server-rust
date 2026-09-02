@@ -922,7 +922,13 @@ impl OutputTarget for OaatOutput {
                         )
                         .await
                         {
-                            error!(device = %device_name, raison = %refus.raison, "oaat: DSD format non accepte, on ne joue pas");
+                            // « DSD format non accepte » etait colle sur TOUT
+                            // echec de negociation, dont ceux qui n'ont rien a
+                            // voir avec le DSD : le journal du Zicmu affichait
+                            // `native DSD streaming dsd_rate=Some(64)` puis
+                            // « DSD format non accepte » alors que le DAC
+                            // n'avait rien refuse (#2758).
+                            error!(device = %device_name, raison = %refus.raison, "oaat: negociation de format DSD echouee, on ne joue pas");
                             signaler_refus_negociation(&refus_negociation, &refus);
                             playing.store(false, Ordering::SeqCst);
                             return;
@@ -1578,7 +1584,17 @@ impl OutputTarget for OaatOutput {
                         }
                     };
                     match adaptateur.finish() {
-                        Ok(fin) => pcm_data.extend(fin),
+                        Ok((fin, residu)) => {
+                            if residu > 0 {
+                                warn!(
+                                    device = %device_name,
+                                    residu_octets = residu,
+                                    trame_octets = adaptateur.source_frame_bytes(),
+                                    "oaat: fin de PCM direct sur une trame incomplète, reliquat abandonné"
+                                );
+                            }
+                            pcm_data.extend(fin);
+                        }
                         Err(raison) => {
                             error!(device = %device_name, %raison, "oaat: fin adaptation PCM directe invalide");
                             playing.store(false, Ordering::SeqCst);
@@ -2578,8 +2594,32 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
                             None => {
+                                // Un reliquat de 1 à 3 octets à l'EOF n'est PAS
+                                // un échec de piste : c'est une fraction de
+                                // trame, moins d'un échantillon, sur une piste
+                                // qui vient d'être délivrée en entier. On la
+                                // jette et on le dit — la seule issue possible
+                                // en fin de flux, où le report n'a plus de bloc
+                                // suivant et où compléter par des zéros
+                                // fabriquerait un micro-clic. Elle était traitée
+                                // en `RefusNegociation { reconnectable: false }`,
+                                // ce qui faisait couper la zone au poller et
+                                // sautait, avec le `break`, le rattrapage du
+                                // préchargement, `extraire_payloads_fin_flux`
+                                // (donc LAST_PACKET) et la transition gapless
+                                // déjà armée (#3163, fil 1641).
                                 match adaptateur_pcm.finish() {
-                                    Ok(fin) => buf.extend(fin),
+                                    Ok((fin, residu)) => {
+                                        if residu > 0 {
+                                            warn!(
+                                                device = %device_name,
+                                                residu_octets = residu,
+                                                trame_octets = adaptateur_pcm.source_frame_bytes(),
+                                                "oaat: fin de flux PCM sur une trame incomplète, reliquat abandonné"
+                                            );
+                                        }
+                                        buf.extend(fin);
+                                    }
                                     Err(raison) => {
                                         let refus = RefusNegociation {
                                             stream_id: stream_id.clone(),
@@ -2731,10 +2771,16 @@ impl OutputTarget for OaatOutput {
                                         {
                                             Ok(cible) => cible,
                                             Err(refus) => {
+                                                // Le libelle nommait une cause
+                                                // que le journal dementait :
+                                                // il s'affichait aussi pour un
+                                                // silence ou une trame hors
+                                                // sujet, pas seulement pour une
+                                                // contre-proposition (#2758).
                                                 error!(
                                                     device = %device_name,
                                                     raison = %refus.raison,
-                                                    "oaat: contre-proposition non honorable en gapless, fin de chaine"
+                                                    "oaat: negociation de format echouee en gapless, fin de chaine"
                                                 );
                                                 signaler_refus_negociation(&refus_negociation, &refus);
                                                 break;
@@ -3369,7 +3415,16 @@ pub(crate) fn adapter_piste_directe_gapless(
     };
     let mut adaptateur = construire_adaptateur_pcm(&source, cible)?;
     let mut pcm = adaptateur.push(&piste.pcm)?;
-    pcm.extend(adaptateur.finish()?);
+    let (fin, residu) = adaptateur.finish()?;
+    if residu > 0 {
+        warn!(
+            residu_octets = residu,
+            trame_octets = adaptateur.source_frame_bytes(),
+            title = %piste.title,
+            "oaat: piste directe gapless finissant sur une trame incomplète, reliquat abandonné"
+        );
+    }
+    pcm.extend(fin);
     piste.pcm = pcm;
     piste.format = cible.format;
     piste.sample_rate = cible.sample_rate;
@@ -3476,6 +3531,21 @@ pub(crate) enum Verdict {
     Accord(ContratPropose),
     /// Reponse d'un flux qui n'est plus le notre. A ecarter, sans consequence.
     Reliquat { flux: String },
+    /// Trame de NOTRE flux, mais qui ne repond pas a la proposition de format
+    /// (#2758, Zicmu / SMSL Sanskrit 10th MkII).
+    ///
+    /// Le reliquat ci-dessus ne couvre que le mauvais EXPEDITEUR. Restait le
+    /// mauvais TYPE : l'endpoint emet ses `StreamStats` juste apres le
+    /// handshake, avec l'identifiant du flux en cours — le NOTRE. Aucun filtre
+    /// sur `stream_id` ne peut donc l'ecarter, les deux concordent ; et le
+    /// fourre-tout d'en dessous en faisait un refus non reconnectable qui
+    /// arretait la zone, au premier Play comme a la transition gapless.
+    ///
+    /// Ce n'est pas un refus : c'est une trame qui ne parle pas de format. On
+    /// la consomme — ce qui la retire du canal, donc elle n'ira pas polluer la
+    /// negociation suivante en signature #2730 — et on continue d'attendre la
+    /// vraie reponse, dans le meme delai.
+    HorsNegociation { trame: &'static str },
 }
 
 /// Un refus de negociation, avec de quoi le remonter jusqu'a l'utilisateur.
@@ -3503,25 +3573,12 @@ impl std::fmt::Display for RefusNegociation {
 /// par `Ok(())` (#2297, JP Robbe). Fonction pure, donc verifiable sur les huit
 /// issues : accord, accord d'un autre flux, contre-proposition identique,
 /// contre-proposition ecartee, refus, reponse hors sujet, fermeture, silence.
-/// L'identifiant de flux que porte un message de l'endpoint, quand il en porte un.
 ///
-/// Sert au seul discernement qui compte pendant une negociation : ce message
-/// parle-t-il de MON flux, ou d'un flux precedent dont la reponse traine encore
-/// dans le canal ? Les six variantes du protocole portent un `stream_id` ;
-/// l'ecrire ici plutot que dans le `match` evite d'oublier une variante quand
-/// le protocole en gagnera une.
-fn stream_id_de(reponse: &oaat_controller::EndpointResponse) -> Option<&str> {
-    use oaat_controller::EndpointResponse as R;
-    Some(match reponse {
-        R::FormatAccept(m) => &m.stream_id,
-        R::FormatCounter(m) => &m.stream_id,
-        R::FormatReject(m) => &m.stream_id,
-        R::NextTrackReady(m) => &m.stream_id,
-        R::NextTrackReformat(m) => &m.stream_id,
-        R::StreamStats(m) => &m.stream_id,
-    })
-}
-
+/// Le `match` sur les six variantes du protocole est EXHAUSTIF, sans bras `_`.
+/// C'est delibere : un fourre-tout est ce qui a produit #2758 quand il refusait
+/// tout, et ce qui produirait pire s'il acceptait tout — une variante ajoutee
+/// demain (une erreur, un abandon) passerait en silence pour inoffensive. Ici
+/// la compilation cassera, et il faudra trancher variante par variante.
 pub(crate) fn juger_reponse(
     contrat: &ContratPropose,
     reponse: ReponseNegociation<'_>,
@@ -3538,6 +3595,9 @@ pub(crate) fn juger_reponse(
     // c'est le reliquat d'une session precedente reste dans `response_rx`. On
     // l'ecarte et on continue d'attendre la notre, dans le meme delai.
     let reliquat = |recu: &str| Ok(Verdict::Reliquat { flux: recu.into() });
+    // Une trame de NOTRE flux qui ne parle pas de format n'est pas un refus
+    // non plus : on la consomme et on continue d'attendre (#2758).
+    let hors_negociation = |trame: &'static str| Ok(Verdict::HorsNegociation { trame });
 
     match reponse {
         ReponseNegociation::Timeout => refus(
@@ -3610,16 +3670,44 @@ pub(crate) fn juger_reponse(
             // Il negociait `tune-2` et recevait les statistiques de `tune-1`,
             // le flux qu'il venait d'arreter. Sans ce bras, corriger seulement
             // le cas du FormatCounter lui aurait laisse un echec sur deux.
-            autre => {
-                if let Some(flux) = stream_id_de(autre)
-                    && flux != contrat.stream_id
-                {
-                    return reliquat(flux);
+            //
+            // Restait le mauvais TYPE, et c'est #2758 (Zicmu, SMSL Sanskrit
+            // 10th MkII, 29/08/2026). Le `stream_id` est le BON : l'endpoint
+            // emet ses `StreamStats` (buffer_frames=0, bit_perfect=true) sur
+            // `tune-1` juste apres le handshake, pendant qu'on negocie
+            // `tune-1`. Le filtre sur l'identifiant ne peut rien, les deux
+            // concordent, et le refus tombait quand meme :
+            //
+            //   raison=reponse inattendue pendant la negociation de format :
+            //   StreamStats(StreamStats { stream_id: "tune-1", ... })
+            //
+            // Il remontait au poller, qui arretait la zone
+            // (`output_reported_failure_stopping_zone`) au PREMIER Play comme
+            // a la transition gapless naturelle. Aucune de ces trois trames ne
+            // repond a une proposition de format : statistiques de flux et
+            // signaux de prefetch n'arrivent ici que parce qu'ils empruntent
+            // le meme canal. Les ecarter, c'est aussi les CONSOMMER, donc les
+            // retirer du canal ou elles allaient polluer le Play suivant.
+            oaat_controller::EndpointResponse::StreamStats(st) => {
+                if st.stream_id != contrat.stream_id {
+                    reliquat(&st.stream_id)
+                } else {
+                    hors_negociation("StreamStats")
                 }
-                refus(
-                    format!("reponse inattendue pendant la negociation de format : {autre:?}"),
-                    false,
-                )
+            }
+            oaat_controller::EndpointResponse::NextTrackReady(ntr) => {
+                if ntr.stream_id != contrat.stream_id {
+                    reliquat(&ntr.stream_id)
+                } else {
+                    hors_negociation("NextTrackReady")
+                }
+            }
+            oaat_controller::EndpointResponse::NextTrackReformat(ntf) => {
+                if ntf.stream_id != contrat.stream_id {
+                    reliquat(&ntf.stream_id)
+                } else {
+                    hors_negociation("NextTrackReformat")
+                }
             }
         },
     }
@@ -3665,12 +3753,56 @@ async fn attendre_accord_format(
     politique: PolitiqueAdaptation,
     delai: std::time::Duration,
 ) -> Result<ContratPropose, RefusNegociation> {
+    // Cette fonction ne fait plus QUE fournir le canal. Toute la mecanique est
+    // dans `attendre_accord_format_sur` juste en dessous : ce n'est pas une
+    // copie du corps, c'est le corps, deplace. Saboter la-bas casse ici.
+    attendre_accord_format_sur(
+        &mut endpoint.response_rx,
+        device_name,
+        contrat,
+        politique,
+        delai,
+    )
+    .await
+}
+
+/// Combien de trames ecartees avant de renoncer.
+///
+/// L'echeance globale borne le TEMPS ; elle ne borne pas le TRAVAIL. Un
+/// endpoint devenu bavard — qui deverse ses statistiques en rafale sans jamais
+/// repondre a la proposition — ferait tourner la boucle et grossir le journal
+/// jusqu'a l'echeance, sans qu'aucun compteur ne l'arrete. Il faut donc les
+/// deux bornes : une sur la duree, une sur le nombre de tours.
+///
+/// 64, parce que le trafic legitime se compte sur les doigts : le Zicmu envoie
+/// UNE trame de statistiques apres le handshake, et le reliquat d'une session
+/// precedente en laisse une poignee. Deux ordres de grandeur au-dessus de ce
+/// qu'on observe, tres en dessous d'un flot : assez large pour ne jamais mordre
+/// sur un appareil sain, assez etroit pour renoncer vite face a un appareil qui
+/// ne repondra pas.
+pub(crate) const MAX_TRAMES_ECARTEES: u32 = 64;
+
+/// La boucle d'attente, detachee du `ConnectedEndpoint`.
+///
+/// Un `ConnectedEndpoint` ne se construit que par un `connect()` TCP suivi d'un
+/// handshake : impossible a fabriquer dans un test. Son canal de reponses, lui,
+/// est un `mpsc::Receiver` ordinaire qu'un test alimente a la main. Prendre le
+/// CANAL plutot que l'endpoint est ce qui rend #2758 eprouvable sans le DAC —
+/// et evite le test-transcription, qui reste vert quand on sabote la
+/// production.
+pub(crate) async fn attendre_accord_format_sur(
+    reponses: &mut tokio::sync::mpsc::Receiver<oaat_controller::EndpointResponse>,
+    device_name: &str,
+    contrat: &ContratPropose,
+    politique: PolitiqueAdaptation,
+    delai: std::time::Duration,
+) -> Result<ContratPropose, RefusNegociation> {
     let echeance = tokio::time::Instant::now() + delai;
     let mut ecartees: u32 = 0;
 
     loop {
         let restant = echeance.saturating_duration_since(tokio::time::Instant::now());
-        let recue = tokio::time::timeout(restant, endpoint.response_rx.recv()).await;
+        let recue = tokio::time::timeout(restant, reponses.recv()).await;
 
         let verdict = match &recue {
             Ok(Some(reponse)) => {
@@ -3702,6 +3834,16 @@ async fn attendre_accord_format(
                     "oaat: reponse d'un flux perime ecartee, on continue d'attendre"
                 );
             }
+            Ok(Verdict::HorsNegociation { trame }) => {
+                ecartees = ecartees.saturating_add(1);
+                warn!(
+                    device = %device_name,
+                    stream_id = %contrat.stream_id,
+                    trame_ecartee = %trame,
+                    ecartees,
+                    "oaat: trame hors negociation ecartee, on continue d'attendre"
+                );
+            }
             Err(refus) => {
                 error!(
                     device = %device_name,
@@ -3712,6 +3854,25 @@ async fn attendre_accord_format(
                 );
                 return Err(refus);
             }
+        }
+
+        // La seconde borne. Voir `MAX_TRAMES_ECARTEES` : sans elle, ecarter au
+        // lieu de refuser ouvrait une boucle que seul le temps arretait.
+        if ecartees > MAX_TRAMES_ECARTEES {
+            error!(
+                device = %device_name,
+                stream_id = %contrat.stream_id,
+                ecartees,
+                "oaat: trop de trames ecartees, negociation abandonnee"
+            );
+            return Err(RefusNegociation {
+                stream_id: contrat.stream_id.clone(),
+                raison: format!(
+                    "l'endpoint a envoye {ecartees} trames sans jamais repondre a la \
+                     proposition de format"
+                ),
+                reconnectable: false,
+            });
         }
     }
 }

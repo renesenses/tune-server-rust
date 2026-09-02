@@ -314,12 +314,29 @@ pub async fn handle_stream(
     // File serving with Range support
     let file_path = session.file_path.lock().await.clone();
     if let Some(ref path) = file_path {
+        // Cette branche ne découpe pas le corps : `Icy-MetaData: 1` a beau
+        // avoir été demandé, aucun bloc ne partira jamais. On le NOTE au lieu
+        // de laisser le poller conclure « aucun renderer connecté » (#2991).
+        tune_core::http::streamer::note_icy_channel(
+            stream_id,
+            wants_icy,
+            false,
+            tune_core::http::streamer::VOIE_FICHIER,
+        );
         return serve_file(path, &session.info, &req_headers, session.clone()).await;
     }
 
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
+        // Idem : le mandataire recopie l'amont octet pour octet. C'est la voie
+        // que prend une radio non transcodée, et elle est SANS ICY (#2991).
+        tune_core::http::streamer::note_icy_channel(
+            stream_id,
+            wants_icy,
+            false,
+            tune_core::http::streamer::VOIE_MANDATAIRE,
+        );
         return proxy_stream(
             url,
             &session.info,
@@ -468,6 +485,16 @@ pub async fn handle_stream(
     if has_icy {
         headers.insert("icy-metaint", HeaderValue::from(ICY_METAINT as u64));
     }
+
+    // Ce que le poller n'avait aucun moyen de savoir : il publie un titre dans
+    // `radio_now` sans jamais apprendre si quelqu'un est en mesure de le
+    // relire. Le voici noté sous la clé qu'ils partagent (#2991).
+    tune_core::http::streamer::note_icy_channel(
+        stream_id,
+        wants_icy,
+        has_icy,
+        tune_core::http::streamer::VOIE_FLUX,
+    );
 
     // Sans cette ligne, ce défaut n'est pas diagnosticable à distance : le
     // journal du testeur ne disait ni si son renderer avait demandé l'ICY, ni
@@ -731,6 +758,45 @@ pub async fn handle_stream(
                         "finite_stream_superseded — le canal passe à une connexion plus récente"
                     );
                     break;
+                }
+
+                // ── Ne jamais s'endormir avec des octets en main ──
+                //
+                // Le tampon de coalescence n'a qu'un rôle : REGROUPER des
+                // morceaux DÉJÀ disponibles pour écrire >= 64 Ko d'un coup.
+                // Quand le canal est VIDE, il n'y a plus rien à regrouper :
+                // attendre les 64 Ko retient ce qu'on a EN PLUS de ce qui
+                // manque. En face, la sortie locale est bloquée dans un
+                // `reader.read()` sans limite de temps (`outputs/local.rs`,
+                // client construit avec `.timeout(None)`) et ne voit RIEN.
+                //
+                // C'est le motif pour lequel la branche RADIO ci-dessus émet
+                // ses morceaux sans les regrouper : « the coalescing buffer
+                // used for finite tracks adds latency […] can cause […] the
+                // local output's HTTP reader to stall waiting for the first
+                // data ». La branche FINIE — celle de TOUTE conversion WAV
+                // servie à une sortie locale ou OAAT — n'a jamais reçu la
+                // même exemption.
+                //
+                // Le regroupement est INTACT tant que le producteur est en
+                // avance : `buffered > 0` laisse le tampon se remplir et les
+                // trames de 64 Ko partent comme avant.
+                if let Some((buffered, max)) = session.channel_fill().await {
+                    if session.note_channel_fill(buffered, max) {
+                        warn!(
+                            stream_id = %session.id,
+                            bytes_sent = session
+                                .bytes_sent
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            channel_max = max,
+                            "stream_producer_ran_dry — le canal du flux interne a été plein puis \
+                             s'est vidé : le producteur a cessé d'alimenter la session"
+                        );
+                    }
+                    if buffered == 0 && !coalesce_buf.is_empty() {
+                        let restant = std::mem::take(&mut coalesce_buf);
+                        yield Ok(bytes::Bytes::from(restant));
+                    }
                 }
 
                 tokio::select! {
@@ -1545,6 +1611,188 @@ mod tests {
         producteur.await.expect("producteur");
     }
 
+    /// FAIT DE BASE : les octets réellement délivrés par le flux interne
+    /// pendant que le producteur est MUET et que le canal reste OUVERT.
+    ///
+    /// C'est la situation d'un trou en pleine lecture (#2952) : la sortie
+    /// locale est bloquée dans `reader.read()` sur un client construit avec
+    /// `.timeout(None)` — elle attend indéfiniment, sans rien signaler avant
+    /// 5 s. Pendant ce temps le tampon de coalescence tient jusqu'à 64 Ko
+    /// qu'il ne rendra qu'une fois 64 Ko ATTEINTS. Le producteur étant à sec,
+    /// ce seuil n'arrive jamais : ces octets-là ne sortent JAMAIS.
+    ///
+    /// Avant le correctif : 0 octet délivré, et le corps ne rend rien du tout
+    /// (la lecture au bout de 2 s expire). Après : les 32 768 octets qui
+    /// étaient déjà là partent, puis les suivants au fil de l'eau.
+    #[tokio::test]
+    async fn un_producteur_a_sec_ne_retient_plus_ce_qui_est_deja_la() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("conv".into(), info, false, 8));
+        // L'en-tête voyage DANS le canal sur une conversion : le handler n'en
+        // ajoute pas. On compte donc du PCM nu, sans 44 octets parasites.
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("conv".to_string(), session.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        // Un seul morceau de 32 768 octets — la moitié du seuil de
+        // regroupement — puis PLUS RIEN. Le canal reste ouvert : ce n'est pas
+        // une fin de piste, c'est un trou.
+        tx.send(vec![0xAB; 32_768]).await.expect("morceau");
+
+        let rep = super::handle_stream(
+            Path("conv.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        let premiere = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+            .await
+            .expect(
+                "le flux interne n'a RIEN délivré : les 32 768 octets déjà décodés \
+                 attendent les 64 Ko d'un producteur à sec",
+            )
+            .expect("le corps s'est terminé au lieu de délivrer")
+            .expect("erreur de flux");
+        assert_eq!(
+            premiere.len(),
+            32_768,
+            "le flux devait rendre exactement ce qu'il avait en main"
+        );
+        assert_eq!(
+            session.bytes_sent.load(Relaxed),
+            32_768,
+            "octets délivrés par la session sur la fenêtre : le compteur de \
+             production, pas celui du test"
+        );
+
+        // …et le flux CONTINUE : le morceau suivant part de la même façon.
+        tx.send(vec![0xCD; 32_768]).await.expect("second morceau");
+        let seconde = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+            .await
+            .expect("second morceau jamais délivré")
+            .expect("corps terminé")
+            .expect("erreur de flux");
+        assert_eq!(seconde.len(), 32_768);
+        assert_eq!(session.bytes_sent.load(Relaxed), 65_536);
+    }
+
+    /// TÉMOIN VERT : tant que le producteur est EN AVANCE, le regroupement est
+    /// intact. Le flux écrit toujours des trames de 64 Ko — c'est la raison
+    /// d'être du tampon (moins d'écritures TCP vers un renderer réseau), et le
+    /// correctif ne doit pas la dissoudre.
+    ///
+    /// Quatre morceaux de 32 768 sont DÉJÀ dans un canal de capacité 4 quand
+    /// la connexion arrive : le canal est plein, donc le producteur est en
+    /// avance, exactement comme en régime établi sur une piste locale.
+    #[tokio::test]
+    async fn un_producteur_en_avance_ecrit_toujours_des_trames_de_64_ko() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("plein".into(), info, false, 4));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("plein".to_string(), session.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        for _ in 0..4 {
+            tx.send(vec![0xCD; 32_768]).await.expect("morceau");
+        }
+
+        let rep = super::handle_stream(
+            Path("plein.wav".into()),
+            State(sessions),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+
+        for rang in 0..2 {
+            let trame = tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+                .await
+                .expect("trame jamais délivrée")
+                .expect("corps terminé")
+                .expect("erreur de flux");
+            assert_eq!(
+                trame.len(),
+                65_536,
+                "trame {rang} : le regroupement a été dissous alors que le \
+                 producteur était en avance"
+            );
+        }
+    }
+
+    /// TÉMOIN VERT : une fin de piste reste une fin de piste, pas un trou. Le
+    /// producteur émet un morceau puis FERME le canal ; le corps rend ces
+    /// octets-là, exactement, puis se termine.
+    #[tokio::test]
+    async fn une_fin_de_piste_reste_une_fin_de_piste() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tune_core::http::streamer::SharedSessions;
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new("fin".into(), info, false, 8));
+        session.wav_header_included.store(true, SeqCst);
+        let tx = session.tx.lock().await.clone().expect("tx");
+        session.close_sender().await;
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("fin".to_string(), session.clone())].into_iter().collect(),
+        ));
+        tx.send(vec![0xEF; 32_768]).await.expect("morceau");
+        drop(tx);
+
+        let rep = super::handle_stream(
+            Path("fin.wav".into()),
+            State(sessions.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let mut corps = rep.into_body().into_data_stream();
+        let mut octets = Vec::new();
+        while let Some(Ok(b)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), corps.next())
+                .await
+                .expect("le corps ne s'est jamais terminé")
+        {
+            octets.extend_from_slice(&b);
+        }
+        assert_eq!(
+            octets.len(),
+            32_768,
+            "une fin de piste doit rendre tous ses octets et RIEN de plus"
+        );
+    }
+
     /// L'Eversolo DMP-A8 télécharge par tranches : `bytes=0-`, puis il ferme et
     /// revient avec `bytes=N-` pour la suite. Répondre 200 + longueur totale à
     /// cette reprise lui fait jeter la réponse et redemander le même offset en
@@ -2081,6 +2329,128 @@ mod tests {
             corps[44..].iter().all(|o| *o == 0xAA),
             "aucun octet de métadonnées ne doit s'être glissé dans le son"
         );
+    }
+
+    // ───────── #2991 — le poller doit pouvoir SAVOIR ce qui a été négocié ────
+    //
+    // Ces épreuves passent par `handle_stream`, la fonction de production, et
+    // relisent le verdict par `canal_radio`, celle que le poller appelle. Rien
+    // n'est transcrit : si la note cessait d'être posée dans `handle_stream`,
+    // le poller conclurait « aucun renderer connecté » sur un renderer bel et
+    // bien connecté — exactement le diagnostic qu'on cherche à rendre sûr.
+
+    /// TÉMOIN. Le chemin qui marche aujourd'hui : un renderer qui demande
+    /// `Icy-MetaData: 1` obtient la fenêtre, ET le poller l'apprend.
+    #[tokio::test]
+    async fn un_renderer_qui_demande_l_icy_est_note_comme_servi() {
+        use tune_core::http::streamer::{CanalRadio, canal_radio, forget_icy_channel};
+
+        let sid = "i2991-a4f218-icy-accorde";
+        forget_icy_channel(sid);
+        let (entetes, _) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            true,
+            4096,
+        )
+        .await;
+
+        assert_eq!(
+            entetes.get("icy-metaint").and_then(|v| v.to_str().ok()),
+            Some("16384"),
+            "témoin : la fenêtre ICY doit rester accordée exactement comme avant"
+        );
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::Icy,
+            "handle_stream doit avoir noté le canal accordé — sans cette note, \
+             le poller ne peut pas distinguer « ça marche » de « personne n'écoute »"
+        );
+        forget_icy_channel(sid);
+    }
+
+    /// L'HYPOTHÈSE nº 1 du ticket, jamais vérifiée sur aucun appareil depuis le
+    /// 22/08 : le renderer ne demande pas `Icy-MetaData: 1`. Elle laissait
+    /// exactement la même trace que l'hypothèse nº 2 (pas de `stream_id`) —
+    /// c'est-à-dire aucune. Elle rend maintenant un verdict qui lui est propre.
+    #[tokio::test]
+    async fn un_renderer_muet_sur_l_icy_est_note_comme_tel() {
+        use tune_core::http::streamer::{CanalRadio, canal_radio, forget_icy_channel};
+
+        let sid = "i2991-a4f218-icy-non-demande";
+        forget_icy_channel(sid);
+        let (entetes, _) = corps_radio(
+            sid,
+            "GStreamer souphttpsrc 1.22.12 libsoup/3.6.5",
+            false,
+            4096,
+        )
+        .await;
+
+        assert!(
+            entetes.get("icy-metaint").is_none(),
+            "témoin : rien ne change pour un renderer qui n'a pas demandé l'ICY"
+        );
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::IcyNonDemande,
+            "le journal doit pouvoir NOMMER cette cause, au lieu de laisser \
+             Bertrand hésiter entre deux branches"
+        );
+        forget_icy_channel(sid);
+    }
+
+    /// La branche fichier ne découpe pas le corps : elle ne peut porter aucun
+    /// bloc, `Icy-MetaData: 1` ou non. « Servi par une voie sans ICY » et
+    /// « aucun renderer connecté » sont deux diagnostics différents, et c'est
+    /// justement celui-là qu'on n'avait pas.
+    #[tokio::test]
+    async fn la_branche_fichier_est_notee_comme_voie_sans_icy() {
+        use axum::extract::{Path, State};
+        use tune_core::http::streamer::{
+            CanalRadio, SharedSessions, canal_radio, forget_icy_channel,
+        };
+
+        let sid = "i2991-a4f218-voie-fichier";
+        forget_icy_channel(sid);
+
+        // Fichier réel, dans un dossier unique par appel que `Drop` emporte —
+        // panique comprise (#3030). D'autres agents tournent sur la même
+        // machine et le répertoire temporaire est partagé.
+        let bac = tune_core::test_scratch::scratch_dir("tune-i2991-a4f218");
+        let chemin = bac.join("voie-fichier.wav");
+        std::fs::write(&chemin, b"RIFF____WAVE").expect("fixture");
+
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = std::sync::Arc::new(StreamSession::new(sid.to_string(), info, false, 8));
+        *session.file_path.lock().await = Some(chemin.to_string_lossy().to_string());
+
+        let sessions: SharedSessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ));
+
+        let mut req = axum::http::HeaderMap::new();
+        // Le renderer DEMANDE l'ICY : c'est le cas piégeux, celui qu'on aurait
+        // pris pour un succès.
+        req.insert("Icy-MetaData", "1".parse().unwrap());
+        let _ = super::handle_stream(Path(format!("{sid}.wav")), State(sessions), req).await;
+
+        assert_eq!(
+            canal_radio(Some(sid)),
+            CanalRadio::VoieSansIcy,
+            "servi par la branche fichier : aucun bloc ne partira, quoi que le \
+             renderer ait demandé"
+        );
+
+        forget_icy_channel(sid);
+        drop(bac);
     }
 
     /// La frontière tombe exactement sur la fin d'un morceau : le bloc part

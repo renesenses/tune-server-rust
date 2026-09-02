@@ -910,6 +910,41 @@ impl ChiffresDeFinDeScan<'_> {
     }
 }
 
+/// Annonce un scan en cours : l'horodatage PUIS le statut.
+///
+/// Chemin d'annonce UNIQUE, partagé par les trois scans — manuel, planifié et
+/// de démarrage. C'est le défaut de #2976 : le scan de démarrage écrivait
+/// `scan_status = "scanning"` tout seul, sans jamais poser `scan_started_at`.
+/// Le garde-fou de mise à jour (`system::update::scan_in_progress`) borne le
+/// report par une fenêtre d'ancienneté de 12 h, mais cette fenêtre n'a rien à
+/// mesurer sans date : un processus tué pendant le scan de démarrage laissait
+/// « scanning » en base pour toujours et différait les mises à jour à vie, en
+/// promettant une reprise « une fois le scan terminé » d'un scan mort depuis
+/// des semaines.
+///
+/// L'ORDRE des deux écritures n'est pas cosmétique. Le garde-fou lit d'abord
+/// `scan_status` et n'ouvre `scan_started_at` que si le premier vaut
+/// "scanning" : écrire le statut en premier laisserait une fenêtre — courte,
+/// mais réelle — où un scan bien vivant se présente sans date, donc comme
+/// périmé depuis #2976. En posant la date d'abord, « scanning » n'est jamais
+/// observable sans elle.
+///
+/// Si l'écriture de la date échoue, le statut est tout de même posé et le scan
+/// retombera du côté « périmé » du garde-fou : la mise à jour passera et
+/// pourra couper ce scan. C'est le compromis voulu — un scan coupé se relance,
+/// un blocage de mise à jour sans date ne se répare jamais tout seul.
+pub(crate) fn marquer_scan_en_cours(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
+        tracing::warn!(error = %e, "scan_started_at_set_failed");
+    }
+    if let Err(e) = settings.set("scan_status", "scanning") {
+        tracing::warn!(error = %e, "scan_status_set_failed");
+    }
+}
+
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -944,13 +979,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(e) = settings.set("scan_status", "scanning") {
-        tracing::warn!(error = %e, "scan_status_set_failed");
-    }
-    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
-        tracing::warn!(error = %e, "scan_started_at_set_failed");
-    }
+    marquer_scan_en_cours(&state.backend);
 
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
@@ -1287,8 +1316,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let cache_dir = crate::routes::library::artwork_cache_dir();
         let mut inserted = 0i64;
         let mut updated = 0i64;
-        let mut db_insert_failed = 0i64;
-        let mut db_update_failed = 0i64;
+        // `db_insert_failed` / `db_update_failed` ne sont plus tenus ici : le
+        // lot REND son manque à écrire au parcours, qui l'agrège dans
+        // `ScanStats` (#2939). Un compteur tenu de ce côté-ci restait invisible
+        // au résumé publié par `batched_scan_complete` — la ligne du journal
+        // qui annonçait `metadata_failed=0` douze millisecondes avant quatorze
+        // refus d'insertion.
         // `skipped` stays the aggregate the UI already shows. Each cause is
         // broken out below, including only those duplicate candidates whose
         // complete files were confirmed byte-for-byte.
@@ -1336,7 +1369,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // batches were already read by the walker, but no DB work is
                 // done for them.
                 if scan_cancel_requested() {
-                    return;
+                    // Rien n'a été présenté à la base : rien n'a pu être
+                    // refusé. Un scan arrêté n'est pas un scan qui perd.
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
                 }
                 // Collect tracks to batch-insert and batch-update
                 let mut to_insert: Vec<tune_core::db::models::Track> =
@@ -1505,8 +1540,15 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }
                     }
                 }
-                db_insert_failed += to_insert.len() as i64 - batch_inserted;
-                db_update_failed += to_update.len() as i64 - batch_updated;
+                // Le manque à écrire de ce lot. Il repart au parcours à la fin
+                // de la fermeture : c'est LUI qui publie le résumé de fin de
+                // scan, et c'est ce résumé qui annonçait « sans erreur »
+                // pendant que quatorze pistes étaient refusées (#2939).
+                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                    to_insert.len(),
+                    batch_inserted as usize,
+                )
+                .avec_manque_a_la_mise_a_jour(to_update.len(), batch_updated as usize);
                 inserted += batch_inserted;
                 updated += batch_updated;
 
@@ -1613,8 +1655,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         }),
                     );
                 }
+
+                ecritures
             },
         );
+
+        // Ce que la base a refusé d'écrire, agrégé par le parcours sur tous
+        // les lots (#2939). Une seule source pour la ligne de journal
+        // `batched_scan_complete` et pour les trois consommateurs du rapport
+        // de fin de scan — deux décomptes séparés, c'est deux décomptes qui
+        // divergent.
+        let db_insert_failed = scan_stats.db_insert_failed as i64;
+        let db_update_failed = scan_stats.db_update_failed as i64;
 
         // Les extensions manifestement non prises en charge sont comptées dès
         // le parcours. Le cas DFF/DST exige une lecture d'en-tête : elle est
