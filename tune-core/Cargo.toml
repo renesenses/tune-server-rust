@@ -219,6 +219,13 @@ postgres = ["dep:sqlx"]
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
+# #3205 : compteur de famine de l'anneau audio. `autotests = false` ci-dessus —
+# sans cette cible le fichier ne serait JAMAIS compile, et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "famine_anneau_i3205"
+path = "tests/famine_anneau_i3205.rs"
+
 [build-dependencies]
 cc = "1"
 
