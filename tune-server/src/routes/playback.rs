@@ -814,7 +814,7 @@ async fn set_queue_retrying(
     sqlite: bool,
     zone_id: i64,
     track_ids: &[i64],
-) -> Result<(), String> {
+) -> Result<tune_core::db::play_queue_repo::SetQueueOutcome, String> {
     let _write_guard = if sqlite {
         Some(crate::sqlite_write_gate::user_queue().await)
     } else {
@@ -823,8 +823,12 @@ async fn set_queue_retrying(
     const MAX_ATTEMPTS: usize = 12;
     let mut last_err = String::new();
     for attempt in 0..MAX_ATTEMPTS {
+        // 🔴 #3231 — le compte rendu de `set_queue` remonte TEL QUEL : les
+        // identifiants absents de `tracks` sont sautes, et l'appelant doit
+        // pouvoir journaliser le nombre de lignes REELLEMENT ecrites plutot que
+        // le nombre demande.
         match queue_repo.set_queue(zone_id, track_ids) {
-            Ok(()) => return Ok(()),
+            Ok(outcome) => return Ok(outcome),
             Err(e) if e.contains("within a transaction") => {
                 last_err = e;
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -1595,7 +1599,23 @@ async fn play(
     )
     .await
     {
-        Ok(()) => info!(zone_id, n = track_ids.len(), "set_queue_ok"),
+        // `n` valait `track_ids.len()` — le nombre DEMANDE, pas le nombre ecrit.
+        // Sur une file amputee (#3231) ce journal affirmait 190 la ou 5 lignes
+        // existaient : un compteur qui ment (#2394). Il dit maintenant les deux,
+        // et une perte non nulle sort en `warn`.
+        Ok(outcome) => {
+            if outcome.has_loss() {
+                warn!(
+                    zone_id,
+                    demandees = outcome.requested,
+                    inserees = outcome.inserted,
+                    absentes = outcome.skipped_count(),
+                    "set_queue_incomplet"
+                );
+            } else {
+                info!(zone_id, n = outcome.inserted, "set_queue_ok");
+            }
+        }
         Err(e) => {
             // Never proceed on the STALE queue: track 1 would play now and the
             // natural-end advance would then resurrect whatever the DB still
@@ -4199,7 +4219,21 @@ pub async fn shuffle_all(
     )
     .await
     {
-        Ok(()) => info!(zone_id, n = all_ids.len(), "set_queue_ok"),
+        // Meme correction qu'au site « Lire » : journaliser les lignes ECRITES,
+        // et dire la perte quand il y en a une (#3231).
+        Ok(outcome) => {
+            if outcome.has_loss() {
+                warn!(
+                    zone_id,
+                    demandees = outcome.requested,
+                    inserees = outcome.inserted,
+                    absentes = outcome.skipped_count(),
+                    "shuffle_set_queue_incomplet"
+                );
+            } else {
+                info!(zone_id, n = outcome.inserted, "set_queue_ok");
+            }
+        }
         Err(e) => {
             warn!(zone_id, error = %e, "shuffle_set_queue_failed_clearing");
             let _ = queue_repo.clear(zone_id);
