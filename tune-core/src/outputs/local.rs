@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{
-    OutputCapabilities, OutputDspMetrics, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransportState,
+    OutputCapabilities, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus,
+    OutputStatus, OutputTarget, RingStarvation, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -1484,6 +1484,14 @@ pub struct LocalOutput {
     /// `play_url()` — a failure belongs to the track that provoked it, and
     /// must never travel to the next one.
     open_failure: Arc<std::sync::Mutex<Option<String>>>,
+    /// Combien de fois le rappel audio a manqué de données depuis le début du
+    /// flux, et combien d'échantillons sont partis en zéros (#3205).
+    ///
+    /// Le même `Arc` est confié à l'anneau de CHAQUE backend au moment où il
+    /// est créé, quelle que soit la branche empruntée ; il survit donc aux
+    /// replis (rate de repli, cascade entière) parce qu'il appartient à la
+    /// sortie, pas au flux.
+    starvation: Arc<RingStarvation>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -1634,6 +1642,7 @@ impl LocalOutput {
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
+            starvation: Arc::new(RingStarvation::new()),
         }
     }
 
@@ -1961,6 +1970,16 @@ pub struct RingBuf {
     write: AtomicU64,
     /// Read position (audio callback reads here)
     read: AtomicU64,
+    /// Compteur de famine (#3205), partagé avec la sortie qui possède cet
+    /// anneau.
+    ///
+    /// Il est porté par l'ANNEAU et non par chaque rappel parce que l'anneau
+    /// est le seul objet que TOUS les backends partagent : cpal partagé,
+    /// repli entier, chemin compressé, CoreAudio exclusif, ASIO et WASAPI
+    /// exclusif reçoivent tous ce même `Arc`. Compter dans le drain couvre
+    /// donc les six d'un seul geste, sans toucher à la signature d'un seul
+    /// backend, et rend impossible l'oubli d'un site futur.
+    starvation: Arc<RingStarvation>,
 }
 
 /// Integer SPSC ring used by Windows exclusive backends when the source must
@@ -1975,6 +1994,9 @@ pub(crate) struct NativePcmRing {
     buf: Box<[UnsafeCell<i32>]>,
     write: AtomicU64,
     read: AtomicU64,
+    /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
+    /// Windows drainent cet anneau-ci.
+    starvation: Arc<RingStarvation>,
 }
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
@@ -1988,6 +2010,11 @@ unsafe impl Sync for NativePcmRing {}
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl NativePcmRing {
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Jumeau de `RingBuf::new_metered` (#3205).
+    pub(crate) fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0i32))
@@ -1995,6 +2022,7 @@ impl NativePcmRing {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -2053,6 +2081,7 @@ impl NativePcmRing {
             *target = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        self.starvation.record(out.len(), n);
         n
     }
 
@@ -2078,6 +2107,9 @@ impl NativePcmRing {
             out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
         }
         self.read.store(r + count as u64, Ordering::Release);
+        // Compté en ÉCHANTILLONS comme partout ailleurs, pas en octets : le
+        // chiffre doit se comparer d'un backend à l'autre (#3205).
+        self.starvation.record(out.len() / bytes_per_sample, count);
         count * bytes_per_sample
     }
 }
@@ -2194,6 +2226,13 @@ unsafe impl Sync for RingBuf {}
 
 impl RingBuf {
     pub fn new(capacity: usize) -> Self {
+        Self::new_metered(capacity, Arc::new(RingStarvation::new()))
+    }
+
+    /// Anneau dont la famine est comptée dans un compteur PARTAGÉ avec la
+    /// sortie, seul moyen pour `/api/v1/system/diagnostics` de lire ce que le
+    /// rappel a vécu.
+    pub fn new_metered(capacity: usize, starvation: Arc<RingStarvation>) -> Self {
         Self {
             buf: (0..capacity)
                 .map(|_| UnsafeCell::new(0.0f32))
@@ -2201,6 +2240,7 @@ impl RingBuf {
                 .into_boxed_slice(),
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
+            starvation,
         }
     }
 
@@ -2269,6 +2309,10 @@ impl RingBuf {
             out[i] = map(unsafe { *self.buf[idx].get() });
         }
         self.read.store(r + n as u64, Ordering::Release);
+        // #3205 : `n < out.len()` ICI, c'est exactement le `read < data.len()`
+        // que les rappels comblent avec des zéros. Trois atomiques `Relaxed`,
+        // rien d'autre — voir le contrat sur `RingStarvation`.
+        self.starvation.record(out.len(), n);
         n
     }
 }
@@ -4059,6 +4103,9 @@ impl OutputTarget for LocalOutput {
         let playing = self.playing.clone();
         let paused = self.paused.clone();
         let volume = self.volume.clone();
+        // #3205 : le compteur de famine suit le flux dans le fil de lecture et
+        // sera confié à l'anneau de la branche effectivement retenue.
+        let starvation = self.starvation.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -4271,7 +4318,8 @@ impl OutputTarget for LocalOutput {
                 let output_ch = output_config.channels;
 
                 let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(output_sr, output_ch);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback can read
                 let ring_cb = ring.clone();
                 let vol_cb = volume.clone();
@@ -4578,7 +4626,8 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(RingBuf::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
                 ring.clear(); // Defensive: zero-fill before callback reads
 
                 let exclusive = match ExclusiveOutput::new(
@@ -4834,8 +4883,10 @@ impl OutputTarget for LocalOutput {
 
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let float_ring = Arc::new(RingBuf::new(ring_cap));
-                let native_ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let float_ring = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
+                let native_ring =
+                    Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 float_ring.clear();
                 native_ring.clear();
 
@@ -5402,7 +5453,8 @@ impl OutputTarget for LocalOutput {
                 );
 
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
-                let ring = Arc::new(NativePcmRing::new(ring_cap));
+                starvation.begin_stream(sample_rate, channels);
+                let ring = Arc::new(NativePcmRing::new_metered(ring_cap, starvation.clone()));
                 ring.clear();
 
                 match WasapiExclusiveOutput::new(
@@ -6010,7 +6062,8 @@ impl OutputTarget for LocalOutput {
 
             let ring_cap =
                 (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
-            let ring_buf = Arc::new(RingBuf::new(ring_cap));
+            starvation.begin_stream(output_config.sample_rate, output_config.channels);
+            let ring_buf = Arc::new(RingBuf::new_metered(ring_cap, starvation.clone()));
             ring_buf.clear(); // Defensive: zero-fill before callback can read
             // Minimum buffer: ~200ms of audio before the callback starts reading.
             // sr * ch / 5 = 200ms of interleaved samples.
@@ -6040,7 +6093,8 @@ impl OutputTarget for LocalOutput {
                     };
                     let ring_cap_fb =
                         (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
-                    let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                    starvation.begin_stream(source_cfg.sample_rate, source_cfg.channels);
+                    let ring_fb = Arc::new(RingBuf::new_metered(ring_cap_fb, starvation.clone()));
                     ring_fb.clear();
                     data_started_shared.store(false, Ordering::SeqCst);
                     let min_buffer_fb =
@@ -6086,7 +6140,8 @@ impl OutputTarget for LocalOutput {
                                 let min_buf =
                                     (cand.sample_rate as usize) * (cand.channels as usize) / 5;
                                 for is_i32 in [true, false] {
-                                    let r = Arc::new(RingBuf::new(cap));
+                                    starvation.begin_stream(cand.sample_rate, cand.channels);
+                                    let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
                                     r.clear();
                                     data_started_shared.store(false, Ordering::SeqCst);
                                     let res = if is_i32 {
@@ -7435,6 +7490,9 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())
     }
 
+    fn ring_starvation(&self) -> Option<OutputRingStarvation> {
+        Some(self.starvation.snapshot())
+    }
     fn dsp_metrics(&self) -> Option<OutputDspMetrics> {
         self.eq.lock().ok().and_then(|eq| {
             eq.as_ref().map(|processor| {
