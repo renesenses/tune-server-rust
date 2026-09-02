@@ -858,11 +858,115 @@ fn sample_rates_measured_default() -> bool {
     true
 }
 
+/// Une variante ALSA d'un même nom de périphérique, telle que l'énumération la
+/// rend.
+///
+/// Le NOM n'est pas un champ : c'est la clef de regroupement, identique pour
+/// tous les membres d'un groupe. La règle ne le lit jamais — elle départage des
+/// variantes dont on sait déjà qu'elles portent le même nom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlsaVariant {
+    /// Le PCM ALSA : `hw:CARD=X,DEV=0`, `sysdefault:CARD=X`, `dmix:CARD=X`…
+    /// C'est la SEULE chose qui distingue ces variantes entre elles.
+    pub endpoint_id: String,
+    /// Voies annoncées par l'énumération — pas forcément par le matériel.
+    pub max_channels: u16,
+    /// Cadences annoncées par l'énumération — pas forcément par le matériel.
+    pub sample_rates: Vec<u32>,
+}
+
+/// Le candidat doit-il remplacer la variante retenue ? (#3209, #1655)
+///
+/// ## Pourquoi « la plus riche » était le défaut lui-même
+///
+/// `snd_device_name_hint` expose une carte sous une dizaine de PCM qui
+/// partagent tous la même première ligne de description — c'est ce qui force le
+/// regroupement par nom. Seul `hw:` atteint le pilote ; tous les autres passent
+/// par un greffon (`plug`, `dmix`, `sysdefault`, `front`…) qui **accepte tout**.
+///
+/// Interroger un greffon cadence par cadence rend donc « oui » partout, et voie
+/// par voie jusqu'à 32 pour un DAC stéréo. Le greffon annonçait ainsi des
+/// capacités **plus riches que le matériel**, gagnait le départage, et imposait
+/// son identité : Tune publiait « 44,1 → 384 kHz mesurées » puis ouvrait un
+/// `dmix` verrouillé à 48 kHz (`defaults.pcm.dmix.rate 48000`). Un FLAC 44,1
+/// était rééchantillonné en silence (GgB, Eversolo DAC-Z8 sous Fedora, #1655 ;
+/// audit #3209 : « rien ne guide vers `hw:` »).
+///
+/// **Une capacité annoncée par un greffon n'est pas une capacité mesurée, et ne
+/// doit jamais gagner un départage contre le matériel.**
+///
+/// ## L'ordre total appliqué
+///
+/// 1. **Le PCM matériel d'abord**, quelles que soient les capacités annoncées.
+/// 2. À classe égale seulement, la variante la plus riche (voies, puis nombre
+///    de cadences) — le comportement d'avant, intact.
+/// 3. À capacités égales, le `pcm_id` le plus petit. Sans ce dernier cran, la
+///    variante retenue serait la **première énumérée**, donc dépendante de
+///    l'ordre d'alsa-lib.
+///
+/// Ces trois critères forment un ordre total : le vainqueur ne dépend pas de
+/// l'ordre du parcours.
+///
+/// ## Ce que cette règle ne change PAS
+///
+/// Elle ne change ni le nombre de périphériques publiés (le regroupement par
+/// nom reste entier — 43 fantômes → 48 zones chez JeromeQ, Ubuntu 24.04), ni
+/// le périphérique d'une zone déjà configurée : la résolution
+/// ([`resolve_device`]) travaille sur la liste BRUTE de `output_devices()`,
+/// jamais sur cette liste fusionnée, et apparie d'abord par `endpoint_id`. Une
+/// zone qui a mémorisé `sysdefault:…` continue donc d'ouvrir `sysdefault:…`.
+/// Seules les zones créées ensuite héritent du PCM matériel.
+///
+/// Quand aucune variante du groupe n'est un `hw:` — le cas d'une machine où
+/// PipeWire est le seul chemin praticable — le critère 1 ne départage rien et
+/// le comportement d'avant s'applique mot pour mot.
+fn variante_alsa_candidate_l_emporte(retenue: &AlsaVariant, candidate: &AlsaVariant) -> bool {
+    let retenue_materielle = alsa_pcm_is_direct_hardware(&retenue.endpoint_id);
+    let candidate_materielle = alsa_pcm_is_direct_hardware(&candidate.endpoint_id);
+    if candidate_materielle != retenue_materielle {
+        return candidate_materielle;
+    }
+    if candidate.max_channels != retenue.max_channels {
+        return candidate.max_channels > retenue.max_channels;
+    }
+    if candidate.sample_rates.len() != retenue.sample_rates.len() {
+        return candidate.sample_rates.len() > retenue.sample_rates.len();
+    }
+    candidate.endpoint_id < retenue.endpoint_id
+}
+
+/// Laquelle de ces variantes homonymes doit être retenue ? Indice, ou `None`
+/// si la liste est vide.
+///
+/// Fonction PURE : aucun appel à alsa-lib, aucun périphérique, aucune variable
+/// d'environnement. Le `cfg` et l'interrogation du pilote restent du câblage,
+/// sur le patron de `resolve_local_audio_backend` — pour que la règle soit
+/// vérifiable sans matériel. Voir `variante_alsa_candidate_l_emporte` pour
+/// l'ordre appliqué et ce qu'il ne change pas.
+pub fn retenir_variante_alsa(variantes: &[AlsaVariant]) -> Option<usize> {
+    let mut gagnante: Option<usize> = None;
+    for (index, variante) in variantes.iter().enumerate() {
+        match gagnante {
+            None => gagnante = Some(index),
+            Some(courante) => {
+                if variante_alsa_candidate_l_emporte(&variantes[courante], variante) {
+                    gagnante = Some(index);
+                }
+            }
+        }
+    }
+    gagnante
+}
+
 /// Regroupe deux variantes Linux qui représentent le même nom de périphérique.
 ///
 /// PipeWire/ALSA peut exposer plusieurs entrées homonymes avec des capacités
-/// différentes. La variante retenue doit rester un tout : son identité et ses
-/// capacités ne peuvent pas provenir de deux entrées différentes.
+/// différentes. La variante retenue doit rester un tout : son identité, ses
+/// capacités **et ce que vaut la liste de cadences** ne peuvent pas provenir de
+/// trois entrées différentes.
+///
+/// Le départage lui-même est délégué à [`variante_alsa_candidate_l_emporte`] —
+/// une seule règle, éprouvable sans matériel.
 #[cfg(any(target_os = "linux", test))]
 fn merge_linux_duplicate_variant(
     existing: &mut AudioDevice,
@@ -870,22 +974,36 @@ fn merge_linux_duplicate_variant(
     candidate_is_default: bool,
     candidate_max_channels: u16,
     candidate_sample_rates: Vec<u32>,
+    candidate_sample_rates_measured: bool,
 ) -> bool {
-    let richer = candidate_max_channels > existing.max_channels
-        || (candidate_max_channels == existing.max_channels
-            && candidate_sample_rates.len() > existing.sample_rates.len());
-    if richer {
+    let retenue = AlsaVariant {
+        endpoint_id: existing.endpoint_id.clone(),
+        max_channels: existing.max_channels,
+        sample_rates: existing.sample_rates.clone(),
+    };
+    let candidate = AlsaVariant {
+        endpoint_id: candidate_endpoint_id,
+        max_channels: candidate_max_channels,
+        sample_rates: candidate_sample_rates,
+    };
+    let bascule = variante_alsa_candidate_l_emporte(&retenue, &candidate);
+    if bascule {
         // L'identité bascule avec les capacités. Conserver l'endpoint de la
         // première variante ferait rouvrir en lecture un autre périphérique
         // que celui dont on vient de publier les capacités.
-        existing.endpoint_id = candidate_endpoint_id;
-        existing.max_channels = candidate_max_channels;
-        existing.sample_rates = candidate_sample_rates;
+        existing.endpoint_id = candidate.endpoint_id;
+        existing.max_channels = candidate.max_channels;
+        existing.sample_rates = candidate.sample_rates;
+        // Et la PREUVE bascule avec elles : `sample_rates_measured` avait été
+        // calculé pour l'endpoint de la première variante. Le laisser en place
+        // faisait présenter les cadences d'un `hw:` comme non mesurées — ou,
+        // pire, celles d'un `dmix:` comme mesurées (#1655).
+        existing.sample_rates_measured = candidate_sample_rates_measured;
     }
     if candidate_is_default {
         existing.is_default = true;
     }
-    richer
+    bascule
 }
 
 static SCAN_GUARD: std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>)>> =
@@ -1100,17 +1218,35 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 #[cfg(target_os = "linux")]
                 {
                     if let Some(&idx) = linux_by_name.get(&raw_name) {
-                        let richer = merge_linux_duplicate_variant(
+                        let ancien_endpoint = devices[idx].endpoint_id.clone();
+                        let ancien_materiel = alsa_pcm_is_direct_hardware(&ancien_endpoint);
+                        let bascule = merge_linux_duplicate_variant(
                             &mut devices[idx],
                             endpoint_id,
                             is_default,
                             max_channels,
                             sample_rates,
+                            rates_evidence.is_measured(),
                         );
+                        let retenu_materiel =
+                            alsa_pcm_is_direct_hardware(&devices[idx].endpoint_id);
+                        if bascule && retenu_materiel && !ancien_materiel {
+                            // Chemin bit-perfect : ce groupe publiera désormais
+                            // le PCM du DAC au lieu d'un greffon qui accepte
+                            // tout. Une décision qui change ce qui sera OUVERT
+                            // ne passe jamais en silence (#3209, #1655).
+                            info!(
+                                device = %raw_name,
+                                greffon_ecarte = %ancien_endpoint,
+                                endpoint_retenu = %devices[idx].endpoint_id,
+                                "local_audio_alsa_hardware_pcm_preferred"
+                            );
+                        }
                         debug!(
                             device = %raw_name,
                             retained_endpoint_id = %devices[idx].endpoint_id,
-                            richer,
+                            bascule,
+                            retenu_materiel,
                             "local_audio_device_collapsed_pipewire_duplicate"
                         );
                         continue;
@@ -9249,6 +9385,15 @@ mod tests {
         }
     }
 
+    /// Épingle « la plus riche l'emporte » — le départage d'avant #3209.
+    ///
+    /// Ce test reste vrai APRÈS #3209, et ce n'est pas un hasard : ni
+    /// `alsa:first-48k` ni `alsa:rich-384k` n'est un PCM `hw:`, donc le
+    /// critère « le matériel d'abord » ne départage rien et l'ancienne règle
+    /// s'applique mot pour mot. C'est exactement le cas d'une machine où
+    /// PipeWire est le seul chemin praticable. Il a gagné un sixième argument
+    /// (`candidate_sample_rates_measured`) parce que la preuve doit désormais
+    /// basculer avec l'identité et les capacités.
     #[test]
     fn linux_duplicate_keeps_the_rich_variant_identity_with_its_capabilities() {
         let mut retained = AudioDevice {
@@ -9260,19 +9405,259 @@ mod tests {
             sample_rates_measured: true,
             backend: "ALSA".into(),
         };
-
+        assert!(
+            !alsa_pcm_is_direct_hardware("alsa:first-48k")
+                && !alsa_pcm_is_direct_hardware("alsa:rich-384k"),
+            "ce test n'épingle l'ANCIENNE règle que tant qu'aucun des deux PCM \
+             n'atteint le matériel ; sinon il vérifierait autre chose que son nom",
+        );
         assert!(merge_linux_duplicate_variant(
             &mut retained,
             "alsa:rich-384k".into(),
             true,
             32,
             vec![44_100, 48_000, 96_000, 192_000, 384_000],
+            true,
         ));
-
         assert_eq!(retained.endpoint_id, "alsa:rich-384k");
         assert_eq!(retained.max_channels, 32);
         assert_eq!(retained.sample_rates.last(), Some(&384_000));
         assert!(retained.is_default);
+    }
+
+    // -----------------------------------------------------------------------
+    // #3209 / #1655 — sur ALSA, le greffon ne gagne plus contre le matériel.
+    //
+    // Le mécanisme : `snd_device_name_hint` rend la même carte sous une
+    // dizaine de PCM homonymes, le dédoublonnage Linux les regroupe par nom, et
+    // le départage retenait « le plus riche ». Or un `plug`/`dmix` ACCEPTE
+    // tout : il annonce 32 voies pour un DAC stéréo et toutes les cadences. Il
+    // gagnait donc, puis imposait son identité — et alsa-lib rééchantillonnait
+    // en silence à 48 kHz (`defaults.pcm.dmix.rate 48000`) pendant que Tune
+    // croyait jouer en natif.
+    //
+    // La règle est PURE : elle reçoit des variantes (pcm_id, voies, cadences)
+    // et rend l'indice de celle qui doit être retenue. Aucun appel à alsa-lib,
+    // aucun périphérique — elle est donc éprouvable sur une machine sans DAC,
+    // et sur toutes les cibles, pas seulement Linux.
+    // -----------------------------------------------------------------------
+
+    /// Les cadences qu'un `plug` accepte : toutes. C'est le mensonge du
+    /// greffon, et il ne doit plus rien gagner.
+    fn cadences_du_greffon() -> Vec<u32> {
+        vec![
+            8_000, 16_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800,
+            384_000,
+        ]
+    }
+
+    /// Ce que le DAC annonce vraiment : deux voies, 44,1 → 384.
+    fn cadences_du_materiel() -> Vec<u32> {
+        vec![
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        ]
+    }
+
+    /// LE CAS D'OR. `sysdefault:CARD=X` annonce 32 voies et TOUTES les
+    /// cadences ; `hw:CARD=X` annonce 2 voies et 44,1 → 384. Le greffon est
+    /// strictement plus riche sur les deux axes — et perd quand même.
+    #[test]
+    fn alsa_le_pcm_materiel_bat_le_greffon_meme_plus_riche() {
+        let greffon = AlsaVariant {
+            endpoint_id: "sysdefault:CARD=DACZ8,DEV=0".into(),
+            max_channels: 32,
+            sample_rates: cadences_du_greffon(),
+        };
+        let materiel = AlsaVariant {
+            endpoint_id: "hw:CARD=DACZ8,DEV=0".into(),
+            max_channels: 2,
+            sample_rates: cadences_du_materiel(),
+        };
+        assert!(
+            greffon.max_channels > materiel.max_channels
+                && greffon.sample_rates.len() > materiel.sample_rates.len(),
+            "le témoin ne vaut que si le greffon est STRICTEMENT plus riche : \
+             c'est ce que l'ancienne règle regardait",
+        );
+
+        // alsa-lib rend `sysdefault` avant `hw` — mais la règle ne doit pas
+        // dépendre de cet ordre, sans quoi elle serait vraie par accident.
+        for (etiquette, variantes) in [
+            ("greffon en tête", vec![greffon.clone(), materiel.clone()]),
+            ("matériel en tête", vec![materiel.clone(), greffon.clone()]),
+        ] {
+            let indice = retenir_variante_alsa(&variantes)
+                .unwrap_or_else(|| panic!("{etiquette} : aucune variante retenue"));
+            assert_eq!(
+                variantes[indice].endpoint_id, "hw:CARD=DACZ8,DEV=0",
+                "{etiquette} : c'est le greffon qui a été retenu — alsa-lib \
+                 rééchantillonnera un FLAC 44,1 kHz en silence (#1655)",
+            );
+            assert_eq!(
+                variantes[indice].max_channels, 2,
+                "{etiquette} : les capacités retenues doivent être celles du \
+                 DAC, pas les 32 voies inventées par le greffon",
+            );
+        }
+    }
+
+    /// LE TÉMOIN PIPEWIRE. Plusieurs variantes homonymes SANS aucun `hw:` :
+    /// le comportement d'avant est conservé, et le regroupement continue de
+    /// rendre UNE seule variante (43 fantômes → 48 zones chez JeromeQ sur
+    /// Ubuntu 24.04 — c'est ce que le regroupement par nom a arrêté).
+    #[test]
+    fn alsa_sans_pcm_materiel_le_dedoublonnage_pipewire_est_inchange() {
+        let variantes = vec![
+            AlsaVariant {
+                endpoint_id: "sysdefault:CARD=PCH".into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "pipewire".into(),
+                max_channels: 32,
+                sample_rates: vec![44_100, 48_000, 96_000, 192_000],
+            },
+            AlsaVariant {
+                endpoint_id: "pulse".into(),
+                max_channels: 2,
+                sample_rates: vec![48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "default".into(),
+                max_channels: 8,
+                sample_rates: vec![44_100, 48_000],
+            },
+            AlsaVariant {
+                endpoint_id: "plughw:CARD=PCH,DEV=0".into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000, 96_000],
+            },
+        ];
+        assert!(
+            variantes
+                .iter()
+                .all(|v| !alsa_pcm_is_direct_hardware(&v.endpoint_id)),
+            "aucune de ces variantes ne doit atteindre le matériel, sinon le \
+             témoin ne parle plus du cas PipeWire",
+        );
+
+        // La plus riche l'emporte, exactement comme avant #3209 — et une
+        // SEULE variante est retenue, quel que soit l'ordre d'énumération.
+        let mut tournee = variantes.clone();
+        for _ in 0..variantes.len() {
+            tournee.rotate_left(1);
+            let indice = retenir_variante_alsa(&tournee).expect("une variante retenue");
+            assert_eq!(
+                tournee[indice].endpoint_id, "pipewire",
+                "le départage PipeWire a changé : une machine où PipeWire est \
+                 le seul chemin praticable ne doit rien voir de #3209",
+            );
+        }
+
+        // Et la règle rend UN indice, jamais une liste : le regroupement par
+        // nom reste entier. Sans lui, 43 périphériques → 48 zones.
+        assert!(retenir_variante_alsa(&[]).is_none());
+    }
+
+    /// L'ÉGALITÉ. Deux variantes de capacités identiques : la règle est
+    /// déterministe et ne dépend pas de l'ordre d'énumération. Sans le
+    /// départage par `pcm_id`, c'est la PREMIÈRE énumérée qui gardait tout —
+    /// et alsa-lib rend `sysdefault` avant `hw`.
+    #[test]
+    fn alsa_l_egalite_se_departage_sans_dependre_de_l_ordre() {
+        for (etiquette, a, b, attendu) in [
+            (
+                "deux sorties matérielles de la même carte",
+                "hw:CARD=DACZ8,DEV=1",
+                "hw:CARD=DACZ8,DEV=0",
+                "hw:CARD=DACZ8,DEV=0",
+            ),
+            (
+                "deux greffons homonymes",
+                "sysdefault:CARD=PCH,DEV=0",
+                "front:CARD=PCH,DEV=0",
+                "front:CARD=PCH,DEV=0",
+            ),
+        ] {
+            let fabriquer = |id: &str| AlsaVariant {
+                endpoint_id: id.into(),
+                max_channels: 2,
+                sample_rates: vec![44_100, 48_000],
+            };
+            for (ordre, variantes) in [
+                ("a puis b", vec![fabriquer(a), fabriquer(b)]),
+                ("b puis a", vec![fabriquer(b), fabriquer(a)]),
+            ] {
+                let indice = retenir_variante_alsa(&variantes).expect("une variante retenue");
+                assert_eq!(
+                    variantes[indice].endpoint_id, attendu,
+                    "{etiquette} ({ordre}) : à capacités égales le vainqueur \
+                     dépend encore de l'ordre rendu par alsa-lib",
+                );
+            }
+        }
+    }
+
+    /// Le câblage : quand le PCM matériel l'emporte, l'AudioDevice publié
+    /// bascule ENTIÈREMENT — identité, capacités, et la preuve qui les
+    /// accompagne. Publier « 32 voies mesurées » sous l'endpoint d'un `hw:`
+    /// stéréo serait un troisième périphérique, qui n'existe pas.
+    #[test]
+    fn alsa_le_materiel_retenu_emporte_ses_capacites_et_sa_preuve() {
+        // L'ordre d'alsa-lib : le greffon est publié en premier, ses cadences
+        // ne valent rien (`sample_rates_measured = false`, #1655).
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "sysdefault:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 32,
+            sample_rates: cadences_du_greffon(),
+            sample_rates_measured: false,
+            backend: "Alsa".into(),
+        };
+        assert!(merge_linux_duplicate_variant(
+            &mut publie,
+            "hw:CARD=DACZ8,DEV=0".into(),
+            false,
+            2,
+            cadences_du_materiel(),
+            true,
+        ));
+        assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.max_channels, 2);
+        assert_eq!(publie.sample_rates, cadences_du_materiel());
+        assert!(
+            publie.sample_rates_measured,
+            "les cadences d'un `hw:` SONT mesurées : la preuve doit basculer \
+             avec l'identité, pas rester celle du greffon",
+        );
+
+        // Et dans l'autre sens : le greffon qui arrive après ne reprend rien
+        // au matériel déjà retenu — ni l'identité, ni ses 32 voies inventées.
+        let mut publie = AudioDevice {
+            name: "Eversolo DAC-Z8, USB Audio".into(),
+            endpoint_id: "hw:CARD=DACZ8,DEV=0".into(),
+            is_default: false,
+            max_channels: 2,
+            sample_rates: cadences_du_materiel(),
+            sample_rates_measured: true,
+            backend: "Alsa".into(),
+        };
+        assert!(!merge_linux_duplicate_variant(
+            &mut publie,
+            "dmix:CARD=DACZ8,DEV=0".into(),
+            true,
+            32,
+            cadences_du_greffon(),
+            false,
+        ));
+        assert_eq!(publie.endpoint_id, "hw:CARD=DACZ8,DEV=0");
+        assert_eq!(publie.max_channels, 2);
+        assert!(publie.sample_rates_measured);
+        // `is_default` reste transmis : c'est un fait sur le NOM, pas sur le
+        // PCM — le comportement d'avant est conservé.
+        assert!(publie.is_default);
     }
 
     // -----------------------------------------------------------------------
