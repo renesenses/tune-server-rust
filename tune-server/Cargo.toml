@@ -195,3 +195,11 @@ path = "tests/canal_de_mise_a_jour.rs"
 [[test]]
 name = "portee_unicite_file_path_2939"
 path = "tests/portee_unicite_file_path_2939.rs"
+
+# #3185 : la base ne doit plus dependre du repertoire de lancement (fil forum
+# 616). La regle et sa migration vivent hors de tout `cfg`, donc ce fichier
+# s'execute sur Linux comme sur macOS. `autotests = false` plus haut — sans
+# cette cible, il ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "base_unique_lancement_i3185"
+path = "tests/base_unique_lancement_i3185.rs"

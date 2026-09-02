@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use tracing::info;
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -233,33 +234,29 @@ impl TuneConfig {
             config.artwork_dir = format!("{data_dir}\\{}", config.artwork_dir);
         }
 
-        // On macOS, resolve relative paths to ~/Library/Application Support/Tune/
-        // so Tune works correctly regardless of the working directory (e.g. inside
-        // a signed .app bundle where CWD is read-only).  Backward-compat: if
-        // tune.db already exists in the CWD, keep using it.
+        // macOS, #3185 : UN SEUL chemin de base, quel que soit le repertoire de
+        // lancement. Le code precedent gardait la base trouvee dans le
+        // repertoire courant quand il y en avait une ; le meme binaire ouvrait
+        // donc DEUX bases differentes selon son lanceur — le `.command` depuis
+        // le dossier d'installation, le LaunchAgent depuis `/`. C'est le
+        // « si je le relance manuellement je perds les zones » du fil 616.
+        //
+        // La regle vit dans `plan_base_macos`, une fonction pure compilee sur
+        // TOUTES les plateformes : ce bloc-ci ne fait plus que lui donner ce
+        // qu'elle ne peut pas savoir (le HOME, le repertoire courant, ce qui
+        // existe sur le disque) et appliquer son plan.
         #[cfg(target_os = "macos")]
-        if !std::path::Path::new(&config.db_path).is_absolute() {
-            let cwd_db = std::path::Path::new(&config.db_path);
-            if !cwd_db.exists() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let app_support =
-                        std::path::PathBuf::from(&home).join("Library/Application Support/Tune");
-                    if std::fs::create_dir_all(&app_support).is_ok() {
-                        let abs_path = app_support.join(&config.db_path);
-                        info!(path = %abs_path.display(), "db_path_resolved_to_app_support");
-                        config.db_path = abs_path.to_string_lossy().into_owned();
-
-                        if !std::path::Path::new(&config.artwork_dir).is_absolute() {
-                            let art_path = app_support.join(&config.artwork_dir);
-                            std::fs::create_dir_all(&art_path).ok();
-                            info!(path = %art_path.display(), "artwork_dir_resolved_to_app_support");
-                            config.artwork_dir = art_path.to_string_lossy().into_owned();
-                        }
-                    }
-                }
-            } else {
-                info!(path = %cwd_db.display(), "db_path_using_existing_local_db");
-            }
+        {
+            let repertoire_courant = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let home = std::env::var("HOME").ok();
+            let plan = plan_base_macos(
+                &config.db_path,
+                &config.artwork_dir,
+                home.as_deref(),
+                &repertoire_courant,
+                |chemin| chemin.exists(),
+            );
+            appliquer_plan_base_macos(&mut config, plan);
         }
 
         if let Ok(v) = std::env::var("TUNE_WEB_DIR") {
@@ -576,6 +573,291 @@ pub(crate) fn dual_stack_listen_socket(
     socket.set_reuse_address(true).ok();
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     Some((socket, addr))
+}
+
+/// Le dossier de donnees de Tune sous macOS, relatif a `$HOME`.
+pub const MACOS_DATA_SUBDIR: &str = "Library/Application Support/Tune";
+
+/// Les fichiers annexes d'une base SQLite.
+///
+/// Une base n'est pas UN fichier : le `-wal` porte les transactions pas
+/// encore repliees, le `-shm` l'index de ce journal. Copier la base seule
+/// et laisser son `-wal` derriere rend une base amputee des dernieres
+/// ecritures ; l'inverse — poser un `-wal` etranger a cote d'une base —
+/// fait rejouer un journal qui n'est pas le sien. Le patron est celui de
+/// `tune_core::db_backup`, qui traite deja les deux suffixes ensemble dans
+/// `create_backup`, `replace_database` et `prune_backups`.
+const ANNEXES_SQLITE: [&str; 2] = ["-wal", "-shm"];
+
+/// Ce que le demarrage doit faire de la base, une fois la regle appliquee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionBaseMacos {
+    /// `db_path` etait deja absolu : la configuration a tranche, on n'y touche pas.
+    CheminAbsolu,
+    /// `HOME` est introuvable : rien a resoudre, les chemins restent tels quels.
+    HomeIntrouvable,
+    /// Rien a deplacer — la base d'`Application Support` est la seule.
+    Aucune,
+    /// Une base vit dans le repertoire de lancement et **aucune** dans
+    /// `Application Support` : elle doit y etre recopiee avant l'ouverture.
+    Migrer { source: PathBuf },
+    /// Les DEUX existent. `Application Support` l'emporte, et l'autre est
+    /// laissee EN PLACE, intacte, nommee dans le journal.
+    DeuxBases { delaissee: PathBuf },
+}
+
+/// Le plan rendu par la regle : les chemins retenus, et ce qu'il faut faire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBaseMacos {
+    /// Le chemin de base retenu. Il ne depend JAMAIS du repertoire courant
+    /// des lors que `home` est connu : c'est tout l'objet de #3185.
+    pub db_path: String,
+    /// Le dossier de pochettes retenu, resolu par la meme regle.
+    pub artwork_dir: String,
+    /// Le dossier de donnees a creer, quand il y en a un.
+    pub app_support: Option<PathBuf>,
+    pub action: ActionBaseMacos,
+}
+
+/// La regle de #3185 : ou vit la base, et que faire de celle qu'on trouve
+/// ailleurs.
+///
+/// Fonction **pure**, et volontairement **sans `cfg`** : le bloc qu'elle
+/// remplace vivait sous `#[cfg(target_os = "macos")]`, donc n'existait pour
+/// aucun compilateur hors d'un Mac — un test qui aurait porte le meme `cfg`
+/// aurait ete vert contre rien. Tout ce que la regle a besoin de savoir lui
+/// est passe : le HOME, le repertoire courant, et un predicat d'existence.
+/// Le patron est celui de `tune_core::config::resolve_local_audio_backend`,
+/// qui prend son `lookup` en parametre « pour que la regle soit verifiable
+/// sans toucher a l'environnement du processus ».
+///
+/// Les regles, dans l'ordre :
+/// 1. un `db_path` **absolu** est honore tel quel — l'utilisateur a decide ;
+/// 2. sans `HOME`, rien n'est resolu : on ne fabrique pas un chemin au hasard ;
+/// 3. sinon le chemin retenu est TOUJOURS
+///    `$HOME/Library/Application Support/Tune/<db_path>`, que le repertoire
+///    courant contienne une base ou non. C'est l'invariant du correctif ;
+/// 4. si une base traine dans le repertoire courant et qu'il n'y en a pas
+///    encore sous `Application Support`, elle est **recopiee** ([`ActionBaseMacos::Migrer`]) ;
+/// 5. si les DEUX existent, `Application Support` gagne — c'est le seul choix
+///    qui ne depende pas du lanceur — et **aucune des deux n'est detruite**
+///    ([`ActionBaseMacos::DeuxBases`]). Le journal nomme la delaissee pour que
+///    l'utilisateur puisse la recuperer ou l'effacer lui-meme.
+pub fn plan_base_macos(
+    db_path: &str,
+    artwork_dir: &str,
+    home: Option<&str>,
+    repertoire_courant: &Path,
+    existe: impl Fn(&Path) -> bool,
+) -> PlanBaseMacos {
+    let inchange = |action| PlanBaseMacos {
+        db_path: db_path.to_string(),
+        artwork_dir: artwork_dir.to_string(),
+        app_support: None,
+        action,
+    };
+    if Path::new(db_path).is_absolute() {
+        return inchange(ActionBaseMacos::CheminAbsolu);
+    }
+    let Some(home) = home else {
+        return inchange(ActionBaseMacos::HomeIntrouvable);
+    };
+    let app_support = PathBuf::from(home).join(MACOS_DATA_SUBDIR);
+    let cible = app_support.join(db_path);
+    let locale = repertoire_courant.join(db_path);
+    // Lance DEPUIS `Application Support` : les deux chemins designent le meme
+    // fichier. Rien a migrer, et surtout rien a « delaisser ».
+    let action = if locale == cible {
+        ActionBaseMacos::Aucune
+    } else {
+        match (existe(&locale), existe(&cible)) {
+            (true, false) => ActionBaseMacos::Migrer { source: locale },
+            (true, true) => ActionBaseMacos::DeuxBases { delaissee: locale },
+            (false, _) => ActionBaseMacos::Aucune,
+        }
+    };
+    // `artwork_dir` suivait le meme chemin dans l'ancien bloc — mais SEULEMENT
+    // dans la branche « aucune base locale », donc lui aussi dependait du
+    // repertoire de lancement. Il est desormais resolu dans tous les cas.
+    let artwork_dir = if Path::new(artwork_dir).is_absolute() {
+        artwork_dir.to_string()
+    } else {
+        app_support.join(artwork_dir).to_string_lossy().into_owned()
+    };
+    PlanBaseMacos {
+        db_path: cible.to_string_lossy().into_owned(),
+        artwork_dir,
+        app_support: Some(app_support),
+        action,
+    }
+}
+
+/// Recopie une base SQLite **et ses annexes** vers `cible`, sans jamais
+/// effacer la source.
+///
+/// Deux garanties, parce qu'il s'agit de la donnee d'un utilisateur :
+///
+/// * **rien n'est detruit** — on copie, on ne deplace pas. Si quoi que ce
+///   soit tourne mal ensuite, la base d'origine est encore la ou elle etait ;
+///   au demarrage suivant la regle la verra comme [`ActionBaseMacos::DeuxBases`]
+///   et la laissera intacte ;
+/// * **aucun etat a mi-chemin** — les trois fichiers sont d'abord ecrits a
+///   cote de la cible sous un nom temporaire, puis mis en place par des
+///   renommages faits dans le meme dossier. Un echec avant la fin retire les
+///   temporaires ET les fichiers deja poses, et rend l'erreur : la cible est
+///   alors exactement dans l'etat ou elle etait.
+///
+/// Sans `cfg` : la migration est ainsi eprouvee sur toutes les plateformes.
+pub fn copier_base_sqlite(source: &Path, cible: &Path) -> Result<u64, String> {
+    /// Defait ce qui a ete pose, retire les temporaires, et rend l'erreur.
+    fn renoncer(
+        a_poser: &[(PathBuf, PathBuf)],
+        poses: &[PathBuf],
+        erreur: String,
+    ) -> Result<u64, String> {
+        for chemin in poses {
+            let _ = std::fs::remove_file(chemin);
+        }
+        for (temporaire, _) in a_poser {
+            let _ = std::fs::remove_file(temporaire);
+        }
+        Err(erreur)
+    }
+
+    let nom_source = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("chemin de base invalide : {}", source.display()))?;
+    let nom_cible = cible
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("chemin de base invalide : {}", cible.display()))?;
+    let marque = format!("{nom_cible}.migration-{}", std::process::id());
+
+    // (temporaire, nom definitif)
+    let mut a_poser: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut poses: Vec<PathBuf> = Vec::new();
+
+    let temporaire = cible.with_file_name(&marque);
+    if let Err(e) = std::fs::copy(source, &temporaire) {
+        // Rien n'a encore ete pose : il n'y a que ce temporaire a retirer, et
+        // il peut n'avoir jamais ete cree.
+        let _ = std::fs::remove_file(&temporaire);
+        return Err(format!("copie de {} : {e}", source.display()));
+    }
+    a_poser.push((temporaire, cible.to_path_buf()));
+
+    for suffixe in ANNEXES_SQLITE {
+        let annexe = source.with_file_name(format!("{nom_source}{suffixe}"));
+        if !annexe.exists() {
+            continue;
+        }
+        let temporaire = cible.with_file_name(format!("{marque}{suffixe}"));
+        if let Err(e) = std::fs::copy(&annexe, &temporaire) {
+            let _ = std::fs::remove_file(&temporaire);
+            return renoncer(
+                &a_poser,
+                &poses,
+                format!("copie de {} : {e}", annexe.display()),
+            );
+        }
+        a_poser.push((
+            temporaire,
+            cible.with_file_name(format!("{nom_cible}{suffixe}")),
+        ));
+    }
+
+    for (temporaire, definitif) in &a_poser {
+        if let Err(e) = std::fs::rename(temporaire, definitif) {
+            return renoncer(
+                &a_poser,
+                &poses,
+                format!("mise en place de {} : {e}", definitif.display()),
+            );
+        }
+        poses.push(definitif.clone());
+    }
+
+    std::fs::metadata(cible)
+        .map(|m| m.len())
+        .map_err(|e| format!("base migree illisible a {} : {e}", cible.display()))
+}
+
+/// Applique le plan de [`plan_base_macos`] : cree le dossier de donnees,
+/// migre s'il le faut, puis pose les chemins definitifs dans la configuration.
+///
+/// Sans `cfg`, comme la regle : les effets de bord aussi sont ainsi eprouves
+/// sur Shrek. Seul l'appel — qui lit `HOME` et le repertoire courant du
+/// processus — reste sous `#[cfg(target_os = "macos")]`.
+///
+/// Deux replis, tous deux journalises :
+///
+/// * `Application Support` **increable** : les chemins d'entree sont conserves,
+///   c'est-a-dire exactement le comportement d'avant le correctif. Un dossier
+///   de donnees inaccessible n'est pas une raison pour refuser de demarrer ;
+/// * migration **echouee** : le chemin retenu reste malgre tout celui
+///   d'`Application Support`, et l'echec sort en `error!`. Repartir sur la base
+///   du repertoire courant reintroduirait precisement l'ambiguite que #3185
+///   corrige ; la base d'origine, elle, est intacte et le journal la nomme.
+pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
+    if matches!(
+        plan.action,
+        ActionBaseMacos::CheminAbsolu | ActionBaseMacos::HomeIntrouvable
+    ) {
+        if plan.action == ActionBaseMacos::HomeIntrouvable {
+            warn!(db_path = %plan.db_path, "db_path_home_introuvable");
+        }
+        return;
+    }
+    let Some(app_support) = plan.app_support.as_ref() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(app_support) {
+        warn!(
+            path = %app_support.display(),
+            error = %e,
+            "db_path_app_support_increable"
+        );
+        return;
+    }
+    match &plan.action {
+        ActionBaseMacos::Migrer { source } => {
+            info!(
+                from = %source.display(),
+                to = %plan.db_path,
+                "db_migration_vers_app_support"
+            );
+            match copier_base_sqlite(source, Path::new(&plan.db_path)) {
+                Ok(octets) => info!(
+                    octets,
+                    from = %source.display(),
+                    to = %plan.db_path,
+                    "db_migration_reussie_base_d_origine_conservee"
+                ),
+                Err(e) => error!(
+                    error = %e,
+                    from = %source.display(),
+                    to = %plan.db_path,
+                    "db_migration_echouee_base_d_origine_intacte"
+                ),
+            }
+        }
+        ActionBaseMacos::DeuxBases { delaissee } => {
+            warn!(
+                retenue = %plan.db_path,
+                delaissee = %delaissee.display(),
+                "db_deux_bases_application_support_l_emporte_l_autre_est_laissee_intacte"
+            );
+        }
+        _ => {}
+    }
+    info!(path = %plan.db_path, "db_path_resolved_to_app_support");
+    config.db_path = plan.db_path;
+    if config.artwork_dir != plan.artwork_dir {
+        std::fs::create_dir_all(&plan.artwork_dir).ok();
+        info!(path = %plan.artwork_dir, "artwork_dir_resolved_to_app_support");
+        config.artwork_dir = plan.artwork_dir;
+    }
 }
 
 #[cfg(test)]
