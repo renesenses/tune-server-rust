@@ -641,7 +641,12 @@ mod tests_homonymes {
         (police, pulp)
     }
 
-    fn ecoute(state: &AppState, titre: &str, artiste: Option<&str>, album_id: Option<i64>) {
+    pub(super) fn ecoute(
+        state: &AppState,
+        titre: &str,
+        artiste: Option<&str>,
+        album_id: Option<i64>,
+    ) {
         state
             .backend
             .execute(
@@ -2074,4 +2079,128 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
         "services": highlights,
         "preferred_service": preferred_service,
     }))
+}
+
+/// Les sections de l'accueil ne doivent pas se taire EN SILENCE.
+///
+/// Le defaut du 02/09/2026 : `sql_top_genres` echouait sur les deux moteurs,
+/// l'erreur etait avalee par `ou_defaut_journalise`, et deux sections rendaient
+/// depuis toujours autre chose que ce qu'elles annoncent — « A decouvrir »
+/// tombait sur son repli ALEATOIRE, `/home/top-mixes` rendait `[]`. Aucun test
+/// ne le voyait : tous verifiaient des requetes prises une par une, aucun ne
+/// verifiait qu'une SECTION rend quelque chose.
+///
+/// Ces deux tests sont ROUGES sur le code d'avant le correctif — c'est leur
+/// seule raison d'exister. Ils ne mesurent pas la qualite des recommandations,
+/// qui est un sujet produit ; ils constatent que le chemin nominal est
+/// emprunte, et non le repli.
+#[cfg(test)]
+mod tests_sections_muettes {
+    use super::tests_homonymes::ecoute;
+    use super::*;
+
+    /// Une bibliotheque minimale mais REALISTE : un album ecoute, un album du
+    /// meme genre jamais ecoute (le candidat), et des pistes pour le mix.
+    fn bibliotheque_avec_une_ecoute(state: &AppState) {
+        let b = &state.backend;
+        let poser_album = |artiste: &str, titre: &str, genre: &str| -> i64 {
+            b.execute(
+                "INSERT INTO artists (name) VALUES (?1)",
+                &[&artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            let artiste_id = b.last_insert_rowid();
+            b.execute(
+                "INSERT INTO albums (title, artist_id, track_count, genre) \
+                 VALUES (?1, ?2, 3, ?3)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &artiste_id as &dyn ToSqlValue,
+                    &genre as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            let album_id = b.last_insert_rowid();
+            for n in 1..=3 {
+                let titre_piste = format!("{titre} {n}");
+                b.execute(
+                    "INSERT INTO tracks (title, album_id, artist_id, genre, file_path) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        &titre_piste as &dyn ToSqlValue,
+                        &album_id as &dyn ToSqlValue,
+                        &artiste_id as &dyn ToSqlValue,
+                        &genre as &dyn ToSqlValue,
+                        &format!("/musique/{titre}/{n}.flac") as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+            }
+            album_id
+        };
+        let ecoute_id = poser_album("Air", "Moon Safari", "Electro");
+        // Jamais ecoute, meme genre : c'est LUI que « A decouvrir » doit
+        // proposer. Sans le correctif, le repli aleatoire pouvait aussi le
+        // sortir — d'ou l'assertion sur `reason`, et non sur l'identifiant.
+        poser_album("Boards of Canada", "Geogaddi", "Electro");
+        ecoute(state, "La femme d'argent", Some("Air"), Some(ecoute_id));
+    }
+
+    /// « A decouvrir » doit recommander PAR GENRE, pas au hasard.
+    ///
+    /// CONTRE-EPREUVE : rouge avant le correctif du 02/09 — `top_genres` etait
+    /// toujours vide, la fonction sortait par son repli et etiquetait chaque
+    /// item `reason: "random"`.
+    #[test]
+    fn a_decouvrir_recommande_par_genre_et_non_au_hasard() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque_avec_une_ecoute(&state);
+
+        let Ok(items) = fetch_recommendations(&state, 20) else {
+            panic!("« A decouvrir » doit repondre");
+        };
+
+        assert!(!items.is_empty(), "« A decouvrir » ne doit pas etre vide");
+        let raisons: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i.get("reason").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            raisons.iter().all(|r| *r == "genre_match"),
+            "toutes les recommandations doivent venir du genre ecoute, pas du \
+             repli aleatoire — raisons vues : {raisons:?}"
+        );
+    }
+
+    /// Les « mixes » doivent exister.
+    ///
+    /// CONTRE-EPREUVE : rouge avant le correctif du 02/09 — la route rendait
+    /// `[]` sur TOUTE bibliotheque, depuis toujours, sans un mot.
+    #[tokio::test]
+    async fn les_mixes_ne_sont_pas_vides_sur_une_bibliotheque_ecoutee() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque_avec_une_ecoute(&state);
+
+        let Ok(Json(mixes)) = top_mixes(State(state)).await else {
+            panic!("/home/top-mixes doit repondre");
+        };
+        let mixes = mixes.as_array().expect("un tableau de mixes").clone();
+
+        assert!(
+            !mixes.is_empty(),
+            "au moins un mix pour le genre ecoute — un tableau vide est \
+             exactement le defaut que ce test interdit"
+        );
+        assert_eq!(
+            mixes[0].get("genre").and_then(|v| v.as_str()),
+            Some("Electro"),
+        );
+        assert!(
+            mixes[0]
+                .get("tracks")
+                .and_then(|v| v.as_array())
+                .is_some_and(|t| !t.is_empty()),
+            "un mix sans piste n'est pas un mix"
+        );
+    }
 }
