@@ -149,3 +149,117 @@ async fn pg_3123_routes_de_lecture_sur_postgresql() {
         echecs.join("\n")
     );
 }
+
+/// Une page de `GET /search`, lue par le VRAI routeur sur PostgreSQL (#3189).
+async fn lire_une_page_de_recherche(state: &AppState, offset: i64) -> serde_json::Value {
+    let app: Router = tune_server::routes::router(state.clone());
+    let reponse = app
+        .oneshot(
+            Request::get(format!("/api/v1/search?q=Autumn&limit=50&offset={offset}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        reponse.status().is_success(),
+        "GET /search sur PostgreSQL → {}",
+        reponse.status()
+    );
+    let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&corps).expect("réponse JSON")
+}
+
+/// #3189 — le total de `GET /search`, sur une VRAIE base PostgreSQL.
+///
+/// jfpaquet est sur PostgreSQL, pas sur SQLite : c'est là que le défaut a été
+/// signalé, et c'est donc là qu'il faut prouver qu'il est levé. Les deux
+/// moteurs doivent rendre le MÊME nombre.
+///
+/// Trois formes neuves passent ici pour la première fois sur PostgreSQL et
+/// n'existent sur aucun chemin déjà couvert :
+///
+///   * `LIMIT $6 OFFSET $7` **lié** (et non interpolé) sur la requête de
+///     recherche — PostgreSQL exige un `bigint` là où SQLite avale tout ;
+///   * `SELECT COUNT(*) FROM (SELECT … LIMIT $6) AS borne` — une sous-requête
+///     bornée, qu'un moteur refuse si l'alias manque ;
+///   * `ORDER BY t.id` ajouté à une requête qui n'en portait aucun.
+///
+/// Le jeu est le même que celui du jumeau SQLite
+/// (`tests/recherche_totaux_i3189.rs`) : plus de correspondances que la limite,
+/// et le total doit valoir le nombre de correspondances, pas la longueur de la
+/// liste.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3189_le_total_de_la_recherche_sur_postgresql() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let state = etat_postgres(&url);
+
+    for table in TABLES_VIDEES {
+        state
+            .backend
+            .execute(
+                &format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"),
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("vidage de {table} sur PostgreSQL : {e}"));
+    }
+
+    const PISTES: usize = 137;
+    let tracks = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    for i in 0..PISTES {
+        let mut t = tune_core::db::models::Track::new(format!("Autumn Leaves {i:04}"));
+        t.file_path = Some(format!("/musique/autumn-{i:04}.flac"));
+        tracks.create(&t).expect("insert piste sur PostgreSQL");
+    }
+    // Du bruit : un total qui compterait la table entière le ramasserait.
+    for i in 0..40 {
+        let mut t = tune_core::db::models::Track::new(format!("Winter Sun {i:04}"));
+        t.file_path = Some(format!("/musique/winter-{i:04}.flac"));
+        tracks.create(&t).expect("insert piste hors sujet");
+    }
+
+    let page1 = lire_une_page_de_recherche(&state, 0).await;
+    assert_eq!(
+        page1["local"]["tracks"].as_array().map(Vec::len),
+        Some(50),
+        "la liste est bornée par `limit`"
+    );
+    assert_eq!(
+        page1["local"]["totals"]["tracks"].as_i64(),
+        Some(PISTES as i64),
+        "sur PostgreSQL aussi, le total est le nombre de correspondances \
+         ({PISTES}) et non la longueur de la liste (50) : {page1}"
+    );
+    assert_eq!(
+        page1["local"]["has_more"]["tracks"].as_bool(),
+        Some(true),
+        "87 pistes n'ont pas été rendues"
+    );
+
+    // La pagination va au bout, sans doublon ni trou — l'épreuve qui exige
+    // l'ordre total, sur le moteur où l'absence d'`ORDER BY` se voit le plus.
+    let mut vus = std::collections::HashSet::new();
+    let mut doublons = 0_usize;
+    for offset in [0_i64, 50, 100] {
+        let page = lire_une_page_de_recherche(&state, offset).await;
+        for p in page["local"]["tracks"].as_array().expect("tableau") {
+            if !vus.insert(p["id"].as_i64().expect("piste sans id")) {
+                doublons += 1;
+            }
+        }
+    }
+    assert_eq!(
+        doublons, 0,
+        "une piste est revenue deux fois sur PostgreSQL"
+    );
+    assert_eq!(
+        vus.len(),
+        PISTES,
+        "le parcours complet doit rendre les {PISTES} correspondances"
+    );
+}
