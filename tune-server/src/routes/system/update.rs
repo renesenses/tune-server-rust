@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChecker};
+use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker};
 
 use crate::state::AppState;
 
@@ -505,6 +505,67 @@ const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB
 /// au fil forum a envoyé Jean Valjean vérifier SON réseau. Il n'y était pour
 /// rien. Un message qui ne nomme pas la cause fait chercher au mauvais endroit
 /// — et le seul qui puisse trancher, c'est le code qui a vu la réponse HTTP.
+/// Le dernier maillon du canal (#2266) : le réglage relu dans la base ARME
+/// bien le vérificateur que les deux routes utilisent.
+///
+/// Ce test ne passe pas par le réseau — il n'interroge pas l'API des releases,
+/// il vérifie que `checker_for` porte le canal enregistré. C'est exactement le
+/// maillon qu'un « écrit mais pas branché » casserait sans qu'aucun test de
+/// filtrage ne bronche : `select_release` pourrait être parfait pendant que les
+/// routes construiraient encore un vérificateur en `Auto`.
+#[cfg(test)]
+mod canal_branche_sur_le_verificateur {
+    use super::{checker_for, update_channel};
+    use tune_core::updater::UpdateChannel;
+
+    fn etat() -> crate::state::AppState {
+        crate::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// LE TÉMOIN, côté serveur : base neuve, réglage jamais écrit → `Auto`,
+    /// c'est-à-dire le vérificateur d'avant #2266.
+    #[test]
+    fn sans_reglage_le_verificateur_reste_en_auto() {
+        let state = etat();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+        assert_eq!(checker_for(&state.backend).channel(), UpdateChannel::Auto);
+    }
+
+    #[test]
+    fn le_reglage_enregistre_arme_le_verificateur() {
+        let state = etat();
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        for canal in [
+            UpdateChannel::Stable,
+            UpdateChannel::Beta,
+            UpdateChannel::Auto,
+        ] {
+            settings
+                .set(UpdateChannel::SETTING_KEY, canal.as_str())
+                .unwrap();
+            assert_eq!(update_channel(&state.backend), canal);
+            assert_eq!(
+                checker_for(&state.backend).channel(),
+                canal,
+                "le vérificateur des routes doit porter le canal {}",
+                canal.as_str()
+            );
+        }
+    }
+
+    /// Une valeur illisible ne doit jamais OUVRIR le canal bêta : le repli est
+    /// le comportement historique.
+    #[test]
+    fn valeur_illisible_retombe_sur_auto() {
+        let state = etat();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(UpdateChannel::SETTING_KEY, "nightly")
+            .unwrap();
+        assert_eq!(update_channel(&state.backend), UpdateChannel::Auto);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateBlame {
     /// Rien n'a répondu : réseau, DNS, proxy, coupure. Chez l'utilisateur.
@@ -800,19 +861,133 @@ kwD8rrpp1dpGuBsy+q0AByW/UZ9CjNSAOJH5bivNcpTQDNkE1aB073ruWxcwOeuJXwpWeh/XVMnkDIoV
     }
 }
 
+/// Le canal de mise à jour effectivement en vigueur, relu dans la base.
+///
+/// **C'est le seul lecteur du réglage**, et les DEUX routes qui interrogent
+/// l'API des releases passent par lui — `update_check` et `update_install`.
+/// Un canal que seule la route de lecture consulterait laisserait
+/// `POST /update/install` installer la préversion que `GET /update/check`
+/// venait de refuser d'annoncer : le réglage serait décoratif.
+///
+/// Une valeur illisible (base écrite par une version postérieure, réglage
+/// bricolé à la main) retombe sur [`UpdateChannel::Auto`] : le comportement
+/// historique est le repli sûr, jamais une ouverture du canal bêta.
+fn update_channel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> UpdateChannel {
+    SettingsRepo::with_backend(backend.clone())
+        .get(UpdateChannel::SETTING_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| UpdateChannel::parse(&raw))
+        .unwrap_or_default()
+}
+
+/// Le vérificateur de releases ARMÉ du canal enregistré.
+///
+/// Les deux routes qui interrogent l'API des releases passent par ici : c'est
+/// le point unique où le réglage rejoint le cœur, et donc le seul endroit à
+/// éprouver pour savoir que le réglage est BRANCHÉ.
+fn checker_for(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> UpdateChecker {
+    UpdateChecker::with_channel(update_channel(backend))
+}
+
+/// Les deux champs que toute réponse de `/update/check` porte désormais :
+/// le réglage tel qu'il est enregistré, et le canal EFFECTIF une fois `auto`
+/// résolu contre le binaire en cours. Sans le second, un écran affichant
+/// « auto » ne dit pas à l'utilisateur ce qu'il va recevoir.
+fn channel_fields(channel: UpdateChannel, current: &str) -> (&'static str, &'static str) {
+    (channel.as_str(), channel.effective(current))
+}
+
+/// GET /system/update/channel — le réglage, et ce qu'il donne concrètement.
+pub(super) async fn update_channel_get(State(state): State<AppState>) -> Json<Value> {
+    let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    Json(json!({
+        "channel": setting,
+        "effective_channel": effective,
+        "current": current,
+        "choices": ["auto", "stable", "beta"],
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct UpdateChannelBody {
+    channel: String,
+}
+
+/// PUT /system/update/channel — choisir stable, bêta, ou revenir à `auto`.
+///
+/// Réservé à l'administrateur, comme `update_install` : ce réglage décide de ce
+/// que la machine acceptera d'installer.
+///
+/// Une valeur inconnue est REFUSÉE (400) plutôt qu'ignorée. Un `200` pour rien
+/// laisserait l'écran croire que « nightly » a été retenu alors que le serveur
+/// serait resté sur `auto`.
+pub(super) async fn update_channel_set(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<UpdateChannelBody>,
+) -> impl IntoResponse {
+    let Some(channel) = UpdateChannel::parse(&body.channel) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unknown_channel",
+                "message": format!("Unknown update channel '{}'", body.channel),
+                "choices": ["auto", "stable", "beta"],
+            })),
+        )
+            .into_response();
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.set(UpdateChannel::SETTING_KEY, channel.as_str()) {
+        error!(error = %e, "update_channel_write_failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "settings_write_failed", "message": e})),
+        )
+            .into_response();
+    }
+
+    let current = tune_core::version();
+    let (setting, effective) = channel_fields(channel, current);
+    info!(channel = setting, effective, "update_channel_set");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "channel": setting,
+            "effective_channel": effective,
+            "current": current,
+            "choices": ["auto", "stable", "beta"],
+        })),
+    )
+        .into_response()
+}
+
 /// GET /system/update/check
 ///
 /// Fetches the latest release from GitHub, compares versions, and returns update info.
-pub(super) async fn update_check() -> Json<Value> {
-    let checker = UpdateChecker::new();
+pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
     let current = tune_core::version();
+    let channel = update_channel(&state.backend);
+    let (setting, effective) = channel_fields(channel, current);
+    let checker = checker_for(&state.backend);
     let homebrew = current_homebrew_installation();
     let installation_version_mismatch = homebrew
         .as_ref()
         .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
     match checker.check().await {
-        Ok(Some(release)) => Json(update_release_payload(current, &release, homebrew.as_ref())),
+        Ok(Some(release)) => {
+            let mut payload = update_release_payload(current, &release, homebrew.as_ref());
+            payload["channel"] = json!(setting);
+            payload["effective_channel"] = json!(effective);
+            Json(payload)
+        }
         Ok(None) => Json(json!({
             "current": current,
             "latest": current,
@@ -825,6 +1000,8 @@ pub(super) async fn update_check() -> Json<Value> {
             "installation_manager": homebrew.as_ref().map(|_| "homebrew"),
             "installation_version": homebrew.as_ref().map(|install| &install.cellar_version),
             "installation_version_mismatch": installation_version_mismatch,
+            "channel": setting,
+            "effective_channel": effective,
         })),
         Err(e) => {
             warn!(error = %e, "update_check_failed");
@@ -833,6 +1010,8 @@ pub(super) async fn update_check() -> Json<Value> {
                 "latest": null,
                 "update_available": false,
                 "error": e,
+                "channel": setting,
+                "effective_channel": effective,
             }))
         }
     }
@@ -1026,7 +1205,12 @@ pub(super) async fn update_install(
     }
 
     // 1. Check for update (fast — just a GitHub API call)
-    let checker = UpdateChecker::new();
+    //
+    // MÊME canal que `/update/check`. C'est ici que le réglage cesse d'être
+    // décoratif : sans lui, l'installation retomberait sur le canal déduit du
+    // binaire et poserait la préversion que la vérification venait de refuser
+    // d'annoncer (#2266).
+    let checker = checker_for(&state.backend);
     let release = match checker.check().await {
         Ok(Some(r)) => r,
         Ok(None) => {

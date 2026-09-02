@@ -170,3 +170,9 @@ required-features = ["postgres"]
 [[test]]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
+
+# Canal stable / beta : quelles versions `/update/check` a le droit de proposer
+# (#2266). Le defaut `auto` reproduit le comportement d'avant.
+[[test]]
+name = "canal_de_mise_a_jour"
+path = "tests/canal_de_mise_a_jour.rs"
