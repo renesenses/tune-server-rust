@@ -151,9 +151,11 @@ pub struct PodcastService {
 ///
 /// Le point d'entrée HISTORIQUE, lui, filtre :
 ///
-///     genre=1310 (Musique) → NUMBERS, Very Good Trip, La Canción
-///     genre=1318 (Tech)    → Silicon Carne, Underscore_
-///     genre=1306 (Cuisine) → On va déguster, Business of Bouffe
+/// ```text
+/// genre=1310 (Musique) → NUMBERS, Very Good Trip, La Canción
+/// genre=1318 (Tech)    → Silicon Carne, Underscore_
+/// genre=1306 (Cuisine) → On va déguster, Business of Bouffe
+/// ```
 ///
 /// On garde `marketingtools` SANS genre : c'est lui qui sert le
 /// classement général, et sa forme est déjà éprouvée.
