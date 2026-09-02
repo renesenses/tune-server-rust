@@ -51,6 +51,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "file_promet_l_enchainement.rs"]
+mod file_promet_l_enchainement;
 #[path = "fonds_communautaire_par_mbid.rs"]
 mod fonds_communautaire_par_mbid;
 #[path = "generateur_playlists_sans_ia.rs"]

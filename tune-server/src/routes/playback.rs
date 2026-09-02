@@ -2166,9 +2166,66 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
         .map(|p| p as i64)
         .unwrap_or(ps.queue_position);
     let length = entries.len();
+    // #2934 — `gapless_next` : ce que CETTE ligne promet à la ligne affichée
+    // juste après. Le client l'affiche depuis toujours (QueueView, badge
+    // « Gapless ») ; aucune structure du serveur ne le portait, il ne vivait
+    // que dans `docs/contrat-web.json`, hérité du serveur Python. Le badge
+    // n'est donc jamais apparu chez personne (Jean Valjean, fil 631).
+    //
+    // La réponse DÉPEND DE LA ZONE : une sortie DLNA, une sortie locale en mode
+    // exclusif et une sortie OAAT en DSD natif n'ont pas les mêmes capacités.
+    // C'est possible ici et seulement ici : `/zones/{id}/queue` est déjà
+    // portée par une zone. La règle vit dans `tune_core::playback::gapless`,
+    // partagée avec les refus du poller — deux copies, et la file promettrait
+    // ce que le poller refuse.
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    let gapless_enabled = zone.as_ref().is_some_and(|z| z.gapless_enabled);
+    let output_device_id = zone.as_ref().and_then(|z| z.output_device_id.clone());
+    let output_type = zone
+        .as_ref()
+        .and_then(|z| z.output_type.clone())
+        .unwrap_or_default();
+    let output_can_gapless =
+        crate::routes::zones::output_capabilities(&state, output_device_id.as_deref())
+            .await
+            .is_some_and(|c| c.can_gapless);
+    let output_prefers_local_file = crate::routes::zones::output_prefers_local_file_gapless(
+        &state,
+        output_device_id.as_deref(),
+    )
+    .await;
+    // L'ordre RÉELLEMENT joué se lit sur la file telle qu'elle est MAINTENANT,
+    // pas sur la longueur que l'état de zone traînait.
+    let mut zs = ps.clone();
+    zs.queue_length = length as i64;
     let tracks: Vec<Value> = entries
         .iter()
-        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+        .enumerate()
+        .map(|(idx, e)| {
+            let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+            let suivant = entries.get(idx + 1);
+            let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
+                &tune_core::playback::gapless::EnchainementAffiche {
+                    gapless_enabled,
+                    output_can_gapless,
+                    output_type: &output_type,
+                    output_prefers_local_file,
+                    index: idx as i64,
+                    successeur_reel: tune_core::poller::PositionPoller::next_position_after(
+                        &zs, idx as i64,
+                    ),
+                    successeur_format: suivant.and_then(|s| s.format.as_deref()),
+                    successeur_est_fichier_local: suivant.is_some_and(|s| s.file_path.is_some()),
+                },
+            );
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("gapless_next".into(), Value::Bool(promesse));
+            }
+            v
+        })
         .collect();
     Json(json!({ "tracks": tracks, "position": position, "length": length }))
 }
