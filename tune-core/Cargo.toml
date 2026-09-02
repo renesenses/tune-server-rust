@@ -226,6 +226,14 @@ audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 name = "famine_anneau_i3205"
 path = "tests/famine_anneau_i3205.rs"
 
+# #2394 : « zero octet servi » et « je ne sais pas » etaient le meme chiffre, et
+# c est ce chiffre qui coupe la zone. `autotests = false` ci-dessus — sans cette
+# cible le fichier ne serait JAMAIS compile, et la porte rendrait un vert contre
+# rien.
+[[test]]
+name = "octets_servis_inconnus_2394"
+path = "tests/octets_servis_inconnus_2394.rs"
+
 [build-dependencies]
 cc = "1"
 
