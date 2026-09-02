@@ -165,6 +165,46 @@ async fn list_collections(
                         .unwrap_or(0)
                 );
             }
+
+            // Pochettes de la mosaïque — quatre au plus, DISTINCTES.
+            //
+            // Une collection intelligente n'a pas de table d'appartenance :
+            // c'est une RÈGLE, évaluée à la demande. On ne peut donc pas
+            // joindre ses pochettes d'un coup comme pour une playlist ; il faut
+            // rejouer sa requête. C'est déjà ce que font les deux comptages
+            // ci-dessus — une troisième requête s'inscrit dans le même modèle
+            // et ne change pas la nature de cette route.
+            //
+            // `HAVING` plutôt qu'un `AND` ajouté à `{where_clause}` : cette
+            // clause est TANTÔT VIDE, tantôt un `WHERE …`. Y coller un `AND`
+            // produirait « ... AND al.cover_path ... » sans `WHERE` sur une
+            // collection sans règle, donc une erreur SQL sur le cas le plus
+            // banal.
+            //
+            // Ordre par `MIN(al.title)` : déterministe, donc la mosaïque ne
+            // change pas d'un rafraîchissement à l'autre. Ce n'est PAS le tri
+            // propre de la collection — une vignette de quatre cases n'est pas
+            // un aperçu du classement, et rejouer le tri complet ici coûterait
+            // une jointure de plus pour un gain invisible.
+            let covers_sql = format!(
+                "SELECT al.cover_path FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
+                 GROUP BY al.cover_path \
+                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> '' \
+                 ORDER BY MIN(al.title) LIMIT 4"
+            );
+            let covers: Vec<String> = state
+                .backend
+                .query_many(&covers_sql, &[])
+                .map(|rs| {
+                    rs.iter()
+                        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            col["covers"] = json!(covers);
+
             col
         })
         .collect();
@@ -997,6 +1037,80 @@ mod tests {
     /// celui de `tune-core/library/smart_collections.rs`) → SQL exécuté sur une
     /// bibliothèque témoin. Un test qui se contenterait de comparer la chaîne
     /// de règles ne dirait rien de ce que l'utilisateur voit.
+    /// La requete des pochettes doit tenir avec une clause vide.
+    ///
+    /// `where_clause` est TANTOT vide, tantot un `WHERE …`. Y coller un `AND`
+    /// pour ecarter les pochettes nulles ne produit PAS une erreur de syntaxe,
+    /// et c'est bien pire : sans `WHERE`, le `AND` s'attache au `ON` du
+    /// `LEFT JOIN`. La condition cesse alors de FILTRER pour devenir une
+    /// condition de jointure — un album sans pochette reste dans le resultat,
+    /// avec un groupe NULL qui mange une des quatre cases.
+    ///
+    /// ⚠️ Ma premiere version de ce test ne l'attrapait pas : l'album sans
+    /// pochette s'appelait « sans » et triait donc APRES les quatre autres, si
+    /// bien que `LIMIT 4` le laissait dehors de toute facon. Il s'appelle
+    /// desormais « a0_… » et trie EN PREMIER : la variante fautive lui donne
+    /// une case, celle-ci non.
+    #[test]
+    fn les_pochettes_sortent_distinctes_et_plafonnees_a_quatre() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Six albums, dont DEUX partageant la pochette « A » : elle ne doit
+        // occuper qu'une seule case.
+        db.execute_batch(
+            "INSERT INTO albums (id, title, cover_path) VALUES \
+               (1,'a1','A'),(2,'a2','A'),(3,'b','B'),(4,'c','C'),(5,'d','D'),(6,'e','E'); \
+             INSERT INTO albums (id, title, cover_path) VALUES (7,'a0_sans_pochette',NULL);",
+        )
+        .unwrap();
+
+        let requete = |where_clause: &str| -> Vec<String> {
+            let sql = format!(
+                "SELECT al.cover_path FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
+                 GROUP BY al.cover_path \
+                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> '' \
+                 ORDER BY MIN(al.title) LIMIT 4"
+            );
+            db.query_many(&sql, &[])
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_string()))
+                .collect()
+        };
+
+        // Clause VIDE — une collection sans regle. C'est le cas qui casserait
+        // avec un `AND` accole.
+        assert_eq!(
+            requete(""),
+            vec!["A", "B", "C", "D"],
+            "sans regle : quatre pochettes distinctes, la nulle ecartee"
+        );
+
+        // Clause NON vide — le cas courant.
+        assert_eq!(
+            requete("WHERE al.title <> 'a1'"),
+            vec!["A", "B", "C", "D"],
+            "avec regle : « A » survit par son second album, la nulle reste ecartee"
+        );
+
+        // Et le plafond mord vraiment : sans LIMIT on en aurait cinq.
+        let sans_plafond = db
+            .query_many(
+                "SELECT al.cover_path FROM albums al GROUP BY al.cover_path \
+                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> ''",
+                &[],
+            )
+            .unwrap()
+            .len();
+        assert_eq!(sans_plafond, 5, "cinq pochettes distinctes en base");
+    }
+
     #[test]
     fn le_prereglage_world_music_ne_ramasse_plus_folk_metal_ni_folk_rock() {
         use tune_core::db::backend::DbBackend;
