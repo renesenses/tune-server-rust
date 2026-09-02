@@ -1192,59 +1192,71 @@ impl OutputTarget for DlnaOutput {
         // cas d'écart, UNE relance complète, puis un échec VISIBLE plutôt
         // qu'un état menteur. Une URI qu'on ne sait pas interpréter (renderer
         // qui réécrit) ne conclut rien — zéro régression sur ces appareils.
-        let mut applique = UriVerdict::Indeterminee;
-        let mut uri_tenue: Option<String> = None;
-        // Le refus SOAP rendu par le `Play` de la relance, s'il y en a un. Cette
-        // réponse n'était pas relue : un renderer qui REFUSE ce Play — un 701,
-        // celui de #2581 — finissait accusé d'« avoir acquitté Play » et de
-        // « jouer une autre source », deux affirmations fausses. Le message
-        // d'échec doit dire ce qui s'est passé (#2396 : l'un des testeurs a
-        // réinstallé son système entier sur la foi de ce message).
-        let mut refus_relance: Option<String> = None;
-        'verif: for relance in 0..2u32 {
-            for essai in 0..3u32 {
-                let resp = self
-                    .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+        // La verification est EXTRAITE dans `verifier_uri_appliquee` : un test
+        // qui la retranscrirait resterait vert pendant que CE chemin-ci se
+        // degrade. Elle ne recoit que les deux actions qu'elle pilote — relire
+        // `CurrentURI`, et reposer l'URI puis rejouer — pour qu'un banc puisse
+        // les simuler sans renderer (#2749).
+        let moi = &*self;
+        let media_verif = media;
+        let mime_relance = attempt_mime.as_str();
+        let verif = verifier_uri_appliquee(
+            media.url,
+            BUDGET_REVEIL_STANDBY,
+            || async move {
+                moi.av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                    .map(|xml| extract_tag(&xml, "CurrentURI"))
+            },
+            || async move {
+                warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
+                let _ = moi
+                    .reposer_uri(media_verif, item_id, mime_relance, niveau_didl)
                     .await;
-                let uri = match &resp {
-                    Ok(xml) => extract_tag(xml, "CurrentURI"),
-                    // Un renderer sans GetMediaInfo ne doit rien bloquer.
-                    Err(_) => break 'verif,
-                };
-                uri_tenue = uri.clone();
-                applique = verdict_uri_appliquee(uri.as_deref(), media.url);
-                match applique {
-                    UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'verif,
-                    UriVerdict::PasAppliquee if essai < 2 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    }
-                    UriVerdict::PasAppliquee => {}
-                }
-            }
-            if relance == 0 {
-                warn!(device = %self.name, url = media.url, ctrl = %self.av_transport_url, "dlna_play_acquitte_mais_pas_applique_relance");
-                let _ = self
-                    .reposer_uri(media, item_id, &attempt_mime, niveau_didl)
-                    .await;
-                self.attendre_apres_set_uri().await;
-                if let Ok(resp) = self
+                moi.attendre_apres_set_uri().await;
+                match moi
                     .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
                     .await
-                    && (resp.contains("UPnPError") || resp.contains("<errorCode>"))
                 {
-                    warn!(device = %self.name, response = %resp, "dlna_relance_play_refuse");
-                    refus_relance = Some(resp);
+                    Ok(resp) if resp.contains("UPnPError") || resp.contains("<errorCode>") => {
+                        warn!(device = %moi.name, response = %resp, "dlna_relance_play_refuse");
+                        Some(resp)
+                    }
+                    _ => None,
                 }
+            },
+        )
+        .await;
+        let applique = verif.verdict;
+        let uri_tenue = verif.uri_tenue.clone();
+        let refus_relance = verif.refus_relance.clone();
+        if matches!(applique, UriVerdict::PasAppliquee | UriVerdict::PasEncore) {
+            // Deux pannes, deux journaux. « Jamais applique » decrit un
+            // renderer qui TIENT autre chose ; l'URI restee VIDE decrit un
+            // appareil qui ne tient RIEN — un reveil qui n'a pas abouti. Le
+            // meme evenement pour les deux rendait le tri impossible cote
+            // support (#2749).
+            if applique == UriVerdict::PasEncore {
+                warn!(
+                    device = %self.name,
+                    url = media.url,
+                    ctrl = %self.av_transport_url,
+                    attente_ms = verif.attente_ms,
+                    relances = verif.relances,
+                    soap_muet = verif.soap_muet,
+                    "dlna_play_uri_restee_vide"
+                );
+            } else {
+                warn!(
+                    device = %self.name,
+                    url = media.url,
+                    ctrl = %self.av_transport_url,
+                    tenue = uri_tenue.as_deref().unwrap_or("-"),
+                    attente_ms = verif.attente_ms,
+                    relances = verif.relances,
+                    "dlna_play_jamais_applique"
+                );
             }
-        }
-        if applique == UriVerdict::PasAppliquee {
-            warn!(
-                device = %self.name,
-                url = media.url,
-                ctrl = %self.av_transport_url,
-                tenue = uri_tenue.as_deref().unwrap_or("-"),
-                "dlna_play_jamais_applique"
-            );
             // Si le renderer tient un flux de NOTRE serveur, ce flux va mourir
             // avec la session que l'appelant s'apprête à démonter — et le
             // DMP-A8 ressasse une URI morte en zombie (PLAYING/TRANSITIONING,
@@ -1285,6 +1297,29 @@ impl OutputTarget for DlnaOutput {
                         ""
                     }
                 ));
+            }
+            // #2749 — une URI VIDE n'est pas « une autre source ».
+            //
+            // Un Denon/HEOS en veille reseau garde sa pile UPnP vivante : il
+            // acquitte tout, et ne tient RIEN. Lui dire qu'il « joue une autre
+            // source » envoie l'utilisateur chercher un conflit qui n'existe
+            // pas — c'est la meme faute que #2396, sur le meme message.
+            if applique == UriVerdict::PasEncore {
+                let secondes = verif.attente_ms / 1000;
+                return Err(if verif.soap_muet {
+                    format!(
+                        "Le renderer a acquitté Play, n'a jamais appliqué l'URI (CurrentURI resté vide) \
+                         puis a CESSÉ de répondre en SOAP au bout de {secondes} s — appareil éteint, \
+                         débranché ou sorti du réseau ?"
+                    )
+                } else {
+                    format!(
+                        "Le renderer a acquitté Play mais ne tient toujours AUCUN média après {secondes} s \
+                         (CurrentURI vide) : il ne joue pas autre chose, il n'a rien chargé. Un ampli en \
+                         veille réseau (Denon/HEOS) met 15 à 30 s à sortir de veille et à basculer sur son \
+                         entrée réseau — allumez-le, puis relancez"
+                    )
+                });
             }
             let detail = match uri_tenue.as_deref() {
                 Some(u) if !u.trim().is_empty() => format!("il tient encore : {u}"),
@@ -2064,14 +2099,50 @@ fn arret_effectif(transport_resp: &str) -> bool {
     !transport_resp.contains("PLAYING") && !transport_resp.contains("TRANSITIONING")
 }
 
+/// Combien de temps laisser a un renderer qui a ACQUITTE `Play` et ne tient
+/// encore AUCUN media (`CurrentURI` vide) pour finir de se reveiller (#2749).
+///
+/// **Pourquoi 30 s.** Un ampli Denon/HEOS en veille reseau garde sa pile UPnP
+/// vivante : il repond 200 a `SetAVTransportURI` puis a `Play` alors qu'il
+/// n'est pas sorti de veille, n'a pas bascule sur son entree reseau et ne tient
+/// rien. Le releve de terrain (AVR-X1600H, 0.9.121) donne 15 a 30 s entre
+/// l'ordre et l'URI reellement posee : une borne PRISE DANS cette plage ne
+/// corrigerait qu'une partie des cas, elle doit donc la couvrir en entier.
+///
+/// **Pourquoi pas plus.** La borne haute n'est pas un gout. `play()` a DEJA
+/// bascule la zone en lecture et arme la grace de chargement du sondeur
+/// (`TRACK_LOAD_GRACE_SECS` = 45 s, `poller.rs`) : tant que l'attente reste
+/// franchement sous cette grace, le sondeur ne peut pas conclure « demarrage
+/// mort » pendant qu'on attend encore — une seule instance decide. Sur CE
+/// chemin (le `Play` a ete acquitte du premier coup, sinon on a deja rendu
+/// `Err`) le reste de `play_media` tient sous ~2 s : ~32 s au pire, sous les
+/// 45 s de la grace comme sous le budget HTTP de l'appelant.
+const BUDGET_REVEIL_STANDBY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Battement entre deux relectures de `CurrentURI` pendant le reveil. Une
+/// seconde : le reveil se compte en dizaines de secondes, et chaque lecture est
+/// une action SOAP de plus sur un appareil qui demarre.
+const CADENCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Intervalle entre deux `SetAVTransportURI` + `Play` de rearmement pendant le
+/// reveil. Un HEOS qui finit de demarrer a pu perdre l'URI posee avant son
+/// reveil : la reposer periodiquement est ce qui la fait prendre.
+const INTERVALLE_RELANCE_REVEIL: std::time::Duration = std::time::Duration::from_secs(8);
+/// Battement du bareme historique (#2390), quand le renderer tient une AUTRE
+/// source. Inchange.
+const CADENCE_URI_ETRANGERE: std::time::Duration = std::time::Duration::from_millis(400);
 /// Verdict sur l'URI que le renderer dit tenir après notre Play.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UriVerdict {
     /// C'est bien la nôtre : le Play est appliqué.
     Appliquee,
-    /// Vide, ou un flux Tune qui n'est pas le nôtre : le renderer a acquitté
-    /// toute la séquence et joue toujours autre chose.
+    /// Un flux Tune qui n'est pas le nôtre : le renderer a acquitté toute la
+    /// séquence et joue toujours autre chose.
     PasAppliquee,
+    /// `CurrentURI` VIDE : le renderer ne tient AUCUN media. Il ne joue pas
+    /// autre chose — il n'a RIEN charge. C'est ce que rend un ampli HEOS en
+    /// veille reseau dont la pile SOAP repond deja alors que l'appareil se
+    /// reveille encore (#2749) ; le confondre avec `PasAppliquee` faisait
+    /// couper la zone en 13 s sur un message faux.
+    PasEncore,
     /// Une URI étrangère qu'on ne sait pas interpréter (un renderer qui
     /// réécrit, un GetMediaInfo exotique) : on ne conclut rien.
     Indeterminee,
@@ -2093,7 +2164,8 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
     };
     let uri = uri.trim();
     if uri.is_empty() {
-        return UriVerdict::PasAppliquee;
+        // #2749 — VIDE veut dire « aucun media », pas « un autre media ».
+        return UriVerdict::PasEncore;
     }
     if uri.contains(chemin_du_flux(url_attendue)) {
         return UriVerdict::Appliquee;
@@ -2104,6 +2176,140 @@ fn verdict_uri_appliquee(current_uri: Option<&str>, url_attendue: &str) -> UriVe
         return UriVerdict::PasAppliquee;
     }
     UriVerdict::Indeterminee
+}
+
+/// Ce que la verification d'apres-`Play` a etabli.
+#[derive(Debug, Clone)]
+struct VerifUri {
+    verdict: UriVerdict,
+    /// La derniere `CurrentURI` lue.
+    uri_tenue: Option<String>,
+    /// Le refus SOAP rendu par le `Play` d'une relance, s'il y en a eu un.
+    refus_relance: Option<String>,
+    /// L'appareil a repondu au moins une fois, PUIS s'est tu. C'est la
+    /// difference entre « il se reveille encore » et « il n'est plus la »
+    /// (#2749) : un renderer qui n'implemente pas `GetMediaInfo` echoue des la
+    /// PREMIERE lecture et ne met donc jamais ce drapeau — il ne bloque rien,
+    /// exactement comme avant.
+    soap_muet: bool,
+    /// Duree totale de la verification, en ms — le chiffre que le journal doit
+    /// porter pour qu'on puisse lire un vrai temps de reveil.
+    attente_ms: u64,
+    /// Nombre de `SetAVTransportURI` + `Play` de relance envoyes.
+    relances: u32,
+}
+
+/// La verification d'apres-`Play`, en DEUX temps.
+///
+/// **Temps 1 — bareme historique (#2390), inchange.** Trois lectures de
+/// `CurrentURI` espacees de 400 ms, une relance complete, trois lectures de
+/// plus. C'est ce qui rattrape la course des 5 ms de l'Eversolo, et c'est ce
+/// qui fait echouer un renderer zombie (#2394) : il tient un flux Tune perime,
+/// verdict `PasAppliquee`, on n'attend rien de plus.
+///
+/// **Temps 2 — fenetre de reveil (#2749), NOUVEAU.** On n'y entre que si le
+/// temps 1 se termine sur `PasEncore` : `CurrentURI` VIDE, donc aucun media
+/// tenu, donc rien a quoi notre flux se disputerait la place. On relit alors a
+/// `CADENCE_REVEIL` et on repose l'URI toutes les `INTERVALLE_RELANCE_REVEIL`,
+/// jusqu'a `budget_reveil`.
+///
+/// La condition « tant que SOAP repond » est EFFECTIVE : des que `lire_uri`
+/// rend `Err` — l'appareil a ete eteint ou debranche pendant l'attente — on
+/// sort immediatement au lieu de bruler le budget. Un refus SOAP sur le `Play`
+/// d'une relance sort aussi : un appareil qui REFUSE la transition nomme un
+/// etat (701), il ne dort pas.
+///
+/// Les deux actions sont passees en parametres pour que cette boucle-ci — celle
+/// de production — soit eprouvable sans renderer.
+async fn verifier_uri_appliquee<L, LF, R, RF>(
+    url_attendue: &str,
+    budget_reveil: std::time::Duration,
+    mut lire_uri: L,
+    mut relancer: R,
+) -> VerifUri
+where
+    L: FnMut() -> LF,
+    LF: std::future::Future<Output = Result<Option<String>, String>>,
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = Option<String>>,
+{
+    let debut = tokio::time::Instant::now();
+    let mut v = VerifUri {
+        verdict: UriVerdict::Indeterminee,
+        uri_tenue: None,
+        refus_relance: None,
+        soap_muet: false,
+        attente_ms: 0,
+        relances: 0,
+    };
+    let mut une_lecture_a_repondu = false;
+
+    // ── Temps 1 : le bareme de #2390, au battement pres. ──────────────────
+    'bareme: for relance in 0..2u32 {
+        for essai in 0..3u32 {
+            match lire_uri().await {
+                Ok(uri) => {
+                    une_lecture_a_repondu = true;
+                    v.uri_tenue = uri.clone();
+                    v.verdict = verdict_uri_appliquee(uri.as_deref(), url_attendue);
+                }
+                // Un renderer sans GetMediaInfo ne doit rien bloquer : si RIEN
+                // n'a jamais repondu, on ne conclut rien. S'il avait repondu et
+                // se tait maintenant, c'est un appareil qui a disparu.
+                Err(_) => {
+                    v.soap_muet = une_lecture_a_repondu;
+                    break 'bareme;
+                }
+            }
+            match v.verdict {
+                UriVerdict::Appliquee | UriVerdict::Indeterminee => break 'bareme,
+                UriVerdict::PasAppliquee | UriVerdict::PasEncore if essai < 2 => {
+                    tokio::time::sleep(CADENCE_URI_ETRANGERE).await;
+                }
+                _ => {}
+            }
+        }
+        if relance == 0 {
+            v.relances += 1;
+            v.refus_relance = relancer().await;
+        }
+    }
+
+    // ── Temps 2 : la fenetre de reveil. ───────────────────────────────────
+    if v.verdict == UriVerdict::PasEncore && v.refus_relance.is_none() && !v.soap_muet {
+        let debut_reveil = tokio::time::Instant::now();
+        let mut derniere_relance = debut_reveil;
+        while debut_reveil.elapsed() < budget_reveil {
+            tokio::time::sleep(CADENCE_REVEIL).await;
+            match lire_uri().await {
+                Ok(uri) => {
+                    v.uri_tenue = uri.clone();
+                    v.verdict = verdict_uri_appliquee(uri.as_deref(), url_attendue);
+                }
+                Err(_) => {
+                    // « Tant que SOAP repond » : il ne repond plus. On rend la
+                    // main TOUT DE SUITE — faire patienter 30 s devant un
+                    // appareil debranche serait un second defaut.
+                    v.soap_muet = true;
+                    break;
+                }
+            }
+            if v.verdict != UriVerdict::PasEncore {
+                break;
+            }
+            if derniere_relance.elapsed() >= INTERVALLE_RELANCE_REVEIL {
+                derniere_relance = tokio::time::Instant::now();
+                v.relances += 1;
+                v.refus_relance = relancer().await;
+                if v.refus_relance.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    v.attente_ms = debut.elapsed().as_millis() as u64;
+    v
 }
 
 /// Un refus SOAP portant le code UPnP **701 « Transition not available »**.
@@ -2460,14 +2666,28 @@ mod tests {
         );
     }
 
+    /// **Ce test a CHANGE de conclusion sur un point, et un seul : l'URI
+    /// VIDE.** Il epinglait `Some("") => PasAppliquee`, c'est-a-dire « le
+    /// renderer joue une autre source ». C'etait faux, et c'est la cause de
+    /// #2749 : un Denon/HEOS en veille reseau acquitte `Play` puis rend une
+    /// `CurrentURI` vide parce qu'il n'a RIEN charge — pas parce qu'il joue
+    /// autre chose. Tune coupait la zone en 13 s sur ce contresens.
+    ///
+    /// Le vide vaut desormais `PasEncore` (voir `UriVerdict`). Le reste du test
+    /// est INTACT : un flux Tune perime, ou celui d'un autre serveur, reste
+    /// `PasAppliquee` — c'est ce qui fait echouer le zombie du DMP-A8 (#2394),
+    /// et ce verdict-la ne bouge pas d'un pouce.
     #[test]
     fn verdict_uri_vide_ou_flux_perime_n_est_pas_applique() {
         let url = "http://192.168.1.42:8888/stream/abc-123.wav";
-        // L'Eversolo qui garde l'URI d'avant : vide, ou un autre flux Tune.
+        // Vide = AUCUN media tenu : pas encore applique (#2749), pas « autre
+        // source ». Les espaces seuls comptent pour du vide, `trim` oblige.
+        assert_eq!(verdict_uri_appliquee(Some(""), url), UriVerdict::PasEncore);
         assert_eq!(
-            verdict_uri_appliquee(Some(""), url),
-            UriVerdict::PasAppliquee
+            verdict_uri_appliquee(Some("   "), url),
+            UriVerdict::PasEncore
         );
+        // L'Eversolo qui garde l'URI d'avant : un AUTRE flux Tune.
         assert_eq!(
             verdict_uri_appliquee(Some("http://192.168.1.42:8888/stream/vieux-flux.flac"), url),
             UriVerdict::PasAppliquee
@@ -2489,6 +2709,224 @@ mod tests {
             UriVerdict::Indeterminee
         );
         assert_eq!(verdict_uri_appliquee(None, url), UriVerdict::Indeterminee);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2749 — un renderer EN VEILLE n'est pas un renderer qui joue autre chose
+    //
+    // Tout ce qui suit fait tourner `verifier_uri_appliquee`, LA boucle que
+    // `play_media` appelle. Un banc qui retranscrirait le mecanisme resterait
+    // vert pendant que le code de production se degrade (mesure le 01/09) :
+    // c'est bien la fonction branchee qui est eprouvee ici, avec ses vraies
+    // constantes, sous `start_paused` pour qu'une attente de 30 s ne coute
+    // rien.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le flux que Tune vient d'envoyer — la radio FIP du releve.
+    const URL_2749: &str = "http://192.168.1.18:8888/stream/fip-2749.wav";
+    /// Un flux Tune PERIME, celui qu'un renderer zombie ne lache pas (#2394).
+    const URI_PERIMEE_2749: &str = "http://192.168.1.42:8888/stream/vieux-flux.flac";
+
+    /// Fait tourner la boucle de production contre un renderer SCRIPTE :
+    /// chaque element de `reponses` est ce que rend le `GetMediaInfo` suivant,
+    /// la derniere reponse etant rejouee indefiniment — un appareil ne change
+    /// pas d'avis tout seul. `refus_relance` est ce que rend le `Play` de
+    /// chaque relance.
+    ///
+    /// Rend le verdict, le nombre de lectures et le nombre de relances.
+    async fn eprouver_2749(
+        reponses: Vec<Result<Option<&'static str>, &'static str>>,
+        refus_relance: Option<&'static str>,
+    ) -> (VerifUri, u32, u32) {
+        let file: std::cell::RefCell<std::collections::VecDeque<_>> =
+            std::cell::RefCell::new(reponses.into_iter().collect());
+        let derniere: std::cell::RefCell<Result<Option<&'static str>, &'static str>> =
+            std::cell::RefCell::new(Ok(None));
+        let lectures = std::cell::Cell::new(0u32);
+        let relances = std::cell::Cell::new(0u32);
+        let (file_r, derniere_r, lectures_r, relances_r) = (&file, &derniere, &lectures, &relances);
+        let v = verifier_uri_appliquee(
+            URL_2749,
+            BUDGET_REVEIL_STANDBY,
+            || async move {
+                lectures_r.set(lectures_r.get() + 1);
+                if let Some(r) = file_r.borrow_mut().pop_front() {
+                    *derniere_r.borrow_mut() = r;
+                }
+                let r = *derniere_r.borrow();
+                r.map(|u| u.map(str::to_string)).map_err(str::to_string)
+            },
+            || async move {
+                relances_r.set(relances_r.get() + 1);
+                refus_relance.map(str::to_string)
+            },
+        )
+        .await;
+        (v, lectures.get(), relances.get())
+    }
+
+    /// TEMOIN 1 — `CurrentURI` vide, puis la BONNE URI : la zone joue.
+    ///
+    /// L'AVR-X1600H en veille reseau acquitte tout et ne tient rien pendant une
+    /// vingtaine de secondes, puis pose enfin l'URI. Avant #2749, Tune coupait
+    /// la zone au bout de 13,5 s en affirmant qu'il « jouait une autre
+    /// source ».
+    #[tokio::test(start_paused = true)]
+    async fn i2749_uri_vide_puis_reveil_la_zone_n_est_pas_coupee() {
+        let mut reponses: Vec<Result<Option<&'static str>, &'static str>> = vec![Ok(Some("")); 25];
+        reponses.push(Ok(Some(URL_2749)));
+        let (v, lectures, relances) = eprouver_2749(reponses, None).await;
+        assert_eq!(
+            v.verdict,
+            UriVerdict::Appliquee,
+            "l'ampli a fini par poser NOTRE URI : la lecture doit aboutir, \
+             pas etre coupee ({} lectures, {} ms)",
+            lectures,
+            v.attente_ms
+        );
+        assert!(!v.soap_muet, "l'appareil a repondu tout du long");
+        assert!(
+            v.attente_ms > 15_000 && v.attente_ms < 30_000,
+            "le reveil observe sur HEOS tient entre 15 et 30 s : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            relances >= 2,
+            "l'URI doit etre REPOSEE plusieurs fois pendant l'attente, pas une \
+             seule comme dans le bareme de #2390 : {relances}"
+        );
+    }
+
+    /// TEMOIN 2 — une AUTRE URI reellement tenue : rien ne change.
+    ///
+    /// C'est le zombie du DMP-A8 (#2394), meme journal
+    /// `dlna_play_jamais_applique` mais cause appareil : il tient un flux Tune
+    /// PERIME et ne le lachera pas. Le correctif de #2749 ne doit RIEN lui
+    /// offrir — ni attente, ni relance de plus, ni message adouci.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_autre_source_reellement_tenue_echoue_comme_avant() {
+        let (v, lectures, relances) = eprouver_2749(vec![Ok(Some(URI_PERIMEE_2749))], None).await;
+        assert_eq!(
+            v.verdict,
+            UriVerdict::PasAppliquee,
+            "un flux Tune perime reste « pas applique » : le zombie doit \
+             continuer d'echouer"
+        );
+        assert_eq!(v.uri_tenue.as_deref(), Some(URI_PERIMEE_2749));
+        assert_eq!(
+            lectures, 6,
+            "le bareme de #2390 fait SIX lectures, pas une de plus"
+        );
+        assert_eq!(relances, 1, "UNE relance, exactement comme avant #2749");
+        assert!(
+            v.attente_ms < 3_000,
+            "aucune fenetre de reveil ne doit s'ouvrir sur une AUTRE source : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// TEMOIN 3 — `CurrentURI` reste vide ET SOAP cesse de repondre :
+    /// on abandonne, sans attendre la borne complete.
+    ///
+    /// C'est la condition « tant que SOAP repond » du rapporteur, rendue
+    /// EFFECTIVE : un appareil debranche en cours d'attente ne doit pas faire
+    /// patienter 30 s pour rien.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_uri_vide_puis_soap_muet_abandonne_sans_bruler_la_borne() {
+        let mut reponses: Vec<Result<Option<&'static str>, &'static str>> = vec![Ok(Some("")); 8];
+        reponses.push(Err(
+            "soap send: error trying to connect: connection refused",
+        ));
+        let (v, _lectures, _relances) = eprouver_2749(reponses, None).await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            v.soap_muet,
+            "l'appareil avait repondu, puis s'est tu : c'est un appareil qui \
+             disparait, pas un appareil qui dort"
+        );
+        assert!(
+            v.attente_ms < 10_000,
+            "l'abandon doit etre IMMEDIAT, pas au bout des 30 s : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// La borne, quand la veille n'aboutit jamais : on echoue — mais APRES
+    /// l'avoir vraiment attendue, et sous la grace de chargement du sondeur
+    /// (45 s), pour qu'une seule instance decide.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_veille_qui_n_aboutit_pas_echoue_a_la_borne() {
+        let (v, _lectures, relances) = eprouver_2749(vec![Ok(Some(""))], None).await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            !v.soap_muet,
+            "l'appareil repond toujours, il ne se reveille pas"
+        );
+        assert!(
+            v.attente_ms >= 30_000,
+            "une attente plus courte que la borne ne corrige rien : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            v.attente_ms < 40_000,
+            "l'attente doit rester franchement sous la grace de chargement du \
+             sondeur (TRACK_LOAD_GRACE_SECS = 45 s) : {} ms",
+            v.attente_ms
+        );
+        assert!(
+            relances >= 3,
+            "l'URI est reposee toutes les 8 s pendant l'attente : {relances}"
+        );
+    }
+
+    /// Contre-epreuve — un renderer qui n'implemente PAS `GetMediaInfo` ne
+    /// bloque toujours rien. Rien n'a jamais repondu : on ne conclut pas a un
+    /// appareil disparu, et surtout on ne fait pas echouer la lecture.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_un_renderer_sans_get_media_info_ne_bloque_toujours_rien() {
+        let (v, lectures, relances) = eprouver_2749(vec![Err("soap send: 501")], None).await;
+        assert_eq!(v.verdict, UriVerdict::Indeterminee);
+        assert!(
+            !v.soap_muet,
+            "aucune lecture n'avait abouti : ce n'est pas un appareil qui se tait"
+        );
+        assert_eq!(lectures, 1);
+        assert_eq!(relances, 0);
+    }
+
+    /// Contre-epreuve — un REFUS SOAP sur le `Play` de la relance n'ouvre pas
+    /// la fenetre de reveil. Un appareil qui refuse la transition NOMME un
+    /// etat (701, #2581) ; il ne dort pas. Sans cette porte, le 701 de FabienM
+    /// aurait ete travesti en veille et l'utilisateur aurait attendu 30 s.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_un_refus_sur_la_relance_n_ouvre_pas_la_fenetre_de_reveil() {
+        let (v, _lectures, relances) = eprouver_2749(
+            vec![Ok(Some(""))],
+            Some("<errorCode>701</errorCode>Transition not available"),
+        )
+        .await;
+        assert_eq!(v.verdict, UriVerdict::PasEncore);
+        assert!(
+            v.refus_relance.is_some(),
+            "le refus doit etre remonte tel quel"
+        );
+        assert_eq!(relances, 1);
+        assert!(
+            v.attente_ms < 3_000,
+            "un refus n'est pas une veille : pas d'attente : {} ms",
+            v.attente_ms
+        );
+    }
+
+    /// Contre-epreuve — une URI reecrite (Sonos) ne conclut toujours RIEN, et
+    /// n'ouvre aucune attente.
+    #[tokio::test(start_paused = true)]
+    async fn i2749_une_uri_reecrite_ne_conclut_toujours_rien() {
+        let (v, lectures, relances) =
+            eprouver_2749(vec![Ok(Some("x-rincon-queue:RINCON_123#0"))], None).await;
+        assert_eq!(v.verdict, UriVerdict::Indeterminee);
+        assert_eq!(lectures, 1);
+        assert_eq!(relances, 0);
     }
 
     #[test]
