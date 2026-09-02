@@ -130,6 +130,46 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
 }
 
 // ---------------------------------------------------------------------------
+// Le fonds communautaire est indexé par MBID (#2258)
+// ---------------------------------------------------------------------------
+
+/// Ce que la clé du fonds communautaire de biographies écarte, dit à
+/// l'utilisateur (#2258).
+///
+/// `cloud::bio_sync::download_artist_bios` interroge mozaiklabs.fr par
+/// `?musicbrainz_ids=…` : **le fonds est indexé par MBID**. Les deux requêtes
+/// qui l'alimentent — envoi et candidats au téléchargement — exigent donc un
+/// MBID non vide, et un artiste qui n'en a pas est écarté des deux côtés.
+///
+/// Ce n'est pas un défaut de ces requêtes : c'est la conséquence d'un choix de
+/// clé, et la lever enverrait des identifiants vides à une API qui s'en sert
+/// d'index. Ce qui était un défaut, c'est que cette exclusion soit
+/// **totalement silencieuse** : le testeur voyait cent vingt fiches vides sans
+/// pouvoir distinguer une panne, une source avare et une clé qu'il ne possède
+/// pas.
+///
+/// Deux nombres, donc, et le nom de la clé qui les produit. Le remède est
+/// nommé lui aussi : `batch_match_artist_mbids` existe déjà et tourne dans
+/// `POST /system/enrich` comme dans `POST /system/enrichment/run` — il
+/// n'accepte un appariement par le nom qu'au-dessus d'un score MusicBrainz de
+/// 90 (`metadata::matcher::lookup_artist`), précisément parce qu'un mauvais
+/// MBID rattacherait une biographie étrangère.
+///
+/// ⚠ À ne pas confondre avec `bio_last_run.artists.sans_source`, qui compte
+/// les artistes que les sources LOCALES ne peuvent pas servir (ni MBID ni clé
+/// Last.fm). Poser une clé Last.fm remet celui-là à zéro et ne change rien à
+/// celui-ci.
+fn fonds_communautaire(artist_repo: &ArtistRepo) -> Value {
+    let hors = artist_repo.hors_fonds_communautaire().unwrap_or_default();
+    json!({
+        "cle": "musicbrainz_id",
+        "bios_non_partagees": hors.bios_non_partagees,
+        "artistes_non_servis": hors.artistes_non_servis,
+        "remede": "artist_mbid_matching",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // POST /system/enrich-bios — bio enrichment
 // ---------------------------------------------------------------------------
 
@@ -150,6 +190,9 @@ pub(super) async fn enrich_bios(
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
+    // Le compte est pris AVANT que les passes soient lancées : il décrit la
+    // bibliothèque telle que l'utilisateur vient de la soumettre.
+    let hors_fonds = fonds_communautaire(&artist_repo);
 
     // One task registered for both bio passes; it clears when the last of the
     // two spawned futures drops its Arc clone of the guard.
@@ -179,6 +222,11 @@ pub(super) async fn enrich_bios(
             "artists_without_bio": without_artist_bio,
             "albums_without_bio": without_album_bio,
             "premium": is_premium,
+            // #2258 — une part de `artists_without_bio` ne peut RIEN attendre
+            // du fonds communautaire, faute de MBID. Le dire ici, dans la
+            // réponse même du bouton, plutôt que de laisser l'utilisateur
+            // conclure d'un écran vide.
+            "fonds_communautaire": hors_fonds,
         })),
     )
 }
@@ -365,6 +413,11 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
         },
         "last_run": last_run,
         "bio_last_run": bio_last_run,
+        // #2258 — la part de la bibliothèque que la clé du fonds
+        // communautaire écarte, des deux côtés. Sous une clé propre : ce n'est
+        // pas un décompte de bibliothèque comme ceux de `stats`, c'est la
+        // mesure d'une exclusion et le nom de sa cause.
+        "fonds_communautaire": fonds_communautaire(&artist_repo),
     }))
 }
 

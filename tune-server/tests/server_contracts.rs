@@ -49,6 +49,8 @@ mod facettes_multivaleurs;
 mod favoris_cloisonnement_par_profil;
 #[path = "favoris_facettes_routes.rs"]
 mod favoris_facettes_routes;
+#[path = "fonds_communautaire_par_mbid.rs"]
+mod fonds_communautaire_par_mbid;
 #[path = "generateur_playlists_sans_ia.rs"]
 mod generateur_playlists_sans_ia;
 #[path = "http_client_seam.rs"]
