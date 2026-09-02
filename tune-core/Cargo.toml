@@ -240,6 +240,14 @@ path = "tests/dsf_tag_volumineux_i3180_e7d445.rs"
 name = "journal_dsf_tag_ecarte_i3180_e7d445"
 path = "tests/journal_dsf_tag_ecarte_i3180_e7d445.rs"
 
+# #2394 : « zero octet servi » et « je ne sais pas » etaient le meme chiffre, et
+# c est ce chiffre qui coupe la zone. `autotests = false` ci-dessus — sans cette
+# cible le fichier ne serait JAMAIS compile, et la porte rendrait un vert contre
+# rien.
+[[test]]
+name = "octets_servis_inconnus_2394"
+path = "tests/octets_servis_inconnus_2394.rs"
+
 [build-dependencies]
 cc = "1"
 

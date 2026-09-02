@@ -560,6 +560,11 @@ pub(crate) mod decisions {
     /// JAMAIS été tirée (0 octet servi). C'est le profil du pipeline Eversolo
     /// coincé — SOAP et HTTP vivants, lecture morte — que la relance guérit.
     /// Un décrochage en cours de lecture (octets déjà servis) n'en est pas un.
+    ///
+    /// `bytes_sent` est un compte MESURÉ : l'appelant ne doit l'appeler que
+    /// quand la consommation est connue ([`super::fsm::ConsommationFlux::ASec`]).
+    /// Un flux dont personne ne connaît le compteur n'est pas un démarrage
+    /// mort — voir [`super::fsm::consommation_flux`].
     pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
         output_type == "dlna" && bytes_sent == 0
     }
@@ -1374,6 +1379,90 @@ pub mod fsm {
         STOPPED_TICKS_THRESHOLD, decisions,
     };
 
+    /// Ce que le sondeur SAIT du flux d'une zone, au moment où la garde
+    /// d'échec (#2394) décide de couper ou d'attendre.
+    ///
+    /// ── Pourquoi trois états et pas un compteur ──
+    ///
+    /// La garde lisait un `Option<u64>` et l'écrasait en `0` : `stream_id`
+    /// absent → `0`, session inconnue du gestionnaire de flux →
+    /// `unwrap_or(0)`. « Zéro octet servi » et « je ne sais pas » étaient donc
+    /// LE MÊME CHIFFRE — et c'est ce chiffre qui arme `force_stop`. Une zone
+    /// qui joue parfaitement mais dont le sondeur ignore le `stream_id` était
+    /// indiscernable d'une zone à sec, et coupée au bout de trente secondes
+    /// (DMP-A8, machine `.18`, #2394).
+    ///
+    /// L'échappatoire « le renderer joue mais n'annonce pas son état »
+    /// (DMP-A10, LHC, Shanling…) était précisément désarmée par cette
+    /// confusion : elle exige `octets > 0`, ce qu'un `0` d'ignorance ne donne
+    /// jamais.
+    ///
+    /// Le `stream_id` manque pour des raisons ORDINAIRES, pas seulement en cas
+    /// de panne : `advance_queue_metadata` — l'avance gapless, que le sondeur
+    /// s'appelle à lui-même — pose `stream_id: None` dans le now-playing, et
+    /// la reprise depuis la base en pose un aussi (cf. `stream_id_de_l_uri`,
+    /// #2991 : la base ne mémorise pas un identifiant de session). Une lecture
+    /// gapless sur un renderer DLNA passe donc structurellement en « inconnu »
+    /// dès la deuxième piste de l'album.
+    ///
+    /// Vit ici, dans `fsm`, et non dans `decisions` : c'est le type d'un champ
+    /// de [`StoppedInput`], et `decisions` est `pub(crate)` — un champ public
+    /// portant un type privé ne serait ni nommable par une épreuve
+    /// d'intégration, ni propre au regard de `private_interfaces`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConsommationFlux {
+        /// Le compteur est connu ET il avance : le renderer tire des octets.
+        Consomme,
+        /// Le compteur est connu et n'avance pas : la zone est réellement à
+        /// sec. C'est le SEUL état qui autorise la coupure.
+        ASec,
+        /// Personne ne sait : pas de `stream_id`, ou session inconnue du
+        /// gestionnaire de flux. On n'a mesuré RIEN — pas « rien servi ».
+        Inconnue,
+    }
+
+    impl ConsommationFlux {
+        /// Étiquette stable pour le journal et le diagnostic. Un état qu'on ne
+        /// peut pas observer se reconfond avec zéro à la première occasion :
+        /// celui-ci se lit dans `journalctl -u tune-server | grep consommation`.
+        pub fn etiquette(self) -> &'static str {
+            match self {
+                ConsommationFlux::Consomme => "consomme",
+                ConsommationFlux::ASec => "a_sec",
+                ConsommationFlux::Inconnue => "inconnue",
+            }
+        }
+
+        /// Le compteur a-t-il été MESURÉ ? Seul un compteur mesuré autorise la
+        /// coupure de la zone et le verdict « démarrage mort ».
+        pub fn est_mesuree(self) -> bool {
+            !matches!(self, ConsommationFlux::Inconnue)
+        }
+    }
+
+    /// Qualifier la consommation d'un flux à partir d'un compteur qui a le
+    /// droit de ne pas savoir.
+    ///
+    /// `octets_servis` vient de `streamer_bytes_sent`, qui rend `None` pour un
+    /// flux qu'il ne connaît pas ; l'appelant rend `None` aussi quand le
+    /// now-playing n'a pas de `stream_id`. Les deux ignorances se valent et
+    /// donnent [`ConsommationFlux::Inconnue`] — jamais `ASec`.
+    ///
+    /// `octets_precedents` est le dernier compte MESURÉ : un tour « inconnu »
+    /// ne le remplace pas, sinon la reprise du `stream_id` relancerait la
+    /// comparaison depuis un faux zéro et un flux stable passerait pour
+    /// consommant.
+    pub fn consommation_flux(
+        octets_servis: Option<u64>,
+        octets_precedents: u64,
+    ) -> ConsommationFlux {
+        match octets_servis {
+            None => ConsommationFlux::Inconnue,
+            Some(octets) if octets > 0 && octets > octets_precedents => ConsommationFlux::Consomme,
+            Some(_) => ConsommationFlux::ASec,
+        }
+    }
+
     /// Terminal decision of one poll tick when the output reports Stopped.
     /// Each variant maps 1:1 to a branch of the `TransportState::Stopped` arm.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1405,6 +1494,11 @@ pub mod fsm {
         NaturalEndAdvance,
         /// Failure threshold reached but the stream is still consuming — keep waiting.
         FailureWaitingConsuming,
+        /// Seuil d'échec atteint, mais la consommation du flux est INCONNUE
+        /// (pas de `stream_id`, ou session inconnue du gestionnaire de flux) —
+        /// on attend (#2394). Couper une zone parce qu'on ne sait pas la
+        /// mesurer est pire que le défaut qu'on croit prévenir.
+        FailureWaitingUnknown,
         /// Failure threshold reached, stream idle — stop the zone.
         FailureStop,
         /// Below threshold, or above threshold without a natural end — accumulate.
@@ -1460,7 +1554,9 @@ pub mod fsm {
         /// already probes this; without it the shadow predicted
         /// NaturalEndGaplessWaiting on every OAAT direct-path track end).
         pub can_internal_gapless: bool,
-        pub stream_consuming: bool,
+        /// Ce que le sondeur SAIT du flux — trois états, pas un compteur
+        /// (#2394). `Inconnue` ne coupe pas.
+        pub consommation: ConsommationFlux,
         /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
         /// DSD track on a DLNA renderer whose peak position reached the end.
         /// Gapless is intentionally off for a DSD next on DLNA, and DLNA never
@@ -1524,10 +1620,10 @@ pub mod fsm {
                 };
             }
             if stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
-                return if i.stream_consuming {
-                    FailureWaitingConsuming
-                } else {
-                    FailureStop
+                return match i.consommation {
+                    ConsommationFlux::Consomme => FailureWaitingConsuming,
+                    ConsommationFlux::Inconnue => FailureWaitingUnknown,
+                    ConsommationFlux::ASec => FailureStop,
                 };
             }
             return Waiting;
@@ -1651,7 +1747,8 @@ pub mod fsm {
                 natural_end: false,
                 gapless_sent: false,
                 can_internal_gapless: true,
-                stream_consuming: false,
+                // Base : compteur MESURÉ et à sec — c'est ce qui doit couper.
+                consommation: ConsommationFlux::ASec,
                 dlna_dsd_reached_end: false,
             }
         }
@@ -1966,13 +2063,19 @@ pub mod fsm {
             assert_eq!(classify_stopped(&i), StoppedOutcome::LocalEndedNaturally);
         }
 
+        // #2394 — ces deux épreuves épinglaient le booléen `stream_consuming`,
+        // qui ne connaissait que deux états. Elles ne sont pas supprimées :
+        // elles disent MAINTENANT la même chose sur le troisième état près,
+        // `ConsommationFlux`, et `octets_servis_inconnus_2394.rs` ajoute
+        // l'épreuve du cas « inconnue » qu'un booléen ne pouvait pas exprimer.
         #[test]
         fn failure_stops_when_idle_past_failure_threshold() {
             // STOPPED_FAILURE_THRESHOLD = 30. pre=29 → +1=30, not natural, idle.
+            // « À sec » = compteur MESURÉ qui n'avance pas : ça coupe toujours.
             let i = StoppedInput {
                 stopped_ticks: 29,
                 natural_end: false,
-                stream_consuming: false,
+                consommation: ConsommationFlux::ASec,
                 ..base()
             };
             assert_eq!(classify_stopped(&i), StoppedOutcome::FailureStop);
@@ -1984,13 +2087,27 @@ pub mod fsm {
             let i = StoppedInput {
                 stopped_ticks: 29,
                 natural_end: false,
-                stream_consuming: true,
+                consommation: ConsommationFlux::Consomme,
                 ..base()
             };
             assert_eq!(
                 classify_stopped(&i),
                 StoppedOutcome::FailureWaitingConsuming
             );
+            assert!(!classify_stopped(&i).is_force_stop());
+        }
+
+        /// #2394 — le cas que le booléen ne savait pas dire : consommation
+        /// INCONNUE au seuil d'échec. La zone attend, elle n'est pas coupée.
+        #[test]
+        fn failure_waits_when_consumption_unknown() {
+            let i = StoppedInput {
+                stopped_ticks: 29,
+                natural_end: false,
+                consommation: ConsommationFlux::Inconnue,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::FailureWaitingUnknown);
             assert!(!classify_stopped(&i).is_force_stop());
         }
 
@@ -4436,9 +4553,13 @@ impl PositionPoller {
                         gapless_sent: ps.gapless_sent,
                         realtime: status.realtime,
                         // Refined by the natural-end branch below (live probe),
-                        // same late-update pattern as stream_consuming.
+                        // same late-update pattern as `consommation`.
                         can_internal_gapless: true,
-                        stream_consuming: false,
+                        // Rien n'a encore été mesuré sur ce tour : « inconnue »
+                        // est le seul départ honnête (#2394). La branche du
+                        // seuil d'échec, seule à interroger le gestionnaire de
+                        // flux, la remplace par un verdict mesuré.
+                        consommation: fsm::ConsommationFlux::Inconnue,
                         dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
@@ -4707,35 +4828,64 @@ impl PositionPoller {
                                 // (renderer actively fetching audio data). If so,
                                 // don't kill — the renderer is playing but not
                                 // reporting state (DMP-A10, LHC, Shanling, etc.).
+                                // #2394 — le compteur a le droit de ne pas
+                                // savoir. `stream_id` absent et session
+                                // inconnue du gestionnaire de flux rendaient
+                                // tous deux `0`, indiscernable d'« aucun octet
+                                // servi » ; et c'est ce chiffre qui arme
+                                // `force_stop`. Voir `fsm::consommation_flux`.
                                 let stream_id = zone_state
                                     .now_playing
                                     .as_ref()
                                     .and_then(|np| np.stream_id.clone());
-                                let current_bytes = if let Some(ref sid) = stream_id {
-                                    self.orchestrator
-                                        .streamer_bytes_sent(sid)
-                                        .await
-                                        .unwrap_or(0)
-                                } else {
-                                    0
+                                let octets_servis: Option<u64> = match stream_id.as_deref() {
+                                    Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                                    None => None,
                                 };
-                                let stream_consuming =
-                                    current_bytes > 0 && current_bytes > ps.last_bytes_sent;
-                                ps.last_bytes_sent = current_bytes;
-                                fsm_in.stream_consuming = stream_consuming;
+                                let consommation =
+                                    fsm::consommation_flux(octets_servis, ps.last_bytes_sent);
+                                // Un compteur inconnu n'écrase pas le dernier
+                                // compte MESURÉ : sinon la reprise du
+                                // `stream_id` ferait repartir la comparaison
+                                // depuis un faux zéro.
+                                if let Some(octets) = octets_servis {
+                                    ps.last_bytes_sent = octets;
+                                }
+                                fsm_in.consommation = consommation;
 
-                                if stream_consuming {
+                                if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     if ps.stopped_ticks % 30 == 0 {
                                         debug!(
                                             zone_id,
                                             peak_pos = ps.peak_position_ms,
                                             wall_secs = wall_elapsed,
-                                            bytes_sent = current_bytes,
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            consommation = consommation.etiquette(),
                                             "dlna_renderer_not_reporting_state_waiting"
                                         );
                                     }
+                                } else if consommation == fsm::ConsommationFlux::Inconnue {
+                                    // On ne mesure RIEN — ce n'est pas « rien
+                                    // servi ». Couper ici couperait une zone
+                                    // qui joue (une avance gapless pose
+                                    // `stream_id: None`, cf. #2991). On attend,
+                                    // et on le DIT : un état invisible se
+                                    // reconfondrait avec zéro.
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingUnknown);
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            consommation = consommation.etiquette(),
+                                            has_stream_id = stream_id.is_some(),
+                                            "octets_servis_inconnus_zone_non_coupee"
+                                        );
+                                    }
                                 } else {
+                                    let current_bytes = octets_servis.unwrap_or(0);
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureStop);
                                     warn!(
                                         zone_id,
@@ -4743,6 +4893,7 @@ impl PositionPoller {
                                         track_dur = track_duration_ms,
                                         wall_secs = wall_elapsed,
                                         bytes_sent = current_bytes,
+                                        consommation = consommation.etiquette(),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
@@ -4757,6 +4908,11 @@ impl PositionPoller {
                                     // toujours à la main. Distinct d'un
                                     // décrochage EN COURS de lecture
                                     // (bytes_sent > 0), qu'on ne rejoue pas.
+                                    //
+                                    // On n'arrive ici qu'avec un compteur
+                                    // MESURÉ (`ASec`) : le `0` d'ignorance ne
+                                    // déclenche plus la relance automatique
+                                    // Pause→Stop→Play sur une zone qui joue.
                                     force_stop_demarrage_mort = decisions::demarrage_mort(
                                         all_zones
                                             .iter()
