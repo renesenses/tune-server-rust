@@ -164,6 +164,21 @@ path = "tests/journal_sondage_repos.rs"
 name = "journal_sondage_lecture"
 path = "tests/journal_sondage_lecture.rs"
 
+# #2505 : `.ape` decode incremental. `autotests = false` ci-dessus — un fichier
+# pose dans tests/ ne se compile pas tout seul.
+[[test]]
+name = "ape_incremental_i2505"
+path = "tests/ape_incremental_i2505.rs"
+
+# Binaire de test a lui seul, DELIBEREMENT (#2505) : il installe un
+# `#[global_allocator]` qui mesure le pic d'octets vivants. L'allocateur est
+# PROCESSUS-global — un test voisin qui allouerait en parallele fausserait la
+# mesure. `tests/ape_fixture_i2505.rs` n'est PAS une cible : c'est un module
+# partage, inclus par `#[path]` dans les deux binaires ci-dessus.
+[[test]]
+name = "ape_pic_memoire_i2505"
+path = "tests/ape_pic_memoire_i2505.rs"
+
 [[bench]]
 name = "dsd_to_pcm"
 harness = false
