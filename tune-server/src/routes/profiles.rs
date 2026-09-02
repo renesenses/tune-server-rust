@@ -156,6 +156,10 @@ pub fn router() -> Router<AppState> {
             get(profile_settings).post(update_profile_settings),
         )
         .route("/{id}/stats", get(profile_stats))
+        .route(
+            "/{id}/preferences",
+            get(list_preferences).put(replace_preferences),
+        )
         .route("/{id}/history", get(profile_history))
         .route("/{id}/favorites/check", post(check_favorites))
 }
@@ -330,6 +334,83 @@ async fn delete_profile(State(state): State<AppState>, Path(id): Path<i64>) -> i
 ///
 /// **404, jamais 403**, comme la #3073 : un 403 confirmerait l'existence du
 /// profil et rendrait l'énumération exploitable.
+/// Clé de rangement des préférences d'un profil.
+///
+/// Elles vivent dans `settings`, une par profil, plutôt que dans une table
+/// dédiée. C'est le modèle déjà en place pour les collections normales et les
+/// playlists collaboratives, et il évite une migration pour ce qui est une
+/// préférence d'INTERFACE — rien que le serveur ait à interroger ou à joindre.
+fn cle_preferences(profile_id: i64) -> String {
+    format!("profile_prefs_{profile_id}")
+}
+
+/// GET /profiles/{id}/preferences — toutes les préférences du profil.
+///
+/// Rend un objet VIDE quand rien n'a jamais été écrit, et non une 404 : un
+/// profil neuf n'est pas une erreur, et l'appelant retomberait sur son
+/// affichage par défaut de toute façon.
+async fn list_preferences(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    profil: ActiveProfile,
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let brut = settings.get(&cle_preferences(id)).ok().flatten();
+    let valeur: Value = brut
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    Json(valeur).into_response()
+}
+
+/// PUT /profiles/{id}/preferences — FUSIONNE les clés reçues.
+///
+/// Fusion et non remplacement : un écran qui n'écrit que sa propre clé ne doit
+/// pas effacer celles des autres. Envoyer `null` pour une clé la supprime —
+/// c'est la seule façon d'en retirer une sans connaître toutes les autres.
+async fn replace_preferences(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    profil: ActiveProfile,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
+    let Some(recu) = body.as_object() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "un objet JSON est attendu"})),
+        )
+            .into_response();
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let cle = cle_preferences(id);
+    let mut courant: serde_json::Map<String, Value> = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    for (k, v) in recu {
+        if v.is_null() {
+            courant.remove(k);
+        } else {
+            courant.insert(k.clone(), v.clone());
+        }
+    }
+
+    let valeur = Value::Object(courant);
+    match settings.set(&cle, &serde_json::to_string(&valeur).unwrap_or_default()) {
+        Ok(_) => Json(valeur).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 fn profil_du_chemin_ou_404(chemin: i64, appelant: ActiveProfile) -> Result<(), Response> {
     if chemin == appelant.id() {
         return Ok(());
@@ -743,4 +824,20 @@ async fn check_favorites(
         })
         .collect();
     Json(json!(results)).into_response()
+}
+
+#[cfg(test)]
+mod tests_preferences {
+    use super::*;
+
+    /// La clé est NOMMÉE par profil : deux profils ne se marchent pas dessus.
+    ///
+    /// Elles vivent dans `settings`, un enregistrement par profil, plutôt que
+    /// dans une table dédiée — même modèle que les collections normales, et pas
+    /// de migration pour une préférence d'interface.
+    #[test]
+    fn chaque_profil_a_sa_propre_cle() {
+        assert_eq!(cle_preferences(1), "profile_prefs_1");
+        assert_ne!(cle_preferences(1), cle_preferences(2));
+    }
 }
