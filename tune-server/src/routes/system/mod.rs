@@ -23,7 +23,13 @@ mod playlist_hub;
 mod plugins;
 mod profile;
 mod remote;
-pub(crate) mod scan;
+// `pub` et non `pub(crate)` : la décision « insertion ou mise à jour »
+// (`verdict_ecriture`) doit être atteignable depuis un test d'intégration, qui
+// est une caisse EXTERNE. Sans cette couture, le garde de #2939 aurait dû
+// recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
+// garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
+// expressément.
+pub mod scan;
 mod tags;
 pub(crate) mod update;
 mod youtube;

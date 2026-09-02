@@ -39,16 +39,27 @@
 //! [`tune_core::db::track_repo::TrackRepo::create_batch`] — jamais par une
 //! transcription de leur logique.
 //!
-//! ## Au passage : les deux portées qui ne coïncident pas
+//! ## Au passage : les deux portées, désormais d'accord
 //!
-//! Les quatorze lignes préexistantes portent `source = 'tidal'`. C'est la
-//! divergence décrite par l'issue : la carte de dédoublonnage est chargée par
-//! `SELECT … FROM tracks WHERE source = 'local'`
-//! (`TrackRepo::get_all_local_file_info`), tandis que la contrainte est
-//! `file_path TEXT UNIQUE` sur toute la table, sans condition sur `source`.
-//! Le test MESURE cet écart (la carte rend zéro entrée là où la table en a
-//! quatorze) sans rien y changer : établir qu'il est atteignable en base est
-//! le préalable à toute décision sur la portée de la requête.
+//! Ce fichier mesurait aussi l'écart de portée décrit par l'issue : la carte
+//! de dédoublonnage était chargée par
+//! `SELECT … FROM tracks WHERE source = 'local'`, tandis que la contrainte est
+//! `file_path TEXT UNIQUE` sur toute la table, sans condition sur `source`. Il
+//! l'épinglait tel quel — « la carte rend zéro entrée là où la table en a
+//! quatorze » — parce qu'établir que l'écart est atteignable en base était le
+//! préalable à toute décision sur la portée de la requête.
+//!
+//! **La décision est prise.** La carte couvre maintenant toute la table
+//! (`TrackRepo::get_all_file_info_by_path`), et l'assertion est retournée : les
+//! quatorze lignes DOIVENT être vues. Elle n'est pas supprimée — c'est elle qui
+//! empêche la portée de se rétrécir à nouveau. Le raisonnement et le garde de
+//! la décision d'écriture vivent dans
+//! `tune-server/tests/portee_unicite_file_path_2939.rs`.
+//!
+//! Ce que ce fichier garde reste inchangé : présenter quatorze insertions que
+//! la base refuse et vérifier que le RÉSUMÉ les porte. La voie d'écriture
+//! réduite utilisée ici (`create_batch` seul, sans la décision du scan) reste
+//! le moyen le plus direct de provoquer un refus réel.
 //!
 //! `autotests = false` dans `tune-core/Cargo.toml` — la cible `[[test]]` est
 //! déclarée là-bas, sans quoi ce fichier ne serait jamais compilé.
@@ -147,18 +158,22 @@ fn un_album_refuse_par_l_unicite_apparait_dans_le_resume_de_fin_de_scan() {
          le test ne mesurerait rien"
     );
 
-    // Les deux portées, mesurées : la carte de dédoublonnage ne voit AUCUNE
-    // des quatorze lignes que la contrainte d'unicité, elle, voit très bien.
-    let carte = repo.get_all_local_file_info().unwrap();
+    // Les deux portées, remises d'accord. Cette assertion épinglait l'écart :
+    // elle exigeait ZÉRO entrée vue, parce que la carte était chargée par
+    // `WHERE source = 'local'` et qu'une ligne `source = 'tidal'` au même
+    // `file_path` lui était invisible — c'est cette invisibilité qui envoyait
+    // le fichier à l'insertion, et l'insertion au refus. Elle est retournée,
+    // pas retirée : c'est elle qui interdit à la portée de se rétrécir à
+    // nouveau.
+    let carte = repo.get_all_file_info_by_path().unwrap();
     let vues_par_la_carte = fichiers
         .iter()
         .filter(|c| carte.contains_key(c.to_string_lossy().as_ref()))
         .count();
     assert_eq!(
-        vues_par_la_carte, 0,
-        "la carte est chargée par `WHERE source = 'local'` : une ligne \
-         `source = 'tidal'` au même file_path lui est invisible, et c'est \
-         cette invisibilité qui envoie le fichier à l'insertion"
+        vues_par_la_carte, PISTES_DE_L_ALBUM,
+        "la carte a désormais la portée de la contrainte : elle voit les \
+         quatorze lignes que `file_path TEXT UNIQUE` refuse de doubler"
     );
 
     // Le scan, par la fonction de production.
@@ -190,9 +205,15 @@ fn un_album_refuse_par_l_unicite_apparait_dans_le_resume_de_fin_de_scan() {
     );
 
     // Et la perte est réelle, pas seulement comptée : aucune des quatorze
-    // pistes n'est entrée sous `source = 'local'`.
+    // pistes n'est entrée sous `source = 'local'`. Le comptage est explicite
+    // depuis que la carte couvre toute la table — les quatorze lignes `tidal`
+    // y sont, et elles ne sont pas des pistes locales.
     assert_eq!(
-        repo.get_all_local_file_info().unwrap().len(),
+        repo.get_all_file_info_by_path()
+            .unwrap()
+            .values()
+            .filter(|info| info.est_locale())
+            .count(),
         0,
         "aucune piste locale n'a pu entrer — c'est bien une perte, pas un \
          faux positif du compteur"
@@ -225,7 +246,11 @@ fn un_scan_qui_reussit_annonce_toujours_zero_echec() {
         "aucune piste n'a été perdue : le résumé ne doit rien signaler"
     );
     assert_eq!(
-        repo.get_all_local_file_info().unwrap().len(),
+        repo.get_all_file_info_by_path()
+            .unwrap()
+            .values()
+            .filter(|info| info.est_locale())
+            .count(),
         PISTES_DE_L_ALBUM,
         "contre-épreuve du témoin : les quatorze pistes sont bien EN BASE, \
          sans quoi ce test serait vert contre rien"

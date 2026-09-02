@@ -176,3 +176,10 @@ path = "tests/ajouts_recents_fenetre.rs"
 [[test]]
 name = "canal_de_mise_a_jour"
 path = "tests/canal_de_mise_a_jour.rs"
+
+# #2939 : la carte de dedoublonnage du scan et la contrainte `file_path UNIQUE`
+# n'avaient pas la meme portee. `autotests = false` plus haut — sans cette
+# cible, le fichier ne serait jamais compile, donc vert contre rien.
+[[test]]
+name = "portee_unicite_file_path_2939"
+path = "tests/portee_unicite_file_path_2939.rs"

@@ -463,8 +463,31 @@ pub mod sql {
         "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
     }
 
-    pub fn get_all_local_file_info() -> &'static str {
-        "SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
+    /// Qui possède déjà ce `file_path` ? **Toutes sources confondues.**
+    ///
+    /// La portée de cette requête doit être celle de la contrainte qui va
+    /// trancher l'écriture, et cette contrainte est `file_path TEXT UNIQUE`
+    /// sur la table ENTIÈRE (`sqlite.rs`, `pg_migrate.rs`) — sans la moindre
+    /// condition sur `source`. Un `WHERE source = 'local'` ici rendait la
+    /// carte aveugle à des lignes que la base, elle, voyait parfaitement :
+    /// le scan les envoyait à l'INSERTION, et l'insertion se faisait refuser
+    /// (#2939).
+    ///
+    /// `source` fait partie du résultat parce que les consommateurs n'ont pas
+    /// tous la même question. « Qui possède ce chemin ? » se pose sur toute la
+    /// table ; « qu'ai-je le droit de retirer ? » ne se pose que sur les
+    /// lignes que le scan a lui-même posées. Le second filtre ici,
+    /// explicitement, au lieu de compter sur une requête qui ne dit pas
+    /// laquelle des deux questions elle répond.
+    pub fn get_all_file_info_by_path() -> &'static str {
+        "SELECT id, file_path, file_mtime, file_size, source FROM tracks WHERE file_path IS NOT NULL"
+    }
+
+    pub fn adopter_en_local<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET source = 'local' WHERE id = {} AND source <> 'local'",
+            d.placeholder(1)
+        )
     }
 
     pub fn get_existing_audio_hash_album_pairs() -> &'static str {
@@ -603,6 +626,37 @@ pub(crate) const ID_INLINE_BATCH: usize = 5_000;
 /// (~205 pistes en base pour ~779 sur le disque, JP Borderies). Même patron
 /// que `scan_walk_errors_truncated` dans `scanner::walker`.
 const ECHECS_DETAILLES: usize = 10;
+
+/// Ce que la base sait déjà du fichier qui vit à un `file_path` donné.
+///
+/// Rendue par [`TrackRepo::get_all_file_info_by_path`], une entrée par chemin —
+/// la contrainte `file_path TEXT UNIQUE` garantit qu'il ne peut y en avoir
+/// qu'une.
+///
+/// `source` est porté jusqu'ici **exprès**. La carte couvre toute la table,
+/// parce que c'est la portée de la contrainte qui va accepter ou refuser
+/// l'écriture ; mais tout consommateur n'a pas le droit d'en faire le même
+/// usage. La purge de fin de scan, en particulier, ne doit retirer que des
+/// lignes `source = 'local'`, et elle le décide en lisant ce champ plutôt qu'en
+/// espérant qu'une requête ait filtré pour elle (#2939).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InfoFichier {
+    /// `tracks.id` de la ligne qui possède ce chemin.
+    pub id: i64,
+    /// `file_mtime` enregistré au dernier scan, s'il l'a été.
+    pub mtime: Option<f64>,
+    /// `file_size` enregistré au dernier scan, s'il l'a été.
+    pub taille: Option<i64>,
+    /// `tracks.source` de la ligne : `local`, ou l'importateur qui l'a posée.
+    pub source: String,
+}
+
+impl InfoFichier {
+    /// La ligne appartient-elle au scan ? Seules celles-là sont purgeables.
+    pub fn est_locale(&self) -> bool {
+        self.source == "local"
+    }
+}
 
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
@@ -1936,21 +1990,63 @@ impl TrackRepo {
             .collect())
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn get_all_local_file_info(
-        &self,
-    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, TuneError> {
-        let rows = self.db.query_many(sql::get_all_local_file_info(), &[])?;
+    /// La carte `file_path` → ligne qui le possède, **toutes sources**.
+    ///
+    /// Voir [`sql::get_all_file_info_by_path`] pour la raison — c'est la
+    /// portée de `file_path TEXT UNIQUE`, et rien d'autre ne peut décider si
+    /// un fichier rencontré par le scan est une insertion ou une mise à jour.
+    pub fn get_all_file_info_by_path(&self) -> Result<HashMap<String, InfoFichier>, TuneError> {
+        let rows = self.db.query_many(sql::get_all_file_info_by_path(), &[])?;
         Ok(rows
             .into_iter()
             .filter_map(|cols| {
                 let id = cols.first().and_then(|v| v.as_i64())?;
                 let path = cols.get(1).and_then(|v| v.as_string())?;
                 let mtime = cols.get(2).and_then(|v| v.as_f64());
-                let size = cols.get(3).and_then(|v| v.as_i64());
-                Some((path, (id, mtime, size)))
+                let taille = cols.get(3).and_then(|v| v.as_i64());
+                // Une ligne sans `source` n'existe pas (colonne NOT NULL
+                // DEFAULT 'local'), mais un moteur qui rendrait NULL ne doit
+                // pas faire passer la ligne pour locale : « inconnue » est le
+                // choix sûr, il ne donne aucun droit de purge.
+                let source = cols
+                    .get(4)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "inconnue".to_string());
+                Some((
+                    path,
+                    InfoFichier {
+                        id,
+                        mtime,
+                        taille,
+                        source,
+                    },
+                ))
             })
             .collect())
+    }
+
+    /// Le scan prend possession des lignes qu'il vient de relire sur le disque.
+    ///
+    /// Une ligne posée par un importateur de bibliothèque (`roon_import`,
+    /// `plex_import`, `jriver`) décrit un fichier local ; dès que le scan l'a
+    /// rouverte et remise à jour depuis ses balises, elle EST une piste locale.
+    /// Sans cette adoption, elle resterait invisible à toutes les requêtes de
+    /// tenue de compte du scan — dont la purge — et le désaccord de portée que
+    /// corrige #2939 se rejouerait à chaque scan suivant.
+    ///
+    /// `AND source <> 'local'` : une ligne déjà locale n'est pas touchée, donc
+    /// le compte rendu est le nombre d'adoptions RÉELLES.
+    pub fn adopter_en_local(&self, ids: &[i64]) -> Result<usize, TuneError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let sql = self.dialect_sql(sql::adopter_en_local, sql::adopter_en_local);
+        let mut adoptees = 0usize;
+        for id in ids {
+            let params: [&dyn ToSqlValue; 1] = [id];
+            adoptees += self.db.execute(&sql, &params)?;
+        }
+        Ok(adoptees)
     }
 
     /// List all local tracks (with file_path set). Used by rescan-metadata to
