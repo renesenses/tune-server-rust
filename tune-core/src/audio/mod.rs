@@ -4,6 +4,7 @@ pub mod alac_encoder;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
+pub mod autoeq;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;
