@@ -2512,18 +2512,31 @@ mod tests {
         );
         assert_eq!(r.stream_id, flux, "le refus doit nommer le flux concerne");
 
-        // 6. reponse hors sujet -> refus : on ne joue pas sur une reponse
-        //    qu'on n'a pas comprise.
+        // 6. reponse hors sujet -> HORS NEGOCIATION, ni accord ni refus.
+        //
+        //    Cette ligne attendait un refus. C'est ce qu'elle gardait qui a
+        //    coupe la zone du Zicmu (#2758) : une trame qui n'exprime AUCUN
+        //    avis sur le format — statistiques de flux, signal de prefetch —
+        //    etait comptee comme un refus non reconnectable, et le poller
+        //    arretait la lecture pour cela.
+        //
+        //    « On ne joue pas sur une reponse qu'on n'a pas comprise » reste
+        //    vrai, et c'est bien ce qui se passe : on ne joue pas dessus, on
+        //    l'ecarte et on continue d'attendre la vraie reponse. Ce qui
+        //    change, c'est qu'on ne la prend plus pour un NON.
         let hors_sujet = EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
             stream_id: flux.clone(),
         });
-        assert!(
+        assert_eq!(
             juger_reponse(
                 &contrat,
                 ReponseNegociation::Recue(&hors_sujet),
                 PolitiqueAdaptation::ExacteSeulement,
             )
-            .is_err()
+            .expect("une trame hors negociation n'exprime pas un refus (#2758)"),
+            Verdict::HorsNegociation {
+                trame: "NextTrackReady"
+            }
         );
 
         // 7. endpoint ferme.
@@ -2642,5 +2655,283 @@ mod tests {
                 "un {nom} etranger doit s'ecarter en nommant son flux"
             );
         }
+    }
+
+    /// Des statistiques de flux, avec le BON identifiant.
+    ///
+    /// C'est le cas que le filtre de #2730 ne pouvait pas voir : la, le
+    /// `stream_id` etait etranger et le message s'ecartait. Ici il concorde
+    /// — l'endpoint parle bien de la session en cours — mais la trame ne
+    /// repond pas a la proposition de format. Le fourre-tout la classait en
+    /// refus non reconnectable, le poller arretait la zone.
+    #[cfg(feature = "oaat")]
+    fn stats_de(stream_id: &str) -> oaat_controller::EndpointResponse {
+        oaat_controller::EndpointResponse::StreamStats(oaat_core::message::StreamStats {
+            stream_id: stream_id.into(),
+            buffer_frames: 0,
+            drift_us: 0,
+            corrections_net_frames: 0,
+            packets_lost: 0,
+            packets_recovered: 0,
+            bit_perfect: true,
+        })
+    }
+
+    /// #2758 — les DEUX sens, sur la vraie `juger_reponse`.
+    ///
+    /// Zicmu / SMSL Sanskrit 10th MkII, 29/08/2026, 0.9.121 : au premier Play
+    /// comme a la transition gapless, l'endpoint emet ses `StreamStats` sur
+    /// `tune-1` pendant qu'on negocie `tune-1`. Journal :
+    ///
+    /// ```text
+    /// raison=reponse inattendue pendant la negociation de format :
+    /// StreamStats(StreamStats { stream_id: "tune-1", buffer_frames: 0, ...,
+    /// bit_perfect: true })
+    /// ... output_reported_failure_stopping_zone zone_id=6
+    /// ```
+    ///
+    /// ## Les deux sens sont dans ce test, et c'est deliberé
+    ///
+    /// Fermer la porte a tout ce qui n'est pas `FormatAccept` etait le defaut.
+    /// L'ouvrir a tout serait une regression pire, et SILENCIEUSE : la zone ne
+    /// s'arreterait plus, mais elle jouerait par-dessus un refus. La seconde
+    /// moitie du test verifie donc que le refus coupe toujours.
+    #[test]
+    #[cfg(feature = "oaat")]
+    fn une_trame_hors_negociation_du_bon_flux_s_ecarte_mais_un_vrai_refus_coupe() {
+        use crate::outputs::oaat::output::{
+            PolitiqueAdaptation, ReponseNegociation, Verdict, juger_reponse,
+        };
+        use oaat_controller::EndpointResponse;
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+
+        // --- Sens 1 : les trames qui ne parlent pas de format s'ecartent.
+        let reformat_a_nous = oaat_core::message::NextTrackReformat {
+            stream_id: notre.clone(),
+            format: contrat.format,
+            // Volontairement DIFFERENT du contrat : meme quand elle annonce un
+            // autre format, cette trame parle de la piste SUIVANTE. Elle est
+            // traitee par `settle_prefetch`, pas par la negociation en cours.
+            sample_rate: 48_000,
+        };
+
+        let inoffensives = [
+            ("StreamStats", stats_de(&notre)),
+            (
+                "NextTrackReady",
+                EndpointResponse::NextTrackReady(oaat_core::message::NextTrackReady {
+                    stream_id: notre.clone(),
+                }),
+            ),
+            (
+                "NextTrackReformat",
+                EndpointResponse::NextTrackReformat(reformat_a_nous),
+            ),
+        ];
+
+        for (trame, reponse) in inoffensives {
+            let verdict = juger_reponse(
+                &contrat,
+                ReponseNegociation::Recue(&reponse),
+                PolitiqueAdaptation::ExacteSeulement,
+            )
+            .unwrap_or_else(|refus| {
+                panic!(
+                    "un {trame} du flux {notre} — le NOTRE — ne repond pas a la \
+                     proposition de format, mais ne la refuse pas non plus : le \
+                     classer en refus arretait la zone (#2758). Recu : {}",
+                    refus.raison
+                )
+            });
+            assert_eq!(
+                verdict,
+                Verdict::HorsNegociation { trame },
+                "la trame ecartee doit etre NOMMEE : sans cela le journal ne dit pas \
+                 ce qui a ete jete"
+            );
+        }
+
+        // --- Sens 2 : ce qui refuse vraiment refuse toujours.
+        //
+        // Sans ces quatre cas, « ne plus arreter la zone » se satisferait d'un
+        // `Ok(...)` inconditionnel, et Tune jouerait par-dessus un refus.
+        let refus_franc = EndpointResponse::FormatReject(oaat_core::message::FormatReject {
+            stream_id: notre.clone(),
+            reason: "cadence non supportee".into(),
+        });
+        let r = juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&refus_franc),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("un FormatReject de NOTRE flux reste un refus");
+        assert!(
+            r.raison.contains("cadence non supportee"),
+            "le motif du DAC doit remonter tel quel, recu : {}",
+            r.raison
+        );
+
+        let mut contre_ecartee = contre_de(&contrat);
+        contre_ecartee.sample_rate = 44_100;
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Recue(&EndpointResponse::FormatCounter(contre_ecartee)),
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("une contre-proposition non produisible reste un refus");
+
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Timeout,
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("le silence n'est pas un accord");
+
+        juger_reponse(
+            &contrat,
+            ReponseNegociation::Fermee,
+            PolitiqueAdaptation::ExacteSeulement,
+        )
+        .expect_err("un endpoint ferme n'est pas un accord");
+    }
+
+    /// La meme chose au niveau de l'ATTENTE, sur la vraie boucle.
+    ///
+    /// `attendre_accord_format` ne fait que passer `endpoint.response_rx` a
+    /// `attendre_accord_format_sur` : c'est cette derniere qui est la
+    /// mecanique, et c'est elle qu'on appelle ici — pas une transcription de
+    /// son corps. Le canal est un `mpsc` ordinaire, alimente a la main : aucun
+    /// DAC, aucune socket.
+    ///
+    /// Trois choses a prouver d'un coup :
+    /// 1. un `StreamStats` traverse et la negociation ABOUTIT ;
+    /// 2. la trame est CONSOMMEE — elle ne reste pas dans le canal pour
+    ///    empoisonner le Play suivant, ce qui etait la deuxieme moitie du
+    ///    defaut (les relances de 12:23:27 a 12:25:15 basculaient en #2730) ;
+    /// 3. un `FormatReject` arrivant derriere un `StreamStats` coupe quand
+    ///    meme, avec SON motif — pas celui de la trame en retard.
+    #[tokio::test]
+    #[cfg(feature = "oaat")]
+    async fn la_boucle_traverse_les_stats_les_consomme_et_laisse_passer_les_refus() {
+        use crate::outputs::oaat::output::attendre_accord_format_sur;
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+
+        // 1 et 2 — stats puis accord.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(stats_de(&notre)).await.unwrap();
+        tx.send(oaat_controller::EndpointResponse::FormatAccept(
+            oaat_core::message::FormatAccept {
+                stream_id: notre.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let arrete = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect(
+            "un StreamStats emis juste apres le handshake, sur NOTRE flux, arretait la \
+             zone au premier Play (#2758)",
+        );
+        assert_eq!(arrete.stream_id, notre);
+        assert_eq!(arrete.sample_rate, contrat.sample_rate);
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "le StreamStats doit avoir ete CONSOMME : laisse dans le canal, il devient \
+             le reliquat qui fera echouer la negociation suivante (#2730)"
+        );
+        drop(tx);
+
+        // 3 — stats puis refus franc.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(stats_de(&notre)).await.unwrap();
+        tx.send(oaat_controller::EndpointResponse::FormatReject(
+            oaat_core::message::FormatReject {
+                stream_id: notre.clone(),
+                reason: "cadence non supportee".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let refus = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect_err("un refus derriere des statistiques reste un refus");
+        assert!(
+            refus.raison.contains("cadence non supportee"),
+            "c'est le motif du DAC qui doit remonter, pas la trame de statistiques \
+             qui le precedait — le journal collait `DSD format non accepte` sur une \
+             raison qui n'etait pas un refus de format. Recu : {}",
+            refus.raison
+        );
+        drop(tx);
+    }
+
+    /// La borne contre l'endpoint bavard.
+    ///
+    /// Ecarter au lieu de refuser ouvre une boucle. L'echeance globale borne le
+    /// TEMPS ; elle ne borne pas le nombre de tours, et un endpoint qui deverse
+    /// ses statistiques en rafale ferait tourner Tune — et grossir le journal —
+    /// jusqu'a l'echeance. `MAX_TRAMES_ECARTEES` borne le TRAVAIL.
+    ///
+    /// Le test envoie une trame de plus que la borne, garde l'emetteur en vie
+    /// (sinon la fermeture du canal deciderait a la place de la borne) et exige
+    /// que le motif nomme le COMPTE. Sans cette derniere exigence, un simple
+    /// `is_err()` serait vert meme sans borne : la boucle finirait par tomber
+    /// en timeout, et le test ne distinguerait pas les deux.
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "oaat")]
+    async fn un_endpoint_bavard_ne_fait_pas_tourner_la_negociation_sans_fin() {
+        use crate::outputs::oaat::output::{MAX_TRAMES_ECARTEES, attendre_accord_format_sur};
+
+        let contrat = contrat_pcm();
+        let notre = contrat.stream_id.clone();
+        let debit = MAX_TRAMES_ECARTEES as usize + 1;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(debit + 4);
+        for _ in 0..debit {
+            tx.send(stats_de(&notre)).await.unwrap();
+        }
+
+        let refus = attendre_accord_format_sur(
+            &mut rx,
+            "Zicmu",
+            &contrat,
+            crate::outputs::oaat::output::PolitiqueAdaptation::ExacteSeulement,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect_err("un endpoint qui ne repond jamais doit finir par etre abandonne");
+        assert!(
+            refus.raison.contains(&format!("{debit} trames")),
+            "c'est la BORNE qui doit trancher, pas l'echeance : le motif doit nommer \
+             les {debit} trames ecartees. Recu : {}",
+            refus.raison
+        );
+        assert!(
+            !refus.reconnectable,
+            "rejouer aveuglement une negociation face a un endpoint muet ne mene nulle part"
+        );
+        drop(tx);
     }
 }
