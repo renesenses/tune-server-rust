@@ -53,22 +53,32 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// celui de l'album. Partage entre les recommandations et les « top mixes »,
 /// qui prenaient tous deux le genre d'un album homonyme (#2731).
 ///
-/// ATTENTION : telle quelle, cette requete ECHOUE sur les deux moteurs —
-/// `WHERE genre IS NOT NULL` est ambigu entre `t.genre` et `a.genre`, et
-/// l'erreur est avalee par le `unwrap_or_default` des appelants. La jointure
-/// est corrigee ici pour le jour ou la requete sera reveillee ; la reveiller
-/// releve d'un arbitrage produit (cf. le test
-/// `les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre`), pas du
-/// defaut d'homonymie.
+/// # Elle ne repondait pas, et personne ne le voyait
+///
+/// Deux defauts de SQL la faisaient echouer sur les DEUX moteurs, et les
+/// appelants avalaient l'erreur (`ou_defaut_journalise`) :
+///
+/// 1. `WHERE genre IS NOT NULL` etait ambigu — `t.genre` et `a.genre` sont
+///    tous deux dans la portee de la sous-requete. Le filtre porte desormais
+///    sur la colonne PROJETEE, a l'exterieur, sous un nom qui n'entre en
+///    collision avec rien (`g`).
+/// 2. La sous-requete n'avait pas d'alias. SQLite s'en accommode, PostgreSQL
+///    l'exige : `FROM (SELECT ...) AS h`.
+///
+/// Vu en clair dans les journaux d'un testeur (Jean-Pierre Borderies,
+/// 0.9.129) : `ambiguous column name: genre`, avale, reponse degradee rendue
+/// a sa place. Conséquences a l'ecran, jamais signalees comme des pannes :
+/// « A decouvrir » retombait sur des albums AU HASARD (`reason: "random"`)
+/// au lieu des genres ecoutes, et `/home/top-mixes` rendait toujours `[]`.
 fn sql_top_genres() -> String {
     format!(
-        "SELECT genre, COUNT(*) as cnt \
-         FROM (SELECT COALESCE(t.genre, a.genre) as genre \
+        "SELECT h.g AS genre, COUNT(*) as cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) as g \
                FROM listen_history lh \
                LEFT JOIN tracks t ON lh.track_id = t.id \
-               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
-               WHERE genre IS NOT NULL AND genre != '') \
-         GROUP BY genre ORDER BY cnt DESC LIMIT 5"
+               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM}) AS h \
+         WHERE h.g IS NOT NULL AND h.g != '' \
+         GROUP BY h.g ORDER BY cnt DESC LIMIT 5"
     )
 }
 
@@ -804,16 +814,26 @@ mod tests_homonymes {
     /// pas le defaut de Tades. Il est laisse hors de ce correctif, et ce test
     /// le fige pour qu'on ne le decouvre pas deux fois.
     #[test]
-    fn les_genres_les_plus_ecoutes_ne_rendent_rien_ambiguite_sur_genre() {
+    fn les_genres_les_plus_ecoutes_repondent_et_ne_comptent_qu_une_fois() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let (_police, pulp) = deux_live(&state, Some("Rock"));
         ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
 
-        assert!(
-            state.backend.query_many(&sql_top_genres(), &[]).is_err(),
-            "si cette requete se met a repondre, les deux jointures corrigees \
-             deviennent testables — et « A decouvrir » cesse d'etre aleatoire"
+        let lignes = state
+            .backend
+            .query_many(&sql_top_genres(), &[])
+            .expect("la requete des genres doit REPONDRE : c'est tout le sujet");
+
+        assert_eq!(lignes.len(), 1, "un seul genre a ete ecoute");
+        assert_eq!(
+            lignes[0][0].as_string().as_deref(),
+            Some("Rock"),
+            "le genre vient de l'album ecoute"
         );
+        // 1 et non 2 : le « Live » de Police est un homonyme, pas une ecoute
+        // (#2731). La jointure corrigee etait ecrite depuis longtemps ; tant
+        // que la requete echouait, RIEN ne pouvait le verifier.
+        assert_eq!(lignes[0][1].as_i64(), Some(1), "l'homonyme ne compte pas");
     }
 }
 
