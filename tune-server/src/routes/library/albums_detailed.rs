@@ -11,10 +11,10 @@
 //! courante, en réutilisant `facets::build_conditions` : les cartes comptent
 //! donc exactement ce que le rail annonce.
 
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;

@@ -53,6 +53,8 @@ concerts = ["dep:tune-concerts"]
 [dependencies]
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
+tune-http-types = { path = "../tune-http-types" }
+tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }
 tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = true }

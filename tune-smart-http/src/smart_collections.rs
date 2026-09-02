@@ -7,10 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
-use crate::error::AppError;
-use crate::routes::active_profile::ActiveProfile;
-use crate::routes::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
-use crate::state::AppState;
+use crate::SmartHttpState;
+use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
+use tune_http_types::{ActiveProfile, AppError};
 
 #[derive(Deserialize)]
 struct CreateCollection {
@@ -48,7 +47,13 @@ struct PreviewRequest {
     max_limit: Option<i64>,
 }
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SmartHttpState: axum::extract::FromRef<S>,
+    ActiveProfile: axum::extract::FromRequestParts<S>,
+    <ActiveProfile as axum::extract::FromRequestParts<S>>::Rejection: IntoResponse,
+{
     Router::new()
         .route("/", get(list_collections).post(create_collection))
         .route(
@@ -97,7 +102,7 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
 }
 
 async fn list_collections(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
 ) -> Result<Json<Value>, AppError> {
     let rows = state
@@ -110,7 +115,7 @@ async fn list_collections(
         )
         .map_err(AppError::internal)?;
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let items: Vec<Value> = rows
         .iter()
@@ -167,7 +172,7 @@ async fn list_collections(
 }
 
 async fn create_collection(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<CreateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules_json = body.rules.to_string();
@@ -176,7 +181,7 @@ async fn create_collection(
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
     // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     smart_refs::check_no_cycle(
         &resolver,
         RefKind::SmartCollection,
@@ -224,7 +229,7 @@ async fn create_collection(
 }
 
 async fn get_collection(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let row = state
@@ -244,7 +249,7 @@ async fn get_collection(
 }
 
 async fn update_collection(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -254,12 +259,12 @@ async fn update_collection(
             .name
             .clone()
             .or_else(|| {
-                DbRefResolver::new(&state)
+                DbRefResolver::new(&state.backend)
                     .smart_entity(RefKind::SmartCollection, id)
                     .map(|e| e.name)
             })
             .unwrap_or_else(|| format!("#{id}"));
-        let resolver = DbRefResolver::new(&state);
+        let resolver = DbRefResolver::new(&state.backend);
         smart_refs::check_no_cycle(
             &resolver,
             RefKind::SmartCollection,
@@ -343,7 +348,7 @@ async fn update_collection(
 }
 
 async fn delete_collection(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     state
@@ -379,7 +384,7 @@ fn resolve_timestamp_sql(input: &str) -> String {
 /// phantom `tracks` columns, unknown fields fell back to `t.title` — which made
 /// whole collections vanish from the facet or count the entire library.)
 /// The WHERE references aliases `al` (albums), `ar` (artists), `t` (tracks).
-pub(crate) fn build_album_query(
+pub fn build_album_query(
     rules_json: &str,
     match_mode: &str,
     sort_by: &str,
@@ -462,7 +467,7 @@ pub(crate) fn build_album_query(
                         // l'utilisateur, une collection `instrument: Grand
                         // Piano` ne trouverait plus rien alors que les lignes
                         // existent. Deux normalisations, deux résultats.
-                        let canon = crate::routes::library::credits_mb::canoniser_instrument(instr);
+                        let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
                         let motif = if canon.is_empty() { instr } else { &canon };
                         sub_conds.push(format!(
                             "LOWER(tc.instrument) LIKE LOWER('%{}%')",
@@ -698,7 +703,7 @@ pub(crate) fn build_album_query(
 
 /// Execute a smart album query and return album rows as JSON values.
 fn execute_album_query(
-    state: &AppState,
+    state: &SmartHttpState,
     where_clause: &str,
     order: &str,
     limit_clause: &str,
@@ -746,7 +751,7 @@ fn execute_album_query(
 
 /// Load a smart collection's criteria from the DB.
 fn load_collection_criteria(
-    state: &AppState,
+    state: &SmartHttpState,
     id: i64,
 ) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
     let row = state
@@ -778,7 +783,7 @@ fn load_collection_criteria(
 }
 
 async fn resolve_albums(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -788,7 +793,7 @@ async fn resolve_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_album_query(
         &rules_json,
@@ -810,7 +815,7 @@ async fn resolve_albums(
 }
 
 async fn preview_albums(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
@@ -819,7 +824,7 @@ async fn preview_albums(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_album_query(
         &rules_json,
@@ -837,7 +842,7 @@ async fn preview_albums(
 #[cfg(test)]
 mod tests {
     use super::{build_album_query, normalize_sort_order, resolve_timestamp_sql};
-    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+    use crate::smart_refs::{EmptyResolver, RefCtx};
 
     #[test]
     fn resolve_timestamp_relative_forms() {

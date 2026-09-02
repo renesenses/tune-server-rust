@@ -8,10 +8,9 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::Engine;
 
-use crate::error::AppError;
-use crate::routes::active_profile::ActiveProfile;
-use crate::routes::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
-use crate::state::AppState;
+use crate::SmartHttpState;
+use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
+use tune_http_types::{ActiveProfile, AppError};
 
 #[derive(Deserialize)]
 struct CreateSmartPlaylist {
@@ -43,7 +42,13 @@ struct PreviewRequest {
     max_tracks: Option<i64>,
 }
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SmartHttpState: axum::extract::FromRef<S>,
+    ActiveProfile: axum::extract::FromRequestParts<S>,
+    <ActiveProfile as axum::extract::FromRequestParts<S>>::Rejection: IntoResponse,
+{
     Router::new()
         .route("/", get(list_smart_playlists).post(create_smart_playlist))
         .route(
@@ -57,7 +62,9 @@ pub fn router() -> Router<AppState> {
         .route("/preview", post(preview_smart_collection))
 }
 
-async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn list_smart_playlists(
+    State(state): State<SmartHttpState>,
+) -> Result<Json<Value>, AppError> {
     let rows = state
         .backend
         .query_many(
@@ -89,7 +96,7 @@ async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Valu
 }
 
 async fn create_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Json(body): Json<CreateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules_json = body.rules.to_string();
@@ -98,7 +105,7 @@ async fn create_smart_playlist(
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
     // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     smart_refs::check_no_cycle(
         &resolver,
         RefKind::SmartPlaylist,
@@ -147,7 +154,7 @@ async fn create_smart_playlist(
 }
 
 async fn get_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
@@ -184,7 +191,7 @@ async fn get_smart_playlist(
 }
 
 async fn update_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -196,12 +203,12 @@ async fn update_smart_playlist(
             .name
             .clone()
             .or_else(|| {
-                DbRefResolver::new(&state)
+                DbRefResolver::new(&state.backend)
                     .smart_entity(RefKind::SmartPlaylist, id)
                     .map(|e| e.name)
             })
             .unwrap_or_else(|| format!("#{id}"));
-        let resolver = DbRefResolver::new(&state);
+        let resolver = DbRefResolver::new(&state.backend);
         smart_refs::check_no_cycle(
             &resolver,
             RefKind::SmartPlaylist,
@@ -326,7 +333,7 @@ async fn update_smart_playlist(
 }
 
 async fn delete_smart_playlist(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let sql = if state.backend.engine() == Engine::Postgres {
@@ -522,7 +529,7 @@ pub(crate) fn build_smart_query(
 
 /// Execute a smart query and return track rows as JSON values.
 fn execute_smart_track_query(
-    state: &AppState,
+    state: &SmartHttpState,
     where_clause: &str,
     order: &str,
     limit_clause: &str,
@@ -580,7 +587,7 @@ fn execute_smart_track_query(
 
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
 fn load_smart_criteria(
-    state: &AppState,
+    state: &SmartHttpState,
     id: i64,
 ) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
@@ -612,7 +619,7 @@ fn load_smart_criteria(
 }
 
 async fn resolve_tracks(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -622,7 +629,7 @@ async fn resolve_tracks(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_smart_query(
         &rules_json,
@@ -638,7 +645,7 @@ async fn resolve_tracks(
 }
 
 async fn smart_collection_albums(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -648,7 +655,7 @@ async fn smart_collection_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_smart_query(
         &rules_json,
@@ -688,7 +695,7 @@ async fn smart_collection_albums(
 }
 
 async fn preview_smart_collection(
-    State(state): State<AppState>,
+    State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
@@ -697,7 +704,7 @@ async fn preview_smart_collection(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let resolver = DbRefResolver::new(&state);
+    let resolver = DbRefResolver::new(&state.backend);
     let ctx = RefCtx::root(&resolver, Some(profile.id()));
     let (where_clause, order, limit_clause) = build_smart_query(
         &rules_json,
@@ -796,7 +803,7 @@ fn strip_accents(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::build_smart_query;
-    use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+    use crate::smart_refs::{EmptyResolver, RefCtx};
 
     fn where_of(rules: &str) -> String {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));

@@ -1,5 +1,5 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use std::collections::HashMap;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

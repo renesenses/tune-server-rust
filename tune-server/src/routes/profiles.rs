@@ -1,5 +1,11 @@
+// Resolution ASYMETRIQUE, et non une union : `rc` apportait ici DEUX imports.
+//   - `ActiveProfile` est le fond du correctif #2560 (cloisonnement des
+//     favoris) : il reste, sans quoi on perdrait un correctif de securite ;
+//   - `crate::routes::panne_sql::OuDefautJournalise` est la FORME d'avant :
+//     ce lot a deplace le module dans `tune-http-types`, il n'existe plus
+//     sous `crate::routes`. L'import vit desormais plus bas, sous son nouveau
+//     chemin. Le garder ici casserait `tune-server` lui-meme.
 use crate::routes::active_profile::ActiveProfile;
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -7,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::favorite_facets_repo::FavoriteFacetsRepo;

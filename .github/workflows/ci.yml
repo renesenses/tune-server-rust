@@ -192,7 +192,12 @@ jobs:
       # `cloud-relay`, absent de tous les jeux de fonctionnalites de la CI.
       # Le relayage des flux y est donc reste un `TODO Phase 2` sans que rien
       # ne rougisse : une requete de flux distante finissait en 504, muette.
-      - run: cargo test --no-fail-fast -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
+      #
+      # `-p tune-http-types` et `-p tune-smart-http` : deux caisses extraites
+      # par ce lot. Sans elles ici, le decoupage aurait retire du code de la
+      # porte au lieu de l'y garder — la liste est un inventaire, pas un
+      # echantillon (cf #2865).
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-bridge --no-default-features --features oaat,cloud-relay
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -534,7 +539,16 @@ jobs:
           done
           echo "::error::apt injoignable apres 3 essais"
           exit 1
-      - run: cargo clippy -p tune-core -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
+      # UNION des deux cotes, jamais un camp. La liste des paquets et celle des
+      # features sont deux inventaires, pas des echantillons (#2865) :
+      #  - `-p tune-http-types` et `-p tune-smart-http` viennent de ce lot,
+      #    deux caisses extraites ; les en sortir retirerait ce code de la
+      #    porte en le decoupant — c'est precisement ce que cette porte a
+      #    attrape apres la fusion precedente ;
+      #  - `concerts` vient de `rc` (#2768, 12987dbd) ; l'en sortir rouvrirait
+      #    l'angle mort que ce commit-la venait de fermer, et
+      #    `toute_feature_declaree_est_activee_par_une_porte_clippy` rougirait.
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-cli -p tune-bridge --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,dj,karaoke,bandcamp,concerts,plugins-wasm -- -D clippy::correctness
 
   audit:
     name: Security Audit

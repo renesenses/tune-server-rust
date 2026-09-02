@@ -11,8 +11,8 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 
 use crate::routes::cloud_error;
-use crate::routes::panne_sql::OuDefautJournalise;
 use crate::state::AppState;
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 // ---------------------------------------------------------------------------
 // Plugin artifact signatures (audit item 8)

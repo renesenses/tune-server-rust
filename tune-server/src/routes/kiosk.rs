@@ -1,9 +1,9 @@
-use crate::routes::panne_sql::OuDefautJournalise;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
