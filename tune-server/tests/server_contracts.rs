@@ -11,6 +11,8 @@ mod albums_pas_des_doublons;
 mod annonce_forum_bornes;
 #[path = "auth_security.rs"]
 mod auth_security;
+#[path = "autoeq_import_route.rs"]
+mod autoeq_import_route;
 #[path = "bios_bilan_visible.rs"]
 mod bios_bilan_visible;
 #[path = "bios_langue_album.rs"]
