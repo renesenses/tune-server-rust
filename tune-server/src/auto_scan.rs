@@ -282,7 +282,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // advertise it via `scan_status` and honour cooperative cancellation.
         // The guards reset the persisted status before releasing the unique
         // owner on every exit path, including panic unwind.
-        let _ = settings.set("scan_status", "scanning");
+        // L'annonce passe par le chemin PARTAGÉ avec le scan manuel : elle
+        // pose l'horodatage ET le statut. Écrire le statut seul, comme on le
+        // faisait, rendait ce scan indatable : le garde-fou de mise à jour
+        // traitait « scanning sans horodatage » comme frais indéfiniment, si
+        // bien qu'un processus tué ici — coupure de courant, `kill -9`, ou un
+        // plantage au démarrage (#2302) — différait les mises à jour POUR
+        // TOUJOURS. `ScanStatusGuard` ne rattrape pas ce cas : il ne s'exécute
+        // que sur les sorties de la tâche, jamais sur une mort du processus
+        // (#2976).
+        crate::routes::system::scan::marquer_scan_en_cours(&db);
         let _scan_status_guard = ScanStatusGuard(db.clone());
 
         let exclude_patterns = scan_exclude_patterns(&db);
@@ -1142,6 +1151,39 @@ mod registre_du_scan_tests {
         );
         assert_eq!(corps.matches("suivi.echec").count(), 1);
         assert_eq!(corps.matches("suivi.terminer").count(), 1);
+    }
+
+    /// #2976 : le scan de demarrage doit annoncer son etat par le chemin
+    /// PARTAGE (`scan::marquer_scan_en_cours`), qui pose l'horodatage EN MEME
+    /// TEMPS que le statut. Une annonce ecrite a la main ici reposerait
+    /// `scan_status = "scanning"` sans date, et un scan sans date ne peut etre
+    /// declare perime par personne : un processus tue pendant ce scan
+    /// differerait les mises a jour a vie.
+    ///
+    /// Ce garde regarde l'APPELANT, pas la fonction appelee : c'est
+    /// exactement le defaut « ecrit mais pas branche » qu'il existe pour
+    /// empecher de revenir.
+    #[test]
+    fn le_scan_de_demarrage_annonce_son_etat_par_le_chemin_partage() {
+        let source = include_str!("auto_scan.rs");
+        let corps = source
+            .split("pub fn spawn_auto_scan")
+            .nth(1)
+            .expect("spawn_auto_scan introuvable")
+            .split("\n    scan_done\n}")
+            .next()
+            .expect("fin de spawn_auto_scan introuvable");
+        assert_eq!(
+            corps.matches("marquer_scan_en_cours(").count(),
+            1,
+            "le scan de demarrage annonce son etat par le chemin partage, une seule fois"
+        );
+        let annonce_a_la_main = format!("set({:?}, {:?})", "scan_status", "scanning");
+        assert!(
+            !corps.contains(&annonce_a_la_main),
+            "aucune annonce ecrite a la main dans le scan de demarrage : \
+             elle poserait le statut sans horodatage (#2976)"
+        );
     }
 
     /// Le rapport de scan contient les chemins de l'utilisateur

@@ -24,6 +24,11 @@ const SCAN_GUARD_STALE_SECS: u64 = 12 * 3600;
 /// update restart that would otherwise kill a long scan mid-import (the batches
 /// never persist, so the library stays empty and the scan looks "stuck" — the
 /// user re-triggers it and the next auto-update kills it again).
+///
+/// L'horodatage est EXIGÉ. Sans lui la fenêtre d'ancienneté n'a rien à
+/// mesurer, et le report que ce garde-fou pose n'a plus aucune sortie — il
+/// n'existe même pas de `force` pour le contourner ici, contrairement au
+/// garde-fou de la lecture (#2976).
 fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> bool {
     let settings = SettingsRepo::with_backend(backend.clone());
     let scanning = settings.get("scan_status").ok().flatten().as_deref() == Some("scanning");
@@ -41,9 +46,22 @@ fn scan_in_progress(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBacke
         .unwrap_or(0);
     match started {
         Some(t) => now.saturating_sub(t) < SCAN_GUARD_STALE_SECS,
-        // No/invalid start time recorded: treat as fresh so we err on the side
-        // of protecting the scan rather than killing it.
-        None => true,
+        // Aucun horodatage lisible : ce n'est PAS un scan que ce binaire a
+        // annoncé. Les deux seuls chemins de production qui posent
+        // `scan_status = "scanning"` — le manuel/planifié et celui du
+        // démarrage — passent désormais par `scan::marquer_scan_en_cours`,
+        // qui écrit la date AVANT le statut. Un scan vivant est donc toujours
+        // daté ; « scanning » sans date ne peut plus venir que d'une base
+        // laissée par une version antérieure, c'est-à-dire du cas même que la
+        // fenêtre d'ancienneté existe pour dénouer : un scan mort.
+        //
+        // Le traiter comme frais, ce qu'on faisait, rendait le report
+        // ÉTERNEL : `POST /system/update/install` rendait 409
+        // `scan_in_progress` à chaque tentative, en promettant une reprise
+        // « une fois le scan terminé » que rien ne pouvait déclencher. Une
+        // mise à jour reportée se rattrape à la tentative suivante ; un scan
+        // coupé se relance. L'asymétrie tranche dans ce sens (#2976).
+        None => false,
     }
 }
 
@@ -2442,14 +2460,78 @@ mod scan_guard_tests {
         assert!(scan_in_progress(&b));
     }
 
+    /// Remplace `scanning_without_start_time_blocks_update`, qui épinglait
+    /// l'inverse (« pas de date ⇒ on protège le scan »). La règle a changé,
+    /// délibérément : tant que le scan de démarrage n'horodatait pas, cette
+    /// branche était le SEUL comportement possible pour lui, donc un report
+    /// perpétuel déguisé en prudence. Maintenant que les deux chemins de
+    /// production datent leur annonce (`scan::marquer_scan_en_cours`), un scan
+    /// vivant ne passe plus jamais par ici : ne reste que la base héritée
+    /// d'une version antérieure tuée en plein scan — exactement ce que la
+    /// fenêtre d'ancienneté doit dénouer (#2976).
     #[test]
-    fn scanning_without_start_time_blocks_update() {
-        // Err on the side of protecting the scan when no start time is recorded.
+    fn scanning_without_start_time_no_longer_blocks_update() {
         let b = backend();
         SettingsRepo::with_backend(b.clone())
             .set("scan_status", "scanning")
             .unwrap();
-        assert!(scan_in_progress(&b));
+        assert!(
+            !scan_in_progress(&b),
+            "« scanning » sans horodatage ne peut venir que d'un scan mort : \
+             le bloquer indéfiniment n'a aucune sortie"
+        );
+    }
+
+    /// Même chose pour un horodatage illisible : `parse::<u64>()` échoue, et
+    /// le garde-fou ne doit pas retomber sur un blocage sans issue.
+    #[test]
+    fn scanning_with_unparsable_start_time_does_not_block_update() {
+        let b = backend();
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("scan_status", "scanning").unwrap();
+        s.set("scan_started_at", "2026-08-30T15:42:00Z").unwrap();
+        assert!(!scan_in_progress(&b));
+    }
+
+    /// TÉMOIN. Un scan RÉELLEMENT en cours doit continuer de différer la mise
+    /// à jour. L'annonce est faite par la FONCTION DE PRODUCTION que les deux
+    /// scans appellent, jamais par une transcription : si elle cesse
+    /// d'horodater, ce test tombe.
+    #[test]
+    fn scan_annonce_par_la_production_bloque_la_mise_a_jour() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        assert!(
+            scan_in_progress(&b),
+            "un scan vivant, annoncé par le chemin de production, doit différer la mise à jour"
+        );
+    }
+
+    /// L'autre sens, sur la MÊME annonce de production : passé la fenêtre
+    /// d'ancienneté, le scan ne bloque plus. Avant #2976 le scan de démarrage
+    /// n'était pas daté et ne pouvait donc JAMAIS franchir cette fenêtre.
+    #[test]
+    fn scan_annonce_par_la_production_puis_perime_laisse_passer() {
+        let b = backend();
+        crate::routes::system::scan::marquer_scan_en_cours(&b);
+        let s = SettingsRepo::with_backend(b.clone());
+        let pose: u64 = s
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le chemin de production doit horodater son annonce")
+            .trim()
+            .parse()
+            .expect("l'horodatage doit être un epoch en secondes");
+        assert!(
+            now_secs().saturating_sub(pose) < 60,
+            "l'horodatage posé doit être celui de maintenant"
+        );
+        s.set(
+            "scan_started_at",
+            &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+        )
+        .unwrap();
+        assert!(!scan_in_progress(&b));
     }
 
     #[test]
@@ -2462,6 +2544,102 @@ mod scan_guard_tests {
         let stale = now_secs() - (super::SCAN_GUARD_STALE_SECS + 3600);
         s.set("scan_started_at", &stale.to_string()).unwrap();
         assert!(!scan_in_progress(&b));
+    }
+}
+
+/// Le scan de DÉMARRAGE, éprouvé de bout en bout — c'est lui, et lui seul,
+/// que #2976 laissait indatable.
+///
+/// Le vrai `spawn_auto_scan` est exécuté sur un dossier de musique temporaire.
+/// `ScanStatusGuard` remet `scan_status` à `idle` en fin de tâche, mais il
+/// n'efface PAS `scan_started_at` : la trace que le scan de démarrage a bien
+/// daté son annonce survit à sa terminaison, et se lit donc sans course.
+#[cfg(test)]
+mod scan_de_demarrage_tests {
+    use super::scan_in_progress;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+
+    #[tokio::test]
+    async fn le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable() {
+        // Le dossier doit exister pendant TOUT le scan : le handle est gardé
+        // en vie jusqu'à la fin du test, et il n'est pas dans /tmp partagé.
+        let dossier = tempfile::tempdir().unwrap();
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[dossier.path().to_string_lossy()]).unwrap(),
+            )
+            .unwrap();
+
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let fini = crate::auto_scan::spawn_auto_scan(backend.clone(), bus);
+        for _ in 0..600 {
+            if fini.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            fini.load(Ordering::Acquire),
+            "le scan de démarrage n'a pas terminé"
+        );
+
+        // 1. Le scan de démarrage a DATÉ son annonce. C'est l'écriture qui
+        //    manquait : sans elle tout ce qui suit est indécidable.
+        let pose: u64 = settings
+            .get("scan_started_at")
+            .unwrap()
+            .expect("le scan de démarrage doit poser `scan_started_at` (#2976)")
+            .trim()
+            .parse()
+            .expect("`scan_started_at` doit être un epoch en secondes parseable");
+        let maintenant = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            maintenant.saturating_sub(pose) < 300,
+            "l'horodatage doit être celui de ce scan-ci"
+        );
+
+        // 2. Le processus meurt pendant le scan : `ScanStatusGuard` ne
+        //    s'exécute pas, la base garde « scanning ». C'est l'état exact que
+        //    laisse une coupure de courant ou un `kill -9`.
+        settings.set("scan_status", "scanning").unwrap();
+
+        // TÉMOIN : tant que la fenêtre n'est pas franchie, la mise à jour
+        //    reste différée — la correction ne tue pas un scan vivant.
+        assert!(
+            scan_in_progress(&backend),
+            "un scan de démarrage récent doit continuer de différer la mise à jour"
+        );
+
+        // 3. Treize heures plus tard, le garde-fou le déclare périmé et la
+        //    mise à jour passe. C'est ce que le scan de démarrage ne pouvait
+        //    PAS faire avant #2976, faute de date.
+        settings
+            .set(
+                "scan_started_at",
+                &(pose - (super::SCAN_GUARD_STALE_SECS + 3600)).to_string(),
+            )
+            .unwrap();
+        assert!(
+            !scan_in_progress(&backend),
+            "passé la fenêtre d'ancienneté, un scan de démarrage mort ne doit plus rien bloquer"
+        );
+
+        drop(dossier);
     }
 }
 

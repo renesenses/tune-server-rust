@@ -910,6 +910,41 @@ impl ChiffresDeFinDeScan<'_> {
     }
 }
 
+/// Annonce un scan en cours : l'horodatage PUIS le statut.
+///
+/// Chemin d'annonce UNIQUE, partagé par les trois scans — manuel, planifié et
+/// de démarrage. C'est le défaut de #2976 : le scan de démarrage écrivait
+/// `scan_status = "scanning"` tout seul, sans jamais poser `scan_started_at`.
+/// Le garde-fou de mise à jour (`system::update::scan_in_progress`) borne le
+/// report par une fenêtre d'ancienneté de 12 h, mais cette fenêtre n'a rien à
+/// mesurer sans date : un processus tué pendant le scan de démarrage laissait
+/// « scanning » en base pour toujours et différait les mises à jour à vie, en
+/// promettant une reprise « une fois le scan terminé » d'un scan mort depuis
+/// des semaines.
+///
+/// L'ORDRE des deux écritures n'est pas cosmétique. Le garde-fou lit d'abord
+/// `scan_status` et n'ouvre `scan_started_at` que si le premier vaut
+/// "scanning" : écrire le statut en premier laisserait une fenêtre — courte,
+/// mais réelle — où un scan bien vivant se présente sans date, donc comme
+/// périmé depuis #2976. En posant la date d'abord, « scanning » n'est jamais
+/// observable sans elle.
+///
+/// Si l'écriture de la date échoue, le statut est tout de même posé et le scan
+/// retombera du côté « périmé » du garde-fou : la mise à jour passera et
+/// pourra couper ce scan. C'est le compromis voulu — un scan coupé se relance,
+/// un blocage de mise à jour sans date ne se répare jamais tout seul.
+pub(crate) fn marquer_scan_en_cours(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
+        tracing::warn!(error = %e, "scan_started_at_set_failed");
+    }
+    if let Err(e) = settings.set("scan_status", "scanning") {
+        tracing::warn!(error = %e, "scan_status_set_failed");
+    }
+}
+
 /// Spawn a background library scan (fire-and-forget). Shared by the `/scan`
 /// endpoint and by `add_music_dir`, so a folder added in Settings is scanned
 /// right away instead of only at the next restart (Jean-Pierre: newly-added
@@ -944,13 +979,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(e) = settings.set("scan_status", "scanning") {
-        tracing::warn!(error = %e, "scan_status_set_failed");
-    }
-    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
-        tracing::warn!(error = %e, "scan_started_at_set_failed");
-    }
+    marquer_scan_en_cours(&state.backend);
 
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
