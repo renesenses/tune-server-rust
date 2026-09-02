@@ -53,11 +53,21 @@ const ROUTES_DE_LECTURE: &[&str] = &[
     "/api/v1/dashboard/genre-breakdown",
     "/api/v1/dashboard/listening-history",
     "/api/v1/dashboard/wrapped",
+    // #3039 — « Ajouts récents ». La fenêtre `days` est liée en `$1`, et les
+    // deux requêtes portent `COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(
+    // t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))` plus un
+    // `CAST(SUM(…) AS BIGINT)` : trois formes que SQLite avale sans un mot et
+    // que PostgreSQL refuse dès qu'elles sont mal posées. La fenêtre EXPLICITE
+    // est sondée, pas seulement le défaut — c'est le chemin neuf.
+    "/api/v1/home/recently-added",
+    "/api/v1/home/recently-added?days=30",
+    "/api/v1/home/recently-added/summary",
+    "/api/v1/home/recently-added/summary?days=30",
 ];
 
 /// Plancher du détecteur : une sonde qui ne sonde plus rien doit échouer, pas
 /// réussir (même patron que le garde de #3152).
-const MINIMUM_DE_ROUTES: usize = 12;
+const MINIMUM_DE_ROUTES: usize = 16;
 
 /// Les tables que les routes sondées lisent, vidées avant l'épreuve.
 ///

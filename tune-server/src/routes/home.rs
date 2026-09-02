@@ -24,11 +24,66 @@ struct HomeParams {
     zone_id: Option<i64>,
 }
 
+/// Les parametres d'« Ajoutes recemment » (#3039).
+///
+/// `days` est la nouveaute : la fenetre etait ecrite en dur a 7 jours dans une
+/// fonction SANS argument, si bien que le testeur qui demande « les quinze
+/// derniers jours » ou « le dernier mois » n'avait aucun moyen de l'obtenir.
+#[derive(Deserialize)]
+struct RecentlyAddedParams {
+    limit: Option<i64>,
+    /// Largeur de la fenetre en jours. Absent ⇒ [`FENETRE_JOURS_DEFAUT`].
+    days: Option<i64>,
+}
+
+/// La fenetre servie quand le client n'en demande aucune.
+///
+/// TEMOIN DE NON-REGRESSION : c'est exactement ce que la route rendait avant
+/// #3039. Un client deja deploye qui appelle `/home/recently-added` sans rien
+/// doit voir la meme chose qu'hier ; la valeur ne se change pas sans changer
+/// ce que voient tous les ecrans d'accueil du parc.
+pub(crate) const FENETRE_JOURS_DEFAUT: i64 = 7;
+
+/// Le plafond de la fenetre, en jours : deux ans.
+///
+/// Une fenetre non bornee est une invitation a `?days=100000`, c'est-a-dire a
+/// un balayage de la bibliotheque entiere — et il n'y a AUCUN index sur
+/// `tracks.file_mtime` ni sur `file_first_seen.first_seen_at` (verifie sur les
+/// deux moteurs le 02/09/2026) : le filtre est deja une passe complete sur
+/// `tracks`, que seul le petit nombre de lignes retenues rend supportable.
+/// Au-dela, la vue « ajouts recents » ne veut de toute facon plus rien dire :
+/// c'est la bibliotheque, et la grille des albums triee par date d'ajout la
+/// sert deja avec sa pagination.
+///
+/// Au-dessus, une erreur qui DIT la borne — pas un silence, pas un ecretage
+/// muet qui ferait croire au client que sa demande a ete honoree.
+pub(crate) const FENETRE_JOURS_MAX: i64 = 730;
+
+/// Traduit une largeur de fenetre en borne basse (secondes epoch), ou refuse.
+///
+/// Refuser plutot qu'ecreter : un client qui demande 5 000 jours et recoit
+/// 730 jours de resultats croit avoir tout. Il vaut mieux qu'il l'apprenne.
+fn borne_basse_de_fenetre(days: Option<i64>) -> Result<f64, AppError> {
+    let jours = days.unwrap_or(FENETRE_JOURS_DEFAUT);
+    if !(1..=FENETRE_JOURS_MAX).contains(&jours) {
+        return Err(AppError::bad_request(format!(
+            "days={jours} hors bornes : la fenetre des ajouts recents va de 1 a \
+             {FENETRE_JOURS_MAX} jours (defaut {FENETRE_JOURS_DEFAUT})"
+        )));
+    }
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    Ok(maintenant - (jours as f64) * 24.0 * 3600.0)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(home_page))
         .route("/continue-listening", get(continue_listening))
         .route("/recently-added", get(recently_added))
+        .route("/recently-added/summary", get(recently_added_summary))
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
         .route("/new-in-library", get(new_in_library))
@@ -76,7 +131,9 @@ fn sql_top_genres() -> String {
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // No zone filter for the aggregated home page — show all zones.
     let continue_items = fetch_continue_listening(&state, 10, None)?;
-    let recent_items = fetch_recently_added(&state, 20)?;
+    // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
+    // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
+    let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
     let top_tracks = fetch_top_tracks(&state, 20);
     let radios = fetch_radio_picks(&state)?;
     let discover = fetch_recommendations(&state, 20)?;
@@ -1338,14 +1395,55 @@ mod tests_contextes {
     }
 }
 
-/// Albums added in the last 7 days (by file mtime of tracks).
+/// Les albums entres dans la bibliotheque au cours des `days` derniers jours.
+///
+/// `days` va de 1 a [`FENETRE_JOURS_MAX`], defaut [`FENETRE_JOURS_DEFAUT`] ;
+/// hors bornes, 400 et le message dit la borne (#3039).
+///
+/// La forme de la reponse — un TABLEAU d'albums — ne change pas : les clients
+/// deployes la lisent telle quelle. Les nombres du sous-titre vivent a cote,
+/// dans [`recently_added_summary`].
 async fn recently_added(
     State(state): State<AppState>,
-    Query(p): Query<HomeParams>,
+    Query(p): Query<RecentlyAddedParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
-    let items = fetch_recently_added(&state, limit)?;
+    let depuis = borne_basse_de_fenetre(p.days)?;
+    let items = fetch_recently_added(&state, limit, depuis)?;
     Ok(Json(json!(items)))
+}
+
+/// Le sous-titre de l'onglet : combien d'albums, combien de pistes, combien de
+/// temps, sur la MEME fenetre que [`recently_added`] (#3039).
+///
+/// Route separee, et non un champ de plus dans la reponse ci-dessus : passer
+/// le tableau en objet casserait tout client deja deploye. `limit` n'est pas
+/// lu ici — on compte la fenetre, pas la page.
+async fn recently_added_summary(
+    State(state): State<AppState>,
+    Query(p): Query<RecentlyAddedParams>,
+) -> Result<Json<Value>, AppError> {
+    let depuis = borne_basse_de_fenetre(p.days)?;
+    let engine = state.backend.engine();
+    let sql = home_queries::recently_added_totaux(engine);
+    let params: [&dyn ToSqlValue; 1] = [&depuis];
+    let rows = state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise();
+    let cols = rows.first();
+    let nombre = |i: usize| cols.and_then(|c: &Vec<_>| c.get(i)?.as_i64()).unwrap_or(0);
+    let duree_ms = nombre(2);
+    Ok(Json(json!({
+        "days": p.days.unwrap_or(FENETRE_JOURS_DEFAUT),
+        "album_count": nombre(0),
+        "track_count": nombre(1),
+        "duration_ms": duree_ms,
+        // Les secondes en plus des millisecondes : c'est la seule des trois
+        // valeurs que l'ecran affiche telle quelle (« 5 h 55 min »), et la
+        // division n'a pas a etre refaite par chaque client.
+        "duration_seconds": duree_ms / 1000,
+    })))
 }
 
 /// « Ajoutes recemment ».
@@ -1356,11 +1454,14 @@ async fn recently_added(
 /// `column "ar.name" must appear in the GROUP BY clause or be used in an
 /// aggregate function`, avalee par le `unwrap_or_default()` plus bas. Cette
 /// section-la etait donc vide, elle aussi, sur toute installation PostgreSQL.
-fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+///
+/// `depuis` est la borne basse de la fenetre, en secondes epoch : elle vient
+/// de [`borne_basse_de_fenetre`], qui l'a deja bornee. Elle etait auparavant
+/// recalculee ici a 7 jours en dur, hors d'atteinte de tout appelant (#3039).
+fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    let seven_days_ago = chrono_epoch_seven_days_ago();
     let sql = home_queries::recently_added(engine);
-    let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
+    let params: [&dyn ToSqlValue; 2] = [&depuis, &limit];
     let rows = state
         .backend
         .query_many(&sql, &params)
@@ -1379,19 +1480,15 @@ fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppE
                 "sample_rate": cols.get(7).and_then(|v| v.as_i64()),
                 "bit_depth": cols.get(8).and_then(|v| v.as_i64()),
                 "track_count": cols.get(9).and_then(|v| v.as_i64()),
+                // `added_at`, et non plus `added_mtime` : la valeur n'est plus
+                // un `mtime` de fichier mais la premiere vue par le scan quand
+                // elle existe (#3039). L'ancien nom est conserve a cote le
+                // temps que les clients migrent — il porte la meme valeur.
+                "added_at": cols.get(10).and_then(|v| v.as_f64()),
                 "added_mtime": cols.get(10).and_then(|v| v.as_f64()),
             })
         })
         .collect())
-}
-
-/// Returns epoch seconds for 7 days ago.
-fn chrono_epoch_seven_days_ago() -> f64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    now - (7.0 * 24.0 * 3600.0)
 }
 
 /// Recommendations based on listening history: find most-played genres/artists,

@@ -165,3 +165,8 @@ path = "tests/journal_sondage_hqplayer.rs"
 name = "pg_routes_serveur"
 path = "tests/pg_routes_serveur.rs"
 required-features = ["postgres"]
+
+# Depuis #3039, la fenetre des ajouts recents est un parametre borne.
+[[test]]
+name = "ajouts_recents_fenetre"
+path = "tests/ajouts_recents_fenetre.rs"
