@@ -44,7 +44,19 @@ use super::backend::{DbBackend, ToSqlValue};
 /// s'éteignait dès que l'id changeait (import M3U rejoué, playlist recréée,
 /// bascule SQLite→PostgreSQL). C'est exactement le défaut .18 des albums, sur
 /// un autre type.
-const LOCAL_ITEM_TYPES: [&str; 4] = ["track", "album", "artist", "playlist"];
+///
+/// Les deux sortes de COLLECTION y entrent séparément : leurs espaces
+/// d'identifiants sont indépendants et se recouvrent (l'id 1 est à la fois la
+/// collection normale « favorites » et l'intelligente « Audiophile » sur le
+/// serveur de Bertrand, 02/09/2026). Un type unique les confondrait.
+const LOCAL_ITEM_TYPES: [&str; 6] = [
+    "track",
+    "album",
+    "artist",
+    "playlist",
+    "collection",
+    "smart_collection",
+];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileStats {
@@ -316,6 +328,11 @@ impl FavoritesReconciler {
             "artist" => "SELECT name, '', '' FROM artists WHERE id = ?",
             // Une playlist n'a ni artiste ni chemin : son nom EST son identité.
             "playlist" => "SELECT name, '', '' FROM playlists WHERE id = ?",
+            // Idem pour une collection intelligente, qui vit dans sa table.
+            "smart_collection" => "SELECT name, '', '' FROM smart_collections WHERE id = ?",
+            // La collection NORMALE n'a pas de table : elle est un objet d'un
+            // tableau JSON rangé dans `settings`. Elle se cherche donc ailleurs.
+            "collection" => return self.lookup_collection(item_id),
             _ => return Ok(None),
         };
         let params: [&dyn ToSqlValue; 1] = [&item_id];
@@ -324,6 +341,39 @@ impl FavoritesReconciler {
             artist: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
             path: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
         }))
+    }
+
+    /// Identité d'une collection NORMALE.
+    ///
+    /// Elle n'a pas de table : les collections normales sont un tableau JSON
+    /// rangé dans `settings` sous la clé `collections`. Une requête SQL sur
+    /// `collections` échouerait donc — la table n'existe pas.
+    ///
+    /// Un identifiant absent rend `None`, comme une ligne manquante ailleurs :
+    /// l'appelant sait déjà quoi en faire (il renonce à l'instantané sans que
+    /// le favori soit perdu).
+    fn lookup_collection(&self, item_id: i64) -> Result<Option<Identity>, String> {
+        let Some(brut) = self
+            .db
+            .query_one("SELECT value FROM settings WHERE key = 'collections'", &[])?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+        else {
+            return Ok(None);
+        };
+        let Ok(liste) = serde_json::from_str::<Vec<serde_json::Value>>(&brut) else {
+            // Blob illisible : on ne fige pas d'identité plutôt que d'en
+            // inventer une. Le favori reste acquis.
+            return Ok(None);
+        };
+        Ok(liste
+            .iter()
+            .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(item_id))
+            .and_then(|c| c.get("name").and_then(|v| v.as_str()))
+            .map(|nom| Identity {
+                name: nom.to_string(),
+                artist: String::new(),
+                path: String::new(),
+            }))
     }
 
     /// Identité de secours via l'historique d'écoute : `listen_history` garde
@@ -949,5 +999,101 @@ mod tests {
             .unwrap();
         assert_eq!(row[0].as_string().as_deref(), Some("Kind of Blue"));
         assert_eq!(row[1].as_string().as_deref(), Some("Miles Davis"));
+    }
+    /// 🔴 Les deux sortes de collection ne se confondent PAS.
+    ///
+    /// Leurs espaces d'identifiants sont indépendants et se recouvrent :
+    /// mesuré sur le serveur de Bertrand le 02/09/2026, l'id 1 est à la fois
+    /// la collection normale « favorites » et l'intelligente « Audiophile ».
+    ///
+    /// Avec un `item_type` unique, mettre l'une en favori figerait le nom de
+    /// l'autre — et le cœur se rallumerait sur le mauvais objet après un
+    /// changement d'id. C'est pour cela qu'il y a DEUX types.
+    #[test]
+    fn deux_collections_de_meme_id_gardent_chacune_son_identite() {
+        let db = test_db();
+        db.execute_batch(
+            // Id 900 des deux côtés : les migrations sèment déjà des
+            // collections intelligentes sur les petits identifiants.
+            "INSERT INTO smart_collections (id, name, rules) VALUES (900, 'Audiophile', '[]'); \
+             INSERT INTO settings (key, value) VALUES \
+               ('collections', '[{\"id\":900,\"name\":\"favorites\"}]'); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES \
+               (1, 'collection', 900), (1, 'smart_collection', 900);",
+        )
+        .unwrap();
+
+        let rec = FavoritesReconciler::with_backend(db.clone());
+        rec.snapshot_item("collection", 900);
+        rec.snapshot_item("smart_collection", 900);
+
+        let nom = |t: &str| -> String {
+            let params: [&dyn ToSqlValue; 1] = [&t];
+            db.query_one(
+                "SELECT item_name FROM favorites WHERE item_type = ? AND item_id = 900",
+                &params,
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_string()))
+            .unwrap_or_default()
+        };
+        assert_eq!(nom("collection"), "favorites");
+        assert_eq!(
+            nom("smart_collection"),
+            "Audiophile",
+            "les deux sortes se sont confondues sur l'id 900"
+        );
+    }
+
+    /// Une collection normale n'a pas de table : son nom vit dans un blob JSON
+    /// de `settings`. Une requête SQL sur `collections` échouerait — la table
+    /// n'existe pas.
+    #[test]
+    fn une_collection_absente_du_blob_ne_fige_rien() {
+        let db = test_db();
+        db.execute_batch(
+            "INSERT INTO settings (key, value) VALUES \
+               ('collections', '[{\"id\":7,\"name\":\"Soirée\"}]'); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'collection', 99);",
+        )
+        .unwrap();
+        FavoritesReconciler::with_backend(db.clone()).snapshot_item("collection", 99);
+        let vide = db
+            .query_one(
+                "SELECT item_name FROM favorites WHERE item_type = 'collection' AND item_id = 99",
+                &[],
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_string()))
+            .unwrap_or_default();
+        assert!(
+            vide.is_empty(),
+            "une identité a été inventée pour une collection qui n'existe pas : {vide}"
+        );
+    }
+
+    /// Un blob illisible ne doit ni paniquer ni inventer un nom.
+    #[test]
+    fn un_blob_de_collections_illisible_est_sans_effet() {
+        let db = test_db();
+        db.execute_batch(
+            "INSERT INTO settings (key, value) VALUES ('collections', 'ceci n est pas du JSON'); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'collection', 1);",
+        )
+        .unwrap();
+        FavoritesReconciler::with_backend(db.clone()).snapshot_item("collection", 1);
+        // Le favori reste acquis : c'est l'instantané qui est facultatif.
+        let compte = db
+            .query_one(
+                "SELECT COUNT(*) FROM favorites WHERE item_type = 'collection'",
+                &[],
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        assert_eq!(
+            compte, 1,
+            "le favori a disparu alors que seul l'instantané échouait"
+        );
     }
 }
