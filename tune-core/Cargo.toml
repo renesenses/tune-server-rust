@@ -226,6 +226,20 @@ audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
 name = "famine_anneau_i3205"
 path = "tests/famine_anneau_i3205.rs"
 
+# #3180 : une pochette de plus d un mebioctet n emporte plus le titre et l
+# artiste d un DSF. `autotests = false` ci-dessus — sans cette cible le fichier
+# ne serait JAMAIS compile, et la porte rendrait un vert contre rien.
+[[test]]
+name = "dsf_tag_volumineux_i3180_e7d445"
+path = "tests/dsf_tag_volumineux_i3180_e7d445.rs"
+
+# Meme famille que #2665 / #2890 : abonne `tracing` GLOBAL, donc un binaire a
+# lui seul et UN SEUL test dedans. Il tient les deux bords du journal du lecteur
+# de tag DSF — un tag ecarte nomme son motif, un fichier ordinaire se tait.
+[[test]]
+name = "journal_dsf_tag_ecarte_i3180_e7d445"
+path = "tests/journal_dsf_tag_ecarte_i3180_e7d445.rs"
+
 [build-dependencies]
 cc = "1"
 
