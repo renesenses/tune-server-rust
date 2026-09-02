@@ -3,6 +3,8 @@
 //! Ces modules utilisent des bases et routeurs isolés ; ils peuvent donc
 //! partager un binaire de tests sans partager leurs données.
 
+#[path = "adresse_du_flux_reservee_au_navigateur.rs"]
+mod adresse_du_flux_reservee_au_navigateur;
 #[path = "albums_pas_des_doublons.rs"]
 mod albums_pas_des_doublons;
 #[path = "annonce_forum_bornes.rs"]

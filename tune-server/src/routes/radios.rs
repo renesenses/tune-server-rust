@@ -845,6 +845,17 @@ async fn play_radio(
 
     repo.record_play(id).ok();
 
+    // #3164 — meme regle que les charges utiles de zone : cette reponse rendait
+    // `PlayResult::stream_url`, rempli pour TOUTES les zones, a un client web
+    // qui n'a le droit de l'ouvrir que sur une zone navigateur.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    let stream_url = stream_url
+        .filter(|_| crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref()));
+
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!({
         "zone_id": zone_id,

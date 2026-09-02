@@ -258,15 +258,6 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
         crate::routes::zones::inject_session_context(obj, &zone_state);
     }
-    // Include stream_url ONLY for browser playback zones, so the web client can
-    // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
-    // / AirPlay / SlimProto / local), an open web-client tab that fetched this URL
-    // would consume the SAME single-consumer stream (streamer.rs mpsc) as the
-    // renderer and starve it — playback stalled or skipped after a few tracks
-    // until the tab was closed (forum: eric, #954; matches "close the tab and the
-    // sound comes back").
-    let is_browser_zone =
-        zone_db.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
     // Où va le son — même champ que GET /zones et GET /zones/{id} (#1499).
     if let Some(ref zone) = zone_db {
         v.as_object_mut().unwrap().insert(
@@ -287,34 +278,20 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             ),
         );
     }
-    if is_browser_zone {
-        if let Some(ref np) = zone_state.now_playing {
-            if let Some(ref stream_id) = np.stream_id {
-                let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                    tune_core::discovery::ssdp::get_local_ip()
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "127.0.0.1".into())
-                });
-                let ext = "flac";
-                let stream_url = format!(
-                    "http://{}:{}/stream/{}.{}",
-                    server_ip, state.port, stream_id, ext
-                );
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("stream_url".into(), json!(stream_url));
-                // Adresse joignable de l'exterieur, quand le pont est actif.
-                if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                    state.backend.clone(),
-                    stream_id,
-                    ext,
-                ) {
-                    v.as_object_mut()
-                        .unwrap()
-                        .insert("stream_url_remote".into(), json!(distant));
-                }
-            }
-        }
+    // #3164 — la règle vit maintenant dans
+    // `zones::zone_recoit_l_adresse_du_flux`, et `inject_stream_url` est le
+    // seul chemin qui pose l'adresse. Elle n'était appliquée QU'ICI ; les
+    // quatre autres surfaces la recopiaient en commentaire sans la poser.
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_stream_url(
+            obj,
+            state,
+            zone_db.as_ref().and_then(|z| z.output_type.as_deref()),
+            zone_state
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref()),
+        );
     }
     // Include signal_path (the bit-perfect indicator) so the play / next /
     // previous / resume responses carry it, matching GET /zones/{id}. Without
@@ -381,8 +358,20 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     zone.as_object_mut()
         .unwrap()
         .insert("output_sent".into(), json!(result.output_sent));
-    // Expose stream_url for browser playback zones
-    if let Some(ref url) = result.stream_url {
+    // #3164 — `PlayResult::stream_url` vaut `Some(resolved.url)` pour TOUTES
+    // les zones : c'est l'adresse que le renderer va consommer. Sans le filtre,
+    // cet `insert` ÉCRASAIT la décision de `build_zone_json` juste au-dessus et
+    // rendait l'adresse aux vingt routes de lecture qui passent par ici
+    // (`play`, `next`, `previous`, `resume`, `queue/jump`, `pins/{i}/invoke`…)
+    // — c'est-à-dire au chemin le plus fréquenté du client web.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    if crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref())
+        && let Some(ref url) = result.stream_url
+    {
         zone.as_object_mut()
             .unwrap()
             .insert("stream_url".into(), json!(url));
@@ -713,32 +702,23 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
             }
         }
     }
-    // Expose stream_url for browser playback zones
-    if let Some(ref np) = zone_state.now_playing {
-        if let Some(ref stream_id) = np.stream_id {
-            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                tune_core::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into())
-            });
-            let ext = "flac"; // default extension
-            let stream_url = format!(
-                "http://{}:{}/stream/{}.{}",
-                server_ip, state.port, stream_id, ext
-            );
-            v.as_object_mut()
-                .unwrap()
-                .insert("stream_url".into(), json!(stream_url));
-            if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                state.backend.clone(),
-                stream_id,
-                ext,
-            ) {
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("stream_url_remote".into(), json!(distant));
-            }
-        }
+    // #3164 — « la surface que les clients interrogent en boucle » (#1274)
+    // publiait l'adresse du flux sans regarder le type de sortie.
+    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    if let Some(obj) = v.as_object_mut() {
+        crate::routes::zones::inject_stream_url(
+            obj,
+            &state,
+            output_type.as_deref(),
+            zone_state
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref()),
+        );
     }
     // #1274 — cette charge utile est la sérialisation brute de
     // `PlaybackState`, qui ne porte que le volume linéaire ; le dB s'ajoute

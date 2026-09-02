@@ -928,6 +928,71 @@ pub(crate) fn inject_session_context(obj: &mut serde_json::Map<String, Value>, p
     );
 }
 
+/// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.
+///
+/// `/stream/{id}` n'admet qu'UN consommateur (`streamer.rs`, un canal mpsc) :
+/// une seconde connexion sur la même session fait `break` sur la première. La
+/// coupure est propre — un `EOF`, et la sortie journalise
+/// `local_audio_stream_eof` — mais elle ARRÊTE la lecture en cours.
+///
+/// Publier cette adresse à une zone dont la sortie n'est PAS l'onglet, c'est
+/// donc donner à cet onglet de quoi voler le flux au renderer (DLNA /
+/// Chromecast / AirPlay / SlimProto / local). C'est le défaut d'eric (#954) :
+/// « je ferme l'onglet et le son revient ».
+///
+/// Une zone `browser` la reçoit : là, l'onglet EST la sortie, et le client web
+/// branche son `<audio>` dessus (`stores/zones.ts`, `handleBrowserPlayback`).
+///
+/// #3164 — cette règle était ÉCRITE cinq fois et POSÉE une seule
+/// (`build_zone_json`). `GET /zones`, `GET /zones/{id}`,
+/// `GET /zones/{id}/status`, les vingt routes de lecture qui passent par
+/// `build_zone_json_with_result` et `POST /radios/{id}/play/{zone_id}`
+/// publiaient l'adresse à tout le monde. Elle vit désormais ici, et
+/// [`inject_stream_url`] est le seul chemin qui la pose.
+pub fn zone_recoit_l_adresse_du_flux(output_type: Option<&str>) -> bool {
+    output_type == Some("browser")
+}
+
+/// Pose `stream_url` (et `stream_url_remote`, quand le pont est actif) sur la
+/// charge utile d'une zone — ou ne pose RIEN quand
+/// [`zone_recoit_l_adresse_du_flux`] le refuse.
+///
+/// Rend `true` quand l'adresse a été publiée, pour que l'appelant puisse le
+/// dire sans relire la charge utile.
+pub(crate) fn inject_stream_url(
+    obj: &mut serde_json::Map<String, Value>,
+    state: &AppState,
+    output_type: Option<&str>,
+    stream_id: Option<&str>,
+) -> bool {
+    if !zone_recoit_l_adresse_du_flux(output_type) {
+        return false;
+    }
+    let Some(stream_id) = stream_id else {
+        return false;
+    };
+    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+        tune_core::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into())
+    });
+    const EXT: &str = "flac";
+    obj.insert(
+        "stream_url".into(),
+        json!(format!(
+            "http://{}:{}/stream/{}.{}",
+            server_ip, state.port, stream_id, EXT
+        )),
+    );
+    // Adresse joignable de l'exterieur, quand le pont est actif.
+    if let Some(distant) =
+        crate::routes::stream_handler::stream_url_distant(state.backend.clone(), stream_id, EXT)
+    {
+        obj.insert("stream_url_remote".into(), json!(distant));
+    }
+    true
+}
+
 /// Délai au-delà duquel une zone navigateur qui « joue » sans que personne ne
 /// tire son flux n'est plus un démarrage lent mais un silence.
 ///
@@ -2387,29 +2452,17 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "output_capabilities".into(),
                 json!(output_capabilities(&state, z.output_device_id.as_deref()).await),
             );
-            // Include stream_url for browser playback zones so the web client
-            // can feed it to an HTML5 <audio> element.
-            if let Some(ref np) = ps.now_playing {
-                if let Some(ref stream_id) = np.stream_id {
-                    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                        tune_core::discovery::ssdp::get_local_ip()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_else(|| "127.0.0.1".into())
-                    });
-                    let stream_url = format!(
-                        "http://{}:{}/stream/{}.flac",
-                        server_ip, state.port, stream_id
-                    );
-                    obj.insert("stream_url".into(), json!(stream_url));
-                    if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                        state.backend.clone(),
-                        stream_id,
-                        "flac",
-                    ) {
-                        obj.insert("stream_url_remote".into(), json!(distant));
-                    }
-                }
-            }
+            // #3164 — l'adresse du flux ne se publie QUE pour une zone
+            // navigateur. Ce site-ci la rendait à toutes : un onglet ouvert sur
+            // la liste des zones tenait de quoi couper la lecture d'un renderer.
+            inject_stream_url(
+                obj,
+                &state,
+                z.output_type.as_deref(),
+                ps.now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref()),
+            );
         }
         result.push(v);
     }
@@ -2557,29 +2610,16 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "output_capabilities".into(),
                     json!(output_capabilities(&state, zone.output_device_id.as_deref()).await),
                 );
-                // Include stream_url for browser playback zones so the web client
-                // can feed it to an HTML5 <audio> element.
-                if let Some(ref np) = ps.now_playing {
-                    if let Some(ref stream_id) = np.stream_id {
-                        let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                            tune_core::discovery::ssdp::get_local_ip()
-                                .map(|ip| ip.to_string())
-                                .unwrap_or_else(|| "127.0.0.1".into())
-                        });
-                        let stream_url = format!(
-                            "http://{}:{}/stream/{}.flac",
-                            server_ip, state.port, stream_id
-                        );
-                        obj.insert("stream_url".into(), json!(stream_url));
-                        if let Some(distant) = crate::routes::stream_handler::stream_url_distant(
-                            state.backend.clone(),
-                            stream_id,
-                            "flac",
-                        ) {
-                            obj.insert("stream_url_remote".into(), json!(distant));
-                        }
-                    }
-                }
+                // #3164 — même règle que la liste, et le même trou : la fiche
+                // d'une zone DLNA rendait l'adresse de son flux au client web.
+                inject_stream_url(
+                    obj,
+                    &state,
+                    zone.output_type.as_deref(),
+                    ps.now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref()),
+                );
             }
             Json(v).into_response()
         }
