@@ -165,6 +165,64 @@ async fn list_collections(
                         .unwrap_or(0)
                 );
             }
+
+            // Pochettes de la mosaïque — quatre au plus, DISTINCTES.
+            //
+            // Une collection intelligente n'a pas de table d'appartenance :
+            // c'est une RÈGLE, évaluée à la demande. On ne peut donc pas
+            // joindre ses pochettes d'un coup comme pour une playlist ; il faut
+            // rejouer sa requête. C'est déjà ce que font les deux comptages
+            // ci-dessus — une troisième requête s'inscrit dans le même modèle
+            // et ne change pas la nature de cette route.
+            //
+            // `HAVING` plutôt qu'un `AND` ajouté à `{where_clause}` : cette
+            // clause est TANTÔT VIDE, tantôt un `WHERE …`. Y coller un `AND`
+            // produirait « ... AND al.cover_path ... » sans `WHERE` sur une
+            // collection sans règle, donc une erreur SQL sur le cas le plus
+            // banal.
+            //
+            // Ordre par `MIN(al.title)` : déterministe, donc la mosaïque ne
+            // change pas d'un rafraîchissement à l'autre. Ce n'est PAS le tri
+            // propre de la collection — une vignette de quatre cases n'est pas
+            // un aperçu du classement, et rejouer le tri complet ici coûterait
+            // une jointure de plus pour un gain invisible.
+            // Groupe sur l'ALBUM — artiste + titre, insensibles a la casse — et
+            // non sur le chemin de la pochette.
+            //
+            // Un coffret est stocke comme PLUSIEURS albums, chacun avec son
+            // propre fichier de pochette en cache : quatre chemins differents,
+            // une seule image. Groupe sur le chemin, les quatre disques
+            // remplissaient la mosaique a eux seuls — vecu sur la collection
+            // « Classique » de Bertrand, coffret Gorecki « A Nonesuch
+            // Retrospective » (02/09/2026).
+            //
+            // On demande DOUZE groupes pour n'en garder que quatre : deux
+            // albums distincts peuvent partager un chemin (une compilation et
+            // sa reedition), et sans marge la mosaique tomberait a trois.
+            let covers_sql = format!(
+                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
+                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                 ORDER BY t LIMIT 12"
+            );
+            let mut covers: Vec<String> = Vec::new();
+            if let Ok(rs) = state.backend.query_many(&covers_sql, &[]) {
+                for r in &rs {
+                    let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                        continue;
+                    };
+                    if covers.len() == 4 {
+                        break;
+                    }
+                    if !covers.iter().any(|x| x == &c) {
+                        covers.push(c);
+                    }
+                }
+            }
+            col["covers"] = json!(covers);
+
             col
         })
         .collect();
@@ -997,6 +1055,145 @@ mod tests {
     /// celui de `tune-core/library/smart_collections.rs`) → SQL exécuté sur une
     /// bibliothèque témoin. Un test qui se contenterait de comparer la chaîne
     /// de règles ne dirait rien de ce que l'utilisateur voit.
+    /// La requete des pochettes doit tenir avec une clause vide.
+    ///
+    /// `where_clause` est TANTOT vide, tantot un `WHERE …`. Y coller un `AND`
+    /// pour ecarter les pochettes nulles ne produit PAS une erreur de syntaxe,
+    /// et c'est bien pire : sans `WHERE`, le `AND` s'attache au `ON` du
+    /// `LEFT JOIN`. La condition cesse alors de FILTRER pour devenir une
+    /// condition de jointure — un album sans pochette reste dans le resultat,
+    /// avec un groupe NULL qui mange une des quatre cases.
+    ///
+    /// ⚠️ Ma premiere version de ce test ne l'attrapait pas : l'album sans
+    /// pochette s'appelait « sans » et triait donc APRES les quatre autres, si
+    /// bien que `LIMIT 4` le laissait dehors de toute facon. Il s'appelle
+    /// desormais « a0_… » et trie EN PREMIER : la variante fautive lui donne
+    /// une case, celle-ci non.
+    #[test]
+    fn les_pochettes_sortent_distinctes_et_plafonnees_a_quatre() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // Six albums, dont DEUX partageant la pochette « A » : elle ne doit
+        // occuper qu'une seule case.
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1,'Un'),(2,'Deux'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (1,'a1',1,'A'),(2,'a2',2,'A'),(3,'b',1,'B'),(4,'c',1,'C'), \
+               (5,'d',1,'D'),(6,'e',1,'E'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (7,'a0_sans_pochette',1,NULL);",
+        )
+        .unwrap();
+
+        let requete = |where_clause: &str| -> Vec<String> {
+            // La requete de production, mot pour mot.
+            let sql = format!(
+                "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause} \
+                 GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                 HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                 ORDER BY t LIMIT 12"
+            );
+            let mut out: Vec<String> = Vec::new();
+            for r in &db.query_many(&sql, &[]).unwrap() {
+                let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                    continue;
+                };
+                if out.len() == 4 {
+                    break;
+                }
+                if !out.iter().any(|x| x == &c) {
+                    out.push(c);
+                }
+            }
+            out
+        };
+
+        // Clause VIDE — une collection sans regle. C'est le cas qui casserait
+        // avec un `AND` accole.
+        assert_eq!(
+            requete(""),
+            vec!["A", "B", "C", "D"],
+            "sans regle : quatre pochettes distinctes, la nulle ecartee"
+        );
+
+        // Clause NON vide — le cas courant.
+        assert_eq!(
+            requete("WHERE al.title <> 'a1'"),
+            vec!["A", "B", "C", "D"],
+            "avec regle : « A » survit par son second album, la nulle reste ecartee"
+        );
+
+        // Et le plafond mord vraiment : sans LIMIT on en aurait cinq.
+        let sans_plafond = db
+            .query_many(
+                "SELECT al.cover_path FROM albums al GROUP BY al.cover_path \
+                 HAVING al.cover_path IS NOT NULL AND al.cover_path <> ''",
+                &[],
+            )
+            .unwrap()
+            .len();
+        assert_eq!(sans_plafond, 5, "cinq pochettes distinctes en base");
+    }
+
+    /// Un COFFRET ne remplit pas la mosaique a lui seul.
+    ///
+    /// Quatre disques du meme coffret = quatre ALBUMS, chacun avec son propre
+    /// fichier de pochette en cache. Quatre chemins differents, une seule
+    /// image. Groupe sur le chemin, ils prenaient les quatre cases — vecu sur
+    /// la collection « Classique » de Bertrand (02/09/2026).
+    #[test]
+    fn un_coffret_ne_prend_qu_une_case_dans_une_collection() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1,'Gorecki'),(2,'Autre'); \
+             INSERT INTO albums (id, title, artist_id, cover_path) VALUES \
+               (1,'A Nonesuch Retrospective',1,'C1'), \
+               (2,'A Nonesuch Retrospective',1,'C2'), \
+               (3,'a nonesuch retrospective',1,'C3'), \
+               (4,'A Nonesuch Retrospective',1,'C4'), \
+               (5,'Zeta',2,'D'),(6,'Zeta Deux',2,'E');",
+        )
+        .unwrap();
+
+        let sql = "SELECT MIN(al.cover_path) AS cover, MIN(al.title) AS t FROM albums al \
+                   LEFT JOIN artists ar ON al.artist_id = ar.id \
+                   LEFT JOIN tracks t ON t.album_id = al.id \
+                   GROUP BY LOWER(COALESCE(ar.name, '')), LOWER(COALESCE(al.title, '')) \
+                   HAVING MIN(al.cover_path) IS NOT NULL AND MIN(al.cover_path) <> '' \
+                   ORDER BY t LIMIT 12";
+        let mut out: Vec<String> = Vec::new();
+        for r in &db.query_many(sql, &[]).unwrap() {
+            let Some(c) = r.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            if out.len() == 4 {
+                break;
+            }
+            if !out.iter().any(|x| x == &c) {
+                out.push(c);
+            }
+        }
+        assert_eq!(
+            out.len(),
+            3,
+            "le coffret ne doit compter que pour UNE case : {out:?}"
+        );
+        assert!(
+            out.contains(&"D".to_string()) && out.contains(&"E".to_string()),
+            "les deux autres albums doivent y figurer : {out:?}"
+        );
+    }
+
     #[test]
     fn le_prereglage_world_music_ne_ramasse_plus_folk_metal_ni_folk_rock() {
         use tune_core::db::backend::DbBackend;

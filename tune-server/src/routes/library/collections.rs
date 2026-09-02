@@ -72,14 +72,143 @@ pub(super) struct CollectionAlbumsQuery {
     sort: Option<String>,
 }
 
+/// Au plus quatre pochettes par collection : la mosaïque du client en compte
+/// quatre, en chercher davantage serait du trafic pour rien.
+const POCHETTES_MAX: usize = 4;
+
+/// Garde-fou sur la requête : une collection peut porter des milliers d'albums,
+/// et on n'a besoin que des premiers de CHACUNE. On ne demande donc jamais plus
+/// que ce plafond d'identifiants, toutes collections confondues.
+const POCHETTES_IDS_MAX: usize = 600;
+
+/// Combien d'albums lire par collection pour y trouver quatre pochettes
+/// DISTINCTES.
+///
+/// Seize fois la cible, et non quatre : un album peut n'avoir aucune pochette —
+/// il ne consomme alors pas de case mais bien une place dans cette fenêtre — et
+/// plusieurs albums d'une même édition partagent la leur. Une fenêtre trop
+/// courte rendrait deux ou trois pochettes là où la collection en a dix, sans
+/// que rien ne le signale : la mosaïque cyclerait, ce qui reste crédible à
+/// l'œil.
+///
+/// Ce n'est pas une garantie. Une collection dont les soixante-quatre premiers
+/// albums partagent trois pochettes en montrera trois — « si possible », a dit
+/// Bertrand, et c'est bien la limite du possible sans lire la collection
+/// entière.
+const POCHETTES_FENETRE: usize = POCHETTES_MAX * 16;
+
 pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let data = settings
+    let mut data = settings
         .get("collections")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
         .unwrap_or_default();
+
+    // Pochettes de mosaïque, jointes ICI plutôt que réclamées album par album.
+    //
+    // Le nouveau client dessine la pochette d'une collection comme une mosaïque
+    // des pochettes qu'elle contient. La collection ne porte que des
+    // `album_ids` : sans ce champ, le client irait chercher chaque album un par
+    // un, pour n'en garder que quatre.
+    //
+    // UNE SEULE requête pour toutes les collections : on rassemble les premiers
+    // identifiants de chacune, on lit leurs pochettes d'un coup, puis on
+    // recompose en respectant l'ordre PROPRE à chaque collection.
+    //
+    // Champ ADDITIF : `covers` s'ajoute, rien n'est retiré. Un client qui
+    // l'ignore ne voit aucune différence.
+    let mut voulus: Vec<i64> = Vec::new();
+    for c in &data {
+        if let Some(ids) = c.get("album_ids").and_then(|v| v.as_array()) {
+            // Fenêtre large : voir `POCHETTES_FENETRE`.
+            for id in ids
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .take(POCHETTES_FENETRE)
+            {
+                if voulus.len() >= POCHETTES_IDS_MAX {
+                    break;
+                }
+                if !voulus.contains(&id) {
+                    voulus.push(id);
+                }
+            }
+        }
+    }
+
+    // id -> (chemin de pochette, cle d'ALBUM : artiste + titre)
+    let mut par_album: std::collections::HashMap<i64, (String, String)> =
+        std::collections::HashMap::new();
+    if !voulus.is_empty() {
+        // Les identifiants viennent de `as_i64` : ce sont des entiers, jamais du
+        // texte. Les insérer directement ne peut donc pas porter d'injection, et
+        // évite d'avoir à lier un nombre variable de paramètres.
+        let liste = voulus
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            // Artiste et titre en DEUX colonnes : la clé se compose côté Rust.
+            // Les concaténer en SQL demanderait un séparateur, donc un caractère
+            // de contrôle échappé — et `\u{{…}}` est lu au lexage, avant
+            // `format!`, ce qui ne compile pas.
+            "SELECT al.id, al.cover_path, LOWER(COALESCE(ar.name, '')) AS artiste, \
+             LOWER(COALESCE(al.title, '')) AS titre \
+             FROM albums al LEFT JOIN artists ar ON ar.id = al.artist_id \
+             WHERE al.id IN ({liste}) \
+             AND al.cover_path IS NOT NULL AND al.cover_path <> ''"
+        );
+        if let Ok(rows) = state.backend.query_many(&sql, &[]) {
+            for r in &rows {
+                if let (Some(id), Some(c), Some(a), Some(t)) = (
+                    r.first().and_then(|v| v.as_i64()),
+                    r.get(1).and_then(|v| v.as_string()),
+                    r.get(2).and_then(|v| v.as_string()),
+                    r.get(3).and_then(|v| v.as_string()),
+                ) {
+                    // Séparateur non imprimable : aucun nom ne le contient, donc
+                    // « A » + « BC » ne peut pas se confondre avec « AB » + « C ».
+                    par_album.insert(id, (c, format!("{a}\u{1f}{t}")));
+                }
+            }
+        }
+    }
+
+    for c in &mut data {
+        let mut vues: Vec<String> = Vec::new();
+        let mut cles: Vec<String> = Vec::new();
+        if let Some(ids) = c.get("album_ids").and_then(|v| v.as_array()) {
+            for id in ids.iter().filter_map(|v| v.as_i64()) {
+                let Some((cover, cle)) = par_album.get(&id) else {
+                    continue;
+                };
+                // Dédoublonnage sur l'ALBUM d'abord : un coffret est stocké
+                // comme plusieurs albums, chacun avec son propre fichier de
+                // pochette en cache — quatre chemins, une seule image (coffret
+                // Górecki, collection « Classique », 02/09/2026).
+                if cles.iter().any(|k| k == cle) {
+                    continue;
+                }
+                // Puis sur le CHEMIN : deux albums distincts peuvent malgré
+                // tout partager une pochette.
+                if vues.iter().any(|v| v == cover) {
+                    continue;
+                }
+                cles.push(cle.clone());
+                vues.push(cover.clone());
+                if vues.len() == POCHETTES_MAX {
+                    break;
+                }
+            }
+        }
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("covers".to_string(), json!(vues));
+        }
+    }
+
     Json(json!(data))
 }
 
