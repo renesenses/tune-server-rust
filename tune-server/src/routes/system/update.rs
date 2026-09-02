@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -79,6 +81,100 @@ async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -
         .await
         .iter()
         .any(|z| z.state == tune_core::playback::PlayState::Playing)
+}
+
+/// Les zones qui jouent, par identifiant. Sert uniquement à nommer dans le
+/// journal ce qui retient la relance : le 30 août, `update_restarting` est
+/// tombé 24 s après le début d'un morceau et rien, dans le journal, ne disait
+/// ce que le chemin de mise à jour avait regardé (#2954).
+async fn playing_zone_ids(playback: &tune_core::playback::PlaybackManager) -> Vec<i64> {
+    playback
+        .all_states()
+        .await
+        .iter()
+        .filter(|z| z.state == tune_core::playback::PlayState::Playing)
+        .map(|z| z.zone_id)
+        .collect()
+}
+
+/// Plafond du report de la relance. Passé ce délai on relance MALGRÉ une zone
+/// annoncée en lecture.
+///
+/// Il faut une sortie, sans quoi une zone oubliée bloque les mises à jour pour
+/// toujours — et #3155 a établi qu'aucun détecteur ne rattrape une zone locale
+/// figée : une zone peut rester `Playing` en mémoire indéfiniment sans qu'un
+/// seul échantillon sorte. Deux heures couvrent un album ou une œuvre longue
+/// d'un bout à l'autre ; au-delà, une zone qui « joue » encore est plus
+/// probablement une zone figée sans auditeur qu'une session réelle, et la mise
+/// à jour reprend la main.
+const RESTART_DEFERRAL_MAX: Duration = Duration::from_secs(2 * 3600);
+
+/// Cadence de relecture de l'état de lecture pendant le report. Une lecture de
+/// l'état en mémoire (un verrou, une `HashMap`) toutes les 5 s : le coût est
+/// nul pour la lecture en cours, et la relance suit la fin du morceau à 5 s
+/// près.
+const RESTART_DEFERRAL_POLL: Duration = Duration::from_secs(5);
+
+/// Comment le report de la relance s'est terminé.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRelease {
+    /// Rien ne jouait : la relance part sans attendre.
+    Idle,
+    /// Une lecture était en cours et s'est arrêtée d'elle-même.
+    PlaybackEnded(Duration),
+    /// Le plafond a expiré, la zone annonce toujours une lecture, on relance.
+    WindowExpired(Duration),
+}
+
+/// Retient la relance tant qu'une zone joue — bornée par
+/// [`RESTART_DEFERRAL_MAX`].
+///
+/// **C'est ici que se joue le défaut de #2954, pas au garde-fou d'entrée.** Le
+/// garde-fou de `update_install` consulte l'état de lecture UNE fois, à la
+/// réception de la requête, avant un téléchargement de 38 Mo — et un appelant
+/// qui passe `?force=true` le saute entièrement. Or ce que la requête autorise,
+/// c'est de télécharger et d'installer : deux actes inaudibles. Ce qui coupe le
+/// son, c'est l'échange d'image (`execv`), plusieurs secondes ou plusieurs
+/// minutes plus tard, et il ne consultait rien du tout. Le 30 août la lecture a
+/// démarré à 15:42:00 et `update_reexec` est tombé à 15:42:24 sans qu'une seule
+/// ligne dise ce qui avait été regardé.
+///
+/// Le report est donc posé au dernier instant utile, et il ne dépend PAS de
+/// `force` : l'utilisateur averti que « la musique va s'arrêter » a été averti
+/// d'un état de lecture qui datait de sa requête, pas de celui de la relance.
+/// Le binaire est déjà remplacé sur le disque quand on arrive ici — la mise à
+/// jour est acquise, même si le processus meurt pendant l'attente, la prochaine
+/// ouverture démarre la nouvelle version. Seul l'échange d'image attend.
+///
+/// Une zone en PAUSE ne retient rien : `playback_in_progress` ne compte que
+/// `PlayState::Playing`, exactement comme le frein de repos du poller depuis
+/// #3120. Les deux chemins disent la même chose de « actif ».
+async fn defer_restart_until_quiet(
+    playback: &tune_core::playback::PlaybackManager,
+    max: Duration,
+    poll: Duration,
+) -> RestartRelease {
+    if !playback_in_progress(playback).await {
+        return RestartRelease::Idle;
+    }
+    let zones = playing_zone_ids(playback).await;
+    warn!(
+        zones = ?zones,
+        max_secs = max.as_secs(),
+        "update_restart_deferred_playback"
+    );
+    let started = tokio::time::Instant::now();
+    loop {
+        let waited = started.elapsed();
+        if waited >= max {
+            return RestartRelease::WindowExpired(waited);
+        }
+        // Le dernier pas est rogné pour atterrir exactement sur le plafond.
+        tokio::time::sleep(poll.min(max - waited)).await;
+        if !playback_in_progress(playback).await {
+            return RestartRelease::PlaybackEnded(started.elapsed());
+        }
+    }
 }
 
 /// Can we actually create a file in `dir`? Permission *bits* are not the
@@ -730,15 +826,38 @@ pub(super) async fn update_check() -> Json<Value> {
 /// cycle in the background and returns immediately.  Progress is exposed via
 /// `GET /system/update/status` (`phase` field).
 ///
-/// `?force=true` overrides the deferral guards that exist to protect work in
-/// progress (currently: playback). The UI sets it on the install button, which
-/// sits directly under the warning that playback will stop.
+/// `?force=true` overrides the *request-time* deferral guard that protects work
+/// in progress (currently: playback). The UI sets it on the install button,
+/// which sits directly under the warning that playback will stop. It does NOT
+/// override the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
 ) -> impl IntoResponse {
     let force = params.force.unwrap_or(false);
+
+    // Journaliser l'entrée AVANT tout garde-fou. Sur l'incident du 30 août
+    // (#2954), le journal montrait `update_download_starting` puis
+    // `update_restarting` 4 s plus tard, et rien ne permettait de départager
+    // « le garde-fou a été court-circuité par `force` » de « le garde-fou a
+    // regardé un état de lecture qui disait autre chose ». Les deux pistes
+    // étaient strictement indiscernables sur le journal du testeur. Ces trois
+    // champs — l'intention de l'appelant, son identité, et ce que le serveur
+    // voyait de la lecture au même instant — rendent le prochain signalement
+    // imputable sans témoin.
+    let origin = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let playing = playing_zone_ids(&state.playback).await;
+    info!(
+        force,
+        origin = %origin,
+        playing_zones = ?playing,
+        "update_install_requested"
+    );
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
@@ -859,12 +978,19 @@ pub(super) async fn update_install(
             .into_response();
     }
 
-    // Guard: don't restart while music is playing. The restart re-execs the
-    // process, which kills every output mid-stream — and says so nowhere, so
-    // the listener just hears the music cut out (#1462). An update that lands
-    // after the album is worth more than one that interrupts it.
-    if !force && playback_in_progress(&state.playback).await {
-        warn!("update_deferred_playback_in_progress");
+    // Guard: don't even DOWNLOAD while music is playing. The restart re-execs
+    // the process, which kills every output mid-stream — and says so nowhere,
+    // so the listener just hears the music cut out (#1462). An update that
+    // lands after the album is worth more than one that interrupts it.
+    //
+    // Ce garde-fou-ci ne protège plus le son à lui seul : il consulte l'état de
+    // lecture à la RÉCEPTION de la requête, et `force` le saute. C'est
+    // `defer_restart_until_quiet` qui tient l'échange d'image (#2954). Ce qu'il
+    // évite encore, et qui vaut d'être gardé : 38 Mo tirés du réseau pendant
+    // qu'une zone joue — la contention est exactement le terrain des coupures
+    // signalées dans le même fil (#2952).
+    if !force && !playing.is_empty() {
+        warn!(zones = ?playing, "update_deferred_playback_in_progress");
         return (
             StatusCode::CONFLICT,
             Json(json!({
@@ -916,6 +1042,8 @@ pub(super) async fn update_install(
         version = %release.version,
         asset = %asset.name,
         size = asset.size,
+        force,
+        playing_zones = ?playing,
         "update_download_starting"
     );
 
@@ -1155,6 +1283,41 @@ pub(super) async fn update_install(
         );
 
         // --- Restart ---
+        //
+        // Le nouveau binaire est en place sur le disque : la mise à jour est
+        // acquise. Il ne reste que l'échange d'image, et c'est LUI, et lui
+        // seul, qui coupe le son. On ne le fait pas au milieu d'un morceau
+        // (#2954) — pas même quand la requête portait `force`, qui décrivait
+        // l'état de lecture d'il y a un téléchargement. Borné par
+        // `RESTART_DEFERRAL_MAX` pour qu'une zone oubliée en lecture ne bloque
+        // pas les mises à jour à vie.
+        if playback_in_progress(&state.playback).await {
+            set_phase("restart_pending_playback");
+        }
+        match defer_restart_until_quiet(
+            &state.playback,
+            RESTART_DEFERRAL_MAX,
+            RESTART_DEFERRAL_POLL,
+        )
+        .await
+        {
+            RestartRelease::Idle => {}
+            RestartRelease::PlaybackEnded(waited) => {
+                info!(
+                    waited_secs = waited.as_secs(),
+                    "update_restart_window_clear"
+                );
+            }
+            RestartRelease::WindowExpired(waited) => {
+                let zones = playing_zone_ids(&state.playback).await;
+                warn!(
+                    waited_secs = waited.as_secs(),
+                    zones = ?zones,
+                    "update_restart_deferral_expired"
+                );
+            }
+        }
+
         set_phase("restarting");
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2350,6 +2513,241 @@ mod playback_guard_tests {
         pm.pause(8).await;
         pm.play(12, NowPlaying::default()).await;
         assert!(playback_in_progress(&pm).await);
+    }
+}
+
+/// Le report de la relance — la moitié qui manquait à #2954.
+///
+/// L'horloge est celle de tokio, mise en pause : `start_paused = true` fait
+/// avancer le temps VIRTUEL dès que toutes les tâches dorment. Ces tests
+/// traversent deux heures de plafond sans qu'une seule seconde réelle passe.
+/// Aucun `sleep` réel : un test qui attendrait vraiment 24 s finirait désarmé.
+///
+/// Ils portent sur `defer_restart_until_quiet` — la fonction que la tâche
+/// d'installation appelle juste avant `set_phase("restarting")`, pas une
+/// réplique de son mécanisme. Dégrader son corps fait tomber ces tests.
+#[cfg(test)]
+mod restart_deferral_tests {
+    use super::{RestartRelease, defer_restart_until_quiet};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tune_core::playback::{NowPlaying, PlaybackManager};
+
+    const MAX: Duration = Duration::from_secs(2 * 3600);
+    const POLL: Duration = Duration::from_secs(5);
+
+    /// Les valeurs de PRODUCTION, pas celles du test.
+    ///
+    /// Les cas ci-dessous passent leurs propres bornes pour rester lisibles ;
+    /// ce test-ci est le seul qui tienne les constantes réelles. Sans lui, un
+    /// plafond porté à l'infini — la façon la plus simple de rétablir le défaut
+    /// « une zone oubliée bloque les mises à jour à vie » — passerait au vert.
+    #[test]
+    fn the_production_ceiling_is_finite_and_the_poll_is_short() {
+        assert_eq!(
+            super::RESTART_DEFERRAL_MAX,
+            MAX,
+            "le plafond du report doit rester borné : sans sortie, une zone \
+             laissée en lecture — ou figée, ce qu'aucun détecteur ne rattrape \
+             (#3155) — bloque les mises à jour pour toujours"
+        );
+        assert_eq!(
+            super::RESTART_DEFERRAL_POLL,
+            POLL,
+            "la relance doit suivre la fin du morceau de près, sinon le report \
+             devient une attente en soi"
+        );
+        assert!(super::RESTART_DEFERRAL_POLL < super::RESTART_DEFERRAL_MAX);
+    }
+
+    /// LA moitié qui décrit l'incident : la lecture démarre, la relance se
+    /// présente 24 s plus tard, et elle N'A PAS LIEU. Le journal du 30 août
+    /// montre `local_audio_playing_after_prefill` à 15:42:00 et
+    /// `update_reexec` à 15:42:24.
+    #[tokio::test(start_paused = true)]
+    async fn restart_waits_while_a_zone_plays() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        // 24 s de plafond : la fenêtre exacte de l'incident. Rien ne s'arrête,
+        // donc la seule sortie est le plafond — et on doit l'avoir ATTENDU.
+        let short = Duration::from_secs(24);
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, short, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(short));
+        assert_eq!(
+            started.elapsed(),
+            short,
+            "la relance est partie avant la fin de la fenêtre"
+        );
+    }
+
+    /// L'autre moitié, qui compte autant : quand plus rien ne joue, la relance
+    /// part — et sans rien attendre du tout.
+    #[tokio::test(start_paused = true)]
+    async fn restart_goes_ahead_when_nothing_plays() {
+        let pm = PlaybackManager::new();
+        let started = tokio::time::Instant::now();
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "une mise à jour hors lecture ne doit rien payer"
+        );
+    }
+
+    /// Une zone arrêtée entre-temps libère la relance au tour de scrutation
+    /// suivant : c'est le cas nominal — la mise à jour prend la fin du morceau,
+    /// pas son milieu.
+    #[tokio::test(start_paused = true)]
+    async fn restart_fires_as_soon_as_playback_stops() {
+        let pm = Arc::new(PlaybackManager::new());
+        pm.play(20, NowPlaying::default()).await;
+
+        let stopper = Arc::clone(&pm);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            stopper.stop(20).await;
+        });
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        match release {
+            RestartRelease::PlaybackEnded(waited) => {
+                assert!(
+                    waited >= Duration::from_secs(90) && waited <= Duration::from_secs(90) + POLL,
+                    "libérée à {waited:?}, attendu entre 90 s et 95 s"
+                );
+            }
+            other => panic!("attendu PlaybackEnded, obtenu {other:?}"),
+        }
+    }
+
+    /// Le piège symétrique : une zone oubliée EN LECTURE ne bloque pas les
+    /// mises à jour à vie. #3155 a établi qu'aucun détecteur ne rattrape une
+    /// zone locale figée — elle peut rester `Playing` indéfiniment sans qu'un
+    /// échantillon sorte. Le plafond est la sortie, et il est atteint.
+    #[tokio::test(start_paused = true)]
+    async fn a_zone_left_playing_forever_does_not_block_updates_forever() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::WindowExpired(MAX));
+    }
+
+    /// Une zone en PAUSE ne retient rien. Sans quoi une zone laissée en pause
+    /// des jours durant bloquerait toutes les mises à jour jusqu'au plafond,
+    /// pour un son que personne n'écoute. C'est aussi ce que dit le frein de
+    /// repos du poller depuis #3120 : la pause n'est pas une lecture.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_zone_never_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(20, NowPlaying::default()).await;
+        pm.pause(20).await;
+
+        let started = tokio::time::Instant::now();
+        let release = defer_restart_until_quiet(&pm, MAX, POLL).await;
+
+        assert_eq!(release, RestartRelease::Idle);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Le corps du handler `update_install`, isolé du fichier source.
+    ///
+    /// `include_str!` rend le fichier ENTIER, ce module de test compris — où le
+    /// nom de la fonction surveillée apparaît en toutes lettres, et où le
+    /// fichier compte huit modules `#[cfg(test)]` intercalés dans la
+    /// production. Sans cette découpe, le garde-fou ci-dessous se prouverait
+    /// lui-même et resterait vert quel que soit le code d'installation.
+    fn corps_de_update_install(source: &str) -> &str {
+        let debut = source
+            .find("pub(super) async fn update_install(")
+            .expect("handler `update_install` introuvable dans le source");
+        let reste = &source[debut..];
+        // Jusqu'au prochain handler de premier niveau, ou au prochain module de
+        // test — le premier des deux.
+        let fin = reste[1..]
+            .find("\npub(super) async fn ")
+            .into_iter()
+            .chain(reste[1..].find("\n#[cfg(test)]"))
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(reste.len());
+        &reste[..fin]
+    }
+
+    /// Le report est-il POSÉ SUR LE CHEMIN DE LA RELANCE ?
+    ///
+    /// Les tests ci-dessus éprouvent le mécanisme ; celui-ci éprouve son
+    /// branchement. C'est exactement la faille de #2954 : le garde-fou de
+    /// lecture existait, il était juste consulté au mauvais endroit. Un
+    /// correctif juste qui n'est appelé nulle part ne coupe rien.
+    #[test]
+    fn the_install_task_defers_the_restart_before_re_execing() {
+        let corps = corps_de_update_install(include_str!("update.rs"));
+        let defer = corps
+            .find("defer_restart_until_quiet(")
+            .expect("la tâche d'installation n'appelle plus le report de relance (#2954)");
+        let restart = corps
+            .find("set_phase(\"restarting\")")
+            .expect("phase `restarting` introuvable dans `update_install`");
+        assert!(
+            defer < restart,
+            "le report doit être consulté AVANT la phase `restarting` : \
+             c'est l'échange d'image qui coupe le son, pas le téléchargement"
+        );
+    }
+
+    /// Contre-épreuve du garde-fou statique : sur un source d'où l'appel a
+    /// disparu, il doit tomber. Un détecteur qui trouve son motif partout ne
+    /// détecte rien.
+    #[test]
+    fn the_call_site_guard_falls_on_a_source_without_the_call() {
+        // Un handler nu : rien à trouver.
+        let nu = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n";
+        assert!(
+            !corps_de_update_install(nu).contains("defer_restart_until_quiet("),
+            "le détecteur trouve l'appel dans un handler qui ne l'a pas"
+        );
+        // Le report posé dans un AUTRE handler ne compte pas : la découpe doit
+        // s'arrêter au handler suivant.
+        let ailleurs = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \npub(super) async fn update_status(s: S) {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(ailleurs).contains("defer_restart_until_quiet("),
+            "la découpe déborde sur le handler suivant"
+        );
+        // Ni un module de test intercalé.
+        let en_test = "pub(super) async fn update_install(s: S) {\n    set_phase(\"restarting\");\n}\n\
+             \n#[cfg(test)]\nmod t {\n    defer_restart_until_quiet(&s.playback);\n}\n";
+        assert!(
+            !corps_de_update_install(en_test).contains("defer_restart_until_quiet("),
+            "la coupe à `#[cfg(test)]` ne tient pas"
+        );
+    }
+
+    /// Treize zones sur .18 : le report regarde toutes les zones, pas la
+    /// première venue. Une seule qui joue suffit à retenir.
+    #[tokio::test(start_paused = true)]
+    async fn one_playing_zone_among_idle_ones_holds_the_restart() {
+        let pm = PlaybackManager::new();
+        pm.play(4, NowPlaying::default()).await;
+        pm.stop(4).await;
+        pm.play(8, NowPlaying::default()).await;
+        pm.pause(8).await;
+        pm.play(20, NowPlaying::default()).await;
+
+        let short = Duration::from_secs(60);
+        assert_eq!(
+            defer_restart_until_quiet(&pm, short, POLL).await,
+            RestartRelease::WindowExpired(short)
+        );
     }
 }
 
