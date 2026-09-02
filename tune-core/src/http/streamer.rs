@@ -695,6 +695,24 @@ impl AudioStreamer {
         }
     }
 
+    /// La session `stream_id` existe-t-elle encore ?
+    ///
+    /// C'est la seule question qui vaille pour une session NON RADIO, et elle
+    /// n'avait pas de réponse : [`Self::radio_producer_done`] ne répond que pour
+    /// la radio, parce que `producer_done` n'est armé que par les appels à
+    /// `decode_radio_stream_to_pcm`. Une session de fichier, de transcodage ou
+    /// de proxy laisse ce drapeau à `false` toute sa vie.
+    ///
+    /// Ce qui tue une session de PISTE, c'est [`Self::cleanup_stale_sessions`] :
+    /// [`SESSION_IDLE_TIMEOUT`] sans un octet servi — ce qu'une lecture EN PAUSE
+    /// atteint sans le moindre effort, le commentaire de la borne le dit
+    /// lui-même. Une fois la session retirée de la table, `/stream/{id}` répond
+    /// 404 (`tune-stream-http`) et TOUTES les familles de sorties reprennent sur
+    /// du vide — la locale comprise, qui va chercher son PCM en HTTP
+    /// (`outputs/local.rs`, `local_audio_http_fetch_failed`).
+    pub async fn session_alive(&self, stream_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(stream_id)
+    }
     pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
         let session = {
             let sessions = self.sessions.lock().await;
@@ -1843,8 +1861,12 @@ mod tests {
         }
     }
 
+    /// Passe par la primitive de PRODUCTION. Recopier ici
+    /// `sessions_state().lock().contains_key(...)` aurait mesuré la
+    /// transcription et non `session_alive`, dont dépend maintenant la reprise
+    /// d'une piste (#2512).
     async fn session_presente(streamer: &AudioStreamer, id: &str) -> bool {
-        streamer.sessions_state().lock().await.contains_key(id)
+        streamer.session_alive(id).await
     }
 
     async fn patienter(ms: u64) {
@@ -1990,6 +2012,34 @@ mod tests {
 
     /// La branche que la garde du poller traversait EN SILENCE. Sans
     /// `stream_id`, rien n'est publié — et il faut que ça se sache.
+    /// #2512 — la brique sur laquelle la reprise d'une PISTE décide.
+    ///
+    /// `une_session_muette_est_ramassee` prouve que le balayage retire la
+    /// session ; celui-ci prouve que `session_alive` le SAIT. Si elle répondait
+    /// « vivante » pour une session déjà retirée, `resume` reprendrait sur du
+    /// vide exactement comme avant le correctif.
+    #[tokio::test]
+    async fn une_session_ramassee_n_est_plus_vivante() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready) = streamer.create_session(info_de_test(), false, 8).await;
+        assert!(
+            streamer.session_alive(&id).await,
+            "une session fraîche est vivante"
+        );
+        // Une lecture EN PAUSE ne sert plus un octet : c'est très exactement ce
+        // que le ramasse-miettes appelle « muette ».
+        patienter(900).await;
+        streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+        assert!(
+            !streamer.session_alive(&id).await,
+            "après le balayage la session n'existe plus : la reprise doit le voir"
+        );
+    }
     #[test]
     fn sans_stream_id_le_canal_le_dit_au_lieu_de_se_taire() {
         assert_eq!(canal_radio(None), CanalRadio::SansStreamId);

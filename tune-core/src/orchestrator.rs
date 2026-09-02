@@ -1608,6 +1608,132 @@ fn replay_needs_output_seek(
 ) -> bool {
     is_network_output && session_is_range_seekable && position_ms > 0
 }
+/// Ce qu'une reprise doit faire de la SESSION DE FLUX d'une zone.
+///
+/// Reprendre « sur place » suppose que la session qui alimentait la sortie a
+/// survécu à la pause. Il y a deux façons de ne pas y survivre, et surtout DEUX
+/// REMÈDES qui n'ont rien à voir l'un avec l'autre. C'est tout l'objet de ce
+/// type : le premier existait déjà, le second manquait, et les confondre aurait
+/// été un défaut de plus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepriseDeSession {
+    /// La session vit : `checked_resume` sur la sortie suffit, et c'est ce qui
+    /// marche aujourd'hui.
+    SurPlace,
+    /// RADIO seulement (#1629). Un flux radio est un DIRECT : on ré-amorce la
+    /// station, position JETÉE. On reprend le direct, pas un différé de dix-neuf
+    /// minutes.
+    RejouerLeDirect,
+    /// PISTE (#2512). Rétablir la MÊME écoute au MÊME point. Rejouer une piste
+    /// « depuis le direct » n'aurait aucun sens : l'auditeur veut retrouver son
+    /// morceau là où il l'a laissé.
+    RetablirALaPosition,
+    /// La session est morte et rien ne permet de la rétablir. Il reste à le
+    /// DIRE : un silence sans message est un défaut à lui seul.
+    Expliquer,
+}
+/// La matrice de décision de [`PlaybackOrchestrator::resume`].
+///
+/// Fonction PURE, et c'est ce qui permet de l'éprouver : `paused_at` est un
+/// `std::time::Instant` que `tokio::time::pause()` n'atteint pas, donc une pause
+/// de vingt minutes ne se joue pas dans un test — mais un booléen, si.
+///
+/// La branche RADIO est la table de vérité de #1629, inchangée : rejouer dès que
+/// la pause dépasse le seuil OU que le producteur de décodage est mort, jamais
+/// sans URL de station. Elle a été écrite contre un cas mesuré et elle
+/// fonctionne ; elle n'est ni généralisée, ni dupliquée, ni contournée.
+///
+/// La branche PISTE ne regarde PAS `pause_longue`. C'est délibéré et c'est le
+/// cœur du correctif : une piste dont la session vit encore reprend sur place,
+/// qu'on l'ait laissée trente secondes ou trois heures. Seule la mort de la
+/// session — le ramasse-miettes est passé — justifie de rétablir quoi que ce
+/// soit, et alors on rétablit à la position, pas au début.
+pub(crate) fn reprise_de_session(
+    est_radio: bool,
+    rejouable: bool,
+    pause_longue: bool,
+    session_morte: bool,
+) -> RepriseDeSession {
+    if est_radio {
+        if rejouable && (pause_longue || session_morte) {
+            RepriseDeSession::RejouerLeDirect
+        } else {
+            RepriseDeSession::SurPlace
+        }
+    } else if !session_morte {
+        RepriseDeSession::SurPlace
+    } else if rejouable {
+        RepriseDeSession::RetablirALaPosition
+    } else {
+        RepriseDeSession::Expliquer
+    }
+}
+/// La demande de lecture qui RÉTABLIT la session d'une piste au point exact où
+/// la pause l'a laissée.
+///
+/// C'est ce qui sépare ce correctif d'une transposition du comportement radio.
+/// Le re-play d'une station jette la position — il le doit. Ici la position est
+/// le cœur de la demande : `seek_ms` porte le `position_ms` que l'état de zone a
+/// conservé à travers la pause. Tout le reste désigne la même écoute, d'où
+/// `play_without_history` chez l'appelant : pas de seconde ligne d'historique,
+/// même règle que le re-play radio.
+///
+/// Les champs de résolution restent `None` : `play_inner` re-résout la piste
+/// depuis `track_id`/`source_id` comme au premier lancement, et une valeur
+/// recopiée ici ne pourrait que le contredire.
+///
+/// Fonction PURE : le contrat « la MÊME piste, au MÊME point » se prouve sans
+/// orchestrateur, sans sortie et sans fichier.
+pub(crate) fn requete_de_retablissement(
+    zone_id: i64,
+    output_device_id: String,
+    np: &NowPlaying,
+    position_ms: u64,
+) -> PlayRequest {
+    PlayRequest {
+        zone_id,
+        output_device_id: Some(output_device_id),
+        track_id: np.track_id,
+        source: Some(np.source.clone()),
+        source_id: np.source_id.clone(),
+        title: Some(np.title.clone()),
+        artist_name: np.artist_name.clone(),
+        album_title: np.album_title.clone(),
+        cover_url: np.cover_path.clone(),
+        duration_ms: (np.duration_ms > 0).then_some(np.duration_ms),
+        seek_ms: Some(position_ms),
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+    }
+}
+/// La phrase que la zone rend quand sa session n'a pas survécu à la pause et
+/// n'a pas pu être rétablie.
+///
+/// Elle existe parce que l'absence de message EST le défaut : « aucun son,
+/// volume dans le vide » et pas une ligne pour dire pourquoi. Elle nomme donc
+/// les trois choses que l'auditeur ne peut pas deviner — quelle piste, à quelle
+/// position, et pourquoi la session n'est plus là.
+///
+/// Fonction PURE, éprouvée sans orchestrateur.
+pub(crate) fn message_session_perdue(titre: &str, position_ms: u64, cause: Option<&str>) -> String {
+    let secondes = position_ms / 1000;
+    let mut phrase = format!(
+        "La lecture de « {titre} » ne peut pas reprendre à {}:{:02} : sa session de \
+         flux n'a pas survécu à la pause (le serveur la libère après {} minutes \
+         sans lecture). Relancez la piste.",
+        secondes / 60,
+        secondes % 60,
+        crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs() / 60,
+    );
+    if let Some(cause) = cause {
+        phrase.push_str(&format!(" Cause : {cause}"));
+    }
+    phrase
+}
 
 /// Temporisation avant le `Seek` qui suit une recréation de flux réseau.
 ///
@@ -9563,46 +9689,113 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// Dire à l'auditeur que la session n'a pas survécu à la pause — sur les
+    /// DEUX canaux, parce qu'aucun des deux ne suffit seul.
+    ///
+    /// L'`OutputCommandError` remonte à l'appelant HTTP : `POST
+    /// /zones/{id}/resume` la rend en 502 avec son `message`
+    /// (`output_command_error_response`). Mais seul le client qui a appuyé sur
+    /// lecture la voit, et seulement s'il attend la réponse.
+    /// `zone.playback_error` — le canal que six autres échecs de lecture
+    /// utilisent déjà, poussé verbatim à TOUS les clients par `routes/ws.rs` —
+    /// porte la même phrase aux autres télécommandes. La deuxième moitié de
+    /// #1998 nommait déjà `resume` parmi les chemins où la cause « mourait ici ».
+    ///
+    /// `fatal: true` pour la raison écrite en #1960 et #2630 : sans lui, la
+    /// fenêtre de grâce d'après-lecture du client web avale le message, et
+    /// l'auditeur n'a — une fois de plus — que le silence.
+    fn dire_session_perdue(
+        &self,
+        zone_id: i64,
+        titre: &str,
+        position_ms: u64,
+        cause: Option<&str>,
+    ) -> OutputCommandError {
+        let message = message_session_perdue(titre, position_ms, cause);
+        warn!(zone_id, position_ms, %message, "resume_stream_session_lost");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message.clone(),
+                    "fatal": true,
+                }),
+            );
+        }
+        OutputCommandError::failed(OutputCommand::Resume, message)
+    }
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
         let position_ms = state.position_ms.max(0) as u64;
 
-        // WEBRADIO : une reprise après une pause longue — ou après la mort du
-        // producteur de décodage — est traitée comme un RE-PLAY de la station
-        // (#1629). Un flux radio est un DIRECT : pendant la pause le pipeline
-        // continue de se périmer (la connexion icecast peut mourir par un
-        // chemin qui ne logge qu'en debug!, la sortie accumule un retard sans
-        // borne, les horodatages OAAT prennent toute la durée de la pause de
-        // retard) et la reprise « sur place » rend du silence sans la moindre
-        // erreur (.42 : pause 15:48 → reprise 16:07, aucun son, volume dans le
-        // vide). Rejouer dans CE chemin commun couvre les trois familles de
-        // sorties (locale, OAAT, réseau) — et c'est de toute façon le
-        // comportement attendu d'un direct : on reprend le direct, pas un
-        // différé de 19 minutes.
+        // Une reprise « sur place » suppose que la SESSION DE FLUX qui alimentait
+        // la sortie a survécu à la pause. Deux façons d'y échouer, deux remèdes.
+        //
+        // WEBRADIO (#1629) : le flux est un DIRECT. Pendant la pause le pipeline
+        // continue de se périmer — la connexion icecast peut mourir par un chemin
+        // qui ne logge qu'en debug!, la sortie accumule un retard sans borne, les
+        // horodatages OAAT prennent toute la durée de la pause de retard — et la
+        // reprise « sur place » rend du silence sans la moindre erreur (.42 :
+        // pause 15:48 → reprise 16:07, aucun son, volume dans le vide). Le remède
+        // est un RE-PLAY de la station : on reprend le direct, pas un différé de
+        // dix-neuf minutes. Rien de tout cela ne change ici.
+        //
+        // PISTE (#2512) : le MÊME silence, par une autre porte, et il n'était pas
+        // gardé. Le ramasse-miettes retire toute session NON RADIO restée
+        // `SESSION_IDLE_TIMEOUT` (trente minutes) sans servir un octet — la radio
+        // y est explicitement exemptée, la piste non — et une lecture en pause ne
+        // tire plus rien, ce que le commentaire de la borne dit mot pour mot :
+        // « elle survit une demi-heure aujourd'hui ». Passé ce délai la session
+        // n'existe plus, `/stream/{id}` répond 404, et toutes les familles de
+        // sorties reprennent sur du vide — la locale comprise, qui va chercher
+        // son PCM en HTTP.
+        //
+        // Le remède n'est PAS celui de la radio : on rétablit la même écoute à la
+        // MÊME position. Et quand plus rien ne le permet, on le dit.
         if let Some(np) = state.now_playing.as_ref() {
+            let est_radio = np.source == "radio";
             let has_url = np.source_id.as_deref().is_some_and(|s| !s.is_empty());
-            if np.source == "radio" && has_url {
-                let paused_long = state
-                    .paused_at
-                    .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
-                // Producteur mort même sous le seuil : plus rien n'alimente la
-                // session WAV, reprendre sur place serait silencieux aussi.
-                let producer_dead = match np.stream_id.as_deref() {
-                    Some(sid) => self.streamer.radio_producer_done(sid).await,
-                    None => false,
-                };
-                if paused_long || producer_dead {
-                    let did = device_id.map(str::to_string).or_else(|| {
-                        ZoneRepo::with_backend(self.db.clone())
-                            .get(zone_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|z| z.output_device_id)
-                    });
-                    if let Some(did) = did {
-                        info!(zone_id, paused_long, producer_dead, "radio_resume_replay");
+            // De quoi re-demander la MÊME écoute : une URL de station pour une
+            // radio, une piste identifiable pour tout le reste.
+            let rejouable = if est_radio {
+                has_url
+            } else {
+                np.track_id.is_some() || has_url
+            };
+            let pause_longue = state
+                .paused_at
+                .is_some_and(|t| t.elapsed() >= RADIO_RESUME_REPLAY_AFTER);
+            // Ce qui tue une session n'est pas le même selon la famille. Radio :
+            // le producteur de décodage s'est terminé — plus rien n'alimente la
+            // session WAV, reprendre sur place serait silencieux aussi. Piste :
+            // `producer_done` n'est jamais armé (seul `decode_radio_stream_to_pcm`
+            // le fait), la seule question qui vaille est « la session existe-t-elle
+            // encore ».
+            let session_morte = match np.stream_id.as_deref() {
+                Some(sid) if est_radio => self.streamer.radio_producer_done(sid).await,
+                Some(sid) => !self.streamer.session_alive(sid).await,
+                None => false,
+            };
+            let decision = reprise_de_session(est_radio, rejouable, pause_longue, session_morte);
+            if decision != RepriseDeSession::SurPlace {
+                let did = device_id.map(str::to_string).or_else(|| {
+                    ZoneRepo::with_backend(self.db.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id)
+                });
+                match (decision, did) {
+                    (RepriseDeSession::RejouerLeDirect, Some(did)) => {
+                        info!(
+                            zone_id,
+                            paused_long = pause_longue,
+                            producer_dead = session_morte,
+                            "radio_resume_replay"
+                        );
                         let req = PlayRequest {
                             zone_id,
                             output_device_id: Some(did),
@@ -9633,10 +9826,41 @@ impl PlaybackOrchestrator {
                             ),
                         }
                     }
+                    (RepriseDeSession::RetablirALaPosition, Some(did)) => {
+                        info!(zone_id, position_ms, "resume_stream_session_restore");
+                        let req = requete_de_retablissement(zone_id, did, np, position_ms);
+                        // Même piste, même écoute : pas de seconde ligne
+                        // d'historique, exactement comme le re-play radio.
+                        match self.play_without_history(req).await {
+                            Ok(_) => return Ok(()),
+                            // Pas de repli silencieux : la sortie n'a plus rien à
+                            // jouer, la reprendre ne ferait que rejouer le défaut.
+                            Err(e) => {
+                                return Err(self.dire_session_perdue(
+                                    zone_id,
+                                    &np.title,
+                                    position_ms,
+                                    Some(&e),
+                                ));
+                            }
+                        }
+                    }
+                    (RepriseDeSession::Expliquer, _)
+                    | (RepriseDeSession::RetablirALaPosition, None) => {
+                        return Err(self.dire_session_perdue(
+                            zone_id,
+                            &np.title,
+                            position_ms,
+                            None,
+                        ));
+                    }
+                    // Radio dont on ne connaît aucune sortie : repli inchangé sur
+                    // la reprise ordinaire, exactement comme avant #2512.
+                    (RepriseDeSession::RejouerLeDirect, None) | (RepriseDeSession::SurPlace, _) => {
+                    }
                 }
             }
         }
-
         let output_type = if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -12757,9 +12981,10 @@ mod tests {
     use crate::streaming::registry::ServiceRegistry;
 
     use super::{
-        PlayRequest, PlaybackOrchestrator, StreamingDsp, is_network_output_type,
-        is_push_uri_output_type, passthrough_didl_duration_ms, pull_output_needs_dsp_transcode,
-        replay_needs_output_seek, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
+        PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, is_network_output_type,
+        is_push_uri_output_type, message_session_perdue, passthrough_didl_duration_ms,
+        pull_output_needs_dsp_transcode, replay_needs_output_seek, reprise_de_session,
+        requete_de_retablissement, spawn_streaming_dsp_relay, streaming_needs_pretranscode,
         streaming_pretranscode_format, use_file_transcode_for,
     };
 
@@ -14667,6 +14892,284 @@ mod tests {
             orch.playback.get_state(zone_id).await.state,
             PlayState::Playing,
             "la zone doit être repassée en lecture"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #2512 — Reprise après une pause longue, côté PISTE.
+    // ------------------------------------------------------------------
+
+    /// TÉMOIN #1629 : la décision RADIO, ligne par ligne, telle qu'elle était.
+    ///
+    /// Les deux épreuves de bout en bout ci-dessus couvrent « producteur mort »
+    /// et « pause courte, producteur vivant ». La ligne PAUSE LONGUE, elle, ne
+    /// pouvait pas être jouée : `paused_at` est un `std::time::Instant` que
+    /// l'horloge virtuelle de tokio n'atteint pas. Rendue pure, elle se prouve.
+    #[test]
+    fn le_temoin_radio_1629_ne_bouge_pas() {
+        for (pause_longue, session_morte, attendu) in [
+            (false, false, RepriseDeSession::SurPlace),
+            (true, false, RepriseDeSession::RejouerLeDirect),
+            (false, true, RepriseDeSession::RejouerLeDirect),
+            (true, true, RepriseDeSession::RejouerLeDirect),
+        ] {
+            assert_eq!(
+                reprise_de_session(true, true, pause_longue, session_morte),
+                attendu,
+                "radio (pause_longue={pause_longue}, session_morte={session_morte})"
+            );
+        }
+        // Sans URL de station la radio n'a jamais rien rejoué — et ne s'explique
+        // pas non plus : ce chemin reste EXACTEMENT celui d'avant #2512.
+        for (pause_longue, session_morte) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                reprise_de_session(true, false, pause_longue, session_morte),
+                RepriseDeSession::SurPlace,
+                "radio sans URL (pause_longue={pause_longue}, session_morte={session_morte})"
+            );
+        }
+    }
+
+    /// LE point qui sépare ce correctif d'une transposition du comportement
+    /// radio : la DURÉE de la pause ne décide de rien pour une piste.
+    ///
+    /// Vingt minutes de pause, session encore vivante ⇒ reprise sur place. Pas
+    /// au début, pas « en direct ». Si un jour quelqu'un branche
+    /// `RADIO_RESUME_REPLAY_AFTER` sur la branche piste, c'est ici que ça tombe.
+    #[test]
+    fn la_duree_d_une_pause_ne_relance_jamais_une_piste() {
+        assert_eq!(
+            reprise_de_session(false, true, true, false),
+            RepriseDeSession::SurPlace,
+            "session vivante : une pause longue ne justifie AUCUN redémarrage"
+        );
+        assert_eq!(
+            reprise_de_session(false, false, true, false),
+            RepriseDeSession::SurPlace
+        );
+    }
+
+    /// Le vrai défaut : session ramassée pendant la pause ⇒ on RÉTABLIT, et à la
+    /// position — quelle que soit la durée de la pause.
+    #[test]
+    fn une_piste_dont_la_session_est_morte_est_retablie_a_sa_position() {
+        assert_eq!(
+            reprise_de_session(false, true, false, true),
+            RepriseDeSession::RetablirALaPosition
+        );
+        assert_eq!(
+            reprise_de_session(false, true, true, true),
+            RepriseDeSession::RetablirALaPosition
+        );
+    }
+
+    /// Session morte et rien à rejouer : il reste à le DIRE. Un silence sans
+    /// message est un défaut à lui seul.
+    #[test]
+    fn une_piste_irrejouable_ne_se_tait_pas() {
+        assert_eq!(
+            reprise_de_session(false, false, false, true),
+            RepriseDeSession::Expliquer
+        );
+    }
+
+    /// La demande de rétablissement repart AU POINT, sur la MÊME piste.
+    #[test]
+    fn le_retablissement_repart_a_la_position_et_pas_du_debut() {
+        let np = NowPlaying {
+            track_id: Some(77),
+            title: "Sur la piste".into(),
+            source: "local".into(),
+            source_id: Some("77".into()),
+            duration_ms: 300_000,
+            ..Default::default()
+        };
+        let req = requete_de_retablissement(9, "local:DAC".into(), &np, 137_000);
+        assert_eq!(
+            req.seek_ms,
+            Some(137_000),
+            "rejouer une piste depuis le début serait la régression que ce \
+             correctif doit éviter"
+        );
+        assert_eq!(req.track_id, Some(77));
+        assert_eq!(req.source.as_deref(), Some("local"));
+        assert_eq!(req.source_id.as_deref(), Some("77"));
+        assert_eq!(req.zone_id, 9);
+        assert_eq!(req.output_device_id.as_deref(), Some("local:DAC"));
+        assert_eq!(req.duration_ms, Some(300_000));
+    }
+
+    /// Le message nomme la piste, la position et la cause. C'est ce qui manquait
+    /// : « aucun son, volume dans le vide », et pas une ligne pour l'expliquer.
+    #[test]
+    fn le_message_de_session_perdue_nomme_la_piste_et_la_position() {
+        let seche = message_session_perdue("Sur la piste", 137_000, None);
+        assert!(seche.contains("Sur la piste"), "{seche}");
+        assert!(seche.contains("2:17"), "la position doit y être : {seche}");
+        assert!(seche.contains("30 minutes"), "{seche}");
+        let detaille = message_session_perdue("X", 0, Some("piste introuvable"));
+        assert!(detaille.contains("piste introuvable"), "{detaille}");
+    }
+
+    /// Prépare une zone qui JOUE une piste locale via une session de flux, puis
+    /// la met en pause à `position_ms`. Rend `(orchestrateur, zone, stream_id)`.
+    async fn zone_en_pause_sur_une_piste(
+        track_id: Option<i64>,
+        position_ms: i64,
+    ) -> (PlaybackOrchestrator, i64, String) {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some("mock"), Some("mock-salon"))
+            .unwrap();
+        orch.outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-salon", "Mock Salon")));
+        // Une session de PISTE — `create_session`, pas `create_radio_session` :
+        // c'est celle que le ramasse-miettes a le droit de prendre.
+        let (sid, _tx, _ready) = orch
+            .streamer
+            .create_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44_100,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                false,
+                4,
+            )
+            .await;
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id,
+                    title: "Sur la piste".into(),
+                    source: "local".into(),
+                    stream_id: Some(sid.clone()),
+                    duration_ms: 300_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        orch.playback.update_position(zone_id, position_ms).await;
+        orch.playback.pause(zone_id).await;
+        (orch, zone_id, sid)
+    }
+
+    /// Fait passer le ramasse-miettes comme il passe toutes les minutes en
+    /// production, avec des bornes réduites : une session en pause ne sert plus
+    /// un octet, elle est donc « muette » au sens de `cleanup_stale_sessions`.
+    async fn le_ramasse_miettes_passe(orch: &PlaybackOrchestrator, sid: &str) {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        orch.streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+        assert!(
+            !orch.streamer.session_alive(sid).await,
+            "le balayage doit avoir ramassé la session de la piste en pause — \
+             sans ça l'épreuve ne mesure rien"
+        );
+    }
+
+    /// #2512, bout en bout sur la VRAIE `resume` : une piste dont la session a
+    /// été ramassée pendant la pause ne répond plus « en lecture » en silence.
+    ///
+    /// Avant : `Ok(())`, la route rend 200 et un `now_playing` qui joue, la
+    /// sortie ne reçoit rien, et rien ne dit pourquoi.
+    #[tokio::test]
+    async fn une_piste_dont_la_session_est_morte_ne_reprend_plus_en_silence() {
+        // Ni `track_id` ni `source_id` : rien ne permet de rétablir quoi que ce
+        // soit. Il reste à le dire — c'est tout l'objet de cette épreuve.
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(None, 137_000).await;
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, Some("mock-salon"))
+            .await
+            .expect_err("une reprise qui ne peut pas aboutir ne doit plus dire « en lecture »");
+        let OutputCommandError::Failed { command, message } = erreur else {
+            panic!("la reprise doit échouer en Failed, pas en Unsupported");
+        };
+        assert_eq!(command, OutputCommand::Resume);
+        assert!(
+            message.contains("Sur la piste") && message.contains("2:17"),
+            "le message doit nommer la piste et la position : {message}"
+        );
+        // Et la zone ne doit pas prétendre jouer.
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Paused,
+            "une zone qui n'a pas repris ne doit pas s'annoncer en lecture"
+        );
+    }
+
+    /// Même chemin, mais la piste est identifiable : `resume` doit TENTER de
+    /// rétablir la session — et quand la tentative échoue (ici la piste n'est pas
+    /// en base), l'échec REMONTE au lieu de retomber en silence sur la sortie.
+    ///
+    /// La position voyage dans le message : c'est la preuve que la reprise
+    /// visait le point de la pause, et non le début du morceau.
+    #[tokio::test]
+    async fn un_retablissement_impossible_remonte_au_lieu_de_se_taire() {
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(Some(4242), 137_000).await;
+        le_ramasse_miettes_passe(&orch, &sid).await;
+        let erreur = orch
+            .resume(zone_id, Some("mock-salon"))
+            .await
+            .expect_err("le rétablissement a échoué : la reprise doit le dire");
+        assert!(
+            erreur.to_string().contains("2:17"),
+            "la reprise visait la position de la pause : {erreur}"
+        );
+        let outputs = orch.outputs.lock().await;
+        let guard = outputs.get("mock-salon").unwrap();
+        let guard = guard.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "rien n'a pu être rétabli : aucune lecture ne doit être annoncée à la sortie"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE : session VIVANTE ⇒ la reprise reste exactement ce qu'elle
+    /// est aujourd'hui. Aucune relecture, aucune erreur, la zone repart.
+    ///
+    /// Sans elle, le correctif pourrait « marcher » en relançant toutes les
+    /// reprises — et personne ne le verrait.
+    #[tokio::test]
+    async fn une_piste_dont_la_session_vit_reprend_sur_place() {
+        let (orch, zone_id, sid) = zone_en_pause_sur_une_piste(Some(4242), 137_000).await;
+        assert!(orch.streamer.session_alive(&sid).await);
+        orch.resume(zone_id, Some("mock-salon"))
+            .await
+            .expect("session vivante : la reprise ordinaire doit aboutir");
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.state,
+            PlayState::Playing
+        );
+        let outputs = orch.outputs.lock().await;
+        let guard = outputs.get("mock-salon").unwrap();
+        let guard = guard.lock().await;
+        let mock = guard
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("mock output");
+        assert_eq!(
+            mock.play_call_count().await,
+            0,
+            "session vivante ⇒ reprise sur place, aucune relecture"
         );
     }
 
