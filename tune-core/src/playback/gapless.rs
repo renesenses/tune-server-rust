@@ -166,9 +166,211 @@ impl GaplessHandler {
     }
 }
 
+/// Un marqueur de format — extension, type MIME, ou `format` scanné — désigne-t-il du DSD ?
+///
+/// UNE seule définition, pour les trois endroits qui la posaient chacun de leur
+/// côté : le garde de fin de piste DSD sur DLNA
+/// (`decisions::dlna_dsd_reached_end`), le refus d'armement DSD sur DLNA
+/// (`prepare_gapless`, #402) et la promesse faite à la file
+/// ([`enchainement_sans_blanc`]). Deux copies, c'est la porte ouverte à ce que
+/// la file promette ce que le poller refuse ensuite.
+pub fn est_dsd(marqueur: &str) -> bool {
+    let m = marqueur.to_lowercase();
+    m.contains("dsd") || m.contains("dsf") || m.contains("dff")
+}
+
+/// Ce qu'une ligne de file peut promettre à la ligne **affichée** juste après elle.
+///
+/// C'est la question exacte que pose le badge « Gapless » de la file : entre
+/// CETTE ligne et la SUIVANTE À L'ÉCRAN, y aura-t-il un blanc ?
+///
+/// Le badge n'a jamais rien affiché, pour personne, sur aucune zone : le champ
+/// `gapless_next` que le client lit n'existait dans **aucune** structure
+/// sérialisée du serveur — il ne survivait que dans `docs/contrat-web.json`,
+/// hérité du serveur Python (Jean Valjean, fil 631, 15/06/2026, #2934). Il est
+/// calculé ici à partir des MÊMES refus que le poller applique au moment
+/// d'armer, jamais d'un défaut constant : un indicateur qui ment est pire que
+/// pas d'indicateur.
+#[derive(Debug, Clone, Copy)]
+pub struct EnchainementAffiche<'a> {
+    /// Réglage `zones.gapless_enabled` de la zone.
+    pub gapless_enabled: bool,
+    /// `capabilities().can_gapless` de la sortie réellement enregistrée.
+    ///
+    /// `false` couvre aussi la sortie inconnue (zone navigateur, sortie
+    /// disparue) : on ne promet pas ce qu'on ne peut pas constater.
+    pub output_can_gapless: bool,
+    /// `output_type()` de la zone (`"dlna"`, `"local"`, `"oaat"`…).
+    pub output_type: &'a str,
+    /// `prefers_local_file_gapless()` : la sortie ne sait mettre en attente
+    /// qu'un FICHIER local (OAAT en DSD natif ou en PCM direct).
+    pub output_prefers_local_file: bool,
+    /// Index AFFICHÉ de la ligne examinée.
+    pub index: i64,
+    /// Index que la file désignera réellement comme suivant quand cette ligne
+    /// se terminera — [`crate::poller::PositionPoller::next_position_after`],
+    /// la seule décision « piste suivante » du serveur. Sous aléatoire ou sous
+    /// répétition-une il n'est PAS `index + 1` : l'ordre affiché ne dit alors
+    /// rien de l'ordre joué.
+    pub successeur_reel: Option<i64>,
+    /// `format` de la ligne affichée juste après.
+    pub successeur_format: Option<&'a str>,
+    /// La ligne affichée juste après a-t-elle un fichier local ?
+    pub successeur_est_fichier_local: bool,
+}
+
+/// Vrai **seulement** si l'enchaînement vers la ligne affichée suivante se fera
+/// réellement sans blanc.
+///
+/// Chaque refus reproduit un refus que le poller applique déjà, et le renvoie à
+/// son journal :
+///
+/// | refus | journal du poller |
+/// |---|---|
+/// | l'ordre affiché n'est pas l'ordre joué | — (aléatoire / répétition-une) |
+/// | zone `gapless_enabled = 0` | le poller n'entre pas dans la branche d'armement |
+/// | sortie qui ne chaîne pas depuis sa boucle | `gapless_skipped_exclusive_output` |
+/// | suivant DSD sur DLNA (#402) | `gapless_skipped_dsd_next_dlna` |
+/// | suivant sans fichier local sur OAAT DSD natif | `gapless_local_file_skipped_no_local_next` |
+pub fn enchainement_sans_blanc(i: &EnchainementAffiche<'_>) -> bool {
+    // L'ordre affiché doit ÊTRE l'ordre joué. Sous aléatoire, la ligne d'en
+    // dessous n'est pas celle qui va suivre ; sous répétition-une, c'est la
+    // même qui repart. Promettre là serait mentir sur QUI s'enchaîne — la
+    // dernière ligne d'une file, qui n'a pas de suivant, tombe ici aussi.
+    if i.successeur_reel != Some(i.index + 1) {
+        return false;
+    }
+    if !i.gapless_enabled {
+        return false;
+    }
+    // Sortie qui ne sait pas chaîner depuis sa propre boucle de lecture :
+    // Chromecast, slimproto, AirPlay, Squeezebox, HQPlayer, sortie locale en
+    // mode exclusif (ASIO / WASAPI exclusif), et sortie locale ou OAAT dont la
+    // chaîne s'est épuisée.
+    if !i.output_can_gapless {
+        return false;
+    }
+    // #402 — un renderer DLNA accepte `SetNextAVTransportURI` pour un flux DSD
+    // et ne le consomme jamais (HiFi Rose RS130, Benjithom). Le poller refuse
+    // d'armer ; la file ne le promet donc pas. Le même DSD sur une sortie
+    // locale garde sa chaîne interne et reste promis.
+    if i.output_type == "dlna" && i.successeur_format.is_some_and(est_dsd) {
+        return false;
+    }
+    // OAAT en DSD natif / PCM direct lit le `.dsf` suivant sur le disque : un
+    // suivant en streaming, sans fichier local, n'est pas armé.
+    if i.output_prefers_local_file && !i.successeur_est_fichier_local {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #2934 : ce que la file promet d'une ligne à la suivante ─────────────
+
+    fn ligne() -> EnchainementAffiche<'static> {
+        EnchainementAffiche {
+            gapless_enabled: true,
+            output_can_gapless: true,
+            output_type: "local",
+            output_prefers_local_file: false,
+            index: 0,
+            successeur_reel: Some(1),
+            successeur_format: Some("flac"),
+            successeur_est_fichier_local: true,
+        }
+    }
+
+    #[test]
+    fn est_dsd_reconnait_les_trois_marqueurs() {
+        assert!(est_dsd("dsf"));
+        assert!(est_dsd("DFF"));
+        assert!(est_dsd("audio/x-dsd"));
+        assert!(!est_dsd("flac"));
+        assert!(!est_dsd("audio/x-flac"));
+        assert!(!est_dsd(""));
+    }
+
+    #[test]
+    fn enchaine_quand_tout_est_reuni() {
+        assert!(enchainement_sans_blanc(&ligne()));
+    }
+
+    #[test]
+    fn derniere_ligne_ne_promet_rien() {
+        let mut l = ligne();
+        l.successeur_reel = None;
+        assert!(!enchainement_sans_blanc(&l));
+    }
+
+    #[test]
+    fn ordre_affiche_different_de_l_ordre_joue_ne_promet_rien() {
+        // Aléatoire : la ligne d'en dessous n'est pas celle qui va suivre.
+        let mut l = ligne();
+        l.successeur_reel = Some(7);
+        assert!(!enchainement_sans_blanc(&l));
+        // Répétition-une : c'est la MÊME ligne qui repart.
+        let mut l = ligne();
+        l.successeur_reel = Some(0);
+        assert!(!enchainement_sans_blanc(&l));
+    }
+
+    #[test]
+    fn zone_sans_gapless_ne_promet_rien() {
+        let mut l = ligne();
+        l.gapless_enabled = false;
+        assert!(!enchainement_sans_blanc(&l));
+    }
+
+    #[test]
+    fn sortie_qui_ne_chaine_pas_ne_promet_rien() {
+        // Chromecast, slimproto, local en mode exclusif, chaîne épuisée…
+        let mut l = ligne();
+        l.output_can_gapless = false;
+        assert!(!enchainement_sans_blanc(&l));
+    }
+
+    #[test]
+    fn dsd_sur_dlna_ne_promet_rien_mais_dsd_en_local_promet() {
+        // #402 : le renderer accepte SetNext et ne le consomme jamais.
+        let mut dlna = ligne();
+        dlna.output_type = "dlna";
+        dlna.successeur_format = Some("dsf");
+        assert!(!enchainement_sans_blanc(&dlna));
+        // Le refus vise le COUPLE DLNA+DSD, pas l'un des deux :
+        let mut dlna_flac = ligne();
+        dlna_flac.output_type = "dlna";
+        assert!(enchainement_sans_blanc(&dlna_flac));
+        let mut local_dsd = ligne();
+        local_dsd.successeur_format = Some("dsf");
+        assert!(enchainement_sans_blanc(&local_dsd));
+    }
+
+    #[test]
+    fn oaat_dsd_natif_ne_promet_qu_un_suivant_local() {
+        let mut streaming = ligne();
+        streaming.output_type = "oaat";
+        streaming.output_prefers_local_file = true;
+        streaming.successeur_est_fichier_local = false;
+        assert!(!enchainement_sans_blanc(&streaming));
+        let mut local = streaming;
+        local.successeur_est_fichier_local = true;
+        assert!(enchainement_sans_blanc(&local));
+    }
+
+    #[test]
+    fn un_suivant_en_streaming_reste_promis_sur_une_sortie_ordinaire() {
+        // Le garde « fichier local » est propre aux sorties qui l'exigent :
+        // une piste Qobuz s'enchaîne normalement sur une sortie DLNA.
+        let mut l = ligne();
+        l.output_type = "dlna";
+        l.successeur_format = None;
+        l.successeur_est_fichier_local = false;
+        assert!(enchainement_sans_blanc(&l));
+    }
 
     #[tokio::test]
     async fn starts_disabled() {

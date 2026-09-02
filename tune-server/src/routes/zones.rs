@@ -1078,6 +1078,23 @@ pub(crate) async fn output_capabilities(
     Some(output.lock().await.capabilities())
 }
 
+/// La sortie enregistrée pour une zone ne sait-elle mettre en attente qu'un
+/// FICHIER local ? (`prefers_local_file_gapless`, OAAT en DSD natif / PCM direct)
+///
+/// `false` pour une sortie inconnue, comme pour l'immense majorité des sorties :
+/// c'est le comportement par défaut du trait.
+pub(crate) async fn output_prefers_local_file_gapless(
+    state: &AppState,
+    output_device_id: Option<&str>,
+) -> bool {
+    let Some(device_id) = output_device_id else {
+        return false;
+    };
+    let Some(output) = ({ state.outputs.lock().await.get(device_id) }) else {
+        return false;
+    };
+    output.lock().await.prefers_local_file_gapless()
+}
 /// Motif pour lequel la sortie d'une zone ne peut pas tenir une consigne en dB.
 ///
 /// `None` = rien à redire : sortie inconnue (zone navigateur, sortie

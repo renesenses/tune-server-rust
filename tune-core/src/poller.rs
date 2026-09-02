@@ -720,10 +720,7 @@ pub(crate) mod decisions {
         if output_type != "dlna" {
             return false;
         }
-        let is_dsd = current_format.is_some_and(|f| {
-            let f = f.to_lowercase();
-            f.contains("dsd") || f.contains("dsf") || f.contains("dff")
-        });
+        let is_dsd = current_format.is_some_and(crate::playback::gapless::est_dsd);
         is_dsd && peak_reached_end(track_duration_ms, peak_position_ms)
     }
 
@@ -6099,8 +6096,7 @@ impl PositionPoller {
                     // output keeps its internal DSD gapless chain untouched.
                     if output.output_type() == "dlna" {
                         let url_lc = resolved.url.to_lowercase();
-                        let next_is_dsd = resolved.mime_type.contains("dsd")
-                            || resolved.mime_type.contains("dsf")
+                        let next_is_dsd = crate::playback::gapless::est_dsd(&resolved.mime_type)
                             || url_lc.ends_with(".dsf")
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
