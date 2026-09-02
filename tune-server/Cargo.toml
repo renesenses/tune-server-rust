@@ -166,6 +166,16 @@ name = "pg_routes_serveur"
 path = "tests/pg_routes_serveur.rs"
 required-features = ["postgres"]
 
+# Les deux sections d'accueil de #3181 sur PostgreSQL, et la contre-epreuve
+# SQLite dans le meme test. Cible separee de `pg_routes_serveur`, qui sonde une
+# bibliotheque VIDE et n'exige qu'un statut : celle-ci seme des lignes et exige
+# qu'elles ressortent, ce qu'un test de statut ne peut pas voir quand la panne
+# est avalee en `200 []`.
+[[test]]
+name = "pg_3181_sections_accueil"
+path = "tests/pg_3181_sections_accueil.rs"
+required-features = ["postgres"]
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
