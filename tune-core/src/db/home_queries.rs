@@ -124,6 +124,43 @@ pub const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
 /// d'aucune cle primaire groupee, et se taire ici coute la section entiere.
 const COLONNES_ALBUM: &str = "a.id, a.title, ar.name, a.year, a.cover_path, a.genre";
 
+/// La jointure qui donne la date de PREMIERE VUE d'un fichier par le scan.
+///
+/// `file_first_seen` (#473) est une table a cote, jamais purgee par
+/// `delete_all` : un rescan complet reecrit `tracks` mais ne touche pas a ces
+/// horodatages. Elle est ecrite `INSERT OR IGNORE` a la premiere insertion
+/// d'un chemin, donc elle porte bien « ajoute a la bibliotheque le … » et non
+/// « fichier ecrit sur le disque le … ».
+///
+/// Elle exige l'alias `t` pour `tracks`.
+pub const JOINTURE_PREMIERE_VUE: &str =
+    "LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
+
+/// La duree d'une piste en millisecondes, lisible quel que soit le type de la
+/// colonne. Voir [`recently_added_totaux`] pour la derive de type qui l'exige.
+pub const DUREE_MS: &str = "CAST(NULLIF(CAST(t.duration_ms AS TEXT), '') AS DOUBLE PRECISION)";
+
+/// La date d'ajout d'une piste : sa premiere vue si le scan l'a enregistree,
+/// sinon SEULEMENT le `mtime` du fichier.
+///
+/// Le repli n'est pas un detail : `file_first_seen` n'est peuplee que depuis
+/// #473, donc une bibliotheque scannee avant porte encore des pistes sans
+/// ligne. Pour celles-la l'expression rend exactement l'ancienne valeur, et la
+/// vue se comporte comme avant. Pour les autres elle dit la verite : un
+/// `rsync -a`, une restauration de sauvegarde ou une recopie deplacent le
+/// `mtime`, jamais la premiere vue.
+///
+/// Transtypage : `file_first_seen.first_seen_at` est DOUBLE, mais le type de
+/// `tracks.file_mtime` sur PostgreSQL depend du millesime de l'installation
+/// (TEXT sur certaines, DOUBLE PRECISION sur .15). Meme forme que
+/// `AlbumRepo::ADDED_AT_JOIN`, et pour la meme raison : un `COALESCE(double,
+/// text)` est une erreur dure sur les installations TEXT, et
+/// `NULLIF(double, '')` en est une a l'analyse sur les installations DOUBLE.
+/// Passer par TEXT puis retranstyper est valide dans les deux cas, et sur
+/// SQLite dont les affinites sont souples.
+pub const DATE_D_AJOUT: &str = "COALESCE(ffs.first_seen_at, \
+     CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))";
+
 /// Second rang de « Continuer l'ecoute » : les albums DEDUITS de l'historique,
 /// pour les lignes anterieures a la migration 84 qui ne disent rien de leur
 /// contexte.
@@ -297,28 +334,70 @@ pub fn progression_pourcent(ecoutees: Option<i64>, total: Option<i64>) -> Option
     Some((ecoutees.saturating_mul(100) / total).min(100))
 }
 
-/// « Ajoutes recemment » : les albums dont une piste a ete ecrite sur le disque
-/// depuis `$1`.
+/// « Ajoutes recemment » : les albums dont une piste est entree dans la
+/// bibliotheque depuis `$1`, au plus `$2`.
+///
+/// `$1` est la BORNE BASSE de la fenetre, en secondes epoch. Elle etait
+/// calculee a 7 jours en dur par l'appelant et n'etait donc reglable par
+/// personne (#3039) ; c'est desormais l'appelant qui la choisit, et lui seul
+/// qui plafonne. La requete, elle, ne connait qu'un instant.
 ///
 /// Jumelle exacte du defaut ci-dessus : meme `ar.name`, meme `GROUP BY a.id`,
 /// meme section vide sur PostgreSQL (#2860).
 ///
 /// Colonnes rendues, dans l'ordre : `id, title, artist_name, year, cover_path,
-/// genre, format, sample_rate, bit_depth, track_count, newest_mtime`.
+/// genre, format, sample_rate, bit_depth, track_count, added_at`.
 pub fn recently_added(engine: Engine) -> String {
     let p1 = ph(engine, 1);
     let p2 = ph(engine, 2);
     format!(
         "SELECT {COLONNES_ALBUM}, \
                a.format, a.sample_rate, a.bit_depth, a.track_count, \
-               MAX(t.file_mtime) as newest_mtime \
+               MAX({DATE_D_AJOUT}) as added_at \
         FROM tracks t \
         JOIN albums a ON t.album_id = a.id \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE t.file_mtime IS NOT NULL AND t.file_mtime > {p1} \
+        {JOINTURE_PREMIERE_VUE} \
+        WHERE {DATE_D_AJOUT} > {p1} \
         GROUP BY {COLONNES_ALBUM}, a.format, a.sample_rate, a.bit_depth, a.track_count \
-        ORDER BY newest_mtime DESC \
+        ORDER BY added_at DESC \
         LIMIT {p2}"
+    )
+}
+
+/// Le decompte de la meme fenetre : combien d'albums, combien de pistes,
+/// combien de temps.
+///
+/// C'est le sous-titre que le testeur montre — « 7 albums • 71 pistes •
+/// 5 h 55 min » (#3039). Il se calcule ici et non en comptant les elements
+/// rendus par [`recently_added`], que le `LIMIT` tronque : compter la page
+/// affichee annoncerait « 20 albums » sur une fenetre qui en porte 300.
+///
+/// DEUX transtypages, et aucun n'est decoratif :
+///
+/// * `t.duration_ms` n'a pas le meme type partout. `010_numeric_column_types`
+///   le porte en BIGINT, mais l'outil de reprise SQLite → PostgreSQL
+///   (`pg_migrate`) le pose en TEXT, exactement la derive qui a coute la .15
+///   sur `file_mtime` (#550). Or `SUM(text)` n'existe pas sur PostgreSQL :
+///   `function sum(text) does not exist`, avalee par le
+///   `ou_defaut_journalise()` de l'appelant, et le sous-titre annoncerait
+///   « 0 min » sans un mot. Le detour par TEXT puis DOUBLE est valide quel que
+///   soit le type de depart, sur les deux moteurs.
+/// * `SUM` rend NUMERIC sur PostgreSQL et non BIGINT ; sans le `CAST` final la
+///   valeur reviendrait en chaine d'un cote et en entier de l'autre.
+///
+/// `$1` : la meme borne basse. Colonnes rendues : `albums, tracks,
+/// duration_ms`.
+pub fn recently_added_totaux(engine: Engine) -> String {
+    let p1 = ph(engine, 1);
+    format!(
+        "SELECT COUNT(DISTINCT a.id) AS albums, \
+                COUNT(*) AS tracks, \
+                CAST(COALESCE(SUM({DUREE_MS}), 0) AS BIGINT) AS duration_ms \
+         FROM tracks t \
+         JOIN albums a ON t.album_id = a.id \
+         {JOINTURE_PREMIERE_VUE} \
+         WHERE {DATE_D_AJOUT} > {p1}"
     )
 }
 
@@ -435,8 +514,84 @@ mod tests {
         let pg = continue_listening_albums_deduits(Engine::Postgres, "");
         assert!(!pg.contains("zone_id = "));
         assert!(pg.ends_with("LIMIT $1"));
+    }
 
-        assert!(recently_added(Engine::Sqlite).contains("file_mtime > ?"));
-        assert!(recently_added(Engine::Postgres).contains("file_mtime > $1"));
+    /// #3039 — la fenetre est une PLACE TENUE, sur les DEUX moteurs.
+    ///
+    /// Le defaut d'origine n'etait pas une mauvaise valeur : c'etait l'absence
+    /// de valeur reglable. `chrono_epoch_seven_days_ago()` ne prenait aucun
+    /// argument, et la requete recevait donc toujours le meme instant. Le
+    /// garde exige ici que la borne basse arrive LIEE — `?` sur SQLite, `$1`
+    /// sur PostgreSQL — pour qu'un litteral reintroduit d'un cote ou de
+    /// l'autre rougisse.
+    #[test]
+    fn la_fenetre_d_ajouts_recents_est_liee_sur_les_deux_moteurs() {
+        for (engine, place) in [(Engine::Sqlite, "?"), (Engine::Postgres, "$1")] {
+            for sql in [recently_added(engine), recently_added_totaux(engine)] {
+                let filtre = sql
+                    .split("WHERE ")
+                    .nth(1)
+                    .expect("la requete porte un WHERE");
+                assert!(
+                    filtre.starts_with(&format!("{DATE_D_AJOUT} > {place}")),
+                    "la borne basse de la fenetre n'est pas liee sur {engine:?} : \
+                     une fenetre ecrite en dur n'est reglable par personne (#3039). \
+                     WHERE :\n{filtre}"
+                );
+            }
+        }
+    }
+
+    /// #3039 — la vue ordonne une DATE D'AJOUT, pas un `mtime` nu.
+    ///
+    /// Le `mtime` d'un fichier n'est pas sa date d'entree dans la
+    /// bibliotheque : un `rsync -a`, une restauration de sauvegarde ou une
+    /// recopie le deplacent, et l'album ressort « ajoute aujourd'hui » alors
+    /// qu'il est la depuis dix ans. `file_first_seen` porte la vraie date ;
+    /// le `mtime` n'est plus qu'un repli pour les pistes scannees avant #473.
+    #[test]
+    fn les_ajouts_recents_preferent_la_premiere_vue_au_mtime() {
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            for sql in [recently_added(engine), recently_added_totaux(engine)] {
+                assert!(
+                    sql.contains(JOINTURE_PREMIERE_VUE),
+                    "la jointure sur `file_first_seen` a disparu : la vue \
+                     retomberait sur le seul `mtime` (#3039). SQL :\n{sql}"
+                );
+                assert!(
+                    sql.contains("ffs.first_seen_at"),
+                    "`first_seen_at` n'est pas lue — la jointure ne sert a rien. \
+                     SQL :\n{sql}"
+                );
+                assert!(
+                    !sql.contains("t.file_mtime >"),
+                    "le filtre porte encore sur le `mtime` nu. SQL :\n{sql}"
+                );
+            }
+        }
+    }
+
+    /// Le decompte porte les TROIS nombres du sous-titre, et il compte la
+    /// FENETRE, pas la page : aucun `LIMIT` ne doit s'y glisser.
+    #[test]
+    fn le_decompte_des_ajouts_recents_ne_se_limite_pas() {
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            let sql = recently_added_totaux(engine);
+            assert!(sql.contains("COUNT(DISTINCT a.id)"), "albums : {sql}");
+            assert!(sql.contains("COUNT(*)"), "pistes : {sql}");
+            assert!(sql.contains(&format!("SUM({DUREE_MS})")), "duree : {sql}");
+            assert!(
+                !sql.contains("SUM(t.duration_ms)"),
+                "`SUM(text)` n'existe pas sur PostgreSQL, et `pg_migrate` pose \
+                 encore `duration_ms` en TEXT : la duree reviendrait a zero \
+                 sans un mot. SQL :\n{sql}"
+            );
+            assert!(
+                !sql.contains("LIMIT"),
+                "un LIMIT dans le decompte annoncerait la page au lieu de la \
+                 fenetre — « 20 albums » sur une fenetre qui en porte 300. \
+                 SQL :\n{sql}"
+            );
+        }
     }
 }

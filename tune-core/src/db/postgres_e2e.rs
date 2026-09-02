@@ -1220,3 +1220,237 @@ async fn pg_2441_continuer_lecoute_contextes_et_progression() {
         "2 pistes sur 5, comme sur SQLite : {resolus:?}"
     );
 }
+
+/// #3039 — la fenetre des « Ajouts recents » sur une VRAIE base PostgreSQL.
+///
+/// Deux choses se jouent ici, qu'aucun test SQLite ne peut trancher :
+///
+/// 1. **Que les requetes s'EXECUTENT.** Elles portent desormais
+///    `COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '')
+///    AS DOUBLE PRECISION))` — la forme exacte d'`ADDED_AT_JOIN`, qui existe
+///    parce qu'un `COALESCE(double, text)` est une erreur DURE sur les
+///    installations ou `tracks.file_mtime` est reste TEXT (#550), et
+///    `NULLIF(double, '')` une erreur a l'analyse sur celles ou il est DOUBLE
+///    (.15). SQLite avale les deux sans un mot. Le decompte y ajoute
+///    `CAST(SUM(...) AS BIGINT)`, parce que `SUM` rend NUMERIC sur PostgreSQL.
+///
+/// 2. **Que la fenetre est bien LIEE** en `$1` et non ecrite en dur.
+///
+/// Pas de `reset_schema` : ce test n'a besoin d'aucune base vide et ne doit
+/// pas vider celle des autres. Il pose ses propres chemins, prefixes d'un
+/// marqueur unique, et ne conclut que sur les lignes qu'il a lui-meme ecrites.
+/// Ni `pg_or_skip!` : la variable ABSENTE saute, mais une connexion qui ECHOUE
+/// fait TOMBER le test — un banc mal branche ne s'affiche pas vert.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3039_fenetre_et_decompte_des_ajouts_recents() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{recently_added, recently_added_totaux};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL absente — epreuve PostgreSQL sautee");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("TUNE_TEST_PG_URL posee : la connexion doit aboutir");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
+
+    // La table de premiere vue arrive par `ENSURE_TABLES` au demarrage, pas
+    // par un script numerote (#473) : la poser ici rend le test independant
+    // du millesime du banc.
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS file_first_seen \
+         (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
+        &[],
+    )
+    .expect("file_first_seen");
+
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let il_y_a = |jours: f64| maintenant - jours * 24.0 * 3600.0;
+    // Marqueur unique : les tests de ce fichier partagent une base et tournent
+    // en parallele. Rien de ce qui suit ne depend des lignes des autres.
+    let marque = format!("i3039-{}", maintenant as i64);
+
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"))
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    let artiste = id_de(&format!(
+        "INSERT INTO artists (name) VALUES ('{marque}') RETURNING id"
+    ));
+    // Les quatre cas du ticket, tels que le test SQLite les pose.
+    let cas: [(&str, f64, Option<f64>); 4] = [
+        ("Recent", 2.0, None),
+        ("Vieux", 60.0, None),
+        ("Restaure", 800.0, Some(3.0)),
+        ("Recopie", 1.0, Some(200.0)),
+    ];
+    let mut ids = Vec::new();
+    for (nom, mtime_j, vue_j) in cas {
+        let titre = format!("{marque} {nom}");
+        let album = id_de(&format!(
+            "INSERT INTO albums (title, artist_id, track_count) \
+             VALUES ('{titre}', {artiste}, 1) RETURNING id"
+        ));
+        let chemin = format!("/{marque}/{nom}.flac");
+        db.execute(
+            &format!(
+                "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime, duration_ms) \
+                 VALUES ('{titre}', {album}, {artiste}, '{chemin}', {}, 60000)",
+                il_y_a(mtime_j)
+            ),
+            &[],
+        )
+        .expect("piste");
+        if let Some(j) = vue_j {
+            db.execute(
+                &format!(
+                    "INSERT INTO file_first_seen (file_path, first_seen_at) \
+                     VALUES ('{chemin}', {})",
+                    il_y_a(j)
+                ),
+                &[],
+            )
+            .expect("premiere vue");
+        }
+        ids.push((nom, album));
+    }
+
+    // ── La requete s'execute sur PostgreSQL, avec la fenetre LIEE en $1 ──
+    let sql = recently_added(Engine::Postgres);
+    let limite: i64 = 5000;
+    let titres = |depuis: f64| -> Vec<String> {
+        db.query_many(
+            &sql,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .unwrap_or_else(|e| panic!("« Ajoutes recemment » doit s'executer sur PostgreSQL : {e}"))
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+        .filter(|t| t.starts_with(&marque))
+        .collect()
+    };
+
+    // ── Fenetre de 7 jours : le temoin, celle d'avant #3039 ──
+    let a7 = titres(il_y_a(7.0));
+    assert!(
+        a7.contains(&format!("{marque} Recent")),
+        "7 jours : `Recent` (J-2) manque — obtenu {a7:?}"
+    );
+    assert!(
+        a7.contains(&format!("{marque} Restaure")),
+        "7 jours : une sauvegarde remise en place (mtime J-800, premiere vue \
+         J-3) doit entrer. La jointure `file_first_seen` ne porte donc pas sur \
+         PostgreSQL — obtenu {a7:?}"
+    );
+    assert!(
+        !a7.contains(&format!("{marque} Recopie")),
+        "7 jours : un `rsync -a` (mtime J-1, premiere vue J-200) ne doit PAS \
+         entrer — obtenu {a7:?}"
+    );
+    assert!(
+        !a7.contains(&format!("{marque} Vieux")),
+        "7 jours : `Vieux` (J-60) doit rester dehors — obtenu {a7:?}"
+    );
+
+    // ── La fenetre est SERVIE : $1 change, le resultat change ──
+    let a61 = titres(il_y_a(61.0));
+    assert!(
+        a61.contains(&format!("{marque} Vieux")),
+        "61 jours : `Vieux` (J-60) doit entrer. S'il n'entre pas, `$1` n'est \
+         pas lu et la fenetre reste ecrite en dur (#3039) — obtenu {a61:?}"
+    );
+    assert!(
+        a61.len() > a7.len(),
+        "une fenetre plus large doit rendre PLUS d'albums : 7 j → {a7:?}, \
+         61 j → {a61:?}"
+    );
+
+    // ── Le decompte : il s'execute, et il suit la meme fenetre ──
+    let sql_t = recently_added_totaux(Engine::Postgres);
+    let compte = |depuis: f64| -> (i64, i64, i64) {
+        let lignes = db
+            .query_many(&sql_t, &[&depuis as &dyn ToSqlValue])
+            .unwrap_or_else(|e| panic!("le decompte doit s'executer sur PostgreSQL : {e}"));
+        let l = lignes.first().expect("le decompte rend une ligne");
+        (
+            l[0].as_i64().expect("albums est un entier"),
+            l[1].as_i64().expect("pistes est un entier"),
+            // `SUM` rend NUMERIC sur PostgreSQL : sans le CAST explicite de la
+            // requete, cette lecture rendrait `None` et le test tomberait ici.
+            l[2].as_i64()
+                .expect("duration_ms est un entier — CAST … AS BIGINT"),
+        )
+    };
+    let (alb7, pis7, dur7) = compte(il_y_a(7.0));
+    let (alb61, pis61, dur61) = compte(il_y_a(61.0));
+    assert!(
+        alb61 > alb7 && pis61 > pis7 && dur61 > dur7,
+        "le decompte doit suivre la fenetre : 7 j → ({alb7}, {pis7}, {dur7}), \
+         61 j → ({alb61}, {pis61}, {dur61})"
+    );
+    assert!(
+        dur7 >= 120_000,
+        "la duree cumulee doit compter les 60 000 ms de chaque piste, \
+         obtenu {dur7}"
+    );
+
+    // ── CONTRE-EPREUVE — la forme d'AVANT #3039 se trompe deux fois ──
+    //
+    // Le filtre sur le seul `mtime`, tel qu'il s'ecrivait, fait entrer la
+    // recopie et sortir la restauration. C'est le defaut que le testeur
+    // aurait vu ; on verifie ici qu'il etait bien la, sur PostgreSQL aussi.
+    let avant = sql
+        .replace(
+            &format!(
+                "LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
+                 WHERE {} > $1",
+                crate::db::home_queries::DATE_D_AJOUT
+            ),
+            "WHERE t.file_mtime IS NOT NULL AND t.file_mtime > $1",
+        )
+        .replace(
+            &format!("MAX({}) as added_at", crate::db::home_queries::DATE_D_AJOUT),
+            "MAX(t.file_mtime) as added_at",
+        );
+    assert_ne!(avant, sql, "la substitution n'a rien remplace");
+    let depuis = il_y_a(7.0);
+    let anciens: Vec<String> = db
+        .query_many(
+            &avant,
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .expect("la forme d'avant doit rester executable")
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+        .filter(|t| t.starts_with(&marque))
+        .collect();
+    assert!(
+        anciens.contains(&format!("{marque} Recopie")),
+        "la forme d'avant DEVAIT faire entrer la recopie — sans quoi la \
+         contre-epreuve ne prouve rien : {anciens:?}"
+    );
+    assert!(
+        !anciens.contains(&format!("{marque} Restaure")),
+        "la forme d'avant DEVAIT laisser la restauration dehors : {anciens:?}"
+    );
+
+    // ── Menage : ce test ne vide pas les tables des autres, il retire les
+    // siennes.
+    for (_, album) in &ids {
+        let _ = db.execute(&format!("DELETE FROM tracks WHERE album_id = {album}"), &[]);
+        let _ = db.execute(&format!("DELETE FROM albums WHERE id = {album}"), &[]);
+    }
+    let _ = db.execute(
+        &format!("DELETE FROM file_first_seen WHERE file_path LIKE '/{marque}/%'"),
+        &[],
+    );
+    let _ = db.execute(&format!("DELETE FROM artists WHERE id = {artiste}"), &[]);
+}
