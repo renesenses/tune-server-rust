@@ -61,6 +61,8 @@ mod licence_grace_visible;
 mod notarisation_bornes;
 #[path = "nuage_limite_dit_la_limite.rs"]
 mod nuage_limite_dit_la_limite;
+#[path = "openhome_pins_atteignent_le_renderer.rs"]
+mod openhome_pins_atteignent_le_renderer;
 #[path = "output_provider_seam.rs"]
 mod output_provider_seam;
 #[path = "paroles_ecriture_fichiers.rs"]
