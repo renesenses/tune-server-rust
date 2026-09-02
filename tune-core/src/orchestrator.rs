@@ -10732,7 +10732,14 @@ impl PlaybackOrchestrator {
         let advance_source = np.source.clone();
         let advance_source_id = np.source_id.clone();
         self.playback.update_now_playing(zone_id, np).await;
-        self.playback.update_position(zone_id, 0).await;
+        // `reset_position` et non `update_position` : ce chemin est le SEUL
+        // changement de piste qui n'emprunte pas `play()` — c'est tout l'objet
+        // du commentaire ci-dessus. La garde de monotonie de `update_position`
+        // n'accepte un recul que d'une COMMANDE, et cette remise à 0 en est
+        // une ; passée par la porte des observations, elle aurait été prise
+        // pour un renderer qui se contredit et le curseur serait resté collé à
+        // la fin de la piste précédente pendant tout un album enchaîné (#3229).
+        self.playback.reset_position(zone_id, 0).await;
         self.playback.emit_position(zone_id, 0);
 
         // Niveaux de la piste devenue courante. Le pré-chargement gapless
@@ -13968,6 +13975,74 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    /// #3229 — l'avance gapless remet le curseur à 0:00 pour de VRAI.
+    ///
+    /// La position publiée ne recule plus dans une piste : `update_position`
+    /// refuse désormais qu'une observation du renderer descende sous ce qui a
+    /// déjà été affiché. Or `advance_queue_metadata` est le SEUL changement de
+    /// piste qui n'emprunte pas `play()` — il évite exprès le rebond de
+    /// `track_generation` — et il rendait la piste suivante à 0 par cette
+    /// MÊME porte. Prise pour un renderer qui se contredit, la remise à zéro
+    /// aurait été refusée et le curseur serait resté collé à la fin de la piste
+    /// précédente pendant tout un album enchaîné : un défaut permanent, visible
+    /// de tous, bien pire que celui qu'on corrige.
+    ///
+    /// L'épreuve passe par l'orchestrateur, et non par un appel direct à
+    /// `reset_position` : c'est le CHOIX DE LA PORTE, ici, qui est en jeu.
+    #[tokio::test]
+    async fn avance_gapless_remet_la_position_a_zero() {
+        let orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Zone 3229", Some("local"), None)
+            .unwrap();
+
+        let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+        let mut ids = Vec::new();
+        for n in 1..=2 {
+            let mut piste = crate::db::models::Track::new(format!("Piste {n}"));
+            piste.file_path = Some(format!("/aucun/chemin/3229/piste{n}.flac"));
+            piste.track_number = n;
+            piste.duration_ms = 179_000;
+            ids.push(pistes.create(&piste).unwrap());
+        }
+        crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+            .set_queue(zone_id, &ids)
+            .unwrap();
+
+        orch.playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    track_id: Some(ids[0]),
+                    title: "Piste 1".into(),
+                    duration_ms: 179_000,
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        // Fin de la piste 1, telle que le sondeur vient de la publier.
+        assert_eq!(
+            orch.playback.update_position(zone_id, 179_000).await,
+            179_000
+        );
+
+        orch.advance_queue_metadata(zone_id, 1)
+            .await
+            .expect("l'avance gapless doit aboutir");
+
+        assert_eq!(
+            orch.playback.get_state(zone_id).await.position_ms,
+            0,
+            "après une avance gapless le curseur doit repartir de 0:00 (#3229)"
+        );
+        assert_eq!(
+            orch.playback.update_position(zone_id, 1_000).await,
+            1_000,
+            "et la piste 2 doit pouvoir compter depuis le début"
+        );
     }
 
     // ------------------------------------------------------------------
