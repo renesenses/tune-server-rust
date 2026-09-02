@@ -256,8 +256,10 @@ static OBSERVED_DEVICE: std::sync::RwLock<Option<ObservedDevice>> = std::sync::R
 struct ObservedDevice {
     backend: &'static str,
     requested: String,
+    /// Vide quand rien n'a été ouvert — voir [`LocalDeviceStatus::opened`].
     opened: String,
     opened_id: Option<String>,
+    reason: Option<LocalDeviceFallback>,
 }
 
 /// Nom du backend tel que `select_host` l'a observé, ou `"local"` faute d'avoir
@@ -286,12 +288,27 @@ fn note_opened_device(
     opened: &str,
     opened_id: Option<&str>,
 ) {
+    note_device_outcome(backend, requested, opened, opened_id, None);
+}
+
+/// Enregistre une ouverture qui n'a **pas** honoré la demande, avec son motif.
+///
+/// `opened` vide = rien n'a été ouvert du tout (refus). Sinon, quelque chose a
+/// bien joué, mais pas ce que la zone nommait.
+fn note_device_outcome(
+    backend: &'static str,
+    requested: &str,
+    opened: &str,
+    opened_id: Option<&str>,
+    reason: Option<LocalDeviceFallback>,
+) {
     if let Ok(mut slot) = OBSERVED_DEVICE.write() {
         *slot = Some(ObservedDevice {
             backend,
             requested: requested.to_string(),
             opened: opened.to_string(),
             opened_id: opened_id.filter(|id| !id.is_empty()).map(str::to_string),
+            reason,
         });
     }
 }
@@ -359,6 +376,67 @@ impl LocalBackendFallback {
     ];
 }
 
+/// Pourquoi la zone ne joue pas sur le périphérique qu'elle NOMME.
+///
+/// Frère de [`LocalBackendFallback`], et volontairement bâti sur le même
+/// modèle : un `code()` stable pour la machine, un `detail()` en clair pour un
+/// écran sans table de traduction. Ce n'est pas un troisième canal — les deux
+/// motifs voyagent dans le **même** [`LocalBackendStatus`], l'un sur le
+/// backend, l'autre sur le périphérique.
+///
+/// #3230 — Jean Valjean règle sa zone sur « Haut-parleurs », un nom WASAPI.
+/// `select_host("asio")` élit l'hôte ASIO dès qu'il expose une sortie, la
+/// résolution cherche « Haut-parleurs » parmi les seules sorties ASIO, ne le
+/// trouve pas, et ouvre **le périphérique ASIO par défaut**. Le son part
+/// ailleurs, ou nulle part, et rien ne le dit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDeviceFallback {
+    /// Le nom mémorisé par la zone vient d'un AUTRE hôte que celui qui est
+    /// ouvert. Aucun appariement n'est possible : un nom WASAPI ne désigne
+    /// aucune sortie ASIO. La demande est **refusée**, pas détournée.
+    ForeignHost,
+    /// Le nom vient bien de cet hôte (ou son origine est inconnue) mais aucune
+    /// sortie ne le porte plus : débranché, renommé, routage macOS changé.
+    /// C'est le cas historique de #2207 — on ouvre le périphérique système et
+    /// on le DIT.
+    NotFoundFellBackToDefault,
+}
+
+impl LocalDeviceFallback {
+    /// Code stable, celui que porte la charge utile JSON et les journaux.
+    ///
+    /// Il doit rester **identique** à la représentation `serde` de la variante,
+    /// comme pour [`LocalBackendFallback`] : un client qui lit le JSON et un
+    /// journal qui lit `code()` doivent parler du même motif. Le test
+    /// `chaque_motif_de_repli_de_peripherique_est_cable` tient cette égalité.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ForeignHost => "foreign_host",
+            Self::NotFoundFellBackToDefault => "not_found_fell_back_to_default",
+        }
+    }
+
+    /// Phrase courte, dans la langue du chemin du signal.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::ForeignHost => {
+                "le périphérique enregistré par la zone vient d'un autre hôte audio \
+                 que celui qui est ouvert — rien n'a été ouvert plutôt que de jouer \
+                 sur un périphérique que la zone n'a jamais désigné"
+            }
+            Self::NotFoundFellBackToDefault => {
+                "le périphérique enregistré par la zone est introuvable \
+                 (débranché, renommé) — lecture sur la sortie système"
+            }
+        }
+    }
+
+    /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
+    /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
+    pub const ALL: [Self; 2] = [Self::ForeignHost, Self::NotFoundFellBackToDefault];
+}
+
 /// Ce que la sortie locale fait vraiment, à côté de ce qu'on lui a demandé.
 ///
 /// Additif : `active` reprend exactement ce que rend [`active_backend_name`],
@@ -408,12 +486,26 @@ pub struct LocalDeviceStatus {
     /// système, demandé explicitement — ce n'est pas un repli.
     pub requested: String,
     /// Le nom réellement ouvert, tel que le pilote le rend.
+    ///
+    /// **Vide** quand rien n'a été ouvert : c'est le cas d'un refus
+    /// ([`LocalDeviceFallback::ForeignHost`]), où l'honnêteté impose de ne
+    /// nommer aucun périphérique plutôt que d'en nommer un que la zone n'a
+    /// jamais désigné. `reason` porte alors le pourquoi.
     pub opened: String,
     /// Identifiant d'endpoint quand le backend en expose un de stable (WASAPI,
     /// cpal). `None` pour ASIO et CoreAudio exclusif : ils n'en ont pas.
     pub opened_id: Option<String>,
     /// `true` dès que les deux noms diffèrent — c'est LE fait à montrer.
     pub differs: bool,
+    /// Pourquoi la zone ne joue pas sur le périphérique qu'elle nomme.
+    /// `None` = le périphérique demandé a bien été celui ouvert.
+    ///
+    /// Même vocabulaire que `fallback_reason` du backend : un code stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<LocalDeviceFallback>,
+    /// La même chose en clair, comme `fallback_detail` pour le backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'static str>,
 }
 
 impl LocalDeviceStatus {
@@ -421,13 +513,16 @@ impl LocalDeviceStatus {
     /// « le périphérique système », il l'a eu. Partout ailleurs, deux noms
     /// différents sont un écart, même sans motif connu.
     fn from_observed(observed: ObservedDevice) -> Self {
-        let differs = observed.requested != "default" && observed.requested != observed.opened;
+        let differs = observed.reason.is_some()
+            || (observed.requested != "default" && observed.requested != observed.opened);
         Self {
             backend: observed.backend,
             requested: observed.requested,
             opened: observed.opened,
             opened_id: observed.opened_id,
             differs,
+            reason: observed.reason,
+            detail: observed.reason.map(LocalDeviceFallback::detail),
         }
     }
 }
@@ -1427,6 +1522,15 @@ pub struct LocalOutput {
     /// **avant** le nom, seule façon de survivre à un renommage (#2269) et de
     /// ne pas confondre deux périphériques homonymes (#2272).
     endpoint_id: Option<String>,
+    /// L'hôte audio qui a énuméré `device_name` (`AudioDevice::backend`).
+    ///
+    /// #3230 : le nom seul ne dit pas d'où il vient. Une zone née d'une
+    /// énumération WASAPI garde un nom WASAPI ; si la lecture ouvre ensuite
+    /// l'hôte ASIO — ce que `select_host("asio")` fait dès qu'ASIO expose une
+    /// sortie — ce nom ne désigne plus rien, et le repli envoyait le son sur
+    /// le périphérique ASIO par défaut. `None` = origine inconnue (sortie
+    /// recréée à la volée, zone d'avant ce correctif) : on ne refuse rien.
+    origin_host: Option<String>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     /// What the playback callbacks actually multiply by: the user volume
@@ -1726,6 +1830,17 @@ impl LocalOutput {
         Self::with_options_and_endpoint(device_name, None, exclusive_mode, audio_backend)
     }
 
+    /// Rattacher cette sortie à l'hôte audio qui a énuméré son nom.
+    ///
+    /// À appeler partout où le nom vient d'un [`AudioDevice`] : sans cette
+    /// étiquette, un nom ne porte rien et la résolution ne peut pas refuser un
+    /// hôte étranger (#3230). Une chaîne vide est traitée comme « inconnu ».
+    #[must_use]
+    pub fn with_origin_host(mut self, origin_host: &str) -> Self {
+        self.origin_host = (!origin_host.is_empty()).then(|| origin_host.to_string());
+        self
+    }
+
     /// Create a local output bound to the stable backend endpoint discovered
     /// alongside its display name.
     pub fn with_options_and_endpoint(
@@ -1739,6 +1854,7 @@ impl LocalOutput {
             device_name,
             device_id,
             endpoint_id,
+            origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(1000)),
@@ -4235,6 +4351,9 @@ impl OutputTarget for LocalOutput {
         // s'en sert désormais pour retrouver un périphérique renommé (#2269) et
         // pour ne pas confondre deux homonymes (#2272).
         let endpoint_id = self.endpoint_id.clone();
+        // #3230 : l'hôte dont vient `device_name`. Sans lui, la résolution ne
+        // peut pas distinguer « introuvable ici » de « n'a jamais été d'ici ».
+        let origin_host = self.origin_host.clone();
         let url = url.to_string();
         let playing = self.playing.clone();
         let paused = self.paused.clone();
@@ -4410,9 +4529,12 @@ impl OutputTarget for LocalOutput {
                 let decoded_len = decoded_samples.len();
 
                 let host = select_host(&audio_backend);
-                let Some((device, fell_back)) =
-                    find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
-                else {
+                let Some((device, fell_back)) = find_device_with_fallback(
+                    &host,
+                    &device_name,
+                    endpoint_id.as_deref(),
+                    origin_host.as_deref(),
+                ) else {
                     warn!(name = %device_name, "audio_device_not_found_compressed");
                     playing.store(false, Ordering::SeqCst);
                     return;
@@ -5922,9 +6044,12 @@ impl OutputTarget for LocalOutput {
             // Nom de la VARIANTE cpal ("Wasapi", "Alsa", "Asio", "CoreAudio").
             // `&'static str`, donc aucun emprunt sur `host`.
             let host_id_name: &'static str = host.id().name();
-            let Some((device, fell_back)) =
-                find_device_with_fallback(&host, &device_name, endpoint_id.as_deref())
-            else {
+            let Some((device, fell_back)) = find_device_with_fallback(
+                &host,
+                &device_name,
+                endpoint_id.as_deref(),
+                origin_host.as_deref(),
+            ) else {
                 warn!(
                     requested = %device_name,
                     "audio_device_not_found_no_fallback"
@@ -7863,6 +7988,15 @@ fn feed_native_ring_abortable(
 pub(crate) struct DeviceIdentity {
     pub(crate) endpoint_id: String,
     pub(crate) raw_name: String,
+    /// L'hôte audio qui a ÉNUMÉRÉ ce périphérique (`"Wasapi"`, `"Asio"`,
+    /// `"Alsa"`, `"CoreAudio"` — la variante cpal, telle que
+    /// `cpal::Host::id().name()` la rend).
+    ///
+    /// #3230 : sans ce champ, un nom n'était rattaché à rien. « Haut-parleurs »
+    /// est un nom WASAPI ; le chercher parmi des sorties ASIO n'a aucun sens,
+    /// et échouer y renvoyait la zone sur le périphérique ASIO par défaut. Un
+    /// nom porte désormais l'hôte dont il vient, et la résolution les apparie.
+    pub(crate) host: String,
 }
 
 /// Par quoi une zone a été rattachée à son périphérique. Le rang porté par
@@ -7887,6 +8021,26 @@ impl DeviceMatch {
     }
 }
 
+/// Le verdict de [`resolve_device`]. Trois issues, pas deux : « introuvable »
+/// et « pas d'ici » n'appellent pas la même conduite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeviceResolution {
+    /// Le périphérique de la zone a été retrouvé sur l'hôte ouvert.
+    Matched(DeviceMatch),
+    /// Le nom de la zone vient d'un AUTRE hôte. Aucun appariement n'est
+    /// possible, et le repli sur le défaut serait un détournement : c'est
+    /// exactement lui qui envoyait Jean Valjean sur une sortie ASIO qu'il
+    /// n'avait jamais choisie (#3230). L'appelant doit **refuser**.
+    ForeignHost {
+        requested_host: String,
+        open_host: String,
+    },
+    /// Le bon hôte, mais plus aucun périphérique de ce nom : débranché,
+    /// renommé, routage macOS changé. L'appelant retombe sur la sortie
+    /// système — en le disant (#2207).
+    NotFound,
+}
+
 /// Résoudre le périphérique qu'une zone désigne.
 ///
 /// Le nom d'affichage n'est **pas** une identité : il n'est ni unique (deux
@@ -7907,21 +8061,73 @@ impl DeviceMatch {
 ///    par sous-chaîne est précisément ce qui envoyait le son sur le mauvais
 ///    DAC en silence.
 ///
-/// `None` veut dire « je ne sais pas », et non « prends le premier venu » :
-/// l'appelant retombe alors sur la sortie par défaut, mais en le **disant**.
+/// [`DeviceResolution::NotFound`] veut dire « je ne sais pas », et non « prends
+/// le premier venu » : l'appelant retombe alors sur la sortie par défaut, mais
+/// en le **disant**.
+///
+/// # L'hôte, avant tout le reste (#3230)
+///
+/// Un nom de périphérique n'a de sens **que** rapporté à l'hôte qui l'a
+/// énuméré. « Haut-parleurs » est un nom WASAPI ; aucune sortie ASIO ne le
+/// porte, ne l'a jamais porté, et ne le portera jamais. Quand la zone sait de
+/// quel hôte vient son nom (`requested_host`) et que cet hôte n'est pas celui
+/// qui est ouvert, les trois étapes ci-dessous sont **sautées** et la demande
+/// est refusée : c'est le seul verdict honnête, et c'est ce qui empêche le
+/// repli de détourner la zone vers le périphérique par défaut d'un hôte
+/// qu'elle n'a jamais choisi.
+///
+/// `requested_host = None` (origine inconnue : zone d'avant ce correctif, ou
+/// sortie recréée à la volée) rend exactement le comportement d'avant. Une
+/// machine à un seul hôte ne voit donc **aucune** différence : l'hôte
+/// d'origine y est toujours celui qui est ouvert.
 pub(crate) fn resolve_device(
     requested: &str,
     requested_endpoint_id: Option<&str>,
+    requested_host: Option<&str>,
+    open_host: &str,
     candidates: &[DeviceIdentity],
-) -> Option<DeviceMatch> {
+) -> DeviceResolution {
+    // 0. L'hôte. Un nom qui vient d'ailleurs ne s'apparie à rien ici, et
+    //    surtout ne doit pas glisser jusqu'au repli sur le défaut.
+    //
+    //    L'hôte ouvert est un PARAMÈTRE et non une déduction sur les
+    //    candidates : une énumération vide — pilote ASIO happé par une autre
+    //    application entre l'élection de l'hôte et l'ouverture — ne doit pas
+    //    faire disparaître le refus. Un fait connu de l'appelant ne se redevine
+    //    pas ici.
+    if let Some(origin) = requested_host.filter(|h| !h.is_empty())
+        && !open_host.is_empty()
+        && !open_host.eq_ignore_ascii_case(origin)
+    {
+        return DeviceResolution::ForeignHost {
+            requested_host: origin.to_string(),
+            open_host: open_host.to_string(),
+        };
+    }
+
+    // Seules les candidates du bon hôte sont appariables. Les rangs `(n)` sont
+    // reconstruits sur cette même liste, comme la découverte les a calculés.
+    let matchable: Vec<(usize, &DeviceIdentity)> = candidates
+        .iter()
+        .enumerate()
+        .filter(
+            |(_, candidate)| match requested_host.filter(|h| !h.is_empty()) {
+                Some(origin) => {
+                    candidate.host.is_empty() || candidate.host.eq_ignore_ascii_case(origin)
+                }
+                None => true,
+            },
+        )
+        .collect();
+
     // 1. L'identifiant d'endpoint stable, quand la zone en connaît un. C'est
     //    le seul appariement qui traverse un renommage ou un réordonnancement.
     if let Some(endpoint_id) = requested_endpoint_id.filter(|id| !id.is_empty())
-        && let Some(index) = candidates
+        && let Some(&(index, _)) = matchable
             .iter()
-            .position(|candidate| candidate.endpoint_id == endpoint_id)
+            .find(|(_, candidate)| candidate.endpoint_id == endpoint_id)
     {
-        return Some(DeviceMatch::ByEndpointId(index));
+        return DeviceResolution::Matched(DeviceMatch::ByEndpointId(index));
     }
 
     let search = requested.to_lowercase();
@@ -7929,10 +8135,10 @@ pub(crate) fn resolve_device(
     // 2. Le nom d'affichage, reconstruit avec la convention de la découverte —
     //    c'est ce nom-là, suffixe compris, qui a été stocké dans la zone.
     let mut seen_names = std::collections::HashSet::new();
-    for (index, candidate) in candidates.iter().enumerate() {
+    for &(index, candidate) in &matchable {
         let display_name = disambiguate_display_name(&candidate.raw_name, &mut seen_names);
         if display_name.to_lowercase() == search {
-            return Some(DeviceMatch::ByDisplayName(index));
+            return DeviceResolution::Matched(DeviceMatch::ByDisplayName(index));
         }
     }
 
@@ -7941,17 +8147,17 @@ pub(crate) fn resolve_device(
     //    laisser glisser renvoyait « Haut-Parleurs (2) » sur le premier
     //    « Haut-Parleurs » — le mauvais DAC, en silence (#2272).
     if looks_disambiguated(requested) {
-        return None;
+        return DeviceResolution::NotFound;
     }
-    let mut ambigus = candidates.iter().enumerate().filter(|(_, candidate)| {
+    let mut ambigus = matchable.iter().filter(|(_, candidate)| {
         let lower = candidate.raw_name.to_lowercase();
         lower.contains(&search) || search.contains(&lower)
     });
     match (ambigus.next(), ambigus.next()) {
-        (Some((index, _)), None) => Some(DeviceMatch::BySubstring(index)),
+        (Some(&(index, _)), None) => DeviceResolution::Matched(DeviceMatch::BySubstring(index)),
         // Deux candidates : choisir la première, c'est rejouer le même défaut
         // sous un autre nom. On préfère l'aveu d'ignorance.
-        _ => None,
+        _ => DeviceResolution::NotFound,
     }
 }
 
@@ -8012,10 +8218,16 @@ fn looks_disambiguated(requested: &str) -> bool {
 ///
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
+///
+/// `origin_host` est l'hôte qui a ÉNUMÉRÉ le nom que porte la zone
+/// (`AudioDevice::backend`). Quand il est connu et qu'il diffère de l'hôte
+/// ouvert, la fonction rend `None` **sans repli** : c'est le refus de #3230.
+/// `None` = origine inconnue, comportement d'avant.
 fn find_device_with_fallback(
     host: &cpal::Host,
     device_name: &str,
     endpoint_id: Option<&str>,
+    origin_host: Option<&str>,
 ) -> Option<(cpal::Device, bool)> {
     if device_name == "default" {
         return host.default_output_device().map(|d| {
@@ -8037,6 +8249,10 @@ fn find_device_with_fallback(
     // La même liste que la découverte, puits nuls écartés compris : c'est la
     // condition pour que les rangs `(n)` reconstruits ici soient ceux qui ont
     // été stockés dans la zone.
+    // L'hôte qui énumère est celui qui a produit ces noms — c'est lui qu'un nom
+    // « porte », et c'est cette étiquette-là que la résolution apparie.
+    let open_host: &'static str = host.id().name();
+
     let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
         .output_devices()
         .map(|devs| devs.collect::<Vec<_>>())
@@ -8049,13 +8265,49 @@ fn find_device_with_fallback(
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into()),
+                host: open_host.to_string(),
             };
             (device, identity)
         })
         .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
         .unzip();
 
-    if let Some(matched) = resolve_device(device_name, endpoint_id, &identities) {
+    let resolution = resolve_device(
+        device_name,
+        endpoint_id,
+        origin_host,
+        open_host,
+        &identities,
+    );
+
+    // Le nom vient d'un autre hôte : REFUS. Retomber sur le défaut de l'hôte
+    // ouvert, c'est le détournement de #3230 — la zone se met à jouer sur un
+    // périphérique qu'elle n'a jamais nommé, sans que rien ne le dise.
+    if let DeviceResolution::ForeignHost {
+        requested_host,
+        open_host: opened,
+    } = &resolution
+    {
+        warn!(
+            requested = %device_name,
+            requested_host = %requested_host,
+            open_host = %opened,
+            fallback_reason = LocalDeviceFallback::ForeignHost.code(),
+            "audio_device_foreign_host_refused — \
+             the device this zone remembers was enumerated by another audio host; \
+             refusing to hijack the zone onto this host's default output"
+        );
+        note_device_outcome(
+            observed_backend_name(),
+            device_name,
+            "",
+            None,
+            Some(LocalDeviceFallback::ForeignHost),
+        );
+        return None;
+    }
+
+    if let DeviceResolution::Matched(matched) = resolution {
         let index = matched.index();
         debug!(
             requested = %device_name,
@@ -8101,12 +8353,14 @@ fn find_device_with_fallback(
              device instead"
         );
         // LE cas de #2207, rendu visible : la zone demandait un DAC, la lecture
-        // part sur le périphérique système. `differs` vaudra `true`.
-        note_opened_device(
+        // part sur le périphérique système. `differs` vaudra `true`, et le
+        // motif nomme désormais la cause plutôt que de la laisser deviner.
+        note_device_outcome(
             observed_backend_name(),
             device_name,
             &default_name,
             default_device.id().ok().map(|id| id.to_string()).as_deref(),
+            Some(LocalDeviceFallback::NotFoundFellBackToDefault),
         );
         Some((default_device, true))
     } else {
@@ -10056,6 +10310,12 @@ mod tests {
         );
     }
 
+    /// Les noms que `cpal::Host::id().name()` rend sur Windows. Ce sont les
+    /// mêmes chaînes que l'énumération stocke dans `AudioDevice::backend` et
+    /// que la résolution apparie — un seul et même vocabulaire.
+    const HOTE_WASAPI: &str = "Wasapi";
+    const HOTE_ASIO: &str = "Asio";
+
     /// Deux DAC USB qui s'annoncent tous deux « Haut-Parleurs », plus une
     /// sortie HDMI. C'est la configuration d'Alain (#1084) et celle de Marco
     /// Polo (#2272).
@@ -10064,14 +10324,17 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{ugreen}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{topping}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{hdmi}".into(),
                 raw_name: "Téléviseur".into(),
+                host: HOTE_WASAPI.into(),
             },
         ]
     }
@@ -10087,13 +10350,13 @@ mod tests {
         // 1. Les homonymes ne se confondent pas. Le suffixe « (2) » que la
         //    découverte a posé désigne le SECOND, jamais le premier.
         assert_eq!(
-            resolve_device("Haut-Parleurs", None, &enumeres),
-            Some(DeviceMatch::ByDisplayName(0)),
+            resolve_device("Haut-Parleurs", None, None, HOTE_WASAPI, &enumeres),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
             "« Haut-Parleurs » doit désigner le premier homonyme"
         );
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", None, &enumeres),
-            Some(DeviceMatch::ByDisplayName(1)),
+            resolve_device("Haut-Parleurs (2)", None, None, HOTE_WASAPI, &enumeres),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
             "« Haut-Parleurs (2) » doit désigner le SECOND homonyme, \
              pas retomber sur le premier par sous-chaîne"
         );
@@ -10106,8 +10369,14 @@ mod tests {
             enumeres[2].clone(),
         ];
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_redemarrage),
-            Some(DeviceMatch::ByEndpointId(0)),
+            resolve_device(
+                "Haut-Parleurs (2)",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &apres_redemarrage
+            ),
+            DeviceResolution::Matched(DeviceMatch::ByEndpointId(0)),
             "après réordonnancement, l'identifiant stable doit primer sur le rang"
         );
 
@@ -10118,15 +10387,23 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{ugreen}".into(),
                 raw_name: "Haut-Parleurs".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{topping}".into(),
                 raw_name: "Topping D10s (96 kHz)".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", Some("{topping}"), &apres_rebranchement),
-            Some(DeviceMatch::ByEndpointId(1)),
+            resolve_device(
+                "Haut-Parleurs (2)",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &apres_rebranchement
+            ),
+            DeviceResolution::Matched(DeviceMatch::ByEndpointId(1)),
             "un renommage ne doit pas casser une zone qui connaît son endpoint"
         );
 
@@ -10135,8 +10412,14 @@ mod tests {
         //    donc un repli SIGNALÉ — au premier « Haut-Parleurs » venu choisi
         //    en silence.
         assert_eq!(
-            resolve_device("Haut-Parleurs (2)", None, &apres_rebranchement),
-            None,
+            resolve_device(
+                "Haut-Parleurs (2)",
+                None,
+                None,
+                HOTE_WASAPI,
+                &apres_rebranchement
+            ),
+            DeviceResolution::NotFound,
             "sans identifiant, un « (2) » orphelin ne doit PAS glisser sur le (1)"
         );
 
@@ -10146,20 +10429,28 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{builtin}".into(),
                 raw_name: "MacBook Pro Speakers".into(),
+                host: "CoreAudio".into(),
             },
             DeviceIdentity {
                 endpoint_id: "{hdmi}".into(),
                 raw_name: "Téléviseur".into(),
+                host: "CoreAudio".into(),
             },
         ];
         assert_eq!(
-            resolve_device("MacBook Pro Speakers (2)", None, &coreaudio),
-            None,
+            resolve_device(
+                "MacBook Pro Speakers (2)",
+                None,
+                None,
+                "CoreAudio",
+                &coreaudio
+            ),
+            DeviceResolution::NotFound,
             "un suffixe posé par Tune ne se rattrape pas par sous-chaîne"
         );
         assert_eq!(
-            resolve_device("MacBook Pro", None, &coreaudio),
-            Some(DeviceMatch::BySubstring(0)),
+            resolve_device("MacBook Pro", None, None, "CoreAudio", &coreaudio),
+            DeviceResolution::Matched(DeviceMatch::BySubstring(0)),
             "un nom tronqué sans ambiguïté reste résolu"
         );
     }
@@ -10172,13 +10463,18 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{a}".into(),
                 raw_name: "Realtek Digital Output".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{b}".into(),
                 raw_name: "Realtek Digital Output (Optical)".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
-        assert_eq!(resolve_device("Realtek", None, &ambigus), None);
+        assert_eq!(
+            resolve_device("Realtek", None, None, HOTE_WASAPI, &ambigus),
+            DeviceResolution::NotFound
+        );
     }
 
     /// L'appariement par nom doit employer la convention `(n)` **exacte** de
@@ -10191,25 +10487,352 @@ mod tests {
             DeviceIdentity {
                 endpoint_id: "{a1}".into(),
                 raw_name: "A".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{a2}".into(),
                 raw_name: "A (2)".into(),
+                host: HOTE_WASAPI.into(),
             },
             DeviceIdentity {
                 endpoint_id: "{a3}".into(),
                 raw_name: "A".into(),
+                host: HOTE_WASAPI.into(),
             },
         ];
         assert_eq!(
-            resolve_device("A (2)", None, &colision),
-            Some(DeviceMatch::ByDisplayName(1)),
+            resolve_device("A (2)", None, None, HOTE_WASAPI, &colision),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
             "« A (2) » est le nom BRUT du deuxième, il lui appartient"
         );
         assert_eq!(
-            resolve_device("A (3)", None, &colision),
-            Some(DeviceMatch::ByDisplayName(2)),
+            resolve_device("A (3)", None, None, HOTE_WASAPI, &colision),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(2)),
             "le troisième reçoit « A (3) », comme à la découverte"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3230 — un nom porte l'hôte dont il vient
+    //
+    // Jean Valjean (forum 893, v0.8.235) : sa zone « Haut-parleurs » est un nom
+    // WASAPI. `select_host("asio")` élit l'hôte ASIO dès qu'il expose une
+    // sortie, la résolution cherche ce nom parmi les seules sorties ASIO, ne le
+    // trouve pas, et ouvrait **le périphérique ASIO par défaut**.
+    //
+    // La branche `select_host("asio")` ne se compile que sous Windows avec le
+    // SDK Steinberg. La DÉCISION, elle, est ici : une fonction pure qui reçoit
+    // l'hôte d'origine, l'hôte ouvert et les candidates. Elle s'éprouve donc
+    // sur n'importe quelle plateforme — Shrek compris.
+    // -----------------------------------------------------------------------
+
+    /// Ce que l'hôte ASIO expose chez Jean Valjean : sa carte, et rien qui
+    /// s'appelle « Haut-parleurs ».
+    fn sorties_asio_fixture() -> Vec<DeviceIdentity> {
+        vec![
+            DeviceIdentity {
+                // Un pilote ASIO n'expose aucun identifiant d'endpoint stable :
+                // `cpal::Device::id()` y échoue, d'où la chaîne vide.
+                endpoint_id: String::new(),
+                raw_name: "RME Fireface UCX".into(),
+                host: HOTE_ASIO.into(),
+            },
+            DeviceIdentity {
+                endpoint_id: String::new(),
+                raw_name: "ASIO4ALL v2".into(),
+                host: HOTE_ASIO.into(),
+            },
+        ]
+    }
+
+    /// ESSAI 1 — hôte ASIO élu, nom demandé venant de WASAPI : **refus**.
+    ///
+    /// Le fait à tenir n'est pas « ça ne trouve rien » : c'est que le verdict
+    /// est distinct de « introuvable ». `NotFound` fait retomber l'appelant sur
+    /// la sortie par défaut de l'hôte ouvert — le détournement même de #3230.
+    #[test]
+    fn un_nom_wasapi_ne_s_apparie_pas_a_une_sortie_asio() {
+        let asio = sorties_asio_fixture();
+
+        let verdict = resolve_device("Haut-parleurs", None, Some(HOTE_WASAPI), HOTE_ASIO, &asio);
+
+        assert_eq!(
+            verdict,
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "un nom WASAPI présenté à un hôte ASIO doit être REFUSÉ, pas déclaré \
+             introuvable : « introuvable » autorise le repli sur le défaut ASIO, \
+             et c'est ce repli-là qui a détourné la zone de Jean Valjean (#3230)"
+        );
+        assert!(
+            !matches!(verdict, DeviceResolution::Matched(_)),
+            "aucun appariement ne doit survivre au changement d'hôte"
+        );
+
+        // Et la sous-chaîne ne doit pas non plus servir de porte dérobée : un
+        // nom d'hôte étranger est écarté AVANT les trois étapes d'appariement.
+        assert_eq!(
+            resolve_device("ASIO4ALL", None, Some(HOTE_WASAPI), HOTE_ASIO, &asio),
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "même un nom qui RESSEMBLE à une sortie ASIO ne s'apparie pas s'il \
+             est présenté comme venant de WASAPI"
+        );
+
+        // Et le refus tient même quand l'hôte ouvert n'énumère RIEN : un pilote
+        // ASIO happé par une autre application entre l'élection de l'hôte et
+        // l'ouverture ne doit pas faire disparaître le refus. C'est pour cela
+        // que l'hôte ouvert est un paramètre, et non une déduction sur la liste.
+        assert_eq!(
+            resolve_device("Haut-parleurs", None, Some(HOTE_WASAPI), HOTE_ASIO, &[]),
+            DeviceResolution::ForeignHost {
+                requested_host: HOTE_WASAPI.into(),
+                open_host: HOTE_ASIO.into(),
+            },
+            "une énumération vide ne doit pas rendre le nom étranger appariable"
+        );
+    }
+
+    /// ESSAI 2 — hôte ASIO élu, nom demandé venant d'ASIO : ouverture normale.
+    #[test]
+    fn un_nom_asio_s_apparie_bien_a_sa_sortie_asio() {
+        let asio = sorties_asio_fixture();
+
+        assert_eq!(
+            resolve_device("RME Fireface UCX", None, Some(HOTE_ASIO), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
+            "un nom qui vient de l'hôte ouvert doit s'apparier comme avant"
+        );
+        assert_eq!(
+            resolve_device("ASIO4ALL v2", None, Some(HOTE_ASIO), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)),
+        );
+        // La casse du nom d'hôte ne doit pas décider du son qui sort.
+        assert_eq!(
+            resolve_device("RME Fireface UCX", None, Some("ASIO"), HOTE_ASIO, &asio),
+            DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
+            "l'appariement d'hôte est insensible à la casse"
+        );
+    }
+
+    /// ESSAI 3 — LE TÉMOIN. Une machine à un seul hôte se comporte **exactement**
+    /// comme avant : l'hôte d'origine y est toujours celui qui est ouvert.
+    ///
+    /// Le témoin compare terme à terme le verdict avec origine connue et le
+    /// verdict sans origine — c'est-à-dire le comportement d'avant le
+    /// correctif. Le moindre écart ici serait une régression pour l'immense
+    /// majorité des installations, qui n'ont jamais vu deux hôtes.
+    #[test]
+    fn temoin_un_seul_hote_ne_change_rien() {
+        let enumeres = homonymes_fixture();
+
+        for demande in [
+            "Haut-Parleurs",
+            "Haut-Parleurs (2)",
+            "Téléviseur",
+            "Haut-Parleurs (9)",
+            "inexistant",
+        ] {
+            let avant = resolve_device(demande, None, None, HOTE_WASAPI, &enumeres);
+            let apres = resolve_device(demande, None, Some(HOTE_WASAPI), HOTE_WASAPI, &enumeres);
+            assert_eq!(
+                avant, apres,
+                "« {demande} » : sur une machine à un seul hôte, connaître \
+                 l'hôte d'origine ne doit RIEN changer"
+            );
+        }
+
+        // Idem pour l'appariement par identifiant d'endpoint, qui passe devant
+        // le nom : le filtre d'hôte ne doit pas l'écarter.
+        assert_eq!(
+            resolve_device(
+                "nom devenu faux",
+                Some("{topping}"),
+                None,
+                HOTE_WASAPI,
+                &enumeres
+            ),
+            resolve_device(
+                "nom devenu faux",
+                Some("{topping}"),
+                Some(HOTE_WASAPI),
+                HOTE_WASAPI,
+                &enumeres
+            ),
+            "l'identifiant stable doit primer de la même façon avec ou sans hôte"
+        );
+
+        // Et une zone d'AVANT ce correctif — qui ne connaît pas son hôte
+        // d'origine — n'est jamais refusée : `None` veut dire « je ne sais
+        // pas », et on ne refuse pas sur une ignorance.
+        assert_eq!(
+            resolve_device(
+                "Haut-parleurs",
+                None,
+                None,
+                HOTE_ASIO,
+                &sorties_asio_fixture()
+            ),
+            DeviceResolution::NotFound,
+            "sans origine connue, on retombe sur le comportement d'avant : \
+             introuvable, donc repli SIGNALÉ — jamais un refus"
+        );
+    }
+
+    /// ESSAI 4 — le repli est observable par le client.
+    ///
+    /// Le canal est celui de #2207 : `LocalBackendStatus.device`, déjà servi
+    /// par `/system/config`. Ce correctif n'en ouvre pas un deuxième — il y
+    /// ajoute le motif, avec le même vocabulaire que `fallback_reason` du
+    /// backend : un `code()` stable et un `detail()` en clair.
+    #[test]
+    fn le_repli_de_peripherique_remonte_au_client() {
+        // a) Refus d'hôte étranger : RIEN n'a été ouvert. `opened` est vide —
+        //    nommer un périphérique ici serait mentir — et le motif le dit.
+        let refus = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "ASIO",
+            requested: "Haut-parleurs".into(),
+            opened: String::new(),
+            opened_id: None,
+            reason: Some(LocalDeviceFallback::ForeignHost),
+        });
+        assert!(refus.differs, "un refus est un écart, et doit se voir");
+        assert_eq!(refus.reason, Some(LocalDeviceFallback::ForeignHost));
+        assert_eq!(
+            refus.detail,
+            Some(LocalDeviceFallback::ForeignHost.detail())
+        );
+        assert!(
+            refus.opened.is_empty(),
+            "un refus n'ouvre rien : aucun nom de périphérique ne doit être avancé"
+        );
+
+        // La charge utile porte bien le code stable, pas le nom de la variante.
+        let json = serde_json::to_value(&refus).expect("sérialisable");
+        assert_eq!(json["reason"], "foreign_host");
+        assert_eq!(json["differs"], true);
+
+        // b) Le cas historique #2207 : le nom est introuvable sur le BON hôte,
+        //    on ouvre la sortie système — et on le dit désormais avec un motif.
+        let repli = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "WASAPI",
+            requested: "Topping D10s".into(),
+            opened: "Haut-parleurs".into(),
+            opened_id: Some("{speakers}".into()),
+            reason: Some(LocalDeviceFallback::NotFoundFellBackToDefault),
+        });
+        assert!(repli.differs);
+        assert_eq!(
+            repli.reason,
+            Some(LocalDeviceFallback::NotFoundFellBackToDefault)
+        );
+        assert_eq!(
+            serde_json::to_value(&repli).expect("sérialisable")["reason"],
+            "not_found_fell_back_to_default"
+        );
+
+        // c) Le cas nominal reste muet : aucun motif, aucun écart. Un écran qui
+        //    ne lit que `differs` voit exactement ce qu'il voyait avant.
+        let nominal = LocalDeviceStatus::from_observed(ObservedDevice {
+            backend: "ALSA",
+            requested: "Topping D10s".into(),
+            opened: "Topping D10s".into(),
+            opened_id: Some("hw:CARD=D10s".into()),
+            reason: None,
+        });
+        assert!(!nominal.differs);
+        assert_eq!(nominal.reason, None);
+        assert_eq!(nominal.detail, None);
+        let json = serde_json::to_value(&nominal).expect("sérialisable");
+        assert!(
+            json.get("reason").is_none() && json.get("detail").is_none(),
+            "sans motif, les deux champs sont ABSENTS de la charge utile : un \
+             client d'avant voit le même objet qu'avant"
+        );
+    }
+
+    /// Chaque motif de repli de périphérique est câblé : un code stable, non
+    /// vide, unique, et un libellé en clair. Même contre-épreuve permanente que
+    /// pour `LocalBackendFallback` — un motif ajouté sans être décrit tombe.
+    #[test]
+    fn chaque_motif_de_repli_de_peripherique_est_cable() {
+        let mut codes = std::collections::HashSet::new();
+        for motif in LocalDeviceFallback::ALL {
+            assert!(!motif.code().is_empty(), "{motif:?} sans code");
+            assert!(!motif.detail().is_empty(), "{motif:?} sans libellé");
+            assert!(
+                codes.insert(motif.code()),
+                "code dupliqué : {} — un client ne pourrait plus distinguer \
+                 les deux motifs",
+                motif.code()
+            );
+            // Le code voyage en JSON : il doit être celui-là, pas le nom Rust.
+            assert_eq!(
+                serde_json::to_value(motif).expect("sérialisable"),
+                serde_json::Value::String(motif.code().to_string()),
+            );
+        }
+    }
+
+    /// GARDE DE SITE — la production doit vraiment PASSER l'hôte d'origine.
+    ///
+    /// La branche ASIO de `select_host` ne se compile pas sur Shrek, donc aucun
+    /// test d'intégration ne peut constater le refus de bout en bout ici. Ce
+    /// que ce test tient, c'est le câblage : `find_device_with_fallback` doit
+    /// transmettre `origin_host` à `resolve_device`, et refuser sans repli sur
+    /// `ForeignHost`. Rebrancher le nom étranger dans la production — passer
+    /// `None`, ou traiter `ForeignHost` comme `NotFound` — fait tomber ce test
+    /// même là où la scène complète n'est pas jouable.
+    ///
+    /// Idiome du dépôt : relire la production par `include_str!`, comme
+    /// `terminologie_eq.rs` et `position_publiee_guard`.
+    #[test]
+    fn find_device_with_fallback_passe_bien_l_hote_d_origine() {
+        let source = include_str!("local.rs");
+        let debut = source
+            .find("fn find_device_with_fallback(")
+            .expect("find_device_with_fallback introuvable");
+        let corps = &source[debut..debut + 4000];
+
+        assert!(
+            corps.contains("origin_host: Option<&str>"),
+            "find_device_with_fallback doit RECEVOIR l'hôte d'origine : sans lui, \
+             un nom ne porte rien et #3230 revient"
+        );
+        let appel = corps
+            .find("resolve_device(")
+            .map(|i| &corps[i..i + 200])
+            .expect("l'appel à resolve_device doit rester dans cette fonction");
+        assert!(
+            appel.contains("origin_host"),
+            "l'appel à resolve_device doit LUI PASSER origin_host ; reçu : {appel}"
+        );
+        assert!(
+            appel.contains("open_host"),
+            "l'appel à resolve_device doit aussi LUI PASSER l'hôte ouvert : le \
+             déduire de la liste énumérée ferait disparaître le refus quand \
+             cette liste est vide ; reçu : {appel}"
+        );
+        assert!(
+            corps.contains("DeviceResolution::ForeignHost"),
+            "le refus d'hôte étranger doit être traité ici, pas confondu avec \
+             « introuvable » — c'est ce dernier qui déclenche le repli sur le \
+             périphérique par défaut de l'hôte ouvert"
+        );
+        // Le refus doit COUPER : pas de repli derrière lui.
+        let refus = corps
+            .find("DeviceResolution::ForeignHost")
+            .map(|i| &corps[i..])
+            .expect("bloc de refus");
+        let fin_refus = refus.find("return None;").unwrap_or(usize::MAX);
+        let repli = refus.find("default_output_device").unwrap_or(usize::MAX);
+        assert!(
+            fin_refus < repli,
+            "le refus doit rendre None AVANT tout repli sur la sortie par défaut"
         );
     }
 
@@ -11714,6 +12337,9 @@ mod backend_fallback_tests {
             requested: requested.to_string(),
             opened: opened.to_string(),
             opened_id: opened_id.map(str::to_string),
+            // Une ouverture qui a abouti sur le nom demandé n'a aucun motif :
+            // les motifs sont éprouvés à part, dans les tests de #3230.
+            reason: None,
         })
     }
 
@@ -12100,10 +12726,11 @@ mod backend_fallback_tests {
         }
 
         // 2. Le chemin cpal PARTAGÉ (ALSA, CoreAudio partagé, WASAPI partagé) :
-        //    `find_device_with_fallback` a trois sorties qui rendent un
-        //    périphérique — « default » demandé, nom résolu, repli sur le
-        //    périphérique système. Les trois doivent enregistrer, et la
-        //    troisième est justement celle de #2207.
+        //    `find_device_with_fallback` a QUATRE sorties qui décident du son —
+        //    « default » demandé, nom résolu, refus d'hôte étranger (#3230, la
+        //    seule qui n'ouvre rien), repli sur le périphérique système
+        //    (#2207). Les quatre doivent enregistrer : une sortie muette, c'est
+        //    une zone qui affiche la consigne au lieu de la vérité.
         let debut = src
             .find("fn find_device_with_fallback(")
             .expect("find_device_with_fallback introuvable");
@@ -12112,15 +12739,21 @@ mod backend_fallback_tests {
             .map(|i| debut + i)
             .expect("le corps de find_device_with_fallback doit précéder `Probe a device`");
         let corps = &src[debut..fin];
-        let enregistrements = corps.matches("note_opened_device(").count();
+        let enregistrements = corps.matches("note_opened_device(").count()
+            + corps.matches("note_device_outcome(").count();
         assert_eq!(
-            enregistrements, 3,
-            "find_device_with_fallback rend un périphérique par trois chemins mais n'en \
-             enregistre que {enregistrements} : une sortie repart sans dire ce qu'elle a ouvert"
+            enregistrements, 4,
+            "find_device_with_fallback décide du son par quatre chemins mais n'en \
+             enregistre que {enregistrements} : une sortie repart sans dire ce qu'elle a fait"
         );
         assert!(
             corps.contains("audio_device_not_found_falling_back_to_default"),
             "le repli sur le périphérique système a disparu — le cas à rendre visible n'existe plus"
+        );
+        assert!(
+            corps.contains("audio_device_foreign_host_refused"),
+            "le refus d'hôte étranger a disparu — un nom WASAPI redeviendrait \
+             appariable à une sortie ASIO (#3230)"
         );
     }
 
